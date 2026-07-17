@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 
@@ -29,6 +31,21 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def calendar_range(
+        date_from: str, date_to: str, days: int = 30, include_past: bool = False
+    ) -> tuple[str, str]:
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        try:
+            start = date.fromisoformat(date_from) if date_from else today
+            end = date.fromisoformat(date_to) if date_to else today + timedelta(days=days)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="calendar dates must use YYYY-MM-DD") from exc
+        if start > end:
+            raise HTTPException(status_code=400, detail="from must be on or before to")
+        if not include_past and start < today:
+            start = today
+        return start.isoformat(), end.isoformat()
+
     @app.get("/v1/health")
     def health():
         return {
@@ -36,6 +53,90 @@ def create_app(
             "version": __version__,
             "database": str(settings.database_path),
         }
+
+    @app.get("/v1/economic-calendar")
+    def economic_calendar(
+        country: str = "US",
+        date_from: str = Query("", alias="from"),
+        date_to: str = Query("", alias="to"),
+        impact: str = "",
+        limit: int = Query(50, ge=1, le=500),
+        include_past: bool = False,
+    ):
+        start, end = calendar_range(date_from, date_to, include_past=include_past)
+        events = service.warehouse.get_economic_calendar(start, end, country, impact, limit)
+        return {
+            "count": len(events), "from": start, "to": end,
+            "filter_timezone": "Asia/Shanghai", "past_events_excluded": not include_past,
+            "events": events,
+        }
+
+    @app.get("/v1/economic-indicators")
+    def economic_indicators(
+        country: str = "US", source: str = "", limit: int = Query(50, ge=1, le=500)
+    ):
+        indicators = service.warehouse.get_economic_indicators(country, source, limit)
+        return {"count": len(indicators), "indicators": indicators}
+
+    @app.get("/v1/earnings-calendar")
+    def earnings_calendar(
+        market: str = "",
+        symbols: str = "",
+        date_from: str = Query("", alias="from"),
+        date_to: str = Query("", alias="to"),
+        limit: int = Query(50, ge=1, le=500),
+        include_past: bool = False,
+    ):
+        start, end = calendar_range(date_from, date_to, include_past=include_past)
+        requested = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        events = service.warehouse.get_earnings_calendar(start, end, market, requested, limit)
+        return {
+            "count": len(events), "from": start, "to": end,
+            "filter_timezone": "Asia/Shanghai", "past_events_excluded": not include_past,
+            "events": events,
+        }
+
+    @app.get("/v1/snapshot")
+    def data_snapshot(limit: int = Query(50, ge=1, le=500), days: int = Query(30, ge=1, le=120)):
+        start, end = calendar_range("", "", days=days)
+        result = service.calendar_snapshot(start, end, limit)
+        result.update({"from": start, "to": end, "past_events_excluded": True})
+        return result
+
+    @app.post("/v1/admin/economic-calendar/refresh")
+    def refresh_economic_calendar(
+        country: str = "US",
+        date_from: str = Query("", alias="from"),
+        date_to: str = Query("", alias="to"),
+        days: int = Query(30, ge=1, le=120),
+    ):
+        start, end = calendar_range(date_from, date_to, days=days, include_past=True)
+        try:
+            return service.refresh_economic_calendar(start, end, country)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/admin/economic-indicators/refresh")
+    def refresh_economic_indicators():
+        try:
+            return service.refresh_economic_indicators()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/admin/earnings-calendar/refresh")
+    def refresh_earnings_calendar(
+        market: str = "",
+        symbols: str = "",
+        date_from: str = Query("", alias="from"),
+        date_to: str = Query("", alias="to"),
+        days: int = Query(30, ge=1, le=120),
+    ):
+        start, end = calendar_range(date_from, date_to, days=days, include_past=True)
+        requested = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+        try:
+            return service.refresh_earnings_calendar(start, end, market, requested)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes")
     def quotes(symbols: str, refresh: bool = True):

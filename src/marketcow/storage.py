@@ -278,6 +278,56 @@ class Warehouse:
                 con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS {0} VARCHAR".format(name))
             con.execute(
                 """
+                CREATE TABLE IF NOT EXISTS economic_calendar_event (
+                    event_id VARCHAR PRIMARY KEY, country VARCHAR, event_date VARCHAR,
+                    event_time VARCHAR, timezone VARCHAR, scheduled_at VARCHAR,
+                    event_name VARCHAR, impact VARCHAR, actual VARCHAR, estimate VARCHAR,
+                    previous VARCHAR, unit VARCHAR, source VARCHAR, source_url VARCHAR,
+                    observed_at VARCHAR, ingested_at VARCHAR, raw_response_locator VARCHAR,
+                    raw_path VARCHAR, raw_artifact_id VARCHAR, payload_json VARCHAR
+                )
+                """
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_economic_calendar_range ON economic_calendar_event(event_date, country)"
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS economic_indicator_latest (
+                    indicator_id VARCHAR PRIMARY KEY, country VARCHAR, name VARCHAR,
+                    source VARCHAR, source_series_id VARCHAR, period VARCHAR,
+                    value DOUBLE, previous_value DOUBLE, change_value DOUBLE,
+                    change_pct DOUBLE, unit VARCHAR, frequency VARCHAR,
+                    latest_date VARCHAR, source_url VARCHAR, observed_at VARCHAR,
+                    ingested_at VARCHAR, raw_response_locator VARCHAR, raw_path VARCHAR,
+                    raw_artifact_id VARCHAR, payload_json VARCHAR
+                )
+                """
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_economic_indicator_country ON economic_indicator_latest(country, latest_date)"
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS earnings_calendar_event (
+                    event_id VARCHAR PRIMARY KEY, market VARCHAR, symbol VARCHAR,
+                    name VARCHAR, report_date VARCHAR, report_time VARCHAR,
+                    timezone VARCHAR, scheduled_at VARCHAR, fiscal_period VARCHAR,
+                    eps_forecast VARCHAR, previous_eps VARCHAR, source VARCHAR,
+                    source_url VARCHAR, observed_at VARCHAR, ingested_at VARCHAR,
+                    raw_response_locator VARCHAR, raw_path VARCHAR,
+                    raw_artifact_id VARCHAR, payload_json VARCHAR
+                )
+                """
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_earnings_calendar_range ON earnings_calendar_event(report_date, market, symbol)"
+            )
+            con.execute(
+                "INSERT OR IGNORE INTO schema_migrations VALUES (3, 'economic and earnings calendar datasets', CAST(CURRENT_TIMESTAMP AS VARCHAR))"
+            )
+            con.execute(
+                """
                 INSERT OR IGNORE INTO provider_health
                 SELECT source, 'healthy', MAX(ingested_at), MAX(ingested_at), NULL, 0
                 FROM market_quote_latest WHERE source IS NOT NULL GROUP BY source
@@ -632,6 +682,128 @@ class Warehouse:
                 [symbol, interval, adjustment, limit],
             )
         return list(reversed(rows))
+
+    @staticmethod
+    def _calendar_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+        payload = json.loads(row.pop("payload_json") or "{}")
+        payload.update({key: value for key, value in row.items() if key not in payload})
+        return payload
+
+    @staticmethod
+    def _serialized_rows(rows: List[Dict[str, Any]], columns: List[str]) -> List[List[Any]]:
+        return [
+            [
+                row.get(column)
+                if column != "payload_json"
+                else json.dumps(row, ensure_ascii=False, allow_nan=False)
+                for column in columns
+            ]
+            for row in rows
+        ]
+
+    def upsert_economic_calendar(self, rows: List[Dict[str, Any]]) -> int:
+        columns = [
+            "event_id", "country", "event_date", "event_time", "timezone", "scheduled_at",
+            "event_name", "impact", "actual", "estimate", "previous", "unit", "source",
+            "source_url", "observed_at", "ingested_at", "raw_response_locator", "raw_path",
+            "raw_artifact_id", "payload_json",
+        ]
+        if rows:
+            with self._lock, self.connect() as con:
+                con.executemany(
+                    "INSERT OR REPLACE INTO economic_calendar_event ({0}) VALUES ({1})".format(
+                        ",".join(columns), ",".join("?" for _ in columns)
+                    ),
+                    self._serialized_rows(rows, columns),
+                )
+        return len(rows)
+
+    def get_economic_calendar(
+        self, date_from: str, date_to: str, country: str = "US", impact: str = "", limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        where, params = ["event_date >= ?", "event_date <= ?"], [date_from, date_to]
+        if country:
+            where.append("country = ?")
+            params.append(country.upper())
+        if impact:
+            where.append("LOWER(impact) = LOWER(?)")
+            params.append(impact)
+        params.append(limit)
+        sql = (
+            "SELECT * FROM economic_calendar_event WHERE " + " AND ".join(where)
+            + " ORDER BY event_date, event_time, event_name LIMIT ?"
+        )
+        with self._lock, self.connect() as con:
+            return [self._calendar_payload(row) for row in self._rows(con, sql, params)]
+
+    def upsert_economic_indicators(self, rows: List[Dict[str, Any]]) -> int:
+        columns = [
+            "indicator_id", "country", "name", "source", "source_series_id", "period", "value",
+            "previous_value", "change_value", "change_pct", "unit", "frequency", "latest_date",
+            "source_url", "observed_at", "ingested_at", "raw_response_locator", "raw_path",
+            "raw_artifact_id", "payload_json",
+        ]
+        if rows:
+            with self._lock, self.connect() as con:
+                con.executemany(
+                    "INSERT OR REPLACE INTO economic_indicator_latest ({0}) VALUES ({1})".format(
+                        ",".join(columns), ",".join("?" for _ in columns)
+                    ),
+                    self._serialized_rows(rows, columns),
+                )
+        return len(rows)
+
+    def get_economic_indicators(self, country: str = "US", source: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+        where, params = [], []
+        if country:
+            where.append("country = ?")
+            params.append(country.upper())
+        if source:
+            where.append("source = ?")
+            params.append(source.lower())
+        params.append(limit)
+        sql = "SELECT * FROM economic_indicator_latest"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY latest_date DESC, name LIMIT ?"
+        with self._lock, self.connect() as con:
+            return [self._calendar_payload(row) for row in self._rows(con, sql, params)]
+
+    def upsert_earnings_calendar(self, rows: List[Dict[str, Any]]) -> int:
+        columns = [
+            "event_id", "market", "symbol", "name", "report_date", "report_time", "timezone",
+            "scheduled_at", "fiscal_period", "eps_forecast", "previous_eps", "source", "source_url",
+            "observed_at", "ingested_at", "raw_response_locator", "raw_path", "raw_artifact_id", "payload_json",
+        ]
+        if rows:
+            with self._lock, self.connect() as con:
+                con.executemany(
+                    "INSERT OR REPLACE INTO earnings_calendar_event ({0}) VALUES ({1})".format(
+                        ",".join(columns), ",".join("?" for _ in columns)
+                    ),
+                    self._serialized_rows(rows, columns),
+                )
+        return len(rows)
+
+    def get_earnings_calendar(
+        self, date_from: str, date_to: str, market: str = "", symbols: Optional[Sequence[str]] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        where, params = ["report_date >= ?", "report_date <= ?"], [date_from, date_to]
+        if market:
+            where.append("market = ?")
+            params.append(market.upper())
+        requested = [item.upper() for item in symbols or [] if item]
+        if requested:
+            where.append("symbol IN ({0})".format(",".join("?" for _ in requested)))
+            params.extend(requested)
+        params.append(limit)
+        sql = (
+            "SELECT * FROM earnings_calendar_event WHERE " + " AND ".join(where)
+            + " ORDER BY report_date, report_time, market, symbol LIMIT ?"
+        )
+        with self._lock, self.connect() as con:
+            return [self._calendar_payload(row) for row in self._rows(con, sql, params)]
 
     def latest_runs(self, limit: int = 20) -> List[Dict[str, Any]]:
         with self._lock, self.connect() as con:

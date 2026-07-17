@@ -44,6 +44,7 @@
 ## 能做什么
 
 - 提供 A 股、ETF、港股和美股的统一行情查询。
+- 提供宏观经济事件、经济指标和中港美财报日历的统一读取接口。
 - 保存 A 股基本面、完整三表和通达信历史财务数据。
 - 支持带 `published_at`、`observed_at`、`ingested_at` 约束的 point-in-time 查询。
 - 保存不可变原始文件 manifest，并记录 `source`、`source_url` 和原始响应定位信息。
@@ -130,6 +131,7 @@ curl 'http://127.0.0.1:8790/v1/quotes/AAPL'
 curl 'http://127.0.0.1:8790/v1/quotes/0700.HK/history?range=1y&interval=1d'
 curl 'http://127.0.0.1:8790/v1/fundamentals/600298?as_of=2026-07-17'
 curl 'http://127.0.0.1:8790/v1/funnel/metrics?min_roe_median=15&max_pe=25'
+curl 'http://127.0.0.1:8790/v1/snapshot?limit=50&days=30'
 ```
 
 大多数用户使用 `sync-cn` 即可，不需要理解刷新顺序。需要精细控制时，底层运维接口位于 `/v1/admin/*`，例如：
@@ -141,6 +143,29 @@ curl -X POST 'http://127.0.0.1:8790/v1/admin/validation/rebuild?report_period=20
 ```
 
 这些管理接口目前没有身份认证。请保持默认 loopback 监听，不要把服务直接暴露到公网或不受信任的局域网。
+
+### 日历数据接口
+
+日历读取接口只访问本地 DuckDB，不会在每次读取时抓取上游。默认按 `Asia/Shanghai` 的当天过滤过期事件，并返回未来 30 天的数据：
+
+```bash
+curl 'http://127.0.0.1:8790/v1/economic-calendar?country=US&limit=50'
+curl 'http://127.0.0.1:8790/v1/economic-indicators?country=US'
+curl 'http://127.0.0.1:8790/v1/earnings-calendar?symbols=PDD,600519,00700&limit=50'
+curl 'http://127.0.0.1:8790/v1/snapshot?limit=50&days=30'
+```
+
+首次使用或需要低频更新时，显式调用管理接口：
+
+```bash
+curl -X POST 'http://127.0.0.1:8790/v1/admin/economic-calendar/refresh?days=30'
+curl -X POST 'http://127.0.0.1:8790/v1/admin/economic-indicators/refresh'
+curl -X POST 'http://127.0.0.1:8790/v1/admin/earnings-calendar/refresh?days=30&symbols=PDD,600519,00700'
+```
+
+经济事件来自 BEA 与 Census 官方发布日历，经济指标来自 BLS Public Data API；财报日历使用 Nasdaq、上交所定期报告预约披露和公开的港股业绩公布日历。刷新命令应按日或更低频率运行，不应持续轮询。
+
+`/v1/snapshot` 保留 `economic_calendar`、`economic_indicators` 和 `earnings_calendar` 三个数组，供依赖旧 snapshot 契约的本地消费者迁移。完整的字段、时区、参数和响应示例见[日历 API 契约](docs/calendar-api.md)。
 
 ## 数据与查询口径
 
@@ -191,6 +216,7 @@ uv pip check
 - [初始架构](docs/architecture/initial-architecture.md)
 - [ADR-001：本地优先、分层存储与统一 API](docs/decisions/ADR-001-local-first-data-platform.md)
 - [实施路线](docs/roadmap.md)
+- [日历 API 契约](docs/calendar-api.md)
 
 ## 安全
 

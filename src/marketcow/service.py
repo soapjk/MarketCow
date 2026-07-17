@@ -26,6 +26,7 @@ from .providers.yahoo_quote import YahooQuoteProvider
 from .providers.instrument_search import InstrumentSearchProvider
 from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normalize_a_symbol
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
+from .providers.calendar import CalendarProvider
 from .storage import FUNDAMENTAL_COLUMNS, Warehouse
 
 
@@ -95,6 +96,7 @@ class FundamentalService:
         search_provider: Optional[InstrumentSearchProvider] = None,
         sina_quote_provider: Optional[SinaRealtimeQuoteProvider] = None,
         a_quote_provider: Optional[EastmoneyRealtimeQuoteProvider] = None,
+        calendar_provider: Optional[CalendarProvider] = None,
     ):
         self.settings = settings
         self.warehouse = warehouse or Warehouse(settings.database_path)
@@ -108,6 +110,7 @@ class FundamentalService:
         self.search_provider = search_provider or InstrumentSearchProvider()
         self.sina_quote_provider = sina_quote_provider or SinaRealtimeQuoteProvider()
         self.a_quote_provider = a_quote_provider or EastmoneyRealtimeQuoteProvider()
+        self.calendar_provider = calendar_provider or CalendarProvider()
 
     def search_instruments(self, query: str, limit: int = 12) -> List[Dict[str, Any]]:
         return self.search_provider.search(query, limit)
@@ -248,6 +251,99 @@ class FundamentalService:
         self.warehouse.record_provider_health(result["source"], True, ingested_at)
         self._finish_run(run_id, "refresh_quote_history", started_at, symbol, count)
         return result
+
+    def _prepare_calendar_rows(self, dataset: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        observed_at = utc_now()
+        deduplicated: Dict[str, Dict[str, Any]] = {}
+        for index, row in enumerate(rows):
+            identity = str(row.get("event_id") or row.get("indicator_id") or index)
+            deduplicated[identity] = row
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in deduplicated.values():
+            grouped.setdefault(str(row.get("source") or "unknown"), []).append(row)
+        prepared: List[Dict[str, Any]] = []
+        for source, source_rows in grouped.items():
+            source_url = str(source_rows[0].get("source_url") or "")
+            artifact = self._write_artifact(
+                self.settings.raw_path / "calendars" / dataset,
+                dataset,
+                [row.get("_raw_payload") for row in source_rows],
+                source,
+                source_url,
+                "items",
+                observed_at,
+                observed_at,
+                {"row_count": len(source_rows)},
+            )
+            for source_row in source_rows:
+                raw_payload = source_row.pop("_raw_payload", None)
+                source_row.update({
+                    "payload": raw_payload,
+                    "observed_at": observed_at,
+                    "ingested_at": observed_at,
+                    "raw_path": artifact["storage_path"],
+                    "raw_artifact_id": artifact["artifact_id"],
+                })
+                prepared.append(source_row)
+        return prepared
+
+    def refresh_economic_calendar(self, date_from: str, date_to: str, country: str = "US") -> Dict[str, Any]:
+        job_name = "refresh_economic_calendar"
+        run_id, started_at = self._start_run(job_name, date_from + ":" + date_to)
+        try:
+            rows = self.calendar_provider.fetch_economic_calendar(date_from, date_to, country)
+            prepared = self._prepare_calendar_rows("economic_calendar", rows)
+            count = self.warehouse.upsert_economic_calendar(prepared)
+            self.warehouse.record_provider_health("economic_calendar", True, utc_now())
+            self._finish_run(run_id, job_name, started_at, date_from + ":" + date_to, count)
+            return {"status": "success", "saved": count, "events": prepared}
+        except Exception as exc:
+            self.warehouse.record_provider_health("economic_calendar", False, utc_now(), str(exc))
+            self._finish_run(run_id, job_name, started_at, date_from + ":" + date_to, 0, str(exc))
+            raise
+
+    def refresh_economic_indicators(self) -> Dict[str, Any]:
+        job_name = "refresh_economic_indicators"
+        run_id, started_at = self._start_run(job_name)
+        try:
+            rows = self.calendar_provider.fetch_economic_indicators()
+            prepared = self._prepare_calendar_rows("economic_indicators", rows)
+            count = self.warehouse.upsert_economic_indicators(prepared)
+            self.warehouse.record_provider_health("economic_indicators", True, utc_now())
+            self._finish_run(run_id, job_name, started_at, "", count)
+            return {"status": "success", "saved": count, "indicators": prepared}
+        except Exception as exc:
+            self.warehouse.record_provider_health("economic_indicators", False, utc_now(), str(exc))
+            self._finish_run(run_id, job_name, started_at, "", 0, str(exc))
+            raise
+
+    def refresh_earnings_calendar(
+        self, date_from: str, date_to: str, market: str = "", symbols: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        job_name = "refresh_earnings_calendar"
+        run_id, started_at = self._start_run(job_name, date_from + ":" + date_to)
+        try:
+            rows = self.calendar_provider.fetch_earnings_calendar(date_from, date_to, market, symbols)
+            prepared = self._prepare_calendar_rows("earnings_calendar", rows)
+            count = self.warehouse.upsert_earnings_calendar(prepared)
+            self.warehouse.record_provider_health("earnings_calendar", True, utc_now())
+            self._finish_run(run_id, job_name, started_at, date_from + ":" + date_to, count)
+            return {"status": "success", "saved": count, "events": prepared}
+        except Exception as exc:
+            self.warehouse.record_provider_health("earnings_calendar", False, utc_now(), str(exc))
+            self._finish_run(run_id, job_name, started_at, date_from + ":" + date_to, 0, str(exc))
+            raise
+
+    def calendar_snapshot(self, date_from: str, date_to: str, limit: int = 50) -> Dict[str, Any]:
+        return {
+            "generated_at": utc_now(),
+            "filter_timezone": "Asia/Shanghai",
+            "date_format": "YYYY-MM-DD",
+            "quotes": [],
+            "economic_calendar": self.warehouse.get_economic_calendar(date_from, date_to, limit=limit),
+            "economic_indicators": self.warehouse.get_economic_indicators(limit=limit),
+            "earnings_calendar": self.warehouse.get_earnings_calendar(date_from, date_to, limit=limit),
+        }
 
     def _save_raw(self, dataset: str, report_period: str, records: List[Dict[str, Any]]) -> Dict[str, Any]:
         folder = self.settings.raw_path / "a_share_fundamentals" / report_period
