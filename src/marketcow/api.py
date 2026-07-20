@@ -15,6 +15,7 @@ from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
 from .telemetry import telemetry_call
+from .health import StorageHealthEvaluator
 
 
 class TushareRequest(BaseModel):
@@ -37,6 +38,13 @@ def create_app(
     app.state.service = service
     app.add_event_handler("shutdown", service.close)
     clock = now_provider or (lambda: datetime.now(timezone.utc))
+    health_evaluator = StorageHealthEvaluator(wall_clock=clock)
+
+    def storage_health() -> Dict[str, Any]:
+        repository = getattr(service, "market_bar_repository", None)
+        telemetry = getattr(repository, "telemetry", None)
+        snapshot = telemetry_call(telemetry, "snapshot")
+        return health_evaluator.evaluate(snapshot)
 
     def cache_metadata(
         bars: list[Dict[str, Any]], fallback_ingested_at: Any = None,
@@ -113,7 +121,16 @@ def create_app(
             "profile": settings.profile,
             "database": str(settings.database_path),
             "metadata_backend": settings.metadata_backend,
+            "storage_health": storage_health(),
         }
+
+    @app.get("/v1/readiness")
+    def readiness():
+        result = storage_health()
+        if not result["ready"]:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=503, content=result)
+        return result
 
     @app.post("/v1/tushare/realtime-quote")
     def tushare_realtime_quote(request: TushareRealtimeRequest):
