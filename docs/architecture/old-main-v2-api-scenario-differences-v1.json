@@ -1,0 +1,120 @@
+{
+  "differences": [
+    {
+      "bg011_action": "decide_compatibility_or_version",
+      "kind": "changed",
+      "legacy": "filesystem_path",
+      "path": "$.scenarios.health.semantic.database",
+      "reason": "known health.database semantic and response shape difference",
+      "v2": "postgresql_clickhouse_logical"
+    },
+    {
+      "bg011_action": "decide_compatibility_or_version",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.scenarios.health.shape.metadata_backend",
+      "reason": "known health.database semantic and response shape difference",
+      "v2": "string"
+    },
+    {
+      "bg011_action": "decide_compatibility_or_version",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.scenarios.health.shape.storage_health",
+      "reason": "known health.database semantic and response shape difference",
+      "v2": {
+        "backend": "string",
+        "candidate_since_monotonic": "null",
+        "candidate_status": "null",
+        "components": {
+          "authoritative_wal": {
+            "status": "string"
+          },
+          "canonical_scheduler": {
+            "status": "string"
+          },
+          "clickhouse_main": {
+            "logical_id": "string",
+            "status": "string"
+          },
+          "clickhouse_pressure": {
+            "disk_used_ratio": "number",
+            "merge_queue": "integer",
+            "status": "string"
+          },
+          "clickhouse_scheduler": {
+            "status": "string"
+          },
+          "postgresql": {
+            "logical_id": "string",
+            "status": "string"
+          }
+        },
+        "observed_at": "string",
+        "ready": "boolean",
+        "reasons": {
+          "items": null,
+          "type": "array"
+        },
+        "schema": "string",
+        "status": "string",
+        "thresholds": {
+          "canonical_failed_unavailable_items": "number",
+          "canonical_lag_degraded_seconds": "number",
+          "canonical_pending_degraded_items": "number",
+          "degrade_after_seconds": "number",
+          "disk_degraded_ratio": "number",
+          "disk_unavailable_ratio": "number",
+          "merge_degraded_items": "number",
+          "merge_unavailable_items": "number",
+          "recover_after_seconds": "number",
+          "unavailable_after_seconds": "number",
+          "wal_failed_degraded_items": "number",
+          "wal_lag_degraded_seconds": "number",
+          "wal_pending_degraded_items": "number",
+          "wal_quarantine_unavailable_items": "number"
+        },
+        "window": {
+          "kind": "string",
+          "process_local": "boolean"
+        }
+      }
+    },
+    {
+      "bg011_action": "decide_compatibility_or_version",
+      "kind": "v2_missing",
+      "legacy": "string",
+      "path": "$.scenarios.quotes_backend_failure.shape.errors.items.status",
+      "reason": "known batch error object difference",
+      "v2": null
+    },
+    {
+      "bg011_action": "decide_compatibility_or_version",
+      "kind": "v2_missing",
+      "legacy": "string",
+      "path": "$.scenarios.quotes_batch_error.shape.errors.items.status",
+      "reason": "known batch error object difference",
+      "v2": null
+    },
+    {
+      "bg011_action": "decide_compatibility_or_version",
+      "kind": "changed",
+      "legacy": false,
+      "path": "$.scenarios.quotes_default.semantic.refresh_seen",
+      "reason": "known quotes refresh default difference",
+      "v2": true
+    },
+    {
+      "bg011_action": "decide_compatibility_or_version",
+      "kind": "v2_missing",
+      "legacy": "string",
+      "path": "$.scenarios.quotes_empty.shape.errors.items.status",
+      "reason": "known batch error object difference",
+      "v2": null
+    }
+  ],
+  "legacy_sha256": "e85566627c4482315372ca7595c53fce58f52e2245bbd26070c3343b6e3d3994",
+  "schema": "marketcow.old-main-v2-api-differences.v1.scenarios",
+  "sha256": "9fe0254cf65474e0220a2d01de468154e7f211bfbd3fca760991ccf44202be25",
+  "v2_sha256": "f4ee9025281bd3be64c9c2d1729cfaabce116f6f3813078755216125a3d0c995"
+}

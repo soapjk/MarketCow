@@ -1,0 +1,774 @@
+{
+  "schema": "marketcow.old-main-v2-api-differences.v1",
+  "legacy_sha256": "a8559e75339089236e6439b018c4fc91f7f9a98ef0bef3b7ea501684faaa81d8",
+  "v2_sha256": "f94ecfbcc583f6529858f2c6427e66cc414fc706f550d369f06dc25a8e8a4833",
+  "differences": [
+    {
+      "path": "$.routes.GET /v1/quotes.parameters[0].schema.default",
+      "kind": "changed",
+      "legacy": false,
+      "v2": true,
+      "reason": "known quotes refresh default difference",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/cross-section",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "bar_at",
+            "required": true,
+            "schema": {
+              "title": "Bar At",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 5000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page Size"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbols"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "reason": "V2 additional bounded market-data read endpoint",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/cross-section/as-of",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "as_of",
+            "required": true,
+            "schema": {
+              "title": "As Of",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_lookback_seconds",
+            "required": false,
+            "schema": {
+              "default": 86400,
+              "maximum": 31536000,
+              "minimum": 1,
+              "title": "Max Lookback Seconds",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": true,
+            "schema": {
+              "title": "Symbols",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "reason": "V2 additional bounded market-data read endpoint",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/cross-section/matrix",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "bar_ats",
+            "required": true,
+            "schema": {
+              "title": "Bar Ats",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 5000,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": true,
+            "schema": {
+              "title": "Symbols",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "reason": "V2 additional bounded market-data read endpoint",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}.parameters[1].schema.default",
+      "kind": "changed",
+      "legacy": false,
+      "v2": true,
+      "reason": "known quotes refresh default difference",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/as-of",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "symbol",
+            "required": true,
+            "schema": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "as_of",
+            "required": true,
+            "schema": {
+              "title": "As Of",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_lookback_seconds",
+            "required": false,
+            "schema": {
+              "default": 86400,
+              "maximum": 31536000,
+              "minimum": 1,
+              "title": "Max Lookback Seconds",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "reason": "V2 additional bounded market-data read endpoint",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters.length",
+      "kind": "changed",
+      "legacy": 6,
+      "v2": 10,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].name",
+      "kind": "changed",
+      "legacy": "interval",
+      "v2": "cursor",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].schema.anyOf",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].schema.default",
+      "kind": "v2_missing",
+      "legacy": "1d",
+      "v2": null,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].schema.title",
+      "kind": "changed",
+      "legacy": "Interval",
+      "v2": "Cursor",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].schema.type",
+      "kind": "v2_missing",
+      "legacy": "string",
+      "v2": null,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].name",
+      "kind": "changed",
+      "legacy": "limit",
+      "v2": "end",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.anyOf",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.default",
+      "kind": "v2_missing",
+      "legacy": 500,
+      "v2": null,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.maximum",
+      "kind": "v2_missing",
+      "legacy": 5000,
+      "v2": null,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.minimum",
+      "kind": "v2_missing",
+      "legacy": 1,
+      "v2": null,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.title",
+      "kind": "changed",
+      "legacy": "Limit",
+      "v2": "End",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.type",
+      "kind": "v2_missing",
+      "legacy": "integer",
+      "v2": null,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[4].name",
+      "kind": "changed",
+      "legacy": "range",
+      "v2": "interval",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[4].schema.default",
+      "kind": "changed",
+      "legacy": "1y",
+      "v2": "1d",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[4].schema.title",
+      "kind": "changed",
+      "legacy": "Range",
+      "v2": "Interval",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].name",
+      "kind": "changed",
+      "legacy": "refresh",
+      "v2": "limit",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.default",
+      "kind": "changed",
+      "legacy": true,
+      "v2": 500,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.maximum",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": 5000,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.minimum",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": 1,
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.title",
+      "kind": "changed",
+      "legacy": "Refresh",
+      "v2": "Limit",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.type",
+      "kind": "changed",
+      "legacy": "boolean",
+      "v2": "integer",
+      "reason": "V2 history range and keyset pagination parameter extension",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/quotes/{symbol}/raw-history",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "symbol",
+            "required": true,
+            "schema": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "raw",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": true,
+            "schema": {
+              "title": "End",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 5000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page Size"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sources",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sources"
+            }
+          },
+          {
+            "in": "query",
+            "name": "start",
+            "required": true,
+            "schema": {
+              "title": "Start",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "reason": "V2 additional bounded market-data read endpoint",
+      "bg011_action": "decide_compatibility_or_version"
+    },
+    {
+      "path": "$.routes.GET /v1/readiness",
+      "kind": "v2_added",
+      "legacy": null,
+      "v2": {
+        "parameters": [],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "reason": "V2 readiness endpoint addition",
+      "bg011_action": "decide_compatibility_or_version"
+    }
+  ],
+  "sha256": "3fd82f10688b8694154cd4660941ba36fcad5747fd3fb071efe0862a21bb2e19"
+}

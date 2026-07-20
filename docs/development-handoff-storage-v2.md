@@ -1571,7 +1571,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：PG/CH 任一必要依赖不可用时 readiness 符合声明；无 `database_path`/DuckDB 指标；disabled 不伪 healthy。
 - **必要测试**：固定时钟、PG/CH 单独/联合故障、backlog、完整响应泄密扫描、并发 snapshot。
 - **排除项**：外部监控和 production 健康探测。
-- **状态**：`本地实现完成，待独立验收`。新增 `marketcow.v2.health.v1` 双库依赖快照与固定阈值状态机；
+- **状态**：`已验收`（Artifacts `bba6f7e` + `6ae6ae1`）。新增 `marketcow.v2.health.v1` 双库依赖快照与固定阈值状态机；
   PostgreSQL、main ClickHouse、authoritative WAL/spool 及启用时的独立 scheduler ClickHouse/worker/queue
   均使用有界逻辑标识和原因。必要 PG/main CH/WAL probe 故障立即 fail-closed，压力、backlog 与 lag 使用持续窗口，
   恢复使用 60 秒滞回；disabled scheduler 明确报告 disabled 而不伪装 active healthy。V2 health/readiness 和
@@ -1587,7 +1587,14 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：逐端点清单完整；明确 quotes refresh 默认、批量错误对象、health.database 三项已知差异。
 - **必要测试**：main 合成服务 contract snapshot、路由覆盖率、schema 版本与变更检测。
 - **排除项**：访问 8790 真实数据、修改 main、决定兼容策略。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。以旧 main `701ffbd` 的隔离 development app 与确定性 fake
+  service 生成版本化、checksum 绑定的 32-route OpenAPI contract 和 7-scenario response contract；当前 V2
+  捕获 38 routes。`api_compat_gate` 对 method/path、参数位置/required/default/constraints、request body、声明
+  response，以及正常、空、参数错误、backend fault 的 HTTP status/必需字段/type/错误 shape 做精确树路径比较。
+  两份差异 ledger 共记录 route/schema 差异和 scenario 差异，每个 path 唯一并具备 exact old/new value、reason
+  与 `bg011_action=decide_compatibility_or_version`；任何新增、消失、改值或未观测条目均使 gate 失败，不使用字段名
+  递归白名单。已知 quotes refresh 默认、batch error object、health.database 语义均由真实 scenario 精确记录；
+  readiness、新增 market-data 端点和 history pagination 参数等本轮发现项也逐项归入 BG-011。本项不改变 API。
 
 ### `BG-011`：API 兼容决策与 V2 修订
 
