@@ -91,7 +91,40 @@ class FailingClickHouseRepository:
         raise ConnectionError("clickhouse unavailable")
 
 
+class FakeCanonicalBuilder:
+    def __init__(self):
+        self.calls = []
+        self.last_diagnostics = {"status": "not_run"}
+
+    def rebuild(self, *args):
+        self.calls.append(args)
+        return {"status": "ok", "written": 1, "spooled": 0, "truncated": False}
+
+
 class ShadowMarketBarRepositoryTest(unittest.TestCase):
+    def test_auto_canonical_only_after_success_and_raw_replay(self):
+        primary, writer, builder = FakePrimary(), CapturingWriter(), FakeCanonicalBuilder()
+        writer.on_raw_replayed = None
+        adapter = ShadowMarketBarRepository(
+            primary, writer, builder, auto_canonical_enabled=True,
+            auto_canonical_limit=123,
+        )
+        adapter.upsert_price_bars(
+            "MU", "1m", "raw", "fixture", "2026-07-20T01:00:02Z", bars()
+        )
+        self.assertEqual(builder.calls[0], (
+            "MU", "1m", "raw", "1970-01-01T00:00:01.000+00:00",
+            "1970-01-01T00:00:01.000+00:00", 123,
+        ))
+        writer.result = {"rows": 1, "written": 0, "spooled": 1, "batches": 1}
+        adapter.upsert_price_bars(
+            "MU", "1m", "raw", "fixture", "2026-07-20T01:00:03Z", bars()
+        )
+        self.assertEqual(len(builder.calls), 1)
+        writer.on_raw_replayed([adapter._raw_rows(
+            "MU", "1m", "raw", "fixture", "2026-07-20T01:00:03Z", bars(), {}
+        )[0]])
+        self.assertEqual(len(builder.calls), 2)
     def test_primary_first_mapping_and_reads_remain_primary(self):
         primary, writer = FakePrimary(), CapturingWriter()
         adapter = ShadowMarketBarRepository(primary, writer)

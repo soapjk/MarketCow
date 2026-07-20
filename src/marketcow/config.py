@@ -41,6 +41,8 @@ class Settings:
     clickhouse_canonical_abs_tol: float = 1e-9
     market_bar_read_backend: str = "duckdb"
     raw_market_bar_read_backend: str = "duckdb"
+    clickhouse_auto_canonical: bool = False
+    clickhouse_auto_canonical_limit: int = 50000
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -117,9 +119,22 @@ class Settings:
             raw_market_bar_read_backend=os.getenv(
                 "MARKETCOW_RAW_MARKET_BAR_READ_BACKEND", "duckdb"
             ).strip().lower(),
+            clickhouse_auto_canonical=os.getenv(
+                "MARKETCOW_CLICKHOUSE_AUTO_CANONICAL", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
+            clickhouse_auto_canonical_limit=int(os.getenv(
+                "MARKETCOW_CLICKHOUSE_AUTO_CANONICAL_LIMIT", "50000"
+            )),
         )
 
     def validate_runtime_isolation(self) -> None:
+        if not 1 <= self.clickhouse_auto_canonical_limit <= 100000:
+            raise ValueError("automatic canonical limit must be between 1 and 100000")
+        if self.clickhouse_auto_canonical:
+            if self.profile != "development":
+                raise ValueError("automatic canonical rebuild is development-only")
+            if not self.clickhouse_enabled:
+                raise ValueError("automatic canonical rebuild requires MARKETCOW_CLICKHOUSE_ENABLED")
         if self.market_bar_read_backend not in {"duckdb", "clickhouse_canonical"}:
             raise ValueError(
                 "MARKETCOW_MARKET_BAR_READ_BACKEND must be duckdb or clickhouse_canonical"

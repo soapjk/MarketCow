@@ -191,6 +191,8 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
                 warehouse, writer, canonical,
                 settings.market_bar_read_backend == "clickhouse_canonical",
                 settings.raw_market_bar_read_backend == "clickhouse_raw",
+                settings.clickhouse_auto_canonical,
+                settings.clickhouse_auto_canonical_limit,
             )
     except Exception:
         RepositoryResources(resources).close()

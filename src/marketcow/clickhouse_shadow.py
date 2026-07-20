@@ -22,12 +22,19 @@ class ShadowMarketBarRepository:
     def __init__(self, primary: Any, writer: ReliableClickHouseWriter,
                  canonical_builder: Any = None,
                  canonical_reads_enabled: bool = False,
-                 raw_reads_enabled: bool = False) -> None:
+                 raw_reads_enabled: bool = False,
+                 auto_canonical_enabled: bool = False,
+                 auto_canonical_limit: int = 50000) -> None:
         self.primary = primary
         self.writer = writer
         self.canonical_builder = canonical_builder
         self.canonical_reads_enabled = canonical_reads_enabled
         self.raw_reads_enabled = raw_reads_enabled
+        self.auto_canonical_enabled = auto_canonical_enabled
+        self.auto_canonical_limit = auto_canonical_limit
+        self._last_auto_canonical: Dict[str, Any] = {"status": "disabled"}
+        if auto_canonical_enabled:
+            self.writer.on_raw_replayed = self._auto_rebuild_rows
         self._last_batch: Optional[Dict[str, Any]] = None
         self._last_shadow: Dict[str, Any] = {"status": "idle"}
         self._last_reconciliation: Dict[str, Any] = {"status": "not_run"}
@@ -213,6 +220,8 @@ class ShadowMarketBarRepository:
             }
             self._last_shadow = {"status": "ok" if not result["spooled"] else "spooled",
                                  **result}
+            if self.auto_canonical_enabled and not result["spooled"]:
+                self._auto_rebuild_rows(rows)
         except Exception as error:
             self._last_shadow = {"status": "error", "error": str(error)[:4000]}
         return count
@@ -302,7 +311,7 @@ class ShadowMarketBarRepository:
 
     def diagnostics(self) -> Dict[str, Any]:
         return {"shadow": self._last_shadow, "reconciliation": self._last_reconciliation,
-                "read": self._last_read,
+                "read": self._last_read, "auto_canonical": self._last_auto_canonical,
                 "canonical": (self.canonical_builder.last_diagnostics
                               if self.canonical_builder else {"status": "disabled"}),
                 "spool": self.writer.spool.diagnostics()}
@@ -316,3 +325,20 @@ class ShadowMarketBarRepository:
         return self.canonical_builder.rebuild(
             symbol, interval, adjustment, start, end, limit
         )
+
+    def _auto_rebuild_rows(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows or self.canonical_builder is None:
+            return
+        groups: Dict[tuple[str, str, str], List[str]] = {}
+        for row in rows:
+            groups.setdefault((row["symbol"], row["interval"], row["adjustment"]), []).append(row["bar_time"])
+        results = []
+        for (symbol, interval, adjustment), times in groups.items():
+            results.append(self.canonical_builder.rebuild(
+                symbol, interval, adjustment, min(times), max(times),
+                self.auto_canonical_limit,
+            ))
+        self._last_auto_canonical = {
+            "status": "ok" if all(r.get("status") == "ok" for r in results) else "fail_open",
+            "groups": len(results), "results": results[:100],
+        }

@@ -9,6 +9,14 @@ from marketcow.config import Settings
 
 
 class SettingsTest(unittest.TestCase):
+    def test_auto_canonical_is_explicit_development_only(self):
+        root = Path("/tmp/marketcow-auto/data-development")
+        base = dict(database_path=root / "db", raw_path=root / "raw",
+                    clickhouse_auto_canonical=True)
+        with self.assertRaisesRegex(ValueError, "development-only"):
+            Settings(**base, clickhouse_enabled=True).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "CLICKHOUSE_ENABLED"):
+            Settings(**base, profile="development", port=8791).validate_runtime_isolation()
     def test_defaults_runtime_data_to_current_directory(self):
         with tempfile.TemporaryDirectory() as folder:
             with patch.dict(os.environ, {}, clear=True), patch("pathlib.Path.cwd", return_value=Path(folder)):

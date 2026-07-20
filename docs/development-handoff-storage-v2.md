@@ -116,6 +116,11 @@ DuckDB
   以同一查询回退 DuckDB，并记录 raw_multisource/backend/fallback/count/truncated/error。
 - 只读 API `GET /v1/quotes/{symbol}/raw-history` 返回规范化范围、全部 provenance、count、
   bars、cached=true 和 truncated；不触发 refresh 或写入，语义参数错误返回 400。
+- automatic canonical 衔接默认关闭，仅 development 可通过
+  `MARKETCOW_CLICKHOUSE_AUTO_CANONICAL=true` 显式启用。raw shadow 成功后按当前批次精确
+  min/max 闭区间同步执行有界 rebuild；raw 仅落 spool 时不执行，只有该 raw 项成功 replay
+  后才执行。canonical spool 不触发回调；所有截断、写入失败和异常均 fail-open，并在
+  `auto_canonical` diagnostics 中有界记录，不改变 DuckDB primary 返回。
 
 ## 二、仓库、分支和 worktree
 

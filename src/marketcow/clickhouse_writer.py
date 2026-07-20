@@ -6,7 +6,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from .clickhouse_repositories import ClickHouseMarketBarRepository
 from .bar_version import raw_content_rank, raw_content_version
@@ -176,6 +176,7 @@ class ReliableClickHouseWriter:
         self.repository = repository
         self.spool = spool
         self.batch_size = batch_size
+        self.on_raw_replayed: Optional[Callable[[List[Dict[str, Any]]], None]] = None
 
     @staticmethod
     def _chunks(rows: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
@@ -220,4 +221,9 @@ class ReliableClickHouseWriter:
             else:
                 self.spool.mark_replayed(path, payload)
                 outcome["replayed"] += 1
+                if payload["dataset"] == "raw" and self.on_raw_replayed:
+                    try:
+                        self.on_raw_replayed(payload["rows"])
+                    except Exception:
+                        pass
         return outcome

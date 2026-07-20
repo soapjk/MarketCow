@@ -348,7 +348,13 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             writer = ReliableClickHouseWriter(
                 self.repository, LocalClickHouseSpool(root / "spool", root), 1000
             )
-            adapter = ShadowMarketBarRepository(warehouse, writer)
+            canonical = CanonicalMarketBarBuilder(
+                self.repository, writer, ("shadow_fixture",)
+            )
+            adapter = ShadowMarketBarRepository(
+                warehouse, writer, canonical,
+                auto_canonical_enabled=True, auto_canonical_limit=100,
+            )
             fixture_bars = [{
                 "timestamp": 100, "bar_at": "1970-01-01T00:01:40Z",
                 "open": 20, "high": 22, "low": 19, "close": 21,
@@ -374,6 +380,7 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                 self.database.client = original
             self.assertEqual(adapter.diagnostics()["shadow"]["status"], "spooled")
             self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
+            self.assertEqual(adapter.diagnostics()["auto_canonical"]["status"], "ok")
             reconciliation = adapter.reconcile_last_write()
             self.assertEqual(reconciliation["status"], "consistent", reconciliation)
 
