@@ -1616,7 +1616,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：旧与 V2 golden gate 对方法、默认值、HTTP 状态、必需字段、类型和错误结构逐项通过；允许差异路径受限。
 - **必要测试**：双应用合成 golden、负向 schema、refresh 零/有上游副作用、完整 API snapshot。
 - **排除项**：真实 production 请求和消费者切换。
-- **状态**：`本地实现完成，待独立验收`。旧 main 已有 quotes 单条/批量 `refresh` 默认恢复为 `false`：省略参数只读
+- **状态**：`已验收`（Artifact `0a85013`）。旧 main 已有 quotes 单条/批量 `refresh` 默认恢复为 `false`：省略参数只读
   cache，不触发上游刷新；显式 `refresh=true` 才调用 refresh，专项测试对两条路由分别验证零/有副作用。批量 cache
   miss 与 refresh failure 恢复 legacy `status=unavailable` error object；单条 backend failure 恢复 legacy 503 与
   `{symbol,status,error}` detail。参数比较改为按 `(in,name)` 稳定键，history 的 cursor/start/end/page_size 仅作为可选
@@ -1637,7 +1637,17 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：导入器不能被 API 工厂导入；只接受副本路径；拒绝 production 原路径、symlink、写模式和未知 schema。
 - **必要测试**：import graph、只读/路径 trap、schema migration fixtures、恶意文件、CLI 零在线副作用。
 - **排除项**：复制真实 production 数据或执行正式导入。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增独立 console entrypoint `marketcow-offline-duckdb` 与
+  `marketcow.offline_duckdb_import` package；该模块被依赖策略登记为 offline-only，online entrypoint 的传递
+  import closure 触达即失败。CLI 只接受显式绝对 `allowed_root`、`development-copy`/`test-fixture` 标识和其下
+  无 symlink 的普通文件；路径或任一组件含 `prod`/`production`/`live`、containment 逃逸、损坏文件均以稳定
+  脱敏 code 拒绝。打开固定使用 DuckDB `read_only=True`、单线程和显式 memory limit，验证引擎 major 1、精确
+  migration 集合 `2/3/4`、19 个固定业务表加 `schema_migrations`，未知/缺失表或 migration fail-closed。
+  validation 绑定文件 SHA-256、大小、migration、逐表行数形成稳定 source fingerprint；读取前后 inode/size/mtime
+  必须不变。文件、总行数、单批行数、内存与 elapsed time 均有硬上限；抽取仅允许固定表白名单并分批返回，
+  不接 PostgreSQL/ClickHouse、不创建 spool/线程/目录。专项覆盖 fixture 字节与 mtime 不变、symlink/path/
+  production trap、未知 migration/额外恶意表/损坏文件、row/batch/memory/time 边界、SQL table 注入拒绝、CLI
+  机器错误脱敏，以及在 PG/CH/V2 factory/API/Service import trap 下运行且零 `MARKETCOW_HOME` 副作用。
 
 ### `BG-013`：合成 DuckDB 副本全量导入 PG/CH
 

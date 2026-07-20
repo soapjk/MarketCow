@@ -16,6 +16,7 @@
   ],
   "offline_only_modules": [
     "marketcow.cold_archive",
+    "marketcow.offline_duckdb_import",
     "marketcow.local_backfill",
     "marketcow.local_benchmark",
     "marketcow.local_restore"

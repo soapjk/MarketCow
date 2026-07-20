@@ -42,6 +42,7 @@ dev = [
 
 [project.scripts]
 marketcow = "marketcow.__main__:main"
+marketcow-offline-duckdb = "marketcow.offline_duckdb_import:main"
 
 [project.urls]
 Homepage = "https://github.com/soapjk/MarketCow"
