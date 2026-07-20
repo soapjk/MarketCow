@@ -211,7 +211,7 @@ class ProductionReadinessPackage:
                   and value.get("final_backend") == "duckdb" and value.get("canonical") == "duckdb"
                   and value.get("raw") == "duckdb" and checkpoint.get("phase") == "rolled_back"
                   and checkpoint.get("binding") == value.get("binding") and
-                  any(event.get("event") == "rollback" for event in value.get("events", [])))
+                  any(event.get("name") == "rollback" for event in value.get("events", [])))
             facts = {"final_backend": value.get("final_backend"),
                      "phase": checkpoint.get("phase"), "events": len(value.get("events", [])),
                      "checkpoint_sha256": _hash(companion.read_bytes())}

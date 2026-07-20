@@ -83,7 +83,7 @@ class ProductionReadinessPackageTest(unittest.TestCase):
         switch_checkpoint = {
             "version": SWITCH_VERSION, "binding": {"fixture": "bound"},
             "phase": "rolled_back", "canonical": "duckdb", "raw": "duckdb",
-            "events": [{"event": "rollback"}], "stop_reason": "fixture",
+            "events": [{"name": "rollback"}], "stop_reason": "fixture",
         }
         LocalReadSwitchDrill._sign(switch_checkpoint)
         plan = BenchmarkPlan(10, 20, 240, 2, 3, max_peak_memory_mb=8192)
@@ -139,7 +139,7 @@ class ProductionReadinessPackageTest(unittest.TestCase):
                          "domains": [{"domain": name, "status": "ok"} for name in domain_names]},
             "SV2-022B": {"version": SWITCH_VERSION, "status": "rolled_back",
                          "final_backend": "duckdb", "canonical": "duckdb", "raw": "duckdb",
-                         "binding": {"fixture": "bound"}, "events": [{"event": "rollback"}]},
+                         "binding": {"fixture": "bound"}, "events": [{"name": "rollback"}]},
             "SV2-023": benchmark,
         }
         commits = {"SV2-021A": "25f833f", "SV2-021B": "8b6aa74", "SV2-022A": "6b44732",
