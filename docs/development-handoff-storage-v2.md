@@ -40,20 +40,23 @@ DuckDB
   这些已迁移的基本面数据域；
 - PostgreSQL 目前只允许 development profile 显式启用，schema 必须以
   `_development` 或 `_test` 结尾；
-- 开发 profile 的 Stage 1 基本面关系数据可由 PostgreSQL 承担；行情仍由 DuckDB
-  承担，未连接或迁移正式 PostgreSQL。
+- 开发 profile 的 Stage 1 基本面关系数据可由 PostgreSQL 承担；DuckDB 仍是行情主写
+  和默认读取 backend，只有 development 显式 opt-in 时，历史 `get_price_bars` 才读取
+  ClickHouse canonical。未连接或迁移正式 PostgreSQL/ClickHouse。
 - ClickHouse development/test 存储基础已建立：默认关闭且只允许显式连接本机回环
   地址及 `_development`/`_test` database；包含客户端生命周期、幂等 migration、
   健康诊断，以及 `market_bar_raw`/`market_bar_canonical` 基础表；
 - 已实现独立的可靠影子写入原语：1000～50000 行可配置微批、字段和 UTC 时间
   规范化、稳定批次 ID、development 本地原子 WAL、显式有界重放与诊断。该 writer
-  已用于 development raw 影子双写和显式 canonical 重建，但未改变 DuckDB 主写/读取。
+  已用于 development raw 影子双写和显式 canonical 重建；DuckDB 主写不变，读取仅有
+  development opt-in 的 canonical history 例外。
 - WAL 隔离采用显式 development storage root 允许边界：配置层要求 root 名称明确包含
   development/test 且 spool resolve 后位于其中；`LocalClickHouseSpool` 构造层再次要求
   显式 allowed root 并在创建目录前校验。兄弟正式目录、`..` 穿越及 symlink 逃逸均拒绝。
 - development 且显式启用 ClickHouse 时，`ShadowMarketBarRepository` 已接入 raw 行情
-  影子双写：DuckDB 必须先成功，shadow 失败只落 spool 并保持 primary 成功；quotes 与
-  所有读取仍直接委托 DuckDB。disabled 时不连接 ClickHouse、不创建 spool。
+  影子双写：DuckDB 必须先成功，shadow 失败只落 spool 并保持 primary 成功；quotes
+  始终委托 DuckDB。默认 history 也委托 DuckDB，只有额外显式启用 canonical read backend
+  时才读取 ClickHouse 并在失败时回退 DuckDB。disabled 时不连接 ClickHouse、不创建 spool。
 - 提供最后一个有界 raw 批次的显式只读对账：按业务键比较 DuckDB 与 ClickHouse
   `FINAL` 的行数、时间边界、OHLCVA、source 和 ingestion lag，结构化输出有限数量的
   mismatch；对账错误不会写数据或阻断主路径。
@@ -95,10 +98,10 @@ https://github.com/soapjk/MarketCow
 ### 正式工作区
 
 ```text
-路径：/Volumes/T9/projects/market-data-service
+路径：/Volumes/T9/projects/marketcow
 分支：main
-提交：71f5b26
-远端：origin/main 已包含 71f5b26
+提交：739e2d8
+远端：本文不声明当前同步状态；任何 push 前须重新只读核验
 用途：正式服务，只维护稳定版本
 ```
 
@@ -126,15 +129,15 @@ cd /Volumes/T9/projects/marketcow-storage-v2
 
 ```text
 地址：http://127.0.0.1:8790
-数据：/Volumes/T9/projects/market-data-service/data/
+数据：/Volumes/T9/projects/marketcow/data/
 数据库：data/warehouse/market_data.duckdb
-tmux session：marketcow-local
-工作区：market-data-service
+服务管理：launchd（com.marketcow.production）
+工作区：marketcow
 ```
 
-正式服务正在被 `epaper-dashboard` 使用。禁止为开发测试执行以下操作：
+正式服务正在被 Investrace 等本机消费者使用。禁止为开发测试执行以下操作：
 
-- 停止或重启 `marketcow-local`；
+- 停止或重启 `com.marketcow.production`；
 - 占用 8790；
 - 修改或删除正式 `data/`；
 - 对正式 DuckDB 执行 schema 实验；
@@ -148,16 +151,16 @@ tmux session：marketcow-local
 数据：/Volumes/T9/projects/marketcow-storage-v2/data-development/
 数据库：data-development/warehouse/market_data.duckdb
 日志：logs-development/marketcow.log
-tmux session：marketcow-development
+服务管理：本文不声明当前存在常驻 development 服务
 工作区：marketcow-storage-v2
 ```
 
-开发服务启动命令：
+如需临时启动开发服务，可使用独立的 development profile；本文不声明当前存在持久运行的
+development 服务或 tmux session：
 
 ```bash
-tmux kill-session -t marketcow-development 2>/dev/null || true
-tmux new-session -d -s marketcow-development \
-  'cd /Volumes/T9/projects/marketcow-storage-v2 && exec .venv/bin/marketcow --profile development start >> logs-development/marketcow.log 2>&1'
+cd /Volumes/T9/projects/marketcow-storage-v2
+.venv/bin/marketcow --profile development start
 ```
 
 检查两个环境：
@@ -271,7 +274,7 @@ adjustment=raw
 ```text
 /v1/quotes/600519.SH：HTTP 200，约 0.24～0.40 秒
 /v1/snapshot?limit=10：HTTP 200，约 0.025～0.027 秒
-完整测试：47/47 通过（加入环境隔离测试后当前为 51 个）
+当时完整测试：47/47 通过（随后环境隔离阶段曾增长到 51 项；最新数量见第十一节）
 ```
 
 ## 六、已确定的数据库决策
@@ -374,7 +377,7 @@ ArtifactStore
 - 为 PostgreSQL/ClickHouse 实现建立稳定契约；
 - 明确幂等键、版本、来源和错误语义。
 
-这是新会话首先应该实施的开发任务。
+本步骤已经完成；新会话不得重复实施，应以长期协作任务的最新检查点指令为准。
 
 ### 第 2 步：开发环境基础设施
 
@@ -408,11 +411,7 @@ fundamental / statements / PIT history
 
 ### 第 4 步：ClickHouse 影子写入
 
-ClickHouse development/test 存储基础与 schema 边界已经完成。当前仅具备显式启用的
-客户端、幂等初始化、健康诊断和基础 round-trip。独立 writer/WAL 原语与 development
-raw 影子双写、显式对账均已完成；canonical 和查询切换尚未开始。
-
-下一步仍是影子写入本身：
+本步骤的 development 范围已经完成：
 
 - 已建立 `market_bar_raw`；
 - 已建立 `market_bar_canonical`；
@@ -420,7 +419,11 @@ raw 影子双写、显式对账均已完成；canonical 和查询切换尚未开
 - 已实现写入失败进入 development 本地 WAL/spool；
 - 已实现显式重放、稳定幂等标识和有界延迟诊断；
 - 已完成 development raw 的 DuckDB-primary/ClickHouse-shadow 双写，并可显式对比
-  行数、OHLCVA、时间边界、来源和 lag。
+  行数、OHLCVA、时间边界、来源和 lag；
+- 已实现确定性 canonical 来源选择、质量分类、稳定/单调 version 与显式有界范围重建；
+- canonical 写入复用可靠 writer，失败进入同一 development spool 并可重放；
+- 已实现 development opt-in canonical history 读取与 DuckDB 故障回退，但默认读取和
+  所有主写仍为 DuckDB。
 
 注意：普通 `ReplacingMergeTree` 允许物理重复行，逻辑读取必须使用合并后语义（例如
 `FINAL`）；稳定 `insert_deduplication_token` 同时为未来 ReplicatedMergeTree 保留批次
@@ -429,9 +432,13 @@ raw 影子双写、显式对账均已完成；canonical 和查询切换尚未开
 
 ### 第 5 步：查询切换
 
-- 先让 development 的 history 查询读取 ClickHouse；
-- 保留 backend 开关和 DuckDB 回滚路径；
-- 完成历史范围、横截面、多来源和缓存契约测试；
+- 已完成第一段：development 可显式让现有 `get_price_bars` 从 ClickHouse canonical
+  读取最近 N 条，保留 backend 开关、DuckDB 默认值与失败回退路径；production 拒绝启用；
+- 尚未完成任意起止时间的历史范围查询契约与规模验证；
+- 尚未完成全市场横截面查询、多来源 raw 查询及其 API/Repository 契约；
+- 尚未完成缓存命中、失效、新鲜度和 ClickHouse/DuckDB 回退一致性契约测试；
+- 尚未实现自动或后台 canonical 调度；当前只能显式、有界重建；
+- 尚未对正式读取进行连接、迁移或切换；
 - 未经用户明确批准，不切换 8790 正式服务。
 
 ### 第 6 步：冷热分层
@@ -496,7 +503,7 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 - 8790 不被停止、重启或修改；
 - development 只写独立存储；
-- 现有 51 个测试继续通过；
+- 现有默认测试继续通过（检查点 6 为 90 项）；
 - 新 backend 有单元测试和显式集成测试；
 - 上游失败仍有界，不占满服务线程；
 - 双写失败不能阻断现有 DuckDB 主路径，除非测试明确验证 fail-closed；
@@ -508,17 +515,19 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 最近一次 Storage V2 检查：
 
 ```text
-feature/storage-v2 已验证基线：dc98841；本检查点为其上的 canonical 历史读取改动
+feature/storage-v2 检查点 6 实现提交：dfdf9a4
 默认测试：发现 90 项且整体通过；7 项 PostgreSQL、6 项 ClickHouse 集成测试因未
 显式配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
 ClickHouse 测试：8 项通过（2 项隔离边界测试、6 项使用一次性 ClickHouse 25.8
 本地容器的集成测试；容器测试后停止并删除）
 本检查点已完成 development opt-in canonical history 读取与 DuckDB 回退；默认仍为
-DuckDB。其他查询切换、自动 canonical 调度及后续阶段尚未开始，必须等待验收方指定。
+DuckDB。任意历史范围、横截面、多来源 raw、缓存契约、自动 canonical 调度及后续阶段
+尚未完成，必须等待验收方指定。
 ```
 
-正式服务的当前进程是在加入 health `profile` 字段前启动的，因此它的 health 响应可能暂时没有 `profile`；这不代表配置错误。不要仅为补这个字段重启正式服务。
+正式服务由 `com.marketcow.production` 管理；最近已验证 health 包含
+`profile=production` 和相对 database 路径。Storage V2 文档核验不得为此停止或重启正式服务。
 
 ## 十二、新会话建议的第一条指令
 
@@ -527,6 +536,8 @@ DuckDB。其他查询切换、自动 canonical 调度及后续阶段尚未开始
 ```text
 请先完整阅读 docs/development-handoff-storage-v2.md、ADR-001、ADR-002 和 AGENTS.md。
 只在 /Volumes/T9/projects/marketcow-storage-v2 的 feature/storage-v2 分支工作，
-不要影响 127.0.0.1:8790 正式服务。先实现 Storage Repository 接口隔离及 DuckDB backend，
-保持现有 API 契约和全部测试通过；暂时不要连接或迁移正式 PostgreSQL/ClickHouse，也不要远程推送。
+不要影响 127.0.0.1:8790 正式服务。先核对 feature/storage-v2 当前 HEAD、本文的已完成
+检查点和长期协作任务的最新指令；不要重复实现已完成的 Repository/PostgreSQL/ClickHouse
+步骤。只执行验收方指定的下一单步，保持现有 API 契约和全部测试通过；不要连接或迁移
+正式 PostgreSQL/ClickHouse，也不要远程推送。
 ```
