@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from marketcow.local_benchmark import BenchmarkPlan
 from marketcow.v2_benchmark import (
@@ -74,22 +75,24 @@ class V2BenchmarkTest(unittest.TestCase):
         return operations
 
     def benchmark(self, **changes):
+        values = dict(
+            root=self.root, plan=self.plan, operations=self.operations(),
+            verifiers=self.verifiers(), methods=V2_METHODS, profile="v2-test",
+            allowed_root=self.allowed,
+            component_versions={"postgresql": "16", "clickhouse": "25.8"},
+            clock=Clock(),
+        )
+        values.update(changes)
+        return V2LocalBenchmark(V2BenchmarkInputs(**values))
+
+    def verifiers(self):
         def verifier(name):
             return lambda _run, result: {
                 "source": "independent_target_read",
                 "expected_rows": result["rows"], "actual_rows": result["rows"],
                 "expected_checksum": name, "actual_checksum": name,
             }
-
-        values = dict(
-            root=self.root, plan=self.plan, operations=self.operations(),
-            verifiers={name: verifier(name) for name in V2_OPERATIONS},
-            methods=V2_METHODS, profile="v2-test", allowed_root=self.allowed,
-            component_versions={"postgresql": "16", "clickhouse": "25.8"},
-            clock=Clock(),
-        )
-        values.update(changes)
-        return V2LocalBenchmark(V2BenchmarkInputs(**values))
+        return {name: verifier(name) for name in V2_OPERATIONS}
 
     def test_complete_pg_ch_report_and_capacity_gate(self):
         report = self.benchmark().run()
@@ -157,6 +160,70 @@ class V2BenchmarkTest(unittest.TestCase):
         operations["page_deep"] = lambda _run: deep
         with self.assertRaisesRegex(RuntimeError, "no-OFFSET"):
             self.benchmark(operations=operations).run()
+
+    def test_prior_pass_is_overwritten_for_every_failure_boundary(self):
+        benchmark = self.benchmark()
+        benchmark.run()
+        verifiers = self.verifiers()
+        verifiers["raw_write"] = lambda _run, result: {
+            "source": "independent_target_read",
+            "expected_rows": result["rows"], "actual_rows": result["rows"],
+            "expected_checksum": "expected", "actual_checksum": "wrong",
+        }
+        with self.assertRaisesRegex(RuntimeError, "target verification mismatch"):
+            self.benchmark(verifiers=verifiers).run()
+        failed = json.loads(benchmark.report_path.read_text())
+        self.assertEqual((failed["version"], failed["status"]),
+                         (V2_BENCHMARK_VERSION, "failed"))
+        self.assertNotIn("observations", failed)
+        self.assertNotIn("checks", failed)
+
+        self.benchmark().run()
+        operations = self.operations()
+        operations["raw_write"] = lambda _run: (_ for _ in ()).throw(
+            RuntimeError("operation failed")
+        )
+        with self.assertRaisesRegex(RuntimeError, "operation failed"):
+            self.benchmark(operations=operations).run()
+        self.assertEqual(json.loads(benchmark.report_path.read_text())["status"], "failed")
+
+        self.benchmark().run()
+        operations = self.operations()
+        slow = operations["merge_probe"](0)
+        slow.update(total_bytes=100, free_bytes=1, merge_backlog=1000)
+        operations["merge_probe"] = lambda _run: slow
+        with self.assertRaisesRegex(RuntimeError, "SLO failed"):
+            self.benchmark(operations=operations).run()
+        self.assertEqual(json.loads(benchmark.report_path.read_text())["status"], "failed")
+
+    def test_publication_failure_removes_prior_pass_or_writes_failed_terminal(self):
+        benchmark = self.benchmark()
+        benchmark.run()
+        from marketcow import v2_benchmark
+
+        original = v2_benchmark._atomic_json
+        calls = {"count": 0}
+
+        def fail_final_once(path, value):
+            calls["count"] += 1
+            # Base uses its own publisher; final V2 publication fails, terminal succeeds.
+            if calls["count"] == 1:
+                raise OSError("publication denied")
+            return original(path, value)
+
+        with patch.object(v2_benchmark, "_atomic_json", side_effect=fail_final_once):
+            with self.assertRaisesRegex(RuntimeError, "publication denied"):
+                self.benchmark().run()
+        terminal = json.loads(benchmark.report_path.read_text())
+        self.assertEqual((terminal["version"], terminal["status"]),
+                         (V2_BENCHMARK_VERSION, "failed"))
+        self.assertNotIn("observations", terminal)
+
+        self.benchmark().run()
+        with patch.object(v2_benchmark, "_atomic_json", side_effect=OSError("disk gone")):
+            with self.assertRaisesRegex(RuntimeError, "terminal publication failed"):
+                self.benchmark().run()
+        self.assertFalse(benchmark.report_path.exists())
 
 
 if __name__ == "__main__":

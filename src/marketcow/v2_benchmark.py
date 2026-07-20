@@ -9,6 +9,7 @@ from .local_backup import _assert_no_sensitive
 from .local_benchmark import (
     OPERATIONS, BenchmarkInputs, BenchmarkPlan, LocalStorageBenchmark, _atomic_json,
 )
+from .telemetry import sanitize_text
 
 
 V2_BENCHMARK_VERSION = "storage-v2.pg-ch-benchmark.v1"
@@ -121,45 +122,59 @@ class V2LocalBenchmark:
         }
 
     def run(self) -> dict[str, Any]:
-        report = self.base.run()
         try:
+            report = self.base.run()
             pg = self._extra("postgres_transaction")
             soak = self._extra("short_soak")
-        except Exception:
-            _atomic_json(self.report_path, {
+            checks = dict(report["checks"])
+            checks.update({
+                "postgres_transaction_throughput": pg["rows_per_second"] >=
+                self.EXTRA_SLO["postgres_transaction_rows_per_second_min"],
+                "short_soak_iterations": soak["iterations"] >=
+                self.EXTRA_SLO["short_soak_iterations_min"],
+                "short_soak_reconcile": soak["mismatches"] <=
+                self.EXTRA_SLO["short_soak_mismatch_max"],
+                "pure_pg_ch_runtime": True,
+            })
+            report.update({
+                "version": V2_BENCHMARK_VERSION,
+                "status": "passed" if all(checks.values()) else "failed",
+                "runtime": "postgresql_clickhouse_online",
+                "methods": dict(V2_METHODS),
+                "slo": {**report["slo"], **self.EXTRA_SLO},
+                "checks": checks,
+            })
+            report["observations"].update({
+                "postgres_transaction": pg, "short_soak": soak,
+            })
+            _assert_no_sensitive(report, "V2 benchmark report")
+            if report["status"] != "passed":
+                failed = ",".join(sorted(key for key, ok in checks.items() if not ok))
+                raise RuntimeError("V2 benchmark SLO failed: " + failed)
+            _atomic_json(self.report_path, report)
+            if json.loads(self.report_path.read_text(encoding="utf-8")) != report:
+                raise RuntimeError("V2 benchmark report publication mismatch")
+            return report
+        except Exception as error:
+            message = sanitize_text(error)
+            terminal = {
                 "version": V2_BENCHMARK_VERSION, "status": "failed",
                 "runtime": "postgresql_clickhouse_online",
-                "failure": "independent_target_verification_failed",
+                "failure": "benchmark_execution_failed",
+                "reason": message,
                 "methods": dict(V2_METHODS),
-            })
-            raise
-        checks = dict(report["checks"])
-        checks.update({
-            "postgres_transaction_throughput": pg["rows_per_second"] >=
-            self.EXTRA_SLO["postgres_transaction_rows_per_second_min"],
-            "short_soak_iterations": soak["iterations"] >=
-            self.EXTRA_SLO["short_soak_iterations_min"],
-            "short_soak_reconcile": soak["mismatches"] <=
-            self.EXTRA_SLO["short_soak_mismatch_max"],
-            "pure_pg_ch_runtime": True,
-        })
-        report.update({
-            "version": V2_BENCHMARK_VERSION,
-            "status": "passed" if all(checks.values()) else "failed",
-            "runtime": "postgresql_clickhouse_online",
-            "methods": dict(V2_METHODS),
-            "slo": {**report["slo"], **self.EXTRA_SLO},
-            "checks": checks,
-        })
-        report["observations"].update({
-            "postgres_transaction": pg, "short_soak": soak,
-        })
-        _assert_no_sensitive(report, "V2 benchmark report")
-        _atomic_json(self.report_path, report)
-        if report["status"] != "passed":
-            failed = ",".join(sorted(key for key, ok in checks.items() if not ok))
-            raise RuntimeError("V2 benchmark SLO failed: " + failed)
-        # Ensure the persisted document is the exact complete terminal report.
-        if json.loads(self.report_path.read_text(encoding="utf-8")) != report:
-            raise RuntimeError("V2 benchmark report publication mismatch")
-        return report
+            }
+            try:
+                _assert_no_sensitive(terminal, "V2 benchmark failed terminal")
+                _atomic_json(self.report_path, terminal)
+                if json.loads(self.report_path.read_text(encoding="utf-8")) != terminal:
+                    raise RuntimeError("failed terminal persistence mismatch")
+            except Exception as publication_error:
+                try:
+                    self.report_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    "V2 benchmark failed; terminal publication failed"
+                ) from publication_error
+            raise RuntimeError("V2 benchmark failed: " + message) from error
