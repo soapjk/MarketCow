@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -38,7 +40,10 @@ class StorageV2BenchmarkTest(unittest.TestCase):
         rows = self.plan.sample_raw_rows
         values = {}
         for name in OPERATIONS:
-            result = {"rows": rows, "logical": {"operation": name, "rows": rows}}
+            result = {"rows": rows, "verification": {
+                "expected_rows": rows, "actual_rows": rows,
+                "expected_checksum": name, "actual_checksum": name,
+            }}
             if name == "raw_write":
                 result["bytes"] = rows * 24
             if name == "archive":
@@ -49,10 +54,15 @@ class StorageV2BenchmarkTest(unittest.TestCase):
                     "SELECT bars ORDER BY bar_time LIMIT 101" if name == "page_first" else
                     "SELECT bars WHERE bar_time > cursor ORDER BY bar_time LIMIT 101"
                 )
+                result["cursor_depth"] = 0 if name == "page_first" else 4600
+            if name == "query_warm":
+                result["path_kind"] = "warm_existing_session"
+            if name == "query_cold":
+                result["path_kind"] = "new_connection"
             if name == "merge_probe":
                 result.update({"total_bytes": 1_000_000, "free_bytes": 400_000,
                                "merge_backlog": 2})
-            values[name] = lambda result=result: dict(result)
+            values[name] = lambda _run, result=result: dict(result)
         return values
 
     def benchmark(self, **overrides):
@@ -81,36 +91,57 @@ class StorageV2BenchmarkTest(unittest.TestCase):
         persisted = json.loads(self.benchmark().report_path.read_text())
         self.assertEqual(persisted["status"], "passed")
 
-    def test_offset_unstable_results_and_failed_slo_are_fail_closed(self):
+    def test_offset_target_mismatch_and_failed_slo_are_fail_closed(self):
         operations = self.operations()
-        operations["page_deep"] = lambda: {
-            "rows": 10, "logical": {"rows": 10},
+        operations["page_deep"] = lambda _run: {
+            "rows": 10, "verification": {"expected_rows": 10, "actual_rows": 10,
+                "expected_checksum": "x", "actual_checksum": "x"},
             "query_plan": "ReadFromMergeTree", "query_sql": "SELECT bars OFFSET 10000",
         }
         with self.assertRaisesRegex(RuntimeError, "no-OFFSET"):
             self.benchmark(operations=operations).run()
 
-        calls = {"value": 0}
         operations = self.operations()
-
-        def unstable():
-            calls["value"] += 1
-            return {"rows": 10, "logical": {"generation": calls["value"]}}
-
-        operations["query_warm"] = unstable
-        with self.assertRaisesRegex(RuntimeError, "checksum is unstable"):
+        operations["query_warm"] = lambda _run: {
+            "rows": 10, "path_kind": "warm_existing_session", "verification": {
+                "expected_rows": 10, "actual_rows": 9,
+                "expected_checksum": "expected", "actual_checksum": "wrong",
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "target verification mismatch"):
             self.benchmark(operations=operations).run()
 
         operations = self.operations()
-        operations["merge_probe"] = lambda: {
-            "rows": 1, "logical": {"probe": "full"}, "total_bytes": 100,
-            "free_bytes": 20, "merge_backlog": 101,
+        operations["merge_probe"] = lambda _run: {
+            "rows": 1, "total_bytes": 100, "free_bytes": 20, "merge_backlog": 101,
+            "verification": {"expected_rows": 1, "actual_rows": 1,
+                "expected_checksum": "probe", "actual_checksum": "probe"},
         }
         with self.assertRaisesRegex(RuntimeError, "SLO failed"):
             self.benchmark(operations=operations).run()
         report = json.loads(self.benchmark(operations=operations).report_path.read_text())
         self.assertFalse(report["checks"]["clickhouse_free_reserve"])
         self.assertFalse(report["checks"]["merge_backlog"])
+
+    def test_transient_thread_peak_is_observed(self):
+        operations = self.operations()
+
+        def transient(_run):
+            workers = [threading.Thread(target=lambda: time.sleep(.03)) for _ in range(4)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            return {"rows": 1, "verification": {
+                "expected_rows": 1, "actual_rows": 1,
+                "expected_checksum": "threads", "actual_checksum": "threads",
+            }}
+
+        operations["concurrent_query"] = transient
+        strict = BenchmarkPlan(10, 20, 240, 2, 3, max_threads=3,
+                               max_peak_memory_mb=8192)
+        with self.assertRaisesRegex(RuntimeError, "thread_bound"):
+            self.benchmark(operations=operations, plan=strict).run()
 
     def test_isolation_plan_and_operation_bounds(self):
         with self.assertRaisesRegex(ValueError, "development/test-only"):
@@ -142,6 +173,8 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
             LocalClickHouseSpool, ReliableClickHouseWriter, normalize_bar,
         )
         from marketcow.cold_archive import ParquetColdArchive
+        from marketcow.contract_gate import normalize_contract_value
+        from marketcow.local_backup import _hash, _json
         from marketcow.storage import Warehouse
 
         class FailingRepository:
@@ -165,65 +198,139 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
             warehouse = Warehouse(root / "source-development/warehouse/market.duckdb")
             plan = BenchmarkPlan(1, 20, 240, 2, 3, max_peak_memory_mb=8192)
             start = datetime(2026, 7, 1, tzinfo=timezone.utc)
-            rows = []
-            for symbol_index in range(plan.symbols):
-                symbol = f"B{symbol_index:04d}"
-                for source_index, source in enumerate(("fixture", "secondary")):
-                    source_bars = []
-                    for day in range(plan.trading_days):
-                        for minute in range(plan.bars_per_day):
-                            moment = start + timedelta(days=day, minutes=minute)
-                            close = float(symbol_index + source_index + day + minute / 1000)
-                            bar = {
-                                "symbol": symbol, "market": "US", "interval": "1m",
-                                "adjustment": "raw", "bar_time": moment.isoformat(),
-                                "open": close, "high": close + 1, "low": close - 1,
-                                "close": close, "raw_close": close,
-                                "adjustment_factor": 1, "volume": 100, "amount": 1000,
-                                "source": source, "source_sequence": f"{day}:{minute}",
-                                "observed_at": moment.isoformat(),
-                                "ingested_at": (moment + timedelta(seconds=1)).isoformat(),
-                                "raw_artifact_id": f"artifact-{source}",
-                            }
-                            rows.append(normalize_bar("raw", bar))
-                            source_bars.append({
-                                "timestamp": int(moment.timestamp()),
-                                "bar_at": moment.isoformat(), "open": close,
-                                "high": close + 1, "low": close - 1, "close": close,
-                                "raw_close": close, "adjustment_factor": 1,
-                                "volume": 100, "amount": 1000,
-                            })
-                    warehouse.upsert_price_bars(
-                        symbol, "1m", "raw", source,
-                        (start + timedelta(days=1)).isoformat(), source_bars,
-                        {"observed_at": start.isoformat(),
-                         "raw_artifact_id": f"artifact-{source}"},
-                    )
+            rows_by_run = []
+            for run_index in range(plan.runs):
+                run_rows = []
+                run_start = start + timedelta(days=run_index * 31)
+                for symbol_index in range(plan.symbols):
+                    symbol = f"B{symbol_index:04d}"
+                    for source_index, source in enumerate(("tushare", "yahoo")):
+                        source_bars = []
+                        for day in range(plan.trading_days):
+                            for minute in range(plan.bars_per_day):
+                                moment = run_start + timedelta(days=day, minutes=minute)
+                                close = float(symbol_index + source_index + day + minute / 1000)
+                                bar = {
+                                    "symbol": symbol, "market": "US", "interval": "1m",
+                                    "adjustment": "raw", "bar_time": moment.isoformat(),
+                                    "open": close, "high": close + 1, "low": close - 1,
+                                    "close": close, "raw_close": close,
+                                    "adjustment_factor": 1, "volume": 100, "amount": 1000,
+                                    "source": source,
+                                    "source_sequence": str(int(moment.timestamp())),
+                                    "observed_at": run_start.isoformat(),
+                                    "ingested_at": (
+                                        run_start + timedelta(days=20)
+                                    ).isoformat(),
+                                    "raw_artifact_id": f"artifact-{source}",
+                                }
+                                run_rows.append(normalize_bar("raw", bar))
+                                source_bars.append({
+                                    "timestamp": int(moment.timestamp()),
+                                    "bar_at": moment.isoformat(), "open": close,
+                                    "high": close + 1, "low": close - 1, "close": close,
+                                    "raw_close": close, "adjustment_factor": 1,
+                                    "volume": 100, "amount": 1000,
+                                })
+                        warehouse.upsert_price_bars(
+                            symbol, "1m", "raw", source,
+                            (run_start + timedelta(days=20)).isoformat(), source_bars,
+                            {"observed_at": run_start.isoformat(),
+                             "raw_artifact_id": f"artifact-{source}"},
+                        )
+                rows_by_run.append(run_rows)
             archive = ParquetColdArchive(
                 warehouse.path, root / "source-development/archive",
                 root / "source-development",
             )
-            artifact = {"path": None}
+            artifacts = {}
+            canonical_expected = {}
             replay_run = {"value": 0}
 
-            def raw_write():
-                outcome = writer.write("raw", rows)
+            def verification(rows, checksum):
+                return {"expected_rows": rows, "actual_rows": rows,
+                        "expected_checksum": checksum, "actual_checksum": checksum}
+
+            def verified_value(value):
+                """Normalize target reads using the contract's bar-only legacy allowance."""
+                normalized = normalize_contract_value(value)
+                if isinstance(normalized, list):
+                    return [verified_value(item) for item in normalized]
+                if isinstance(normalized, dict):
+                    return {
+                        key: verified_value(item)
+                        for key, item in normalized.items()
+                        if not (key == "source_payload" and
+                                "timestamp" in normalized and "source" in normalized)
+                    }
+                return normalized
+
+            def raw_read_value(rows):
+                mapped = []
+                for row in rows:
+                    moment = datetime.fromisoformat(
+                        str(row["bar_time"]).replace("Z", "+00:00")
+                    ).astimezone(timezone.utc)
+                    mapped.append({
+                        key: row.get(key) for key in (
+                            "symbol", "interval", "adjustment", "open", "high", "low",
+                            "close", "raw_close", "adjustment_factor", "volume", "amount",
+                            "source", "source_sequence", "observed_at", "ingested_at",
+                            "raw_artifact_id",
+                        )
+                    } | {"timestamp": int(moment.timestamp()),
+                         "bar_at": moment.isoformat()})
+                return verified_value(mapped)
+
+            def raw_write(run_index):
+                run_rows = rows_by_run[run_index]
+                run_start = start + timedelta(days=run_index * 31)
+                outcome = writer.write("raw", run_rows)
+                expected_rows, actual_rows = [], []
+                for source in ("tushare", "yahoo"):
+                    expected_rows.extend(warehouse.get_raw_price_bars_range(
+                        "B0000", "1m", "raw", run_start.isoformat(),
+                        (run_start + timedelta(days=19, minutes=239)).isoformat(),
+                        5000, [source],
+                    )[0])
+                    actual_rows.extend(repository.get_raw_price_bars_range(
+                        "B0000", "1m", "raw", run_start.isoformat(),
+                        (run_start + timedelta(days=19, minutes=239)).isoformat(),
+                        5000, [source],
+                    )[0])
                 stored = database.client.query(
                     "SELECT sum(bytes_on_disk) FROM system.parts WHERE active "
                     "AND database=currentDatabase() AND table='market_bar_raw'"
                 ).result_rows[0][0] or 1
-                return {"rows": len(rows), "bytes": int(stored),
-                        "logical": {"rows": len(rows), "spooled": outcome["spooled"]}}
+                return {"rows": len(run_rows), "bytes": int(stored),
+                        "verification": {"expected_rows": len(expected_rows),
+                            "actual_rows": len(actual_rows),
+                            "expected_checksum": _hash(_json(
+                                verified_value(expected_rows))),
+                            "actual_checksum": _hash(_json(
+                                verified_value(actual_rows)))},
+                        "spooled": outcome["spooled"]}
 
-            def rebuild():
+            def rebuild(run_index):
                 total = 0
+                run_start = start + timedelta(days=run_index * 31)
                 for symbol_index in range(plan.symbols):
                     result = builder.rebuild(
-                        f"B{symbol_index:04d}", "1m", "raw", start.isoformat(),
-                        (start + timedelta(days=19, minutes=239)).isoformat(), 50000,
+                        f"B{symbol_index:04d}", "1m", "raw", run_start.isoformat(),
+                        (run_start + timedelta(days=19, minutes=239)).isoformat(), 50000,
                     )
                     total += result["scanned_groups"]
-                return {"rows": total, "logical": {"rows": total}}
+                expected = builder.build_rows(rows_by_run[run_index], [])[0]
+                canonical_expected[run_index] = expected
+                actual = repository.query_range(
+                    "canonical", "B0000", "1m", "raw", run_start.isoformat(),
+                    (run_start + timedelta(days=19, minutes=239)).isoformat(), 5000,
+                )[0]
+                return {"rows": total, "verification": {
+                    "expected_rows": len(expected), "actual_rows": len(actual),
+                    "expected_checksum": _hash(_json(verified_value(expected))),
+                    "actual_checksum": _hash(_json(verified_value(actual))),
+                }}
 
             def query(after=None):
                 result = repository.get_canonical_price_bars_page(
@@ -232,12 +339,38 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
                 )
                 return result
 
-            def query_operation(after=None):
+            def query_operation(_run_index=0, after=None):
                 result = query(after)
+                expected_rows = repository._map_canonical_rows(canonical_expected[0])
+                if after is not None:
+                    expected_rows = [
+                        row for row in expected_rows if row["timestamp"] > int(after)
+                    ]
+                expected = (expected_rows[:100], len(expected_rows) > 100)
                 return {"rows": len(result[0]),
-                        "logical": {"bars": result[0], "more": result[1]}}
+                        "path_kind": "warm_existing_session",
+                        "verification": {"expected_rows": len(expected[0]),
+                            "actual_rows": len(result[0]),
+                            "expected_checksum": _hash(_json(verified_value(expected))),
+                            "actual_checksum": _hash(_json(verified_value(result)))}}
 
-            def plan_query(after=None):
+            def cold_query(_run_index):
+                client = database._connect(database_name)
+                try:
+                    count = client.query(
+                        "SELECT count() FROM market_bar_canonical FINAL WHERE "
+                        "symbol='B0000' AND interval='1m' AND adjustment='raw'"
+                    ).result_rows[0][0]
+                finally:
+                    client.close()
+                expected = plan.trading_days * plan.bars_per_day * plan.runs
+                checksum = f"cold-count-{expected}"
+                return {"rows": count, "path_kind": "new_connection",
+                        "verification": {"expected_rows": expected, "actual_rows": count,
+                            "expected_checksum": checksum,
+                            "actual_checksum": f"cold-count-{count}"}}
+
+            def plan_query(_run_index, after=None):
                 predicate = "" if after is None else "AND bar_time > toDateTime64('2026-07-01 01:00:00',3,'UTC')"
                 sql = (
                     "SELECT * FROM market_bar_canonical FINAL WHERE symbol='B0000' "
@@ -247,42 +380,70 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
                 explanation = database.client.query(
                     "EXPLAIN " + sql
                 ).result_rows
-                result = query_operation(after)
+                result = query_operation(0, after)
                 result["query_plan"] = " ".join(row[0] for row in explanation)
                 result["query_sql"] = sql
+                result["cursor_depth"] = 0 if after is None else 4600
                 return result
 
-            def archive_operation():
-                result = archive.export_partition("US", "1m", "fixture", 2026, 7)
-                artifact["path"] = Path(result["artifact_path"])
-                manifest = json.loads((artifact["path"] / "manifest.json").read_text())
+            def archive_operation(run_index):
+                run_start = start + timedelta(days=run_index * 31)
+                result = archive.export_partition(
+                    "US", "1m", "tushare", run_start.year, run_start.month,
+                )
+                artifacts[run_index] = Path(result["artifact_path"])
+                manifest = json.loads((artifacts[run_index] / "manifest.json").read_text())
+                verified = archive.verify(artifacts[run_index])
                 return {"rows": result["row_count"], "bytes": manifest["parquet_bytes"],
                         "uncompressed_bytes": manifest["logical_json_bytes"],
-                        "logical": {"artifact_id": result["artifact_id"],
-                                    "rows": result["row_count"]}}
+                        "verification": {"expected_rows": manifest["row_count"],
+                            "actual_rows": verified["row_count"],
+                            "expected_checksum": manifest["logical_checksum"],
+                            "actual_checksum": verified["logical_checksum"]}}
 
-            def restore_operation():
-                if artifact["path"] is None:
-                    archive_operation()
-                restored = archive.read_for_backfill(artifact["path"])
+            def restore_operation(run_index):
+                if run_index not in artifacts:
+                    archive_operation(run_index)
+                restored = archive.read_for_backfill(artifacts[run_index])
+                queried = archive.query(artifacts[run_index])
+                expected_checksum = _hash(_json(queried))
                 return {"rows": len(restored),
-                        "logical": {"rows": len(restored),
-                                    "first": restored[0]["symbol"]}}
+                        "verification": {"expected_rows": len(queried),
+                            "actual_rows": len(restored),
+                            "expected_checksum": expected_checksum,
+                            "actual_checksum": _hash(_json(restored))}}
 
-            def replay_operation():
+            def replay_operation(run_index):
                 replay_run["value"] += 1
                 local_spool = LocalClickHouseSpool(
                     root / f"replay-{replay_run['value']}-test", root,
                 )
                 failed = ReliableClickHouseWriter(FailingRepository(), local_spool, 1000)
-                sample = rows[:1000]
+                sample = []
+                for row in rows_by_run[run_index][:1000]:
+                    changed = dict(row)
+                    changed.update({
+                        "symbol": f"SPOOL{run_index}",
+                        "source": f"spool-{run_index}",
+                        "raw_artifact_id": f"spool-artifact-{run_index}",
+                    })
+                    sample.append(normalize_bar("raw", changed))
                 failed.write("raw", sample)
                 recovered = ReliableClickHouseWriter(repository, local_spool, 1000).replay(10)
+                run_start = start + timedelta(days=run_index * 31)
+                actual = repository.get_raw_price_bars_range(
+                    f"SPOOL{run_index}", "1m", "raw", run_start.isoformat(),
+                    (run_start + timedelta(days=4, minutes=39)).isoformat(),
+                    5000, [f"spool-{run_index}"],
+                )[0]
                 return {"rows": len(sample),
-                        "logical": {"rows": len(sample),
-                                    "replayed": recovered["replayed"]}}
+                        "verification": {"expected_rows": len(sample),
+                            "actual_rows": len(actual),
+                            "expected_checksum": _hash(_json(raw_read_value(sample))),
+                            "actual_checksum": _hash(_json(verified_value(actual))),
+                        }, "replayed": recovered["replayed"]}
 
-            def concurrent_operation():
+            def concurrent_operation(_run_index):
                 def isolated_query(_index):
                     client = database._connect(database_name)
                     try:
@@ -295,9 +456,15 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
 
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     results = list(executor.map(isolated_query, range(4)))
-                return {"rows": sum(results), "logical": {"counts": results}}
+                expected_each = plan.trading_days * plan.bars_per_day * plan.runs
+                expected = [expected_each] * 4
+                return {"rows": sum(results),
+                        "verification": {"expected_rows": sum(expected),
+                            "actual_rows": sum(results),
+                            "expected_checksum": _hash(_json(expected)),
+                            "actual_checksum": _hash(_json(results))}}
 
-            def merge_probe():
+            def merge_probe(_run_index):
                 disk = database.client.query(
                     "SELECT total_space, free_space FROM system.disks LIMIT 1"
                 ).result_rows[0]
@@ -305,13 +472,16 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
                     "SELECT count() FROM system.merges WHERE database=currentDatabase()"
                 ).result_rows[0][0]
                 return {"rows": 1, "total_bytes": disk[0], "free_bytes": disk[1],
-                        "merge_backlog": merges, "logical": {"probe": "merge_disk"}}
+                        "merge_backlog": merges,
+                        "verification": verification(1, "merge-disk")}
 
             operations = {
                 "raw_write": raw_write, "canonical_rebuild": rebuild,
-                "query_warm": query_operation, "query_cold": query_operation,
-                "page_first": lambda: plan_query(None),
-                "page_deep": lambda: plan_query(int((start + timedelta(minutes=60)).timestamp())),
+                "query_warm": query_operation, "query_cold": cold_query,
+                "page_first": lambda run_index: plan_query(run_index, None),
+                "page_deep": lambda run_index: plan_query(
+                    run_index, int((start + timedelta(days=19, minutes=39)).timestamp())
+                ),
                 "archive": archive_operation, "restore": restore_operation,
                 "spool_recovery": replay_operation,
                 "concurrent_query": concurrent_operation, "merge_probe": merge_probe,
@@ -322,7 +492,7 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
                     {"clickhouse": database.diagnostics()["version"], "duckdb": "local"},
                 )).run()
                 self.assertEqual(report["status"], "passed")
-                self.assertEqual(report["plan"]["sample_raw_rows"], len(rows))
+                self.assertEqual(report["plan"]["sample_raw_rows"], len(rows_by_run[0]))
                 self.assertTrue(all(report["checks"].values()))
             finally:
                 database.close()

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping
 
-from .local_backup import _assert_no_sensitive, _fsync_dir, _hash, _json
+from .local_backup import _assert_no_sensitive, _fsync_dir
 from .telemetry import sanitize_text
 
 
@@ -75,7 +75,7 @@ class BenchmarkPlan:
 class BenchmarkInputs:
     root: Path
     plan: BenchmarkPlan
-    operations: Mapping[str, Callable[[], Mapping[str, Any]]]
+    operations: Mapping[str, Callable[[int], Mapping[str, Any]]]
     profile: str = "development"
     allowed_root: Path | None = None
     component_versions: Mapping[str, str] | None = None
@@ -150,23 +150,47 @@ class LocalStorageBenchmark:
         durations: list[float] = []
         throughputs: list[float] = []
         checksums: list[str] = []
+        peak_threads = threading.active_count()
+        peak_memory_mb = self._rss_mb()
+        memory_baseline_mb = peak_memory_mb
         last: Dict[str, Any] = {}
-        for _ in range(self.inputs.plan.runs):
+        for run_index in range(self.inputs.plan.runs):
+            stop = threading.Event()
+            samples = {"threads": threading.active_count(), "memory": self._rss_mb()}
+
+            def monitor() -> None:
+                while not stop.wait(.001):
+                    samples["threads"] = max(samples["threads"], threading.active_count())
+                    samples["memory"] = max(samples["memory"], self._rss_mb())
+
+            sampler = threading.Thread(target=monitor, name="storage-v2-benchmark-sampler")
+            sampler.start()
             started = self.inputs.clock()
-            result = dict(self.inputs.operations[name]())
-            elapsed = max(0.000001, self.inputs.clock() - started)
+            try:
+                result = dict(self.inputs.operations[name](run_index))
+                elapsed = max(0.000001, self.inputs.clock() - started)
+            finally:
+                stop.set()
+                sampler.join()
+            samples["threads"] = max(samples["threads"], threading.active_count())
+            samples["memory"] = max(samples["memory"], self._rss_mb())
+            peak_threads = max(peak_threads, int(samples["threads"]))
+            peak_memory_mb = max(peak_memory_mb, float(samples["memory"]))
             rows = int(result.get("rows", 0))
             if rows < 0:
                 raise ValueError(f"benchmark {name} returned negative rows")
             durations.append(elapsed)
             throughputs.append(rows / elapsed)
-            logical = result.get("logical", {key: value for key, value in result.items()
-                                              if key not in {"query_plan", "query_sql", "free_bytes",
-                                                             "total_bytes"}})
-            checksums.append(_hash(_json(logical)))
+            verification = result.get("verification")
+            if not isinstance(verification, Mapping):
+                raise ValueError(f"benchmark {name} requires independent target verification")
+            if (int(verification.get("actual_rows", -1)) !=
+                    int(verification.get("expected_rows", -2)) or
+                    verification.get("actual_checksum") !=
+                    verification.get("expected_checksum")):
+                raise RuntimeError(f"benchmark {name} target verification mismatch")
+            checksums.append(str(verification["actual_checksum"]))
             last = result
-        if len(set(checksums)) != 1:
-            raise RuntimeError(f"benchmark {name} correctness checksum is unstable")
         plan = str(last.get("query_plan", ""))
         query_sql = str(last.get("query_sql", ""))
         if name in {"page_first", "page_deep"} and (
@@ -174,6 +198,15 @@ class LocalStorageBenchmark:
             (name == "page_deep" and "bar_time >" not in query_sql.lower())
         ):
             raise RuntimeError(f"benchmark {name} must prove a no-OFFSET keyset plan")
+        if name == "page_deep" and int(last.get("cursor_depth", 0)) < int(
+            self.inputs.plan.trading_days * self.inputs.plan.bars_per_day * .8
+        ):
+            raise RuntimeError("benchmark page_deep cursor is not in the sample tail")
+        path_kind = str(last.get("path_kind", ""))
+        if name == "query_warm" and path_kind != "warm_existing_session":
+            raise RuntimeError("benchmark warm query path is not explicit")
+        if name == "query_cold" and path_kind not in {"new_connection", "cold_archive"}:
+            raise RuntimeError("benchmark cold query path is not independently cold")
         return {
             "runs": len(durations), "rows": int(last.get("rows", 0)),
             "latency_seconds": {
@@ -182,7 +215,7 @@ class LocalStorageBenchmark:
                 "p99": _percentile(durations, .99),
             },
             "rows_per_second": round(min(throughputs), 3),
-            "checksum": checksums[0],
+            "checksums": checksums,
             "bytes": max(0, int(last.get("bytes", 0))),
             "uncompressed_bytes": max(0, int(last.get("uncompressed_bytes", 0))),
             "query_plan": sanitize_text(plan)[:2000] if plan else None,
@@ -190,15 +223,24 @@ class LocalStorageBenchmark:
             "free_bytes": max(0, int(last.get("free_bytes", 0))),
             "total_bytes": max(0, int(last.get("total_bytes", 0))),
             "merge_backlog": max(0, int(last.get("merge_backlog", 0))),
+            "path_kind": path_kind or None,
+            "cursor_depth": max(0, int(last.get("cursor_depth", 0))),
+            "resource_peak": {
+                "threads": peak_threads,
+                "memory_mb": round(peak_memory_mb, 3),
+                "memory_delta_mb": round(max(0.0, peak_memory_mb - memory_baseline_mb), 3),
+            },
         }
 
+    @staticmethod
+    def _rss_mb() -> float:
+        value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return value / (1024 * 1024 if platform.system() == "Darwin" else 1024)
+
     def run(self) -> Dict[str, Any]:
-        threads_before = threading.active_count()
-        memory_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         observations = {name: self._measure(name) for name in OPERATIONS}
-        memory_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        peak_memory_mb = max(memory_before, memory_after) / (1024 * 1024 if platform.system() == "Darwin" else 1024)
-        threads_peak = max(threads_before, threading.active_count())
+        peak_memory_mb = max(item["resource_peak"]["memory_mb"] for item in observations.values())
+        threads_peak = max(item["resource_peak"]["threads"] for item in observations.values())
         capacity = self._capacity(observations)
         checks = self._slo_checks(observations, capacity, peak_memory_mb, threads_peak)
         report = {
