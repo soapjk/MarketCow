@@ -393,6 +393,38 @@ class ClickHouseMarketBarRepository:
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
         return self._map_canonical_rows(rows[:limit]), len(rows) > limit
 
+    def get_canonical_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int, after: Optional[int] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("history page_size must be between 1 and 5000")
+        start_at = self._datetime(start).astimezone(timezone.utc)
+        end_at = self._datetime(end).astimezone(timezone.utc)
+        start_at = datetime.fromtimestamp(int(start_at.timestamp()), timezone.utc)
+        end_at = datetime.fromtimestamp(int(end_at.timestamp()), timezone.utc)
+        if start_at > end_at:
+            raise ValueError("history range start must not be after end")
+        after_sql = "" if after is None else " AND bar_time > {after:DateTime64(3)}"
+        parameters: Dict[str, Any] = {
+            "symbol": symbol, "interval": interval, "adjustment": adjustment,
+            "start": start_at, "end": end_at, "fetch": page_size + 1,
+        }
+        if after is not None:
+            parameters["after"] = datetime.fromtimestamp(after, timezone.utc)
+        result = self.database._require_client().query(
+            "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
+            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
+            "version FROM market_bar_canonical FINAL WHERE symbol={symbol:String} "
+            "AND interval={interval:String} AND adjustment={adjustment:String} "
+            "AND bar_time >= {start:DateTime64(3)} AND bar_time <= {end:DateTime64(3)}" +
+            after_sql + " ORDER BY bar_time ASC LIMIT {fetch:UInt32}",
+            parameters=parameters,
+        )
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        return self._map_canonical_rows(rows[:page_size]), len(rows) > page_size
+
     def get_raw_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
         start: str, end: str, limit: int,

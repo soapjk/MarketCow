@@ -35,6 +35,9 @@ class FakePrimary:
     def get_price_bars_range(self, *args):
         return (["duckdb-range"], True)
 
+    def get_price_bars_page(self, *args):
+        return (["duckdb-page"], True)
+
     def get_price_bars_cross_section(self, *args):
         return (["duckdb-cross-section"], True)
 
@@ -75,6 +78,11 @@ class ReconcileRepository:
             raise self.rows
         return self.rows, False
 
+    def get_canonical_price_bars_page(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows, False
+
     def get_canonical_price_bars_cross_section(self, *args):
         if isinstance(self.rows, Exception):
             raise self.rows
@@ -102,6 +110,27 @@ class FakeCanonicalBuilder:
 
 
 class ShadowMarketBarRepositoryTest(unittest.TestCase):
+    def test_keyset_page_read_and_same_cursor_fallback(self):
+        arguments = (
+            "MU", "1m", "raw", "2026-07-20T00:00:00Z",
+            "2026-07-20T01:00:00Z", 50, 1752969900,
+        )
+        primary = FakePrimary()
+        writer = CapturingWriter()
+        writer.repository = ReconcileRepository(["clickhouse-page"])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(
+            primary, writer, canonical_reads_enabled=True
+        )
+        self.assertEqual(adapter.get_price_bars_page(*arguments),
+                         (["clickhouse-page"], False))
+        self.assertTrue(adapter.diagnostics()["read"]["keyset_page"])
+        writer.repository.rows = ConnectionError("unavailable")
+        self.assertEqual(adapter.get_price_bars_page(*arguments),
+                         (["duckdb-page"], True))
+        diagnostic = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostic["fallback"])
+        self.assertEqual(diagnostic["backend"], "duckdb")
     def test_auto_canonical_only_after_success_and_raw_replay(self):
         primary, writer, builder = FakePrimary(), CapturingWriter(), FakeCanonicalBuilder()
         writer.on_raw_replayed = None

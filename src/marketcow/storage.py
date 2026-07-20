@@ -868,6 +868,42 @@ class Warehouse:
             result.append(row)
         return result, truncated
 
+    def get_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int, after: Optional[int] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("history page_size must be between 1 and 5000")
+        start_at, end_at = self._utc_range(start, end)
+        start_epoch, end_epoch = int(start_at.timestamp()), int(end_at.timestamp())
+        after_sql = "" if after is None else " AND timestamp > ?"
+        parameters: List[Any] = [symbol, interval, adjustment, start_epoch, end_epoch]
+        if after is not None:
+            parameters.append(after)
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "ingested_at, payload_json FROM (SELECT *, ROW_NUMBER() OVER "
+                "(PARTITION BY timestamp ORDER BY ingested_at DESC, source ASC) selected "
+                "FROM market_price_bar WHERE symbol = ? AND interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?" + after_sql +
+                ") WHERE selected = 1 ORDER BY timestamp ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        result = []
+        for row in rows[:page_size]:
+            payload = row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            row["bar_at"] = self._utc_iso(row["bar_at"])
+            row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            row["source_payload"] = json.loads(payload) if payload else {}
+            result.append(row)
+        return result, has_more
+
     def get_price_bars_cross_section(
         self, interval: str, adjustment: str, bar_at: str, limit: int,
         symbols: Optional[Sequence[str]] = None,

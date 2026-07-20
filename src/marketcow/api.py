@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings
+from .market_bar_cursor import decode_cursor, encode_cursor
 from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
@@ -255,6 +256,8 @@ def create_app(
         limit: int = Query(500, ge=1, le=5000),
         start: Optional[str] = None,
         end: Optional[str] = None,
+        page_size: Optional[int] = Query(None, ge=1, le=5000),
+        cursor: Optional[str] = None,
     ):
         try:
             if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
@@ -266,7 +269,58 @@ def create_app(
                 normalized, _ = normalize_yahoo_symbol(symbol)
             if (start is None) != (end is None):
                 raise ValueError("history range requires both start and end")
+            if cursor is not None and page_size is None:
+                raise ValueError("history cursor requires page_size")
+            if page_size is not None and (start is None or end is None):
+                raise ValueError("history pagination requires start and end")
             if start is not None and end is not None:
+                start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                if start_at.tzinfo is None or end_at.tzinfo is None:
+                    raise ValueError("history range timestamps must include a timezone")
+                start_at = datetime.fromtimestamp(
+                    int(start_at.timestamp()), timezone.utc
+                )
+                end_at = datetime.fromtimestamp(int(end_at.timestamp()), timezone.utc)
+                if start_at > end_at:
+                    raise ValueError("history range start must not be after end")
+                if page_size is not None:
+                    query_binding = {
+                        "symbol": normalized, "interval": interval,
+                        "adjustment": adjustment, "start": start_at.isoformat(),
+                        "end": end_at.isoformat(), "page_size": page_size,
+                    }
+                    cursor_now = clock()
+                    if cursor_now.tzinfo is None:
+                        cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+                    now_epoch = int(cursor_now.timestamp())
+                    after = None if cursor is None else decode_cursor(
+                        cursor, query_binding, now_epoch,
+                        settings.market_bar_cursor_ttl_seconds,
+                        settings.market_bar_cursor_secret,
+                    )
+                    if after is not None and not (
+                        int(start_at.timestamp()) <= after <= int(end_at.timestamp())
+                    ):
+                        raise ValueError("cursor position is outside the query range")
+                    bars, has_more = service.market_bar_repository.get_price_bars_page(
+                        normalized, interval, adjustment, start_at.isoformat(),
+                        end_at.isoformat(), page_size, after,
+                    )
+                    next_cursor = None
+                    if has_more and bars:
+                        next_cursor = encode_cursor(
+                            query_binding, int(bars[-1]["timestamp"]), now_epoch,
+                            settings.market_bar_cursor_secret,
+                        )
+                    return {
+                        "symbol": normalized, "interval": interval,
+                        "adjustment": adjustment, "count": len(bars), "bars": bars,
+                        "cached": True, "start": start_at.isoformat(),
+                        "end": end_at.isoformat(), "truncated": has_more,
+                        "page_size": page_size, "next_cursor": next_cursor,
+                        **cache_metadata(bars),
+                    }
                 bars, truncated = service.market_bar_repository.get_price_bars_range(
                     normalized, interval, adjustment, start, end, limit
                 )

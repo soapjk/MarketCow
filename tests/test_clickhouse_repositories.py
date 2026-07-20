@@ -227,6 +227,25 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertEqual(len(ranged), 1)
         self.assertEqual(ranged[0]["bar_at"], "2026-07-20T04:00:00+00:00")
+        first_page, more = self.repository.get_canonical_price_bars_page(
+            "HISTORY.HK", "1m", "raw", "2026-07-20T12:00:00+08:00",
+            "2026-07-20T04:02:00Z", 1,
+        )
+        self.assertTrue(more)
+        self.assertEqual(first_page[0]["bar_at"], "2026-07-20T04:00:00+00:00")
+        second_page, more = self.repository.get_canonical_price_bars_page(
+            "HISTORY.HK", "1m", "raw", "2026-07-20T04:00:00Z",
+            "2026-07-20T04:02:00Z", 1, first_page[0]["timestamp"],
+        )
+        self.assertTrue(more)
+        self.assertEqual(second_page[0]["close"], 13.0)
+        self.assertEqual(second_page[0]["source_payload"]["version"], 2)
+        last_page, more = self.repository.get_canonical_price_bars_page(
+            "HISTORY.HK", "1m", "raw", "2026-07-20T04:00:00Z",
+            "2026-07-20T04:02:00Z", 1, second_page[0]["timestamp"],
+        )
+        self.assertFalse(more)
+        self.assertEqual(last_page[0]["close"], 14.0)
         empty, truncated = self.repository.get_canonical_price_bars_range(
             "HISTORY.HK", "1m", "raw", "2026-07-21T00:00:00Z",
             "2026-07-21T01:00:00Z", 10,

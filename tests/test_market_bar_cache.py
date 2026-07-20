@@ -32,6 +32,9 @@ class Repository:
     def get_price_bars_range(self, *args):
         return list(self.rows), False
 
+    def get_price_bars_page(self, *args):
+        return list(self.rows), True
+
     def get_price_bars_cross_section(self, *args):
         return list(self.rows), False
 
@@ -54,6 +57,11 @@ class ClickHouseRepository(Repository):
 
     def get_canonical_price_bars_range(self, *args):
         return self._result(True)
+
+    def get_canonical_price_bars_page(self, *args):
+        if self.error:
+            raise self.error
+        return list(self.rows), True
 
     def get_canonical_price_bars_cross_section(self, *args):
         return self._result(True)
@@ -168,6 +176,8 @@ class MarketBarCacheContractTest(unittest.TestCase):
         )))
         paths = [
             "/v1/quotes/AAPL/history?refresh=false",
+            "/v1/quotes/AAPL/history?start=1970-01-01T00:00:00Z"
+            "&end=1970-01-01T00:02:00Z&page_size=10",
             "/v1/quotes/AAPL/raw-history?start=1970-01-01T00:00:00Z"
             "&end=1970-01-01T00:02:00Z",
         ]
@@ -175,7 +185,9 @@ class MarketBarCacheContractTest(unittest.TestCase):
             for path in paths:
                 left, right = first.get(path).json(), second.get(path).json()
                 for field in ("bars", "cache_status", "newest_ingested_at",
-                              "cache_age_seconds", "served_at"):
+                              "cache_age_seconds", "served_at", "next_cursor"):
+                    if field not in left and field not in right:
+                        continue
                     self.assertEqual(left[field], right[field])
 
     def test_freshness_threshold_is_bounded(self):
