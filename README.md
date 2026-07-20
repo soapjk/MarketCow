@@ -144,6 +144,14 @@ curl 'http://127.0.0.1:8790/v1/quotes/600519'
 curl 'http://127.0.0.1:8790/v1/quotes/AAPL'
 ```
 
+行情读取默认返回本地缓存，避免把上游网络延迟传递给下游服务。需要在当前请求内
+同步刷新时，显式传入 `refresh=true`：
+
+```bash
+curl 'http://127.0.0.1:8790/v1/quotes/600519?refresh=true'
+curl 'http://127.0.0.1:8790/v1/quotes?symbols=600519.SH,MU&refresh=true'
+```
+
 ### 首次同步中国市场数据
 
 需要全市场基本面和通达信历史财务时，显式运行一次低频同步：

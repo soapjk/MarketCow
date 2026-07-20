@@ -169,29 +169,38 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes")
-    def quotes(symbols: str, refresh: bool = True):
+    def quotes(symbols: str, refresh: bool = False):
         requested = [item.strip() for item in symbols.split(",") if item.strip()]
         if not requested:
             raise HTTPException(status_code=400, detail="symbols is required")
         if len(requested) > 20:
             raise HTTPException(status_code=400, detail="at most 20 symbols per request")
-        items, errors = [], []
+        normalized_symbols, normalization_errors = [], []
         for symbol in requested:
             try:
                 try:
                     normalized = normalize_a_symbol(symbol)
                 except ValueError:
                     normalized, _ = normalize_yahoo_symbol(symbol)
-                if refresh:
-                    items.append(service.refresh_quote(normalized))
-                else:
-                    cached = service.warehouse.get_latest_quotes([normalized])
-                    if cached:
-                        items.extend(cached)
-                    else:
-                        errors.append({"symbol": normalized, "error": "quote not cached"})
+                normalized_symbols.append(normalized)
             except Exception as exc:
-                errors.append({"symbol": symbol, "error": str(exc)})
+                normalization_errors.append({"symbol": symbol, "error": str(exc)})
+        if not refresh:
+            items = service.warehouse.get_latest_quotes(normalized_symbols)
+            for item in items:
+                item["is_cached"] = True
+            found = {item["symbol"] for item in items}
+            errors = normalization_errors + [
+                {"symbol": symbol, "error": "quote not cached"}
+                for symbol in normalized_symbols if symbol not in found
+            ]
+            return {"count": len(items), "items": items, "errors": errors}
+        items, errors = [], normalization_errors
+        for normalized in normalized_symbols:
+            try:
+                items.append(service.refresh_quote(normalized))
+            except Exception as exc:
+                errors.append({"symbol": normalized, "error": str(exc)})
         return {"count": len(items), "items": items, "errors": errors}
 
     @app.get("/v1/instruments/search")
@@ -235,7 +244,7 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes/{symbol}")
-    def quote(symbol: str, refresh: bool = True):
+    def quote(symbol: str, refresh: bool = False):
         try:
             try:
                 normalized = normalize_a_symbol(symbol)
@@ -246,6 +255,7 @@ def create_app(
             cached = service.warehouse.get_latest_quotes([normalized])
             if not cached:
                 raise HTTPException(status_code=404, detail="quote not cached")
+            cached[0]["is_cached"] = True
             return cached[0]
         except HTTPException:
             raise
