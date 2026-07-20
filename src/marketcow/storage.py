@@ -10,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 import duckdb
 import pandas as pd
 
+from .bar_version import raw_content_rank
+
 
 FUNDAMENTAL_COLUMNS = [
     "instrument_id", "symbol", "exchange", "name", "is_active", "report_period",
@@ -280,6 +282,7 @@ class Warehouse:
             con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS amount DOUBLE")
             con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS payload_json VARCHAR")
             con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS source_sequence VARCHAR")
+            con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS content_rank VARCHAR")
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS economic_calendar_event (
@@ -695,17 +698,38 @@ class Warehouse:
 
     def upsert_price_bars(self, symbol: str, interval: str, adjustment: str, source: str, ingested_at: str, bars: List[Dict[str, Any]], provenance: Optional[Dict[str, Any]] = None) -> int:
         provenance = provenance or {}
-        values = [
-            [symbol, interval, adjustment, bar.get("timestamp"), bar.get("bar_at"), bar.get("open"), bar.get("high"), bar.get("low"), bar.get("close"), bar.get("raw_close"), bar.get("adjustment_factor"), bar.get("volume"), source, ingested_at, provenance.get("source_url"), provenance.get("observed_at") or bar.get("bar_at"), provenance.get("raw_response_locator"), provenance.get("raw_path"), provenance.get("raw_artifact_id"), bar.get("amount"), json.dumps(bar.get("source_payload") or bar, ensure_ascii=False, allow_nan=False), str(bar.get("source_sequence") or bar.get("timestamp"))]
-            for bar in bars
-        ]
+        values = []
+        for bar in bars:
+            observed_at = provenance.get("observed_at") or bar.get("bar_at")
+            source_sequence = str(bar.get("source_sequence") or bar.get("timestamp"))
+            content_rank = raw_content_rank({
+                "symbol": symbol, "interval": interval, "adjustment": adjustment,
+                "bar_time": bar.get("bar_at"), "open": bar.get("open"),
+                "high": bar.get("high"), "low": bar.get("low"),
+                "close": bar.get("close"), "raw_close": bar.get("raw_close"),
+                "adjustment_factor": bar.get("adjustment_factor"),
+                "volume": bar.get("volume"), "amount": bar.get("amount"),
+                "source": source, "source_sequence": source_sequence,
+                "observed_at": observed_at,
+                "raw_artifact_id": provenance.get("raw_artifact_id"),
+            })
+            values.append([
+                symbol, interval, adjustment, bar.get("timestamp"), bar.get("bar_at"),
+                bar.get("open"), bar.get("high"), bar.get("low"), bar.get("close"),
+                bar.get("raw_close"), bar.get("adjustment_factor"), bar.get("volume"),
+                source, ingested_at, provenance.get("source_url"), observed_at,
+                provenance.get("raw_response_locator"), provenance.get("raw_path"),
+                provenance.get("raw_artifact_id"), bar.get("amount"),
+                json.dumps(bar.get("source_payload") or bar, ensure_ascii=False,
+                           allow_nan=False), source_sequence, content_rank,
+            ])
         if values:
             with self._lock, self.connect() as con:
                 columns = (
                     "symbol, interval, adjustment, timestamp, bar_at, open, high, low, "
                     "close, raw_close, adjustment_factor, volume, source, ingested_at, "
                     "source_url, observed_at, raw_response_locator, raw_path, "
-                    "raw_artifact_id, amount, payload_json, source_sequence"
+                    "raw_artifact_id, amount, payload_json, source_sequence, content_rank"
                 )
                 for value in values:
                     existing = con.execute(
@@ -719,8 +743,8 @@ class Warehouse:
                         if incoming_time < existing_time:
                             continue
                         if (incoming_time == existing_time and
-                                self._bar_version_rank(value) <=
-                                self._bar_version_rank(existing)):
+                                value[22] <= (existing[22] or
+                                              self._existing_bar_content_rank(existing))):
                             continue
                     con.execute(
                         "INSERT OR REPLACE INTO market_price_bar (" + columns + ") "
@@ -736,12 +760,16 @@ class Warehouse:
         return parsed.astimezone(timezone.utc)
 
     @staticmethod
-    def _bar_version_rank(value: Sequence[Any]) -> str:
-        """Stable tie-break: lexicographically greatest complete row wins."""
-        return json.dumps(
-            list(value), ensure_ascii=False, allow_nan=False, default=str,
-            separators=(",", ":"),
-        )
+    def _existing_bar_content_rank(value: Sequence[Any]) -> str:
+        return raw_content_rank({
+            "symbol": value[0], "interval": value[1], "adjustment": value[2],
+            "bar_time": value[4], "open": value[5], "high": value[6],
+            "low": value[7], "close": value[8], "raw_close": value[9],
+            "adjustment_factor": value[10], "volume": value[11],
+            "source": value[12], "observed_at": value[15],
+            "raw_artifact_id": value[18], "amount": value[19],
+            "source_sequence": value[21],
+        })
 
     def save_tushare_response(
         self, request: Dict[str, Any], rows: List[Dict[str, Any]]

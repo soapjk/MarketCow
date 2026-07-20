@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.storage import Warehouse
+from marketcow.bar_version import raw_content_rank
 
 
 def bars():
@@ -222,7 +223,45 @@ class MarketBarRangeTest(unittest.TestCase):
                 "VERSION", "1m", "raw", "fixture", "2026-07-20T00:00:04Z", [bar]
             )
         self.assertEqual(result()["close"], first_order)
-        self.assertEqual(first_order, 32)
+
+    def test_raw_content_rank_normalizes_numbers_and_timezones(self):
+        logical = {
+            "symbol": "RANK", "interval": "1m", "adjustment": "raw",
+            "bar_time": "2026-07-20T08:00:00+08:00", "open": 1,
+            "high": 2.0, "low": 0.50, "close": 1.5, "raw_close": None,
+            "adjustment_factor": None, "volume": 10, "amount": None,
+            "source": "fixture", "source_sequence": 1,
+            "observed_at": "2026-07-20T08:00:01.123+08:00",
+            "raw_artifact_id": None,
+        }
+        equivalent = {
+            **logical, "bar_time": "2026-07-20T00:00:00.000Z", "open": 1.0,
+            "high": 2, "low": 0.5, "volume": 10.0, "source_sequence": "1",
+            "observed_at": "2026-07-20T00:00:01.123Z",
+        }
+        self.assertEqual(raw_content_rank(logical), raw_content_rank(equivalent))
+
+    def test_duckdb_equal_ingestion_winner_is_independent_of_insert_order(self):
+        candidates = [
+            {**bars()[0], "close": 41, "open": 1},
+            {**bars()[0], "close": 42.0, "open": 1.0},
+        ]
+        winners = []
+        for order in (candidates, list(reversed(candidates))):
+            with tempfile.TemporaryDirectory() as folder:
+                warehouse = Warehouse(Path(folder) / "warehouse.duckdb")
+                for candidate in order:
+                    warehouse.upsert_price_bars(
+                        "ORDER", "1m", "raw", "fixture",
+                        "2026-07-20T08:00:00+08:00", [candidate],
+                        {"observed_at": "2026-07-20T00:00:01.123Z"},
+                    )
+                rows, _ = warehouse.get_raw_price_bars_range(
+                    "ORDER", "1m", "raw", "1970-01-01T00:01:40Z",
+                    "1970-01-01T00:01:40Z", 10,
+                )
+                winners.append(rows[0]["close"])
+        self.assertEqual(winners[0], winners[1])
 
     def test_raw_history_api_is_read_only_and_validates(self):
         service = RangeService(self.warehouse)

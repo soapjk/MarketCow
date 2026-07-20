@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 from .clickhouse_repositories import ClickHouseMarketBarRepository
+from .bar_version import raw_content_rank, raw_content_version
 
 
 DATASET_COLUMNS = {
@@ -40,6 +41,8 @@ def normalize_bar(dataset: str, row: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("dataset must be raw or canonical")
     normalized: Dict[str, Any] = {}
     for column in DATASET_COLUMNS[dataset]:
+        if dataset == "raw" and column in {"content_rank", "content_version"}:
+            continue
         value = row.get(column)
         if value is None and column not in OPTIONAL_COLUMNS:
             raise ValueError(f"{dataset} bar requires {column}")
@@ -50,6 +53,11 @@ def normalize_bar(dataset: str, row: Dict[str, Any]) -> Dict[str, Any]:
         elif value is not None and column in INTEGER_COLUMNS:
             value = int(value)
         normalized[column] = value
+    if dataset == "raw":
+        normalized["content_rank"] = raw_content_rank(normalized)
+        normalized["content_version"] = raw_content_version(
+            normalized["ingested_at"], normalized["content_rank"]
+        )
     return normalized
 
 

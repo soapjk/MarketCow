@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 
 import clickhouse_connect
 
+from .bar_version import raw_content_rank, raw_content_version
+
 
 CLICKHOUSE_MIGRATIONS = [
     (
@@ -61,6 +63,39 @@ CLICKHOUSE_MIGRATIONS = [
             "raw_close Nullable(Float64) AFTER close",
             "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
             "adjustment_factor Nullable(Float64) AFTER raw_close",
+        ],
+    ),
+    (
+        4,
+        "deterministic raw equal-ingestion content rank",
+        [
+            "DROP TABLE IF EXISTS market_bar_raw_v3",
+            "DROP TABLE IF EXISTS market_bar_raw_v4",
+            """
+            CREATE TABLE market_bar_raw_v4 (
+                symbol String, market LowCardinality(String), interval LowCardinality(String),
+                adjustment LowCardinality(String), bar_time DateTime64(3, 'UTC'),
+                open Float64, high Float64, low Float64, close Float64,
+                raw_close Nullable(Float64), adjustment_factor Nullable(Float64),
+                volume Float64, amount Nullable(Float64), source LowCardinality(String),
+                source_sequence Nullable(String), observed_at DateTime64(3, 'UTC'),
+                ingested_at DateTime64(3, 'UTC'), raw_artifact_id Nullable(String),
+                content_rank String, content_version UInt256
+            ) ENGINE = ReplacingMergeTree(content_version)
+            PARTITION BY toYYYYMM(bar_time)
+            ORDER BY (symbol, interval, adjustment, source, bar_time)
+            """,
+            """
+            INSERT INTO market_bar_raw_v4
+            SELECT symbol, market, interval, adjustment, bar_time, open, high, low,
+                   close, raw_close, adjustment_factor, volume, amount, source,
+                   source_sequence, observed_at, ingested_at, raw_artifact_id, '',
+                   bitShiftLeft(toUInt256(toUnixTimestamp64Milli(ingested_at)), 208)
+            FROM market_bar_raw FINAL
+            """,
+            "RENAME TABLE market_bar_raw TO market_bar_raw_v3, "
+            "market_bar_raw_v4 TO market_bar_raw",
+            "DROP TABLE market_bar_raw_v3",
         ],
     ),
 ]
@@ -165,7 +200,8 @@ class ClickHouseMarketBarRepository:
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
         "low", "close", "raw_close", "adjustment_factor", "volume", "amount",
         "source", "source_sequence",
-        "observed_at", "ingested_at", "raw_artifact_id",
+        "observed_at", "ingested_at", "raw_artifact_id", "content_rank",
+        "content_version",
     ]
     CANONICAL_COLUMNS = [
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
@@ -203,7 +239,16 @@ class ClickHouseMarketBarRepository:
         return len(rows)
 
     def insert_raw_bars(self, rows: List[Dict[str, Any]], batch_id: str = "") -> int:
-        return self._insert("market_bar_raw", self.RAW_COLUMNS, rows, batch_id)
+        normalized = []
+        for row in rows:
+            content_rank = row.get("content_rank") or raw_content_rank(row)
+            normalized.append({
+                **row, "content_rank": content_rank,
+                "content_version": row.get("content_version") or raw_content_version(
+                    row["ingested_at"], content_rank
+                ),
+            })
+        return self._insert("market_bar_raw", self.RAW_COLUMNS, normalized, batch_id)
 
     def insert_canonical_bars(
         self, rows: List[Dict[str, Any]], batch_id: str = ""
@@ -383,11 +428,13 @@ class ClickHouseMarketBarRepository:
             "open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, source, source_sequence, "
             "toUnixTimestamp64Milli(observed_at) AS observed_millis, "
-            "toUnixTimestamp64Milli(ingested_at) AS ingested_millis, raw_artifact_id "
-            "FROM market_bar_raw FINAL "
+            "toUnixTimestamp64Milli(ingested_at) AS ingested_millis, raw_artifact_id, "
+            "content_rank FROM (SELECT *, row_number() OVER (PARTITION BY symbol, "
+            "interval, adjustment, source, bar_time ORDER BY ingested_at DESC, "
+            "content_rank DESC) AS selected FROM market_bar_raw "
             "WHERE symbol={symbol:String} AND interval={interval:String} "
             "AND adjustment={adjustment:String} AND bar_time >= {start:DateTime64(3)} "
-            "AND bar_time <= {end:DateTime64(3)}" + source_sql +
+            "AND bar_time <= {end:DateTime64(3)}" + source_sql + ") WHERE selected=1" +
             " ORDER BY bar_time ASC, source ASC LIMIT {fetch:UInt32}",
             parameters=parameters,
         )
@@ -397,6 +444,7 @@ class ClickHouseMarketBarRepository:
             timestamp = int(row.pop("timestamp"))
             observed_millis = int(row.pop("observed_millis"))
             ingested_millis = int(row.pop("ingested_millis"))
+            row.pop("content_rank")
             mapped.append({
                 **row, "timestamp": timestamp,
                 "bar_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),

@@ -14,6 +14,7 @@ from marketcow.clickhouse_shadow import ShadowMarketBarRepository
 from marketcow.clickhouse_canonical import CanonicalMarketBarBuilder
 from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
 from marketcow.storage import Warehouse
+from marketcow.clickhouse_writer import normalize_bar
 
 
 class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
@@ -71,7 +72,7 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         versions = self.database.client.query(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).result_rows
-        self.assertEqual(versions, [(1,), (2,), (3,)])
+        self.assertEqual(versions, [(1,), (2,), (3,), (4,)])
 
     def test_raw_and_canonical_round_trip_with_replacing_keys(self):
         raw = {
@@ -316,6 +317,29 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                 "RAW.HK", "1m", "raw", "2026-07-20T06:00:00",
                 "2026-07-20T06:01:00Z", 10,
             )
+
+    def test_raw_equal_ingestion_winner_is_stable_across_insert_and_merge_order(self):
+        base = {
+            "market": "US", "interval": "1m", "adjustment": "raw",
+            "bar_time": "2026-07-20T07:00:00Z", "open": 1, "high": 2,
+            "low": 0.5, "raw_close": None, "adjustment_factor": None,
+            "volume": 10, "amount": None, "source": "fixture",
+            "source_sequence": "1", "observed_at": "2026-07-20T07:00:01.123Z",
+            "ingested_at": "2026-07-20T07:00:02.456Z", "raw_artifact_id": None,
+        }
+        winners = []
+        for symbol, closes in (("ORDER-A", (41, 42)), ("ORDER-B", (42, 41))):
+            candidates = [normalize_bar("raw", {**base, "symbol": symbol, "close": close})
+                          for close in closes]
+            for candidate in candidates:
+                self.repository.insert_raw_bars([candidate])
+            self.database.client.command("OPTIMIZE TABLE market_bar_raw FINAL")
+            bars, _ = self.repository.get_raw_price_bars_range(
+                symbol, "1m", "raw", "2026-07-20T07:00:00Z",
+                "2026-07-20T07:00:00Z", 10,
+            )
+            winners.append(bars[0]["close"])
+        self.assertEqual(winners[0], winners[1])
 
     def test_real_shadow_dual_write_replay_and_reconciliation(self):
         with tempfile.TemporaryDirectory() as folder:

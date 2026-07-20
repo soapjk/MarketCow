@@ -104,9 +104,11 @@ DuckDB
   start, end, limit, sources=None)`：带时区端点统一为 UTC 整数秒并使用闭区间；同一
   bar_time 的各 source 分别保留，同一 raw 业务键只返回最新逻辑版本，按 bar_time、source
   稳定升序并显式报告 truncated。sources 去重且最多 100 个，limit 为 1..5000。
-  DuckDB 主写按规范化 UTC ingested_at 保留同一业务键的最新版本；时间相同时以完整行的
-  稳定字典序决定唯一胜者，因此不受到达顺序影响，并与 ClickHouse
-  `ReplacingMergeTree(ingested_at)` 的择新语义对齐。ClickHouse provenance 通过
+  DuckDB 主写按规范化 UTC ingested_at 保留同一业务键的最新版本；时间相同时使用共享的
+  逻辑内容 SHA-256 派生的 208-bit rank 决定唯一胜者。rank 将时间统一为 UTC 毫秒、数值统一为 Decimal
+  规范字符串，并统一 null/string，因而不受 `1`/`1.0`、Z/offset 或到达顺序影响。
+  ClickHouse 查询不依赖等版本 `FINAL` 胜者，而用窗口按 ingested_at、content_rank 降序
+  选择，与 DuckDB 使用同一 rank；普通重复及最新 ingestion 仍收敛。ClickHouse provenance 通过
   DateTime64(3) 毫秒 epoch 映射为 UTC ISO，不截断 observed_at/ingested_at 毫秒。
 - raw 读取 backend 与 canonical 读取独立配置：默认
   `MARKETCOW_RAW_MARKET_BAR_READ_BACKEND=duckdb`；只有 development、ClickHouse 已显式
