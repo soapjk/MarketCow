@@ -134,7 +134,9 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             finally:
                 self.repository.database.client = original
             self.assertEqual(failed["spooled"], 1)
-            self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
+            replayed = writer.replay()
+            self.assertEqual({key: replayed[key] for key in ("attempted", "replayed", "failed")},
+                             {"attempted": 1, "replayed": 1, "failed": 0})
 
     def test_canonical_bounded_build_is_stable_and_replayable(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -179,7 +181,9 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             finally:
                 self.repository.database.client = original
             self.assertEqual(failed["spooled"], 1)
-            self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
+            replayed = writer.replay()
+            self.assertEqual({key: replayed[key] for key in ("attempted", "replayed", "failed")},
+                             {"attempted": 1, "replayed": 1, "failed": 0})
 
     def test_canonical_history_contract_filters_limits_orders_and_final(self):
         base = {
@@ -379,7 +383,9 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             finally:
                 self.database.client = original
             self.assertEqual(adapter.diagnostics()["shadow"]["status"], "spooled")
-            self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
+            replayed = writer.replay()
+            self.assertEqual({key: replayed[key] for key in ("attempted", "replayed", "failed")},
+                             {"attempted": 1, "replayed": 1, "failed": 0})
             self.assertEqual(adapter.diagnostics()["auto_canonical"]["status"], "ok")
             reconciliation = adapter.reconcile_last_write()
             self.assertEqual(reconciliation["status"], "consistent", reconciliation)

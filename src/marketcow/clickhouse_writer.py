@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import tempfile
@@ -261,34 +262,55 @@ class ReliableClickHouseWriter:
                 self.spool._atomic_json(path, {**payload, "intent_id": intent_id})
         return outcome
 
-    def replay(self, limit: int = 100) -> Dict[str, int]:
+    def replay(self, limit: int = 100) -> Dict[str, Any]:
         if not 1 <= limit <= 1000:
             raise ValueError("replay limit must be between 1 and 1000")
-        paths, _ = self.spool._bounded_files(self.spool.pending, limit)
-        outcome = {"attempted": 0, "replayed": 0, "failed": 0}
-        for path in paths:
-            payload = self.spool.read(path)
-            outcome["attempted"] += 1
+        outcome = {"attempted": 0, "replayed": 0, "failed": 0,
+                   "callback_attempted": 0, "callback_ok": 0,
+                   "callback_failed": 0, "remaining": 0,
+                   "truncated": False, "lock_busy": False}
+        lock_path = self.spool.root / ".replay.lock"
+        with lock_path.open("a+") as lock:
             try:
-                self._insert(payload["dataset"], payload["rows"], payload["batch_id"])
-            except Exception as error:
-                self.spool.enqueue(
-                    payload["dataset"], payload["batch_id"], payload["rows"], str(error)
-                )
-                outcome["failed"] += 1
-            else:
-                self.spool.mark_replayed(path, payload)
-                outcome["replayed"] += 1
-                if payload["dataset"] == "raw" and payload.get("intent_id"):
-                    self.spool.complete_chunk(payload["intent_id"], payload["batch_id"])
-        if self.on_raw_replayed:
-            for intent in self.spool.ready_intents(limit):
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                outcome["lock_busy"] = True
+                outcome["remaining"] = 1
+                outcome["truncated"] = True
+                return outcome
+            paths, wal_truncated = self.spool._bounded_files(self.spool.pending, limit)
+            for path in paths:
+                payload = self.spool.read(path)
+                outcome["attempted"] += 1
                 try:
-                    self.on_raw_replayed(intent["rows"])
+                    self._insert(payload["dataset"], payload["rows"], payload["batch_id"])
                 except Exception as error:
-                    self.spool.callback_result(intent, str(error))
-                    self.last_replay_callback = {"status": "error", "error": str(error)[:4000]}
+                    self.spool.enqueue(payload["dataset"], payload["batch_id"],
+                                       payload["rows"], str(error))
+                    outcome["failed"] += 1
                 else:
-                    self.spool.callback_result(intent)
-                    self.last_replay_callback = {"status": "ok", "rows": len(intent["rows"])}
+                    self.spool.mark_replayed(path, payload)
+                    outcome["replayed"] += 1
+                    if payload["dataset"] == "raw" and payload.get("intent_id"):
+                        self.spool.complete_chunk(payload["intent_id"], payload["batch_id"])
+            budget = limit - outcome["attempted"]
+            if self.on_raw_replayed and budget:
+                for intent in self.spool.ready_intents(budget):
+                    outcome["callback_attempted"] += 1
+                    try:
+                        self.on_raw_replayed(intent["rows"])
+                    except Exception as error:
+                        self.spool.callback_result(intent, str(error))
+                        outcome["callback_failed"] += 1
+                        self.last_replay_callback = {"status": "error", "error": str(error)[:4000]}
+                    else:
+                        self.spool.callback_result(intent)
+                        outcome["callback_ok"] += 1
+                        self.last_replay_callback = {"status": "ok", "rows": len(intent["rows"])}
+            pending, pending_more = self.spool._bounded_files(self.spool.pending, 10000)
+            intents, intents_more = self.spool._bounded_files(self.spool.intents, 10000)
+            outcome["remaining"] = len(pending) + len(intents)
+            outcome["truncated"] = bool(outcome["remaining"] or wal_truncated or
+                                        pending_more or intents_more)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         return outcome

@@ -127,6 +127,9 @@ DuckDB
   显式 replay 还会有界扫描无 pending 的 ready intents；callback 失败或进程重启后可重试，
   成功即删除 intent。intent 在回调前原子 claim，且会依据 pending/replayed WAL 状态收敛，
   可恢复 WAL 已移走但 intent 尚未更新的崩溃窗口。
+  replay 的 WAL attempt 与 ready callback attempt 共用同一 limit 预算，outcome 报告两类
+  attempted/ok/failed、remaining、truncated 与 lock_busy。同一 spool 通过进程级文件锁串行
+  replay；活跃 processing claim 不会被第二个 writer 回收，进程退出释放锁后才允许恢复。
 
 ## 二、仓库、分支和 worktree
 

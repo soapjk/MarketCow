@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -37,6 +38,45 @@ class FakeRepository:
 
 
 class ReliableClickHouseWriterTest(unittest.TestCase):
+    def test_replay_shared_budget_and_concurrent_claim_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            rows = [normalize_bar("raw", raw_bar())]
+            spool.save_intent("ready", rows, [])
+            spool.enqueue("canonical", "wal", [], "pending")
+            writer = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            callbacks = []
+            writer.on_raw_replayed = lambda value: callbacks.append(value)
+            first = writer.replay(limit=1)
+            self.assertEqual(first["attempted"] + first["callback_attempted"], 1)
+            self.assertEqual(callbacks, [])
+            self.assertTrue(first["truncated"])
+            second = writer.replay(limit=1)
+            self.assertEqual(second["callback_attempted"], 1)
+            self.assertEqual(len(callbacks), 1)
+
+            spool.save_intent("blocked", rows, [])
+            entered, release = threading.Event(), threading.Event()
+            first_writer = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            second_writer = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            calls = []
+            def blocking(value):
+                calls.append(value)
+                entered.set()
+                release.wait(5)
+            first_writer.on_raw_replayed = blocking
+            second_writer.on_raw_replayed = lambda value: calls.append(value)
+            thread = threading.Thread(target=first_writer.replay)
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            busy = second_writer.replay()
+            self.assertTrue(busy["lock_busy"])
+            self.assertEqual(len(calls), 1)
+            release.set()
+            thread.join(5)
+            self.assertEqual(len(calls), 1)
+            self.assertFalse((spool.intents / "blocked.json").exists())
     def test_partial_chunks_rebuild_only_after_complete_intent_and_report_callback_error(self):
         class Partial(FakeRepository):
             def insert_raw_bars(self, rows, batch_id=""):
@@ -130,10 +170,12 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
 
             repository.fail = False
             replayed = writer.replay(limit=10)
-            self.assertEqual(replayed, {"attempted": 3, "replayed": 3, "failed": 0})
+            self.assertEqual({key: replayed[key] for key in ("attempted", "replayed", "failed")},
+                             {"attempted": 3, "replayed": 3, "failed": 0})
             self.assertEqual(list(spool.pending.glob("*.json")), [])
             self.assertEqual(len(list(spool.replayed.glob("*.json"))), 3)
-            self.assertEqual(writer.replay(limit=10),
+            replayed = writer.replay(limit=10)
+            self.assertEqual({key: replayed[key] for key in ("attempted", "replayed", "failed")},
                              {"attempted": 0, "replayed": 0, "failed": 0})
             self.assertEqual(spool.diagnostics()["replayed"], 3)
 

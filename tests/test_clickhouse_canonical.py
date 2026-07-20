@@ -89,7 +89,8 @@ class CanonicalMarketBarBuilderTest(unittest.TestCase):
             self.assertEqual(result["status"], "spooled")
             self.assertEqual(result["spooled"], 1)
             repository.fail = False
-            self.assertEqual(builder.writer.replay(),
+            replayed = builder.writer.replay()
+            self.assertEqual({key: replayed[key] for key in ("attempted", "replayed", "failed")},
                              {"attempted": 1, "replayed": 1, "failed": 0})
             repository.raw_rows = [raw(bar_time=f"2026-07-20T01:00:{i:02d}Z")
                                    for i in range(3)]
