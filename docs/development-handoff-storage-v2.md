@@ -1800,7 +1800,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：V2 内无 DuckDB fallback；绿故障时整体目标回蓝；新增增量追平后可再次切绿；重复演练幂等。
 - **必要测试**：两端真实本地 API golden、故障/lag/backlog/health、切换各 checkpoint 崩溃、cursor/cache/error 连续性。
 - **排除项**：修改真实消费者、launchd、8790 或任何 production 配置。
-- **状态**：`本地实现完成，待独立验收`。新增 offline-only `storage-v2.pg-ch-blue-green.v1` 演练，
+- **状态**：`已验收（8b84b04）`。新增 offline-only `storage-v2.pg-ch-blue-green.v1` 演练，
   仅通过单一消费者目标在独立 blue/green 服务间整体切换。preflight 对 BG-015 verified copy、BG-014 三次稳定
   fingerprint/lag=0、BG-016 complete restore 与 BG-018 全 checks passed 做单次受限读取和内容哈希绑定；固定
   lag/reconcile/contract、WAL/spool/quarantine、canonical queue、PG/CH 与 readiness stop condition，任一失败整体
@@ -1817,7 +1817,13 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：在线 import/open trap、默认/API/PG/CH/端到端/恢复/benchmark/静态门禁全通过；工作树干净；无未解决阻断项。
 - **必要测试**：固定最终矩阵、空环境初始化、合成副本迁移追平、备份恢复、双服务切换回滚及远程/production 审计。
 - **排除项**：`BG-EXT` 和 MarketCow 未来产品功能。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 offline-only、内容寻址且原子发布的
+  `storage-v2.pg-ch-final-acceptance.v1` 门禁，机械绑定 BG-001～BG-019 全部候选/返修 Artifact、当前 HEAD
+  祖先关系、交接状态与在线依赖策略；固定默认、旧 main API、在线 import/open、V2 runtime、authoritative
+  WAL/canonical、full import/catch-up、授权副本、PG/CH backup/restore、benchmark、蓝绿整体回滚、真实
+  disposable PG/CH、Ruff、diff-check 和 clean worktree 矩阵。任一 preflight、命令或持久化验证失败均原子覆盖
+  旧 passed 为最小脱敏 failed terminal。本项只证明 T9/本机 synthetic/disposable 范围；BG-EXT、真实数据、真实
+  消费者/launchd/8790/8791、production 与全部远程写入仍未经授权且未执行，等待独立最终验收。
 
 ### `BG-EXT`：需另行授权的外部动作
 

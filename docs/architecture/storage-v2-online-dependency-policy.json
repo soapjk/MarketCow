@@ -23,6 +23,7 @@
     "marketcow.v2_backup_restore",
     "marketcow.v2_benchmark",
     "marketcow.v2_blue_green",
+    "marketcow.v2_final_acceptance",
     "marketcow.local_backfill",
     "marketcow.local_benchmark",
     "marketcow.local_restore"
