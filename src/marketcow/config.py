@@ -18,6 +18,9 @@ class Settings:
     tushare_realtime_url: str = "https://realtime.stockai888.top"
     tushare_min_interval: float = 0.5
     profile: str = "production"
+    metadata_backend: str = "duckdb"
+    postgres_dsn: str = ""
+    postgres_schema: str = "marketcow_development"
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -47,9 +50,23 @@ class Settings:
             tushare_realtime_url=os.getenv("TUSHARE_REALTIME_URL", "https://realtime.stockai888.top").rstrip("/"),
             tushare_min_interval=float(os.getenv("TUSHARE_MIN_INTERVAL", "0.5")),
             profile=profile,
+            metadata_backend=os.getenv("MARKETCOW_METADATA_BACKEND", "duckdb").strip().lower(),
+            postgres_dsn=os.getenv("MARKETCOW_POSTGRES_DSN", "").strip(),
+            postgres_schema=os.getenv(
+                "MARKETCOW_POSTGRES_SCHEMA", "marketcow_development"
+            ).strip(),
         )
 
     def validate_runtime_isolation(self) -> None:
+        if self.metadata_backend not in {"duckdb", "postgres"}:
+            raise ValueError("MARKETCOW_METADATA_BACKEND must be duckdb or postgres")
+        if self.metadata_backend == "postgres":
+            if self.profile != "development":
+                raise ValueError("PostgreSQL metadata backend is development-only during Stage 1")
+            if not self.postgres_dsn:
+                raise ValueError("MARKETCOW_POSTGRES_DSN is required for PostgreSQL metadata")
+            if not self.postgres_schema.endswith(("_development", "_test")):
+                raise ValueError("development PostgreSQL schema must end in _development or _test")
         if self.profile != "development":
             return
         production_db = (Path.cwd() / "data/warehouse/market_data.duckdb").resolve()

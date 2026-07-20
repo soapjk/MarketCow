@@ -28,7 +28,7 @@ from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normal
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
 from .providers.calendar import CalendarProvider
 from .providers.tushare_provider import TushareProvider
-from .duckdb_repositories import create_duckdb_repositories
+from .duckdb_repositories import create_stage1_repositories
 from .repositories import Repositories
 from .storage import FUNDAMENTAL_COLUMNS, Warehouse
 
@@ -105,9 +105,12 @@ class FundamentalService:
     ):
         self.settings = settings
         self.warehouse = warehouse
+        self.repository_database = None
         if repositories is None:
             self.warehouse = self.warehouse or Warehouse(settings.database_path)
-            repositories = create_duckdb_repositories(self.warehouse)
+            repositories, self.repository_database = create_stage1_repositories(
+                settings, self.warehouse
+            )
         self.repositories = repositories
         self.metadata_repository = self.repositories.metadata
         self.fundamental_repository = self.repositories.fundamentals
@@ -128,6 +131,10 @@ class FundamentalService:
             settings.tushare_token, settings.tushare_base_url,
             settings.tushare_realtime_url, settings.tushare_min_interval,
         )
+
+    def close(self) -> None:
+        if self.repository_database is not None:
+            self.repository_database.close()
 
     def _persist_tushare_response(
         self, api_name: str, params: Dict[str, Any], fields: str, result: Dict[str, Any]

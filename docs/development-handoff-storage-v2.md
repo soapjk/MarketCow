@@ -24,6 +24,17 @@ DuckDB
 
 当前阶段不是立即替换生产数据库，而是先建立存储接口、测试环境和可回滚的双写能力。
 
+### 2026-07-20 Stage 1 进展
+
+- 已完成 `MetadataRepository` 、`FundamentalRepository`、`MarketBarRepository`、
+  `ArtifactStore` 接口隔离和 DuckDB 兼容 backend；
+- PostgreSQL metadata backend 已实现连接池、独立 schema、事务化版本 migration、
+  migration advisory lock；
+- 已迁移任务记录、Provider 健康、Artifact manifest、日历和 Tushare 请求控制面；
+- PostgreSQL 目前只允许 development profile 显式启用，schema 必须以
+  `_development` 或 `_test` 结尾；
+- 基本面和行情仍由 DuckDB 承担，未连接或迁移正式 PostgreSQL。
+
 ## 二、仓库、分支和 worktree
 
 GitHub 仓库：

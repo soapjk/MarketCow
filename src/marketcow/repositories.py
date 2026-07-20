@@ -101,6 +101,19 @@ class ArtifactStore(Protocol):
     ) -> Optional[Dict[str, Any]]: ...
 
 
+@runtime_checkable
+class ArtifactManifestRepository(Protocol):
+    def save_artifact(self, row: Dict[str, Any]) -> None: ...
+    def save_artifacts(self, rows: List[Dict[str, Any]]) -> int: ...
+    def artifact_paths(self) -> set[str]: ...
+    def list_artifacts(
+        self, dataset: str = "", limit: int = 100
+    ) -> List[Dict[str, Any]]: ...
+    def latest_artifact(
+        self, dataset: str, metadata_key: str = "", metadata_value: str = ""
+    ) -> Optional[Dict[str, Any]]: ...
+
+
 @dataclass(frozen=True)
 class Repositories:
     metadata: MetadataRepository

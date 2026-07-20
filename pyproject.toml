@@ -27,6 +27,7 @@ dependencies = [
   "httpx>=0.25,<0.26",
   "mootdx>=0.11,<1",
   "pandas>=2.1,<3",
+  "psycopg[binary,pool]>=3.2,<4",
   "python-dotenv>=1.0,<2",
   "requests>=2.31,<3",
   "tushare>=1.4,<2",

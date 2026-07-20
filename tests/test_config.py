@@ -45,6 +45,42 @@ class SettingsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "production or development"):
                 Settings.from_env("staging")
 
+    def test_postgres_metadata_is_explicit_and_development_only(self):
+        root = Path("/tmp/marketcow-config-test")
+        base = dict(
+            database_path=root / "db.duckdb",
+            raw_path=root / "raw",
+            metadata_backend="postgres",
+            postgres_dsn="postgresql://localhost/marketcow_development",
+        )
+        with self.assertRaisesRegex(ValueError, "development-only"):
+            Settings(**base).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "POSTGRES_DSN"):
+            Settings(
+                root / "db.duckdb", root / "raw", profile="development", port=8791,
+                metadata_backend="postgres", postgres_dsn="",
+            ).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "schema must end"):
+            Settings(
+                **base, profile="development", port=8791,
+                postgres_schema="marketcow_production",
+            ).validate_runtime_isolation()
+
+    def test_postgres_environment_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            environment = {
+                "MARKETCOW_METADATA_BACKEND": "postgres",
+                "MARKETCOW_POSTGRES_DSN": "postgresql://localhost/marketcow_development",
+                "MARKETCOW_POSTGRES_SCHEMA": "tenant_test",
+            }
+            with patch.dict(os.environ, environment, clear=True), patch(
+                "pathlib.Path.cwd", return_value=Path(folder)
+            ):
+                settings = Settings.from_env("development")
+        self.assertEqual(settings.metadata_backend, "postgres")
+        self.assertEqual(settings.postgres_schema, "tenant_test")
+        settings.validate_runtime_isolation()
+
     def test_marketcow_home_changes_both_default_paths(self):
         with tempfile.TemporaryDirectory() as folder:
             with patch.dict(os.environ, {"MARKETCOW_HOME": folder}, clear=True):

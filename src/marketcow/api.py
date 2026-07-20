@@ -32,6 +32,7 @@ def create_app(
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
     app.state.service = service
+    app.add_event_handler("shutdown", service.close)
 
     def parse_as_of(value: str) -> str:
         if not value:
@@ -63,6 +64,7 @@ def create_app(
             "version": __version__,
             "profile": settings.profile,
             "database": str(settings.database_path),
+            "metadata_backend": settings.metadata_backend,
         }
 
     @app.post("/v1/tushare/realtime-quote")

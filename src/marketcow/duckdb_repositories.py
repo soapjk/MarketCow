@@ -6,15 +6,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .repositories import Repositories
+from .repositories import ArtifactManifestRepository, Repositories
 from .storage import Warehouse
 
 
 class LocalArtifactStore:
     """Filesystem artifact bodies with manifests persisted by DuckDB."""
 
-    def __init__(self, warehouse: Warehouse):
-        self._warehouse = warehouse
+    def __init__(self, manifest_repository: ArtifactManifestRepository):
+        self._manifest_repository = manifest_repository
 
     def write_json(
         self,
@@ -64,21 +64,21 @@ class LocalArtifactStore:
         return manifest
 
     def save_artifact(self, row: Dict[str, Any]) -> None:
-        self._warehouse.save_artifact(row)
+        self._manifest_repository.save_artifact(row)
 
     def save_artifacts(self, rows: List[Dict[str, Any]]) -> int:
-        return self._warehouse.save_artifacts(rows)
+        return self._manifest_repository.save_artifacts(rows)
 
     def artifact_paths(self) -> set[str]:
-        return self._warehouse.artifact_paths()
+        return self._manifest_repository.artifact_paths()
 
     def list_artifacts(self, dataset: str = "", limit: int = 100) -> List[Dict[str, Any]]:
-        return self._warehouse.list_artifacts(dataset, limit)
+        return self._manifest_repository.list_artifacts(dataset, limit)
 
     def latest_artifact(
         self, dataset: str, metadata_key: str = "", metadata_value: str = ""
     ) -> Optional[Dict[str, Any]]:
-        return self._warehouse.latest_artifact(dataset, metadata_key, metadata_value)
+        return self._manifest_repository.latest_artifact(dataset, metadata_key, metadata_value)
 
 
 def create_duckdb_repositories(warehouse: Warehouse) -> Repositories:
@@ -90,3 +90,22 @@ def create_duckdb_repositories(warehouse: Warehouse) -> Repositories:
         market_bars=warehouse,
         artifacts=LocalArtifactStore(warehouse),
     )
+
+
+def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Repositories, Any]:
+    """Select the metadata backend while market bars and fundamentals remain on DuckDB."""
+
+    settings.validate_runtime_isolation()
+    if settings.metadata_backend == "duckdb":
+        return create_duckdb_repositories(warehouse), None
+    from .postgres_repositories import PostgresDatabase, PostgresMetadataRepository
+
+    database = PostgresDatabase(settings.postgres_dsn, settings.postgres_schema)
+    database.open()
+    metadata = PostgresMetadataRepository(database)
+    return Repositories(
+        metadata=metadata,
+        fundamentals=warehouse,
+        market_bars=warehouse,
+        artifacts=LocalArtifactStore(metadata),
+    ), database
