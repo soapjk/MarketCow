@@ -158,6 +158,10 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         prog="marketcow",
         description="Run and maintain the local market data API",
     )
+    parser.add_argument(
+        "--profile", choices=("production", "development"), default=settings.profile,
+        help="runtime profile; must appear before the command",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     start = commands.add_parser("start", help="start the local HTTP API")
@@ -177,16 +181,25 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    settings = Settings.from_env()
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
         arguments = ["start"]
     elif arguments[0] in {"--host", "--port"}:
         arguments.insert(0, "start")
+    profile = None
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--profile="):
+            profile = argument.split("=", 1)[1]
+            break
+        if argument == "--profile" and index + 1 < len(arguments):
+            profile = arguments[index + 1]
+            break
+    settings = Settings.from_env(profile)
     parser = build_parser(settings)
     args = parser.parse_args(arguments)
 
     try:
+        settings.validate_runtime_isolation()
         if args.command == "init":
             print(json.dumps(initialize(settings), ensure_ascii=False, indent=2))
             return 0
@@ -218,6 +231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "set MARKETCOW_ALLOW_NON_LOOPBACK=1 only in a trusted network"
                 )
         initialize(settings)
+        os.environ["MARKETCOW_PROFILE"] = settings.profile
         uvicorn.run("marketcow.api:app", host=args.host, port=args.port)
         return 0
     except Exception as exc:

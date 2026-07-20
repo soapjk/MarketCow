@@ -16,6 +16,34 @@ class SettingsTest(unittest.TestCase):
 
         self.assertEqual(settings.database_path, Path(folder) / "data/warehouse/market_data.duckdb")
         self.assertEqual(settings.raw_path, Path(folder) / "data/raw")
+        self.assertEqual(settings.profile, "production")
+        self.assertEqual(settings.port, 8790)
+
+    def test_development_defaults_are_isolated(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.dict(os.environ, {}, clear=True), patch("pathlib.Path.cwd", return_value=Path(folder)):
+                settings = Settings.from_env("development")
+
+        self.assertEqual(settings.database_path, Path(folder) / "data-development/warehouse/market_data.duckdb")
+        self.assertEqual(settings.raw_path, Path(folder) / "data-development/raw")
+        self.assertEqual(settings.profile, "development")
+        self.assertEqual(settings.port, 8791)
+
+    def test_development_rejects_production_port_and_paths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch("pathlib.Path.cwd", return_value=root):
+                with self.assertRaisesRegex(ValueError, "production port"):
+                    Settings(root / "data-development/db.duckdb", root / "data-development/raw", port=8790,
+                             profile="development").validate_runtime_isolation()
+                with self.assertRaisesRegex(ValueError, "production data paths"):
+                    Settings(root / "data/warehouse/market_data.duckdb", root / "data/raw", port=8791,
+                             profile="development").validate_runtime_isolation()
+
+    def test_unknown_profile_is_rejected(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "production or development"):
+                Settings.from_env("staging")
 
     def test_marketcow_home_changes_both_default_paths(self):
         with tempfile.TemporaryDirectory() as folder:

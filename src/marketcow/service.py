@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +27,7 @@ from .providers.instrument_search import InstrumentSearchProvider
 from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normalize_a_symbol
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
 from .providers.calendar import CalendarProvider
+from .providers.tushare_provider import TushareProvider
 from .storage import FUNDAMENTAL_COLUMNS, Warehouse
 
 
@@ -97,6 +98,7 @@ class FundamentalService:
         sina_quote_provider: Optional[SinaRealtimeQuoteProvider] = None,
         a_quote_provider: Optional[EastmoneyRealtimeQuoteProvider] = None,
         calendar_provider: Optional[CalendarProvider] = None,
+        tushare_provider: Optional[TushareProvider] = None,
     ):
         self.settings = settings
         self.warehouse = warehouse or Warehouse(settings.database_path)
@@ -111,6 +113,87 @@ class FundamentalService:
         self.sina_quote_provider = sina_quote_provider or SinaRealtimeQuoteProvider()
         self.a_quote_provider = a_quote_provider or EastmoneyRealtimeQuoteProvider()
         self.calendar_provider = calendar_provider or CalendarProvider()
+        self.tushare_provider = tushare_provider or TushareProvider(
+            settings.tushare_token, settings.tushare_base_url,
+            settings.tushare_realtime_url, settings.tushare_min_interval,
+        )
+
+    def _persist_tushare_response(
+        self, api_name: str, params: Dict[str, Any], fields: str, result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        result = json_safe(result)
+        ingested_at = utc_now()
+        rows = self.tushare_provider.rows(result)
+        artifact = self._write_artifact(
+            self.settings.raw_path / "tushare" / api_name,
+            "tushare-" + api_name,
+            result,
+            self.tushare_provider.name,
+            self.tushare_provider.base_url + "/",
+            "data.fields + data.items",
+            ingested_at,
+            ingested_at,
+            {"api_name": api_name, "params": params, "fields": fields, "row_count": len(rows)},
+        )
+        self.warehouse.save_tushare_response({
+            "request_id": uuid.uuid4().hex, "api_name": api_name, "params": params,
+            "requested_fields": fields, "response_fields": (result.get("data") or {}).get("fields") or [],
+            "response_code": result.get("code"), "response_message": result.get("msg"),
+            "source": self.tushare_provider.name, "source_url": self.tushare_provider.base_url + "/",
+            "observed_at": ingested_at, "ingested_at": ingested_at,
+            "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"],
+        }, rows)
+        return artifact
+
+    def call_tushare(self, api_name: str, params: Dict[str, Any], fields: str = "") -> Dict[str, Any]:
+        result = self.tushare_provider.call(api_name, params, fields)
+        self._persist_tushare_response(api_name, params, fields, result)
+        self.warehouse.record_provider_health(self.tushare_provider.name, True, utc_now())
+        return result
+
+    def tushare_realtime_quote(self, ts_code: str) -> List[Dict[str, Any]]:
+        rows = json_safe(self.tushare_provider.realtime_quote(ts_code))
+        fields = list(rows[0]) if rows else []
+        result = {"code": 0, "msg": None, "data": {"fields": fields, "items": [[row.get(key) for key in fields] for row in rows]}}
+        self._persist_tushare_response("realtime_quote", {"ts_code": ts_code}, "", result)
+        return rows
+
+    def refresh_tushare_minute_history(
+        self, symbol: str, range_: str, interval: str, adjustment: str
+    ) -> Dict[str, Any]:
+        if adjustment != "raw":
+            raise ValueError("Tushare minute bars currently require adjustment=raw")
+        frequencies = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "60m": "60min", "1h": "60min"}
+        if interval not in frequencies:
+            raise ValueError("unsupported Tushare minute interval")
+        range_days = {"1d": 1, "5d": 5, "1mo": 31, "3mo": 93, "6mo": 186, "1y": 366, "2y": 732, "5y": 1830, "10y": 3660, "ytd": 366, "max": 3660}
+        if range_ not in range_days:
+            raise ValueError("unsupported range")
+        end = datetime.now().astimezone()
+        start = end - timedelta(days=range_days[range_])
+        params = {
+            "ts_code": symbol, "freq": frequencies[interval],
+            "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
+            "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        result = self.tushare_provider.call("stk_mins", params, "")
+        artifact = self._persist_tushare_response("stk_mins", params, "", result)
+        bars = self.tushare_provider.minute_bars(result)
+        ingested_at = utc_now()
+        count = self.warehouse.upsert_price_bars(
+            symbol, interval, "raw", self.tushare_provider.name, ingested_at, bars,
+            {"source_url": self.tushare_provider.base_url + "/", "observed_at": ingested_at,
+             "raw_response_locator": "data.items", "raw_path": artifact["storage_path"],
+             "raw_artifact_id": artifact["artifact_id"]},
+        )
+        self.warehouse.record_provider_health(self.tushare_provider.name, True, ingested_at)
+        return {
+            "symbol": symbol, "range": range_, "interval": interval, "adjustment": "raw",
+            "source": self.tushare_provider.name, "source_url": self.tushare_provider.base_url + "/",
+            "raw_response_locator": "data.items", "bars": bars, "count": count,
+            "observed_at": ingested_at, "ingested_at": ingested_at,
+            "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"],
+        }
 
     def search_instruments(self, query: str, limit: int = 12) -> List[Dict[str, Any]]:
         return self.search_provider.search(query, limit)
@@ -232,6 +315,8 @@ class FundamentalService:
         return row
 
     def refresh_quote_history(self, symbol: str, range_: str, interval: str, adjustment: str) -> Dict[str, Any]:
+        if interval in {"1m", "5m", "15m", "30m", "60m", "1h"} and symbol.endswith((".SH", ".SZ", ".BJ")):
+            return self.refresh_tushare_minute_history(symbol, range_, interval, adjustment)
         run_id, started_at = self._start_run("refresh_quote_history", symbol)
         try:
             result = self.quote_provider.fetch_history(symbol, range_, interval, adjustment)

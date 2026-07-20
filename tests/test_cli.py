@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import os
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -82,3 +83,13 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertTrue(self.settings.database_path.exists())
+
+    def test_main_development_profile_initializes_isolated_storage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.dict(os.environ, {}, clear=True), patch("pathlib.Path.cwd", return_value=Path(folder)):
+                with redirect_stdout(StringIO()):
+                    exit_code = main(["--profile", "development", "init"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(Path(folder, "data-development/warehouse/market_data.duckdb").exists())
+            self.assertFalse(Path(folder, "data/warehouse/market_data.duckdb").exists())

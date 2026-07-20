@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -68,8 +69,9 @@ def _session(meta: Dict[str, Any], timestamp: Optional[int]) -> str:
 class YahooQuoteProvider:
     name = "yahoo_chart"
 
-    def __init__(self, timeout: int = 12):
+    def __init__(self, timeout: float = 1.5, request_budget: float = 3.5):
         self.timeout = timeout
+        self.request_budget = request_budget
         self.session = requests.Session()
         self.session.trust_env = True
         self.headers = {
@@ -81,20 +83,27 @@ class YahooQuoteProvider:
     def _fetch_chart(self, symbol: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
         url = YAHOO_CHART_URL.format(symbol=symbol)
         source_url = url + "?" + urlencode(params)
+        deadline = time.monotonic() + self.request_budget
         try:
-            response = self.session.get(url, params=params, headers=self.headers, timeout=self.timeout)
+            response = self.session.get(
+                url, params=params, headers=self.headers,
+                timeout=min(self.timeout, self.request_budget),
+            )
             response.raise_for_status()
             return response.json(), source_url
         except (requests.RequestException, ValueError) as request_error:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.1:
+                raise RuntimeError(f"Yahoo chart request budget exhausted for {symbol}") from request_error
             try:
                 completed = subprocess.run(
                     [
-                        "curl", "-fsSL", "--max-time", str(self.timeout),
+                        "curl", "-fsSL", "--max-time", str(remaining),
                         "-A", self.headers["User-Agent"], "-e", self.headers["Referer"], source_url,
                     ],
                     capture_output=True,
                     text=True,
-                    timeout=self.timeout + 3,
+                    timeout=remaining + 0.2,
                     check=True,
                 )
                 return json.loads(completed.stdout), source_url

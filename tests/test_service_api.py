@@ -281,6 +281,7 @@ class ServiceApiTest(unittest.TestCase):
     def test_health(self):
         response = self.client.get("/v1/health")
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["profile"], "production")
         self.assertEqual(response.json()["status"], "ok")
         sources = self.client.get("/v1/sources/health")
         self.assertEqual(sources.status_code, 200)

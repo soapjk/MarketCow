@@ -22,8 +22,9 @@ class SinaRealtimeQuoteProvider:
 
     name = "sina_finance_hq"
 
-    def __init__(self, timeout: int = 8):
+    def __init__(self, timeout: float = 0.4, request_budget: float = 1.8):
         self.timeout = timeout
+        self.request_budget = request_budget
         self.session = requests.Session()
         self.direct_session = requests.Session()
         self.direct_session.trust_env = False
@@ -51,19 +52,23 @@ class SinaRealtimeQuoteProvider:
             ),
         ]
         errors: list[str] = []
+        deadline = time.monotonic() + self.request_budget
         for session, url, request_headers in candidates:
-            for attempt in range(2):
-                try:
-                    response = session.get(url, headers=request_headers, timeout=self.timeout)
-                    response.raise_for_status()
-                    text = response.content.decode("gbk", errors="replace").strip()
-                    if text:
-                        return text, url
-                    errors.append(f"{url}: empty response")
-                except requests.RequestException as exc:
-                    errors.append(f"{url}: {exc}")
-                    if attempt == 0:
-                        time.sleep(0.2)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append("request budget exhausted")
+                break
+            try:
+                response = session.get(
+                    url, headers=request_headers, timeout=max(0.05, min(self.timeout, remaining))
+                )
+                response.raise_for_status()
+                text = response.content.decode("gbk", errors="replace").strip()
+                if text:
+                    return text, url
+                errors.append(f"{url}: empty response")
+            except requests.RequestException as exc:
+                errors.append(f"{url}: {exc}")
         raise RuntimeError("Sina realtime quote failed: " + "; ".join(errors))
 
     @staticmethod

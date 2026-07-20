@@ -1,5 +1,8 @@
 import unittest
+import time
 from unittest.mock import Mock
+
+import requests
 
 from marketcow.providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normalize_a_symbol
 
@@ -21,6 +24,19 @@ class EastmoneyRealtimeQuoteProviderTest(unittest.TestCase):
         self.assertEqual(quote["price"], 0.603)
         self.assertEqual(quote["change_pct"], 1.34)
         self.assertEqual(quote["currency"], "CNY")
+
+    def test_retries_and_curl_share_one_wall_clock_budget(self):
+        provider = EastmoneyRealtimeQuoteProvider(timeout=0.1, request_budget=0.15)
+
+        def timeout(*args, **kwargs):
+            time.sleep(kwargs["timeout"])
+            raise requests.Timeout("simulated timeout")
+
+        provider.session.get = timeout
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+            provider.fetch_quote("513180.SH")
+        self.assertLess(time.monotonic() - started, 0.4)
 
 
 if __name__ == "__main__":

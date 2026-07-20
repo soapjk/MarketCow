@@ -276,6 +276,8 @@ class Warehouse:
             )
             for name in ("source_url", "observed_at", "raw_response_locator", "raw_path", "raw_artifact_id"):
                 con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS {0} VARCHAR".format(name))
+            con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS amount DOUBLE")
+            con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS payload_json VARCHAR")
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS economic_calendar_event (
@@ -325,6 +327,32 @@ class Warehouse:
             )
             con.execute(
                 "INSERT OR IGNORE INTO schema_migrations VALUES (3, 'economic and earnings calendar datasets', CAST(CURRENT_TIMESTAMP AS VARCHAR))"
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tushare_request (
+                    request_id VARCHAR PRIMARY KEY, api_name VARCHAR, params_json VARCHAR,
+                    requested_fields VARCHAR, response_fields_json VARCHAR,
+                    response_code INTEGER, response_message VARCHAR, row_count BIGINT,
+                    source VARCHAR, source_url VARCHAR, observed_at VARCHAR,
+                    ingested_at VARCHAR, raw_path VARCHAR, raw_artifact_id VARCHAR
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tushare_data_row (
+                    request_id VARCHAR, row_index BIGINT, api_name VARCHAR,
+                    symbol VARCHAR, data_date VARCHAR, source VARCHAR,
+                    source_url VARCHAR, observed_at VARCHAR, ingested_at VARCHAR,
+                    payload_json VARCHAR,
+                    PRIMARY KEY (request_id, row_index)
+                )
+                """
+            )
+            con.execute("CREATE INDEX IF NOT EXISTS idx_tushare_rows_api ON tushare_data_row(api_name, symbol, data_date)")
+            con.execute(
+                "INSERT OR IGNORE INTO schema_migrations VALUES (4, 'generic Tushare request and full-field row storage', CAST(CURRENT_TIMESTAMP AS VARCHAR))"
             )
             con.execute(
                 """
@@ -666,22 +694,59 @@ class Warehouse:
     def upsert_price_bars(self, symbol: str, interval: str, adjustment: str, source: str, ingested_at: str, bars: List[Dict[str, Any]], provenance: Optional[Dict[str, Any]] = None) -> int:
         provenance = provenance or {}
         values = [
-            [symbol, interval, adjustment, bar.get("timestamp"), bar.get("bar_at"), bar.get("open"), bar.get("high"), bar.get("low"), bar.get("close"), bar.get("raw_close"), bar.get("adjustment_factor"), bar.get("volume"), source, ingested_at, provenance.get("source_url"), provenance.get("observed_at") or bar.get("bar_at"), provenance.get("raw_response_locator"), provenance.get("raw_path"), provenance.get("raw_artifact_id")]
+            [symbol, interval, adjustment, bar.get("timestamp"), bar.get("bar_at"), bar.get("open"), bar.get("high"), bar.get("low"), bar.get("close"), bar.get("raw_close"), bar.get("adjustment_factor"), bar.get("volume"), source, ingested_at, provenance.get("source_url"), provenance.get("observed_at") or bar.get("bar_at"), provenance.get("raw_response_locator"), provenance.get("raw_path"), provenance.get("raw_artifact_id"), bar.get("amount"), json.dumps(bar.get("source_payload") or bar, ensure_ascii=False, allow_nan=False)]
             for bar in bars
         ]
         if values:
             with self._lock, self.connect() as con:
-                con.executemany("INSERT OR REPLACE INTO market_price_bar (symbol, interval, adjustment, timestamp, bar_at, open, high, low, close, raw_close, adjustment_factor, volume, source, ingested_at, source_url, observed_at, raw_response_locator, raw_path, raw_artifact_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+                con.executemany("INSERT OR REPLACE INTO market_price_bar (symbol, interval, adjustment, timestamp, bar_at, open, high, low, close, raw_close, adjustment_factor, volume, source, ingested_at, source_url, observed_at, raw_response_locator, raw_path, raw_artifact_id, amount, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
         return len(values)
+
+    def save_tushare_response(
+        self, request: Dict[str, Any], rows: List[Dict[str, Any]]
+    ) -> int:
+        date_keys = ("trade_time", "trade_date", "cal_date", "ann_date", "end_date", "date", "time")
+        values = []
+        for index, row in enumerate(rows):
+            symbol = row.get("ts_code") or row.get("code") or row.get("symbol")
+            data_date = next((row.get(key) for key in date_keys if row.get(key) not in (None, "")), None)
+            values.append([
+                request["request_id"], index, request["api_name"], symbol, data_date,
+                request["source"], request["source_url"], request["observed_at"],
+                request["ingested_at"], json.dumps(row, ensure_ascii=False, allow_nan=False),
+            ])
+        with self._lock, self.connect() as con:
+            con.execute(
+                "INSERT INTO tushare_request VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    request["request_id"], request["api_name"],
+                    json.dumps(request.get("params") or {}, ensure_ascii=False, allow_nan=False),
+                    request.get("requested_fields") or "",
+                    json.dumps(request.get("response_fields") or [], ensure_ascii=False),
+                    request.get("response_code"), request.get("response_message"), len(rows),
+                    request["source"], request["source_url"], request["observed_at"],
+                    request["ingested_at"], request.get("raw_path"), request.get("raw_artifact_id"),
+                ],
+            )
+            if values:
+                con.executemany(
+                    "INSERT INTO tushare_data_row VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values
+                )
+        return len(rows)
 
     def get_price_bars(self, symbol: str, interval: str, adjustment: str, limit: int) -> List[Dict[str, Any]]:
         with self._lock, self.connect() as con:
             rows = self._rows(
                 con,
-                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, low, close, raw_close, adjustment_factor, volume, source, ingested_at FROM market_price_bar WHERE symbol = ? AND interval = ? AND adjustment = ? ORDER BY timestamp DESC LIMIT ?",
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, low, close, raw_close, adjustment_factor, volume, amount, source, ingested_at, payload_json FROM market_price_bar WHERE symbol = ? AND interval = ? AND adjustment = ? ORDER BY timestamp DESC LIMIT ?",
                 [symbol, interval, adjustment, limit],
             )
-        return list(reversed(rows))
+        result = []
+        for row in reversed(rows):
+            payload = row.pop("payload_json", None)
+            row["source_payload"] = json.loads(payload) if payload else {}
+            result.append(row)
+        return result
 
     @staticmethod
     def _calendar_payload(row: Dict[str, Any]) -> Dict[str, Any]:

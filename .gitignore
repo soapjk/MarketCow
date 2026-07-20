@@ -1,5 +1,8 @@
 .DS_Store
 .env
+.env.*
+!.env.production.example
+!.env.development.example
 .internal/
 .venv/
 .venv*/
@@ -11,7 +14,9 @@ dist/
 .pytest_cache/
 .ruff_cache/
 data/
+data-development/
 logs/
+logs-development/
 state/
 *.sqlite3
 *.sqlite3-shm

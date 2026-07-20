@@ -1,9 +1,15 @@
 import unittest
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import Mock
 
+import requests
+from fastapi.testclient import TestClient
+
+from marketcow.api import create_app
 from marketcow.config import Settings
+from marketcow.providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider
 from marketcow.providers.sina_realtime import SinaRealtimeQuoteProvider
 from marketcow.service import FundamentalService
 from marketcow.storage import Warehouse
@@ -37,6 +43,20 @@ class SinaRealtimeQuoteProviderTest(unittest.TestCase):
         self.assertEqual(quote["previous_close"], 37.18)
         self.assertEqual(quote["source"], "sina_finance_hq")
         self.assertEqual(quote["quote_at"], "2026-07-15T15:34:59+08:00")
+
+    def test_all_fallbacks_share_one_wall_clock_budget(self):
+        provider = SinaRealtimeQuoteProvider(timeout=0.1, request_budget=0.15)
+
+        def timeout(*args, **kwargs):
+            time.sleep(kwargs["timeout"])
+            raise requests.Timeout("simulated timeout")
+
+        provider.session.get = timeout
+        provider.direct_session.get = timeout
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "request budget"):
+            provider.fetch_quote("600036.SH")
+        self.assertLess(time.monotonic() - started, 0.4)
 
 
 class AShareQuoteRoutingTest(unittest.TestCase):
@@ -107,6 +127,39 @@ class AShareQuoteRoutingTest(unittest.TestCase):
         self.assertTrue(cached["is_cached"])
         self.assertEqual(cached["price"], 37.75)
         self.assertIn("sina unavailable", cached["cache_reason"])
+
+    def test_upstream_timeouts_return_cached_quote_without_starving_snapshot(self):
+        seed_sina = Mock()
+        seed_sina.name = "sina_finance_hq"
+        seed_sina.fetch_quote.return_value = self.quote("sina_finance_hq")
+        service = self.service(seed_sina, Mock())
+        service.refresh_quote("600036.SH")
+
+        def timeout(*args, **kwargs):
+            time.sleep(kwargs["timeout"])
+            raise requests.Timeout("simulated timeout")
+
+        sina = SinaRealtimeQuoteProvider(timeout=0.1, request_budget=0.15)
+        sina.session.get = timeout
+        sina.direct_session.get = timeout
+        eastmoney = EastmoneyRealtimeQuoteProvider(timeout=0.1, request_budget=0.15)
+        eastmoney.session.get = timeout
+        service.sina_quote_provider = sina
+        service.a_quote_provider = eastmoney
+        client = TestClient(create_app(self.settings, service))
+
+        started = time.monotonic()
+        response = client.get("/v1/quotes/600036.SH")
+        quote_elapsed = time.monotonic() - started
+        started = time.monotonic()
+        snapshot = client.get("/v1/snapshot?limit=10")
+        snapshot_elapsed = time.monotonic() - started
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["is_cached"])
+        self.assertLess(quote_elapsed, 0.8)
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertLess(snapshot_elapsed, 0.5)
 
 
 if __name__ == "__main__":

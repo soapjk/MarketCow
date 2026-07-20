@@ -29,8 +29,9 @@ def normalize_a_symbol(value: str) -> str:
 class EastmoneyRealtimeQuoteProvider:
     name = "eastmoney_quote_center"
 
-    def __init__(self, timeout: int = 8):
+    def __init__(self, timeout: float = 0.7, request_budget: float = 1.8):
         self.timeout = timeout
+        self.request_budget = request_budget
         self.session = requests.Session()
         self.session.trust_env = True
 
@@ -42,22 +43,32 @@ class EastmoneyRealtimeQuoteProvider:
         headers={"User-Agent": "Mozilla/5.0 marketcow/0.1", "Referer": "https://quote.eastmoney.com/"}
         last_error = None
         payload = None
-        for attempt in range(3):
+        deadline = time.monotonic() + self.request_budget
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                response = self.session.get(EASTMONEY_QUOTE_URL, params=params, headers=headers, timeout=self.timeout)
+                response = self.session.get(
+                    EASTMONEY_QUOTE_URL, params=params, headers=headers,
+                    timeout=max(0.05, min(self.timeout, remaining)),
+                )
                 response.raise_for_status()
                 payload = response.json()
                 break
             except (requests.RequestException, ValueError) as exc:
                 last_error = exc
-                if attempt < 2:
-                    time.sleep(0.2 * (attempt + 1))
+                if attempt == 0 and deadline - time.monotonic() > 0.1:
+                    time.sleep(0.05)
         source_url = EASTMONEY_QUOTE_URL + "?" + urlencode(params)
         if payload is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.1:
+                raise RuntimeError("Eastmoney realtime quote request budget exhausted") from last_error
             try:
                 completed = subprocess.run(
-                    ["curl", "-fsSL", "--retry", "3", "--max-time", str(self.timeout * 2), "-A", headers["User-Agent"], "-e", headers["Referer"], source_url],
-                    capture_output=True, text=True, timeout=self.timeout * 3, check=True,
+                    ["curl", "-fsSL", "--max-time", str(remaining), "-A", headers["User-Agent"], "-e", headers["Referer"], source_url],
+                    capture_output=True, text=True, timeout=remaining + 0.2, check=True,
                 )
                 payload = json.loads(completed.stdout)
             except Exception as curl_error:

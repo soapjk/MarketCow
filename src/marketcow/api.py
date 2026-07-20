@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import Optional
+from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings
@@ -12,6 +13,15 @@ from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
+
+
+class TushareRequest(BaseModel):
+    params: Dict[str, Any] = Field(default_factory=dict)
+    fields: str = ""
+
+
+class TushareRealtimeRequest(BaseModel):
+    ts_code: str
 
 
 def create_app(
@@ -51,8 +61,28 @@ def create_app(
         return {
             "status": "ok",
             "version": __version__,
+            "profile": settings.profile,
             "database": str(settings.database_path),
         }
+
+    @app.post("/v1/tushare/realtime-quote")
+    def tushare_realtime_quote(request: TushareRealtimeRequest):
+        try:
+            items = service.tushare_realtime_quote(request.ts_code)
+            return {"count": len(items), "items": items, "source": "tushare_realtime"}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/tushare/{api_name}")
+    def tushare_call(api_name: str, request: TushareRequest):
+        try:
+            return service.call_tushare(api_name, request.params, request.fields)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/economic-calendar")
     def economic_calendar(
@@ -185,7 +215,13 @@ def create_app(
         limit: int = Query(500, ge=1, le=5000),
     ):
         try:
-            normalized, _ = normalize_yahoo_symbol(symbol)
+            if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
+                try:
+                    normalized = normalize_a_symbol(symbol)
+                except ValueError:
+                    normalized, _ = normalize_yahoo_symbol(symbol)
+            else:
+                normalized, _ = normalize_yahoo_symbol(symbol)
             if refresh:
                 result = service.refresh_quote_history(normalized, range_, interval, adjustment)
                 result["bars"] = result["bars"][-limit:]

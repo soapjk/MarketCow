@@ -81,6 +81,41 @@ uv run marketcow start
 
 服务默认仅监听 `127.0.0.1:8790`，交互式接口文档位于 `http://127.0.0.1:8790/docs`。
 
+### 正式版与开发版隔离
+
+运行配置分为 `production` 和 `development`。正式服务继续使用 8790 和现有 `data/`；
+开发服务默认使用 8791 和完全独立的 `data-development/`：
+
+| 配置 | HTTP 端口 | 数据目录 | 配置文件 |
+|---|---:|---|---|
+| production | 8790 | `data/` | `.env.production`，公共机密可放 `.env` |
+| development | 8791 | `data-development/` | `.env.development`，公共机密可放 `.env` |
+
+启动正式版：
+
+```bash
+uv run marketcow --profile production start
+```
+
+启动开发版：
+
+```bash
+uv run marketcow --profile development start
+```
+
+也可以设置 `MARKETCOW_PROFILE=development`。`--profile` 必须放在子命令之前。
+开发配置如果指向 8790 或默认正式数据目录，服务会拒绝启动。两个环境的健康接口会明确返回
+`profile`、数据库路径和版本：
+
+```bash
+curl http://127.0.0.1:8790/v1/health
+curl http://127.0.0.1:8791/v1/health
+```
+
+真实 `.env`、`.env.production` 和 `.env.development` 均被 Git 忽略；仓库只提交不含凭证的
+`.env.production.example` 与 `.env.development.example`。开发环境应优先使用独立的上游凭证，
+避免测试消耗正式环境配额。
+
 启动命令会自动创建本地数据库和数据目录。此时已经可以按需查询 A 股、ETF、港股和美股行情：
 
 ```bash
@@ -133,6 +168,50 @@ curl 'http://127.0.0.1:8790/v1/fundamentals/600298?as_of=2026-07-17'
 curl 'http://127.0.0.1:8790/v1/funnel/metrics?min_roe_median=15&max_pe=25'
 curl 'http://127.0.0.1:8790/v1/snapshot?limit=50&days=30'
 ```
+
+### Tushare 通用接口
+
+在被 Git 忽略的本地 `.env` 中配置 `TUSHARE_TOKEN` 后，可以通过同一个路由调用任意
+Tushare Pro 接口。路由中的名字就是官方 `api_name`，请求体原样接受 `params` 和
+`fields`，因此上游新增接口时不需要在 MarketCow 中逐个增加适配代码：
+
+```bash
+curl -X POST 'http://127.0.0.1:8790/v1/tushare/daily' \
+  -H 'Content-Type: application/json' \
+  -d '{"params":{"trade_date":"20260717"},"fields":"ts_code,trade_date,open,high,low,close"}'
+
+curl -X POST 'http://127.0.0.1:8790/v1/tushare/income' \
+  -H 'Content-Type: application/json' \
+  -d '{"params":{"ts_code":"600519.SH","period":"20251231"},"fields":""}'
+```
+
+文档中的特殊实时接口单独映射为：
+
+```bash
+curl -X POST 'http://127.0.0.1:8790/v1/tushare/realtime-quote' \
+  -H 'Content-Type: application/json' \
+  -d '{"ts_code":"600000.SH,000001.SZ,000001.SH"}'
+```
+
+所有成功的 Tushare 请求都会落库：`tushare_request` 保存接口名、参数、字段、来源及原始
+文件定位，`tushare_data_row` 按行保存上游返回的完整动态字段。原始响应同时写入
+`data/raw/tushare/`，因此统一字段映射不会造成上游字段丢失。
+
+A 股分钟 K 线已经接入统一 history 路由，支持 `1m/5m/15m/30m/60m/1h`。分钟数据会
+同时写入通用 Tushare 表和 `market_price_bar`，后者包含统一 OHLCV、成交额、完整源行及
+`source`：
+
+```bash
+curl 'http://127.0.0.1:8790/v1/quotes/600000.SH/history?range=5d&interval=5m&adjustment=raw'
+```
+
+当前 Tushare HTTP 分钟接口按未复权数据接入，因此分钟请求必须明确使用
+`adjustment=raw`；服务不会把未复权数据错误标记成前复权数据。
+
+默认中转地址分别为 `https://fastapic.stockai888.top` 与
+`https://realtime.stockai888.top`。Provider 强制发送 gzip 请求头，并以每次至少 0.5 秒
+的间隔将频率限制在文档规定的每分钟 120 次以内。可通过
+`TUSHARE_BASE_URL`、`TUSHARE_REALTIME_URL` 和 `TUSHARE_MIN_INTERVAL` 覆盖配置。
 
 大多数用户使用 `sync-cn` 即可，不需要理解刷新顺序。需要精细控制时，底层运维接口位于 `/v1/admin/*`，例如：
 
@@ -215,6 +294,7 @@ uv pip check
 
 - [初始架构](docs/architecture/initial-architecture.md)
 - [ADR-001：本地优先、分层存储与统一 API](docs/decisions/ADR-001-local-first-data-platform.md)
+- [ADR-002：拆分事务型数据与大规模行情时序存储](docs/decisions/ADR-002-split-transactional-and-market-time-series-storage.md)
 - [实施路线](docs/roadmap.md)
 - [日历 API 契约](docs/calendar-api.md)
 
