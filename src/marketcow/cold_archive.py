@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import shutil
@@ -38,6 +39,18 @@ def _json_hash(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _logical_json_bytes(value: Any) -> int:
+    return len(json.dumps(value, default=str).encode("utf-8"))
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _month_bounds(year: int, month: int) -> tuple[int, int]:
@@ -103,6 +116,16 @@ class ParquetColdArchive:
 
     def export_partition(self, market: str, interval: str, source: str,
                          year: int, month: int) -> Dict[str, Any]:
+        lock_path = self.archive_root / ".archive.lock"
+        with lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                return self._export_partition_locked(market, interval, source, year, month)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _export_partition_locked(self, market: str, interval: str, source: str,
+                                 year: int, month: int) -> Dict[str, Any]:
         start, end = _month_bounds(year, month)
         partition = self._partition(market, interval, source, year, month)
         params = [market, interval, source, start, end]
@@ -153,7 +176,7 @@ class ParquetColdArchive:
                 "business_key_checksum": key_checksum,
                 "parquet_sha256": parquet_checksum,
                 "parquet_bytes": parquet.stat().st_size,
-                "logical_json_bytes": len(json.dumps(logical_rows, default=str).encode("utf-8")),
+                "logical_json_bytes": _logical_json_bytes(logical_rows),
                 "schema": schema,
                 "watermark": {
                     "min_timestamp": min(row["timestamp"] for row in logical_rows),
@@ -169,7 +192,19 @@ class ParquetColdArchive:
                 os.fsync(handle.fileno())
             if self.fault_hook:
                 self.fault_hook("after_manifest")
+            _fsync_directory(staging)
+            _fsync_directory(self.staging_root)
+            if self.fault_hook:
+                self.fault_hook("after_staging_fsync")
             partition.mkdir(parents=True, exist_ok=True)
+            current = partition
+            while True:
+                _fsync_directory(current)
+                if current == self.archive_root:
+                    break
+                current = current.parent
+            if self.fault_hook:
+                self.fault_hook("after_partition_fsync")
             try:
                 os.replace(staging, final)
             except OSError:
@@ -177,11 +212,8 @@ class ParquetColdArchive:
                     shutil.rmtree(staging, ignore_errors=True)
                     return self.verify(final)
                 raise
-            directory_fd = os.open(partition, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _fsync_directory(self.staging_root)
+            _fsync_directory(partition)
             if self.fault_hook:
                 self.fault_hook("after_publish")
             return self.verify(final)
@@ -196,6 +228,13 @@ class ParquetColdArchive:
         except ValueError as error:
             raise ValueError("archive artifact escapes archive root") from error
         manifest_path, parquet = artifact / "manifest.json", artifact / "data.parquet"
+        for path in (manifest_path, parquet):
+            try:
+                path.resolve().relative_to(artifact)
+            except ValueError as error:
+                raise ValueError("archive file escapes artifact directory") from error
+            if path.is_symlink():
+                raise ValueError("archive files must not be symlinks")
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
@@ -221,8 +260,7 @@ class ParquetColdArchive:
             ).fetchall()
             columns = [row[0] for row in description]
             rows = con.execute(
-                f"SELECT * FROM read_parquet('{target}', hive_partitioning=false) ORDER BY "
-                "symbol, interval, adjustment, timestamp, source"
+                f"SELECT * FROM read_parquet('{target}', hive_partitioning=false)"
             ).fetchall()
         actual_schema = [{"name": row[0], "type": row[1]} for row in description]
         if actual_schema != manifest.get("schema"):
@@ -232,11 +270,55 @@ class ParquetColdArchive:
                 f"archive parquet schema or row count mismatch: {columns!r}/{len(rows)}"
             )
         logical_rows = [dict(zip(DATA_COLUMNS, row)) for row in rows]
-        if _json_hash(logical_rows) != manifest.get("logical_checksum"):
+        logical_checksum = _json_hash(logical_rows)
+        if logical_checksum != manifest.get("logical_checksum"):
             raise ValueError("archive logical checksum mismatch")
         keys = [[row[column] for column in BUSINESS_KEY] for row in logical_rows]
         if _json_hash(keys) != manifest.get("business_key_checksum"):
             raise ValueError("archive business key checksum mismatch")
+        key_tuples = [tuple(key) for key in keys]
+        if len(set(key_tuples)) != len(key_tuples):
+            raise ValueError("archive contains duplicate business keys")
+        if key_tuples != sorted(key_tuples):
+            raise ValueError("archive physical rows are not in business-key order")
+        partition = manifest.get("partition")
+        if not isinstance(partition, dict):
+            raise ValueError("archive partition metadata is invalid")
+        try:
+            expected_partition = self._partition(
+                partition["market"], partition["interval"], partition["source"],
+                int(partition["year"]), int(partition["month"]),
+            ).resolve()
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("archive partition metadata is invalid") from error
+        artifact_id = logical_checksum[:24]
+        if manifest.get("artifact_id") != artifact_id:
+            raise ValueError("archive artifact id does not match logical content")
+        if artifact != expected_partition / artifact_id:
+            raise ValueError("archive directory does not match manifest partition")
+        start, end = _month_bounds(int(partition["year"]), int(partition["month"]))
+        for row in logical_rows:
+            actual_market = ("CN" if str(row["symbol"]).endswith((".SH", ".SZ", ".BJ"))
+                             else "HK" if str(row["symbol"]).endswith(".HK") else "US")
+            if (actual_market != partition["market"] or
+                    row["interval"] != partition["interval"] or
+                    row["source"] != partition["source"] or
+                    not start <= int(row["timestamp"]) < end):
+                raise ValueError("archive rows do not match manifest partition")
+        ingested = sorted(_utc_iso(row["ingested_at"]) for row in logical_rows)
+        watermark = {
+            "min_timestamp": min(row["timestamp"] for row in logical_rows),
+            "max_timestamp": max(row["timestamp"] for row in logical_rows),
+            "min_ingested_at": ingested[0], "max_ingested_at": ingested[-1],
+        }
+        if manifest.get("watermark") != watermark:
+            raise ValueError("archive watermark does not match parquet content")
+        if manifest.get("parquet_bytes") != parquet.stat().st_size:
+            raise ValueError("archive parquet byte size mismatch")
+        if manifest.get("logical_json_bytes") != _logical_json_bytes(logical_rows):
+            raise ValueError("archive logical byte size mismatch")
+        if manifest.get("dataset") != "market_price_bar_raw":
+            raise ValueError("archive dataset contract mismatch")
         return {**manifest, "artifact_path": str(artifact), "status": "verified"}
 
     def query(self, artifact: Path, where: str = "", params: Sequence[Any] = (),

@@ -1,16 +1,28 @@
 import hashlib
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+import marketcow.cold_archive as cold_archive_module
 from marketcow.cold_archive import MANIFEST_VERSION, ParquetColdArchive
 from marketcow.storage import Warehouse
 
 
 def epoch(value):
     return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+
+
+def resign(manifest):
+    unsigned = {key: value for key, value in manifest.items()
+                if key != "manifest_payload_sha256"}
+    manifest["manifest_payload_sha256"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"), default=str,
+    ).encode()).hexdigest()
 
 
 class ColdArchiveTest(unittest.TestCase):
@@ -117,18 +129,98 @@ class ColdArchiveTest(unittest.TestCase):
             self.archive.verify(artifact)
         manifest["row_count"] -= 1
         manifest["schema_version"] = 999
-        unsigned = {key: value for key, value in manifest.items()
-                    if key != "manifest_payload_sha256"}
-        manifest["manifest_payload_sha256"] = hashlib.sha256(json.dumps(
-            unsigned, ensure_ascii=False, allow_nan=False, sort_keys=True,
-            separators=(",", ":"), default=str,
-        ).encode()).hexdigest()
+        resign(manifest)
         manifest_path.write_text(json.dumps(manifest))
         with self.assertRaisesRegex(ValueError, "schema version"):
             self.archive.read_for_backfill(artifact)
         manifest_path.write_text("not-json")
         with self.assertRaisesRegex(ValueError, "manifest"):
             self.archive.verify(artifact)
+
+    def test_resigned_derived_metadata_and_directory_mismatch_are_rejected(self):
+        self.insert(times=["2026-07-01T00:00:00Z"])
+        result = self.archive.export_partition("HK", "1m", "fixture", 2026, 7)
+        artifact = Path(result["artifact_path"])
+        manifest_path = artifact / "manifest.json"
+        original = json.loads(manifest_path.read_text())
+        cases = [
+            ("watermark", lambda item: item["watermark"].update(max_timestamp=1)),
+            ("partition", lambda item: item["partition"].update(year=2099)),
+            ("parquet byte", lambda item: item.update(parquet_bytes=1)),
+            ("logical byte", lambda item: item.update(logical_json_bytes=1)),
+            ("artifact id", lambda item: item.update(artifact_id="0" * 24)),
+        ]
+        for label, mutate in cases:
+            manifest = json.loads(json.dumps(original))
+            mutate(manifest)
+            resign(manifest)
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "archive", msg=label):
+                self.archive.verify(artifact)
+        manifest_path.write_text(json.dumps(original))
+        wrong = artifact.parent / ("f" * 24)
+        artifact.rename(wrong)
+        with self.assertRaisesRegex(ValueError, "directory"):
+            self.archive.verify(wrong)
+
+    def test_symlink_artifact_and_file_escape_are_rejected(self):
+        self.insert(times=["2026-07-01T00:00:00Z"])
+        result = self.archive.export_partition("HK", "1m", "fixture", 2026, 7)
+        artifact = Path(result["artifact_path"])
+        outside = Path(self.folder.name) / "outside.parquet"
+        outside.write_bytes((artifact / "data.parquet").read_bytes())
+        (artifact / "data.parquet").unlink()
+        (artifact / "data.parquet").symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "symlink|escapes"):
+            self.archive.verify(artifact)
+        artifact_link = self.archive.archive_root / "artifact-link"
+        artifact_link.symlink_to(Path(self.folder.name), target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            self.archive.verify(artifact_link)
+
+    def test_concurrent_same_content_publishes_once(self):
+        self.insert(times=["2026-07-01T00:00:00Z"])
+        results = []
+        errors = []
+
+        def export():
+            try:
+                results.append(self.archive.export_partition(
+                    "HK", "1m", "fixture", 2026, 7
+                ))
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=export) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len({item["artifact_id"] for item in results}), 1)
+        artifact = Path(results[0]["artifact_path"])
+        self.assertEqual([path for path in artifact.parent.iterdir() if path.is_dir()],
+                         [artifact])
+
+    def test_directory_fsync_order_covers_staging_hierarchy_and_publish(self):
+        self.insert(times=["2026-07-01T00:00:00Z"])
+        calls = []
+        real_fsync = cold_archive_module._fsync_directory
+
+        def record(path):
+            calls.append(Path(path))
+            real_fsync(path)
+
+        with patch("marketcow.cold_archive._fsync_directory", side_effect=record):
+            result = self.archive.export_partition("HK", "1m", "fixture", 2026, 7)
+        artifact = Path(result["artifact_path"])
+        staging_index = next(index for index, path in enumerate(calls)
+                             if path.parent == self.archive.staging_root)
+        partition_indices = [index for index, path in enumerate(calls)
+                             if path == artifact.parent]
+        self.assertEqual(len(partition_indices), 2)
+        self.assertLess(staging_index, partition_indices[0])
+        self.assertLess(partition_indices[0], partition_indices[1])
 
     def test_representative_zstd_compression_and_business_key_integrity(self):
         self.insert(count=1000)
