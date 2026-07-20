@@ -240,6 +240,21 @@ class OfflineFullImportIntegrationTest(unittest.TestCase):
                 self.assertEqual(client.query("SELECT count() FROM market_bar_raw FINAL").result_rows[0][0], 2)
                 self.assertEqual(client.query("SELECT count() FROM market_bar_canonical FINAL").result_rows[0][0], 2)
                 self.assertEqual(catchup.run(), caught_up)
+                with warehouse.connect() as connection:
+                    connection.execute(
+                        "UPDATE provider_health SET status='unavailable' WHERE provider='fixture'"
+                    )
+                advanced = catchup.run(max_passes=3)
+                self.assertEqual(advanced["lag"], 0)
+                self.assertNotEqual(
+                    advanced["source_high_watermark"]["source_fingerprint"],
+                    caught_up["source_high_watermark"]["source_fingerprint"],
+                )
+                with pg.connection() as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT status FROM provider_health WHERE provider='fixture'"
+                    ).fetchone()["status"], "unavailable")
+                self.assertEqual(catchup.run(), advanced)
             finally:
                 ch.close()
                 pg.close()

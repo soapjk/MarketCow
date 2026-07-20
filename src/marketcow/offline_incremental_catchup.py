@@ -164,14 +164,41 @@ class OfflineIncrementalCatchup:
             try:
                 checkpoint = self._load(full)
                 if checkpoint["phase"] == "complete":
-                    expected = self._completion_report(checkpoint)
-                    if not self.report_path.exists():
-                        _atomic(self.report_path, expected)
-                        return expected
-                    report = json.loads(self.report_path.read_text())
-                    if report != expected:
-                        raise ValueError("incremental report binding mismatch")
-                    return report
+                    current = self.source.inspect()["source_fingerprint"]
+                    completed_at = checkpoint.get("source_high_watermark", {}).get("source_fingerprint")
+                    if current != completed_at:
+                        history = checkpoint.setdefault("completion_history", [])
+                        history.append({
+                            "source_fingerprint": completed_at,
+                            "stability": checkpoint.get("stability", []),
+                            "passes": checkpoint.get("passes", 0),
+                            "checkpoint_checksum": checkpoint["checksum"],
+                            "completion": checkpoint.get("completion", {}),
+                        })
+                        checkpoint["completion_history"] = history[-MAX_PASSES:]
+                        checkpoint["phase"] = "catchup"
+                        checkpoint["stability"] = []
+                        checkpoint["active_fingerprint"] = ""
+                        checkpoint.pop("completion", None)
+                        self._save(checkpoint)
+                        _atomic(self.report_path, {
+                            "version": CATCHUP_VERSION,
+                            "status": "incomplete",
+                            "catchup_run_id": checkpoint["catchup_run_id"],
+                            "passes": checkpoint["passes"],
+                            "lag": 1,
+                            "reason": "source_advanced_after_completion",
+                            "checkpoint_checksum": checkpoint["checksum"],
+                        })
+                    else:
+                        expected = self._completion_report(checkpoint)
+                        if not self.report_path.exists():
+                            _atomic(self.report_path, expected)
+                            return expected
+                        report = json.loads(self.report_path.read_text())
+                        if report != expected:
+                            raise ValueError("incremental report binding mismatch")
+                        return report
                 for _ in range(max_passes):
                     before = self.source.inspect()["source_fingerprint"]
                     self._stage_snapshot(before)

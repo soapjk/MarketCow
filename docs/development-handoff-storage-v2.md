@@ -1693,7 +1693,10 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   完成必须依次取得 catch-up 前、全域 reconcile 前、reconcile 后三个完全相同的 source fingerprint，并再次
   通过 18 个 PG 域、CH raw/canonical FINAL selection/provenance、Artifact body/manifest、migration 版本及
   spool pending/failed/intent/quarantine 空闸门；否则报告 `lag=1/status=incomplete`，只有全部成立才写
-  `lag=0/status=complete`。报告仅含逻辑目标、高水位 checksum、稳定窗口、批次数与有界域 checksum，不含
+  `lag=0/status=complete`。任何重复调用在返回既有 complete 前仍须重新读取 verified source fingerprint；
+  未变化才允许无写入幂等返回，变化则先把上一代 completion/checkpoint checksum 存入最多 10 代的审计历史，
+  原子转回 catch-up，并重新完成三点稳定和全域闸门。旧报告缺失或被篡改不能遮蔽新 source generation。
+  报告仅含逻辑目标、高水位 checksum、稳定窗口、批次数与有界域 checksum，不含
   DSN、凭证、绝对路径或原始异常。真实 disposable PG16+CH25.8 合成演练覆盖 full→活动源 PG update +
   market append→catch-up、批次/checkpoint 窗口中断续跑、重复运行幂等；固定时钟/Mock 回归覆盖窗口注入后
   多轮稳定、伪造 full/checkpoint、短确认与不稳定窗口 fail-closed。未实现 CDC 或读取真实副本。

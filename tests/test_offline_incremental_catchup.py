@@ -89,7 +89,71 @@ class OfflineIncrementalCatchupTest(unittest.TestCase):
         self.assertEqual(report["lag"], 0)
         self.assertEqual(report["stability"], ["stable"] * 3)
         self.catchup.report_path.unlink()
+        self.catchup.source.inspect.side_effect = None
+        self.catchup.source.inspect.return_value = {"source_fingerprint": "stable"}
         self.assertEqual(self.catchup.run(max_passes=1), report)
+
+    def test_completed_source_advance_reopens_catchup_and_preserves_audit(self):
+        self._full_checkpoint()
+        self.catchup.source.inspect.side_effect = [
+            {"source_fingerprint": "a"}, {"source_fingerprint": "a"},
+            {"source_fingerprint": "a"},
+        ]
+        self.catchup._stage_snapshot = Mock()
+        self.catchup._watermark = Mock(side_effect=lambda value: {
+            "source_fingerprint": value, "tables": [],
+        })
+        self.catchup._apply = Mock()
+        self.catchup.full._reconcile = Mock(return_value={"status": "ok", "domains": []})
+        self.catchup._record_control_checkpoint = Mock()
+        first = self.catchup.run(max_passes=1)
+        self.assertEqual(first["lag"], 0)
+
+        # A missing old report cannot mask a newly observed source.  A subsequent
+        # source fault must leave durable lag rather than resurrecting old success.
+        self.catchup.report_path.unlink()
+        self.catchup.source.inspect.side_effect = [
+            {"source_fingerprint": "b"},  # completed-state freshness probe
+            RuntimeError("synthetic source fault"),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "source fault"):
+            self.catchup.run(max_passes=1)
+        self.assertEqual(json.loads(self.catchup.report_path.read_text())["lag"], 1)
+        checkpoint = json.loads(self.catchup.checkpoint_path.read_text())
+        self.assertEqual(checkpoint["phase"], "catchup")
+        self.assertEqual(checkpoint["completion_history"][0]["source_fingerprint"], "a")
+
+        self.catchup.source.inspect.side_effect = [
+            {"source_fingerprint": "b"}, {"source_fingerprint": "c"},
+        ]
+        second = self.catchup.run(max_passes=1)
+        self.assertEqual(second["status"], "incomplete")
+        self.assertEqual(second["lag"], 1)
+
+        # Once b is stable at all three independent observations, complete a new
+        # generation.  A subsequent unchanged call is a read-only idempotent check.
+        writes_before = self.catchup._apply.call_count
+        self.catchup.source.inspect.side_effect = [
+            {"source_fingerprint": "b"}, {"source_fingerprint": "b"},
+            {"source_fingerprint": "b"},
+        ]
+        third = self.catchup.run(max_passes=1)
+        self.assertEqual(third["lag"], 0)
+        self.assertEqual(third["stability"], ["b"] * 3)
+        self.assertGreater(self.catchup._apply.call_count, writes_before)
+        writes_after = self.catchup._apply.call_count
+        self.catchup.source.inspect.side_effect = None
+        self.catchup.source.inspect.return_value = {"source_fingerprint": "b"}
+        self.assertEqual(self.catchup.run(max_passes=1), third)
+        self.assertEqual(self.catchup._apply.call_count, writes_after)
+
+        self.catchup.report_path.write_text('{"status":"complete","lag":0}')
+        self.catchup.source.inspect.side_effect = [
+            {"source_fingerprint": "c"}, {"source_fingerprint": "c"},
+            {"source_fingerprint": "d"},
+        ]
+        tampered = self.catchup.run(max_passes=1)
+        self.assertEqual(tampered["lag"], 1)
 
     def test_window_mutation_retries_and_only_second_stable_pass_completes(self):
         self._full_checkpoint()
