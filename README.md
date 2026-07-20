@@ -97,6 +97,27 @@ uv run marketcow start
 uv run marketcow --profile production start
 ```
 
+长期后台运行建议使用 macOS `launchd`，不依赖终端或 tmux 会话。项目提供的
+LaunchAgent 只启动 production profile，固定监听 `127.0.0.1:8790`：
+
+```bash
+./ops/launchd/install.sh
+launchctl print gui/$(id -u)/com.marketcow.production
+curl http://127.0.0.1:8790/v1/health
+```
+
+卸载：
+
+```bash
+./ops/launchd/uninstall.sh
+```
+
+日志写入 `~/Library/Logs/MarketCow/production.log` 和
+`~/Library/Logs/MarketCow/production.error.log`。LaunchAgent 通过安装在
+`~/Library/Application Support/MarketCow/` 的包装脚本进入项目目录，避免将
+launchd 自身的入口和日志放在外置卷。安装前必须先停止其他占用 8790 的进程，
+避免 launchd 与手工启动的服务相互竞争。
+
 启动开发版：
 
 ```bash
