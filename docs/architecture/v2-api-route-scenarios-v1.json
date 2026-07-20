@@ -8,9 +8,13 @@
         "query": {}
       },
       "shape": {
-        "non_json": "boolean"
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        }
       },
-      "status": 500
+      "status": 200
     },
     "GET /v1/admin/jobs": {
       "request": {
@@ -130,9 +134,9 @@
         "query": {}
       },
       "shape": {
-        "detail": "string"
+        "symbol": "string"
       },
-      "status": 404
+      "status": 200
     },
     "GET /v1/fundamentals/{symbol}/history": {
       "request": {
@@ -300,9 +304,23 @@
         }
       },
       "shape": {
-        "detail": "string"
+        "adjustment": "string",
+        "bar_at": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "truncated": "boolean"
       },
-      "status": 400
+      "status": 200
     },
     "GET /v1/quotes/cross-section/as-of": {
       "request": {
@@ -315,9 +333,31 @@
         }
       },
       "shape": {
-        "detail": "string"
+        "adjustment": "string",
+        "as_of": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "max_lookback_seconds": "integer",
+        "max_staleness_seconds": "null",
+        "newest_ingested_at": "null",
+        "next_cursor": "null",
+        "page_size": "integer",
+        "served_at": "string",
+        "symbols": {
+          "items": "string",
+          "type": "array"
+        },
+        "truncated": "boolean"
       },
-      "status": 400
+      "status": 200
     },
     "GET /v1/quotes/cross-section/matrix": {
       "request": {
@@ -330,9 +370,33 @@
         }
       },
       "shape": {
-        "detail": "string"
+        "adjustment": "string",
+        "bar_ats": {
+          "items": "string",
+          "type": "array"
+        },
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "matrix_cells": "integer",
+        "newest_ingested_at": "null",
+        "next_cursor": "null",
+        "page_size": "integer",
+        "served_at": "string",
+        "symbols": {
+          "items": "string",
+          "type": "array"
+        },
+        "truncated": "boolean"
       },
-      "status": 400
+      "status": 200
     },
     "GET /v1/quotes/{symbol}": {
       "request": {
@@ -358,9 +422,22 @@
         }
       },
       "shape": {
-        "detail": "string"
+        "adjustment": "string",
+        "as_of": "string",
+        "bar": "null",
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "max_lookback_seconds": "integer",
+        "max_staleness_seconds": "null",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "symbol": "string"
       },
-      "status": 502
+      "status": 200
     },
     "GET /v1/quotes/{symbol}/history": {
       "request": {
@@ -370,9 +447,22 @@
         "query": {}
       },
       "shape": {
-        "detail": "string"
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "symbol": "string"
       },
-      "status": 502
+      "status": 200
     },
     "GET /v1/quotes/{symbol}/raw-history": {
       "request": {
@@ -385,9 +475,25 @@
         }
       },
       "shape": {
-        "detail": "string"
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "end": "string",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "start": "string",
+        "symbol": "string",
+        "truncated": "boolean"
       },
-      "status": 400
+      "status": 200
     },
     "GET /v1/readiness": {
       "request": {
@@ -463,9 +569,11 @@
         "query": {}
       },
       "shape": {
-        "non_json": "boolean"
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
       },
-      "status": 500
+      "status": 200
     },
     "GET /v1/sources/health": {
       "request": {
@@ -703,5 +811,5 @@
     }
   },
   "schema": "marketcow.old-main-api-contract.v1.route-scenarios",
-  "sha256": "965828edb92235ac8aeaff1b797c430b8d0d573ddb943cd9439ecb643aa9ce88"
+  "sha256": "c688681c58333f9d9a8276a2dd2523f80859f4876abcbb37f2855a77b1ab3c9c"
 }

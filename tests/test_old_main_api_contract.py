@@ -69,6 +69,31 @@ class FixtureRepository:
             for symbol in symbols if symbol != "MISSING"
         ]
 
+    def get_price_bars(self, *_args):
+        return []
+
+    def get_price_bars_range(self, *_args):
+        return [], False
+
+    get_price_bars_page = get_price_bars_range
+    get_price_bars_cross_section = get_price_bars_range
+    get_price_bars_cross_section_page = get_price_bars_range
+    get_price_bars_matrix_page = get_price_bars_range
+    get_price_bars_as_of_page = get_price_bars_range
+    get_raw_price_bars_range = get_price_bars_range
+    get_raw_price_bars_page = get_price_bars_range
+
+    def get_price_bar_as_of(self, *_args):
+        return None
+
+    def query_fundamentals(self, *args, **kwargs):
+        if kwargs.get("limit") == 1:
+            return [{"symbol": kwargs.get("symbol", "000001")}]
+        return []
+
+    def list_artifacts(self, *_args):
+        return []
+
     def __getattr__(self, _name):
         return lambda *_args, **_kwargs: []
 
@@ -79,6 +104,7 @@ class FixtureService:
         self.market_bar_repository = repository
         self.metadata_repository = repository
         self.fundamental_repository = repository
+        self.artifact_store = repository
         self.v2_resources = SimpleNamespace(health_snapshot=lambda: {
             "schema": V2_HEALTH_SCHEMA,
             "components": {
@@ -98,6 +124,18 @@ class FixtureService:
         if symbol == "FAIL":
             raise RuntimeError("fixture unavailable")
         return {"symbol": symbol, "close": 1.0, "refresh_seen": True}
+
+    def refresh_quote_history(self, symbol, _range, interval, adjustment):
+        if interval == "bad":
+            raise RuntimeError("bounded fixture failure")
+        return {"symbol": symbol, "interval": interval, "adjustment": adjustment,
+                "bars": [], "count": 0}
+
+    def calendar_snapshot(self, *_args):
+        return {}
+
+    def search_instruments(self, *_args):
+        return []
 
     def close(self):
         pass
@@ -128,6 +166,14 @@ class FaultService(FixtureService):
         def fail(*_args, **_kwargs):
             raise RuntimeError("bounded fixture failure")
         return fail
+
+    def refresh_quote(self, *_args, **_kwargs):
+        raise RuntimeError("bounded fixture failure")
+
+    refresh_quote_history = refresh_quote
+    calendar_snapshot = refresh_quote
+    search_instruments = refresh_quote
+    tushare_realtime_quote = refresh_quote
 
 
 class OldMainApiContractTest(unittest.TestCase):
@@ -178,12 +224,15 @@ class OldMainApiContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(suffix="-capture-proof") as directory:
             output = Path(directory) / "contract.json"
             matrix_output = Path(directory) / "matrix.json"
+            scenario_output = Path(directory) / "scenarios.json"
             subprocess.run([
                 "uv", "run", "python", "scripts/capture_old_main_api.py",
                 "--source-root", str(source_root), "--output", str(output),
                 "--matrix-output", str(matrix_output),
+                "--scenario-output", str(scenario_output),
             ], cwd=ROOT, check=True, capture_output=True)
             self.assertEqual(json.loads(output.read_text()), legacy)
+            self.assertEqual(json.loads(scenario_output.read_text()), scenarios)
             self.assertEqual(
                 json.loads(matrix_output.read_text()),
                 load_document(
@@ -195,9 +244,6 @@ class OldMainApiContractTest(unittest.TestCase):
         legacy = load_document(LEGACY_CONTRACT, SCHEMA_VERSION)
         current = capture_openapi_contract(self.app)
         coverage = load_document(COVERAGE, "marketcow.old-main-v2-api-coverage.v1")
-        report = validate_coverage_inventory(coverage, legacy, current)
-        self.assertEqual(report["status"], "ok", report)
-        self.assertEqual(report["route_count"], 38)
         legacy_routes = load_document(
             LEGACY_ROUTE_SCENARIOS,
             SCHEMA_VERSION + ".route-scenarios",
@@ -211,15 +257,17 @@ class OldMainApiContractTest(unittest.TestCase):
         self.assertEqual(set(legacy_routes["captures"]), set(legacy["routes"]))
         self.assertEqual(set(observed_v2["captures"]), set(current["routes"]))
         self.assertEqual(observed_v2, expected_v2)
-        self.assertEqual(coverage["legacy_capture_sha256"],
-                         legacy_routes["sha256"])
-        self.assertEqual(coverage["v2_capture_sha256"], observed_v2["sha256"])
         expected_legacy_matrix = load_document(
             LEGACY_ROUTE_MATRIX, SCHEMA_VERSION + ".route-matrix",
         )
         expected_v2_matrix = load_document(
             V2_ROUTE_MATRIX, SCHEMA_VERSION + ".route-matrix",
         )
+        report = validate_coverage_inventory(
+            coverage, legacy, current, expected_legacy_matrix, expected_v2_matrix,
+        )
+        self.assertEqual(report["status"], "ok", report)
+        self.assertEqual(report["route_count"], 38)
         fault_app = create_app(self.settings, FaultService())
         with TestClient(self.app, raise_server_exceptions=False) as normal_client, \
                 TestClient(fault_app, raise_server_exceptions=False) as fault_client:
@@ -236,17 +284,70 @@ class OldMainApiContractTest(unittest.TestCase):
             self.assertIn(route + "::normal", expected_legacy_matrix["captures"])
         for route in current["routes"]:
             self.assertIn(route + "::normal", observed_matrix["captures"])
+        self.assertEqual(
+            observed_matrix["captures"]["GET /v1/admin/artifacts::normal"]["status"],
+            200,
+        )
+        tushare = next(item for item in coverage["routes"]
+                       if item["route"] == "POST /v1/tushare/{api_name}")
+        tushare_validation = next(
+            item for item in tushare["scenarios"]
+            if item["kind"] == "validation_error"
+        )
+        self.assertEqual(tushare_validation["v2"], "not_applicable")
+        self.assertNotIn("v2_capture_sha256", tushare_validation)
 
         mutated = dict(coverage)
         mutated["routes"] = coverage["routes"][:-1]
         self.assertEqual(
-            validate_coverage_inventory(mutated, legacy, current)["status"],
+            validate_coverage_inventory(
+                mutated, legacy, current, expected_legacy_matrix, expected_v2_matrix,
+            )["status"],
+            "mismatch",
+        )
+        bad_matrix = json.loads(json.dumps(expected_v2_matrix))
+        bad_matrix["captures"]["GET /v1/admin/artifacts::normal"]["status"] = 500
+        self.assertEqual(
+            validate_coverage_inventory(
+                coverage, legacy, current, expected_legacy_matrix, bad_matrix,
+            )["status"],
+            "mismatch",
+        )
+        bad_request = json.loads(json.dumps(expected_v2_matrix))
+        bad_request["captures"]["GET /v1/admin/artifacts::normal"]["request"][
+            "query"
+        ]["unexecuted"] = "true"
+        self.assertEqual(
+            validate_coverage_inventory(
+                coverage, legacy, current, expected_legacy_matrix, bad_request,
+            )["status"],
+            "mismatch",
+        )
+        bad_shape = json.loads(json.dumps(expected_v2_matrix))
+        bad_shape["captures"]["GET /v1/admin/artifacts::normal"]["shape"] = {
+            "forged": "string"
+        }
+        self.assertEqual(
+            validate_coverage_inventory(
+                coverage, legacy, current, expected_legacy_matrix, bad_shape,
+            )["status"],
+            "mismatch",
+        )
+        missing_capture = json.loads(json.dumps(expected_v2_matrix))
+        missing_capture["captures"].pop("GET /v1/admin/artifacts::normal")
+        self.assertEqual(
+            validate_coverage_inventory(
+                coverage, legacy, current, expected_legacy_matrix, missing_capture,
+            )["status"],
             "mismatch",
         )
         duplicated = dict(coverage)
         duplicated["routes"] = coverage["routes"] + [coverage["routes"][0]]
         self.assertEqual(
-            validate_coverage_inventory(duplicated, legacy, current)["status"],
+            validate_coverage_inventory(
+                duplicated, legacy, current,
+                expected_legacy_matrix, expected_v2_matrix,
+            )["status"],
             "mismatch",
         )
 

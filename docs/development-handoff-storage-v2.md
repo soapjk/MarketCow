@@ -1598,9 +1598,13 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   返修后旧基线文档同时冻结完整 `source_commit=701ffbde...`、capture tool/schema version、生成输入标识及
   代码内 expected SHA-256；`scripts/capture_old_main_api.py` 只接受 HEAD 精确等于该提交的隔离 worktree，测试会
   实际重跑并逐对象比对，不能通过同时替换 snapshot/ledger 绕过来源。另有 38-route union coverage inventory，
-  每条公开 method/path 均具备唯一双侧执行状态与逐类 applicability/不适用原因；32-route old-main 与 38-route V2
-  的全路由确定性请求/status/response shape 分别 checksum 固化。新增/遗漏路由、重复 route/scenario ID、缺任一侧
-  或未执行状态均 fail-closed；专项负向测试覆盖删路由和重复路由。本轮仍未做任何兼容行为修复。
+  每条公开 method/path 均具备唯一双侧执行状态与逐类 applicability/不适用原因；152 个逐路由场景分别以双侧
+  capture SHA-256 绑定实际 request、status、response shape 与 semantic summary。`normal` 必须为声明成功响应，
+  `empty` 必须具有真实空 collection 或 `count=0`，`validation_error` 必须为带结构化 detail 的 4xx，
+  `backend_failure` 必须为带错误结构的 5xx；不能满足者按具体 route/side 具名 `not_applicable`，不得伪称 executed。
+  32-route old-main 与 38-route V2 的全路由 matrix 分别 checksum 固化。新增/遗漏路由、重复 route/scenario ID、
+  capture 缺失，或 request/status/shape/semantic 任一篡改均 fail-closed；专项负向测试覆盖这些边界。本轮仍未做任何
+  兼容行为修复。
 
 ### `BG-011`：API 兼容决策与 V2 修订
 

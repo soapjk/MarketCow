@@ -1,6 +1,5 @@
 {
-  "legacy_capture_sha256": "c67f04bc3bb16bf5d38dbef68378e2fa103f4b4cd44b98321b8961e0396db779",
-  "legacy_matrix_sha256": "cbfdd6d30631acb0b339f926093e03802d883472a08582fb19578dd7748442c7",
+  "legacy_matrix_sha256": "d1a02f809d9ad0183cb112aff8167112c1a36af829175a3d1c11ba76de3e8fe7",
   "legacy_source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4",
   "routes": [
     {
@@ -21,28 +20,40 @@
       "route": "GET /v1/admin/artifacts",
       "scenarios": [
         {
+          "capture_key": "GET /v1/admin/artifacts::normal",
           "id": "get-_v1_admin_artifacts-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "0da2ccbeba395a1d02c4dc7315d4523a45d53df5f9658ebc30b3b7c3df394032",
+          "v2": "executed",
+          "v2_capture_sha256": "3d4af28c3410c7d3975d97302b9484b50e7a9785275141398ff341082ed0d216"
         },
         {
+          "capture_key": "GET /v1/admin/artifacts::empty",
           "id": "get-_v1_admin_artifacts-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "7b6df100ad5b75be7ccc718ca27b0e47e26510e7eff97a83ef2cd0215bd6d2a9",
+          "v2": "executed",
+          "v2_capture_sha256": "4453122b5a293245622d56bcd1514097f8144d27630086ec5f5b069414fce7f6"
         },
         {
+          "capture_key": "GET /v1/admin/artifacts::validation_error",
           "id": "get-_v1_admin_artifacts-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "ea621067569fcf19411bd591ca67c91fb560366ccd00831fa65f1325136dea70",
+          "v2": "executed",
+          "v2_capture_sha256": "ea621067569fcf19411bd591ca67c91fb560366ccd00831fa65f1325136dea70"
         },
         {
+          "capture_key": "GET /v1/admin/artifacts::backend_failure",
           "id": "get-_v1_admin_artifacts-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "98d0bd8e2f2732857b2cfbc636b477bfeee584f942af4cc9b7eeba1b86800b53",
+          "v2": "executed",
+          "v2_capture_sha256": "98d0bd8e2f2732857b2cfbc636b477bfeee584f942af4cc9b7eeba1b86800b53"
         }
       ]
     },
@@ -64,28 +75,40 @@
       "route": "GET /v1/admin/jobs",
       "scenarios": [
         {
+          "capture_key": "GET /v1/admin/jobs::normal",
           "id": "get-_v1_admin_jobs-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "af2c0942815ec8250d241f57c92149b122c8325273410c34c9c6d519825169b8",
+          "v2": "executed",
+          "v2_capture_sha256": "af2c0942815ec8250d241f57c92149b122c8325273410c34c9c6d519825169b8"
         },
         {
+          "capture_key": "GET /v1/admin/jobs::empty",
           "id": "get-_v1_admin_jobs-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "6b32f1484542ea00a1d03debf04239385c11f2f948335bf526554e1170a39ec0",
+          "v2": "executed",
+          "v2_capture_sha256": "6b32f1484542ea00a1d03debf04239385c11f2f948335bf526554e1170a39ec0"
         },
         {
+          "capture_key": "GET /v1/admin/jobs::validation_error",
           "id": "get-_v1_admin_jobs-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "6224048ee14969c8e6f2d371c6916481b3be3481bf3a76fedb3411401de53f45",
+          "v2": "executed",
+          "v2_capture_sha256": "6224048ee14969c8e6f2d371c6916481b3be3481bf3a76fedb3411401de53f45"
         },
         {
+          "capture_key": "GET /v1/admin/jobs::backend_failure",
           "id": "get-_v1_admin_jobs-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "6e7947be84fd2ad3211fecb6e8a816504fccfcde86fea050c4da87854f029f68",
+          "v2": "executed",
+          "v2_capture_sha256": "6e7947be84fd2ad3211fecb6e8a816504fccfcde86fea050c4da87854f029f68"
         }
       ]
     },
@@ -107,28 +130,40 @@
       "route": "GET /v1/earnings-calendar",
       "scenarios": [
         {
+          "capture_key": "GET /v1/earnings-calendar::normal",
           "id": "get-_v1_earnings-calendar-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "d3477d811bfebabafd30c557bc85d45ae80132f916d508504bbe3421c5d94a53",
+          "v2": "executed",
+          "v2_capture_sha256": "d3477d811bfebabafd30c557bc85d45ae80132f916d508504bbe3421c5d94a53"
         },
         {
+          "capture_key": "GET /v1/earnings-calendar::empty",
           "id": "get-_v1_earnings-calendar-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "f1955c6afe8dc6841837202eaf9e0456038b96c2ad72cfe94a5f9da83054ec6f",
+          "v2": "executed",
+          "v2_capture_sha256": "f1955c6afe8dc6841837202eaf9e0456038b96c2ad72cfe94a5f9da83054ec6f"
         },
         {
+          "capture_key": "GET /v1/earnings-calendar::validation_error",
           "id": "get-_v1_earnings-calendar-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "b571c16c6789138d54c53f01a5cad4e5fd76731d4e40fec9c469775d3f65673f",
+          "v2": "executed",
+          "v2_capture_sha256": "b571c16c6789138d54c53f01a5cad4e5fd76731d4e40fec9c469775d3f65673f"
         },
         {
+          "capture_key": "GET /v1/earnings-calendar::backend_failure",
           "id": "get-_v1_earnings-calendar-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "2992eca6933a76e3a2fd46b90f4f514a47157e3fa9b143cdcc64898b61dabb69",
+          "v2": "executed",
+          "v2_capture_sha256": "2992eca6933a76e3a2fd46b90f4f514a47157e3fa9b143cdcc64898b61dabb69"
         }
       ]
     },
@@ -150,28 +185,40 @@
       "route": "GET /v1/economic-calendar",
       "scenarios": [
         {
+          "capture_key": "GET /v1/economic-calendar::normal",
           "id": "get-_v1_economic-calendar-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "3aaaa140a110b692af44023f0977ae5557b6ddd8942c88a367281c65412c89b7",
+          "v2": "executed",
+          "v2_capture_sha256": "3aaaa140a110b692af44023f0977ae5557b6ddd8942c88a367281c65412c89b7"
         },
         {
+          "capture_key": "GET /v1/economic-calendar::empty",
           "id": "get-_v1_economic-calendar-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "d86fd3fb8cc98c276471fcab54dc325354bbe9b7ec7862005794b1d15bde27c9",
+          "v2": "executed",
+          "v2_capture_sha256": "d86fd3fb8cc98c276471fcab54dc325354bbe9b7ec7862005794b1d15bde27c9"
         },
         {
+          "capture_key": "GET /v1/economic-calendar::validation_error",
           "id": "get-_v1_economic-calendar-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "14907a70b898303ead1d6537c426eb4afbef0220657f3b9cd3ea9c5d6278cb27",
+          "v2": "executed",
+          "v2_capture_sha256": "14907a70b898303ead1d6537c426eb4afbef0220657f3b9cd3ea9c5d6278cb27"
         },
         {
+          "capture_key": "GET /v1/economic-calendar::backend_failure",
           "id": "get-_v1_economic-calendar-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "b71d3919a2edfbde530671870287f2bdb15baf9317ec74097bed54391c2ee778",
+          "v2": "executed",
+          "v2_capture_sha256": "b71d3919a2edfbde530671870287f2bdb15baf9317ec74097bed54391c2ee778"
         }
       ]
     },
@@ -193,28 +240,40 @@
       "route": "GET /v1/economic-indicators",
       "scenarios": [
         {
+          "capture_key": "GET /v1/economic-indicators::normal",
           "id": "get-_v1_economic-indicators-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "8fe5b176ffe5f4c120200c9a047cb9dd8047e823bb39413163ef2976e6c1aa1d",
+          "v2": "executed",
+          "v2_capture_sha256": "8fe5b176ffe5f4c120200c9a047cb9dd8047e823bb39413163ef2976e6c1aa1d"
         },
         {
+          "capture_key": "GET /v1/economic-indicators::empty",
           "id": "get-_v1_economic-indicators-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "b73f47e945640fb707263158356f3e26743959cb8122abaf922918cb429bba9b",
+          "v2": "executed",
+          "v2_capture_sha256": "b73f47e945640fb707263158356f3e26743959cb8122abaf922918cb429bba9b"
         },
         {
+          "capture_key": "GET /v1/economic-indicators::validation_error",
           "id": "get-_v1_economic-indicators-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "9b63aa3cdb3f1714e069867dcabb3953aaf0e7286db64e8df6438014e063d05c",
+          "v2": "executed",
+          "v2_capture_sha256": "9b63aa3cdb3f1714e069867dcabb3953aaf0e7286db64e8df6438014e063d05c"
         },
         {
+          "capture_key": "GET /v1/economic-indicators::backend_failure",
           "id": "get-_v1_economic-indicators-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "a1775935634e6f8b0afe779d216f75905470727bf701b90e73225b1a9c8eb6d9",
+          "v2": "executed",
+          "v2_capture_sha256": "a1775935634e6f8b0afe779d216f75905470727bf701b90e73225b1a9c8eb6d9"
         }
       ]
     },
@@ -230,34 +289,47 @@
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "GET /v1/financials/{symbol}/statements",
       "scenarios": [
         {
+          "capture_key": "GET /v1/financials/{symbol}/statements::normal",
           "id": "get-_v1_financials_symbol_statements-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "6c5a03111ecb88ced1b00a75480ab9d5a63d58cb11954ed3fb33264ffde81ee8",
+          "v2": "executed",
+          "v2_capture_sha256": "6c5a03111ecb88ced1b00a75480ab9d5a63d58cb11954ed3fb33264ffde81ee8"
         },
         {
+          "capture_key": "GET /v1/financials/{symbol}/statements::empty",
           "id": "get-_v1_financials_symbol_statements-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "1443dd9f068df9c9218362d5f8eae73de5da088fbe239be2bec6a0e73455dae6",
+          "v2": "executed",
+          "v2_capture_sha256": "1443dd9f068df9c9218362d5f8eae73de5da088fbe239be2bec6a0e73455dae6"
         },
         {
+          "capture_key": "GET /v1/financials/{symbol}/statements::validation_error",
           "id": "get-_v1_financials_symbol_statements-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "GET /v1/financials/{symbol}/statements::backend_failure",
           "id": "get-_v1_financials_symbol_statements-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "c956c25d866efdb03c887b4b2b6ab25ef8aa65af1d89d7532073e20d43132dc9",
+          "v2": "executed",
+          "v2_capture_sha256": "c956c25d866efdb03c887b4b2b6ab25ef8aa65af1d89d7532073e20d43132dc9"
         }
       ]
     },
@@ -279,28 +351,40 @@
       "route": "GET /v1/fundamentals",
       "scenarios": [
         {
+          "capture_key": "GET /v1/fundamentals::normal",
           "id": "get-_v1_fundamentals-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "70cb41a8a1ee4799b608f5bd12aa7cad875d6736c2ae4bf3c744a042e6c583e8",
+          "v2": "executed",
+          "v2_capture_sha256": "70cb41a8a1ee4799b608f5bd12aa7cad875d6736c2ae4bf3c744a042e6c583e8"
         },
         {
+          "capture_key": "GET /v1/fundamentals::empty",
           "id": "get-_v1_fundamentals-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "627b224b853ccfeec24e8c42e954e9dc028682a46984140d2693bb3a96bb676d",
+          "v2": "executed",
+          "v2_capture_sha256": "627b224b853ccfeec24e8c42e954e9dc028682a46984140d2693bb3a96bb676d"
         },
         {
+          "capture_key": "GET /v1/fundamentals::validation_error",
           "id": "get-_v1_fundamentals-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "79160e364af6943b4d6d02771e12b9b5262e8d43ead7b54a89543fe53b66bff6",
+          "v2": "executed",
+          "v2_capture_sha256": "79160e364af6943b4d6d02771e12b9b5262e8d43ead7b54a89543fe53b66bff6"
         },
         {
+          "capture_key": "GET /v1/fundamentals::backend_failure",
           "id": "get-_v1_fundamentals-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "2fe2cd712cb5b828296cd63d1bb481e7572544343396791f0cc053a201b49ef9",
+          "v2": "executed",
+          "v2_capture_sha256": "2fe2cd712cb5b828296cd63d1bb481e7572544343396791f0cc053a201b49ef9"
         }
       ]
     },
@@ -310,40 +394,54 @@
           "status": "covered"
         },
         "empty": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "GET /v1/fundamentals/{symbol}",
       "scenarios": [
         {
+          "capture_key": "GET /v1/fundamentals/{symbol}::normal",
           "id": "get-_v1_fundamentals_symbol-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "875fb35288bfaa8c4013641d4b8a8c3701e6bd91b89a747ea3ce54e753b966c3",
+          "v2": "executed",
+          "v2_capture_sha256": "875fb35288bfaa8c4013641d4b8a8c3701e6bd91b89a747ea3ce54e753b966c3"
         },
         {
+          "capture_key": "GET /v1/fundamentals/{symbol}::empty",
           "id": "get-_v1_fundamentals_symbol-empty",
           "kind": "empty",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
         },
         {
+          "capture_key": "GET /v1/fundamentals/{symbol}::validation_error",
           "id": "get-_v1_fundamentals_symbol-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "GET /v1/fundamentals/{symbol}::backend_failure",
           "id": "get-_v1_fundamentals_symbol-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "c02a87f0f67adb07da062419f118cb9423a801c7cec3927c78a5744f7ea1662c",
+          "v2": "executed",
+          "v2_capture_sha256": "c02a87f0f67adb07da062419f118cb9423a801c7cec3927c78a5744f7ea1662c"
         }
       ]
     },
@@ -365,28 +463,40 @@
       "route": "GET /v1/fundamentals/{symbol}/history",
       "scenarios": [
         {
+          "capture_key": "GET /v1/fundamentals/{symbol}/history::normal",
           "id": "get-_v1_fundamentals_symbol_history-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "4b37b79ec90dce11ebf286aa4350b0408c9aa93fb1981fd9ca19f324f801dfb5",
+          "v2": "executed",
+          "v2_capture_sha256": "4b37b79ec90dce11ebf286aa4350b0408c9aa93fb1981fd9ca19f324f801dfb5"
         },
         {
+          "capture_key": "GET /v1/fundamentals/{symbol}/history::empty",
           "id": "get-_v1_fundamentals_symbol_history-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "6ecfdea22942822c5c8d76ca2037191605538c8a4a62b7bdc1d67febe6029fd9",
+          "v2": "executed",
+          "v2_capture_sha256": "6ecfdea22942822c5c8d76ca2037191605538c8a4a62b7bdc1d67febe6029fd9"
         },
         {
+          "capture_key": "GET /v1/fundamentals/{symbol}/history::validation_error",
           "id": "get-_v1_fundamentals_symbol_history-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "a175b26276a7cc98c2244b1d6246aefd0ea718da9b8d2556e722b15d5f20d902",
+          "v2": "executed",
+          "v2_capture_sha256": "a175b26276a7cc98c2244b1d6246aefd0ea718da9b8d2556e722b15d5f20d902"
         },
         {
+          "capture_key": "GET /v1/fundamentals/{symbol}/history::backend_failure",
           "id": "get-_v1_fundamentals_symbol_history-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "2dd9e5f767c5863908c4f999bd7841771fa89f4efba7ee840c2e16a6e2b24247",
+          "v2": "executed",
+          "v2_capture_sha256": "2dd9e5f767c5863908c4f999bd7841771fa89f4efba7ee840c2e16a6e2b24247"
         }
       ]
     },
@@ -408,61 +518,98 @@
       "route": "GET /v1/funnel/metrics",
       "scenarios": [
         {
+          "capture_key": "GET /v1/funnel/metrics::normal",
           "id": "get-_v1_funnel_metrics-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "ecf38282e5f7ea4e1ccb9555bd00f90669f79ce787145d43ee366f9210695021",
+          "v2": "executed",
+          "v2_capture_sha256": "ecf38282e5f7ea4e1ccb9555bd00f90669f79ce787145d43ee366f9210695021"
         },
         {
+          "capture_key": "GET /v1/funnel/metrics::empty",
           "id": "get-_v1_funnel_metrics-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "187b2c10cdb8e5951c4972869ac2dc0da177d98c638e4b77d675e77b533b20a9",
+          "v2": "executed",
+          "v2_capture_sha256": "187b2c10cdb8e5951c4972869ac2dc0da177d98c638e4b77d675e77b533b20a9"
         },
         {
+          "capture_key": "GET /v1/funnel/metrics::validation_error",
           "id": "get-_v1_funnel_metrics-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "1d238d9003d43db6309ab5a292bac75aa615c9b7ac3007bba4968dbc63dc7a1b",
+          "v2": "executed",
+          "v2_capture_sha256": "1d238d9003d43db6309ab5a292bac75aa615c9b7ac3007bba4968dbc63dc7a1b"
         },
         {
+          "capture_key": "GET /v1/funnel/metrics::backend_failure",
           "id": "get-_v1_funnel_metrics-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "67ea8815509848f1e78f437cf098b5694fcf2bd09cfeb5db42b696805815d6d5",
+          "v2": "executed",
+          "v2_capture_sha256": "67ea8815509848f1e78f437cf098b5694fcf2bd09cfeb5db42b696805815d6d5"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "reason": "GET /v1/health: backend_failure has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "empty": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "reason": "GET /v1/health: validation_error has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         }
       },
       "route": "GET /v1/health",
       "scenarios": [
         {
+          "capture_key": "GET /v1/health::normal",
           "id": "get-_v1_health-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "6682ee1e68825ddca7972e514f7a0566aa4eca5c02371b0991e9b9c31b839f6d",
+          "v2": "executed",
+          "v2_capture_sha256": "35ff4711c0e04de4b29e9b53efd9924edba7cd93eabb3ddad2b66ec950edef5e"
         },
         {
+          "capture_key": "GET /v1/health::empty",
           "id": "get-_v1_health-empty",
           "kind": "empty",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/health::validation_error",
+          "id": "get-_v1_health-validation-error",
+          "kind": "validation_error",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/health::backend_failure",
+          "id": "get-_v1_health-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
         }
       ]
     },
@@ -484,35 +631,48 @@
       "route": "GET /v1/instruments/search",
       "scenarios": [
         {
+          "capture_key": "GET /v1/instruments/search::normal",
           "id": "get-_v1_instruments_search-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "5dc0411546e4fe470ea120e7b7792ab32ea00d75a61616155bf161f3a233ca6a",
+          "v2": "executed",
+          "v2_capture_sha256": "5dc0411546e4fe470ea120e7b7792ab32ea00d75a61616155bf161f3a233ca6a"
         },
         {
+          "capture_key": "GET /v1/instruments/search::empty",
           "id": "get-_v1_instruments_search-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "5bf2aa087a69f9aa112cb8cc0201b7122280c097025e082d5e0d984876b2b261",
+          "v2": "executed",
+          "v2_capture_sha256": "5bf2aa087a69f9aa112cb8cc0201b7122280c097025e082d5e0d984876b2b261"
         },
         {
+          "capture_key": "GET /v1/instruments/search::validation_error",
           "id": "get-_v1_instruments_search-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "efa574af2abf28624663927fd28c0f1e68a75d283c1c567eb0074b0f106b6528",
+          "v2": "executed",
+          "v2_capture_sha256": "efa574af2abf28624663927fd28c0f1e68a75d283c1c567eb0074b0f106b6528"
         },
         {
+          "capture_key": "GET /v1/instruments/search::backend_failure",
           "id": "get-_v1_instruments_search-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "9d9a58fee8aee5f6ebb37292c8867fd810e82e0784b74d5ab5ed7c0f17c72d3e",
+          "v2": "executed",
+          "v2_capture_sha256": "9d9a58fee8aee5f6ebb37292c8867fd810e82e0784b74d5ab5ed7c0f17c72d3e"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
@@ -527,28 +687,40 @@
       "route": "GET /v1/quotes",
       "scenarios": [
         {
+          "capture_key": "GET /v1/quotes::normal",
           "id": "get-_v1_quotes-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "9a438bc90fcd8fb0f778573f69baf6307b408baab9aa53de924f307c7bf6ca77",
+          "v2": "executed",
+          "v2_capture_sha256": "9a438bc90fcd8fb0f778573f69baf6307b408baab9aa53de924f307c7bf6ca77"
         },
         {
+          "capture_key": "GET /v1/quotes::empty",
           "id": "get-_v1_quotes-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "18f3f13a73b7cc76b8f7c307eccf52e93bbf4465a00cdce405a1869b5769f6d3",
+          "v2": "executed",
+          "v2_capture_sha256": "8ef0514d8c9725f2366506e1d46260f3182f0302d1e1939435cb61cba769541c"
         },
         {
+          "capture_key": "GET /v1/quotes::validation_error",
           "id": "get-_v1_quotes-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "bb02ee6910d7a783eba222aaf2a840ec1b7ae252be0d2e95c2a0df25ebcb50f5",
+          "v2": "executed",
+          "v2_capture_sha256": "bb02ee6910d7a783eba222aaf2a840ec1b7ae252be0d2e95c2a0df25ebcb50f5"
         },
         {
+          "capture_key": "GET /v1/quotes::backend_failure",
           "id": "get-_v1_quotes-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
         }
       ]
     },
@@ -570,28 +742,36 @@
       "route": "GET /v1/quotes/cross-section",
       "scenarios": [
         {
+          "capture_key": "GET /v1/quotes/cross-section::normal",
           "id": "get-_v1_quotes_cross-section-normal",
           "kind": "normal",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "60424848bf0c0fba747e60d888e591ca009213acee04d71656de23436d181387"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section::empty",
           "id": "get-_v1_quotes_cross-section-empty",
           "kind": "empty",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "085fd03d1f0eb20a3259c7e55b5ab974614ece6433b8834e93dfa65614bb9473"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section::validation_error",
           "id": "get-_v1_quotes_cross-section-validation-error",
           "kind": "validation_error",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "ce0db405b544b134d7acaeced86b0502f0c2680edc1f3d1d90022ffc2d9e86a9"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section::backend_failure",
           "id": "get-_v1_quotes_cross-section-backend-failure",
           "kind": "backend_failure",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "6a57474700d361a401fcc26c5ce95970813d29fdb41568979994d90711093e40"
         }
       ]
     },
@@ -613,28 +793,36 @@
       "route": "GET /v1/quotes/cross-section/as-of",
       "scenarios": [
         {
+          "capture_key": "GET /v1/quotes/cross-section/as-of::normal",
           "id": "get-_v1_quotes_cross-section_as-of-normal",
           "kind": "normal",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "d4026962b0bb2a6b17f23d579a5c225a937de878c90c1fd926f5ee472f41c7e1"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section/as-of::empty",
           "id": "get-_v1_quotes_cross-section_as-of-empty",
           "kind": "empty",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "2ca2c64902a2acaddedd1fe8ed42051ecd989c90d91d4c7a623cd6f6557d904c"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section/as-of::validation_error",
           "id": "get-_v1_quotes_cross-section_as-of-validation-error",
           "kind": "validation_error",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "0e62b783f05179e13806faa2efec1b48b4a00c867de30c940fe5b0bd7715b848"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section/as-of::backend_failure",
           "id": "get-_v1_quotes_cross-section_as-of-backend-failure",
           "kind": "backend_failure",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "34f19c3ed6cc983644ba29aecdecc5b08ce21f5d4122553a88f05952428075a4"
         }
       ]
     },
@@ -656,28 +844,36 @@
       "route": "GET /v1/quotes/cross-section/matrix",
       "scenarios": [
         {
+          "capture_key": "GET /v1/quotes/cross-section/matrix::normal",
           "id": "get-_v1_quotes_cross-section_matrix-normal",
           "kind": "normal",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "9a3e671d8fc3bd13ffbf11bb206d8d73dbe756428996506b978b7bb8b9529ab1"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section/matrix::empty",
           "id": "get-_v1_quotes_cross-section_matrix-empty",
           "kind": "empty",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "869bafd3e8e57be89c6e4aecd2982ae0fd961d6fe8560a255cdcab6c084748c8"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section/matrix::validation_error",
           "id": "get-_v1_quotes_cross-section_matrix-validation-error",
           "kind": "validation_error",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "84823611f524e51dc2b4082e243e0141adcb891d5a56bdab1d2fb1a3d4b17ea9"
         },
         {
+          "capture_key": "GET /v1/quotes/cross-section/matrix::backend_failure",
           "id": "get-_v1_quotes_cross-section_matrix-backend-failure",
           "kind": "backend_failure",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "6243b6dc686f8173c83f469dd1eb46bbcdf4083f31928e5319b6d113888a4766"
         }
       ]
     },
@@ -687,40 +883,54 @@
           "status": "covered"
         },
         "empty": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "GET /v1/quotes/{symbol}",
       "scenarios": [
         {
+          "capture_key": "GET /v1/quotes/{symbol}::normal",
           "id": "get-_v1_quotes_symbol-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "9bcdadf16206efc7a50642bb2b99e58fbbb7c4db0ec54fa63db6bd90ef3bb0ac",
+          "v2": "executed",
+          "v2_capture_sha256": "9bcdadf16206efc7a50642bb2b99e58fbbb7c4db0ec54fa63db6bd90ef3bb0ac"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}::empty",
           "id": "get-_v1_quotes_symbol-empty",
           "kind": "empty",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}::validation_error",
           "id": "get-_v1_quotes_symbol-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}::backend_failure",
           "id": "get-_v1_quotes_symbol-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "3e30a20e66228b43719b611f5529b8a2622e8906c91a774a2322adbbedfc8c7b",
+          "v2": "executed",
+          "v2_capture_sha256": "2258d00a374aff4eebc57a259bc68067e0689c8cd1286985630dfd965a3b82a4"
         }
       ]
     },
@@ -742,28 +952,36 @@
       "route": "GET /v1/quotes/{symbol}/as-of",
       "scenarios": [
         {
+          "capture_key": "GET /v1/quotes/{symbol}/as-of::normal",
           "id": "get-_v1_quotes_symbol_as-of-normal",
           "kind": "normal",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "51b45988eda8ff4da56ae073eb5f5d12d5c78ec25253dfddf7f320a2e5135dcd"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/as-of::empty",
           "id": "get-_v1_quotes_symbol_as-of-empty",
           "kind": "empty",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "08478a3612778b9bbd5fd5b0b7d4a13c29617cea514821ff32ea44a96ba71d2f"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/as-of::validation_error",
           "id": "get-_v1_quotes_symbol_as-of-validation-error",
           "kind": "validation_error",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "965ef58062a08377b83447381e94e75ddd6a94eddada9a8a029628594eccc52f"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/as-of::backend_failure",
           "id": "get-_v1_quotes_symbol_as-of-backend-failure",
           "kind": "backend_failure",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "4ef57c7014103d1f49da8ecb7fc0a19370d9ddd7bddddaaece84269203bb8e95"
         }
       ]
     },
@@ -785,28 +1003,40 @@
       "route": "GET /v1/quotes/{symbol}/history",
       "scenarios": [
         {
+          "capture_key": "GET /v1/quotes/{symbol}/history::normal",
           "id": "get-_v1_quotes_symbol_history-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "230c8e76e915e198b53e8560c354f9a1fdd74ad111a63455ce0785980a73f735",
+          "v2": "executed",
+          "v2_capture_sha256": "c937ead924ce8ce76f8395e2521e64c4d34ad447d28e5ca7a24f4e4fef2ab24d"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/history::empty",
           "id": "get-_v1_quotes_symbol_history-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "c71aae98010face7c586475c3b5840d030d22fb194cef4bfeca85e900b3929e6",
+          "v2": "executed",
+          "v2_capture_sha256": "e2a81f309f70d18d99def7d034294d79a8f1543bc655258811189b43d052b1d3"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/history::validation_error",
           "id": "get-_v1_quotes_symbol_history-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "16c75be67641e6e75949869569b4e6f5cc7957944a29de5c6a4b8a4d9d4fb6ae",
+          "v2": "executed",
+          "v2_capture_sha256": "16c75be67641e6e75949869569b4e6f5cc7957944a29de5c6a4b8a4d9d4fb6ae"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/history::backend_failure",
           "id": "get-_v1_quotes_symbol_history-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "547216d28ac0a243ef701bc46ed9743727319f3ae192e6e2ed8ae940c1549fc1",
+          "v2": "executed",
+          "v2_capture_sha256": "547216d28ac0a243ef701bc46ed9743727319f3ae192e6e2ed8ae940c1549fc1"
         }
       ]
     },
@@ -828,35 +1058,43 @@
       "route": "GET /v1/quotes/{symbol}/raw-history",
       "scenarios": [
         {
+          "capture_key": "GET /v1/quotes/{symbol}/raw-history::normal",
           "id": "get-_v1_quotes_symbol_raw-history-normal",
           "kind": "normal",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "0e89b98dbf8460b774b644031fdcda0b7dfd5f162ee0eb9991a9d83f17255311"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/raw-history::empty",
           "id": "get-_v1_quotes_symbol_raw-history-empty",
           "kind": "empty",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "9f9b9f9286f3bb99c6b0fac1e6c693bd2f7deb953a4ca8de9f67e8a145e165c8"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/raw-history::validation_error",
           "id": "get-_v1_quotes_symbol_raw-history-validation-error",
           "kind": "validation_error",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "0c6a6af8f2f991f74b3fe1762eff6513ebbaa326600ef7b5b3d0dcbafe641e35"
         },
         {
+          "capture_key": "GET /v1/quotes/{symbol}/raw-history::backend_failure",
           "id": "get-_v1_quotes_symbol_raw-history-backend-failure",
           "kind": "backend_failure",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "d65adaf96fec0160666da2396a8bcddd4345db48b1adfd9722052ad0d6e25df6"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "reason": "GET /v1/readiness: backend_failure has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "empty": {
@@ -866,23 +1104,43 @@
           "status": "covered"
         },
         "validation_error": {
-          "reason": "GET /v1/readiness: validation_error has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         }
       },
       "route": "GET /v1/readiness",
       "scenarios": [
         {
+          "capture_key": "GET /v1/readiness::normal",
           "id": "get-_v1_readiness-normal",
           "kind": "normal",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "9e608aaa3680cb92b1c59b354fb9c1d8820521433483e609abbb693cf3bc8c27"
         },
         {
+          "capture_key": "GET /v1/readiness::empty",
           "id": "get-_v1_readiness-empty",
           "kind": "empty",
           "legacy": "route_absent",
-          "v2": "executed"
+          "v2": "executed",
+          "v2_capture_sha256": "d07c8dbdf1bc5b743797182b2af47a5e3c075137f2242bf387d182210aa8d9be"
+        },
+        {
+          "capture_key": "GET /v1/readiness::validation_error",
+          "id": "get-_v1_readiness-validation-error",
+          "kind": "validation_error",
+          "legacy": "route_absent",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/readiness::backend_failure",
+          "id": "get-_v1_readiness-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "route_absent",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
         }
       ]
     },
@@ -892,7 +1150,8 @@
           "status": "covered"
         },
         "empty": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
@@ -904,28 +1163,40 @@
       "route": "GET /v1/snapshot",
       "scenarios": [
         {
+          "capture_key": "GET /v1/snapshot::normal",
           "id": "get-_v1_snapshot-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "8dc5d61cd29a1df52b0c14598486e086f897bb62f95debbb29f990d82abaa805",
+          "v2": "executed",
+          "v2_capture_sha256": "8dc5d61cd29a1df52b0c14598486e086f897bb62f95debbb29f990d82abaa805"
         },
         {
+          "capture_key": "GET /v1/snapshot::empty",
           "id": "get-_v1_snapshot-empty",
           "kind": "empty",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
         },
         {
+          "capture_key": "GET /v1/snapshot::validation_error",
           "id": "get-_v1_snapshot-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "d05fd4e10972cf7ac0abdc7316b5f5f16bcd2b74a3cbc9569c73a5da4c8b9fec",
+          "v2": "executed",
+          "v2_capture_sha256": "d05fd4e10972cf7ac0abdc7316b5f5f16bcd2b74a3cbc9569c73a5da4c8b9fec"
         },
         {
+          "capture_key": "GET /v1/snapshot::backend_failure",
           "id": "get-_v1_snapshot-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "1e069cbfdf9fadd2e38982163ae0761d7d9ef97e02a1a032c88ec0f3c196635e",
+          "v2": "executed",
+          "v2_capture_sha256": "1e069cbfdf9fadd2e38982163ae0761d7d9ef97e02a1a032c88ec0f3c196635e"
         }
       ]
     },
@@ -941,29 +1212,47 @@
           "status": "covered"
         },
         "validation_error": {
-          "reason": "GET /v1/sources/health: validation_error has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         }
       },
       "route": "GET /v1/sources/health",
       "scenarios": [
         {
+          "capture_key": "GET /v1/sources/health::normal",
           "id": "get-_v1_sources_health-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "38c8ceff84360a0e8b281d2db28ffbe94524490bfa961b3817dc63a9b6c16f3c",
+          "v2": "executed",
+          "v2_capture_sha256": "38c8ceff84360a0e8b281d2db28ffbe94524490bfa961b3817dc63a9b6c16f3c"
         },
         {
+          "capture_key": "GET /v1/sources/health::empty",
           "id": "get-_v1_sources_health-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "b3cbf3fef765724d884e1c0c663e2b53c7abb502c3e7896939953f459f4f1a77",
+          "v2": "executed",
+          "v2_capture_sha256": "b3cbf3fef765724d884e1c0c663e2b53c7abb502c3e7896939953f459f4f1a77"
         },
         {
+          "capture_key": "GET /v1/sources/health::validation_error",
+          "id": "get-_v1_sources_health-validation-error",
+          "kind": "validation_error",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/sources/health::backend_failure",
           "id": "get-_v1_sources_health-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "e2178c81f850833f9be1c73107d3043d23b9c411b3591f3be7686beb66b9295e",
+          "v2": "executed",
+          "v2_capture_sha256": "e2178c81f850833f9be1c73107d3043d23b9c411b3591f3be7686beb66b9295e"
         }
       ]
     },
@@ -979,29 +1268,47 @@
           "status": "covered"
         },
         "validation_error": {
-          "reason": "GET /v1/sources/tdx/coverage: validation_error has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         }
       },
       "route": "GET /v1/sources/tdx/coverage",
       "scenarios": [
         {
+          "capture_key": "GET /v1/sources/tdx/coverage::normal",
           "id": "get-_v1_sources_tdx_coverage-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "8f0f9b5f7234c4bd2eca2ed5e0ef4ebe43679aea8a95f9fcac6884fa5ba801f8",
+          "v2": "executed",
+          "v2_capture_sha256": "8f0f9b5f7234c4bd2eca2ed5e0ef4ebe43679aea8a95f9fcac6884fa5ba801f8"
         },
         {
+          "capture_key": "GET /v1/sources/tdx/coverage::empty",
           "id": "get-_v1_sources_tdx_coverage-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "b68534c0bc70ff7fe7dcbb958aa186bd8d22292ccaccbd793d86ecd7fbd35c39",
+          "v2": "executed",
+          "v2_capture_sha256": "b68534c0bc70ff7fe7dcbb958aa186bd8d22292ccaccbd793d86ecd7fbd35c39"
         },
         {
+          "capture_key": "GET /v1/sources/tdx/coverage::validation_error",
+          "id": "get-_v1_sources_tdx_coverage-validation-error",
+          "kind": "validation_error",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/sources/tdx/coverage::backend_failure",
           "id": "get-_v1_sources_tdx_coverage-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "b0997d577e54cd5122198da3543ef9f3558ef06ca107eec3a4d51b64ee2be676",
+          "v2": "executed",
+          "v2_capture_sha256": "b0997d577e54cd5122198da3543ef9f3558ef06ca107eec3a4d51b64ee2be676"
         }
       ]
     },
@@ -1011,7 +1318,8 @@
           "status": "covered"
         },
         "empty": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
@@ -1023,28 +1331,40 @@
       "route": "GET /v1/validation/{symbol}",
       "scenarios": [
         {
+          "capture_key": "GET /v1/validation/{symbol}::normal",
           "id": "get-_v1_validation_symbol-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "8678c133240ab62f9426b6102b9b1f28f43fb91ecdc08930d8cfe39ad9dcb8b1",
+          "v2": "executed",
+          "v2_capture_sha256": "4514f67bf38668518a4217a5f5ae7526aff3f59fae7089c911e18af7e11ca900"
         },
         {
+          "capture_key": "GET /v1/validation/{symbol}::empty",
           "id": "get-_v1_validation_symbol-empty",
           "kind": "empty",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
         },
         {
+          "capture_key": "GET /v1/validation/{symbol}::validation_error",
           "id": "get-_v1_validation_symbol-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "24086e68b7ecbdbb469ad32f5bb2a5595e134e9a5039cdf12b794bfde1c2f0f2",
+          "v2": "executed",
+          "v2_capture_sha256": "24086e68b7ecbdbb469ad32f5bb2a5595e134e9a5039cdf12b794bfde1c2f0f2"
         },
         {
+          "capture_key": "GET /v1/validation/{symbol}::backend_failure",
           "id": "get-_v1_validation_symbol-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "f535b58254930145600c90c9f7900607beaa39365c5068739496cb195ae9e715",
+          "v2": "executed",
+          "v2_capture_sha256": "f535b58254930145600c90c9f7900607beaa39365c5068739496cb195ae9e715"
         }
       ]
     },
@@ -1066,28 +1386,40 @@
       "route": "GET /v1/validation/{symbol}/results",
       "scenarios": [
         {
+          "capture_key": "GET /v1/validation/{symbol}/results::normal",
           "id": "get-_v1_validation_symbol_results-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "73fb05b5a100bc8f0e1ce325d0503d0ad5c3fad4f81834bdb90f1757347ca459",
+          "v2": "executed",
+          "v2_capture_sha256": "73fb05b5a100bc8f0e1ce325d0503d0ad5c3fad4f81834bdb90f1757347ca459"
         },
         {
+          "capture_key": "GET /v1/validation/{symbol}/results::empty",
           "id": "get-_v1_validation_symbol_results-empty",
           "kind": "empty",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "23fba28d1659b04c54dce0d37468344d6d721a5cc13adfbf2c2fa54d349814f7",
+          "v2": "executed",
+          "v2_capture_sha256": "23fba28d1659b04c54dce0d37468344d6d721a5cc13adfbf2c2fa54d349814f7"
         },
         {
+          "capture_key": "GET /v1/validation/{symbol}/results::validation_error",
           "id": "get-_v1_validation_symbol_results-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "291b87b632647f73cb5ca8a08398991f6f340f9000bf969b4a24c0b2b63fdc48",
+          "v2": "executed",
+          "v2_capture_sha256": "291b87b632647f73cb5ca8a08398991f6f340f9000bf969b4a24c0b2b63fdc48"
         },
         {
+          "capture_key": "GET /v1/validation/{symbol}/results::backend_failure",
           "id": "get-_v1_validation_symbol_results-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "47f9e589830eb7d2f32f7f746ac2611abceeaf2f7f26592e630fee1f6d261e15",
+          "v2": "executed",
+          "v2_capture_sha256": "47f9e589830eb7d2f32f7f746ac2611abceeaf2f7f26592e630fee1f6d261e15"
         }
       ]
     },
@@ -1097,30 +1429,54 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/artifacts/backfill: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "reason": "POST /v1/admin/artifacts/backfill: validation_error has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         }
       },
       "route": "POST /v1/admin/artifacts/backfill",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/artifacts/backfill::normal",
           "id": "post-_v1_admin_artifacts_backfill-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "6d4d330aba4bae4efb6eeb0c7d7a1ddc230a131496fb5e5edf345b1f5161005d",
+          "v2": "executed",
+          "v2_capture_sha256": "34591b908b017599be5b9c34c6e2c6e69b7f3ebd66981451988812fb40ae4f47"
         },
         {
+          "capture_key": "POST /v1/admin/artifacts/backfill::empty",
+          "id": "post-_v1_admin_artifacts_backfill-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/artifacts/backfill::validation_error",
+          "id": "post-_v1_admin_artifacts_backfill-validation-error",
+          "kind": "validation_error",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/artifacts/backfill::backend_failure",
           "id": "post-_v1_admin_artifacts_backfill-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "42c309bd3de6bdf986e4e47253687c7bab6565b97fb04bc60d323a193a65d1b3",
+          "v2": "executed",
+          "v2_capture_sha256": "42c309bd3de6bdf986e4e47253687c7bab6565b97fb04bc60d323a193a65d1b3"
         }
       ]
     },
@@ -1130,7 +1486,7 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/baostock/{symbol}/refresh: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
@@ -1143,22 +1499,40 @@
       "route": "POST /v1/admin/baostock/{symbol}/refresh",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/baostock/{symbol}/refresh::normal",
           "id": "post-_v1_admin_baostock_symbol_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "ef56d19b837388316e3c6f8d822c6deb42f236eeb981b91ae76fe38649e2bf69",
+          "v2": "executed",
+          "v2_capture_sha256": "5bf585aad492570043b69c35b3264eefbe362a75f1f2368dae10b75c1612e3ac"
         },
         {
+          "capture_key": "POST /v1/admin/baostock/{symbol}/refresh::empty",
+          "id": "post-_v1_admin_baostock_symbol_refresh-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/baostock/{symbol}/refresh::validation_error",
           "id": "post-_v1_admin_baostock_symbol_refresh-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "a2bcb8974d77e16747587c1d4575673a75d7e495af964d4dddee8bec056adb00",
+          "v2": "executed",
+          "v2_capture_sha256": "a2bcb8974d77e16747587c1d4575673a75d7e495af964d4dddee8bec056adb00"
         },
         {
+          "capture_key": "POST /v1/admin/baostock/{symbol}/refresh::backend_failure",
           "id": "post-_v1_admin_baostock_symbol_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "f73f565ec22c52a9bef728024baf1733ebce6747ae61cabb2504545190f1de27",
+          "v2": "executed",
+          "v2_capture_sha256": "f73f565ec22c52a9bef728024baf1733ebce6747ae61cabb2504545190f1de27"
         }
       ]
     },
@@ -1168,35 +1542,54 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/earnings-calendar/refresh: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "POST /v1/admin/earnings-calendar/refresh",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/earnings-calendar/refresh::normal",
           "id": "post-_v1_admin_earnings-calendar_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "d8b01d920544d89332db62c66c2959168df1391c22fcd77ed623adfa577f77ae",
+          "v2": "executed",
+          "v2_capture_sha256": "872bf8722335c0e14ee377cdcc9a47561e68d0d8d639e90870a754bd814e90ed"
         },
         {
+          "capture_key": "POST /v1/admin/earnings-calendar/refresh::empty",
+          "id": "post-_v1_admin_earnings-calendar_refresh-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/earnings-calendar/refresh::validation_error",
           "id": "post-_v1_admin_earnings-calendar_refresh-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "POST /v1/admin/earnings-calendar/refresh::backend_failure",
           "id": "post-_v1_admin_earnings-calendar_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "e4b70414967109c4d5de090f8e2bfddf7a7e107cc8ed68173a1898d430524477",
+          "v2": "executed",
+          "v2_capture_sha256": "e4b70414967109c4d5de090f8e2bfddf7a7e107cc8ed68173a1898d430524477"
         }
       ]
     },
@@ -1206,35 +1599,54 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/economic-calendar/refresh: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "POST /v1/admin/economic-calendar/refresh",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/economic-calendar/refresh::normal",
           "id": "post-_v1_admin_economic-calendar_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "c98acc2ac29cb11fe05f6415d0ba5d578d04817fe7ee3f8bb83a4a0c780def31",
+          "v2": "executed",
+          "v2_capture_sha256": "9a808e53a53f6385ca8e4336b5cb6a45293da012821601859fa693c15f5f0e5a"
         },
         {
+          "capture_key": "POST /v1/admin/economic-calendar/refresh::empty",
+          "id": "post-_v1_admin_economic-calendar_refresh-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/economic-calendar/refresh::validation_error",
           "id": "post-_v1_admin_economic-calendar_refresh-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "POST /v1/admin/economic-calendar/refresh::backend_failure",
           "id": "post-_v1_admin_economic-calendar_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "b0e873e51325da13c4225a78a20389cd9e129b4fd9557f96f6ee44016e9ad619",
+          "v2": "executed",
+          "v2_capture_sha256": "b0e873e51325da13c4225a78a20389cd9e129b4fd9557f96f6ee44016e9ad619"
         }
       ]
     },
@@ -1244,30 +1656,54 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/economic-indicators/refresh: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "reason": "POST /v1/admin/economic-indicators/refresh: validation_error has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         }
       },
       "route": "POST /v1/admin/economic-indicators/refresh",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/economic-indicators/refresh::normal",
           "id": "post-_v1_admin_economic-indicators_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "ee2c227791f5ec1094366074070e569852ef2437e6a2f9a9727462409e2d0893",
+          "v2": "executed",
+          "v2_capture_sha256": "d3d1a98161b0909202321c7bf3564198d8d8507653b8dfcf4a3dd9d3f1f27d89"
         },
         {
+          "capture_key": "POST /v1/admin/economic-indicators/refresh::empty",
+          "id": "post-_v1_admin_economic-indicators_refresh-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/economic-indicators/refresh::validation_error",
+          "id": "post-_v1_admin_economic-indicators_refresh-validation-error",
+          "kind": "validation_error",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/economic-indicators/refresh::backend_failure",
           "id": "post-_v1_admin_economic-indicators_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "1c5e1b594b950dbfd03f128bc055ea542c1dea89f98491cf325808a6765cacd8",
+          "v2": "executed",
+          "v2_capture_sha256": "1c5e1b594b950dbfd03f128bc055ea542c1dea89f98491cf325808a6765cacd8"
         }
       ]
     },
@@ -1277,35 +1713,54 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/financials/{symbol}/refresh: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "POST /v1/admin/financials/{symbol}/refresh",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/financials/{symbol}/refresh::normal",
           "id": "post-_v1_admin_financials_symbol_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "a2e805cba4a2e6c73e270916812b6f0e314097629821c0de0a7e07f5c8e4ef44",
+          "v2": "executed",
+          "v2_capture_sha256": "da3986db935686fff057766c7a067f8281fd30179f5c315e8de5350970231c30"
         },
         {
+          "capture_key": "POST /v1/admin/financials/{symbol}/refresh::empty",
+          "id": "post-_v1_admin_financials_symbol_refresh-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/financials/{symbol}/refresh::validation_error",
           "id": "post-_v1_admin_financials_symbol_refresh-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "POST /v1/admin/financials/{symbol}/refresh::backend_failure",
           "id": "post-_v1_admin_financials_symbol_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "0a8c9ef52167adc055fd8b3daf77b19f16ab5f5ecf0a8d719f9efa87d5945972",
+          "v2": "executed",
+          "v2_capture_sha256": "0a8c9ef52167adc055fd8b3daf77b19f16ab5f5ecf0a8d719f9efa87d5945972"
         }
       ]
     },
@@ -1315,35 +1770,54 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/fundamentals/refresh: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "POST /v1/admin/fundamentals/refresh",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/fundamentals/refresh::normal",
           "id": "post-_v1_admin_fundamentals_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "5ceafb8474de84a315a033761bc91916152ebc907dfce5ef225880347ceb858a",
+          "v2": "executed",
+          "v2_capture_sha256": "f0904e7ae210e2f1d487d00f997d170cfc4b1f2855942131d5ab913a45508698"
         },
         {
+          "capture_key": "POST /v1/admin/fundamentals/refresh::empty",
+          "id": "post-_v1_admin_fundamentals_refresh-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/fundamentals/refresh::validation_error",
           "id": "post-_v1_admin_fundamentals_refresh-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "POST /v1/admin/fundamentals/refresh::backend_failure",
           "id": "post-_v1_admin_fundamentals_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "ef983a038dd27140501fc6db6435c5ac6ace13396baeb398049eb714120d51f5",
+          "v2": "executed",
+          "v2_capture_sha256": "ef983a038dd27140501fc6db6435c5ac6ace13396baeb398049eb714120d51f5"
         }
       ]
     },
@@ -1353,30 +1827,54 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/funnel/metrics/rebuild: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "reason": "POST /v1/admin/funnel/metrics/rebuild: validation_error has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         }
       },
       "route": "POST /v1/admin/funnel/metrics/rebuild",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/funnel/metrics/rebuild::normal",
           "id": "post-_v1_admin_funnel_metrics_rebuild-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "73a225d2288d8b964cb3488a5982f4d2a9aa11026fe3a7eae65ea37f83a5e93e",
+          "v2": "executed",
+          "v2_capture_sha256": "74da4a6f7ec9ea0fb2f5b8e091dc6938422120363d1901ba5dc711264eca1b7d"
         },
         {
+          "capture_key": "POST /v1/admin/funnel/metrics/rebuild::empty",
+          "id": "post-_v1_admin_funnel_metrics_rebuild-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/funnel/metrics/rebuild::validation_error",
+          "id": "post-_v1_admin_funnel_metrics_rebuild-validation-error",
+          "kind": "validation_error",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/funnel/metrics/rebuild::backend_failure",
           "id": "post-_v1_admin_funnel_metrics_rebuild-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "d453837c02941af159cf6c7741ecb586cbe88fdae57cfa6c7247fd743185d77b",
+          "v2": "executed",
+          "v2_capture_sha256": "d453837c02941af159cf6c7741ecb586cbe88fdae57cfa6c7247fd743185d77b"
         }
       ]
     },
@@ -1386,35 +1884,54 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/tdx/financials/sync: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "POST /v1/admin/tdx/financials/sync",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/tdx/financials/sync::normal",
           "id": "post-_v1_admin_tdx_financials_sync-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "eeb5039ec54bb92be40de407bd7361063ad5bcdc300361f8a8ad0677448fbdf4",
+          "v2": "executed",
+          "v2_capture_sha256": "80e0376e1696009b4bda821f895862cfaaa30bca4372dc66c6ddfd771b4f7565"
         },
         {
+          "capture_key": "POST /v1/admin/tdx/financials/sync::empty",
+          "id": "post-_v1_admin_tdx_financials_sync-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/tdx/financials/sync::validation_error",
           "id": "post-_v1_admin_tdx_financials_sync-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "POST /v1/admin/tdx/financials/sync::backend_failure",
           "id": "post-_v1_admin_tdx_financials_sync-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "80ab97d272875ccdc77d5c167af0dce96bfe982461d6039adaa639a2c831f280",
+          "v2": "executed",
+          "v2_capture_sha256": "80ab97d272875ccdc77d5c167af0dce96bfe982461d6039adaa639a2c831f280"
         }
       ]
     },
@@ -1424,7 +1941,7 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/admin/validation/rebuild: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
@@ -1437,22 +1954,40 @@
       "route": "POST /v1/admin/validation/rebuild",
       "scenarios": [
         {
+          "capture_key": "POST /v1/admin/validation/rebuild::normal",
           "id": "post-_v1_admin_validation_rebuild-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "7e4228f7534c81bef80ed6ee971220de5977f386e15e55c1dfe640fe7c9a8cfd",
+          "v2": "executed",
+          "v2_capture_sha256": "7747e95e7dc619ece237868e901c63d459c8774dbe967077b75c1e2e49c817a7"
         },
         {
+          "capture_key": "POST /v1/admin/validation/rebuild::empty",
+          "id": "post-_v1_admin_validation_rebuild-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/validation/rebuild::validation_error",
           "id": "post-_v1_admin_validation_rebuild-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "ded6af6d860fb303751e88d7759addd6d4fd5c39aaed306e7ef60288f70e6795",
+          "v2": "executed",
+          "v2_capture_sha256": "ded6af6d860fb303751e88d7759addd6d4fd5c39aaed306e7ef60288f70e6795"
         },
         {
+          "capture_key": "POST /v1/admin/validation/rebuild::backend_failure",
           "id": "post-_v1_admin_validation_rebuild-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "06934c239830c5550fe647f3c2b9c29045994602bc1a2318c36bd6d6b31c341b",
+          "v2": "executed",
+          "v2_capture_sha256": "06934c239830c5550fe647f3c2b9c29045994602bc1a2318c36bd6d6b31c341b"
         }
       ]
     },
@@ -1462,7 +1997,7 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/tushare/realtime-quote: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
@@ -1475,22 +2010,40 @@
       "route": "POST /v1/tushare/realtime-quote",
       "scenarios": [
         {
+          "capture_key": "POST /v1/tushare/realtime-quote::normal",
           "id": "post-_v1_tushare_realtime-quote-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "34208108ee857230ad6eb4be0c183974f7ac0fc7328b72685ebd40af764fc517",
+          "v2": "executed",
+          "v2_capture_sha256": "34208108ee857230ad6eb4be0c183974f7ac0fc7328b72685ebd40af764fc517"
         },
         {
+          "capture_key": "POST /v1/tushare/realtime-quote::empty",
+          "id": "post-_v1_tushare_realtime-quote-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/tushare/realtime-quote::validation_error",
           "id": "post-_v1_tushare_realtime-quote-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "180a8d333406719e39375f85c1d12034fdf9f8b7b7e6e99f1e6e3df152ba06b4",
+          "v2": "executed",
+          "v2_capture_sha256": "180a8d333406719e39375f85c1d12034fdf9f8b7b7e6e99f1e6e3df152ba06b4"
         },
         {
+          "capture_key": "POST /v1/tushare/realtime-quote::backend_failure",
           "id": "post-_v1_tushare_realtime-quote-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "a0664c7f070a305d50dc232f99356954a3e8d074e4542cab3779fa31bdbc273e",
+          "v2": "executed",
+          "v2_capture_sha256": "a0664c7f070a305d50dc232f99356954a3e8d074e4542cab3779fa31bdbc273e"
         }
       ]
     },
@@ -1500,41 +2053,59 @@
           "status": "covered"
         },
         "empty": {
-          "reason": "POST /v1/tushare/{api_name}: empty has no meaningful HTTP contract for either route shape",
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
         },
         "normal": {
           "status": "covered"
         },
         "validation_error": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         }
       },
       "route": "POST /v1/tushare/{api_name}",
       "scenarios": [
         {
+          "capture_key": "POST /v1/tushare/{api_name}::normal",
           "id": "post-_v1_tushare_api_name-normal",
           "kind": "normal",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "160f9b893b9a23f8cf6ecdc83822dfa57d71e04714fba946d4bf6cce3fbfafc1",
+          "v2": "executed",
+          "v2_capture_sha256": "e80313a78e8f454fc266111ca792b19313d52041abef976083fa3358454e9dd0"
         },
         {
+          "capture_key": "POST /v1/tushare/{api_name}::empty",
+          "id": "post-_v1_tushare_api_name-empty",
+          "kind": "empty",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid empty condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid empty condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/tushare/{api_name}::validation_error",
           "id": "post-_v1_tushare_api_name-validation-error",
           "kind": "validation_error",
-          "legacy": "executed",
-          "v2": "executed"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid validation_error condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid validation_error condition for this route"
         },
         {
+          "capture_key": "POST /v1/tushare/{api_name}::backend_failure",
           "id": "post-_v1_tushare_api_name-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "v2": "executed"
+          "legacy_capture_sha256": "3afd4a13452943b34985ede3e608cc14f6c987c7a2a52dbd176918a5e1b588cb",
+          "v2": "executed",
+          "v2_capture_sha256": "3afd4a13452943b34985ede3e608cc14f6c987c7a2a52dbd176918a5e1b588cb"
         }
       ]
     }
   ],
   "schema": "marketcow.old-main-v2-api-coverage.v1",
-  "sha256": "ab827300fef8e2ac4d86c979ad92492a9220fab09c2617fa55168a4a9163703d",
-  "v2_capture_sha256": "965828edb92235ac8aeaff1b797c430b8d0d573ddb943cd9439ecb643aa9ce88",
-  "v2_matrix_sha256": "2491fa9b9f8d9ddf0d1ec6c3eb0e00cb456c1b7ddb3d367af7ef5cd7e13039b2"
+  "sha256": "a83f875f51b1081d18c126c778ccc52e6464ecd49c7fc119ac0fe2e621105631",
+  "v2_matrix_sha256": "d4cf3ff551b2403c041e09599cfd72cc3fcbcc8b210de4701606a3eb9cefe069"
 }

@@ -9,6 +9,12 @@
         "query": {}
       },
       "route": "GET /v1/admin/artifacts",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -25,10 +31,22 @@
         }
       },
       "route": "GET /v1/admin/artifacts",
-      "shape": {
-        "non_json": "boolean"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 500
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
     },
     "GET /v1/admin/artifacts::normal": {
       "kind": "normal",
@@ -39,10 +57,22 @@
         "query": {}
       },
       "route": "GET /v1/admin/artifacts",
-      "shape": {
-        "non_json": "boolean"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 500
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
     },
     "GET /v1/admin/artifacts::validation_error": {
       "kind": "validation_error",
@@ -55,6 +85,12 @@
         }
       },
       "route": "GET /v1/admin/artifacts",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -83,6 +119,12 @@
         "query": {}
       },
       "route": "GET /v1/admin/jobs",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -99,6 +141,14 @@
         }
       },
       "route": "GET /v1/admin/jobs",
+      "semantics": {
+        "count": null,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "items": {
           "items": null,
@@ -116,6 +166,14 @@
         "query": {}
       },
       "route": "GET /v1/admin/jobs",
+      "semantics": {
+        "count": null,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "items": {
           "items": null,
@@ -135,6 +193,12 @@
         }
       },
       "route": "GET /v1/admin/jobs",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -163,6 +227,12 @@
         "query": {}
       },
       "route": "GET /v1/earnings-calendar",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -180,6 +250,14 @@
         }
       },
       "route": "GET /v1/earnings-calendar",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "events"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "events": {
@@ -202,6 +280,14 @@
         "query": {}
       },
       "route": "GET /v1/earnings-calendar",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "events"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "events": {
@@ -226,6 +312,12 @@
         }
       },
       "route": "GET /v1/earnings-calendar",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -254,6 +346,12 @@
         "query": {}
       },
       "route": "GET /v1/economic-calendar",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -270,6 +368,14 @@
         }
       },
       "route": "GET /v1/economic-calendar",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "events"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "events": {
@@ -292,6 +398,14 @@
         "query": {}
       },
       "route": "GET /v1/economic-calendar",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "events"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "events": {
@@ -316,6 +430,12 @@
         }
       },
       "route": "GET /v1/economic-calendar",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -344,6 +464,12 @@
         "query": {}
       },
       "route": "GET /v1/economic-indicators",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -360,6 +486,14 @@
         }
       },
       "route": "GET /v1/economic-indicators",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "indicators"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "indicators": {
@@ -378,6 +512,14 @@
         "query": {}
       },
       "route": "GET /v1/economic-indicators",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "indicators"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "indicators": {
@@ -398,6 +540,12 @@
         }
       },
       "route": "GET /v1/economic-indicators",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -426,6 +574,12 @@
         "query": {}
       },
       "route": "GET /v1/financials/{symbol}/statements",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -442,6 +596,14 @@
         }
       },
       "route": "GET /v1/financials/{symbol}/statements",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -463,6 +625,14 @@
         "query": {}
       },
       "route": "GET /v1/financials/{symbol}/statements",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -486,6 +656,14 @@
         }
       },
       "route": "GET /v1/financials/{symbol}/statements",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -507,6 +685,12 @@
         "query": {}
       },
       "route": "GET /v1/fundamentals/{symbol}/history",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -523,6 +707,14 @@
         }
       },
       "route": "GET /v1/fundamentals/{symbol}/history",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -544,6 +736,14 @@
         "query": {}
       },
       "route": "GET /v1/fundamentals/{symbol}/history",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -567,6 +767,12 @@
         }
       },
       "route": "GET /v1/fundamentals/{symbol}/history",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -595,6 +801,12 @@
         "query": {}
       },
       "route": "GET /v1/fundamentals/{symbol}",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -611,10 +823,16 @@
         }
       },
       "route": "GET /v1/fundamentals/{symbol}",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 404
+      "shape": {
+        "symbol": "string"
+      },
+      "status": 200
     },
     "GET /v1/fundamentals/{symbol}::normal": {
       "kind": "normal",
@@ -625,10 +843,16 @@
         "query": {}
       },
       "route": "GET /v1/fundamentals/{symbol}",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 404
+      "shape": {
+        "symbol": "string"
+      },
+      "status": 200
     },
     "GET /v1/fundamentals/{symbol}::validation_error": {
       "kind": "validation_error",
@@ -641,10 +865,16 @@
         }
       },
       "route": "GET /v1/fundamentals/{symbol}",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 404
+      "shape": {
+        "symbol": "string"
+      },
+      "status": 200
     },
     "GET /v1/fundamentals::backend_failure": {
       "kind": "backend_failure",
@@ -655,6 +885,12 @@
         "query": {}
       },
       "route": "GET /v1/fundamentals",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -671,6 +907,14 @@
         }
       },
       "route": "GET /v1/fundamentals",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -693,6 +937,14 @@
         "query": {}
       },
       "route": "GET /v1/fundamentals",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -717,6 +969,12 @@
         }
       },
       "route": "GET /v1/fundamentals",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -745,6 +1003,12 @@
         "query": {}
       },
       "route": "GET /v1/funnel/metrics",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -761,6 +1025,14 @@
         }
       },
       "route": "GET /v1/funnel/metrics",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -783,6 +1055,14 @@
         "query": {}
       },
       "route": "GET /v1/funnel/metrics",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "as_of": "null",
         "count": "integer",
@@ -807,6 +1087,12 @@
         }
       },
       "route": "GET /v1/funnel/metrics",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -837,6 +1123,12 @@
         }
       },
       "route": "GET /v1/health",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "database": "string",
         "metadata_backend": "string",
@@ -912,6 +1204,12 @@
         "query": {}
       },
       "route": "GET /v1/health",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "database": "string",
         "metadata_backend": "string",
@@ -989,6 +1287,12 @@
         }
       },
       "route": "GET /v1/instruments/search",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -1006,6 +1310,14 @@
         }
       },
       "route": "GET /v1/instruments/search",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "items": {
@@ -1026,6 +1338,14 @@
         }
       },
       "route": "GET /v1/instruments/search",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "items": {
@@ -1044,6 +1364,12 @@
         "query": {}
       },
       "route": "GET /v1/instruments/search",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1072,6 +1398,12 @@
         }
       },
       "route": "GET /v1/quotes/cross-section/as-of",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -1090,10 +1422,40 @@
         }
       },
       "route": "GET /v1/quotes/cross-section/as-of",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 400
+      "shape": {
+        "adjustment": "string",
+        "as_of": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "max_lookback_seconds": "integer",
+        "max_staleness_seconds": "null",
+        "newest_ingested_at": "null",
+        "next_cursor": "null",
+        "page_size": "integer",
+        "served_at": "string",
+        "symbols": {
+          "items": "string",
+          "type": "array"
+        },
+        "truncated": "boolean"
+      },
+      "status": 200
     },
     "GET /v1/quotes/cross-section/as-of::normal": {
       "kind": "normal",
@@ -1107,10 +1469,40 @@
         }
       },
       "route": "GET /v1/quotes/cross-section/as-of",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 400
+      "shape": {
+        "adjustment": "string",
+        "as_of": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "max_lookback_seconds": "integer",
+        "max_staleness_seconds": "null",
+        "newest_ingested_at": "null",
+        "next_cursor": "null",
+        "page_size": "integer",
+        "served_at": "string",
+        "symbols": {
+          "items": "string",
+          "type": "array"
+        },
+        "truncated": "boolean"
+      },
+      "status": 200
     },
     "GET /v1/quotes/cross-section/as-of::validation_error": {
       "kind": "validation_error",
@@ -1123,6 +1515,12 @@
         }
       },
       "route": "GET /v1/quotes/cross-section/as-of",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1151,6 +1549,12 @@
         }
       },
       "route": "GET /v1/quotes/cross-section/matrix",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -1169,10 +1573,42 @@
         }
       },
       "route": "GET /v1/quotes/cross-section/matrix",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 400
+      "shape": {
+        "adjustment": "string",
+        "bar_ats": {
+          "items": "string",
+          "type": "array"
+        },
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "matrix_cells": "integer",
+        "newest_ingested_at": "null",
+        "next_cursor": "null",
+        "page_size": "integer",
+        "served_at": "string",
+        "symbols": {
+          "items": "string",
+          "type": "array"
+        },
+        "truncated": "boolean"
+      },
+      "status": 200
     },
     "GET /v1/quotes/cross-section/matrix::normal": {
       "kind": "normal",
@@ -1186,10 +1622,42 @@
         }
       },
       "route": "GET /v1/quotes/cross-section/matrix",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 400
+      "shape": {
+        "adjustment": "string",
+        "bar_ats": {
+          "items": "string",
+          "type": "array"
+        },
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "matrix_cells": "integer",
+        "newest_ingested_at": "null",
+        "next_cursor": "null",
+        "page_size": "integer",
+        "served_at": "string",
+        "symbols": {
+          "items": "string",
+          "type": "array"
+        },
+        "truncated": "boolean"
+      },
+      "status": 200
     },
     "GET /v1/quotes/cross-section/matrix::validation_error": {
       "kind": "validation_error",
@@ -1202,6 +1670,12 @@
         }
       },
       "route": "GET /v1/quotes/cross-section/matrix",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1229,6 +1703,12 @@
         }
       },
       "route": "GET /v1/quotes/cross-section",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -1247,10 +1727,32 @@
         }
       },
       "route": "GET /v1/quotes/cross-section",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 400
+      "shape": {
+        "adjustment": "string",
+        "bar_at": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "truncated": "boolean"
+      },
+      "status": 200
     },
     "GET /v1/quotes/cross-section::normal": {
       "kind": "normal",
@@ -1263,10 +1765,32 @@
         }
       },
       "route": "GET /v1/quotes/cross-section",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 400
+      "shape": {
+        "adjustment": "string",
+        "bar_at": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "truncated": "boolean"
+      },
+      "status": 200
     },
     "GET /v1/quotes/cross-section::validation_error": {
       "kind": "validation_error",
@@ -1277,6 +1801,12 @@
         "query": {}
       },
       "route": "GET /v1/quotes/cross-section",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1304,6 +1834,12 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/as-of",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -1321,10 +1857,29 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/as-of",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 502
+      "shape": {
+        "adjustment": "string",
+        "as_of": "string",
+        "bar": "null",
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "max_lookback_seconds": "integer",
+        "max_staleness_seconds": "null",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "symbol": "string"
+      },
+      "status": 200
     },
     "GET /v1/quotes/{symbol}/as-of::normal": {
       "kind": "normal",
@@ -1337,10 +1892,29 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/as-of",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 502
+      "shape": {
+        "adjustment": "string",
+        "as_of": "string",
+        "bar": "null",
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "max_lookback_seconds": "integer",
+        "max_staleness_seconds": "null",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "symbol": "string"
+      },
+      "status": 200
     },
     "GET /v1/quotes/{symbol}/as-of::validation_error": {
       "kind": "validation_error",
@@ -1351,6 +1925,12 @@
         "query": {}
       },
       "route": "GET /v1/quotes/{symbol}/as-of",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1376,6 +1956,12 @@
         "query": {}
       },
       "route": "GET /v1/quotes/{symbol}/history",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -1392,6 +1978,14 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/history",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "adjustment": "string",
         "bars": {
@@ -1419,10 +2013,31 @@
         "query": {}
       },
       "route": "GET /v1/quotes/{symbol}/history",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 502
+      "shape": {
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "symbol": "string"
+      },
+      "status": 200
     },
     "GET /v1/quotes/{symbol}/history::validation_error": {
       "kind": "validation_error",
@@ -1435,6 +2050,12 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/history",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1466,6 +2087,12 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/raw-history",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -1484,10 +2111,34 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/raw-history",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 400
+      "shape": {
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "end": "string",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "start": "string",
+        "symbol": "string",
+        "truncated": "boolean"
+      },
+      "status": 200
     },
     "GET /v1/quotes/{symbol}/raw-history::normal": {
       "kind": "normal",
@@ -1501,10 +2152,34 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/raw-history",
-      "shape": {
-        "detail": "string"
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "bars"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 400
+      "shape": {
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "end": "string",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "start": "string",
+        "symbol": "string",
+        "truncated": "boolean"
+      },
+      "status": 200
     },
     "GET /v1/quotes/{symbol}/raw-history::validation_error": {
       "kind": "validation_error",
@@ -1517,6 +2192,12 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}/raw-history",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1542,12 +2223,16 @@
         "query": {}
       },
       "route": "GET /v1/quotes/{symbol}",
-      "shape": {
-        "close": "number",
-        "refresh_seen": "boolean",
-        "symbol": "string"
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
       },
-      "status": 200
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
     },
     "GET /v1/quotes/{symbol}::empty": {
       "kind": "empty",
@@ -1560,6 +2245,12 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "close": "number",
         "refresh_seen": "boolean",
@@ -1576,6 +2267,12 @@
         "query": {}
       },
       "route": "GET /v1/quotes/{symbol}",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "close": "number",
         "refresh_seen": "boolean",
@@ -1594,6 +2291,12 @@
         }
       },
       "route": "GET /v1/quotes/{symbol}",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "close": "number",
         "refresh_seen": "boolean",
@@ -1612,18 +2315,25 @@
         }
       },
       "route": "GET /v1/quotes",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "errors": {
-          "items": null,
+          "items": {
+            "error": "string",
+            "symbol": "string"
+          },
           "type": "array"
         },
         "items": {
-          "items": {
-            "close": "number",
-            "refresh_seen": "boolean",
-            "symbol": "string"
-          },
+          "items": null,
           "type": "array"
         }
       },
@@ -1641,6 +2351,14 @@
         }
       },
       "route": "GET /v1/quotes",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "errors": {
@@ -1668,6 +2386,14 @@
         }
       },
       "route": "GET /v1/quotes",
+      "semantics": {
+        "count": 1,
+        "empty_collections": [
+          "errors"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "errors": {
@@ -1694,6 +2420,12 @@
         "query": {}
       },
       "route": "GET /v1/quotes",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1721,6 +2453,14 @@
         }
       },
       "route": "GET /v1/readiness",
+      "semantics": {
+        "count": null,
+        "empty_collections": [
+          "reasons"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "backend": "string",
         "candidate_since_monotonic": "null",
@@ -1789,6 +2529,14 @@
         "query": {}
       },
       "route": "GET /v1/readiness",
+      "semantics": {
+        "count": null,
+        "empty_collections": [
+          "reasons"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "backend": "string",
         "candidate_since_monotonic": "null",
@@ -1857,6 +2605,12 @@
         "query": {}
       },
       "route": "GET /v1/snapshot",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -1873,10 +2627,18 @@
         }
       },
       "route": "GET /v1/snapshot",
-      "shape": {
-        "non_json": "boolean"
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 500
+      "shape": {
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
     },
     "GET /v1/snapshot::normal": {
       "kind": "normal",
@@ -1887,10 +2649,18 @@
         "query": {}
       },
       "route": "GET /v1/snapshot",
-      "shape": {
-        "non_json": "boolean"
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": false
       },
-      "status": 500
+      "shape": {
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
     },
     "GET /v1/snapshot::validation_error": {
       "kind": "validation_error",
@@ -1903,6 +2673,12 @@
         }
       },
       "route": "GET /v1/snapshot",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -1931,6 +2707,12 @@
         "query": {}
       },
       "route": "GET /v1/sources/health",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -1947,6 +2729,14 @@
         }
       },
       "route": "GET /v1/sources/health",
+      "semantics": {
+        "count": null,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "items": {
           "items": null,
@@ -1964,6 +2754,14 @@
         "query": {}
       },
       "route": "GET /v1/sources/health",
+      "semantics": {
+        "count": null,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "items": {
           "items": null,
@@ -1981,6 +2779,12 @@
         "query": {}
       },
       "route": "GET /v1/sources/tdx/coverage",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -1997,6 +2801,14 @@
         }
       },
       "route": "GET /v1/sources/tdx/coverage",
+      "semantics": {
+        "count": null,
+        "empty_collections": [
+          "periods"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "periods": {
           "items": null,
@@ -2014,6 +2826,14 @@
         "query": {}
       },
       "route": "GET /v1/sources/tdx/coverage",
+      "semantics": {
+        "count": null,
+        "empty_collections": [
+          "periods"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "periods": {
           "items": null,
@@ -2033,6 +2853,12 @@
         }
       },
       "route": "GET /v1/validation/{symbol}/results",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -2050,6 +2876,14 @@
         }
       },
       "route": "GET /v1/validation/{symbol}/results",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "items": {
@@ -2072,6 +2906,14 @@
         }
       },
       "route": "GET /v1/validation/{symbol}/results",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "items": {
@@ -2092,6 +2934,12 @@
         "query": {}
       },
       "route": "GET /v1/validation/{symbol}/results",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -2119,6 +2967,12 @@
         }
       },
       "route": "GET /v1/validation/{symbol}",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -2136,6 +2990,10 @@
         }
       },
       "route": "GET /v1/validation/{symbol}",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2153,6 +3011,10 @@
         }
       },
       "route": "GET /v1/validation/{symbol}",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2168,6 +3030,12 @@
         "query": {}
       },
       "route": "GET /v1/validation/{symbol}",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -2193,6 +3061,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/artifacts/backfill",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -2207,6 +3081,10 @@
         "query": {}
       },
       "route": "POST /v1/admin/artifacts/backfill",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2224,6 +3102,12 @@
         }
       },
       "route": "POST /v1/admin/baostock/{symbol}/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2240,6 +3124,10 @@
         }
       },
       "route": "POST /v1/admin/baostock/{symbol}/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2255,6 +3143,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/baostock/{symbol}/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -2280,6 +3174,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/earnings-calendar/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2294,6 +3194,10 @@
         "query": {}
       },
       "route": "POST /v1/admin/earnings-calendar/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2311,6 +3215,10 @@
         }
       },
       "route": "POST /v1/admin/earnings-calendar/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2326,6 +3234,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/economic-calendar/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2340,6 +3254,10 @@
         "query": {}
       },
       "route": "POST /v1/admin/economic-calendar/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2357,6 +3275,10 @@
         }
       },
       "route": "POST /v1/admin/economic-calendar/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2372,6 +3294,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/economic-indicators/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2386,6 +3314,10 @@
         "query": {}
       },
       "route": "POST /v1/admin/economic-indicators/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2401,6 +3333,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/financials/{symbol}/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2415,6 +3353,10 @@
         "query": {}
       },
       "route": "POST /v1/admin/financials/{symbol}/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2432,6 +3374,10 @@
         }
       },
       "route": "POST /v1/admin/financials/{symbol}/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2447,6 +3393,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/fundamentals/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2461,6 +3413,10 @@
         "query": {}
       },
       "route": "POST /v1/admin/fundamentals/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2478,6 +3434,10 @@
         }
       },
       "route": "POST /v1/admin/fundamentals/refresh",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2493,6 +3453,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/funnel/metrics/rebuild",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -2507,6 +3473,10 @@
         "query": {}
       },
       "route": "POST /v1/admin/funnel/metrics/rebuild",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2522,6 +3492,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/tdx/financials/sync",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2536,6 +3512,10 @@
         "query": {}
       },
       "route": "POST /v1/admin/tdx/financials/sync",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2553,6 +3533,10 @@
         }
       },
       "route": "POST /v1/admin/tdx/financials/sync",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2570,6 +3554,12 @@
         }
       },
       "route": "POST /v1/admin/validation/rebuild",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": false,
+        "has_error_shape": true
+      },
       "shape": {
         "non_json": "boolean"
       },
@@ -2586,6 +3576,10 @@
         }
       },
       "route": "POST /v1/admin/validation/rebuild",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2601,6 +3595,12 @@
         "query": {}
       },
       "route": "POST /v1/admin/validation/rebuild",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -2628,6 +3628,12 @@
         "query": {}
       },
       "route": "POST /v1/tushare/realtime-quote",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2644,6 +3650,14 @@
         "query": {}
       },
       "route": "POST /v1/tushare/realtime-quote",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_error_shape": false
+      },
       "shape": {
         "count": "integer",
         "items": {
@@ -2663,6 +3677,12 @@
         "query": {}
       },
       "route": "POST /v1/tushare/realtime-quote",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": {
           "items": {
@@ -2691,6 +3711,12 @@
         "query": {}
       },
       "route": "POST /v1/tushare/{api_name}",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_error_shape": true
+      },
       "shape": {
         "detail": "string"
       },
@@ -2708,6 +3734,10 @@
         "query": {}
       },
       "route": "POST /v1/tushare/{api_name}",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2723,6 +3753,10 @@
         "query": {}
       },
       "route": "POST /v1/tushare/{api_name}",
+      "semantics": {
+        "count": null,
+        "empty_collections": []
+      },
       "shape": {
         "items": null,
         "type": "array"
@@ -2731,5 +3765,5 @@
     }
   },
   "schema": "marketcow.old-main-api-contract.v1.route-matrix",
-  "sha256": "2491fa9b9f8d9ddf0d1ec6c3eb0e00cb456c1b7ddb3d367af7ef5cd7e13039b2"
+  "sha256": "d4cf3ff551b2403c041e09599cfd72cc3fcbcc8b210de4701606a3eb9cefe069"
 }

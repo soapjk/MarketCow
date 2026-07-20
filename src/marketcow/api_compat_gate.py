@@ -97,6 +97,20 @@ def response_shape(value: Any) -> Any:
     return "string"
 
 
+def response_semantics(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {"count": None, "empty_collections": []}
+    empty = [str(key) for key, item in sorted(value.items())
+             if isinstance(item, list) and not item]
+    count = value.get("count")
+    return {
+        "count": count if isinstance(count, int) and not isinstance(count, bool) else None,
+        "empty_collections": empty,
+        "has_detail": "detail" in value,
+        "has_error_shape": "detail" in value or value.get("non_json") is True,
+    }
+
+
 def route_request(route: str, parameters: list[Mapping[str, Any]]) -> dict[str, Any]:
     """Produce the stable isolated-fixture request used by both captures."""
     method, template = route.split(" ", 1)
@@ -189,6 +203,7 @@ def capture_route_matrix(
             captures[f"{route}::{kind}"] = {
                 "route": route, "kind": kind, "request": request,
                 "status": response.status_code, "shape": response_shape(body),
+                "semantics": response_semantics(body),
             }
     result = {"schema": SCHEMA_VERSION + ".route-matrix", "captures": captures}
     result["sha256"] = sha256_json(result)
@@ -250,6 +265,7 @@ def load_document(path: Path, expected_schema: str) -> dict[str, Any]:
 
 def validate_coverage_inventory(
     inventory: Mapping[str, Any], legacy: Mapping[str, Any], v2: Mapping[str, Any],
+    legacy_matrix: Mapping[str, Any], v2_matrix: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Fail closed unless every public route has an explicit two-sided scenario plan."""
     entries = inventory.get("routes")
@@ -261,6 +277,12 @@ def validate_coverage_inventory(
     seen: set[str] = set()
     scenario_ids: set[str] = set()
     errors: list[str] = []
+    if inventory.get("legacy_matrix_sha256") != legacy_matrix.get("sha256"):
+        errors.append("legacy-matrix-checksum")
+    if inventory.get("v2_matrix_sha256") != v2_matrix.get("sha256"):
+        errors.append("v2-matrix-checksum")
+    matrices = {"legacy": legacy_matrix.get("captures", {}),
+                "v2": v2_matrix.get("captures", {})}
     for entry in entries:
         route = entry.get("route") if isinstance(entry, Mapping) else None
         if not isinstance(route, str) or route in seen:
@@ -283,6 +305,8 @@ def validate_coverage_inventory(
             kind = scenario.get("kind")
             if kind not in {"normal", "empty", "validation_error", "backend_failure"}:
                 errors.append(f"invalid-scenario-kind:{route}:{scenario_id}")
+            if scenario.get("capture_key") != f"{route}::{kind}":
+                errors.append(f"invalid-capture-key:{route}:{scenario_id}")
             for side, present in (("legacy", route in legacy_routes),
                                   ("v2", route in v2_routes)):
                 state = scenario.get(side)
@@ -296,6 +320,33 @@ def validate_coverage_inventory(
                     )
                 if not present and state != "route_absent":
                     errors.append(f"missing-route-absence:{side}:{route}:{scenario_id}")
+                if state == "executed":
+                    capture = matrices[side].get(f"{route}::{kind}")
+                    if not isinstance(capture, Mapping):
+                        errors.append(f"missing-capture:{side}:{route}:{kind}")
+                        continue
+                    if capture.get("route") != route or capture.get("kind") != kind:
+                        errors.append(f"capture-binding:{side}:{route}:{kind}")
+                    if scenario.get(side + "_capture_sha256") != sha256_json(capture):
+                        errors.append(f"capture-checksum:{side}:{route}:{kind}")
+                    status = capture.get("status")
+                    semantics = capture.get("semantics", {})
+                    valid = False
+                    if kind == "normal":
+                        valid = isinstance(status, int) and 200 <= status < 300
+                    elif kind == "validation_error":
+                        valid = (isinstance(status, int) and 400 <= status < 500
+                                 and semantics.get("has_detail") is True)
+                    elif kind == "backend_failure":
+                        valid = (isinstance(status, int) and 500 <= status < 600
+                                 and semantics.get("has_error_shape") is True)
+                    elif kind == "empty":
+                        valid = (isinstance(status, int) and 200 <= status < 300
+                                 and (semantics.get("count") == 0 or bool(
+                                     semantics.get("empty_collections")
+                                 )))
+                    if not valid:
+                        errors.append(f"semantic-mismatch:{side}:{route}:{kind}")
         applicability = entry.get("applicability")
         if not isinstance(applicability, Mapping):
             errors.append(f"missing-applicability:{route}")

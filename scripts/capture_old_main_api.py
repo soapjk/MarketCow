@@ -56,6 +56,19 @@ def shape(value):
     return "string"
 
 
+def semantics(value):
+    if not isinstance(value, dict):
+        return {"count": None, "empty_collections": [], "has_detail": False}
+    count = value.get("count")
+    return {
+        "count": count if isinstance(count, int) and not isinstance(count, bool) else None,
+        "empty_collections": [str(key) for key, item in sorted(value.items())
+                              if isinstance(item, list) and not item],
+        "has_detail": "detail" in value,
+        "has_error_shape": "detail" in value or value.get("non_json") is True,
+    }
+
+
 def request_for(route, detail):
     method, template = route.split(" ", 1)
     path, query = template, {}
@@ -81,6 +94,11 @@ class Repository:
         return [{"symbol": value, "close": 1.0, "refresh_seen": False}
                 for value in symbols]
 
+    def query_fundamentals(self, *args, **kwargs):
+        if kwargs.get("limit") == 1:
+            return [{"symbol": kwargs.get("symbol", "000001")}]
+        return []
+
     def __getattr__(self, name):
         if name.startswith(("get_", "query_", "latest_", "provider_", "tdx_")):
             return lambda *_args, **_kwargs: []
@@ -100,10 +118,14 @@ class Service:
         return {"symbol": symbol, "close": 1.0, "refresh_seen": True}
 
     def get_quote(self, symbol, force_refresh=False):
+        if symbol in {"FAIL", "MISSING"}:
+            raise RuntimeError("bounded fixture failure")
         return {"symbol": symbol, "close": 1.0,
                 "refresh_seen": bool(force_refresh)}
 
     def refresh_quote_history(self, symbol, _range, interval, adjustment):
+        if interval == "bad":
+            raise RuntimeError("bounded fixture failure")
         return {"symbol": symbol, "interval": interval, "adjustment": adjustment,
                 "bars": [], "count": 0}
 
@@ -145,6 +167,14 @@ class FaultService(Service):
         def fail(*_args, **_kwargs):
             raise RuntimeError("bounded fixture failure")
         return fail
+
+    def get_quote(self, *_args, **_kwargs):
+        raise RuntimeError("bounded fixture failure")
+
+    refresh_quote_history = get_quote
+    calendar_snapshot = get_quote
+    search_instruments = get_quote
+    tushare_realtime_quote = get_quote
 
 
 def main() -> int:
@@ -201,26 +231,37 @@ def main() -> int:
     else:
         print(rendered, end="")
     if args.scenario_output:
-        captures = {}
+        requests = {
+            "health": "/v1/health",
+            "quotes_default": "/v1/quotes?symbols=AAPL",
+            "quotes_empty": "/v1/quotes?symbols=MISSING&refresh=false",
+            "quotes_batch_error": "/v1/quotes?symbols=AAPL,FAIL&refresh=true",
+            "quotes_backend_failure": "/v1/quotes?symbols=FAIL&refresh=true",
+            "quotes_missing_parameter": "/v1/quotes?symbols=",
+            "history_invalid_parameter": "/v1/quotes/AAPL/history?interval=bad",
+        }
+        scenario_values = {}
         with TestClient(app, raise_server_exceptions=False) as client:
-            for route, detail in sorted(routes.items()):
-                method, path, query, body = request_for(route, detail)
-                url = path + (("?" + urlencode(query)) if query else "")
-                response = client.request(method, url, json=body)
-                try:
-                    value = response.json()
-                except ValueError:
-                    value = {"non_json": True}
-                captures[route] = {
-                    "request": {"method": method, "path": path,
-                                "query": query, "json": body},
+            for name, url in requests.items():
+                response = client.get(url)
+                value = response.json()
+                semantic = {}
+                if name == "health":
+                    semantic["database"] = "filesystem_path"
+                elif name == "quotes_default":
+                    items = value.get("items", [])
+                    semantic["refresh_seen"] = (
+                        items[0].get("refresh_seen") if items else None
+                    )
+                scenario_values[name] = {
                     "status": response.status_code, "shape": shape(value),
+                    "semantic": semantic,
                 }
         scenarios = {
-            "schema": "marketcow.old-main-api-contract.v1.route-scenarios",
+            "schema": "marketcow.old-main-api-contract.v1.scenarios",
             "capture_tool_version": TOOL_VERSION, "source_commit": commit,
-            "generation_input": "isolated-deterministic-fixture:all-public-routes-v1",
-            "captures": captures,
+            "generation_input": "isolated-deterministic-fixture:legacy-fixture-v1",
+            "scenarios": scenario_values,
         }
         scenarios["sha256"] = digest(scenarios)
         args.scenario_output.write_text(
@@ -271,6 +312,7 @@ def main() -> int:
                     captures[f"{route}::{kind}"] = {
                         "route": route, "kind": kind, "request": request,
                         "status": response.status_code, "shape": shape(value),
+                        "semantics": semantics(value),
                     }
         matrix = {
             "schema": "marketcow.old-main-api-contract.v1.route-matrix",
