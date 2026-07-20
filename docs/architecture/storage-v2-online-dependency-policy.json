@@ -1,0 +1,35 @@
+{
+  "schema": "marketcow.online-dependency-policy.v1",
+  "decision": "ADR-003",
+  "online_entrypoints": [
+    "marketcow.api",
+    "marketcow.service",
+    "marketcow.health"
+  ],
+  "forbidden_internal_imports": [
+    "marketcow.duckdb_repositories",
+    "marketcow.storage"
+  ],
+  "forbidden_external_imports": [
+    "duckdb"
+  ],
+  "offline_only_modules": [
+    "marketcow.cold_archive",
+    "marketcow.local_backfill",
+    "marketcow.local_benchmark",
+    "marketcow.local_restore"
+  ],
+  "temporary_direct_import_exceptions": [
+    {
+      "from": "marketcow.service",
+      "to": "marketcow.duckdb_repositories",
+      "removal_item": "BG-007"
+    },
+    {
+      "from": "marketcow.service",
+      "to": "marketcow.storage",
+      "removal_item": "BG-008"
+    }
+  ],
+  "exception_policy": "Exact migration debt only; additions require an accepted BG REV or BLOCK item."
+}
