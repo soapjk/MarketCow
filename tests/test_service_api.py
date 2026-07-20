@@ -287,7 +287,7 @@ class ServiceApiTest(unittest.TestCase):
         self.assertEqual(sources.status_code, 200)
 
     def test_hk_us_quote_batch_cache_and_adjusted_history(self):
-        response = self.client.get("/v1/quotes?symbols=0700.HK,AAPL")
+        response = self.client.get("/v1/quotes?symbols=0700.HK,AAPL&refresh=true")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["count"], 2)
         self.assertEqual({item["symbol"] for item in response.json()["items"]}, {"0700.HK", "AAPL"})
