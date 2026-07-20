@@ -89,6 +89,32 @@ def _database_status(path: Path) -> dict[str, Any]:
 
 
 def diagnose(settings: Settings) -> dict[str, Any]:
+    if settings.profile in {"v2-development", "v2-test"}:
+        settings.validate_v2_preflight()
+        from .health import V2HealthEvaluator
+        from .v2_factory import create_v2_online_repositories
+        resources = None
+        try:
+            resources = create_v2_online_repositories(settings)
+            health = V2HealthEvaluator().evaluate(resources.health_snapshot())
+            return {
+                "status": "ready" if health["ready"] else "attention",
+                "checks": {"v2_storage": health, "network": {
+                    "checked": False,
+                    "message": "upstream access is checked only on explicit requests",
+                }},
+            }
+        except Exception:
+            return {"status": "attention", "checks": {"v2_storage": {
+                "status": "unavailable", "ready": False,
+                "reason": "v2_dependency_probe_failed",
+            }}}
+        finally:
+            if resources is not None:
+                try:
+                    resources.close()
+                except Exception:
+                    pass
     modules: dict[str, dict[str, Any]] = {}
     for name in REQUIRED_MODULES:
         try:

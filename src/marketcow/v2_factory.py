@@ -12,6 +12,7 @@ from .config import Settings
 from .postgres_migrations import POSTGRES_TRANSACTION_DOMAINS
 from .postgres_repositories import PostgresDatabase, PostgresRepository
 from .telemetry import Telemetry
+from .health import V2_HEALTH_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,88 @@ class V2OnlineRepositories:
                 errors.append(error)
         if errors:
             raise RuntimeError("V2 resource shutdown failed") from errors[0]
+
+    @staticmethod
+    def _safe_status(call: Callable[[], Any], logical_id: str) -> dict[str, Any]:
+        try:
+            call()
+            return {"status": "healthy", "logical_id": logical_id}
+        except Exception:
+            return {"status": "unavailable", "logical_id": logical_id,
+                    "reason": "dependency_probe_failed"}
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Bounded logical-only dependency snapshot; never exposes connection details."""
+        pg = self._safe_status(
+            lambda: self.postgres_database.pool.check(),
+            f"postgresql://{self.postgres_database.schema}",
+        )
+        main = self._safe_status(
+            lambda: self.clickhouse_database._require_client().ping() or
+            (_ for _ in ()).throw(RuntimeError("ping failed")),
+            f"clickhouse://{self.clickhouse_database.database}",
+        )
+        try:
+            wal_raw = self.spool.diagnostics(1000)
+            usage = wal_raw.get("quota", {})
+            total = max(1, int(usage.get("bytes", 0)) + int(usage.get("free_bytes", 0)))
+            wal = {
+                "status": "healthy", "pending": int(wal_raw.get("pending", 0)),
+                "failed": int(wal_raw.get("failed", 0)),
+                "replayed": int(wal_raw.get("replayed", 0)),
+                "quarantine": len(self.spool._bounded_files(self.spool.quarantine, 1000)[0]),
+                "oldest_pending_lag_seconds": float(
+                    wal_raw.get("oldest_pending_lag_seconds", 0)
+                ),
+                "truncated": bool(wal_raw.get("truncated")),
+                "disk_used_ratio": round(1.0 - int(usage.get("free_bytes", 0)) / total, 6),
+            }
+        except Exception:
+            wal = {"status": "unavailable", "reason": "wal_probe_failed"}
+        if self.canonical_scheduler is None:
+            scheduler = {"status": "disabled", "enabled": False}
+            scheduler_ch = {"status": "disabled", "enabled": False}
+        else:
+            try:
+                raw_scheduler = self.canonical_scheduler.diagnostics()
+                scheduler = {
+                    "status": "healthy", "enabled": True,
+                    "paused": bool(raw_scheduler.get("paused")),
+                    "thread_alive": bool(raw_scheduler.get("thread_alive")),
+                    "pending": int(raw_scheduler.get("pending", 0)),
+                    "failed": int(raw_scheduler.get("failed", 0)),
+                    "backlog_truncated": bool(raw_scheduler.get("backlog_truncated")),
+                    "oldest_lag_seconds": float(
+                        raw_scheduler.get("oldest_lag_seconds", 0)
+                    ),
+                    "invalid": int(raw_scheduler.get("invalid", 0)),
+                }
+            except Exception:
+                scheduler = {"status": "unavailable", "enabled": True,
+                             "reason": "canonical_probe_failed"}
+            scheduler_ch = self._safe_status(
+                lambda: self.scheduler_clickhouse_database._require_client().ping() or
+                (_ for _ in ()).throw(RuntimeError("ping failed")),
+                f"clickhouse://{self.scheduler_clickhouse_database.database}",
+            )
+            scheduler_ch["enabled"] = True
+        pressure = {"status": "missing"}
+        try:
+            snapshot = self.telemetry.snapshot()
+            values = {}
+            for metric in snapshot.get("metrics", []):
+                if metric.get("name") == "clickhouse_pressure":
+                    values[metric.get("labels", {}).get("kind")] = metric.get("value")
+            if {"merge_queue", "disk_used_ratio"} <= values.keys():
+                pressure = {"status": "observed", "merge_queue": values["merge_queue"],
+                            "disk_used_ratio": values["disk_used_ratio"]}
+        except Exception:
+            pressure = {"status": "missing"}
+        return {"schema": V2_HEALTH_SCHEMA, "components": {
+            "postgresql": pg, "clickhouse_main": main, "authoritative_wal": wal,
+            "canonical_scheduler": scheduler, "clickhouse_scheduler": scheduler_ch,
+            "clickhouse_pressure": pressure,
+        }}
 
     def __enter__(self) -> "V2OnlineRepositories":
         return self

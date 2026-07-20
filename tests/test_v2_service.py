@@ -122,7 +122,10 @@ class V2ServiceRoutingTest(unittest.TestCase):
                 self.assertEqual(quote.status_code, 200)
                 self.assertEqual(quote.json()["items"][0]["symbol"], "AAPL")
                 health = client.get("/v1/health")
-                self.assertEqual(health.json()["database"], "[REDACTED_PATH]")
+                self.assertEqual(
+                    health.json()["database"],
+                    "postgresql://marketcow_test+clickhouse://marketcow_test",
+                )
                 service.quote_provider = SimpleNamespace(
                     name="fixture", base_url="local://fixture",
                     fetch_history=lambda *_args: {
@@ -200,7 +203,7 @@ import marketcow.api as api
 with TestClient(api.app) as client:
  assert client.get('/v1/economic-indicators').status_code == 200
  assert client.get('/v1/quotes?symbols=AAPL&refresh=false').status_code == 200
- assert client.get('/v1/health').json()['database']=='[REDACTED_PATH]'
+ assert client.get('/v1/health').json()['database']=='postgresql://marketcow_test+clickhouse://marketcow_test'
 assert 'duckdb' not in sys.modules
 assert 'marketcow.storage' not in sys.modules
 assert 'marketcow.duckdb_repositories' not in sys.modules
@@ -262,6 +265,19 @@ class V2ServiceIntegrationTest(unittest.TestCase):
                 "2026-07-20T00:00:00Z", "2026-07-21T00:00:01Z",
             )
             with TestClient(create_app(settings, service)) as client:
+                health = client.get("/v1/health")
+                readiness = client.get("/v1/readiness")
+                self.assertEqual(health.status_code, 200)
+                self.assertEqual(readiness.status_code, 200)
+                self.assertEqual(
+                    health.json()["storage_health"]["components"]["postgresql"]["status"],
+                    "healthy",
+                )
+                self.assertEqual(
+                    health.json()["storage_health"]["components"]["clickhouse_main"]["status"],
+                    "healthy",
+                )
+                self.assertNotIn("duckdb", health.text.lower())
                 self.assertEqual(client.get(
                     "/v1/quotes?symbols=AAPL&refresh=false"
                 ).json()["items"][0]["close"], 11.0)

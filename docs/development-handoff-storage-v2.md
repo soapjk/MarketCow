@@ -1552,7 +1552,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：V2 全路由在 DuckDB import/open trap 下可启动和运行；写读错误保持明确且有界。
 - **必要测试**：完整 API 路由、刷新/失败、Artifact、生命周期及旧 Service 单元回归。
 - **排除项**：health/readiness、旧 main API golden。
-- **状态**：`本地实施完成，待独立验收`。`FundamentalService` 仅在 legacy profile 动态加载隔离的
+- **状态**：`已验收`（Artifact `cddcc58`）。`FundamentalService` 仅在 legacy profile 动态加载隔离的
   `legacy_service_factory`；V2 profile 唯一调用 BG-007 工厂，并把 metadata/fundamentals/artifact/control
   全部绑定 PostgreSQL，把 quote/canonical/raw 查询绑定 direct ClickHouse。中立 `LocalArtifactStore` 仅把
   body 写入隔离 raw root、manifest 写入 PostgreSQL。V2 行情适配器将 history refresh 规范化后交给 BG-005
@@ -1560,7 +1560,8 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   有界错误上抛且无 DuckDB fallback。API shutdown 幂等关闭完整工厂资源；legacy production/development
   构造和 CLI 行为保持原路径。在线 import 闭包的临时 DuckDB 例外已收敛为空，V2 app 在 duckdb、Warehouse、
   `.duckdb` open trap 下可导入、启动并执行 PG/CH 路由。health/readiness 状态机未在本项修改，双库判定留待
-  BG-009；旧 main 响应兼容决策仍留待 BG-010/BG-011。
+  BG-009；旧 main 响应兼容决策仍留待 BG-010/BG-011。本项已通过独立验收（Artifact
+  `cddcc58`）。
 
 ### `BG-009`：V2 health/readiness 双数据库契约
 
@@ -1570,7 +1571,11 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：PG/CH 任一必要依赖不可用时 readiness 符合声明；无 `database_path`/DuckDB 指标；disabled 不伪 healthy。
 - **必要测试**：固定时钟、PG/CH 单独/联合故障、backlog、完整响应泄密扫描、并发 snapshot。
 - **排除项**：外部监控和 production 健康探测。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 `marketcow.v2.health.v1` 双库依赖快照与固定阈值状态机；
+  PostgreSQL、main ClickHouse、authoritative WAL/spool 及启用时的独立 scheduler ClickHouse/worker/queue
+  均使用有界逻辑标识和原因。必要 PG/main CH/WAL probe 故障立即 fail-closed，压力、backlog 与 lag 使用持续窗口，
+  恢复使用 60 秒滞回；disabled scheduler 明确报告 disabled 而不伪装 active healthy。V2 health/readiness 和
+  doctor 不读取 database_path、不导入 DuckDB，完整响应不包含 DSN、凭证、异常原文或绝对路径；legacy 路径不变。
 
 ### `BG-010`：旧 main API 契约捕获器
 

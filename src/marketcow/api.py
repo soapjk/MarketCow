@@ -15,7 +15,7 @@ from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
 from .telemetry import sanitize_text, telemetry_call
-from .health import StorageHealthEvaluator
+from .health import StorageHealthEvaluator, V2HealthEvaluator
 
 
 class TushareRequest(BaseModel):
@@ -39,14 +39,24 @@ def create_app(
     app.add_event_handler("shutdown", service.close)
     clock = now_provider or (lambda: datetime.now(timezone.utc))
     health_evaluator = StorageHealthEvaluator(wall_clock=clock)
+    v2_health_evaluator = V2HealthEvaluator(wall_clock=clock)
 
     def storage_health() -> Dict[str, Any]:
+        if settings.profile in {"v2-development", "v2-test"}:
+            resources = getattr(service, "v2_resources", None)
+            try:
+                snapshot = resources.health_snapshot() if resources is not None else None
+            except Exception:
+                snapshot = None
+            return v2_health_evaluator.evaluate(snapshot)
         repository = getattr(service, "market_bar_repository", None)
         telemetry = getattr(repository, "telemetry", None)
         snapshot = telemetry_call(telemetry, "snapshot")
         return health_evaluator.evaluate(snapshot)
 
     def database_identifier() -> str:
+        if settings.profile in {"v2-development", "v2-test"}:
+            return f"postgresql://{sanitize_text(settings.postgres_schema)}+clickhouse://{sanitize_text(settings.clickhouse_database)}"
         if settings.database_path is None:
             return "[REDACTED_PATH]"
         try:
