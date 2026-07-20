@@ -748,6 +748,24 @@ class Warehouse:
             result.append(row)
         return result
 
+    def get_price_bars_for_reconciliation(
+        self, symbol: str, interval: str, adjustment: str, source: str,
+        timestamps: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        if not timestamps:
+            return []
+        placeholders = ",".join("?" for _ in timestamps)
+        query = (
+            "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, low, "
+            "close, volume, amount, source, ingested_at, observed_at, raw_artifact_id "
+            "FROM market_price_bar WHERE symbol=? AND interval=? AND adjustment=? "
+            "AND source=? AND timestamp IN (" + placeholders + ") ORDER BY timestamp"
+        )
+        with self._lock, self.connect() as con:
+            return self._rows(
+                con, query, [symbol, interval, adjustment, source, *timestamps]
+            )
+
     @staticmethod
     def _calendar_payload(row: Dict[str, Any]) -> Dict[str, Any]:
         payload = json.loads(row.pop("payload_json") or "{}")

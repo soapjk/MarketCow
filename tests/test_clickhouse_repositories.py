@@ -10,7 +10,9 @@ from marketcow.clickhouse_repositories import (
     ClickHouseDatabase,
     ClickHouseMarketBarRepository,
 )
+from marketcow.clickhouse_shadow import ShadowMarketBarRepository
 from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
+from marketcow.storage import Warehouse
 
 
 class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
@@ -129,6 +131,52 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                 self.repository.database.client = original
             self.assertEqual(failed["spooled"], 1)
             self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
+
+    def test_real_shadow_dual_write_replay_and_reconciliation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            warehouse = Warehouse(root / "warehouse.duckdb")
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(root / "spool", root), 1000
+            )
+            adapter = ShadowMarketBarRepository(warehouse, writer)
+            fixture_bars = [{
+                "timestamp": 100, "bar_at": "1970-01-01T00:01:40Z",
+                "open": 20, "high": 22, "low": 19, "close": 21,
+                "volume": 200, "amount": 4200,
+            }]
+            provenance = {"observed_at": "2026-07-20T02:00:01Z",
+                          "raw_artifact_id": "shadow-artifact"}
+            self.assertEqual(adapter.upsert_price_bars(
+                "000777.SZ", "1m", "raw", "shadow_fixture",
+                "2026-07-20T02:00:02Z", fixture_bars, provenance,
+            ), 1)
+            reconciliation = adapter.reconcile_last_write()
+            self.assertEqual(reconciliation["status"], "consistent", reconciliation)
+
+            original = self.database.client
+            self.database.client = None
+            try:
+                self.assertEqual(adapter.upsert_price_bars(
+                    "000778.SZ", "1m", "raw", "shadow_fixture",
+                    "2026-07-20T02:00:02Z", fixture_bars, provenance,
+                ), 1)
+            finally:
+                self.database.client = original
+            self.assertEqual(adapter.diagnostics()["shadow"]["status"], "spooled")
+            self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
+            reconciliation = adapter.reconcile_last_write()
+            self.assertEqual(reconciliation["status"], "consistent", reconciliation)
+
+            changed = adapter._raw_rows(
+                "000778.SZ", "1m", "raw", "shadow_fixture",
+                "2026-07-20T02:00:03Z", fixture_bars, provenance,
+            )
+            changed[0]["close"] = 99.0
+            self.repository.insert_raw_bars(changed, batch_id="intentional-mismatch")
+            mismatch = adapter.reconcile_last_write()
+            self.assertEqual(mismatch["status"], "mismatch")
+            self.assertEqual(mismatch["mismatch_count"], 1)
 
 
 if __name__ == "__main__":

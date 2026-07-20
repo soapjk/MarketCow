@@ -135,6 +135,8 @@ class SettingsTest(unittest.TestCase):
                     storage_root=root / "data-development")
         with self.assertRaisesRegex(ValueError, "batch size"):
             Settings(**base, clickhouse_batch_size=100).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "connect timeout"):
+            Settings(**base, clickhouse_connect_timeout=60).validate_runtime_isolation()
         formal = Path("/Volumes/T9/projects/market-data-service/data/spool/clickhouse")
         with self.assertRaisesRegex(ValueError, "within development storage root"):
             Settings(**base, clickhouse_spool_path=formal).validate_runtime_isolation()

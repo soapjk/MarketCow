@@ -115,6 +115,16 @@ class Stage1FundamentalRepository:
         return getattr(repository, name)
 
 
+class RepositoryResources:
+    def __init__(self, resources: List[Any]) -> None:
+        self.resources = resources
+
+    def close(self) -> None:
+        for resource in reversed(self.resources):
+            resource.close()
+        self.resources.clear()
+
+
 def create_duckdb_repositories(warehouse: Warehouse) -> Repositories:
     """Build the compatibility backend while each data domain is migrated separately."""
 
@@ -127,19 +137,54 @@ def create_duckdb_repositories(warehouse: Warehouse) -> Repositories:
 
 
 def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Repositories, Any]:
-    """Select the metadata backend while market bars and fundamentals remain on DuckDB."""
+    """Assemble opt-in development backends while DuckDB remains the primary."""
 
     settings.validate_runtime_isolation()
-    if settings.metadata_backend == "duckdb":
+    if settings.metadata_backend == "duckdb" and not settings.clickhouse_enabled:
         return create_duckdb_repositories(warehouse), None
-    from .postgres_repositories import PostgresDatabase, PostgresMetadataRepository
+    resources: List[Any] = []
+    metadata: Any = warehouse
+    fundamentals: Any = warehouse
+    artifacts: Any = LocalArtifactStore(warehouse)
+    market_bars: Any = warehouse
+    try:
+        if settings.metadata_backend == "postgres":
+            from .postgres_repositories import PostgresDatabase, PostgresMetadataRepository
 
-    database = PostgresDatabase(settings.postgres_dsn, settings.postgres_schema)
-    database.open()
-    metadata = PostgresMetadataRepository(database)
+            postgres = PostgresDatabase(settings.postgres_dsn, settings.postgres_schema)
+            postgres.open()
+            resources.append(postgres)
+            metadata = PostgresMetadataRepository(postgres)
+            fundamentals = Stage1FundamentalRepository(metadata, warehouse)
+            artifacts = LocalArtifactStore(metadata)
+        if settings.clickhouse_enabled:
+            from .clickhouse_repositories import (
+                ClickHouseDatabase,
+                ClickHouseMarketBarRepository,
+            )
+            from .clickhouse_shadow import ShadowMarketBarRepository
+            from .clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
+
+            clickhouse = ClickHouseDatabase(
+                settings.clickhouse_host, settings.clickhouse_port,
+                settings.clickhouse_database, settings.clickhouse_username,
+                settings.clickhouse_password, settings.clickhouse_secure,
+                settings.clickhouse_connect_timeout, settings.clickhouse_read_timeout,
+            )
+            clickhouse.open()
+            resources.append(clickhouse)
+            spool = LocalClickHouseSpool(
+                settings.clickhouse_spool_path, settings.storage_root
+            )
+            writer = ReliableClickHouseWriter(
+                ClickHouseMarketBarRepository(clickhouse), spool,
+                settings.clickhouse_batch_size,
+            )
+            market_bars = ShadowMarketBarRepository(warehouse, writer)
+    except Exception:
+        RepositoryResources(resources).close()
+        raise
     return Repositories(
-        metadata=metadata,
-        fundamentals=Stage1FundamentalRepository(metadata, warehouse),
-        market_bars=warehouse,
-        artifacts=LocalArtifactStore(metadata),
-    ), database
+        metadata=metadata, fundamentals=fundamentals, market_bars=market_bars,
+        artifacts=artifacts,
+    ), RepositoryResources(resources)

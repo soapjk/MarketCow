@@ -49,7 +49,8 @@ class ClickHouseDatabase:
 
     def __init__(
         self, host: str, port: int, database: str, username: str = "default",
-        password: str = "", secure: bool = False,
+        password: str = "", secure: bool = False, connect_timeout: float = 2.0,
+        read_timeout: float = 5.0,
     ) -> None:
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", database):
             raise ValueError("ClickHouse database must be a simple identifier")
@@ -67,12 +68,15 @@ class ClickHouseDatabase:
         self.username = username
         self.password = password
         self.secure = secure
+        self.connect_timeout = connect_timeout
+        self.read_timeout = read_timeout
         self.client: Optional[Any] = None
 
     def _connect(self, database: str) -> Any:
         return clickhouse_connect.get_client(
             host=self.host, port=self.port, username=self.username,
             password=self.password, database=database, secure=self.secure,
+            connect_timeout=self.connect_timeout, send_receive_timeout=self.read_timeout,
         )
 
     def open(self) -> None:
@@ -189,5 +193,22 @@ class ClickHouseMarketBarRepository:
             "SELECT * FROM market_bar_raw FINAL WHERE symbol = {symbol:String} "
             "ORDER BY bar_time DESC LIMIT {limit:UInt32}",
             parameters={"symbol": symbol, "limit": limit},
+        )
+        return [dict(zip(result.column_names, row)) for row in result.result_rows]
+
+    def query_raw_batch(
+        self, symbol: str, interval: str, adjustment: str, source: str,
+        bar_times: List[Any],
+    ) -> List[Dict[str, Any]]:
+        if not bar_times:
+            return []
+        times = [self._datetime(value) for value in bar_times]
+        result = self.database._require_client().query(
+            "SELECT * FROM market_bar_raw FINAL WHERE symbol={symbol:String} "
+            "AND interval={interval:String} AND adjustment={adjustment:String} "
+            "AND source={source:String} AND bar_time IN {times:Array(DateTime64(3))} "
+            "ORDER BY bar_time",
+            parameters={"symbol": symbol, "interval": interval,
+                        "adjustment": adjustment, "source": source, "times": times},
         )
         return [dict(zip(result.column_names, row)) for row in result.result_rows]

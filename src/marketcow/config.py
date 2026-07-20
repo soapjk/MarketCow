@@ -32,6 +32,8 @@ class Settings:
     clickhouse_batch_size: int = 5000
     clickhouse_spool_path: Path = Path("data-development/spool/clickhouse")
     storage_root: Path = Path("data")
+    clickhouse_connect_timeout: float = 2.0
+    clickhouse_read_timeout: float = 5.0
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -86,6 +88,12 @@ class Settings:
                 "MARKETCOW_CLICKHOUSE_SPOOL", str(data_root / "spool/clickhouse")
             )).expanduser(),
             storage_root=data_root,
+            clickhouse_connect_timeout=float(os.getenv(
+                "MARKETCOW_CLICKHOUSE_CONNECT_TIMEOUT", "2.0"
+            )),
+            clickhouse_read_timeout=float(os.getenv(
+                "MARKETCOW_CLICKHOUSE_READ_TIMEOUT", "5.0"
+            )),
         )
 
     def validate_runtime_isolation(self) -> None:
@@ -113,6 +121,10 @@ class Settings:
                 )
             if not 1000 <= self.clickhouse_batch_size <= 50000:
                 raise ValueError("ClickHouse batch size must be between 1000 and 50000")
+            if not 0.1 <= self.clickhouse_connect_timeout <= 30:
+                raise ValueError("ClickHouse connect timeout must be between 0.1 and 30 seconds")
+            if not 0.1 <= self.clickhouse_read_timeout <= 30:
+                raise ValueError("ClickHouse read timeout must be between 0.1 and 30 seconds")
             storage_root = self.storage_root.resolve()
             root_name = storage_root.name.lower()
             if "development" not in root_name and not root_name.endswith(("_test", "-test")):
