@@ -4,7 +4,8 @@
   "online_entrypoints": [
     "marketcow.api",
     "marketcow.service",
-    "marketcow.health"
+    "marketcow.health",
+    "marketcow.v2_factory"
   ],
   "forbidden_internal_imports": [
     "marketcow.duckdb_repositories",
@@ -26,7 +27,7 @@
         "marketcow.service",
         "marketcow.duckdb_repositories"
       ],
-      "removal_item": "BG-007"
+      "removal_item": "BG-008"
     },
     {
       "path": [
@@ -41,7 +42,7 @@
         "marketcow.service",
         "marketcow.duckdb_repositories"
       ],
-      "removal_item": "BG-007"
+      "removal_item": "BG-008"
     },
     {
       "path": [

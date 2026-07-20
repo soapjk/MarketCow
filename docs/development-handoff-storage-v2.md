@@ -1512,7 +1512,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：无 DuckDB primary/fingerprint；重复输入稳定；raw 完整落库后才推进；lag/backoff/队列有界。
 - **必要测试**：选源 golden、重复/乱序、崩溃窗口、并发 lease、outage→recovery、短 soak。
 - **排除项**：服务工厂和 production 调度。
-- **状态**：`本地实现完成，待独立验收`。`CanonicalMarketBarBuilder` 现显式绑定
+- **状态**：`已验收`（Artifact `8f1180c`）。`CanonicalMarketBarBuilder` 现显式绑定
   `ClickHouseMarketBarRepository`，只通过 `market_bar_raw FINAL` 的有界精确范围读取构建，并由
   BG-005 权威 writer 写回 canonical；canonical write 只有 `acknowledged && verified` 才报告 `ok`。
   `BackgroundCanonicalScheduler.bind_writer()` 将同步 raw commit 与 replay commit 统一接入同一个原子
@@ -1533,7 +1533,12 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：在线模块 import/启动期间不构造 `Warehouse`、不打开 `.duckdb`、不导入 DuckDB adapter；反向关闭完整。
 - **必要测试**：依赖注入、连接顺序、部分启动失败清理、资源关闭、DuckDB open/import trap。
 - **排除项**：Service/API 启动切换。
-- **状态**：`待实施`。
+- **状态**：`本地实施完成，待独立验收`。新增唯一 `marketcow.v2_factory` 装配入口，纯预检后按
+  PostgreSQL → ClickHouse → telemetry/spool/writer/builder/scheduler 顺序创建，显式暴露 18 个 PG
+  权威事务域和 direct ClickHouse `MarketBarRepository`。部分启动失败关闭全部既有连接，正常关闭按
+  scheduler → ClickHouse → PostgreSQL 反序且幂等；scheduler disabled 不创建线程、lease、额外连接或
+  scheduler 目录。传递依赖门禁把本工厂列为 online entrypoint 并禁止 DuckDB/Warehouse/shadow/offline。
+  旧 Service/API 仍保持原装配，留待 BG-008。
 
 ### `BG-008`：Service 与 API 去 DuckDB 化
 

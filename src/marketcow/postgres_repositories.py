@@ -12,7 +12,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from .postgres_migrations import POSTGRES_MIGRATIONS
-from .storage import FUNDAMENTAL_COLUMNS, TDX_COLUMNS
+from .domain_columns import FUNDAMENTAL_COLUMNS, TDX_COLUMNS
 
 
 class PostgresDatabase:
