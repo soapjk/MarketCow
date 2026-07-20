@@ -217,12 +217,89 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
             wal = next(spool.pending.glob("*.json"))
             payload = spool.read(wal)
             spool.mark_replayed(wal, payload)  # simulate crash before complete_chunk
+            from marketcow.spool_operator import SpoolOperator
+            self.assertEqual(SpoolOperator(spool).audit()["missing_wal_references"], [])
             recovered = []
             restarted = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
             restarted.on_raw_replayed = lambda rows: recovered.append(rows)
             restarted.replay()
             self.assertEqual(len(recovered), 1)
             self.assertEqual(list(spool.intents.glob("*.json")), [])
+
+    def test_intent_publish_fsync_failure_cannot_create_false_ready_progress(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            repository = FakeRepository(False)
+            writer = ReliableClickHouseWriter(repository, spool, 1000)
+            real_atomic = spool._atomic_json
+
+            def fail_after_intent_replace(path, payload):
+                real_atomic(path, payload)
+                if path.parent == spool.intents:
+                    raise OSError("intent directory fsync failed")
+
+            with patch.object(spool, "_atomic_json", side_effect=fail_after_intent_replace):
+                with self.assertRaises(AuthoritativeWriteError) as raised:
+                    writer.write("raw", [raw_bar()])
+            self.assertEqual(raised.exception.outcome["status"], "terminal_failure")
+            self.assertEqual(raised.exception.outcome["durability"], "not_durable")
+            self.assertEqual(repository.calls, [])
+            self.assertEqual(list(spool.pending.glob("*.json")), [])
+
+            callbacks = []
+            restarted_repository = FakeRepository(False)
+            restarted = ReliableClickHouseWriter(restarted_repository, spool, 1000)
+            restarted.on_raw_replayed = lambda rows: callbacks.append(rows)
+            replay = restarted.replay()
+            self.assertEqual(replay["attempted"], 0)
+            self.assertEqual(replay["callback_attempted"], 0)
+            self.assertEqual(restarted_repository.calls, [])
+            self.assertEqual(callbacks, [])
+
+    def test_missing_pending_without_replayed_evidence_stays_blocked(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            rows = [normalize_bar("raw", raw_bar())]
+            intent_id = stable_batch_id("raw", rows)
+            missing_batch = "f" * 64
+            spool.save_intent(intent_id, rows, [missing_batch])
+            callbacks = []
+            writer = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            writer.on_raw_replayed = lambda value: callbacks.append(value)
+            result = writer.replay()
+            self.assertEqual(result["callback_attempted"], 0)
+            self.assertTrue(result["truncated"])
+            self.assertEqual(callbacks, [])
+            intent = spool.read(spool.intents / f"{intent_id}.json")
+            self.assertEqual(intent["pending"], [missing_batch])
+
+    def test_preexisting_ready_intent_is_not_reset_or_deleted_by_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            rows = [normalize_bar("raw", raw_bar())]
+            intent_id = stable_batch_id("raw", rows)
+            spool.save_intent(intent_id, rows, [])
+            path = spool.intents / f"{intent_id}.json"
+            intent = spool.read(path)
+            intent["callback_attempts"] = 3
+            intent["last_callback_error"] = "bounded prior failure"
+            spool._atomic_json(path, intent)
+
+            writer = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            result = writer.write("raw", [raw_bar()])
+            self.assertEqual(result["status"], "success")
+            preserved = spool.read(path)
+            self.assertEqual(preserved["callback_attempts"], 3)
+            self.assertEqual(preserved["last_callback_error"], "bounded prior failure")
+            callbacks = []
+            writer.on_raw_replayed = lambda value: callbacks.append(value)
+            writer.replay()
+            self.assertEqual(len(callbacks), 1)
     def test_normalization_empty_batch_and_stable_identity(self):
         normalized = normalize_bar("raw", raw_bar())
         self.assertEqual(normalized["open"], 100.0)

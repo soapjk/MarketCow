@@ -1495,6 +1495,11 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   fail-closed，绝不调用目标或伪装成功。所有微批在首个 ClickHouse mutation 前先 checksum 签名、
   fsync 文件、原子 rename 并 fsync 目录；raw 完整 intent 在写前持久化，成功块移入 replayed，
   失败块保持 pending，重启/显式有界 replay 后只有完整 intent ready 才推进既有 callback。
+  intent 完成判定严格要求每个 chunk 存在 checksum-valid、dataset/batch identity 一致的 replayed
+  commit evidence；pending 文件缺失本身永不代表成功。intent 发布失败只清理由本次新建的 staged
+  状态，既有 intent 的 pending/callback attempts/error 不会被重复写重置或删除；若崩溃窗口遗留
+  orphan intent，它会保持 blocked 而不会制造 canonical 假进度。operator audit 同时识别 pending 与
+  有效 replayed evidence，mark_replayed 与 complete_chunk 之间崩溃可在重启后确定收敛一次。
   replay 同样校验确认行数，并沿用 operator/replay 双锁、共享预算、legacy 补签、quarantine、
   配额/磁盘预检与幂等 batch token。异常及 callback diagnostics 使用统一脱敏和长度上限。
   本项未接在线 factory，未修改 scheduler 或 API，也未引入 DuckDB primary/shadow/fallback。

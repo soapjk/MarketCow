@@ -231,11 +231,18 @@ class LocalClickHouseSpool:
             finally:
                 os.close(directory)
 
-    def save_intent(self, intent_id: str, rows: List[Dict[str, Any]], pending: List[str]) -> None:
-        self._atomic_json(self.intents / f"{intent_id}.json", {
+    def save_intent(self, intent_id: str, rows: List[Dict[str, Any]], pending: List[str]) -> bool:
+        path = self.intents / f"{intent_id}.json"
+        if path.exists():
+            existing = self.read(path, require_checksum=True)
+            if existing.get("intent_id") != intent_id or existing.get("rows") != rows:
+                raise ValueError("existing raw intent does not match stable identity")
+            return False
+        self._atomic_json(path, {
             "intent_id": intent_id, "rows": rows, "pending": pending,
             "callback_attempts": 0, "last_callback_error": "",
         })
+        return True
 
     def complete_chunk(self, intent_id: str, batch_id: str) -> None:
         path = self.intents / f"{intent_id}.json"
@@ -253,8 +260,23 @@ class LocalClickHouseSpool:
         ready = []
         for path in paths:
             intent = self.read(path, require_checksum=True)
-            remaining = [batch_id for batch_id in intent["pending"]
-                         if (self.pending / f"{batch_id}.json").exists()]
+            remaining = []
+            for batch_id in intent["pending"]:
+                pending_path = self.pending / f"{batch_id}.json"
+                if pending_path.exists():
+                    remaining.append(batch_id)
+                    continue
+                replayed_path = self.replayed / f"{batch_id}.json"
+                try:
+                    evidence = self.read(replayed_path, require_checksum=True)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    # Missing pending is never proof of success. Only a checksum-valid,
+                    # identity-bound replayed record may close a logical chunk.
+                    remaining.append(batch_id)
+                    continue
+                if (evidence.get("batch_id") != batch_id
+                        or evidence.get("dataset") != "raw"):
+                    remaining.append(batch_id)
             if remaining != intent["pending"]:
                 intent["pending"] = remaining
                 self._atomic_json(path, intent)
@@ -354,6 +376,8 @@ class ReliableClickHouseWriter:
             chunks.append((batch_id, chunk))
             outcome["batches"] += 1
         staged: List[tuple[Path, bool]] = []
+        intent_existed = (self.spool.intents / f"{intent_id}.json").exists()
+        intent_created = False
         try:
             # WAL every micro-batch before the first ClickHouse mutation. A crash can
             # therefore never leave an acknowledged or untracked partial logical write.
@@ -366,7 +390,7 @@ class ReliableClickHouseWriter:
                 )
                 staged.append((path, existed))
             if dataset == "raw" and chunks:
-                self.spool.save_intent(
+                intent_created = self.spool.save_intent(
                     intent_id, normalized_rows, [batch_id for batch_id, _ in chunks]
                 )
         except Exception as error:
@@ -375,6 +399,14 @@ class ReliableClickHouseWriter:
             for path, existed in staged:
                 if not existed and path.exists():
                     path.unlink()
+            intent_path = self.spool.intents / f"{intent_id}.json"
+            if not intent_existed and intent_path.exists():
+                try:
+                    intent_path.unlink()
+                except OSError:
+                    # If cleanup itself fails, the evidence gate above keeps this staged
+                    # orphan permanently non-ready until an operator resolves it.
+                    pass
             if staged:
                 try:
                     directory = os.open(self.spool.pending, os.O_RDONLY)
@@ -447,7 +479,7 @@ class ReliableClickHouseWriter:
                     path = self.spool.pending / f"{batch_id}.json"
                     payload = self.spool.read(path, require_checksum=True)
                     self.spool._atomic_json(path, {**payload, "intent_id": intent_id})
-                if not failed_batches:
+                if not failed_batches and intent_created:
                     self.spool.remove_intent(intent_id)
             except Exception as error:
                 outcome.update({

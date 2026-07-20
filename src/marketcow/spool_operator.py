@@ -276,6 +276,7 @@ class SpoolOperator:
             raise ValueError("audit limit must be between 1 and 10000")
         corrupt: List[Dict[str, str]] = []
         wal_ids = set()
+        replayed_ids = set()
         intent_refs = set()
         checked = 0
         for kind in KINDS | SCHEDULER_KINDS:
@@ -293,13 +294,15 @@ class SpoolOperator:
                     continue
                 if kind == "wal-pending":
                     wal_ids.add(str(payload.get("batch_id")))
+                if kind == "wal-replayed" and payload.get("dataset") == "raw":
+                    replayed_ids.add(str(payload.get("batch_id")))
                 if kind in {"raw-intents", "raw-processing"}:
                     intent_refs.update(str(value) for value in payload.get("pending", []))
                 if checked >= limit:
                     break
             if checked >= limit:
                 break
-        missing_wal = sorted(intent_refs - wal_ids)[:limit]
+        missing_wal = sorted(intent_refs - wal_ids - replayed_ids)[:limit]
         orphan_wal = sorted(wal_ids - intent_refs)[:limit]
         return {"status": "ok" if not corrupt and not missing_wal else "attention",
                 "checked": checked, "truncated": checked >= limit,
