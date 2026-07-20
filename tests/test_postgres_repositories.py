@@ -4,7 +4,11 @@ import uuid
 
 import psycopg
 
-from marketcow.postgres_repositories import PostgresDatabase, PostgresMetadataRepository
+from marketcow.postgres_repositories import (
+    PostgresDatabase,
+    PostgresFundamentalRepository,
+    PostgresMetadataRepository,
+)
 
 
 @unittest.skipUnless(
@@ -19,6 +23,7 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         cls.database = PostgresDatabase(cls.dsn, cls.schema, min_size=1, max_size=2)
         cls.database.open()
         cls.repository = PostgresMetadataRepository(cls.database)
+        cls.fundamentals = PostgresFundamentalRepository(cls.database)
 
     @classmethod
     def tearDownClass(cls):
@@ -31,7 +36,7 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
             versions = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1])
+        self.assertEqual([row["version"] for row in versions], [1, 2])
 
         run = ["run-1", "fixture", "running", None, "2026-07-20T00:00:00+00:00", None, 0, None]
         self.repository.save_run(run)
@@ -69,6 +74,47 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(events[0]["event_id"], "event-1")
         self.assertEqual(events[0]["payload_json"], {"value": 1})
+
+    def test_fundamental_history_and_strict_point_in_time_queries(self):
+        base = {
+            "instrument_id": "CN.XSHG.600298", "symbol": "600298", "exchange": "XSHG",
+            "name": "Fixture", "is_active": True, "report_period": "20260331",
+            "published_at": "2026-04-30", "industry": "Food", "roe_weighted": 8.5,
+            "pe_dynamic": 20.0, "source": "fixture", "observed_at": "2026-05-01",
+            "ingested_at": "2026-05-01", "fetched_at": "2026-05-01", "price": 10.0,
+        }
+        self.fundamentals.replace_fundamentals("20260331", [base])
+        revised = {**base, "price": 20.0, "observed_at": "2026-07-01", "ingested_at": "2026-07-01", "fetched_at": "2026-07-01"}
+        self.fundamentals.replace_fundamentals("20260331", [revised])
+
+        current = self.fundamentals.query_fundamentals(symbol="600298", limit=1)
+        point_in_time = self.fundamentals.query_fundamentals(
+            symbol="600298", as_of="2026-06-01", limit=1
+        )
+        unavailable = self.fundamentals.query_fundamentals(
+            symbol="600298", as_of="2026-04-29", limit=1
+        )
+        self.assertEqual(current[0]["price"], 20.0)
+        self.assertEqual(point_in_time[0]["price"], 10.0)
+        self.assertEqual(unavailable, [])
+
+    def test_financial_statement_jsonb_round_trip_and_as_of(self):
+        row = {
+            "instrument_id": "CN.XSHG.600298", "symbol": "600298",
+            "statement": "income", "report_date": "2026-03-31",
+            "published_at": "2026-04-30", "source": "fixture",
+            "payload": {"revenue": 123.0}, "fetched_at": "2026-05-01",
+            "observed_at": "2026-05-01", "ingested_at": "2026-05-01",
+        }
+        self.fundamentals.replace_statement_rows("600298", "income", [row])
+        available = self.fundamentals.get_statement_rows(
+            "600298", "income", 10, "2026-06-01"
+        )
+        unavailable = self.fundamentals.get_statement_rows(
+            "600298", "income", 10, "2026-04-29"
+        )
+        self.assertEqual(available[0]["payload"], {"revenue": 123.0})
+        self.assertEqual(unavailable, [])
 
 
 if __name__ == "__main__":

@@ -81,6 +81,29 @@ class LocalArtifactStore:
         return self._manifest_repository.latest_artifact(dataset, metadata_key, metadata_value)
 
 
+class Stage1FundamentalRepository:
+    """Route migrated fundamentals to PostgreSQL and remaining datasets to DuckDB."""
+
+    POSTGRES_METHODS = {
+        "replace_fundamentals",
+        "query_fundamentals",
+        "replace_statement_rows",
+        "get_statement_rows",
+    }
+
+    def __init__(self, postgres_repository: Any, duckdb_repository: Warehouse):
+        self._postgres_repository = postgres_repository
+        self._duckdb_repository = duckdb_repository
+
+    def __getattr__(self, name: str) -> Any:
+        repository = (
+            self._postgres_repository
+            if name in self.POSTGRES_METHODS
+            else self._duckdb_repository
+        )
+        return getattr(repository, name)
+
+
 def create_duckdb_repositories(warehouse: Warehouse) -> Repositories:
     """Build the compatibility backend while each data domain is migrated separately."""
 
@@ -105,7 +128,7 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
     metadata = PostgresMetadataRepository(database)
     return Repositories(
         metadata=metadata,
-        fundamentals=warehouse,
+        fundamentals=Stage1FundamentalRepository(metadata, warehouse),
         market_bars=warehouse,
         artifacts=LocalArtifactStore(metadata),
     ), database

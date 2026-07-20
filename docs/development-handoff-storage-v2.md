@@ -31,6 +31,8 @@ DuckDB
 - PostgreSQL metadata backend 已实现连接池、独立 schema、事务化版本 migration、
   migration advisory lock；
 - 已迁移任务记录、Provider 健康、Artifact manifest、日历和 Tushare 请求控制面；
+- 已迁移基本面当前快照、不可变版本历史、完整财务报表 JSONB 和严格
+  point-in-time 查询；BaoStock、TDX、验证结果和漏斗指标暂时继续读写 DuckDB；
 - PostgreSQL 目前只允许 development profile 显式启用，schema 必须以
   `_development` 或 `_test` 结尾；
 - 基本面和行情仍由 DuckDB 承担，未连接或迁移正式 PostgreSQL。

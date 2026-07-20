@@ -68,4 +68,57 @@ POSTGRES_MIGRATIONS = [
             ON tushare_data_row (api_name, symbol, data_date);
         """,
     ),
+    (
+        2,
+        "fundamental snapshots, immutable history, and financial statement rows",
+        """
+        CREATE TABLE IF NOT EXISTS fundamental_snapshot (
+            instrument_id TEXT, symbol TEXT NOT NULL, exchange TEXT, name TEXT,
+            is_active BOOLEAN, report_period TEXT NOT NULL, published_at TEXT,
+            valuation_as_of TEXT, price DOUBLE PRECISION, change_pct DOUBLE PRECISION,
+            pe_dynamic DOUBLE PRECISION, pb DOUBLE PRECISION,
+            total_market_cap DOUBLE PRECISION, float_market_cap DOUBLE PRECISION,
+            roe_weighted DOUBLE PRECISION, eps DOUBLE PRECISION, revenue DOUBLE PRECISION,
+            revenue_yoy DOUBLE PRECISION, revenue_qoq DOUBLE PRECISION,
+            net_profit DOUBLE PRECISION, net_profit_yoy DOUBLE PRECISION,
+            net_profit_qoq DOUBLE PRECISION, book_value_per_share DOUBLE PRECISION,
+            ocf_per_share DOUBLE PRECISION, gross_margin DOUBLE PRECISION, industry TEXT,
+            cash DOUBLE PRECISION, accounts_receivable DOUBLE PRECISION,
+            inventory DOUBLE PRECISION, total_assets DOUBLE PRECISION,
+            total_assets_yoy DOUBLE PRECISION, accounts_payable DOUBLE PRECISION,
+            advance_receipts DOUBLE PRECISION, total_liabilities DOUBLE PRECISION,
+            total_liabilities_yoy DOUBLE PRECISION, debt_ratio DOUBLE PRECISION,
+            total_equity DOUBLE PRECISION, operating_cost DOUBLE PRECISION,
+            sales_expense DOUBLE PRECISION, admin_expense DOUBLE PRECISION,
+            financial_expense DOUBLE PRECISION, total_operating_expense DOUBLE PRECISION,
+            operating_profit DOUBLE PRECISION, total_profit DOUBLE PRECISION,
+            net_cashflow DOUBLE PRECISION, net_cashflow_yoy DOUBLE PRECISION,
+            operating_cashflow DOUBLE PRECISION, investing_cashflow DOUBLE PRECISION,
+            financing_cashflow DOUBLE PRECISION, source TEXT, source_url TEXT,
+            observed_at TEXT, ingested_at TEXT, raw_response_locator TEXT, raw_path TEXT,
+            raw_artifact_id TEXT, quality_status TEXT, fetched_at TEXT,
+            PRIMARY KEY (symbol, report_period)
+        );
+        CREATE INDEX IF NOT EXISTS fundamental_snapshot_period_idx
+            ON fundamental_snapshot (report_period, symbol);
+        CREATE TABLE IF NOT EXISTS fundamental_snapshot_history (
+            LIKE fundamental_snapshot INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY
+        );
+        ALTER TABLE fundamental_snapshot_history ADD COLUMN IF NOT EXISTS version_id TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS fundamental_history_version_idx
+            ON fundamental_snapshot_history (version_id);
+        CREATE INDEX IF NOT EXISTS fundamental_history_pit_idx
+            ON fundamental_snapshot_history (symbol, report_period, published_at, ingested_at);
+        CREATE TABLE IF NOT EXISTS financial_statement_rows (
+            instrument_id TEXT, symbol TEXT NOT NULL, statement TEXT NOT NULL,
+            report_date TEXT NOT NULL, published_at TEXT, source TEXT NOT NULL,
+            payload_json JSONB NOT NULL, fetched_at TEXT, source_url TEXT,
+            observed_at TEXT, ingested_at TEXT, raw_response_locator TEXT,
+            raw_path TEXT, raw_artifact_id TEXT,
+            PRIMARY KEY (symbol, statement, report_date, source)
+        );
+        CREATE INDEX IF NOT EXISTS financial_statement_pit_idx
+            ON financial_statement_rows (symbol, report_date, published_at, ingested_at);
+        """,
+    ),
 ]

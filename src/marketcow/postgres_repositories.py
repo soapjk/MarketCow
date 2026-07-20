@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
@@ -10,6 +11,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from .postgres_migrations import POSTGRES_MIGRATIONS
+from .storage import FUNDAMENTAL_COLUMNS
 
 
 class PostgresDatabase:
@@ -84,7 +86,7 @@ class PostgresDatabase:
                 )
 
 
-class PostgresMetadataRepository:
+class _PostgresControlPlaneRepository:
     def __init__(self, database: PostgresDatabase) -> None:
         self.database = database
 
@@ -185,6 +187,171 @@ class PostgresMetadataRepository:
         params.append(limit)
         with self.database.connection() as connection:
             return list(connection.execute(query, params).fetchall())
+
+
+class PostgresRepository(_PostgresControlPlaneRepository):
+    """Core PostgreSQL fundamentals with immutable point-in-time history."""
+
+    def __init__(self, database: PostgresDatabase) -> None:
+        self.database = database
+
+    def replace_fundamentals(self, report_period: str, rows: List[Dict[str, Any]]) -> int:
+        if not rows:
+            with self.database.connection() as connection:
+                connection.execute(
+                    "DELETE FROM fundamental_snapshot WHERE report_period = %s",
+                    (report_period,),
+                )
+            return 0
+        columns = list(FUNDAMENTAL_COLUMNS)
+        insert = sql.SQL("INSERT INTO fundamental_snapshot ({}) VALUES ({})").format(
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        )
+        history_columns = columns + ["version_id"]
+        insert_history = sql.SQL(
+            "INSERT INTO fundamental_snapshot_history ({}) VALUES ({})"
+        ).format(
+            sql.SQL(", ").join(map(sql.Identifier, history_columns)),
+            sql.SQL(", ").join(sql.Placeholder() for _ in history_columns),
+        )
+        with self.database.connection() as connection:
+            connection.execute(
+                "DELETE FROM fundamental_snapshot WHERE report_period = %s",
+                (report_period,),
+            )
+            for row in rows:
+                values = [row.get(column) for column in columns]
+                connection.execute(insert, values)
+                connection.execute(insert_history, values + [uuid.uuid4().hex])
+        return len(rows)
+
+    def query_fundamentals(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        symbol: str = "",
+        report_period: str = "",
+        industry: str = "",
+        min_roe: Optional[float] = None,
+        max_pe: Optional[float] = None,
+        active_only: bool = True,
+        as_of: str = "",
+    ) -> List[Dict[str, Any]]:
+        where: List[str] = []
+        params: List[Any] = []
+        table = "fundamental_snapshot"
+        if as_of:
+            table = "fundamental_snapshot_history"
+            where.extend([
+                "published_at IS NOT NULL AND published_at <= %s",
+                "CAST(COALESCE(observed_at, ingested_at, fetched_at) AS DATE) <= CAST(%s AS DATE)",
+            ])
+            params.extend([as_of, as_of])
+        if active_only:
+            where.append("is_active IS TRUE")
+        if symbol:
+            where.append("symbol = %s")
+            params.append(symbol)
+        if report_period:
+            where.append("report_period = %s")
+            params.append(report_period)
+        elif as_of:
+            where.append(
+                "report_period = (SELECT MAX(fs2.report_period) "
+                "FROM fundamental_snapshot_history fs2 "
+                f"WHERE fs2.symbol = {table}.symbol AND fs2.published_at IS NOT NULL "
+                "AND fs2.published_at <= %s "
+                "AND CAST(COALESCE(fs2.observed_at, fs2.ingested_at, fs2.fetched_at) AS DATE) "
+                "<= CAST(%s AS DATE))"
+            )
+            params.extend([as_of, as_of])
+        elif symbol:
+            where.append(
+                "report_period = (SELECT MAX(fs2.report_period) FROM fundamental_snapshot fs2 "
+                "WHERE fs2.symbol = fundamental_snapshot.symbol)"
+            )
+        else:
+            where.append("report_period = (SELECT MAX(report_period) FROM fundamental_snapshot)")
+        if industry:
+            where.append("industry = %s")
+            params.append(industry)
+        if min_roe is not None:
+            where.append("roe_weighted >= %s")
+            params.append(min_roe)
+        if max_pe is not None:
+            where.append("pe_dynamic > 0 AND pe_dynamic <= %s")
+            params.append(max_pe)
+        selected = ", ".join(FUNDAMENTAL_COLUMNS)
+        if as_of:
+            query = (
+                f"SELECT {selected} FROM (SELECT *, ROW_NUMBER() OVER ("
+                "PARTITION BY symbol, report_period ORDER BY "
+                "COALESCE(ingested_at, fetched_at) DESC, version_id DESC) AS revision_rank "
+                f"FROM {table} WHERE {' AND '.join(where)}) revisions "
+                "WHERE revision_rank = 1 ORDER BY symbol LIMIT %s OFFSET %s"
+            )
+        else:
+            query = f"SELECT {selected} FROM {table}"
+            if where:
+                query += " WHERE " + " AND ".join(where)
+            query += " ORDER BY symbol LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+        with self.database.connection() as connection:
+            return list(connection.execute(query, params).fetchall())
+
+    def replace_statement_rows(
+        self, symbol: str, statement: str, rows: List[Dict[str, Any]]
+    ) -> int:
+        columns = [
+            "instrument_id", "symbol", "statement", "report_date", "published_at",
+            "source", "payload_json", "fetched_at", "source_url", "observed_at",
+            "ingested_at", "raw_response_locator", "raw_path", "raw_artifact_id",
+        ]
+        statement_sql = sql.SQL(
+            "INSERT INTO financial_statement_rows ({}) VALUES ({})"
+        ).format(
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        )
+        with self.database.connection() as connection:
+            connection.execute(
+                "DELETE FROM financial_statement_rows WHERE symbol = %s AND statement = %s",
+                (symbol, statement),
+            )
+            for row in rows:
+                values = [
+                    Jsonb(row.get("payload", {})) if column == "payload_json"
+                    else row.get(column)
+                    for column in columns
+                ]
+                connection.execute(statement_sql, values)
+        return len(rows)
+
+    def get_statement_rows(
+        self, symbol: str, statement: str = "", limit_periods: int = 20,
+        as_of: str = "",
+    ) -> List[Dict[str, Any]]:
+        where, params = ["symbol = %s"], [symbol]
+        if statement:
+            where.append("statement = %s")
+            params.append(statement)
+        if as_of:
+            where.extend([
+                "published_at IS NOT NULL AND published_at <= %s",
+                "CAST(COALESCE(observed_at, ingested_at, fetched_at) AS DATE) <= CAST(%s AS DATE)",
+            ])
+            params.extend([as_of, as_of])
+        params.append(limit_periods)
+        with self.database.connection() as connection:
+            rows = list(connection.execute(
+                "SELECT * FROM financial_statement_rows WHERE " + " AND ".join(where)
+                + " ORDER BY report_date DESC, statement LIMIT %s",
+                params,
+            ).fetchall())
+        for row in rows:
+            row["payload"] = row.pop("payload_json")
+        return rows
 
     def latest_artifact(
         self, dataset: str, metadata_key: str = "", metadata_value: str = ""
@@ -344,3 +511,7 @@ class PostgresMetadataRepository:
         params.append(limit)
         with self.database.connection() as connection:
             return list(connection.execute(query, params).fetchall())
+
+
+PostgresMetadataRepository = PostgresRepository
+PostgresFundamentalRepository = PostgresRepository
