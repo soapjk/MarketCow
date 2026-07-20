@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import clickhouse_connect
+from fastapi.testclient import TestClient
 
+from marketcow.api import create_app
 from marketcow.clickhouse_repositories import (
     ClickHouseDatabase,
     ClickHouseMarketBarRepository,
@@ -16,6 +18,15 @@ from marketcow.clickhouse_canonical import CanonicalMarketBarBuilder
 from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
 from marketcow.storage import Warehouse
 from marketcow.clickhouse_writer import normalize_bar
+from marketcow.config import Settings
+
+
+class MarketBarService:
+    def __init__(self, repository):
+        self.market_bar_repository = repository
+
+    def close(self):
+        pass
 
 
 class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
@@ -364,6 +375,93 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(empty, [])
         self.assertFalse(truncated)
+
+    def test_canonical_cross_section_keyset_page_matches_duckdb_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            warehouse = Warehouse(root / "warehouse.duckdb")
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(root / "spool", root), 1000
+            )
+            base = {
+                "market": "US", "interval": "1m", "adjustment": "raw",
+                "bar_time": "2026-07-20T05:30:00Z", "open": 10, "high": 12,
+                "low": 9, "close": 11, "raw_close": 22,
+                "adjustment_factor": 0.5, "volume": 100, "amount": 1100,
+                "selected_source": "tushare", "source_count": 1,
+                "quality_status": "single_source",
+                "observed_at": "2026-07-20T05:30:01Z",
+                "ingested_at": "2026-07-20T05:30:02Z",
+                "raw_artifact_id": "cross-page-artifact",
+                "updated_at": "2026-07-20T05:30:03Z",
+            }
+            canonical = []
+            for symbol in ("PAGE-A", "PAGE-B", "PAGE-C"):
+                close = 22 if symbol == "PAGE-B" else 11
+                warehouse.upsert_price_bars(
+                    symbol, "1m", "raw", "tushare", "2026-07-20T05:30:02Z",
+                    [{"timestamp": 1784525400, "bar_at": base["bar_time"],
+                      "open": 10, "high": 12, "low": 9, "close": close,
+                      "raw_close": 22, "adjustment_factor": 0.5,
+                      "volume": 100, "amount": 1100}],
+                    {"observed_at": base["observed_at"],
+                     "raw_artifact_id": base["raw_artifact_id"]},
+                )
+                canonical.append({
+                    **base, "symbol": symbol, "close": close, "version": 1,
+                    "input_fingerprint": symbol + "-v1",
+                })
+            canonical.append({
+                **base, "symbol": "PAGE-B", "close": 22, "version": 2,
+                "input_fingerprint": "PAGE-B-v2",
+            })
+            self.repository.insert_canonical_bars(canonical)
+            adapter = ShadowMarketBarRepository(
+                warehouse, writer, canonical_reads_enabled=True
+            )
+            arguments = (
+                "1m", "raw", "2026-07-20T13:30:00+08:00", 1,
+                ["PAGE-C", "PAGE-B", "PAGE-A", "PAGE-A"], None,
+            )
+            clickhouse_page = adapter.get_price_bars_cross_section_page(*arguments)
+            duckdb_page = warehouse.get_price_bars_cross_section_page(*arguments)
+            self.assertEqual(clickhouse_page, duckdb_page)
+            self.assertTrue(clickhouse_page[1])
+            after = clickhouse_page[0][-1]["symbol"]
+            next_arguments = (*arguments[:-1], after)
+            self.assertEqual(
+                adapter.get_price_bars_cross_section_page(*next_arguments),
+                warehouse.get_price_bars_cross_section_page(*next_arguments),
+            )
+
+            settings = Settings(
+                root / "warehouse.duckdb", root / "raw",
+                market_bar_cursor_secret="clickhouse-cross-page-secret-1234567890",
+                storage_root=root / "data-development",
+            )
+            path = (
+                "/v1/quotes/cross-section?interval=1m&adjustment=raw"
+                "&bar_at=2026-07-20T13:30:00%2B08:00&page_size=1"
+                "&symbols=PAGE-C,PAGE-B,PAGE-A,PAGE-A"
+            )
+            app = create_app(
+                settings, MarketBarService(adapter),
+                lambda: datetime(2026, 7, 20, 6, 0, tzinfo=timezone.utc),
+            )
+            with TestClient(app) as client:
+                clickhouse_payload = client.get(path).json()
+
+            original = self.repository.database.client
+            self.repository.database.client = None
+            try:
+                fallback_page = adapter.get_price_bars_cross_section_page(*arguments)
+                with TestClient(app) as client:
+                    fallback_payload = client.get(path).json()
+            finally:
+                self.repository.database.client = original
+            self.assertEqual(fallback_page, clickhouse_page)
+            self.assertEqual(fallback_payload, clickhouse_payload)
+            self.assertTrue(adapter.diagnostics()["read"]["fallback"])
 
     def test_raw_multisource_range_filter_final_provenance_and_truncation(self):
         base = {

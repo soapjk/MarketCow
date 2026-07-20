@@ -91,6 +91,10 @@ class MarketBarRepository(Protocol):
         self, interval: str, adjustment: str, bar_at: str, limit: int,
         symbols: Optional[Sequence[str]] = None,
     ) -> tuple[List[Dict[str, Any]], bool]: ...
+    def get_price_bars_cross_section_page(
+        self, interval: str, adjustment: str, bar_at: str, page_size: int,
+        symbols: Optional[Sequence[str]] = None, after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]: ...
     def get_raw_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
         start: str, end: str, limit: int,

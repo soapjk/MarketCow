@@ -41,6 +41,9 @@ class FakePrimary:
     def get_price_bars_cross_section(self, *args):
         return (["duckdb-cross-section"], True)
 
+    def get_price_bars_cross_section_page(self, *args):
+        return (["duckdb-cross-section-page"], True)
+
     def get_raw_price_bars_range(self, *args):
         return (["duckdb-raw"], True)
 
@@ -87,6 +90,11 @@ class ReconcileRepository:
         return self.rows, False
 
     def get_canonical_price_bars_cross_section(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows, False
+
+    def get_canonical_price_bars_cross_section_page(self, *args):
         if isinstance(self.rows, Exception):
             raise self.rows
         return self.rows, False
@@ -240,6 +248,29 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
         self.assertTrue(diagnostics["fallback"])
         self.assertTrue(diagnostics["truncated"])
         self.assertEqual(diagnostics["backend"], "duckdb")
+
+    def test_cross_section_page_same_boundary_fallback_diagnostics(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.repository = ReconcileRepository([{"symbol": "MSFT"}])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(
+            primary, writer, canonical_reads_enabled=True
+        )
+        arguments = (
+            "1m", "raw", "2026-07-20T01:00:00Z", 10,
+            ["AAPL", "MSFT"], "AAPL",
+        )
+        self.assertEqual(adapter.get_price_bars_cross_section_page(*arguments),
+                         ([{"symbol": "MSFT"}], False))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["cross_section"])
+        self.assertTrue(diagnostics["keyset_page"])
+        writer.repository.rows = ConnectionError("cross section page unavailable")
+        self.assertEqual(adapter.get_price_bars_cross_section_page(*arguments),
+                         (["duckdb-cross-section-page"], True))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["fallback"])
+        self.assertTrue(diagnostics["truncated"])
 
     def test_raw_multisource_opt_in_and_same_query_fallback_diagnostics(self):
         primary, writer = FakePrimary(), CapturingWriter()

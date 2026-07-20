@@ -107,7 +107,9 @@ def decode_cursor(
         raise ValueError("cursor does not match this query")
     issued_at = decoded.get("iat")
     after = decoded.get("after")
-    if not isinstance(issued_at, int) or not isinstance(after, (int, list)):
+    if not isinstance(issued_at, int) or not isinstance(after, (int, str, list)):
+        raise ValueError("invalid cursor payload")
+    if isinstance(after, str) and not after:
         raise ValueError("invalid cursor payload")
     if isinstance(after, list) and (
         len(after) != 2 or not isinstance(after[0], int)

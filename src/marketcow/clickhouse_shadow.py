@@ -175,6 +175,41 @@ class ShadowMarketBarRepository:
             }
             return rows, truncated
 
+    def get_price_bars_cross_section_page(
+        self, interval: str, adjustment: str, bar_at: str, page_size: int,
+        symbols: Optional[Sequence[str]] = None, after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (interval, adjustment, bar_at, page_size, symbols, after)
+        if not self.canonical_reads_enabled:
+            rows, has_more = self.primary.get_price_bars_cross_section_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more, "cross_section": True,
+                "keyset_page": True,
+            }
+            return rows, has_more
+        try:
+            rows, has_more = (
+                self.writer.repository.get_canonical_price_bars_cross_section_page(
+                    interval, adjustment, bar_at, page_size,
+                    None if symbols is None else list(symbols), after,
+                )
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": has_more,
+                "cross_section": True, "keyset_page": True,
+            }
+            return rows, has_more
+        except Exception as error:
+            rows, has_more = self.primary.get_price_bars_cross_section_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": has_more, "cross_section": True, "keyset_page": True,
+                "error": str(error)[:4000],
+            }
+            return rows, has_more
     def get_raw_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
         start: str, end: str, limit: int,

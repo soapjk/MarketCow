@@ -376,12 +376,16 @@ def create_app(
         adjustment: str = "adjusted",
         limit: int = 500,
         symbols: Optional[str] = None,
+        page_size: Optional[int] = Query(None, ge=1, le=5000),
+        cursor: Optional[str] = None,
     ):
         try:
             if adjustment not in {"adjusted", "raw"}:
                 raise ValueError("adjustment must be adjusted or raw")
             if not 1 <= limit <= 5000:
                 raise ValueError("cross-section limit must be between 1 and 5000")
+            if cursor is not None and page_size is None:
+                raise ValueError("cross-section cursor requires page_size")
             point = datetime.fromisoformat(bar_at.replace("Z", "+00:00"))
             if point.tzinfo is None:
                 raise ValueError("cross-section bar_at must include a timezone")
@@ -396,6 +400,43 @@ def create_app(
                     raise ValueError(
                         "cross-section symbols must contain at most 5000 values"
                     )
+            if page_size is not None:
+                query_binding = {
+                    "interval": interval, "adjustment": adjustment,
+                    "bar_at": normalized_bar_at, "symbols": symbol_filter,
+                    "page_size": page_size,
+                }
+                cursor_secret = load_or_create_secret(
+                    settings.market_bar_cursor_secret, settings.storage_root
+                )
+                cursor_now = clock()
+                if cursor_now.tzinfo is None:
+                    cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+                now_epoch = int(cursor_now.timestamp())
+                after = None if cursor is None else decode_cursor(
+                    cursor, query_binding, now_epoch,
+                    settings.market_bar_cursor_ttl_seconds, cursor_secret,
+                )
+                if after is not None and not isinstance(after, str):
+                    raise ValueError("invalid cross-section cursor position")
+                bars, has_more = (
+                    service.market_bar_repository.get_price_bars_cross_section_page(
+                        interval, adjustment, normalized_bar_at, page_size,
+                        symbol_filter, after,
+                    )
+                )
+                next_cursor = None
+                if has_more and bars:
+                    next_cursor = encode_cursor(
+                        query_binding, bars[-1]["symbol"], now_epoch, cursor_secret
+                    )
+                return {
+                    "bar_at": normalized_bar_at, "interval": interval,
+                    "adjustment": adjustment, "count": len(bars), "bars": bars,
+                    "cached": True, "truncated": has_more,
+                    "page_size": page_size, "next_cursor": next_cursor,
+                    **cache_metadata(bars),
+                }
             bars, truncated = service.market_bar_repository.get_price_bars_cross_section(
                 interval, adjustment, normalized_bar_at, limit, symbol_filter
             )

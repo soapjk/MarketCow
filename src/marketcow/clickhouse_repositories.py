@@ -618,3 +618,49 @@ class ClickHouseMarketBarRepository:
         )
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
         return self._map_canonical_rows(rows[:limit]), len(rows) > limit
+
+    def get_canonical_price_bars_cross_section_page(
+        self, interval: str, adjustment: str, bar_at: str, page_size: int,
+        symbols: Optional[List[str]] = None, after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("cross-section page_size must be between 1 and 5000")
+        point = datetime.fromisoformat(bar_at.replace("Z", "+00:00"))
+        if point.tzinfo is None:
+            raise ValueError("cross-section bar_at must include a timezone")
+        point = datetime.fromtimestamp(
+            int(point.astimezone(timezone.utc).timestamp()), timezone.utc
+        )
+        symbol_filter = None if symbols is None else sorted(set(symbols))
+        if symbol_filter is not None and len(symbol_filter) > 5000:
+            raise ValueError("cross-section symbols must contain at most 5000 values")
+        if symbol_filter == []:
+            return [], False
+        filter_sql = ""
+        parameters: Dict[str, Any] = {
+            "interval": interval, "adjustment": adjustment, "bar_at": point,
+            "fetch": page_size + 1,
+        }
+        if symbol_filter is not None:
+            filter_sql += " AND symbol IN {symbols:Array(String)}"
+            parameters["symbols"] = symbol_filter
+        if after is not None:
+            filter_sql += " AND symbol > {after:String}"
+            parameters["after"] = after
+        result = self.database._require_client().query(
+            "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
+            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
+            "version FROM market_bar_canonical FINAL WHERE interval={interval:String} "
+            "AND adjustment={adjustment:String} AND bar_time={bar_at:DateTime64(3)}" +
+            filter_sql + " ORDER BY symbol ASC LIMIT {fetch:UInt32}",
+            parameters=parameters,
+        )
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        mapped = self._map_canonical_rows(rows[:page_size])
+        for row in mapped:
+            payload = row["source_payload"]
+            row["source_payload"] = canonical_page_payload(
+                row["source"], payload["observed_at"], payload["raw_artifact_id"]
+            )
+        return mapped, len(rows) > page_size
