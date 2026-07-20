@@ -177,7 +177,7 @@ https://github.com/soapjk/MarketCow
 路径：/Volumes/T9/projects/marketcow-storage-v2
 分支：feature/storage-v2
 当前已验证基线：1ce0fe5（SV2-024）
-当前本地候选：无；SV2-025 正在执行最终本地验收
+当前本地候选：f529164（SV2-025 本地实现与最终门禁，待独立验收）
 远端状态：该分支目前仅存在于本地，尚未推送
 用途：PostgreSQL、ClickHouse、Repository 接口和迁移开发
 ```
