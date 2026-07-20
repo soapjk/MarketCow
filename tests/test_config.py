@@ -47,6 +47,7 @@ class SettingsTest(unittest.TestCase):
                 "MARKETCOW_V2_CLICKHOUSE_PASSWORD": "secret",
                 "MARKETCOW_CLICKHOUSE_PASSWORD_REF":
                     "MARKETCOW_V2_CLICKHOUSE_PASSWORD",
+                "MARKETCOW_V2_ALLOWED_ROOT": folder,
             }
             with patch.dict(os.environ, environment, clear=True), patch(
                 "pathlib.Path.cwd", return_value=Path(folder)
@@ -60,6 +61,42 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.storage_root, Path(folder) / "data-v2-development")
         settings.validate_runtime_isolation()
 
+    def test_v2_environment_requires_explicit_root_and_nonempty_secret_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = {
+                "MARKETCOW_POSTGRES_DSN_REF": "MARKETCOW_V2_POSTGRES_DSN",
+                "MARKETCOW_V2_POSTGRES_DSN":
+                    "postgresql://fixture:secret@127.0.0.1/marketcow_development",
+                "MARKETCOW_CLICKHOUSE_PASSWORD_REF":
+                    "MARKETCOW_V2_CLICKHOUSE_PASSWORD",
+                "MARKETCOW_V2_CLICKHOUSE_PASSWORD": "clickhouse-secret",
+                "MARKETCOW_V2_ALLOWED_ROOT": folder,
+            }
+            cases = (
+                ({"MARKETCOW_V2_ALLOWED_ROOT": None}, "explicit allowed root"),
+                ({"MARKETCOW_V2_POSTGRES_DSN": None}, "requires PostgreSQL credentials"),
+                ({"MARKETCOW_V2_POSTGRES_DSN": ""}, "requires PostgreSQL credentials"),
+                ({"MARKETCOW_V2_CLICKHOUSE_PASSWORD": None},
+                 "requires ClickHouse credentials"),
+                ({"MARKETCOW_V2_CLICKHOUSE_PASSWORD": ""},
+                 "requires ClickHouse credentials"),
+            )
+            for changes, message in cases:
+                environment = dict(base)
+                for key, value in changes.items():
+                    if value is None:
+                        environment.pop(key, None)
+                    else:
+                        environment[key] = value
+                with self.subTest(changes=changes), patch.dict(
+                    os.environ, environment, clear=True
+                ), patch("pathlib.Path.cwd", return_value=Path(folder)):
+                    settings = Settings.from_env("v2-development")
+                    with self.assertRaisesRegex(ValueError, message) as captured:
+                        settings.validate_runtime_isolation()
+                    self.assertNotIn("clickhouse-secret", str(captured.exception))
+                    self.assertNotIn("fixture:secret", str(captured.exception))
+
     def test_v2_preflight_requires_both_databases_and_forbids_duckdb(self):
         root = Path("/Volumes/T9/projects/marketcow-storage-v2/data-v2-development")
         base = self._v2_settings(root)
@@ -71,12 +108,24 @@ class SettingsTest(unittest.TestCase):
             ({"market_bar_read_backend": "duckdb"}, "must use ClickHouse"),
             ({"raw_market_bar_read_backend": "duckdb"}, "must use ClickHouse"),
             ({"database_path": root / "warehouse.duckdb"}, "must not define a DuckDB"),
+            ({"v2_allowed_root": None}, "explicit allowed root"),
+            ({"clickhouse_password": ""}, "requires ClickHouse credentials"),
+            ({"clickhouse_password": "   "}, "requires ClickHouse credentials"),
         )
-        for overrides, message in cases:
-            with self.subTest(overrides=overrides), self.assertRaisesRegex(
-                ValueError, message
-            ):
-                self._v2_settings(root, **overrides).validate_runtime_isolation()
+        with patch.object(Path, "mkdir") as mkdir, patch.object(
+            socket, "create_connection"
+        ) as connect, patch.object(threading.Thread, "start") as start, patch(
+            "builtins.open"
+        ) as opened:
+            for overrides, message in cases:
+                with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                    ValueError, message
+                ):
+                    self._v2_settings(root, **overrides).validate_runtime_isolation()
+        mkdir.assert_not_called()
+        connect.assert_not_called()
+        start.assert_not_called()
+        opened.assert_not_called()
 
     def test_v2_preflight_rejects_production_and_non_loopback_targets(self):
         root = Path("/Volumes/T9/projects/marketcow-storage-v2/data-v2-development")

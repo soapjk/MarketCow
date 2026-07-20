@@ -104,6 +104,7 @@ class Settings:
             "MARKETCOW_CLICKHOUSE_PASSWORD_REF",
             "MARKETCOW_CLICKHOUSE_PASSWORD" if v2 else "",
         ).strip()
+        v2_allowed_root_value = os.getenv("MARKETCOW_V2_ALLOWED_ROOT", "").strip()
         return cls(
             database_path=database_path,
             raw_path=raw_path,
@@ -218,8 +219,8 @@ class Settings:
                 "MARKETCOW_POSTGRES_READ_TIMEOUT", "5.0"
             )),
             v2_allowed_root=(
-                Path(os.getenv("MARKETCOW_V2_ALLOWED_ROOT", str(Path.cwd()))).expanduser()
-                if v2 else None
+                Path(v2_allowed_root_value).expanduser()
+                if v2 and v2_allowed_root_value else None
             ),
             runtime_config_schema=(
                 "marketcow.v2-runtime-config.v1" if v2 else
@@ -390,6 +391,8 @@ class Settings:
             raise ValueError("V2 ClickHouse credential must use a valid environment reference")
         if not self.postgres_dsn:
             raise ValueError("V2 requires PostgreSQL credentials through its environment reference")
+        if not self.clickhouse_password.strip():
+            raise ValueError("V2 requires ClickHouse credentials through its environment reference")
         parsed = urlsplit(self.postgres_dsn)
         if parsed.scheme not in {"postgres", "postgresql"} or not parsed.hostname:
             raise ValueError("V2 PostgreSQL target is invalid")
