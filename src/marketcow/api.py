@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
@@ -27,12 +27,50 @@ class TushareRealtimeRequest(BaseModel):
 def create_app(
     settings: Optional[Settings] = None,
     service: Optional[FundamentalService] = None,
+    now_provider: Optional[Callable[[], datetime]] = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
     app.state.service = service
     app.add_event_handler("shutdown", service.close)
+    clock = now_provider or (lambda: datetime.now(timezone.utc))
+
+    def cache_metadata(
+        bars: list[Dict[str, Any]], fallback_ingested_at: Any = None,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        served = clock()
+        if served.tzinfo is None:
+            served = served.replace(tzinfo=timezone.utc)
+        served = served.astimezone(timezone.utc)
+        candidates = [row.get("ingested_at") for row in bars if row.get("ingested_at")]
+        if fallback_ingested_at:
+            candidates.append(fallback_ingested_at)
+        newest = None
+        for value in candidates:
+            parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.astimezone(timezone.utc)
+            newest = parsed if newest is None or parsed > newest else newest
+        age = None if newest is None else max(0.0, (served - newest).total_seconds())
+        status = "empty" if not bars else (
+            "fresh" if age is not None and
+            age <= settings.market_bar_cache_freshness_seconds else "stale"
+        )
+        result: Dict[str, Any] = {
+            "cache_status": status,
+            "newest_ingested_at": None if newest is None else newest.isoformat(),
+            "cache_age_seconds": age,
+            "served_at": served.isoformat(),
+            "cache_freshness_seconds": settings.market_bar_cache_freshness_seconds,
+        }
+        if reason:
+            result["cache_reason"] = reason[:1000]
+        return result
 
     def parse_as_of(value: str) -> str:
         if not value:
@@ -237,14 +275,36 @@ def create_app(
                     "adjustment": adjustment, "count": len(bars), "bars": bars,
                     "cached": True, "start": start, "end": end,
                     "truncated": truncated,
+                    **cache_metadata(bars),
                 }
             if refresh:
-                result = service.refresh_quote_history(normalized, range_, interval, adjustment)
+                try:
+                    result = service.refresh_quote_history(
+                        normalized, range_, interval, adjustment
+                    )
+                except Exception as error:
+                    bars = service.market_bar_repository.get_price_bars(
+                        normalized, interval, adjustment, limit
+                    )
+                    if not bars:
+                        raise
+                    return {
+                        "symbol": normalized, "interval": interval,
+                        "adjustment": adjustment, "count": len(bars), "bars": bars,
+                        "cached": True, "cache_degraded": True,
+                        **cache_metadata(bars, reason=str(error)),
+                    }
                 result["bars"] = result["bars"][-limit:]
                 result["count"] = len(result["bars"])
+                result.setdefault("cached", False)
+                result.update(cache_metadata(
+                    result["bars"], result.get("ingested_at") or result.get("observed_at")
+                ))
                 return result
             bars = service.market_bar_repository.get_price_bars(normalized, interval, adjustment, limit)
-            return {"symbol": normalized, "interval": interval, "adjustment": adjustment, "count": len(bars), "bars": bars, "cached": True}
+            return {"symbol": normalized, "interval": interval, "adjustment": adjustment,
+                    "count": len(bars), "bars": bars, "cached": True,
+                    **cache_metadata(bars)}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -285,6 +345,7 @@ def create_app(
                 "adjustment": adjustment,
                 "count": len(bars), "bars": bars, "cached": True,
                 "truncated": truncated,
+                **cache_metadata(bars),
             }
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -335,6 +396,7 @@ def create_app(
                 "adjustment": adjustment, "start": normalized_start,
                 "end": normalized_end, "count": len(bars), "bars": bars,
                 "cached": True, "truncated": truncated,
+                **cache_metadata(bars),
             }
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

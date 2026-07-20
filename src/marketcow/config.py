@@ -43,6 +43,7 @@ class Settings:
     raw_market_bar_read_backend: str = "duckdb"
     clickhouse_auto_canonical: bool = False
     clickhouse_auto_canonical_limit: int = 50000
+    market_bar_cache_freshness_seconds: int = 900
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -125,9 +126,14 @@ class Settings:
             clickhouse_auto_canonical_limit=int(os.getenv(
                 "MARKETCOW_CLICKHOUSE_AUTO_CANONICAL_LIMIT", "50000"
             )),
+            market_bar_cache_freshness_seconds=int(os.getenv(
+                "MARKETCOW_MARKET_BAR_CACHE_FRESHNESS_SECONDS", "900"
+            )),
         )
 
     def validate_runtime_isolation(self) -> None:
+        if not 1 <= self.market_bar_cache_freshness_seconds <= 86400:
+            raise ValueError("market bar cache freshness must be between 1 and 86400 seconds")
         if not 1 <= self.clickhouse_auto_canonical_limit <= 100000:
             raise ValueError("automatic canonical limit must be between 1 and 100000")
         if self.clickhouse_auto_canonical:

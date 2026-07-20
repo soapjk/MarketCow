@@ -116,6 +116,13 @@ DuckDB
   以同一查询回退 DuckDB，并记录 raw_multisource/backend/fallback/count/truncated/error。
 - 只读 API `GET /v1/quotes/{symbol}/raw-history` 返回规范化范围、全部 provenance、count、
   bars、cached=true 和 truncated；不触发 refresh 或写入，语义参数错误返回 400。
+- 最近 N 条、闭区间、精确横截面和 raw-history 响应统一提供 `cache_status`、
+  `newest_ingested_at`、`cache_age_seconds`、`served_at` 和
+  `cache_freshness_seconds`。状态确定为 fresh、stale 或 empty；时间统一为 UTC，age 非负。
+  阈值由 `MARKETCOW_MARKET_BAR_CACHE_FRESHNESS_SECONDS` 配置，范围 1..86400 秒，默认
+  900 秒。refresh 失败但缓存存在时返回 `cache_degraded=true` 和有界 cache_reason；缓存
+  为空则保持有界错误。ClickHouse 成功读取与同查询 DuckDB fallback 使用同一响应层算法，
+  backend diagnostics 不参与缓存语义。
 - automatic canonical 衔接默认关闭，仅 development 可通过
   `MARKETCOW_CLICKHOUSE_AUTO_CANONICAL=true` 显式启用。raw shadow 成功后按当前批次精确
   min/max 闭区间同步执行有界 rebuild；raw 仅落 spool 时不执行，只有该 raw 项成功 replay
@@ -489,9 +496,11 @@ fundamental / statements / PIT history
 - 已完成 development-only、default-off 的同步 automatic canonical 衔接：raw shadow 当前
   逻辑批次完整成功，或其全部失败分块经 spool/replay 成功后，才按完整精确范围执行有界
   rebuild；共享 replay 预算、持久化 intent、崩溃恢复和进程级互斥均已实现；
+- 已完成最近 N 条、闭区间、精确横截面和 raw-history 的统一缓存命中/空结果/新鲜度契约，
+  包括固定时钟可测的 fresh/stale/empty、UTC newest ingestion、非负 age、refresh 失败缓存
+  降级，以及 ClickHouse 成功与同查询 DuckDB fallback 的等价语义；
 - 尚未完成大规模长时间范围基准与分页/游标契约；
 - 尚未完成非精确时间（如最近有效 bar）或多时间点横截面；
-- 尚未完成缓存命中、失效、新鲜度和 ClickHouse/DuckDB 回退一致性契约测试；
 - 尚未实现后台扫描、定时或异步 canonical 调度；当前 automatic canonical 仅为显式启用的
   development 同步、有界衔接；
 - 尚未实现冷热分层；
@@ -560,7 +569,7 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 - 8790 不被停止、重启或修改；
 - development 只写独立存储；
-- 现有默认测试继续通过（检查点 10 的数量见第十一节）；
+- 现有默认测试继续通过（最新数量见第十一节）；
 - 新 backend 有单元测试和显式集成测试；
 - 上游失败仍有界，不占满服务线程；
 - 双写失败不能阻断现有 DuckDB 主路径，除非测试明确验证 fail-closed；
@@ -572,8 +581,9 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 最近一次 Storage V2 检查：
 
 ```text
-feature/storage-v2 检查点 10 已验证基线：4e613bd
-默认测试：111 项通过；16 项显式外部存储集成测试因未配置本地服务而跳过
+feature/storage-v2 检查点 10（含文档修订）已验证基线：c73ae22；检查点 11 候选变更
+只扩展行情历史缓存状态、新鲜度和 fallback 一致性契约
+默认测试：115 项通过；16 项显式外部存储集成测试因未配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
 ClickHouse 集成测试：11 项通过（显式启用，使用一次性 ClickHouse 25.8 本地容器；
 容器测试后停止）
@@ -581,9 +591,10 @@ ClickHouse 集成测试：11 项通过（显式启用，使用一次性 ClickHou
 ClickHouse 等版本确定性收敛。检查点 10 已完成 development-only、default-off 的同步
 automatic canonical：raw 逻辑批次完整成功或全部 spool 分块重放成功后按完整精确范围
 有界 rebuild，并具备共享 replay 预算、持久化 intent、崩溃恢复和并发互斥；DuckDB
-仍为 primary，所有失败保持 fail-open。尚未完成大规模范围分页/基准、非精确或多时间点
-横截面、缓存命中/失效/新鲜度一致性、后台扫描/调度、冷热分层及正式连接/切换，必须等待
-验收方指定。
+仍为 primary，所有失败保持 fail-open。检查点 11 候选已完成四类只读行情响应的统一
+fresh/stale/empty、UTC newest ingestion、age/served_at、refresh 缓存降级和 ClickHouse→
+DuckDB fallback 等价契约。尚未完成大规模范围分页/基准、非精确或多时间点横截面、后台
+扫描/调度、冷热分层及正式连接/切换，必须等待验收方指定。
 ```
 
 正式服务由 `com.marketcow.production` 管理；最近已验证 health 包含
