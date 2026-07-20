@@ -1,17 +1,22 @@
 {
-  "legacy_matrix_sha256": "d1a02f809d9ad0183cb112aff8167112c1a36af829175a3d1c11ba76de3e8fe7",
+  "legacy_matrix_sha256": "96c0e85f868d01c6d6f06817afb4c4f4b40b1ed8350be9aeb3a10c1c53e96cef",
   "legacy_source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4",
   "routes": [
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -24,49 +29,63 @@
           "id": "get-_v1_admin_artifacts-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "0da2ccbeba395a1d02c4dc7315d4523a45d53df5f9658ebc30b3b7c3df394032",
+          "legacy_capture_sha256": "35f7d451cb582417b066dbb790ea7b5a14e0171d3c9ace68c6985063d27029b4",
           "v2": "executed",
-          "v2_capture_sha256": "3d4af28c3410c7d3975d97302b9484b50e7a9785275141398ff341082ed0d216"
+          "v2_capture_sha256": "6eacfbc2fbb36bbb9c83fe4ac1b1d849715cdc40ddd109ab8b49084ea6e6f745"
         },
         {
           "capture_key": "GET /v1/admin/artifacts::empty",
           "id": "get-_v1_admin_artifacts-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "7b6df100ad5b75be7ccc718ca27b0e47e26510e7eff97a83ef2cd0215bd6d2a9",
+          "legacy_capture_sha256": "a76c5721b3bac882fa02370947d6f09e3a5c8af7eb8623fd6e7eab3fd238a302",
           "v2": "executed",
-          "v2_capture_sha256": "4453122b5a293245622d56bcd1514097f8144d27630086ec5f5b069414fce7f6"
+          "v2_capture_sha256": "20252a2e562546a29fd06569871f451bf21099fdcd2a9bf77b3665ee3fcd0bdc"
         },
         {
           "capture_key": "GET /v1/admin/artifacts::validation_error",
           "id": "get-_v1_admin_artifacts-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "ea621067569fcf19411bd591ca67c91fb560366ccd00831fa65f1325136dea70",
+          "legacy_capture_sha256": "fc1e20e15f02324011f272fa9719ea45a58c7257073eac13e7bc0a9f72c9295f",
           "v2": "executed",
-          "v2_capture_sha256": "ea621067569fcf19411bd591ca67c91fb560366ccd00831fa65f1325136dea70"
+          "v2_capture_sha256": "fc1e20e15f02324011f272fa9719ea45a58c7257073eac13e7bc0a9f72c9295f"
         },
         {
           "capture_key": "GET /v1/admin/artifacts::backend_failure",
           "id": "get-_v1_admin_artifacts-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "98d0bd8e2f2732857b2cfbc636b477bfeee584f942af4cc9b7eeba1b86800b53",
-          "v2": "executed",
-          "v2_capture_sha256": "98d0bd8e2f2732857b2cfbc636b477bfeee584f942af4cc9b7eeba1b86800b53"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/admin/artifacts::partial_failure",
+          "id": "get-_v1_admin_artifacts-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -79,49 +98,63 @@
           "id": "get-_v1_admin_jobs-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "af2c0942815ec8250d241f57c92149b122c8325273410c34c9c6d519825169b8",
+          "legacy_capture_sha256": "b294edb24e2999e2fa9ea1c58526e2a7c192ad337ba15bd6c67542dd5dc20515",
           "v2": "executed",
-          "v2_capture_sha256": "af2c0942815ec8250d241f57c92149b122c8325273410c34c9c6d519825169b8"
+          "v2_capture_sha256": "b294edb24e2999e2fa9ea1c58526e2a7c192ad337ba15bd6c67542dd5dc20515"
         },
         {
           "capture_key": "GET /v1/admin/jobs::empty",
           "id": "get-_v1_admin_jobs-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "6b32f1484542ea00a1d03debf04239385c11f2f948335bf526554e1170a39ec0",
+          "legacy_capture_sha256": "5b9b03229efbe4cfc135307bd1c23481c546b4be71f2665f23029e99ebd27325",
           "v2": "executed",
-          "v2_capture_sha256": "6b32f1484542ea00a1d03debf04239385c11f2f948335bf526554e1170a39ec0"
+          "v2_capture_sha256": "5b9b03229efbe4cfc135307bd1c23481c546b4be71f2665f23029e99ebd27325"
         },
         {
           "capture_key": "GET /v1/admin/jobs::validation_error",
           "id": "get-_v1_admin_jobs-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "6224048ee14969c8e6f2d371c6916481b3be3481bf3a76fedb3411401de53f45",
+          "legacy_capture_sha256": "782f068e3a1b0d72c7b180076081c7d9a9fd6496e33db04bbb3d8c782b0a645f",
           "v2": "executed",
-          "v2_capture_sha256": "6224048ee14969c8e6f2d371c6916481b3be3481bf3a76fedb3411401de53f45"
+          "v2_capture_sha256": "782f068e3a1b0d72c7b180076081c7d9a9fd6496e33db04bbb3d8c782b0a645f"
         },
         {
           "capture_key": "GET /v1/admin/jobs::backend_failure",
           "id": "get-_v1_admin_jobs-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "6e7947be84fd2ad3211fecb6e8a816504fccfcde86fea050c4da87854f029f68",
-          "v2": "executed",
-          "v2_capture_sha256": "6e7947be84fd2ad3211fecb6e8a816504fccfcde86fea050c4da87854f029f68"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/admin/jobs::partial_failure",
+          "id": "get-_v1_admin_jobs-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -134,49 +167,63 @@
           "id": "get-_v1_earnings-calendar-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "d3477d811bfebabafd30c557bc85d45ae80132f916d508504bbe3421c5d94a53",
+          "legacy_capture_sha256": "b77ee5ba1f77237fd1b186a1a0e570a6026f3b8f5e8195ef3348c6ddb685f27e",
           "v2": "executed",
-          "v2_capture_sha256": "d3477d811bfebabafd30c557bc85d45ae80132f916d508504bbe3421c5d94a53"
+          "v2_capture_sha256": "b77ee5ba1f77237fd1b186a1a0e570a6026f3b8f5e8195ef3348c6ddb685f27e"
         },
         {
           "capture_key": "GET /v1/earnings-calendar::empty",
           "id": "get-_v1_earnings-calendar-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "f1955c6afe8dc6841837202eaf9e0456038b96c2ad72cfe94a5f9da83054ec6f",
+          "legacy_capture_sha256": "a6900c062f9199620d9668028bbc0907e0e463b9d81e6aa8d08c5a4041f3edd1",
           "v2": "executed",
-          "v2_capture_sha256": "f1955c6afe8dc6841837202eaf9e0456038b96c2ad72cfe94a5f9da83054ec6f"
+          "v2_capture_sha256": "a6900c062f9199620d9668028bbc0907e0e463b9d81e6aa8d08c5a4041f3edd1"
         },
         {
           "capture_key": "GET /v1/earnings-calendar::validation_error",
           "id": "get-_v1_earnings-calendar-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "b571c16c6789138d54c53f01a5cad4e5fd76731d4e40fec9c469775d3f65673f",
+          "legacy_capture_sha256": "8bc2bd1496cf7da128ac4fffe2fad237fb3e420dcfb27eeefc71e2f731562e5c",
           "v2": "executed",
-          "v2_capture_sha256": "b571c16c6789138d54c53f01a5cad4e5fd76731d4e40fec9c469775d3f65673f"
+          "v2_capture_sha256": "8bc2bd1496cf7da128ac4fffe2fad237fb3e420dcfb27eeefc71e2f731562e5c"
         },
         {
           "capture_key": "GET /v1/earnings-calendar::backend_failure",
           "id": "get-_v1_earnings-calendar-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "2992eca6933a76e3a2fd46b90f4f514a47157e3fa9b143cdcc64898b61dabb69",
-          "v2": "executed",
-          "v2_capture_sha256": "2992eca6933a76e3a2fd46b90f4f514a47157e3fa9b143cdcc64898b61dabb69"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/earnings-calendar::partial_failure",
+          "id": "get-_v1_earnings-calendar-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -189,49 +236,63 @@
           "id": "get-_v1_economic-calendar-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "3aaaa140a110b692af44023f0977ae5557b6ddd8942c88a367281c65412c89b7",
+          "legacy_capture_sha256": "39fc1c9377ea499656777feb21d3ae66940dcbcced06c3a44cb431439e2cb729",
           "v2": "executed",
-          "v2_capture_sha256": "3aaaa140a110b692af44023f0977ae5557b6ddd8942c88a367281c65412c89b7"
+          "v2_capture_sha256": "39fc1c9377ea499656777feb21d3ae66940dcbcced06c3a44cb431439e2cb729"
         },
         {
           "capture_key": "GET /v1/economic-calendar::empty",
           "id": "get-_v1_economic-calendar-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "d86fd3fb8cc98c276471fcab54dc325354bbe9b7ec7862005794b1d15bde27c9",
+          "legacy_capture_sha256": "949b6005f32fdb10257b451a1cd2f11d82863b9b67dd7010de977cf7b459e362",
           "v2": "executed",
-          "v2_capture_sha256": "d86fd3fb8cc98c276471fcab54dc325354bbe9b7ec7862005794b1d15bde27c9"
+          "v2_capture_sha256": "949b6005f32fdb10257b451a1cd2f11d82863b9b67dd7010de977cf7b459e362"
         },
         {
           "capture_key": "GET /v1/economic-calendar::validation_error",
           "id": "get-_v1_economic-calendar-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "14907a70b898303ead1d6537c426eb4afbef0220657f3b9cd3ea9c5d6278cb27",
+          "legacy_capture_sha256": "366386080cb7386d90cbf5fd3f3d420c62cab26365774a7014b637fc961e7b8b",
           "v2": "executed",
-          "v2_capture_sha256": "14907a70b898303ead1d6537c426eb4afbef0220657f3b9cd3ea9c5d6278cb27"
+          "v2_capture_sha256": "366386080cb7386d90cbf5fd3f3d420c62cab26365774a7014b637fc961e7b8b"
         },
         {
           "capture_key": "GET /v1/economic-calendar::backend_failure",
           "id": "get-_v1_economic-calendar-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "b71d3919a2edfbde530671870287f2bdb15baf9317ec74097bed54391c2ee778",
-          "v2": "executed",
-          "v2_capture_sha256": "b71d3919a2edfbde530671870287f2bdb15baf9317ec74097bed54391c2ee778"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/economic-calendar::partial_failure",
+          "id": "get-_v1_economic-calendar-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -244,49 +305,63 @@
           "id": "get-_v1_economic-indicators-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "8fe5b176ffe5f4c120200c9a047cb9dd8047e823bb39413163ef2976e6c1aa1d",
+          "legacy_capture_sha256": "5c1cd32b68cf057424160d18b906c126c5e9f557beaf7fd31bd1fe4802c55663",
           "v2": "executed",
-          "v2_capture_sha256": "8fe5b176ffe5f4c120200c9a047cb9dd8047e823bb39413163ef2976e6c1aa1d"
+          "v2_capture_sha256": "5c1cd32b68cf057424160d18b906c126c5e9f557beaf7fd31bd1fe4802c55663"
         },
         {
           "capture_key": "GET /v1/economic-indicators::empty",
           "id": "get-_v1_economic-indicators-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "b73f47e945640fb707263158356f3e26743959cb8122abaf922918cb429bba9b",
+          "legacy_capture_sha256": "3254705c8401175d8d473e62e81acd66a4c9d2e1ac87afad7de2ccc6da761bac",
           "v2": "executed",
-          "v2_capture_sha256": "b73f47e945640fb707263158356f3e26743959cb8122abaf922918cb429bba9b"
+          "v2_capture_sha256": "3254705c8401175d8d473e62e81acd66a4c9d2e1ac87afad7de2ccc6da761bac"
         },
         {
           "capture_key": "GET /v1/economic-indicators::validation_error",
           "id": "get-_v1_economic-indicators-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "9b63aa3cdb3f1714e069867dcabb3953aaf0e7286db64e8df6438014e063d05c",
+          "legacy_capture_sha256": "7d3240672151bb8a9786e2c6fe8e7a494c653c04a173e1be4f7698a6e9bb1306",
           "v2": "executed",
-          "v2_capture_sha256": "9b63aa3cdb3f1714e069867dcabb3953aaf0e7286db64e8df6438014e063d05c"
+          "v2_capture_sha256": "7d3240672151bb8a9786e2c6fe8e7a494c653c04a173e1be4f7698a6e9bb1306"
         },
         {
           "capture_key": "GET /v1/economic-indicators::backend_failure",
           "id": "get-_v1_economic-indicators-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "a1775935634e6f8b0afe779d216f75905470727bf701b90e73225b1a9c8eb6d9",
-          "v2": "executed",
-          "v2_capture_sha256": "a1775935634e6f8b0afe779d216f75905470727bf701b90e73225b1a9c8eb6d9"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/economic-indicators::partial_failure",
+          "id": "get-_v1_economic-indicators-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -300,18 +375,18 @@
           "id": "get-_v1_financials_symbol_statements-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "6c5a03111ecb88ced1b00a75480ab9d5a63d58cb11954ed3fb33264ffde81ee8",
+          "legacy_capture_sha256": "d1bd47df71c8362e0ca4bd7bb2848c39d671a0d0058772f92cdb707d61c7a6b7",
           "v2": "executed",
-          "v2_capture_sha256": "6c5a03111ecb88ced1b00a75480ab9d5a63d58cb11954ed3fb33264ffde81ee8"
+          "v2_capture_sha256": "d1bd47df71c8362e0ca4bd7bb2848c39d671a0d0058772f92cdb707d61c7a6b7"
         },
         {
           "capture_key": "GET /v1/financials/{symbol}/statements::empty",
           "id": "get-_v1_financials_symbol_statements-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "1443dd9f068df9c9218362d5f8eae73de5da088fbe239be2bec6a0e73455dae6",
+          "legacy_capture_sha256": "60ed99da32cbab92923ab66ebf4056cc7a24aa23aaa3c9735ea9fbd97b09353c",
           "v2": "executed",
-          "v2_capture_sha256": "1443dd9f068df9c9218362d5f8eae73de5da088fbe239be2bec6a0e73455dae6"
+          "v2_capture_sha256": "60ed99da32cbab92923ab66ebf4056cc7a24aa23aaa3c9735ea9fbd97b09353c"
         },
         {
           "capture_key": "GET /v1/financials/{symbol}/statements::validation_error",
@@ -326,23 +401,37 @@
           "capture_key": "GET /v1/financials/{symbol}/statements::backend_failure",
           "id": "get-_v1_financials_symbol_statements-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "c956c25d866efdb03c887b4b2b6ab25ef8aa65af1d89d7532073e20d43132dc9",
-          "v2": "executed",
-          "v2_capture_sha256": "c956c25d866efdb03c887b4b2b6ab25ef8aa65af1d89d7532073e20d43132dc9"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/financials/{symbol}/statements::partial_failure",
+          "id": "get-_v1_financials_symbol_statements-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -355,43 +444,53 @@
           "id": "get-_v1_fundamentals-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "70cb41a8a1ee4799b608f5bd12aa7cad875d6736c2ae4bf3c744a042e6c583e8",
+          "legacy_capture_sha256": "c5cbeb026f28fafc34bd7c7e5c8aae60a0048e6ea5c96e460a852a0acf4097f6",
           "v2": "executed",
-          "v2_capture_sha256": "70cb41a8a1ee4799b608f5bd12aa7cad875d6736c2ae4bf3c744a042e6c583e8"
+          "v2_capture_sha256": "c5cbeb026f28fafc34bd7c7e5c8aae60a0048e6ea5c96e460a852a0acf4097f6"
         },
         {
           "capture_key": "GET /v1/fundamentals::empty",
           "id": "get-_v1_fundamentals-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "627b224b853ccfeec24e8c42e954e9dc028682a46984140d2693bb3a96bb676d",
+          "legacy_capture_sha256": "37a2da644009bd4f76cae20fd8d7928ce700f7693bd48a53e14e0de0c11aa3c2",
           "v2": "executed",
-          "v2_capture_sha256": "627b224b853ccfeec24e8c42e954e9dc028682a46984140d2693bb3a96bb676d"
+          "v2_capture_sha256": "37a2da644009bd4f76cae20fd8d7928ce700f7693bd48a53e14e0de0c11aa3c2"
         },
         {
           "capture_key": "GET /v1/fundamentals::validation_error",
           "id": "get-_v1_fundamentals-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "79160e364af6943b4d6d02771e12b9b5262e8d43ead7b54a89543fe53b66bff6",
+          "legacy_capture_sha256": "d823ee9ef5a3347e248fa66d57c7d092d9d9e3883e6bfc3b8de21db206392195",
           "v2": "executed",
-          "v2_capture_sha256": "79160e364af6943b4d6d02771e12b9b5262e8d43ead7b54a89543fe53b66bff6"
+          "v2_capture_sha256": "d823ee9ef5a3347e248fa66d57c7d092d9d9e3883e6bfc3b8de21db206392195"
         },
         {
           "capture_key": "GET /v1/fundamentals::backend_failure",
           "id": "get-_v1_fundamentals-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "2fe2cd712cb5b828296cd63d1bb481e7572544343396791f0cc053a201b49ef9",
-          "v2": "executed",
-          "v2_capture_sha256": "2fe2cd712cb5b828296cd63d1bb481e7572544343396791f0cc053a201b49ef9"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/fundamentals::partial_failure",
+          "id": "get-_v1_fundamentals-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -399,6 +498,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -412,9 +515,9 @@
           "id": "get-_v1_fundamentals_symbol-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "875fb35288bfaa8c4013641d4b8a8c3701e6bd91b89a747ea3ce54e753b966c3",
+          "legacy_capture_sha256": "5152973e312cbdca97bd63fcd2dd0ed05df5d4425f31b5420b1a9c84e77773e9",
           "v2": "executed",
-          "v2_capture_sha256": "875fb35288bfaa8c4013641d4b8a8c3701e6bd91b89a747ea3ce54e753b966c3"
+          "v2_capture_sha256": "5152973e312cbdca97bd63fcd2dd0ed05df5d4425f31b5420b1a9c84e77773e9"
         },
         {
           "capture_key": "GET /v1/fundamentals/{symbol}::empty",
@@ -438,23 +541,37 @@
           "capture_key": "GET /v1/fundamentals/{symbol}::backend_failure",
           "id": "get-_v1_fundamentals_symbol-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "c02a87f0f67adb07da062419f118cb9423a801c7cec3927c78a5744f7ea1662c",
-          "v2": "executed",
-          "v2_capture_sha256": "c02a87f0f67adb07da062419f118cb9423a801c7cec3927c78a5744f7ea1662c"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/fundamentals/{symbol}::partial_failure",
+          "id": "get-_v1_fundamentals_symbol-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -467,49 +584,63 @@
           "id": "get-_v1_fundamentals_symbol_history-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "4b37b79ec90dce11ebf286aa4350b0408c9aa93fb1981fd9ca19f324f801dfb5",
+          "legacy_capture_sha256": "5ca0997ffb9bfb6f479a1e27a5f741cc1ecd07c9d1464b57b511bb41867df987",
           "v2": "executed",
-          "v2_capture_sha256": "4b37b79ec90dce11ebf286aa4350b0408c9aa93fb1981fd9ca19f324f801dfb5"
+          "v2_capture_sha256": "5ca0997ffb9bfb6f479a1e27a5f741cc1ecd07c9d1464b57b511bb41867df987"
         },
         {
           "capture_key": "GET /v1/fundamentals/{symbol}/history::empty",
           "id": "get-_v1_fundamentals_symbol_history-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "6ecfdea22942822c5c8d76ca2037191605538c8a4a62b7bdc1d67febe6029fd9",
+          "legacy_capture_sha256": "9b544a1741d6e5d6eade3f27da8342d5de80ef3d487793fb446f2457d08174a7",
           "v2": "executed",
-          "v2_capture_sha256": "6ecfdea22942822c5c8d76ca2037191605538c8a4a62b7bdc1d67febe6029fd9"
+          "v2_capture_sha256": "9b544a1741d6e5d6eade3f27da8342d5de80ef3d487793fb446f2457d08174a7"
         },
         {
           "capture_key": "GET /v1/fundamentals/{symbol}/history::validation_error",
           "id": "get-_v1_fundamentals_symbol_history-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "a175b26276a7cc98c2244b1d6246aefd0ea718da9b8d2556e722b15d5f20d902",
+          "legacy_capture_sha256": "79233e0c90a977090cb175f8e8cc2b7ad29a3372a74f695e88a3bacb3ce8cdf9",
           "v2": "executed",
-          "v2_capture_sha256": "a175b26276a7cc98c2244b1d6246aefd0ea718da9b8d2556e722b15d5f20d902"
+          "v2_capture_sha256": "79233e0c90a977090cb175f8e8cc2b7ad29a3372a74f695e88a3bacb3ce8cdf9"
         },
         {
           "capture_key": "GET /v1/fundamentals/{symbol}/history::backend_failure",
           "id": "get-_v1_fundamentals_symbol_history-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "2dd9e5f767c5863908c4f999bd7841771fa89f4efba7ee840c2e16a6e2b24247",
-          "v2": "executed",
-          "v2_capture_sha256": "2dd9e5f767c5863908c4f999bd7841771fa89f4efba7ee840c2e16a6e2b24247"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/fundamentals/{symbol}/history::partial_failure",
+          "id": "get-_v1_fundamentals_symbol_history-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -522,36 +653,45 @@
           "id": "get-_v1_funnel_metrics-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "ecf38282e5f7ea4e1ccb9555bd00f90669f79ce787145d43ee366f9210695021",
+          "legacy_capture_sha256": "c2c86763f91e08a504868070e6eeef1394eae8eabc2f9c58cf70a0d85a34c97a",
           "v2": "executed",
-          "v2_capture_sha256": "ecf38282e5f7ea4e1ccb9555bd00f90669f79ce787145d43ee366f9210695021"
+          "v2_capture_sha256": "c2c86763f91e08a504868070e6eeef1394eae8eabc2f9c58cf70a0d85a34c97a"
         },
         {
           "capture_key": "GET /v1/funnel/metrics::empty",
           "id": "get-_v1_funnel_metrics-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "187b2c10cdb8e5951c4972869ac2dc0da177d98c638e4b77d675e77b533b20a9",
+          "legacy_capture_sha256": "c635f52e1e9fec5a0322b3b6b36d38e33d133a9f58e7a50652768cd7486dcd9a",
           "v2": "executed",
-          "v2_capture_sha256": "187b2c10cdb8e5951c4972869ac2dc0da177d98c638e4b77d675e77b533b20a9"
+          "v2_capture_sha256": "c635f52e1e9fec5a0322b3b6b36d38e33d133a9f58e7a50652768cd7486dcd9a"
         },
         {
           "capture_key": "GET /v1/funnel/metrics::validation_error",
           "id": "get-_v1_funnel_metrics-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "1d238d9003d43db6309ab5a292bac75aa615c9b7ac3007bba4968dbc63dc7a1b",
+          "legacy_capture_sha256": "bdbe90ff13cf2a8087017add3c011384aebee9491cdd19c77160d276abb0eef7",
           "v2": "executed",
-          "v2_capture_sha256": "1d238d9003d43db6309ab5a292bac75aa615c9b7ac3007bba4968dbc63dc7a1b"
+          "v2_capture_sha256": "bdbe90ff13cf2a8087017add3c011384aebee9491cdd19c77160d276abb0eef7"
         },
         {
           "capture_key": "GET /v1/funnel/metrics::backend_failure",
           "id": "get-_v1_funnel_metrics-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "67ea8815509848f1e78f437cf098b5694fcf2bd09cfeb5db42b696805815d6d5",
-          "v2": "executed",
-          "v2_capture_sha256": "67ea8815509848f1e78f437cf098b5694fcf2bd09cfeb5db42b696805815d6d5"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/funnel/metrics::partial_failure",
+          "id": "get-_v1_funnel_metrics-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -567,6 +707,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -580,9 +724,9 @@
           "id": "get-_v1_health-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "6682ee1e68825ddca7972e514f7a0566aa4eca5c02371b0991e9b9c31b839f6d",
+          "legacy_capture_sha256": "4dc07ff9099d72ca102e9d31e9ff7b1fc02dd90724674abb5ce99ab88b13da2d",
           "v2": "executed",
-          "v2_capture_sha256": "35ff4711c0e04de4b29e9b53efd9924edba7cd93eabb3ddad2b66ec950edef5e"
+          "v2_capture_sha256": "9a46aa1fbb620f8f0259da8ab2c7a48cad2e6a3cfabd39b8f0cb3b95495e7d1b"
         },
         {
           "capture_key": "GET /v1/health::empty",
@@ -610,6 +754,15 @@
           "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
           "v2": "not_applicable",
           "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/health::partial_failure",
+          "id": "get-_v1_health-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -624,6 +777,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "status": "covered"
         }
@@ -635,36 +792,45 @@
           "id": "get-_v1_instruments_search-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "5dc0411546e4fe470ea120e7b7792ab32ea00d75a61616155bf161f3a233ca6a",
+          "legacy_capture_sha256": "5e04e23c23bd20aaa99ac60bb421e51ed8b0d127add89badfdae3e7c7ada0c8e",
           "v2": "executed",
-          "v2_capture_sha256": "5dc0411546e4fe470ea120e7b7792ab32ea00d75a61616155bf161f3a233ca6a"
+          "v2_capture_sha256": "5e04e23c23bd20aaa99ac60bb421e51ed8b0d127add89badfdae3e7c7ada0c8e"
         },
         {
           "capture_key": "GET /v1/instruments/search::empty",
           "id": "get-_v1_instruments_search-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "5bf2aa087a69f9aa112cb8cc0201b7122280c097025e082d5e0d984876b2b261",
+          "legacy_capture_sha256": "22fdbf37b17017ddfd06bbc65a64c0d2066f67ce1bc23a2f98b5442c86c6a028",
           "v2": "executed",
-          "v2_capture_sha256": "5bf2aa087a69f9aa112cb8cc0201b7122280c097025e082d5e0d984876b2b261"
+          "v2_capture_sha256": "22fdbf37b17017ddfd06bbc65a64c0d2066f67ce1bc23a2f98b5442c86c6a028"
         },
         {
           "capture_key": "GET /v1/instruments/search::validation_error",
           "id": "get-_v1_instruments_search-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "efa574af2abf28624663927fd28c0f1e68a75d283c1c567eb0074b0f106b6528",
+          "legacy_capture_sha256": "33825f7bb0c1b1da59152b117e565871f78148c14538651fd9fba22e9751c27e",
           "v2": "executed",
-          "v2_capture_sha256": "efa574af2abf28624663927fd28c0f1e68a75d283c1c567eb0074b0f106b6528"
+          "v2_capture_sha256": "33825f7bb0c1b1da59152b117e565871f78148c14538651fd9fba22e9751c27e"
         },
         {
           "capture_key": "GET /v1/instruments/search::backend_failure",
           "id": "get-_v1_instruments_search-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "9d9a58fee8aee5f6ebb37292c8867fd810e82e0784b74d5ab5ed7c0f17c72d3e",
+          "legacy_capture_sha256": "3aa67b8624fd315084f5cbd8097d35bd71b3cd66544d2d13142dd794634ca42e",
           "v2": "executed",
-          "v2_capture_sha256": "9d9a58fee8aee5f6ebb37292c8867fd810e82e0784b74d5ab5ed7c0f17c72d3e"
+          "v2_capture_sha256": "3aa67b8624fd315084f5cbd8097d35bd71b3cd66544d2d13142dd794634ca42e"
+        },
+        {
+          "capture_key": "GET /v1/instruments/search::partial_failure",
+          "id": "get-_v1_instruments_search-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -678,6 +844,9 @@
           "status": "covered"
         },
         "normal": {
+          "status": "covered"
+        },
+        "partial_failure": {
           "status": "covered"
         },
         "validation_error": {
@@ -691,27 +860,27 @@
           "id": "get-_v1_quotes-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "9a438bc90fcd8fb0f778573f69baf6307b408baab9aa53de924f307c7bf6ca77",
+          "legacy_capture_sha256": "d0faecd5fda3bdd95ea86f9197a375bf96ab8d871af7183c8a0bad73650565c6",
           "v2": "executed",
-          "v2_capture_sha256": "9a438bc90fcd8fb0f778573f69baf6307b408baab9aa53de924f307c7bf6ca77"
+          "v2_capture_sha256": "d0faecd5fda3bdd95ea86f9197a375bf96ab8d871af7183c8a0bad73650565c6"
         },
         {
           "capture_key": "GET /v1/quotes::empty",
           "id": "get-_v1_quotes-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "18f3f13a73b7cc76b8f7c307eccf52e93bbf4465a00cdce405a1869b5769f6d3",
+          "legacy_capture_sha256": "669976d2baa84e7fde3fa1897c1ffa7771005b943280a94ece02f5cebb6e05a3",
           "v2": "executed",
-          "v2_capture_sha256": "8ef0514d8c9725f2366506e1d46260f3182f0302d1e1939435cb61cba769541c"
+          "v2_capture_sha256": "38bf4aae263e68e854014cc62a111318c1af8eb8db8ee7b7106f74e2336d66cc"
         },
         {
           "capture_key": "GET /v1/quotes::validation_error",
           "id": "get-_v1_quotes-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "bb02ee6910d7a783eba222aaf2a840ec1b7ae252be0d2e95c2a0df25ebcb50f5",
+          "legacy_capture_sha256": "004d6622ebde23053666efe0e25ed57e9ac4d566a33f82a107b89813acb71791",
           "v2": "executed",
-          "v2_capture_sha256": "bb02ee6910d7a783eba222aaf2a840ec1b7ae252be0d2e95c2a0df25ebcb50f5"
+          "v2_capture_sha256": "004d6622ebde23053666efe0e25ed57e9ac4d566a33f82a107b89813acb71791"
         },
         {
           "capture_key": "GET /v1/quotes::backend_failure",
@@ -721,6 +890,15 @@
           "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
           "v2": "not_applicable",
           "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/quotes::partial_failure",
+          "id": "get-_v1_quotes-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "executed",
+          "legacy_capture_sha256": "2d71ff16a57d84d6c475d1979c296f151f6816e4213938d9965c067f5ba38951",
+          "v2": "executed",
+          "v2_capture_sha256": "aac1de627ec61c6bf09b80f83efe1b2d1e410b55774ab3938379c00a5af16f08"
         }
       ]
     },
@@ -734,6 +912,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -747,7 +929,7 @@
           "kind": "normal",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "60424848bf0c0fba747e60d888e591ca009213acee04d71656de23436d181387"
+          "v2_capture_sha256": "58ec1c7a9aaef1e525cdf5da166ba2c6dd6ffbcd079bb9a3d49e9b4ebc087201"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section::empty",
@@ -755,7 +937,7 @@
           "kind": "empty",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "085fd03d1f0eb20a3259c7e55b5ab974614ece6433b8834e93dfa65614bb9473"
+          "v2_capture_sha256": "56a3d7114a94a1280b88ee5fe961f317ad710860c1087ebf7ba9116162a10f04"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section::validation_error",
@@ -763,7 +945,7 @@
           "kind": "validation_error",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "ce0db405b544b134d7acaeced86b0502f0c2680edc1f3d1d90022ffc2d9e86a9"
+          "v2_capture_sha256": "a644b2d66dff8fbe7f3645531213fbb769ddf346216156c133a9420d14c46d41"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section::backend_failure",
@@ -771,7 +953,15 @@
           "kind": "backend_failure",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "6a57474700d361a401fcc26c5ce95970813d29fdb41568979994d90711093e40"
+          "v2_capture_sha256": "513784b73a584122a7d874a3ec03838b64f065fed20bd24991a86a76830cad3a"
+        },
+        {
+          "capture_key": "GET /v1/quotes/cross-section::partial_failure",
+          "id": "get-_v1_quotes_cross-section-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "route_absent",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -785,6 +975,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -798,7 +992,7 @@
           "kind": "normal",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "d4026962b0bb2a6b17f23d579a5c225a937de878c90c1fd926f5ee472f41c7e1"
+          "v2_capture_sha256": "325360ab244e2a0360914e2f46564e08fdea631dfe9773c7063ec146355efaf7"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section/as-of::empty",
@@ -806,7 +1000,7 @@
           "kind": "empty",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "2ca2c64902a2acaddedd1fe8ed42051ecd989c90d91d4c7a623cd6f6557d904c"
+          "v2_capture_sha256": "32c1fb286652db4b23ce34f8a61d69c5bc6a7b48f71e5157ac7fb103dd7918f0"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section/as-of::validation_error",
@@ -814,7 +1008,7 @@
           "kind": "validation_error",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "0e62b783f05179e13806faa2efec1b48b4a00c867de30c940fe5b0bd7715b848"
+          "v2_capture_sha256": "d9017ea7072438203771641b630158b28a06d0c980a109481b1be87b71c37659"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section/as-of::backend_failure",
@@ -822,7 +1016,15 @@
           "kind": "backend_failure",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "34f19c3ed6cc983644ba29aecdecc5b08ce21f5d4122553a88f05952428075a4"
+          "v2_capture_sha256": "01023333db762bef84d0bd9083b6759a074867b064492292fcda9c67fc45be14"
+        },
+        {
+          "capture_key": "GET /v1/quotes/cross-section/as-of::partial_failure",
+          "id": "get-_v1_quotes_cross-section_as-of-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "route_absent",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -836,6 +1038,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -849,7 +1055,7 @@
           "kind": "normal",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "9a3e671d8fc3bd13ffbf11bb206d8d73dbe756428996506b978b7bb8b9529ab1"
+          "v2_capture_sha256": "44b9016618c31345f6c25fcd56ad2dd3fb8da0d6034e51e137783e12ba2c9de5"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section/matrix::empty",
@@ -857,7 +1063,7 @@
           "kind": "empty",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "869bafd3e8e57be89c6e4aecd2982ae0fd961d6fe8560a255cdcab6c084748c8"
+          "v2_capture_sha256": "3de98d51e2a503bd3618adb1309ba574db0f9423c03403dd44a40b7203aafbd0"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section/matrix::validation_error",
@@ -865,7 +1071,7 @@
           "kind": "validation_error",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "84823611f524e51dc2b4082e243e0141adcb891d5a56bdab1d2fb1a3d4b17ea9"
+          "v2_capture_sha256": "1613f722d45dee9b245d56bcebe3732168a973cdb9450986ebb53b88f1497f2d"
         },
         {
           "capture_key": "GET /v1/quotes/cross-section/matrix::backend_failure",
@@ -873,7 +1079,15 @@
           "kind": "backend_failure",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "6243b6dc686f8173c83f469dd1eb46bbcdf4083f31928e5319b6d113888a4766"
+          "v2_capture_sha256": "2bef8b5dbfd7570b207f714f9d98403ad5f6250c7d977403eb1bae76b2e8078d"
+        },
+        {
+          "capture_key": "GET /v1/quotes/cross-section/matrix::partial_failure",
+          "id": "get-_v1_quotes_cross-section_matrix-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "route_absent",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -889,6 +1103,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
@@ -901,9 +1119,9 @@
           "id": "get-_v1_quotes_symbol-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "9bcdadf16206efc7a50642bb2b99e58fbbb7c4db0ec54fa63db6bd90ef3bb0ac",
+          "legacy_capture_sha256": "e334a272d7a135120405b7bdfc654fbc7c26731be18d9f94b15d767413577427",
           "v2": "executed",
-          "v2_capture_sha256": "9bcdadf16206efc7a50642bb2b99e58fbbb7c4db0ec54fa63db6bd90ef3bb0ac"
+          "v2_capture_sha256": "e334a272d7a135120405b7bdfc654fbc7c26731be18d9f94b15d767413577427"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}::empty",
@@ -928,9 +1146,18 @@
           "id": "get-_v1_quotes_symbol-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "3e30a20e66228b43719b611f5529b8a2622e8906c91a774a2322adbbedfc8c7b",
+          "legacy_capture_sha256": "559e55149cd0ce7020e35c3df620645ea747a4c03957135b1bcb7d32798f4ff4",
           "v2": "executed",
-          "v2_capture_sha256": "2258d00a374aff4eebc57a259bc68067e0689c8cd1286985630dfd965a3b82a4"
+          "v2_capture_sha256": "289b4942962d6e0bb213fb449fb57499ec2915ba30aa514009720af4fa968211"
+        },
+        {
+          "capture_key": "GET /v1/quotes/{symbol}::partial_failure",
+          "id": "get-_v1_quotes_symbol-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -944,6 +1171,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -957,7 +1188,7 @@
           "kind": "normal",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "51b45988eda8ff4da56ae073eb5f5d12d5c78ec25253dfddf7f320a2e5135dcd"
+          "v2_capture_sha256": "3e1cf549b98ae69ca28062e9fedc99d4decf25ba6d1427e8505e4590c3dbfe89"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/as-of::empty",
@@ -965,7 +1196,7 @@
           "kind": "empty",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "08478a3612778b9bbd5fd5b0b7d4a13c29617cea514821ff32ea44a96ba71d2f"
+          "v2_capture_sha256": "44404ca86239d6923585d174e8e54a7e40aabe50f2938ff423ffe024eba91849"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/as-of::validation_error",
@@ -973,7 +1204,7 @@
           "kind": "validation_error",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "965ef58062a08377b83447381e94e75ddd6a94eddada9a8a029628594eccc52f"
+          "v2_capture_sha256": "3da4b9d5083958ac093185bfa32bd6b574aa39dbadfdb8ffee22e094243e1e10"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/as-of::backend_failure",
@@ -981,7 +1212,15 @@
           "kind": "backend_failure",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "4ef57c7014103d1f49da8ecb7fc0a19370d9ddd7bddddaaece84269203bb8e95"
+          "v2_capture_sha256": "f68b403d56411421a9c6d3a27135d735820c98cd32fd54b7cb97341bac196f5e"
+        },
+        {
+          "capture_key": "GET /v1/quotes/{symbol}/as-of::partial_failure",
+          "id": "get-_v1_quotes_symbol_as-of-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "route_absent",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -995,6 +1234,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -1007,36 +1250,45 @@
           "id": "get-_v1_quotes_symbol_history-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "230c8e76e915e198b53e8560c354f9a1fdd74ad111a63455ce0785980a73f735",
+          "legacy_capture_sha256": "1e93352db116f37666e380f647794e7c99017e979f67f3705df671935672fc4d",
           "v2": "executed",
-          "v2_capture_sha256": "c937ead924ce8ce76f8395e2521e64c4d34ad447d28e5ca7a24f4e4fef2ab24d"
+          "v2_capture_sha256": "73fab40bafc136521b410a0039e45948984150a8368052a8e52f2b3ae53f61aa"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/history::empty",
           "id": "get-_v1_quotes_symbol_history-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "c71aae98010face7c586475c3b5840d030d22fb194cef4bfeca85e900b3929e6",
+          "legacy_capture_sha256": "394458943d4fd6dea0d59c90a20c506e9dbf39776ce56089a3a5a184565b4a45",
           "v2": "executed",
-          "v2_capture_sha256": "e2a81f309f70d18d99def7d034294d79a8f1543bc655258811189b43d052b1d3"
+          "v2_capture_sha256": "062ff7391c29dca48d17262e4314d379c16ca4fbc9023b81b3e323c68b4d81c8"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/history::validation_error",
           "id": "get-_v1_quotes_symbol_history-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "16c75be67641e6e75949869569b4e6f5cc7957944a29de5c6a4b8a4d9d4fb6ae",
+          "legacy_capture_sha256": "2b6a0281220fec90d1f0ef1e90be8bacf86fd3771a81ac71679270d6063b0006",
           "v2": "executed",
-          "v2_capture_sha256": "16c75be67641e6e75949869569b4e6f5cc7957944a29de5c6a4b8a4d9d4fb6ae"
+          "v2_capture_sha256": "2b6a0281220fec90d1f0ef1e90be8bacf86fd3771a81ac71679270d6063b0006"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/history::backend_failure",
           "id": "get-_v1_quotes_symbol_history-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "547216d28ac0a243ef701bc46ed9743727319f3ae192e6e2ed8ae940c1549fc1",
+          "legacy_capture_sha256": "15589f22c360344f5e0f137fa4f15d10e208f7e5d15d6af055361478f2a1dd61",
           "v2": "executed",
-          "v2_capture_sha256": "547216d28ac0a243ef701bc46ed9743727319f3ae192e6e2ed8ae940c1549fc1"
+          "v2_capture_sha256": "15589f22c360344f5e0f137fa4f15d10e208f7e5d15d6af055361478f2a1dd61"
+        },
+        {
+          "capture_key": "GET /v1/quotes/{symbol}/history::partial_failure",
+          "id": "get-_v1_quotes_symbol_history-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1050,6 +1302,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -1063,7 +1319,7 @@
           "kind": "normal",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "0e89b98dbf8460b774b644031fdcda0b7dfd5f162ee0eb9991a9d83f17255311"
+          "v2_capture_sha256": "d36e5625f0c6e02d4d312e8202bb93416c34885f1811ad31b09906f72d4a1be9"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/raw-history::empty",
@@ -1071,7 +1327,7 @@
           "kind": "empty",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "9f9b9f9286f3bb99c6b0fac1e6c693bd2f7deb953a4ca8de9f67e8a145e165c8"
+          "v2_capture_sha256": "fa0bf9b8d28a8da1c180930fd339a8658a2f8aa03b478c3eb267c43e0d4b29bf"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/raw-history::validation_error",
@@ -1079,7 +1335,7 @@
           "kind": "validation_error",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "0c6a6af8f2f991f74b3fe1762eff6513ebbaa326600ef7b5b3d0dcbafe641e35"
+          "v2_capture_sha256": "5faf8bbc2b0ba8ecbba66e35a1b891f7759ae69e5d1ec85a7726ab2efabe9415"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}/raw-history::backend_failure",
@@ -1087,7 +1343,15 @@
           "kind": "backend_failure",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "d65adaf96fec0160666da2396a8bcddd4345db48b1adfd9722052ad0d6e25df6"
+          "v2_capture_sha256": "2cbb38d4f185c6281af3eb5171c221e4c23d7e23d0ee5268eba53a40ab91d048"
+        },
+        {
+          "capture_key": "GET /v1/quotes/{symbol}/raw-history::partial_failure",
+          "id": "get-_v1_quotes_symbol_raw-history-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "route_absent",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1102,6 +1366,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1116,7 +1384,7 @@
           "kind": "normal",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "9e608aaa3680cb92b1c59b354fb9c1d8820521433483e609abbb693cf3bc8c27"
+          "v2_capture_sha256": "3a8665c7c193ff11becc49594a1fa473de6789d863b077d6bb1258a9bc767f54"
         },
         {
           "capture_key": "GET /v1/readiness::empty",
@@ -1124,7 +1392,7 @@
           "kind": "empty",
           "legacy": "route_absent",
           "v2": "executed",
-          "v2_capture_sha256": "d07c8dbdf1bc5b743797182b2af47a5e3c075137f2242bf387d182210aa8d9be"
+          "v2_capture_sha256": "4f9657df69f45d6593b2fa807a80ad303bb2453e2d0136c5237c94579f5e8246"
         },
         {
           "capture_key": "GET /v1/readiness::validation_error",
@@ -1141,13 +1409,22 @@
           "legacy": "route_absent",
           "v2": "not_applicable",
           "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/readiness::partial_failure",
+          "id": "get-_v1_readiness-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "route_absent",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1155,6 +1432,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -1167,9 +1448,9 @@
           "id": "get-_v1_snapshot-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "8dc5d61cd29a1df52b0c14598486e086f897bb62f95debbb29f990d82abaa805",
+          "legacy_capture_sha256": "19da18e6d25ad40e89a78465e68077d2ad0112e348e0691eacdcb7f4f07f5a2d",
           "v2": "executed",
-          "v2_capture_sha256": "8dc5d61cd29a1df52b0c14598486e086f897bb62f95debbb29f990d82abaa805"
+          "v2_capture_sha256": "19da18e6d25ad40e89a78465e68077d2ad0112e348e0691eacdcb7f4f07f5a2d"
         },
         {
           "capture_key": "GET /v1/snapshot::empty",
@@ -1185,31 +1466,45 @@
           "id": "get-_v1_snapshot-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "d05fd4e10972cf7ac0abdc7316b5f5f16bcd2b74a3cbc9569c73a5da4c8b9fec",
+          "legacy_capture_sha256": "606782ba4a8da1a741e93a801271922d0854f437fd970596844b7789985914ec",
           "v2": "executed",
-          "v2_capture_sha256": "d05fd4e10972cf7ac0abdc7316b5f5f16bcd2b74a3cbc9569c73a5da4c8b9fec"
+          "v2_capture_sha256": "606782ba4a8da1a741e93a801271922d0854f437fd970596844b7789985914ec"
         },
         {
           "capture_key": "GET /v1/snapshot::backend_failure",
           "id": "get-_v1_snapshot-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "1e069cbfdf9fadd2e38982163ae0761d7d9ef97e02a1a032c88ec0f3c196635e",
-          "v2": "executed",
-          "v2_capture_sha256": "1e069cbfdf9fadd2e38982163ae0761d7d9ef97e02a1a032c88ec0f3c196635e"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/snapshot::partial_failure",
+          "id": "get-_v1_snapshot-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1223,18 +1518,18 @@
           "id": "get-_v1_sources_health-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "38c8ceff84360a0e8b281d2db28ffbe94524490bfa961b3817dc63a9b6c16f3c",
+          "legacy_capture_sha256": "0730f2ca0d74a3caad017688075310f115430bc2efc8e0b720928a68bdefd3ba",
           "v2": "executed",
-          "v2_capture_sha256": "38c8ceff84360a0e8b281d2db28ffbe94524490bfa961b3817dc63a9b6c16f3c"
+          "v2_capture_sha256": "0730f2ca0d74a3caad017688075310f115430bc2efc8e0b720928a68bdefd3ba"
         },
         {
           "capture_key": "GET /v1/sources/health::empty",
           "id": "get-_v1_sources_health-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "b3cbf3fef765724d884e1c0c663e2b53c7abb502c3e7896939953f459f4f1a77",
+          "legacy_capture_sha256": "709be1d79f0b005d7289da848fbb64cb6305fbac722f570904f72001d906f0a7",
           "v2": "executed",
-          "v2_capture_sha256": "b3cbf3fef765724d884e1c0c663e2b53c7abb502c3e7896939953f459f4f1a77"
+          "v2_capture_sha256": "709be1d79f0b005d7289da848fbb64cb6305fbac722f570904f72001d906f0a7"
         },
         {
           "capture_key": "GET /v1/sources/health::validation_error",
@@ -1249,23 +1544,37 @@
           "capture_key": "GET /v1/sources/health::backend_failure",
           "id": "get-_v1_sources_health-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "e2178c81f850833f9be1c73107d3043d23b9c411b3591f3be7686beb66b9295e",
-          "v2": "executed",
-          "v2_capture_sha256": "e2178c81f850833f9be1c73107d3043d23b9c411b3591f3be7686beb66b9295e"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/sources/health::partial_failure",
+          "id": "get-_v1_sources_health-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1279,18 +1588,18 @@
           "id": "get-_v1_sources_tdx_coverage-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "8f0f9b5f7234c4bd2eca2ed5e0ef4ebe43679aea8a95f9fcac6884fa5ba801f8",
+          "legacy_capture_sha256": "78d659f808e41d0dfbd1ceb96ccfe2b60667f8542698d341cac60e2ee375501b",
           "v2": "executed",
-          "v2_capture_sha256": "8f0f9b5f7234c4bd2eca2ed5e0ef4ebe43679aea8a95f9fcac6884fa5ba801f8"
+          "v2_capture_sha256": "78d659f808e41d0dfbd1ceb96ccfe2b60667f8542698d341cac60e2ee375501b"
         },
         {
           "capture_key": "GET /v1/sources/tdx/coverage::empty",
           "id": "get-_v1_sources_tdx_coverage-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "b68534c0bc70ff7fe7dcbb958aa186bd8d22292ccaccbd793d86ecd7fbd35c39",
+          "legacy_capture_sha256": "88fcfc5eec99ae0e612af456539063aacbf554c1a5e9b4edb7490437d2f115a8",
           "v2": "executed",
-          "v2_capture_sha256": "b68534c0bc70ff7fe7dcbb958aa186bd8d22292ccaccbd793d86ecd7fbd35c39"
+          "v2_capture_sha256": "88fcfc5eec99ae0e612af456539063aacbf554c1a5e9b4edb7490437d2f115a8"
         },
         {
           "capture_key": "GET /v1/sources/tdx/coverage::validation_error",
@@ -1305,17 +1614,27 @@
           "capture_key": "GET /v1/sources/tdx/coverage::backend_failure",
           "id": "get-_v1_sources_tdx_coverage-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "b0997d577e54cd5122198da3543ef9f3558ef06ca107eec3a4d51b64ee2be676",
-          "v2": "executed",
-          "v2_capture_sha256": "b0997d577e54cd5122198da3543ef9f3558ef06ca107eec3a4d51b64ee2be676"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/sources/tdx/coverage::partial_failure",
+          "id": "get-_v1_sources_tdx_coverage-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1323,6 +1642,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -1335,9 +1658,9 @@
           "id": "get-_v1_validation_symbol-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "8678c133240ab62f9426b6102b9b1f28f43fb91ecdc08930d8cfe39ad9dcb8b1",
+          "legacy_capture_sha256": "245a2b56b3a31c13a273788eb8b42eb8205848305fa6b24623b280573186ec59",
           "v2": "executed",
-          "v2_capture_sha256": "4514f67bf38668518a4217a5f5ae7526aff3f59fae7089c911e18af7e11ca900"
+          "v2_capture_sha256": "ce78cd2faed7958e3de673fcf7b9df1566791b25fe85c9c3dbbd79db81252869"
         },
         {
           "capture_key": "GET /v1/validation/{symbol}::empty",
@@ -1353,31 +1676,45 @@
           "id": "get-_v1_validation_symbol-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "24086e68b7ecbdbb469ad32f5bb2a5595e134e9a5039cdf12b794bfde1c2f0f2",
+          "legacy_capture_sha256": "af1e846429ac6619789d62bcd0b2b4af6c659619e068785ec8909b41ef8b12da",
           "v2": "executed",
-          "v2_capture_sha256": "24086e68b7ecbdbb469ad32f5bb2a5595e134e9a5039cdf12b794bfde1c2f0f2"
+          "v2_capture_sha256": "af1e846429ac6619789d62bcd0b2b4af6c659619e068785ec8909b41ef8b12da"
         },
         {
           "capture_key": "GET /v1/validation/{symbol}::backend_failure",
           "id": "get-_v1_validation_symbol-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "f535b58254930145600c90c9f7900607beaa39365c5068739496cb195ae9e715",
-          "v2": "executed",
-          "v2_capture_sha256": "f535b58254930145600c90c9f7900607beaa39365c5068739496cb195ae9e715"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/validation/{symbol}::partial_failure",
+          "id": "get-_v1_validation_symbol-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "status": "covered"
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -1390,43 +1727,53 @@
           "id": "get-_v1_validation_symbol_results-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "73fb05b5a100bc8f0e1ce325d0503d0ad5c3fad4f81834bdb90f1757347ca459",
+          "legacy_capture_sha256": "a38abd89a5f78494d01d792c4be4a15f7fa7960eeba498403ef7ce1f56467e93",
           "v2": "executed",
-          "v2_capture_sha256": "73fb05b5a100bc8f0e1ce325d0503d0ad5c3fad4f81834bdb90f1757347ca459"
+          "v2_capture_sha256": "a38abd89a5f78494d01d792c4be4a15f7fa7960eeba498403ef7ce1f56467e93"
         },
         {
           "capture_key": "GET /v1/validation/{symbol}/results::empty",
           "id": "get-_v1_validation_symbol_results-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "23fba28d1659b04c54dce0d37468344d6d721a5cc13adfbf2c2fa54d349814f7",
+          "legacy_capture_sha256": "58b93fdbd474509cd77be439932b1fb29c9f5628a05bf160478b0b6fe23e9ea0",
           "v2": "executed",
-          "v2_capture_sha256": "23fba28d1659b04c54dce0d37468344d6d721a5cc13adfbf2c2fa54d349814f7"
+          "v2_capture_sha256": "58b93fdbd474509cd77be439932b1fb29c9f5628a05bf160478b0b6fe23e9ea0"
         },
         {
           "capture_key": "GET /v1/validation/{symbol}/results::validation_error",
           "id": "get-_v1_validation_symbol_results-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "291b87b632647f73cb5ca8a08398991f6f340f9000bf969b4a24c0b2b63fdc48",
+          "legacy_capture_sha256": "a7555d93384a00f9b3f22507f4020407f3be489ec7a786fddf62a8d890161975",
           "v2": "executed",
-          "v2_capture_sha256": "291b87b632647f73cb5ca8a08398991f6f340f9000bf969b4a24c0b2b63fdc48"
+          "v2_capture_sha256": "a7555d93384a00f9b3f22507f4020407f3be489ec7a786fddf62a8d890161975"
         },
         {
           "capture_key": "GET /v1/validation/{symbol}/results::backend_failure",
           "id": "get-_v1_validation_symbol_results-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "47f9e589830eb7d2f32f7f746ac2611abceeaf2f7f26592e630fee1f6d261e15",
-          "v2": "executed",
-          "v2_capture_sha256": "47f9e589830eb7d2f32f7f746ac2611abceeaf2f7f26592e630fee1f6d261e15"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "GET /v1/validation/{symbol}/results::partial_failure",
+          "id": "get-_v1_validation_symbol_results-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1434,6 +1781,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1447,9 +1798,9 @@
           "id": "post-_v1_admin_artifacts_backfill-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "6d4d330aba4bae4efb6eeb0c7d7a1ddc230a131496fb5e5edf345b1f5161005d",
+          "legacy_capture_sha256": "b3c85fbf26d499b37fe9f404d6de3acfffcda7704e38022d57b782edcca19259",
           "v2": "executed",
-          "v2_capture_sha256": "34591b908b017599be5b9c34c6e2c6e69b7f3ebd66981451988812fb40ae4f47"
+          "v2_capture_sha256": "4a9d13efc7acf06b0ed2516db1b99cb53d66d613a93c2b5ab2e71cccbe1afa0c"
         },
         {
           "capture_key": "POST /v1/admin/artifacts/backfill::empty",
@@ -1473,10 +1824,19 @@
           "capture_key": "POST /v1/admin/artifacts/backfill::backend_failure",
           "id": "post-_v1_admin_artifacts_backfill-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "42c309bd3de6bdf986e4e47253687c7bab6565b97fb04bc60d323a193a65d1b3",
-          "v2": "executed",
-          "v2_capture_sha256": "42c309bd3de6bdf986e4e47253687c7bab6565b97fb04bc60d323a193a65d1b3"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/artifacts/backfill::partial_failure",
+          "id": "post-_v1_admin_artifacts_backfill-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1492,6 +1852,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "status": "covered"
         }
@@ -1503,9 +1867,9 @@
           "id": "post-_v1_admin_baostock_symbol_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "ef56d19b837388316e3c6f8d822c6deb42f236eeb981b91ae76fe38649e2bf69",
+          "legacy_capture_sha256": "6003cafb757316745aa20ee2e27846860e8f433724f95362cb2abee41dcae8f2",
           "v2": "executed",
-          "v2_capture_sha256": "5bf585aad492570043b69c35b3264eefbe362a75f1f2368dae10b75c1612e3ac"
+          "v2_capture_sha256": "eb8f4d0a6d313a11f2d696ebcd0b0b2b071a67179b5aaff578f59e2f2f776d1a"
         },
         {
           "capture_key": "POST /v1/admin/baostock/{symbol}/refresh::empty",
@@ -1521,18 +1885,27 @@
           "id": "post-_v1_admin_baostock_symbol_refresh-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "a2bcb8974d77e16747587c1d4575673a75d7e495af964d4dddee8bec056adb00",
+          "legacy_capture_sha256": "9e72e41f1232e1db37071bb9abdf89b152600710a0d375c2aabd6d3970cd883e",
           "v2": "executed",
-          "v2_capture_sha256": "a2bcb8974d77e16747587c1d4575673a75d7e495af964d4dddee8bec056adb00"
+          "v2_capture_sha256": "9e72e41f1232e1db37071bb9abdf89b152600710a0d375c2aabd6d3970cd883e"
         },
         {
           "capture_key": "POST /v1/admin/baostock/{symbol}/refresh::backend_failure",
           "id": "post-_v1_admin_baostock_symbol_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "f73f565ec22c52a9bef728024baf1733ebce6747ae61cabb2504545190f1de27",
+          "legacy_capture_sha256": "e645ed7b3afb274a5dafc66c56c74f7e8cdeb4da35060c640250d3f40a6c8e3b",
           "v2": "executed",
-          "v2_capture_sha256": "f73f565ec22c52a9bef728024baf1733ebce6747ae61cabb2504545190f1de27"
+          "v2_capture_sha256": "e645ed7b3afb274a5dafc66c56c74f7e8cdeb4da35060c640250d3f40a6c8e3b"
+        },
+        {
+          "capture_key": "POST /v1/admin/baostock/{symbol}/refresh::partial_failure",
+          "id": "post-_v1_admin_baostock_symbol_refresh-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1548,6 +1921,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
@@ -1560,9 +1937,9 @@
           "id": "post-_v1_admin_earnings-calendar_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "d8b01d920544d89332db62c66c2959168df1391c22fcd77ed623adfa577f77ae",
+          "legacy_capture_sha256": "58958498d8ebc65452bc5bbb6688c2f1d1082015f278ad86497ef290c68d6c49",
           "v2": "executed",
-          "v2_capture_sha256": "872bf8722335c0e14ee377cdcc9a47561e68d0d8d639e90870a754bd814e90ed"
+          "v2_capture_sha256": "a18f88d5181cc57365300a2f5cdb780fbf8018e14bb67ce65020055417bae29c"
         },
         {
           "capture_key": "POST /v1/admin/earnings-calendar/refresh::empty",
@@ -1587,9 +1964,18 @@
           "id": "post-_v1_admin_earnings-calendar_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "e4b70414967109c4d5de090f8e2bfddf7a7e107cc8ed68173a1898d430524477",
+          "legacy_capture_sha256": "0d05d9e5f015668745af4f71e9768d008685d53f987445b0770dedfe24efa9d0",
           "v2": "executed",
-          "v2_capture_sha256": "e4b70414967109c4d5de090f8e2bfddf7a7e107cc8ed68173a1898d430524477"
+          "v2_capture_sha256": "0d05d9e5f015668745af4f71e9768d008685d53f987445b0770dedfe24efa9d0"
+        },
+        {
+          "capture_key": "POST /v1/admin/earnings-calendar/refresh::partial_failure",
+          "id": "post-_v1_admin_earnings-calendar_refresh-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1605,6 +1991,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
@@ -1617,9 +2007,9 @@
           "id": "post-_v1_admin_economic-calendar_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "c98acc2ac29cb11fe05f6415d0ba5d578d04817fe7ee3f8bb83a4a0c780def31",
+          "legacy_capture_sha256": "4cd51a19dc96560ce78c8acb52523d4fc65c45423c2aa7eed265fe999436b9e3",
           "v2": "executed",
-          "v2_capture_sha256": "9a808e53a53f6385ca8e4336b5cb6a45293da012821601859fa693c15f5f0e5a"
+          "v2_capture_sha256": "4bef73987df17c0776642dcf66591369734fcb5d59c060e74e3749f3a3d332b9"
         },
         {
           "capture_key": "POST /v1/admin/economic-calendar/refresh::empty",
@@ -1644,9 +2034,18 @@
           "id": "post-_v1_admin_economic-calendar_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "b0e873e51325da13c4225a78a20389cd9e129b4fd9557f96f6ee44016e9ad619",
+          "legacy_capture_sha256": "1f62cff73f25b76177073568b138178a17445fc3636059407d96f604df66c370",
           "v2": "executed",
-          "v2_capture_sha256": "b0e873e51325da13c4225a78a20389cd9e129b4fd9557f96f6ee44016e9ad619"
+          "v2_capture_sha256": "1f62cff73f25b76177073568b138178a17445fc3636059407d96f604df66c370"
+        },
+        {
+          "capture_key": "POST /v1/admin/economic-calendar/refresh::partial_failure",
+          "id": "post-_v1_admin_economic-calendar_refresh-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1662,6 +2061,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
@@ -1674,9 +2077,9 @@
           "id": "post-_v1_admin_economic-indicators_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "ee2c227791f5ec1094366074070e569852ef2437e6a2f9a9727462409e2d0893",
+          "legacy_capture_sha256": "4cac24629e5ad1a679b3b60e0dae940a58aa3c0c07040e930b166accb2bffa9c",
           "v2": "executed",
-          "v2_capture_sha256": "d3d1a98161b0909202321c7bf3564198d8d8507653b8dfcf4a3dd9d3f1f27d89"
+          "v2_capture_sha256": "b8dbe3861e12a04902168e7e6cd550ef8060e5087b15668a5ec64f6e4fe6cbcf"
         },
         {
           "capture_key": "POST /v1/admin/economic-indicators/refresh::empty",
@@ -1701,9 +2104,18 @@
           "id": "post-_v1_admin_economic-indicators_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "1c5e1b594b950dbfd03f128bc055ea542c1dea89f98491cf325808a6765cacd8",
+          "legacy_capture_sha256": "eaa4d21c95bd44eb313643565b235a15d0de52e692372589a6a2fc938cce086d",
           "v2": "executed",
-          "v2_capture_sha256": "1c5e1b594b950dbfd03f128bc055ea542c1dea89f98491cf325808a6765cacd8"
+          "v2_capture_sha256": "eaa4d21c95bd44eb313643565b235a15d0de52e692372589a6a2fc938cce086d"
+        },
+        {
+          "capture_key": "POST /v1/admin/economic-indicators/refresh::partial_failure",
+          "id": "post-_v1_admin_economic-indicators_refresh-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1719,6 +2131,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
@@ -1731,9 +2147,9 @@
           "id": "post-_v1_admin_financials_symbol_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "a2e805cba4a2e6c73e270916812b6f0e314097629821c0de0a7e07f5c8e4ef44",
+          "legacy_capture_sha256": "7858c2fa2e63633f6c3102a952415252a8752674469540becf560fa3c3ef708a",
           "v2": "executed",
-          "v2_capture_sha256": "da3986db935686fff057766c7a067f8281fd30179f5c315e8de5350970231c30"
+          "v2_capture_sha256": "7ed477fd44caaed6e12b7866664df90577151b046f52acd8f970eeac9bdcab40"
         },
         {
           "capture_key": "POST /v1/admin/financials/{symbol}/refresh::empty",
@@ -1758,9 +2174,18 @@
           "id": "post-_v1_admin_financials_symbol_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "0a8c9ef52167adc055fd8b3daf77b19f16ab5f5ecf0a8d719f9efa87d5945972",
+          "legacy_capture_sha256": "562ba817873947f58991936e5b6543792ee545a5ec73ffe590299dc7342ca5c2",
           "v2": "executed",
-          "v2_capture_sha256": "0a8c9ef52167adc055fd8b3daf77b19f16ab5f5ecf0a8d719f9efa87d5945972"
+          "v2_capture_sha256": "562ba817873947f58991936e5b6543792ee545a5ec73ffe590299dc7342ca5c2"
+        },
+        {
+          "capture_key": "POST /v1/admin/financials/{symbol}/refresh::partial_failure",
+          "id": "post-_v1_admin_financials_symbol_refresh-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1776,6 +2201,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
@@ -1788,9 +2217,9 @@
           "id": "post-_v1_admin_fundamentals_refresh-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "5ceafb8474de84a315a033761bc91916152ebc907dfce5ef225880347ceb858a",
+          "legacy_capture_sha256": "bd2be127d1c87e4cb59c02ec85ce1b7417b4dc16e6c3be9f8fe1c806adced122",
           "v2": "executed",
-          "v2_capture_sha256": "f0904e7ae210e2f1d487d00f997d170cfc4b1f2855942131d5ab913a45508698"
+          "v2_capture_sha256": "9b32fcad6b093a390821812c2546790904e613c3772670bd97c42274c01263c1"
         },
         {
           "capture_key": "POST /v1/admin/fundamentals/refresh::empty",
@@ -1815,16 +2244,26 @@
           "id": "post-_v1_admin_fundamentals_refresh-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "ef983a038dd27140501fc6db6435c5ac6ace13396baeb398049eb714120d51f5",
+          "legacy_capture_sha256": "309deb74ad402910372c8f088107b8c9760a6ecec047a279e8df5b8dc74fbe1a",
           "v2": "executed",
-          "v2_capture_sha256": "ef983a038dd27140501fc6db6435c5ac6ace13396baeb398049eb714120d51f5"
+          "v2_capture_sha256": "309deb74ad402910372c8f088107b8c9760a6ecec047a279e8df5b8dc74fbe1a"
+        },
+        {
+          "capture_key": "POST /v1/admin/fundamentals/refresh::partial_failure",
+          "id": "post-_v1_admin_fundamentals_refresh-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1832,6 +2271,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1845,9 +2288,9 @@
           "id": "post-_v1_admin_funnel_metrics_rebuild-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "73a225d2288d8b964cb3488a5982f4d2a9aa11026fe3a7eae65ea37f83a5e93e",
+          "legacy_capture_sha256": "a0d74e8ca25e4784af01c2c952526865750ef524f5c30d2daf27b262c038cbbd",
           "v2": "executed",
-          "v2_capture_sha256": "74da4a6f7ec9ea0fb2f5b8e091dc6938422120363d1901ba5dc711264eca1b7d"
+          "v2_capture_sha256": "39b292eb86446b69216c48cef14c7c9693c03a93c5ca98012854a6ab4b8f8aba"
         },
         {
           "capture_key": "POST /v1/admin/funnel/metrics/rebuild::empty",
@@ -1871,10 +2314,19 @@
           "capture_key": "POST /v1/admin/funnel/metrics/rebuild::backend_failure",
           "id": "post-_v1_admin_funnel_metrics_rebuild-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "d453837c02941af159cf6c7741ecb586cbe88fdae57cfa6c7247fd743185d77b",
-          "v2": "executed",
-          "v2_capture_sha256": "d453837c02941af159cf6c7741ecb586cbe88fdae57cfa6c7247fd743185d77b"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/funnel/metrics/rebuild::partial_failure",
+          "id": "post-_v1_admin_funnel_metrics_rebuild-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -1890,6 +2342,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
@@ -1902,9 +2358,9 @@
           "id": "post-_v1_admin_tdx_financials_sync-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "eeb5039ec54bb92be40de407bd7361063ad5bcdc300361f8a8ad0677448fbdf4",
+          "legacy_capture_sha256": "c84c660ace2b589076f5b0024fa093ca7025b792cf493602ce7b74caab9d6265",
           "v2": "executed",
-          "v2_capture_sha256": "80e0376e1696009b4bda821f895862cfaaa30bca4372dc66c6ddfd771b4f7565"
+          "v2_capture_sha256": "8f52baf5aa389813f361cee902f951d7f6231ead19213a54827ae8dd16fa96e5"
         },
         {
           "capture_key": "POST /v1/admin/tdx/financials/sync::empty",
@@ -1929,16 +2385,26 @@
           "id": "post-_v1_admin_tdx_financials_sync-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "80ab97d272875ccdc77d5c167af0dce96bfe982461d6039adaa639a2c831f280",
+          "legacy_capture_sha256": "91c4ee4efde8b88c973e80007aaa13080e62f4e88ab97b32aa114463cef89dd8",
           "v2": "executed",
-          "v2_capture_sha256": "80ab97d272875ccdc77d5c167af0dce96bfe982461d6039adaa639a2c831f280"
+          "v2_capture_sha256": "91c4ee4efde8b88c973e80007aaa13080e62f4e88ab97b32aa114463cef89dd8"
+        },
+        {
+          "capture_key": "POST /v1/admin/tdx/financials/sync::partial_failure",
+          "id": "post-_v1_admin_tdx_financials_sync-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
     {
       "applicability": {
         "backend_failure": {
-          "status": "covered"
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "empty": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
@@ -1946,6 +2412,10 @@
         },
         "normal": {
           "status": "covered"
+        },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
         },
         "validation_error": {
           "status": "covered"
@@ -1958,9 +2428,9 @@
           "id": "post-_v1_admin_validation_rebuild-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "7e4228f7534c81bef80ed6ee971220de5977f386e15e55c1dfe640fe7c9a8cfd",
+          "legacy_capture_sha256": "118dc2d486a0db03933652a7fd48961d6ba698a9a94da0b9ba2d7e667ce2a3f5",
           "v2": "executed",
-          "v2_capture_sha256": "7747e95e7dc619ece237868e901c63d459c8774dbe967077b75c1e2e49c817a7"
+          "v2_capture_sha256": "86a866ef84bab0fd700cc6a1bef817baa625d23f11b0374d5dbcbafb72b58545"
         },
         {
           "capture_key": "POST /v1/admin/validation/rebuild::empty",
@@ -1976,18 +2446,27 @@
           "id": "post-_v1_admin_validation_rebuild-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "ded6af6d860fb303751e88d7759addd6d4fd5c39aaed306e7ef60288f70e6795",
+          "legacy_capture_sha256": "dd7b8e7648c92d8e2270bf7b32226f41cd698fee48b267089667b72e8572df76",
           "v2": "executed",
-          "v2_capture_sha256": "ded6af6d860fb303751e88d7759addd6d4fd5c39aaed306e7ef60288f70e6795"
+          "v2_capture_sha256": "dd7b8e7648c92d8e2270bf7b32226f41cd698fee48b267089667b72e8572df76"
         },
         {
           "capture_key": "POST /v1/admin/validation/rebuild::backend_failure",
           "id": "post-_v1_admin_validation_rebuild-backend-failure",
           "kind": "backend_failure",
-          "legacy": "executed",
-          "legacy_capture_sha256": "06934c239830c5550fe647f3c2b9c29045994602bc1a2318c36bd6d6b31c341b",
-          "v2": "executed",
-          "v2_capture_sha256": "06934c239830c5550fe647f3c2b9c29045994602bc1a2318c36bd6d6b31c341b"
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid backend_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid backend_failure condition for this route"
+        },
+        {
+          "capture_key": "POST /v1/admin/validation/rebuild::partial_failure",
+          "id": "post-_v1_admin_validation_rebuild-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -2003,6 +2482,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "status": "covered"
         }
@@ -2014,9 +2497,9 @@
           "id": "post-_v1_tushare_realtime-quote-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "34208108ee857230ad6eb4be0c183974f7ac0fc7328b72685ebd40af764fc517",
+          "legacy_capture_sha256": "041fa44283f25c7264007aed4643d766fa92f43e54edda887bf608ce709a2004",
           "v2": "executed",
-          "v2_capture_sha256": "34208108ee857230ad6eb4be0c183974f7ac0fc7328b72685ebd40af764fc517"
+          "v2_capture_sha256": "041fa44283f25c7264007aed4643d766fa92f43e54edda887bf608ce709a2004"
         },
         {
           "capture_key": "POST /v1/tushare/realtime-quote::empty",
@@ -2032,18 +2515,27 @@
           "id": "post-_v1_tushare_realtime-quote-validation-error",
           "kind": "validation_error",
           "legacy": "executed",
-          "legacy_capture_sha256": "180a8d333406719e39375f85c1d12034fdf9f8b7b7e6e99f1e6e3df152ba06b4",
+          "legacy_capture_sha256": "168db5b5eca6a28cbc56bddc90784820d4f31045aa4435ec10ba518548fbd096",
           "v2": "executed",
-          "v2_capture_sha256": "180a8d333406719e39375f85c1d12034fdf9f8b7b7e6e99f1e6e3df152ba06b4"
+          "v2_capture_sha256": "168db5b5eca6a28cbc56bddc90784820d4f31045aa4435ec10ba518548fbd096"
         },
         {
           "capture_key": "POST /v1/tushare/realtime-quote::backend_failure",
           "id": "post-_v1_tushare_realtime-quote-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "a0664c7f070a305d50dc232f99356954a3e8d074e4542cab3779fa31bdbc273e",
+          "legacy_capture_sha256": "25a889aff4e3c7fd9d7741f5b56705f92d92f65d8cd8ef8538e431c1d905a947",
           "v2": "executed",
-          "v2_capture_sha256": "a0664c7f070a305d50dc232f99356954a3e8d074e4542cab3779fa31bdbc273e"
+          "v2_capture_sha256": "25a889aff4e3c7fd9d7741f5b56705f92d92f65d8cd8ef8538e431c1d905a947"
+        },
+        {
+          "capture_key": "POST /v1/tushare/realtime-quote::partial_failure",
+          "id": "post-_v1_tushare_realtime-quote-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     },
@@ -2059,6 +2551,10 @@
         "normal": {
           "status": "covered"
         },
+        "partial_failure": {
+          "reason": "neither isolated side exposes a semantically valid condition for this route",
+          "status": "not_applicable"
+        },
         "validation_error": {
           "reason": "neither isolated side exposes a semantically valid condition for this route",
           "status": "not_applicable"
@@ -2071,9 +2567,9 @@
           "id": "post-_v1_tushare_api_name-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "160f9b893b9a23f8cf6ecdc83822dfa57d71e04714fba946d4bf6cce3fbfafc1",
+          "legacy_capture_sha256": "03bada53555b92f1066bde96c1ae100c8e9dbef269f68f341408fb7693912f66",
           "v2": "executed",
-          "v2_capture_sha256": "e80313a78e8f454fc266111ca792b19313d52041abef976083fa3358454e9dd0"
+          "v2_capture_sha256": "5cb96afaf14e2a50a13929d8e05cca9cfe65963f9261f78173892023c618d8c2"
         },
         {
           "capture_key": "POST /v1/tushare/{api_name}::empty",
@@ -2098,14 +2594,23 @@
           "id": "post-_v1_tushare_api_name-backend-failure",
           "kind": "backend_failure",
           "legacy": "executed",
-          "legacy_capture_sha256": "3afd4a13452943b34985ede3e608cc14f6c987c7a2a52dbd176918a5e1b588cb",
+          "legacy_capture_sha256": "8acd4e294ba6a8bdecd8f58dc72981807539f818e0b6b4335a910fada287ee22",
           "v2": "executed",
-          "v2_capture_sha256": "3afd4a13452943b34985ede3e608cc14f6c987c7a2a52dbd176918a5e1b588cb"
+          "v2_capture_sha256": "8acd4e294ba6a8bdecd8f58dc72981807539f818e0b6b4335a910fada287ee22"
+        },
+        {
+          "capture_key": "POST /v1/tushare/{api_name}::partial_failure",
+          "id": "post-_v1_tushare_api_name-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "not_applicable",
+          "legacy_reason": "isolated legacy fixture has no semantically valid partial_failure condition for this route",
+          "v2": "not_applicable",
+          "v2_reason": "isolated v2 fixture has no semantically valid partial_failure condition for this route"
         }
       ]
     }
   ],
   "schema": "marketcow.old-main-v2-api-coverage.v1",
-  "sha256": "a83f875f51b1081d18c126c778ccc52e6464ecd49c7fc119ac0fe2e621105631",
-  "v2_matrix_sha256": "d4cf3ff551b2403c041e09599cfd72cc3fcbcc8b210de4701606a3eb9cefe069"
+  "sha256": "6cd880f1f65b16bd662ab0db111bda4b56441d1c055040f72b506d0d3ecb80f4",
+  "v2_matrix_sha256": "dde3b61ac882bf2e5f83132d68fb56eecf78ca859307ae816e20113f6293a2ed"
 }

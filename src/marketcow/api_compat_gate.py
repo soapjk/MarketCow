@@ -12,6 +12,7 @@ DIFF_VERSION = "marketcow.old-main-v2-api-differences.v1"
 CAPTURE_TOOL_VERSION = "marketcow.api-compat-capture.v2"
 LEGACY_SOURCE_COMMIT = "701ffbde1b25ae587845ea2bd021ca8fa12b93b4"
 MAX_DIFFERENCES = 1000
+STRUCTURED_ERROR_FIELDS = frozenset({"detail", "error", "code", "message"})
 PARAMETER_FIXTURES = {
     "symbols": "AAPL", "symbol": "AAPL", "q": "AAPL",
     "bar_at": "2026-01-02T00:00:00Z",
@@ -99,15 +100,20 @@ def response_shape(value: Any) -> Any:
 
 def response_semantics(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        return {"count": None, "empty_collections": []}
+        return {"count": None, "empty_collections": [],
+                "structured_error_fields": [], "has_partial_errors": False}
     empty = [str(key) for key, item in sorted(value.items())
              if isinstance(item, list) and not item]
     count = value.get("count")
+    error_fields = sorted(STRUCTURED_ERROR_FIELDS.intersection(value))
+    errors = value.get("errors")
     return {
         "count": count if isinstance(count, int) and not isinstance(count, bool) else None,
         "empty_collections": empty,
         "has_detail": "detail" in value,
-        "has_error_shape": "detail" in value or value.get("non_json") is True,
+        "structured_error_fields": error_fields,
+        "has_structured_error": bool(error_fields),
+        "has_partial_errors": isinstance(errors, (list, dict)) and bool(errors),
     }
 
 
@@ -189,7 +195,9 @@ def capture_route_matrix(
             else:
                 invalid["query"]["__invalid"] = "true"
             variants.append(("validation_error", normal_client, invalid))
-        if route not in {"GET /v1/health", "GET /v1/readiness"}:
+        if route == "GET /v1/quotes":
+            variants.append(("partial_failure", fault_client, base))
+        elif route not in {"GET /v1/health", "GET /v1/readiness"}:
             variants.append(("backend_failure", fault_client, base))
         for kind, client, request in variants:
             url = request["path"]
@@ -303,7 +311,10 @@ def validate_coverage_inventory(
             else:
                 scenario_ids.add(scenario_id)
             kind = scenario.get("kind")
-            if kind not in {"normal", "empty", "validation_error", "backend_failure"}:
+            if kind not in {
+                "normal", "empty", "validation_error", "backend_failure",
+                "partial_failure",
+            }:
                 errors.append(f"invalid-scenario-kind:{route}:{scenario_id}")
             if scenario.get("capture_key") != f"{route}::{kind}":
                 errors.append(f"invalid-capture-key:{route}:{scenario_id}")
@@ -339,7 +350,10 @@ def validate_coverage_inventory(
                                  and semantics.get("has_detail") is True)
                     elif kind == "backend_failure":
                         valid = (isinstance(status, int) and 500 <= status < 600
-                                 and semantics.get("has_error_shape") is True)
+                                 and semantics.get("has_structured_error") is True)
+                    elif kind == "partial_failure":
+                        valid = (isinstance(status, int) and 200 <= status < 300
+                                 and semantics.get("has_partial_errors") is True)
                     elif kind == "empty":
                         valid = (isinstance(status, int) and 200 <= status < 300
                                  and (semantics.get("count") == 0 or bool(
@@ -351,7 +365,10 @@ def validate_coverage_inventory(
         if not isinstance(applicability, Mapping):
             errors.append(f"missing-applicability:{route}")
             continue
-        for kind in ("normal", "empty", "validation_error", "backend_failure"):
+        for kind in (
+            "normal", "empty", "validation_error", "backend_failure",
+            "partial_failure",
+        ):
             value = applicability.get(kind)
             if not isinstance(value, Mapping) or value.get("status") not in {
                 "covered", "not_applicable",

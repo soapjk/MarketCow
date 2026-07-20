@@ -19,6 +19,7 @@ from marketcow.api_compat_gate import (
     capture_scenarios,
     load_document,
     run_gate,
+    sha256_json,
     validate_coverage_inventory,
 )
 from marketcow.config import Settings
@@ -349,6 +350,50 @@ class OldMainApiContractTest(unittest.TestCase):
                 expected_legacy_matrix, expected_v2_matrix,
             )["status"],
             "mismatch",
+        )
+
+        backend_scenario = next(
+            scenario
+            for route_entry in coverage["routes"]
+            for scenario in route_entry["scenarios"]
+            if scenario["kind"] == "backend_failure"
+            and scenario.get("v2") == "executed"
+        )
+
+        def assert_forged_backend_rejected(status, shape, semantics):
+            forged_matrix = json.loads(json.dumps(expected_v2_matrix))
+            capture = forged_matrix["captures"][backend_scenario["capture_key"]]
+            capture.update(status=status, shape=shape, semantics=semantics)
+            unsigned_matrix = {
+                key: value for key, value in forged_matrix.items()
+                if key != "sha256"
+            }
+            forged_matrix["sha256"] = sha256_json(unsigned_matrix)
+            forged_coverage = json.loads(json.dumps(coverage))
+            forged_coverage["v2_matrix_sha256"] = forged_matrix["sha256"]
+            for route_entry in forged_coverage["routes"]:
+                for scenario in route_entry["scenarios"]:
+                    if scenario["id"] == backend_scenario["id"]:
+                        scenario["v2_capture_sha256"] = sha256_json(capture)
+            self.assertEqual(
+                validate_coverage_inventory(
+                    forged_coverage, legacy, current,
+                    expected_legacy_matrix, forged_matrix,
+                )["status"],
+                "mismatch",
+            )
+
+        assert_forged_backend_rejected(
+            500, {"non_json": "boolean"},
+            {"has_structured_error": False, "non_json": True},
+        )
+        assert_forged_backend_rejected(
+            200, {"errors": {"type": "array", "items": None}},
+            {"has_structured_error": False, "has_partial_errors": True},
+        )
+        assert_forged_backend_rejected(
+            500, {"status": "string"},
+            {"has_structured_error": False},
         )
 
     def test_success_empty_validation_and_backend_failure_scenarios_are_exact(self):

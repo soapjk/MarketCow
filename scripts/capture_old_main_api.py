@@ -58,14 +58,19 @@ def shape(value):
 
 def semantics(value):
     if not isinstance(value, dict):
-        return {"count": None, "empty_collections": [], "has_detail": False}
+        return {"count": None, "empty_collections": [], "has_detail": False,
+                "structured_error_fields": [], "has_partial_errors": False}
     count = value.get("count")
+    error_fields = sorted({"detail", "error", "code", "message"}.intersection(value))
+    errors = value.get("errors")
     return {
         "count": count if isinstance(count, int) and not isinstance(count, bool) else None,
         "empty_collections": [str(key) for key, item in sorted(value.items())
                               if isinstance(item, list) and not item],
         "has_detail": "detail" in value,
-        "has_error_shape": "detail" in value or value.get("non_json") is True,
+        "structured_error_fields": error_fields,
+        "has_structured_error": bool(error_fields),
+        "has_partial_errors": isinstance(errors, (list, dict)) and bool(errors),
     }
 
 
@@ -297,7 +302,9 @@ def main() -> int:
                     else:
                         invalid["query"]["__invalid"] = "true"
                     variants.append(("validation_error", normal_client, invalid))
-                if route != "GET /v1/health":
+                if route == "GET /v1/quotes":
+                    variants.append(("partial_failure", fault_client, base))
+                elif route != "GET /v1/health":
                     variants.append(("backend_failure", fault_client, base))
                 for kind, client, request in variants:
                     url = request["path"]

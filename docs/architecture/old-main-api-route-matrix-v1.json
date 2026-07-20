@@ -14,7 +14,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -36,7 +38,9 @@
         "count": 0,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -57,7 +61,9 @@
         "count": 0,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -80,7 +86,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -114,7 +124,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -138,7 +150,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "items": {
@@ -163,7 +177,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "items": {
@@ -188,7 +204,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -222,7 +242,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -247,7 +269,9 @@
           "events"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -277,7 +301,9 @@
           "events"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -307,7 +333,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -341,7 +371,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -365,7 +397,9 @@
           "events"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -395,7 +429,9 @@
           "events"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -425,7 +461,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -459,7 +499,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -483,7 +525,9 @@
           "indicators"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -509,7 +553,9 @@
           "indicators"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -535,7 +581,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -569,7 +619,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -593,7 +645,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -622,7 +676,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -653,7 +709,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -680,7 +738,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -704,7 +764,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -733,7 +795,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -762,7 +826,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -796,7 +864,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -818,7 +888,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "symbol": "string"
@@ -838,7 +910,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "symbol": "string"
@@ -860,7 +934,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "symbol": "string"
@@ -880,7 +956,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -904,7 +982,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -934,7 +1014,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -964,7 +1046,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -998,7 +1084,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -1022,7 +1110,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -1052,7 +1142,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "as_of": "null",
@@ -1082,7 +1174,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -1118,7 +1214,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "database": "string",
@@ -1141,7 +1239,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "database": "string",
@@ -1166,7 +1266,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -1191,7 +1295,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -1219,7 +1325,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -1243,7 +1351,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -1274,7 +1386,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -1298,7 +1414,9 @@
           "bars"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "adjustment": "string",
@@ -1328,7 +1446,9 @@
           "bars"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "adjustment": "string",
@@ -1357,7 +1477,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -1391,7 +1515,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -1417,7 +1545,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "close": "number",
@@ -1439,7 +1569,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "close": "number",
@@ -1463,48 +1595,14 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "close": "number",
         "refresh_seen": "boolean",
         "symbol": "string"
-      },
-      "status": 200
-    },
-    "GET /v1/quotes::backend_failure": {
-      "kind": "backend_failure",
-      "request": {
-        "json": null,
-        "method": "GET",
-        "path": "/v1/quotes",
-        "query": {
-          "symbols": "AAPL"
-        }
-      },
-      "route": "GET /v1/quotes",
-      "semantics": {
-        "count": 0,
-        "empty_collections": [
-          "items"
-        ],
-        "has_detail": false,
-        "has_error_shape": false
-      },
-      "shape": {
-        "count": "integer",
-        "errors": {
-          "items": {
-            "error": "string",
-            "status": "string",
-            "symbol": "string"
-          },
-          "type": "array"
-        },
-        "items": {
-          "items": null,
-          "type": "array"
-        }
       },
       "status": 200
     },
@@ -1526,7 +1624,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": true,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -1562,7 +1662,9 @@
           "errors"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -1581,6 +1683,44 @@
       },
       "status": 200
     },
+    "GET /v1/quotes::partial_failure": {
+      "kind": "partial_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes",
+        "query": {
+          "symbols": "AAPL"
+        }
+      },
+      "route": "GET /v1/quotes",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_partial_errors": true,
+        "has_structured_error": false,
+        "structured_error_fields": []
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": {
+            "error": "string",
+            "status": "string",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
     "GET /v1/quotes::validation_error": {
       "kind": "validation_error",
       "request": {
@@ -1594,7 +1734,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -1625,7 +1769,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -1647,7 +1793,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "from": "string",
@@ -1669,7 +1817,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "from": "string",
@@ -1693,7 +1843,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -1727,7 +1881,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -1751,7 +1907,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "items": {
@@ -1776,7 +1934,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "items": {
@@ -1799,7 +1959,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -1823,7 +1985,9 @@
           "periods"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "periods": {
@@ -1848,7 +2012,9 @@
           "periods"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "periods": {
@@ -1873,7 +2039,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -1898,7 +2066,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -1928,7 +2098,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -1954,7 +2126,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -1987,7 +2163,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -2010,7 +2188,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2030,7 +2210,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2048,7 +2230,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -2079,7 +2265,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -2099,7 +2287,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2119,7 +2309,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2141,7 +2335,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2159,7 +2355,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -2190,7 +2390,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2210,7 +2414,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2230,7 +2436,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2248,7 +2456,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2268,7 +2480,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2288,7 +2502,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2306,7 +2522,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2326,7 +2546,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2344,7 +2566,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2364,7 +2590,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2384,7 +2612,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2402,7 +2632,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2422,7 +2656,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2442,7 +2678,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2460,7 +2698,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -2480,7 +2720,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2498,7 +2740,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2518,7 +2764,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2538,7 +2786,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2558,7 +2808,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "non_json": "boolean"
@@ -2580,7 +2832,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2598,7 +2852,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -2631,7 +2889,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2655,7 +2917,9 @@
           "items"
         ],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {
         "count": "integer",
@@ -2680,7 +2944,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": {
@@ -2714,7 +2982,11 @@
         "count": null,
         "empty_collections": [],
         "has_detail": true,
-        "has_error_shape": true
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
       },
       "shape": {
         "detail": "string"
@@ -2737,7 +3009,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2755,7 +3029,9 @@
         "count": null,
         "empty_collections": [],
         "has_detail": false,
-        "has_error_shape": false
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
       },
       "shape": {},
       "status": 200
@@ -2763,6 +3039,6 @@
   },
   "generation_input": "isolated-deterministic-fixture:route-matrix-v1",
   "schema": "marketcow.old-main-api-contract.v1.route-matrix",
-  "sha256": "d1a02f809d9ad0183cb112aff8167112c1a36af829175a3d1c11ba76de3e8fe7",
+  "sha256": "96c0e85f868d01c6d6f06817afb4c4f4b40b1ed8350be9aeb3a10c1c53e96cef",
   "source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4"
 }
