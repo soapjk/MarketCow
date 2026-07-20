@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping
 
@@ -142,6 +142,25 @@ class LocalStorageRestore:
                 return report
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def record_verification(self, results: Mapping[str, Any]) -> Dict[str, Any]:
+        """Durably attach bounded, sanitized post-restore gate results to the drill report."""
+        if not self.checkpoint_path.is_file() or not (self.state_root / "report.json").is_file():
+            raise ValueError("restore must complete before verification is recorded")
+        checkpoint = json.loads(self.checkpoint_path.read_text())
+        self._validate_checkpoint(checkpoint)
+        if checkpoint["completed"] != list(COMPONENT_ORDER):
+            raise ValueError("restore is incomplete")
+        if not isinstance(results, Mapping) or not 1 <= len(results) <= 50:
+            raise ValueError("restore verification results must contain 1..50 checks")
+        normalized = {str(key): value for key, value in sorted(results.items())}
+        _assert_no_sensitive(normalized, "restore verification")
+        report_path = self.state_root / "report.json"
+        report = json.loads(report_path.read_text())
+        report["verification"] = normalized
+        _assert_no_sensitive(report, "restore report")
+        _atomic_json(report_path, report)
+        return report
 
     def _preflight(self, artifacts: tuple[Path, ...]):
         if not artifacts:
@@ -351,7 +370,7 @@ class LocalStorageRestore:
             return None
         if kind.startswith("DateTime") and isinstance(value, str):
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
         if kind.startswith("UInt") and isinstance(value, str) and value.isdigit():
             return int(value)
         return value
@@ -375,5 +394,10 @@ class LocalStorageRestore:
             "manual_steps": ["run local contract gate against disposable targets"],
             "rollback": "discard disposable restore root and database instances",
         }
+        previous_path = self.state_root / "report.json"
+        if previous_path.is_file() and not previous_path.is_symlink():
+            previous = json.loads(previous_path.read_text())
+            if isinstance(previous.get("verification"), Mapping):
+                report["verification"] = previous["verification"]
         _assert_no_sensitive(report, "restore report")
         return report

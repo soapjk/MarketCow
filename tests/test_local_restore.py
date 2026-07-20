@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from marketcow.local_backup import BackupComponent, LocalStorageBackup
@@ -128,7 +129,13 @@ class LocalStorageRestoreTest(unittest.TestCase):
         )
         rendered = (self.target / ".storage-v2-restore/report.json").read_text()
         self.assertNotIn(str(self.target), rendered)
-        self.assertEqual(restore.restore([self.artifact])["steps"], report["steps"])
+        verified = restore.record_verification({"contract_gate": "ok"})
+        self.assertEqual(verified["verification"], {"contract_gate": "ok"})
+        with self.assertRaisesRegex(ValueError, "sensitive"):
+            restore.record_verification({"authorization": "Bearer leaked"})
+        repeated = restore.restore([self.artifact])
+        self.assertEqual(repeated["steps"], report["steps"])
+        self.assertEqual(repeated["verification"], {"contract_gate": "ok"})
 
     def test_every_component_boundary_recovers_from_durable_checkpoint(self):
         for fail_name in ("postgresql", "clickhouse", "duckdb", "cold_archive", "spool",
@@ -227,11 +234,37 @@ class LocalStorageRestoreIntegrationTest(unittest.TestCase):
     def test_real_postgres_clickhouse_empty_environment_restore(self):
         import clickhouse_connect
         import psycopg
+        from fastapi.testclient import TestClient
 
+        from marketcow.api import create_app
+        from marketcow.clickhouse_canonical import CanonicalMarketBarBuilder
         from marketcow.clickhouse_repositories import (
             ClickHouseDatabase, ClickHouseMarketBarRepository,
         )
-        from marketcow.postgres_repositories import PostgresDatabase
+        from marketcow.clickhouse_writer import (
+            LocalClickHouseSpool, ReliableClickHouseWriter, normalize_bar,
+        )
+        from marketcow.cold_archive import ParquetColdArchive
+        from marketcow.config import Settings
+        from marketcow.contract_gate import LEGACY_PAYLOAD_PATHS, assert_contract_equal
+        from marketcow.postgres_repositories import (
+            PostgresDatabase, PostgresFundamentalRepository,
+        )
+        from marketcow.storage import Warehouse
+
+        class FailingRepository:
+            def insert_raw_bars(self, _rows, batch_id=""):
+                raise ConnectionError("synthetic ClickHouse outage")
+
+        class RestoredService:
+            def __init__(self, repository):
+                self.market_bar_repository = repository
+
+            def close(self):
+                return None
+
+            def refresh_quote_history(self, *_args):
+                raise AssertionError("restored cached query must not refresh upstream")
 
         dsn = os.environ["MARKETCOW_TEST_POSTGRES_DSN"]
         host = os.environ["MARKETCOW_TEST_CLICKHOUSE_HOST"]
@@ -257,40 +290,124 @@ class LocalStorageRestoreIntegrationTest(unittest.TestCase):
                     "VALUES (%s,%s,%s,%s)",
                     ("restore-fixture", "healthy", "2026-07-20T00:00:00Z", 0),
                 )
+                connection.execute(
+                    "INSERT INTO raw_artifact_manifest "
+                    "(artifact_id,dataset,source,observed_at,ingested_at,storage_path,"
+                    "sha256,byte_size,metadata_json) VALUES "
+                    "(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                    ("restore-artifact", "market_price_bar_raw", "fixture",
+                     "2026-07-01T00:00:01Z", "2026-07-01T00:00:02Z",
+                     "cold://restore-artifact", "fixture-sha256", 1, '{}'),
+                )
+            source_fundamentals = PostgresFundamentalRepository(source_pg)
+            fundamental = {
+                "symbol": "RESTORE", "is_active": True,
+                "report_period": "20260331", "published_at": "2026-04-30",
+                "price": 10.0, "source": "fixture",
+                "observed_at": "2026-05-01", "ingested_at": "2026-05-01",
+                "fetched_at": "2026-05-01",
+            }
+            source_fundamentals.replace_fundamentals("20260331", [fundamental])
+            source_fundamentals.replace_fundamentals("20260331", [{
+                **fundamental, "price": 20.0, "observed_at": "2026-07-01",
+                "ingested_at": "2026-07-01", "fetched_at": "2026-07-01",
+            }])
             source_ch.open()
-            ClickHouseMarketBarRepository(source_ch).insert_raw_bars([{
+            source_ch_repository = ClickHouseMarketBarRepository(source_ch)
+            source_ch_repository.insert_raw_bars([{
                 "symbol": "RESTORE", "market": "US", "interval": "1m",
-                "adjustment": "raw", "bar_time": "2026-07-20T00:00:00Z",
+                "adjustment": "raw", "bar_time": "2026-07-01T00:00:00Z",
                 "open": 1, "high": 2, "low": 0.5, "close": 1.5,
                 "raw_close": 1.5, "adjustment_factor": 1, "volume": 10,
                 "amount": 15, "source": "fixture", "source_sequence": "1",
-                "observed_at": "2026-07-20T00:00:01Z",
-                "ingested_at": "2026-07-20T00:00:02Z",
+                "observed_at": "2026-07-01T00:00:01Z",
+                "ingested_at": "2026-07-01T00:00:02Z",
                 "raw_artifact_id": "restore-artifact",
             }])
-            captured = "2026-07-20T00:00:03Z"
-            watermark = {"captured_at": captured}
-            components = [
-                BackupComponent.postgresql(source_pg, captured),
-                BackupComponent.clickhouse(source_ch, captured),
-                BackupComponent("duckdb", "duckdb-file", "1",
-                                {"market_data.duckdb": b"synthetic-duckdb"}, watermark),
-                BackupComponent("cold_archive", "parquet-tree", "manifest-v1",
-                                {"fixture/data.parquet": b"PAR1fixture"}, watermark),
-                BackupComponent("spool", "wal-tree", "spool-v1",
-                                {"pending/raw.json": b'{"batch":"fixture"}'},
-                                watermark, True),
-                BackupComponent("cursor_key", "sealed-secret", "cursor-v1",
-                                {"cursor.key": b"c" * 48}, watermark),
-            ]
             with tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 source_root = root / "backup-development"
                 source_root.mkdir()
+                source_warehouse = Warehouse(
+                    source_root / "warehouse/market_data.duckdb"
+                )
+                bar_at = "2026-07-01T00:00:00Z"
+                bar_epoch = int(datetime.fromisoformat(
+                    bar_at.replace("Z", "+00:00")
+                ).timestamp())
+                source_warehouse.upsert_price_bars(
+                    "RESTORE", "1m", "raw", "fixture",
+                    "2026-07-01T00:00:02Z", [
+                        {
+                            "timestamp": bar_epoch, "bar_at": bar_at,
+                            "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5,
+                            "raw_close": 1.5, "adjustment_factor": 1.0,
+                            "volume": 10.0, "amount": 15.0,
+                            "source_payload": {"fixture": True},
+                        },
+                        {
+                            "timestamp": bar_epoch + 30,
+                            "bar_at": "2026-07-01T00:00:30Z",
+                            "open": 2.0, "high": 3.0, "low": 1.5, "close": 2.5,
+                            "raw_close": 2.5, "adjustment_factor": 1.0,
+                            "volume": 20.0, "amount": 50.0,
+                            "source_payload": {"fixture": True},
+                        },
+                    ], {"observed_at": "2026-07-01T00:00:01Z",
+                         "raw_artifact_id": "restore-artifact"},
+                )
+                source_archive = ParquetColdArchive(
+                    source_warehouse.path, source_root / "archive", source_root
+                )
+                cold_result = source_archive.export_partition(
+                    "US", "1m", "fixture", 2026, 7
+                )
+                cold_relative = Path(cold_result["artifact_path"]).relative_to(
+                    source_archive.archive_root
+                )
+
+                source_spool = LocalClickHouseSpool(
+                    source_root / "spool/clickhouse", source_root
+                )
+                pending_bar = normalize_bar("raw", {
+                    "symbol": "SPOOL", "market": "US", "interval": "1m",
+                    "adjustment": "raw", "bar_time": "2026-07-01T00:00:30Z",
+                    "open": 3, "high": 4, "low": 2, "close": 3.5,
+                    "raw_close": 3.5, "adjustment_factor": 1, "volume": 20,
+                    "amount": 70, "source": "fixture", "source_sequence": "1",
+                    "observed_at": "2026-07-01T00:00:31Z",
+                    "ingested_at": "2026-07-01T00:00:32Z",
+                    "raw_artifact_id": "spool-artifact",
+                })
+                failed = ReliableClickHouseWriter(
+                    FailingRepository(), source_spool, 1000
+                ).write("raw", [pending_bar])
+                self.assertEqual(failed["spooled"], 1)
+
+                captured = "2026-07-01T00:01:00Z"
+                watermark = {"captured_at": captured}
+                components = [
+                    BackupComponent.postgresql(source_pg, captured),
+                    BackupComponent.clickhouse(source_ch, captured),
+                    BackupComponent.tree(
+                        "duckdb", "duckdb-file", "1", source_root / "warehouse",
+                        source_root, watermark,
+                    ),
+                    BackupComponent.tree(
+                        "cold_archive", "parquet-tree", "manifest-v1",
+                        source_root / "archive", source_root, watermark,
+                    ),
+                    BackupComponent.tree(
+                        "spool", "wal-tree", "spool-v1",
+                        source_root / "spool/clickhouse", source_root, watermark, True,
+                    ),
+                    BackupComponent("cursor_key", "sealed-secret", "cursor-v1",
+                                    {"cursor.key": b"c" * 48}, watermark),
+                ]
                 backup = LocalStorageBackup(source_root / "backups", source_root,
                                             b"w" * 32)
                 artifact = Path(backup.create(
-                    components, "2026-07-20T00:00:04Z"
+                    components, "2026-07-01T00:01:01Z"
                 )["artifact_path"])
                 target_pg.pool.open(wait=True)
                 bootstrap = clickhouse_connect.get_client(
@@ -310,12 +427,170 @@ class LocalStorageRestoreIntegrationTest(unittest.TestCase):
                         "WHERE provider='restore-fixture'"
                     ).fetchone()["count"]
                 self.assertEqual(count, 1)
+                with target_pg.connection() as connection:
+                    artifact_count = connection.execute(
+                        "SELECT count(*) AS count FROM raw_artifact_manifest "
+                        "WHERE artifact_id='restore-artifact' AND "
+                        "storage_path='cold://restore-artifact'"
+                    ).fetchone()["count"]
+                self.assertEqual(artifact_count, 1)
+                target_fundamentals = PostgresFundamentalRepository(target_pg)
+                self.assertEqual(target_fundamentals.query_fundamentals(
+                    symbol="RESTORE", as_of="2026-06-01", limit=1
+                )[0]["price"], 10.0)
+
+                target_ch_repository = ClickHouseMarketBarRepository(target_ch)
                 count = target_ch.client.query(
                     "SELECT count() FROM market_bar_raw FINAL WHERE symbol='RESTORE'"
                 ).result_rows[0][0]
                 self.assertEqual(count, 1)
+                restored_warehouse = Warehouse(
+                    target_root / "warehouse/market_data.duckdb"
+                )
+                duckdb_bars = restored_warehouse.get_price_bars_range(
+                    "RESTORE", "1m", "raw", "2026-07-01T00:00:00Z",
+                    "2026-07-01T00:01:00Z", 10,
+                )[0]
+                self.assertEqual(len(duckdb_bars), 2)
+                self.assertEqual(restored_warehouse.get_price_bar_as_of(
+                    "RESTORE", "1m", "raw", "2026-07-01T00:00:10Z", 60
+                )["close"], 1.5)
+
+                restored_archive = ParquetColdArchive(
+                    restored_warehouse.path, target_root / "archive", target_root
+                )
+                restored_cold_artifact = restored_archive.archive_root / cold_relative
+                self.assertEqual(restored_archive.verify(
+                    restored_cold_artifact
+                )["status"], "verified")
+                cold_rows = restored_archive.query(
+                    restored_cold_artifact, "symbol=?", ["RESTORE"]
+                )
+                self.assertEqual(restored_archive.read_for_backfill(
+                    restored_cold_artifact
+                ), cold_rows)
+                self.assertEqual(cold_rows[0]["close"], duckdb_bars[0]["close"])
+
+                restored_spool = LocalClickHouseSpool(
+                    target_root / "spool/clickhouse", target_root
+                )
+                restored_writer = ReliableClickHouseWriter(
+                    target_ch_repository, restored_spool, 1000
+                )
+                builder = CanonicalMarketBarBuilder(
+                    target_ch_repository, restored_writer
+                )
+
+                def rebuild_replayed(rows):
+                    self.assertLessEqual(
+                        max(row["bar_time"] for row in rows),
+                        report["watermark"]["latest_captured_at"],
+                    )
+                    for symbol in sorted({row["symbol"] for row in rows}):
+                        result = builder.rebuild(
+                            symbol, "1m", "raw", "2026-07-01T00:00:00Z",
+                            report["watermark"]["latest_captured_at"], 100,
+                        )
+                        self.assertEqual(result["status"], "ok", result)
+
+                restored_writer.on_raw_replayed = rebuild_replayed
+                first_replay = restored_writer.replay(10)
+                second_replay = restored_writer.replay(10)
+                self.assertEqual(first_replay["replayed"], 1)
+                self.assertEqual(first_replay["callback_ok"], 1)
+                self.assertEqual(first_replay["remaining"], 0)
+                self.assertEqual(second_replay["replayed"], 0)
+                self.assertEqual(second_replay["callback_attempted"], 0)
+                self.assertEqual(target_ch.client.query(
+                    "SELECT count() FROM market_bar_raw FINAL WHERE symbol='SPOOL'"
+                ).result_rows[0][0], 1)
+
+                # A post-snapshot row must not enter the bounded canonical rebuild.
+                target_ch_repository.insert_raw_bars([{
+                    **pending_bar, "symbol": "FUTURE",
+                    "bar_time": "2026-07-01T00:02:00Z",
+                    "observed_at": "2026-07-01T00:02:01Z",
+                    "ingested_at": "2026-07-01T00:02:02Z",
+                    "raw_artifact_id": "future-artifact",
+                }])
+                restored_raw = target_ch_repository.query_raw_bars("RESTORE")
+                self.assertEqual(len(restored_raw), 1, restored_raw)
+                self.assertEqual(restored_raw[0]["interval"], "1m", restored_raw)
+                self.assertEqual(restored_raw[0]["adjustment"], "raw", restored_raw)
+                self.assertEqual(str(restored_raw[0]["bar_time"])[:16],
+                                 "2026-07-01 00:00", restored_raw)
+                for symbol in ("RESTORE", "SPOOL"):
+                    rebuilt = builder.rebuild(
+                        symbol, "1m", "raw", "2026-07-01T00:00:00Z",
+                        report["watermark"]["latest_captured_at"], 100,
+                    )
+                    self.assertEqual(rebuilt["status"], "ok", rebuilt)
+                    self.assertEqual(rebuilt["written"], 1, rebuilt)
+                self.assertEqual(target_ch.client.query(
+                    "SELECT count() FROM market_bar_canonical FINAL "
+                    "WHERE symbol='FUTURE'"
+                ).result_rows[0][0], 0)
+                canonical, _ = target_ch_repository.query_range(
+                    "canonical", "RESTORE", "1m", "raw",
+                    "2026-07-01T00:00:00Z", "2026-07-01T00:01:00Z", 10,
+                )
+                comparable = lambda row: {key: row[key] for key in (
+                    "symbol", "interval", "adjustment", "open", "high", "low",
+                    "close", "raw_close", "adjustment_factor", "volume", "amount",
+                )}
+                assert_contract_equal(
+                    {"bars": [comparable(duckdb_bars[0])]},
+                    {"bars": [comparable(canonical[0])]},
+                    "restored DuckDB/ClickHouse golden", LEGACY_PAYLOAD_PATHS,
+                )
+
+                settings = Settings(
+                    database_path=restored_warehouse.path,
+                    raw_path=target_root / "raw", profile="development",
+                    storage_root=target_root, market_bar_cursor_secret="",
+                    market_bar_cache_freshness_seconds=3600,
+                )
+                app = create_app(
+                    settings, RestoredService(restored_warehouse),
+                    now_provider=lambda: datetime.fromisoformat(
+                        "2026-07-01T00:10:00+00:00"
+                    ),
+                )
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/v1/quotes/RESTORE/history?interval=1m&adjustment=raw&"
+                        "start=2026-07-01T00:00:00Z&end=2026-07-01T00:01:00Z&"
+                        "page_size=1&refresh=false"
+                    )
+                self.assertEqual(response.status_code, 200)
+                payload = response.json()
+                self.assertEqual(payload["count"], 1)
+                self.assertEqual(payload["cache_status"], "fresh")
+                self.assertIsNotNone(payload["next_cursor"])
+                with TestClient(app) as client:
+                    second = client.get(
+                        "/v1/quotes/RESTORE/history?interval=1m&adjustment=raw&"
+                        "start=2026-07-01T00:00:00Z&end=2026-07-01T00:01:00Z&"
+                        "page_size=1&refresh=false&cursor=" + payload["next_cursor"]
+                    )
+                self.assertEqual(second.status_code, 200)
+                self.assertEqual(second.json()["bars"][0]["close"], 2.5)
+                self.assertIsNone(second.json()["next_cursor"])
                 self.assertEqual((target_root / ".market-bar-cursor.key").read_bytes(),
                                  b"c" * 48)
+                report_document = LocalStorageRestore(
+                    backup, RestoreTargets(target_root, target_pg, target_ch, "test", root)
+                ).record_verification({
+                    "postgres_pit": "ok", "clickhouse_raw": "ok",
+                    "duckdb_api_contract": "ok", "cold_verify_query_backfill": "ok",
+                    "spool_replay_once": "ok", "canonical_boundary": "ok",
+                })
+                report_path = target_root / ".storage-v2-restore/report.json"
+                rendered = report_path.read_text()
+                self.assertEqual(report_document["verification"]["canonical_boundary"],
+                                 "ok")
+                self.assertNotIn(str(target_root), rendered)
+                self.assertNotIn(password, rendered)
         finally:
             source_pg.close()
             target_pg.close()
