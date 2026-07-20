@@ -1,6 +1,8 @@
 import os
+import tempfile
 import unittest
 import uuid
+from pathlib import Path
 
 import clickhouse_connect
 
@@ -8,6 +10,7 @@ from marketcow.clickhouse_repositories import (
     ClickHouseDatabase,
     ClickHouseMarketBarRepository,
 )
+from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
 
 
 class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
@@ -94,6 +97,37 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             "SELECT count() FROM market_bar_canonical FINAL"
         ).result_rows[0][0]
         self.assertEqual(count, 1)
+
+    def test_chunked_writer_repeat_batch_and_spool_replay(self):
+        with tempfile.TemporaryDirectory() as folder:
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(Path(folder)), 1000
+            )
+            rows = [{
+                "symbol": f"{index:06d}.SZ", "market": "CN", "interval": "1m",
+                "adjustment": "raw", "bar_time": "2026-07-20T02:00:00Z",
+                "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 100,
+                "amount": 1050, "source": "writer_fixture", "source_sequence": str(index),
+                "observed_at": "2026-07-20T02:00:01Z",
+                "ingested_at": "2026-07-20T02:00:02Z", "raw_artifact_id": "artifact-w",
+            } for index in range(2001)]
+            first = writer.write("raw", rows)
+            second = writer.write("raw", rows)
+            self.assertEqual(first["batches"], 3)
+            self.assertEqual(second["batches"], 3)
+            logical = self.database.client.query(
+                "SELECT count() FROM market_bar_raw FINAL WHERE source='writer_fixture'"
+            ).result_rows[0][0]
+            self.assertEqual(logical, 2001)
+
+            original = self.repository.database.client
+            self.repository.database.client = None
+            try:
+                failed = writer.write("raw", [rows[0]])
+            finally:
+                self.repository.database.client = original
+            self.assertEqual(failed["spooled"], 1)
+            self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
 
 
 if __name__ == "__main__":

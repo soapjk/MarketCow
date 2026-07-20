@@ -107,6 +107,8 @@ class SettingsTest(unittest.TestCase):
                 "MARKETCOW_CLICKHOUSE_DATABASE": "tenant_test",
                 "MARKETCOW_CLICKHOUSE_USERNAME": "fixture",
                 "MARKETCOW_CLICKHOUSE_PASSWORD": "secret",
+                "MARKETCOW_CLICKHOUSE_BATCH_SIZE": "10000",
+                "MARKETCOW_CLICKHOUSE_SPOOL": str(Path(folder) / "spool"),
             }
             with patch.dict(os.environ, environment, clear=True), patch(
                 "pathlib.Path.cwd", return_value=Path(folder)
@@ -116,7 +118,20 @@ class SettingsTest(unittest.TestCase):
         self.assertTrue(enabled.clickhouse_enabled)
         self.assertEqual(enabled.clickhouse_port, 18123)
         self.assertEqual(enabled.clickhouse_database, "tenant_test")
+        self.assertEqual(enabled.clickhouse_batch_size, 10000)
+        self.assertEqual(enabled.clickhouse_spool_path, Path(folder) / "spool")
         enabled.validate_runtime_isolation()
+
+    def test_clickhouse_rejects_unsafe_batch_and_spool_configuration(self):
+        root = Path("/tmp/marketcow-config-test")
+        base = dict(database_path=root / "db.duckdb", raw_path=root / "raw",
+                    profile="development", port=8791, clickhouse_enabled=True,
+                    clickhouse_database="marketcow_test")
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            Settings(**base, clickhouse_batch_size=100).validate_runtime_isolation()
+        with patch("pathlib.Path.cwd", return_value=root):
+            with self.assertRaisesRegex(ValueError, "production data"):
+                Settings(**base, clickhouse_spool_path=root / "data/spool").validate_runtime_isolation()
 
     def test_marketcow_home_changes_both_default_paths(self):
         with tempfile.TemporaryDirectory() as folder:

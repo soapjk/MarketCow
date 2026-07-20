@@ -157,7 +157,10 @@ class ClickHouseMarketBarRepository:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
-    def _insert(self, table: str, columns: List[str], rows: List[Dict[str, Any]]) -> int:
+    def _insert(
+        self, table: str, columns: List[str], rows: List[Dict[str, Any]],
+        batch_id: str = "",
+    ) -> int:
         if not rows:
             return 0
         date_columns = {"bar_time", "observed_at", "ingested_at", "updated_at"}
@@ -165,14 +168,21 @@ class ClickHouseMarketBarRepository:
             self._datetime(row.get(column)) if column in date_columns else row.get(column)
             for column in columns
         ] for row in rows]
-        self.database._require_client().insert(table, values, column_names=columns)
+        settings = {"insert_deduplication_token": batch_id} if batch_id else None
+        self.database._require_client().insert(
+            table, values, column_names=columns, settings=settings
+        )
         return len(rows)
 
-    def insert_raw_bars(self, rows: List[Dict[str, Any]]) -> int:
-        return self._insert("market_bar_raw", self.RAW_COLUMNS, rows)
+    def insert_raw_bars(self, rows: List[Dict[str, Any]], batch_id: str = "") -> int:
+        return self._insert("market_bar_raw", self.RAW_COLUMNS, rows, batch_id)
 
-    def insert_canonical_bars(self, rows: List[Dict[str, Any]]) -> int:
-        return self._insert("market_bar_canonical", self.CANONICAL_COLUMNS, rows)
+    def insert_canonical_bars(
+        self, rows: List[Dict[str, Any]], batch_id: str = ""
+    ) -> int:
+        return self._insert(
+            "market_bar_canonical", self.CANONICAL_COLUMNS, rows, batch_id
+        )
 
     def query_raw_bars(self, symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
         result = self.database._require_client().query(

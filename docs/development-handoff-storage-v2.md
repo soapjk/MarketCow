@@ -44,7 +44,10 @@ DuckDB
   承担，未连接或迁移正式 PostgreSQL。
 - ClickHouse development/test 存储基础已建立：默认关闭且只允许显式连接本机回环
   地址及 `_development`/`_test` database；包含客户端生命周期、幂等 migration、
-  健康诊断，以及 `market_bar_raw`/`market_bar_canonical` 基础表。尚未接入应用双写。
+  健康诊断，以及 `market_bar_raw`/`market_bar_canonical` 基础表；
+- 已实现独立的可靠影子写入原语：1000～50000 行可配置微批、字段和 UTC 时间
+  规范化、稳定批次 ID、development 本地原子 WAL、显式有界重放与诊断。该 writer
+  尚未接入 ingestion/service 或 DuckDB 主写路径。
 
 ## 二、仓库、分支和 worktree
 
@@ -373,16 +376,22 @@ fundamental / statements / PIT history
 ### 第 4 步：ClickHouse 影子写入
 
 ClickHouse development/test 存储基础与 schema 边界已经完成。当前仅具备显式启用的
-客户端、幂等初始化、健康诊断和基础 round-trip；应用双写尚未开始。
+客户端、幂等初始化、健康诊断和基础 round-trip。独立 writer/WAL 原语也已完成，
+但应用双写尚未开始。
 
 下一步仍是影子写入本身：
 
-- 建立 `market_bar_raw`；
-- 建立 `market_bar_canonical`；
-- 实现数千到数万行微批写入；
-- 写入失败进入本地 WAL/spool；
-- 支持重放、幂等和延迟监控；
+- 已建立 `market_bar_raw`；
+- 已建立 `market_bar_canonical`；
+- 已实现数千到数万行微批写入原语；
+- 已实现写入失败进入 development 本地 WAL/spool；
+- 已实现显式重放、稳定幂等标识和有界延迟诊断；
 - DuckDB 与 ClickHouse 双写并对比行数、OHLCVA、时间边界和来源。
+
+注意：普通 `ReplacingMergeTree` 允许物理重复行，逻辑读取必须使用合并后语义（例如
+`FINAL`）；稳定 `insert_deduplication_token` 同时为未来 ReplicatedMergeTree 保留批次
+幂等标识。WAL 成功重放后原子写入 `replayed/` 再移除 pending，崩溃后重复重放仍以
+相同批次 ID 和业务排序键收敛为一个逻辑版本。
 
 ### 第 5 步：查询切换
 
@@ -466,12 +475,13 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 ```text
 feature/storage-v2 基线：9c21cf1
-默认测试：发现 68 项且整体通过；7 项 PostgreSQL、2 项 ClickHouse 集成测试因未
+默认测试：发现 74 项且整体通过；7 项 PostgreSQL、3 项 ClickHouse 集成测试因未
 显式配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
-ClickHouse 测试：4 项通过（2 项隔离边界测试、2 项使用一次性 ClickHouse 25.8
+ClickHouse 测试：5 项通过（2 项隔离边界测试、3 项使用一次性 ClickHouse 25.8
 本地容器的集成测试；容器测试后删除）
-下一阶段：ClickHouse 影子写入，尚未开始
+下一阶段：把 writer 接入 development ingestion 的影子路径并执行 DuckDB 对账；
+尚未开始
 ```
 
 正式服务的当前进程是在加入 health `profile` 字段前启动的，因此它的 health 响应可能暂时没有 `profile`；这不代表配置错误。不要仅为补这个字段重启正式服务。

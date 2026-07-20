@@ -1,0 +1,101 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from marketcow.clickhouse_writer import (
+    LocalClickHouseSpool,
+    ReliableClickHouseWriter,
+    normalize_bar,
+    stable_batch_id,
+)
+
+
+def raw_bar(index=0):
+    return {
+        "symbol": f"{index:06d}.SH", "market": "CN", "interval": "1m",
+        "adjustment": "raw", "bar_time": "2026-07-20T01:31:00Z",
+        "open": "100", "high": 102, "low": 99, "close": 101,
+        "volume": 1000, "amount": None, "source": "fixture",
+        "source_sequence": str(index), "observed_at": "2026-07-20T09:31:01+08:00",
+        "ingested_at": "2026-07-20T01:31:02Z", "raw_artifact_id": None,
+    }
+
+
+class FakeRepository:
+    def __init__(self, fail=True):
+        self.fail = fail
+        self.calls = []
+
+    def insert_raw_bars(self, rows, batch_id=""):
+        self.calls.append((rows, batch_id))
+        if self.fail:
+            raise ConnectionError("fixture unavailable")
+        return len(rows)
+
+    def insert_canonical_bars(self, rows, batch_id=""):
+        return self.insert_raw_bars(rows, batch_id)
+
+
+class ReliableClickHouseWriterTest(unittest.TestCase):
+    def test_normalization_empty_batch_and_stable_identity(self):
+        normalized = normalize_bar("raw", raw_bar())
+        self.assertEqual(normalized["open"], 100.0)
+        self.assertEqual(normalized["observed_at"], "2026-07-20T01:31:01.000+00:00")
+        self.assertEqual(stable_batch_id("raw", [normalized]),
+                         stable_batch_id("raw", [normalized]))
+        with tempfile.TemporaryDirectory() as folder:
+            writer = ReliableClickHouseWriter(
+                FakeRepository(False), LocalClickHouseSpool(Path(folder)), 1000
+            )
+            self.assertEqual(writer.write("raw", []),
+                             {"rows": 0, "written": 0, "spooled": 0, "batches": 0})
+            canonical = {**raw_bar(), "selected_source": "fixture", "source_count": 1,
+                         "quality_status": "single_source", "version": 1,
+                         "updated_at": "2026-07-20T01:31:03Z"}
+            self.assertEqual(writer.write("canonical", [canonical])["written"], 1)
+        with self.assertRaisesRegex(ValueError, "requires close"):
+            normalize_bar("raw", {**raw_bar(), "close": None})
+
+    def test_micro_batches_spool_atomically_and_replay_after_recovery(self):
+        with tempfile.TemporaryDirectory() as folder:
+            repository = FakeRepository(True)
+            spool = LocalClickHouseSpool(Path(folder))
+            writer = ReliableClickHouseWriter(repository, spool, 1000)
+            result = writer.write("raw", [raw_bar(index) for index in range(2001)])
+            self.assertEqual(result, {"rows": 2001, "written": 0,
+                                      "spooled": 2001, "batches": 3})
+            self.assertEqual(len(list(spool.pending.glob("*.json"))), 3)
+            self.assertEqual(list(spool.pending.glob(".write-*")), [])
+            diagnostics = spool.diagnostics(limit=2)
+            self.assertEqual(diagnostics["pending"], 2)
+            self.assertEqual(diagnostics["failed"], 2)
+            self.assertTrue(diagnostics["truncated"])
+            self.assertGreaterEqual(diagnostics["oldest_pending_lag_seconds"], 0)
+
+            repository.fail = False
+            replayed = writer.replay(limit=10)
+            self.assertEqual(replayed, {"attempted": 3, "replayed": 3, "failed": 0})
+            self.assertEqual(list(spool.pending.glob("*.json")), [])
+            self.assertEqual(len(list(spool.replayed.glob("*.json"))), 3)
+            self.assertEqual(writer.replay(limit=10),
+                             {"attempted": 0, "replayed": 0, "failed": 0})
+            self.assertEqual(spool.diagnostics()["replayed"], 3)
+
+    def test_failed_replay_increments_attempts_without_duplicate_wal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            spool = LocalClickHouseSpool(Path(folder))
+            writer = ReliableClickHouseWriter(FakeRepository(True), spool, 1000)
+            writer.write("raw", [raw_bar()])
+            writer.replay()
+            paths = list(spool.pending.glob("*.json"))
+            self.assertEqual(len(paths), 1)
+            self.assertEqual(spool.read(paths[0])["attempts"], 2)
+
+    def test_production_spool_path_is_rejected(self):
+        production = Path.cwd() / "data/spool/clickhouse"
+        with self.assertRaisesRegex(ValueError, "production data"):
+            LocalClickHouseSpool(production)
+
+
+if __name__ == "__main__":
+    unittest.main()
