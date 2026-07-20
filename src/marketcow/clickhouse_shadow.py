@@ -207,6 +207,42 @@ class ShadowMarketBarRepository:
                 "error": str(error)[:4000],
             }
             return rows, truncated
+
+    def get_raw_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int,
+        sources: Optional[Sequence[str]] = None,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (symbol, interval, adjustment, start, end, page_size, sources, after)
+        if not self.raw_reads_enabled:
+            rows, has_more = self.primary.get_raw_price_bars_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more,
+                "raw_multisource": True, "keyset_page": True,
+            }
+            return rows, has_more
+        try:
+            rows, has_more = self.writer.repository.get_raw_price_bars_page(
+                symbol, interval, adjustment, start, end, page_size,
+                None if sources is None else list(sources), after,
+            )
+            self._last_read = {
+                "backend": "clickhouse_raw", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more,
+                "raw_multisource": True, "keyset_page": True,
+            }
+            return rows, has_more
+        except Exception as error:
+            rows, has_more = self.primary.get_raw_price_bars_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_raw",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": has_more, "raw_multisource": True,
+                "keyset_page": True, "error": str(error)[:4000],
+            }
+            return rows, has_more
     @staticmethod
     def _raw_rows(
         symbol: str, interval: str, adjustment: str, source: str,

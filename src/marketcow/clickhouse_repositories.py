@@ -504,6 +504,84 @@ class ClickHouseMarketBarRepository:
             })
         return mapped, len(rows) > limit
 
+    def get_raw_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int,
+        sources: Optional[List[str]] = None,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("raw history page_size must be between 1 and 5000")
+        start_at = self._datetime(start).astimezone(timezone.utc)
+        end_at = self._datetime(end).astimezone(timezone.utc)
+        start_at = datetime.fromtimestamp(int(start_at.timestamp()), timezone.utc)
+        end_at = datetime.fromtimestamp(int(end_at.timestamp()), timezone.utc)
+        if start_at > end_at:
+            raise ValueError("history range start must not be after end")
+        source_filter = None if sources is None else sorted({
+            str(value).strip() for value in sources if str(value).strip()
+        })
+        if source_filter is not None and len(source_filter) > 100:
+            raise ValueError("raw history sources must contain at most 100 values")
+        if source_filter == []:
+            return [], False
+        source_sql = ""
+        after_sql = ""
+        parameters: Dict[str, Any] = {
+            "symbol": symbol, "interval": interval, "adjustment": adjustment,
+            "start": start_at, "end": end_at, "fetch": page_size + 1,
+        }
+        if source_filter is not None:
+            source_sql = " AND source IN {sources:Array(String)}"
+            parameters["sources"] = source_filter
+        if after is not None:
+            after_sql = (
+                " AND (bar_time > {after_time:DateTime64(3)} OR "
+                "(bar_time = {after_time:DateTime64(3)} AND source > {after_source:String}))"
+            )
+            parameters["after_time"] = datetime.fromtimestamp(after[0], timezone.utc)
+            parameters["after_source"] = after[1]
+        result = self.database._require_client().query(
+            "SELECT symbol, interval, adjustment, toUnixTimestamp(bar_time) AS timestamp, "
+            "open, high, low, close, raw_close, adjustment_factor, volume, amount, source, "
+            "source_sequence, toUnixTimestamp64Milli(observed_at) AS observed_millis, "
+            "toUnixTimestamp64Milli(ingested_at) AS ingested_millis, raw_artifact_id, "
+            "content_rank FROM (SELECT *, row_number() OVER (PARTITION BY symbol, "
+            "interval, adjustment, source, bar_time ORDER BY ingested_at DESC, "
+            "content_rank DESC) AS selected FROM market_bar_raw "
+            "WHERE symbol={symbol:String} AND interval={interval:String} "
+            "AND adjustment={adjustment:String} AND bar_time >= {start:DateTime64(3)} "
+            "AND bar_time <= {end:DateTime64(3)}" + source_sql + ") WHERE selected=1" +
+            after_sql + " ORDER BY bar_time ASC, source ASC LIMIT {fetch:UInt32}",
+            parameters=parameters,
+        )
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        mapped = []
+        for row in rows[:page_size]:
+            timestamp = int(row.pop("timestamp"))
+            observed_millis = int(row.pop("observed_millis"))
+            ingested_millis = int(row.pop("ingested_millis"))
+            row.pop("content_rank")
+            mapped.append({
+                **row, "timestamp": timestamp,
+                "bar_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+                "open": float(row["open"]), "high": float(row["high"]),
+                "low": float(row["low"]), "close": float(row["close"]),
+                "raw_close": None if row["raw_close"] is None else float(row["raw_close"]),
+                "adjustment_factor": (None if row["adjustment_factor"] is None
+                                      else float(row["adjustment_factor"])),
+                "volume": float(row["volume"]),
+                "amount": None if row["amount"] is None else float(row["amount"]),
+                "observed_at": datetime.fromtimestamp(
+                    observed_millis / 1000, timezone.utc
+                ).isoformat(),
+                "ingested_at": datetime.fromtimestamp(
+                    ingested_millis / 1000, timezone.utc
+                ).isoformat(),
+                "source_payload": {},
+            })
+        return mapped, len(rows) > page_size
+
     def get_canonical_price_bars_cross_section(
         self, interval: str, adjustment: str, bar_at: str, limit: int,
         symbols: Optional[List[str]] = None,

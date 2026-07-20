@@ -96,6 +96,12 @@ class MarketBarRepository(Protocol):
         start: str, end: str, limit: int,
         sources: Optional[Sequence[str]] = None,
     ) -> tuple[List[Dict[str, Any]], bool]: ...
+    def get_raw_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int,
+        sources: Optional[Sequence[str]] = None,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]: ...
 
 
 @runtime_checkable

@@ -73,7 +73,7 @@ def _decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def encode_cursor(query: Dict[str, Any], after: int, issued_at: int, secret: str) -> str:
+def encode_cursor(query: Dict[str, Any], after: Any, issued_at: int, secret: str) -> str:
     payload = json.dumps(
         {"v": CURSOR_VERSION, "q": query, "after": after, "iat": issued_at},
         sort_keys=True, separators=(",", ":"), ensure_ascii=True,
@@ -84,7 +84,7 @@ def encode_cursor(query: Dict[str, Any], after: int, issued_at: int, secret: str
 
 def decode_cursor(
     token: str, query: Dict[str, Any], now: int, ttl_seconds: int, secret: str,
-) -> int:
+) -> Any:
     if not token or len(token) > MAX_CURSOR_LENGTH:
         raise ValueError("invalid cursor length")
     try:
@@ -107,7 +107,12 @@ def decode_cursor(
         raise ValueError("cursor does not match this query")
     issued_at = decoded.get("iat")
     after = decoded.get("after")
-    if not isinstance(issued_at, int) or not isinstance(after, int):
+    if not isinstance(issued_at, int) or not isinstance(after, (int, list)):
+        raise ValueError("invalid cursor payload")
+    if isinstance(after, list) and (
+        len(after) != 2 or not isinstance(after[0], int)
+        or not isinstance(after[1], str) or not after[1]
+    ):
         raise ValueError("invalid cursor payload")
     if issued_at > now + 30:
         raise ValueError("cursor issued_at is in the future")

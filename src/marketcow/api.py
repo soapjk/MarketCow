@@ -302,6 +302,8 @@ def create_app(
                         settings.market_bar_cursor_ttl_seconds,
                         cursor_secret,
                     )
+                    if after is not None and not isinstance(after, int):
+                        raise ValueError("invalid history cursor position")
                     if after is not None and not (
                         int(start_at.timestamp()) <= after <= int(end_at.timestamp())
                     ):
@@ -418,12 +420,16 @@ def create_app(
         adjustment: str = "raw",
         limit: int = 500,
         sources: Optional[str] = None,
+        page_size: Optional[int] = Query(None, ge=1, le=5000),
+        cursor: Optional[str] = None,
     ):
         try:
             if adjustment not in {"adjusted", "raw"}:
                 raise ValueError("adjustment must be adjusted or raw")
             if not 1 <= limit <= 5000:
                 raise ValueError("raw history limit must be between 1 and 5000")
+            if cursor is not None and page_size is None:
+                raise ValueError("raw history cursor requires page_size")
             try:
                 normalized = normalize_a_symbol(symbol)
             except ValueError:
@@ -444,6 +450,51 @@ def create_app(
                                         if value.strip()})
                 if len(source_filter) > 100:
                     raise ValueError("raw history sources must contain at most 100 values")
+            if page_size is not None:
+                query_binding = {
+                    "symbol": normalized, "interval": interval,
+                    "adjustment": adjustment, "start": normalized_start,
+                    "end": normalized_end, "sources": source_filter,
+                    "page_size": page_size,
+                }
+                cursor_secret = load_or_create_secret(
+                    settings.market_bar_cursor_secret, settings.storage_root
+                )
+                cursor_now = clock()
+                if cursor_now.tzinfo is None:
+                    cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+                now_epoch = int(cursor_now.timestamp())
+                decoded_after = None if cursor is None else decode_cursor(
+                    cursor, query_binding, now_epoch,
+                    settings.market_bar_cursor_ttl_seconds, cursor_secret,
+                )
+                after = None
+                if decoded_after is not None:
+                    if not isinstance(decoded_after, list):
+                        raise ValueError("invalid raw history cursor position")
+                    after = (decoded_after[0], decoded_after[1])
+                    if not (int(start_at.timestamp()) <= after[0]
+                            <= int(end_at.timestamp())):
+                        raise ValueError("cursor position is outside the query range")
+                bars, has_more = service.market_bar_repository.get_raw_price_bars_page(
+                    normalized, interval, adjustment, normalized_start, normalized_end,
+                    page_size, source_filter, after,
+                )
+                next_cursor = None
+                if has_more and bars:
+                    next_cursor = encode_cursor(
+                        query_binding,
+                        [int(bars[-1]["timestamp"]), bars[-1]["source"]],
+                        now_epoch, cursor_secret,
+                    )
+                return {
+                    "symbol": normalized, "interval": interval,
+                    "adjustment": adjustment, "start": normalized_start,
+                    "end": normalized_end, "count": len(bars), "bars": bars,
+                    "cached": True, "truncated": has_more,
+                    "page_size": page_size, "next_cursor": next_cursor,
+                    **cache_metadata(bars),
+                }
             bars, truncated = service.market_bar_repository.get_raw_price_bars_range(
                 normalized, interval, adjustment, normalized_start, normalized_end,
                 limit, source_filter,

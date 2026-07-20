@@ -44,6 +44,9 @@ class FakePrimary:
     def get_raw_price_bars_range(self, *args):
         return (["duckdb-raw"], True)
 
+    def get_raw_price_bars_page(self, *args):
+        return (["duckdb-raw-page"], True)
+
 
 class CapturingWriter:
     def __init__(self, result=None):
@@ -89,6 +92,11 @@ class ReconcileRepository:
         return self.rows, False
 
     def get_raw_price_bars_range(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows, False
+
+    def get_raw_price_bars_page(self, *args):
         if isinstance(self.rows, Exception):
             raise self.rows
         return self.rows, False
@@ -251,6 +259,25 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
         diagnostics = adapter.diagnostics()["read"]
         self.assertTrue(diagnostics["fallback"])
         self.assertTrue(diagnostics["truncated"])
+
+    def test_raw_keyset_page_uses_same_query_for_bounded_fallback(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.repository = ReconcileRepository([{"source": "beta", "timestamp": 100}])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(primary, writer, raw_reads_enabled=True)
+        arguments = (
+            "AAPL", "1m", "raw", "1970-01-01T00:01:40Z",
+            "1970-01-01T00:02:00Z", 1, ["alpha", "beta"], (100, "alpha"),
+        )
+        self.assertEqual(adapter.get_raw_price_bars_page(*arguments),
+                         ([{"source": "beta", "timestamp": 100}], False))
+        self.assertTrue(adapter.diagnostics()["read"]["keyset_page"])
+        writer.repository.rows = ConnectionError("raw page unavailable")
+        self.assertEqual(adapter.get_raw_price_bars_page(*arguments),
+                         (["duckdb-raw-page"], True))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["fallback"])
+        self.assertTrue(diagnostics["keyset_page"])
 
     def test_primary_failure_never_attempts_shadow(self):
         writer = CapturingWriter()

@@ -411,6 +411,69 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                 "2026-07-20T06:01:00Z", 10,
             )
 
+    def test_raw_keyset_pages_match_duckdb_and_failure_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            warehouse = Warehouse(root / "warehouse.duckdb")
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(root / "spool", root), 1000
+            )
+            for source in ("alpha", "beta"):
+                rows = []
+                for timestamp in (1784527200, 1784527260):
+                    row = {
+                        "timestamp": timestamp,
+                        "bar_at": datetime.fromtimestamp(
+                            timestamp, timezone.utc
+                        ).isoformat(),
+                        "open": 10, "high": 12, "low": 9,
+                        "close": 11 if source == "alpha" else 12,
+                        "raw_close": 22, "adjustment_factor": 0.5,
+                        "volume": 100, "amount": 1100,
+                    }
+                    rows.append(row)
+                warehouse.upsert_price_bars(
+                    "RAW-PAGE.HK", "1m", "raw", source,
+                    "2026-07-20T06:00:02.456Z", rows,
+                    {"observed_at": "2026-07-20T06:00:01.123Z",
+                     "raw_artifact_id": f"artifact-{source}"},
+                )
+                self.repository.insert_raw_bars([
+                    {
+                        "symbol": "RAW-PAGE.HK", "market": "HK", "interval": "1m",
+                        "adjustment": "raw", "bar_time": row["bar_at"], **row,
+                        "source": source, "source_sequence": str(row["timestamp"]),
+                        "observed_at": "2026-07-20T06:00:01.123Z",
+                        "ingested_at": "2026-07-20T06:00:02.456Z",
+                        "raw_artifact_id": f"artifact-{source}",
+                    } for row in rows
+                ])
+            adapter = ShadowMarketBarRepository(
+                warehouse, writer, raw_reads_enabled=True
+            )
+            arguments = (
+                "RAW-PAGE.HK", "1m", "raw", "2026-07-20T14:00:00+08:00",
+                "2026-07-20T06:01:00Z", 1, ["beta", "alpha", "alpha"], None,
+            )
+            clickhouse_page = adapter.get_raw_price_bars_page(*arguments)
+            duckdb_page = warehouse.get_raw_price_bars_page(*arguments)
+            self.assertEqual(clickhouse_page, duckdb_page)
+            self.assertTrue(clickhouse_page[1])
+            after = (clickhouse_page[0][-1]["timestamp"],
+                     clickhouse_page[0][-1]["source"])
+            next_arguments = (*arguments[:-1], after)
+            self.assertEqual(adapter.get_raw_price_bars_page(*next_arguments),
+                             warehouse.get_raw_price_bars_page(*next_arguments))
+
+            original = self.repository.database.client
+            self.repository.database.client = None
+            try:
+                fallback_page = adapter.get_raw_price_bars_page(*arguments)
+            finally:
+                self.repository.database.client = original
+            self.assertEqual(fallback_page, clickhouse_page)
+            self.assertTrue(adapter.diagnostics()["read"]["fallback"])
+
     def test_raw_equal_ingestion_winner_is_stable_across_insert_and_merge_order(self):
         base = {
             "market": "US", "interval": "1m", "adjustment": "raw",

@@ -1006,6 +1006,58 @@ class Warehouse:
             result.append(row)
         return result, truncated
 
+    def get_raw_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int,
+        sources: Optional[Sequence[str]] = None,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("raw history page_size must be between 1 and 5000")
+        start_at, end_at = self._utc_range(start, end)
+        source_filter = None if sources is None else sorted({
+            str(value).strip() for value in sources if str(value).strip()
+        })
+        if source_filter is not None and len(source_filter) > 100:
+            raise ValueError("raw history sources must contain at most 100 values")
+        if source_filter == []:
+            return [], False
+        filters = ""
+        parameters: List[Any] = [
+            symbol, interval, adjustment, int(start_at.timestamp()), int(end_at.timestamp())
+        ]
+        if source_filter is not None:
+            filters += " AND source IN (" + ",".join("?" for _ in source_filter) + ")"
+            parameters.extend(source_filter)
+        if after is not None:
+            filters += " AND (timestamp > ? OR (timestamp = ? AND source > ?))"
+            parameters.extend([after[0], after[0], after[1]])
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "source_sequence, observed_at, ingested_at, raw_artifact_id, payload_json "
+                "FROM market_price_bar WHERE symbol = ? AND interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?" + filters +
+                " ORDER BY timestamp ASC, source ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        result = []
+        for row in rows[:page_size]:
+            row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            for field in ("bar_at", "observed_at", "ingested_at"):
+                row[field] = self._utc_iso(row[field])
+            # ClickHouse raw storage intentionally preserves the normalized
+            # provenance contract rather than the provider-specific payload.
+            # Keep paginated fallback pages byte-for-byte equivalent.
+            row["source_payload"] = {}
+            result.append(row)
+        return result, has_more
+
     def get_price_bars_for_reconciliation(
         self, symbol: str, interval: str, adjustment: str, source: str,
         timestamps: Sequence[int],
