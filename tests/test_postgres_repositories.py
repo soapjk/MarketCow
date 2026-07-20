@@ -58,6 +58,41 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         with psycopg.connect(cls.dsn, autocommit=True) as connection:
             connection.execute(f'DROP SCHEMA IF EXISTS "{cls.schema}" CASCADE')
 
+    def _create_v4_schema(self, schema, invalid_table=""):
+        with psycopg.connect(self.dsn, autocommit=True) as connection:
+            connection.execute(f'CREATE SCHEMA "{schema}"')
+            connection.execute(f'SET search_path TO "{schema}", public')
+            connection.execute("""
+                CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY, description TEXT NOT NULL,
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            for version, description, statement in POSTGRES_MIGRATIONS[:4]:
+                connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, description) VALUES (%s, %s)",
+                    (version, description),
+                )
+            if invalid_table == "ingestion_runs":
+                connection.execute(
+                    "INSERT INTO ingestion_runs "
+                    "(run_id,job_name,status,started_at,row_count) "
+                    "VALUES ('bad','fixture','failed','2026-07-20',-1)"
+                )
+            elif invalid_table == "provider_health":
+                connection.execute(
+                    "INSERT INTO provider_health "
+                    "(provider,status,last_attempt_at,consecutive_failures) "
+                    "VALUES ('bad','unhealthy','2026-07-20',-1)"
+                )
+            elif invalid_table == "raw_artifact_manifest":
+                connection.execute(
+                    "INSERT INTO raw_artifact_manifest "
+                    "(artifact_id,dataset,source,observed_at,ingested_at,storage_path,sha256,byte_size) "
+                    "VALUES ('bad','fixture','fixture','2026-07-20','2026-07-20','bad','bad',-1)"
+                )
+
     def test_migrations_control_plane_and_artifact_manifest(self):
         self.assertIsInstance(self.repository, V2ControlPlaneRepository)
         self.database.migrate()
@@ -91,8 +126,8 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         self.assertEqual(saved["artifact_id"], "artifact-1")
 
     def test_runtime_config_pit_and_checkpoint_compare_and_swap(self):
-        def config(version, observed, value):
-            payload = {"metadata_backend": "postgres", "value": value}
+        def config(version, observed, value, payload=None):
+            payload = payload or {"metadata_backend": "postgres", "value": value}
             digest = hashlib.sha256(json.dumps(
                 payload, sort_keys=True, separators=(",", ":")
             ).encode()).hexdigest()
@@ -113,6 +148,24 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
             config(2, "2026-07-21T00:00:00Z", "second")
         )
         self.assertEqual(first["version"], repeated["version"])
+        equivalent = config(
+            1, "2026-07-20T00:00:00Z", "first",
+            {"value": "first", "metadata_backend": "postgres"},
+        )
+        self.assertEqual(
+            self.repository.save_runtime_config_version(equivalent)["version"], 1
+        )
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            self.repository.save_runtime_config_version({
+                **config(3, "2026-07-22T00:00:00Z", "third"),
+                "config_sha256": "0" * 64,
+            })
+        first_hash = first["config_sha256"]
+        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+            self.repository.save_runtime_config_version({
+                **config(3, "2026-07-22T00:00:00Z", "different"),
+                "config_sha256": first_hash,
+            })
         self.assertEqual(self.repository.get_runtime_config_version(
             "v2-runtime", "2026-07-20T12:00:00Z"
         )["config_json"]["value"], "first")
@@ -161,21 +214,7 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
     def test_upgrade_from_migration_four_and_repeat_migrate(self):
         schema = "marketcow_upgrade_" + uuid.uuid4().hex[:10] + "_test"
         try:
-            with psycopg.connect(self.dsn, autocommit=True) as connection:
-                connection.execute(f'CREATE SCHEMA "{schema}"')
-                connection.execute(f'SET search_path TO "{schema}", public')
-                connection.execute("""
-                    CREATE TABLE schema_migrations (
-                        version INTEGER PRIMARY KEY, description TEXT NOT NULL,
-                        applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                for version, description, statement in POSTGRES_MIGRATIONS[:4]:
-                    connection.execute(statement)
-                    connection.execute(
-                        "INSERT INTO schema_migrations(version, description) VALUES (%s, %s)",
-                        (version, description),
-                    )
+            self._create_v4_schema(schema)
             upgraded = PostgresDatabase(self.dsn, schema, min_size=1, max_size=2)
             upgraded.open()
             upgraded.migrate()
@@ -193,6 +232,29 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         finally:
             with psycopg.connect(self.dsn, autocommit=True) as connection:
                 connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+    def test_upgrade_from_migration_four_rejects_invalid_history(self):
+        for invalid_table in (
+            "ingestion_runs", "provider_health", "raw_artifact_manifest"
+        ):
+            with self.subTest(table=invalid_table):
+                schema = "marketcow_invalid_" + uuid.uuid4().hex[:10] + "_test"
+                database = None
+                try:
+                    self._create_v4_schema(schema, invalid_table)
+                    database = PostgresDatabase(self.dsn, schema, min_size=1, max_size=2)
+                    with self.assertRaises(psycopg.errors.CheckViolation):
+                        database.open()
+                    with psycopg.connect(self.dsn) as connection:
+                        versions = [row[0] for row in connection.execute(
+                            f'SELECT version FROM "{schema}".schema_migrations ORDER BY version'
+                        ).fetchall()]
+                    self.assertEqual(versions, [1, 2, 3, 4])
+                finally:
+                    if database is not None:
+                        database.close()
+                    with psycopg.connect(self.dsn, autocommit=True) as connection:
+                        connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
     def test_calendar_round_trip(self):
         row = {

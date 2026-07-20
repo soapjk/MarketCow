@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from contextlib import contextmanager
@@ -149,6 +150,13 @@ class _PostgresControlPlaneRepository:
     def save_runtime_config_version(self, row: Dict[str, Any]) -> Dict[str, Any]:
         """Append an immutable, content-addressed V2 runtime configuration version."""
         config = row.get("config_json", row.get("config", {}))
+        canonical = json.dumps(
+            config, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        expected_sha256 = hashlib.sha256(canonical).hexdigest()
+        if row.get("config_sha256") != expected_sha256:
+            raise ValueError("runtime configuration content checksum mismatch")
         with self.database.connection() as connection:
             return connection.execute(
                 """
@@ -162,7 +170,7 @@ class _PostgresControlPlaneRepository:
                 """,
                 (
                     row["config_id"], row["version"], row["profile"],
-                    row["schema_version"], Jsonb(config), row["config_sha256"],
+                    row["schema_version"], Jsonb(config), expected_sha256,
                     row["observed_at"], row["actor"],
                 ),
             ).fetchone()

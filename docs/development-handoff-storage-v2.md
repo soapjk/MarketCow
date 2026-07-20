@@ -1455,7 +1455,9 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   使用 JSONB。migration 还为 run row count、provider failure count 和 Artifact byte size 增加非负约束。
   Repository 增加配置版本 PIT、checkpoint 创建/读取/CAS 与 Tushare request+rows 读取；既有 16 域方法
   保持不变。真实 PostgreSQL 测试覆盖从 migration 4 升级、全新 schema、重复 migrate、JSONB、复合键、
-  PIT/history、约束和双连接并发冲突。未装配在线工厂，未改 ClickHouse 行情契约。
+  PIT/history、约束和双连接并发冲突。三个 legacy 非负约束在同一 migration 事务中显式 VALIDATE，任一
+  历史负值会回滚并阻断 v5；配置 JSON 使用 UTF-8、key 排序、无空白的固定规范化编码，在 Repository
+  边界重算 SHA-256 并拒绝调用方伪造或错配 hash。未装配在线工厂，未改 ClickHouse 行情契约。
 
 ### `BG-004`：ClickHouse 直接行情 Repository 契约
 

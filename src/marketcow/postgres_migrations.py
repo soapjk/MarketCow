@@ -242,6 +242,12 @@ POSTGRES_MIGRATIONS = [
         ALTER TABLE raw_artifact_manifest
             ADD CONSTRAINT raw_artifact_manifest_byte_size_nonnegative
             CHECK (byte_size >= 0) NOT VALID;
+        ALTER TABLE ingestion_runs
+            VALIDATE CONSTRAINT ingestion_runs_row_count_nonnegative;
+        ALTER TABLE provider_health
+            VALIDATE CONSTRAINT provider_health_failures_nonnegative;
+        ALTER TABLE raw_artifact_manifest
+            VALIDATE CONSTRAINT raw_artifact_manifest_byte_size_nonnegative;
 
         CREATE TABLE IF NOT EXISTS runtime_config_version (
             config_id TEXT NOT NULL,
