@@ -37,6 +37,36 @@ class FakeRepository:
 
 
 class ReliableClickHouseWriterTest(unittest.TestCase):
+    def test_partial_chunks_rebuild_only_after_complete_intent_and_report_callback_error(self):
+        class Partial(FakeRepository):
+            def insert_raw_bars(self, rows, batch_id=""):
+                self.calls.append((rows, batch_id))
+                if len(self.calls) in {2, 3}:
+                    raise ConnectionError("partial")
+                return len(rows)
+        with tempfile.TemporaryDirectory() as folder:
+            repository = Partial(False)
+            spool = LocalClickHouseSpool(Path(folder) / "spool", Path(folder))
+            writer = ReliableClickHouseWriter(repository, spool, 1000)
+            callbacks = []
+            writer.on_raw_replayed = lambda rows: callbacks.append(rows)
+            result = writer.write("raw", [raw_bar(index) for index in range(2501)])
+            self.assertEqual(result["spooled"], 1501)
+            self.assertEqual(callbacks, [])
+            writer.replay(limit=1)
+            self.assertEqual(callbacks, [])
+            writer.replay(limit=10)
+            self.assertEqual(len(callbacks[0]), 2501)
+            self.assertEqual(callbacks[0][0]["symbol"], "000000.SH")
+            self.assertEqual(callbacks[0][-1]["symbol"], "002500.SH")
+            repository.calls = []
+            writer.write("raw", [raw_bar(index) for index in range(2501)])
+            writer.on_raw_replayed = lambda rows: (_ for _ in ()).throw(RuntimeError("callback boom"))
+            writer.replay(limit=10)
+            self.assertEqual(writer.last_replay_callback["status"], "error")
+            intents = list(spool.intents.glob("*.json"))
+            self.assertTrue(any("callback boom" in spool.read(path).get("last_callback_error", "")
+                                for path in intents))
     def test_normalization_empty_batch_and_stable_identity(self):
         normalized = normalize_bar("raw", raw_bar())
         self.assertEqual(normalized["open"], 100.0)

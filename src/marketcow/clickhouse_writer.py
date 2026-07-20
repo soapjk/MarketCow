@@ -79,8 +79,10 @@ class LocalClickHouseSpool:
             raise ValueError("ClickHouse spool must stay within its allowed development root")
         self.pending = self.root / "pending"
         self.replayed = self.root / "replayed"
+        self.intents = self.root / "intents"
         self.pending.mkdir(parents=True, exist_ok=True)
         self.replayed.mkdir(parents=True, exist_ok=True)
+        self.intents.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _now() -> str:
@@ -131,6 +133,30 @@ class LocalClickHouseSpool:
         self._atomic_json(destination, payload)
         path.unlink()
 
+    def save_intent(self, intent_id: str, rows: List[Dict[str, Any]], pending: List[str]) -> None:
+        self._atomic_json(self.intents / f"{intent_id}.json", {
+            "intent_id": intent_id, "rows": rows, "pending": pending,
+            "callback_attempts": 0, "last_callback_error": "",
+        })
+
+    def complete_chunk(self, intent_id: str, batch_id: str) -> Optional[Dict[str, Any]]:
+        path = self.intents / f"{intent_id}.json"
+        if not path.exists():
+            return None
+        intent = self.read(path)
+        intent["pending"] = [value for value in intent["pending"] if value != batch_id]
+        self._atomic_json(path, intent)
+        return intent if not intent["pending"] else None
+
+    def callback_result(self, intent: Dict[str, Any], error: str = "") -> None:
+        path = self.intents / f"{intent['intent_id']}.json"
+        if error:
+            intent["callback_attempts"] = int(intent.get("callback_attempts", 0)) + 1
+            intent["last_callback_error"] = error[:4000]
+            self._atomic_json(path, intent)
+        elif path.exists():
+            path.unlink()
+
     @staticmethod
     def _bounded_files(folder: Path, limit: int) -> tuple[List[Path], bool]:
         files = []
@@ -177,6 +203,7 @@ class ReliableClickHouseWriter:
         self.spool = spool
         self.batch_size = batch_size
         self.on_raw_replayed: Optional[Callable[[List[Dict[str, Any]]], None]] = None
+        self.last_replay_callback: Dict[str, Any] = {"status": "not_run"}
 
     @staticmethod
     def _chunks(rows: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
@@ -192,15 +219,24 @@ class ReliableClickHouseWriter:
         if dataset not in DATASET_COLUMNS:
             raise ValueError("dataset must be raw or canonical")
         outcome = {"rows": len(rows), "written": 0, "spooled": 0, "batches": 0}
-        for input_chunk in self._chunks(rows, self.batch_size):
-            chunk = [normalize_bar(dataset, row) for row in input_chunk]
+        normalized_rows = [normalize_bar(dataset, row) for row in rows]
+        failed_batches = []
+        intent_id = stable_batch_id(dataset, normalized_rows)
+        for chunk in self._chunks(normalized_rows, self.batch_size):
             batch_id = stable_batch_id(dataset, chunk)
             outcome["batches"] += 1
             try:
                 outcome["written"] += self._insert(dataset, chunk, batch_id)
             except Exception as error:
                 self.spool.enqueue(dataset, batch_id, chunk, str(error))
+                failed_batches.append(batch_id)
                 outcome["spooled"] += len(chunk)
+        if dataset == "raw" and failed_batches:
+            self.spool.save_intent(intent_id, normalized_rows, failed_batches)
+            for batch_id in failed_batches:
+                path = self.spool.pending / f"{batch_id}.json"
+                payload = self.spool.read(path)
+                self.spool._atomic_json(path, {**payload, "intent_id": intent_id})
         return outcome
 
     def replay(self, limit: int = 100) -> Dict[str, int]:
@@ -221,9 +257,15 @@ class ReliableClickHouseWriter:
             else:
                 self.spool.mark_replayed(path, payload)
                 outcome["replayed"] += 1
-                if payload["dataset"] == "raw" and self.on_raw_replayed:
+                intent = (self.spool.complete_chunk(payload["intent_id"], payload["batch_id"])
+                          if payload["dataset"] == "raw" and payload.get("intent_id") else None)
+                if intent and self.on_raw_replayed:
                     try:
-                        self.on_raw_replayed(payload["rows"])
-                    except Exception:
-                        pass
+                        self.on_raw_replayed(intent["rows"])
+                    except Exception as error:
+                        self.spool.callback_result(intent, str(error))
+                        self.last_replay_callback = {"status": "error", "error": str(error)[:4000]}
+                    else:
+                        self.spool.callback_result(intent)
+                        self.last_replay_callback = {"status": "ok", "rows": len(intent["rows"])}
         return outcome

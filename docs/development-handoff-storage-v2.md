@@ -121,6 +121,9 @@ DuckDB
   min/max 闭区间同步执行有界 rebuild；raw 仅落 spool 时不执行，只有该 raw 项成功 replay
   后才执行。canonical spool 不触发回调；所有截断、写入失败和异常均 fail-open，并在
   `auto_canonical` diagnostics 中有界记录，不改变 DuckDB primary 返回。
+  分块 raw 写入会持久化逻辑批次 intent（完整规范化 rows、完整范围和 pending chunk ID）；
+  只有所有失败块均成功 replay 后才用完整逻辑批次触发一次 rebuild。回调异常保留 intent、
+  记录有界 `replay_callback` 错误，不会被静默丢弃。
 
 ## 二、仓库、分支和 worktree
 

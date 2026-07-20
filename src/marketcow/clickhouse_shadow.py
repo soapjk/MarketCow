@@ -314,7 +314,10 @@ class ShadowMarketBarRepository:
                 "read": self._last_read, "auto_canonical": self._last_auto_canonical,
                 "canonical": (self.canonical_builder.last_diagnostics
                               if self.canonical_builder else {"status": "disabled"}),
-                "spool": self.writer.spool.diagnostics()}
+                "spool": self.writer.spool.diagnostics(),
+                "replay_callback": getattr(
+                    self.writer, "last_replay_callback", {"status": "not_run"}
+                )}
 
     def rebuild_canonical(
         self, symbol: str, interval: str, adjustment: str,
