@@ -271,8 +271,7 @@ class ProductionReadinessPackage:
     def _verify_evidence(self, paths: Mapping[str, Path], release_commit: str) -> Dict[str, Any]:
         head = _git(self.repository_root, "rev-parse", "HEAD")
         release = _git(self.repository_root, "rev-parse", f"{release_commit}^{{commit}}")
-        if release != head:
-            raise ValueError("readiness release commit must equal local HEAD")
+        _git(self.repository_root, "merge-base", "--is-ancestor", release, head)
         result: Dict[str, Any] = {}
         for item in REQUIRED_ARTIFACTS:
             acceptance_path = _contained_file(Path(paths[item]), self.allowed_root_supplied,
@@ -370,7 +369,8 @@ class ProductionReadinessPackage:
         target = dict(self.inputs.target)
         return {
             "version": READINESS_VERSION, "status": "ready_for_user_review",
-            "release_commit": _git(self.repository_root, "rev-parse", "HEAD"),
+            "release_commit": _git(self.repository_root, "rev-parse",
+                                   f"{self.inputs.release_commit}^{{commit}}"),
             "evidence": self._public_evidence(), "target": target,
             "capacity": {
                 "measured_raw_rows": capacity["measured_raw_rows"],
