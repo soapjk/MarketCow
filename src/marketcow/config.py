@@ -31,6 +31,7 @@ class Settings:
     clickhouse_secure: bool = False
     clickhouse_batch_size: int = 5000
     clickhouse_spool_path: Path = Path("data-development/spool/clickhouse")
+    storage_root: Path = Path("data")
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -84,6 +85,7 @@ class Settings:
             clickhouse_spool_path=Path(os.getenv(
                 "MARKETCOW_CLICKHOUSE_SPOOL", str(data_root / "spool/clickhouse")
             )).expanduser(),
+            storage_root=data_root,
         )
 
     def validate_runtime_isolation(self) -> None:
@@ -111,10 +113,15 @@ class Settings:
                 )
             if not 1000 <= self.clickhouse_batch_size <= 50000:
                 raise ValueError("ClickHouse batch size must be between 1000 and 50000")
-            production_spool = (Path.cwd() / "data").resolve()
+            storage_root = self.storage_root.resolve()
+            root_name = storage_root.name.lower()
+            if "development" not in root_name and not root_name.endswith(("_test", "-test")):
+                raise ValueError(
+                    "ClickHouse storage root must be explicitly named development or test"
+                )
             spool = self.clickhouse_spool_path.resolve()
-            if spool == production_spool or production_spool in spool.parents:
-                raise ValueError("development ClickHouse spool must not use production data")
+            if spool != storage_root and storage_root not in spool.parents:
+                raise ValueError("ClickHouse spool must stay within development storage root")
         if self.profile != "development":
             return
         production_db = (Path.cwd() / "data/warehouse/market_data.duckdb").resolve()

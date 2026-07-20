@@ -101,7 +101,8 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
     def test_chunked_writer_repeat_batch_and_spool_replay(self):
         with tempfile.TemporaryDirectory() as folder:
             writer = ReliableClickHouseWriter(
-                self.repository, LocalClickHouseSpool(Path(folder)), 1000
+                self.repository,
+                LocalClickHouseSpool(Path(folder) / "spool", Path(folder)), 1000,
             )
             rows = [{
                 "symbol": f"{index:06d}.SZ", "market": "CN", "interval": "1m",

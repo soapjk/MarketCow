@@ -48,6 +48,9 @@ DuckDB
 - 已实现独立的可靠影子写入原语：1000～50000 行可配置微批、字段和 UTC 时间
   规范化、稳定批次 ID、development 本地原子 WAL、显式有界重放与诊断。该 writer
   尚未接入 ingestion/service 或 DuckDB 主写路径。
+- WAL 隔离采用显式 development storage root 允许边界：配置层要求 root 名称明确包含
+  development/test 且 spool resolve 后位于其中；`LocalClickHouseSpool` 构造层再次要求
+  显式 allowed root 并在创建目录前校验。兄弟正式目录、`..` 穿越及 symlink 逃逸均拒绝。
 
 ## 二、仓库、分支和 worktree
 

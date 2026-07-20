@@ -60,11 +60,11 @@ def stable_batch_id(dataset: str, rows: List[Dict[str, Any]]) -> str:
 class LocalClickHouseSpool:
     """Atomic development-only filesystem WAL for failed ClickHouse batches."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, allowed_root: Path) -> None:
         self.root = root.resolve()
-        production = (Path.cwd() / "data").resolve()
-        if self.root == production or production in self.root.parents:
-            raise ValueError("ClickHouse spool must not use the production data directory")
+        self.allowed_root = allowed_root.resolve()
+        if self.root != self.allowed_root and self.allowed_root not in self.root.parents:
+            raise ValueError("ClickHouse spool must stay within its allowed development root")
         self.pending = self.root / "pending"
         self.replayed = self.root / "replayed"
         self.pending.mkdir(parents=True, exist_ok=True)

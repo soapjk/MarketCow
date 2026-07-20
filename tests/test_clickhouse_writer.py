@@ -45,7 +45,8 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
                          stable_batch_id("raw", [normalized]))
         with tempfile.TemporaryDirectory() as folder:
             writer = ReliableClickHouseWriter(
-                FakeRepository(False), LocalClickHouseSpool(Path(folder)), 1000
+                FakeRepository(False),
+                LocalClickHouseSpool(Path(folder) / "spool", Path(folder)), 1000,
             )
             self.assertEqual(writer.write("raw", []),
                              {"rows": 0, "written": 0, "spooled": 0, "batches": 0})
@@ -59,7 +60,7 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
     def test_micro_batches_spool_atomically_and_replay_after_recovery(self):
         with tempfile.TemporaryDirectory() as folder:
             repository = FakeRepository(True)
-            spool = LocalClickHouseSpool(Path(folder))
+            spool = LocalClickHouseSpool(Path(folder) / "spool", Path(folder))
             writer = ReliableClickHouseWriter(repository, spool, 1000)
             result = writer.write("raw", [raw_bar(index) for index in range(2001)])
             self.assertEqual(result, {"rows": 2001, "written": 0,
@@ -83,7 +84,7 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
 
     def test_failed_replay_increments_attempts_without_duplicate_wal(self):
         with tempfile.TemporaryDirectory() as folder:
-            spool = LocalClickHouseSpool(Path(folder))
+            spool = LocalClickHouseSpool(Path(folder) / "spool", Path(folder))
             writer = ReliableClickHouseWriter(FakeRepository(True), spool, 1000)
             writer.write("raw", [raw_bar()])
             writer.replay()
@@ -91,10 +92,24 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
             self.assertEqual(len(paths), 1)
             self.assertEqual(spool.read(paths[0])["attempts"], 2)
 
-    def test_production_spool_path_is_rejected(self):
-        production = Path.cwd() / "data/spool/clickhouse"
-        with self.assertRaisesRegex(ValueError, "production data"):
-            LocalClickHouseSpool(production)
+    def test_allowed_root_rejects_formal_path_traversal_and_symlink_escape(self):
+        formal = Path("/Volumes/T9/projects/market-data-service/data/spool/clickhouse")
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            development = base / "data-development"
+            outside = base / "outside"
+            development.mkdir()
+            outside.mkdir()
+            with self.assertRaisesRegex(ValueError, "allowed development root"):
+                LocalClickHouseSpool(formal, development)
+            with self.assertRaisesRegex(ValueError, "allowed development root"):
+                LocalClickHouseSpool(development / "../outside/spool", development)
+            link = development / "linked-outside"
+            link.symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "allowed development root"):
+                LocalClickHouseSpool(link / "spool", development)
+            allowed = LocalClickHouseSpool(development / "spool/clickhouse", development)
+            self.assertEqual(allowed.allowed_root, development.resolve())
 
 
 if __name__ == "__main__":
