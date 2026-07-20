@@ -124,6 +124,9 @@ DuckDB
   分块 raw 写入会持久化逻辑批次 intent（完整规范化 rows、完整范围和 pending chunk ID）；
   只有所有失败块均成功 replay 后才用完整逻辑批次触发一次 rebuild。回调异常保留 intent、
   记录有界 `replay_callback` 错误，不会被静默丢弃。
+  显式 replay 还会有界扫描无 pending 的 ready intents；callback 失败或进程重启后可重试，
+  成功即删除 intent。intent 在回调前原子 claim，且会依据 pending/replayed WAL 状态收敛，
+  可恢复 WAL 已移走但 intent 尚未更新的崩溃窗口。
 
 ## 二、仓库、分支和 worktree
 

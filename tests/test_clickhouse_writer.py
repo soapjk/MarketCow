@@ -67,6 +67,30 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
             intents = list(spool.intents.glob("*.json"))
             self.assertTrue(any("callback boom" in spool.read(path).get("last_callback_error", "")
                                 for path in intents))
+            recovered = []
+            restarted = ReliableClickHouseWriter(repository, spool, 1000)
+            restarted.on_raw_replayed = lambda rows: recovered.append(rows)
+            restarted.replay(limit=10)
+            self.assertEqual(len(recovered[0]), 2501)
+            self.assertEqual(list(spool.intents.glob("*.json")), [])
+            restarted.replay(limit=10)
+            self.assertEqual(len(recovered), 1)
+
+    def test_intent_recovers_crash_after_wal_moved_before_completion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            writer = ReliableClickHouseWriter(FakeRepository(True), spool, 1000)
+            writer.write("raw", [raw_bar()])
+            wal = next(spool.pending.glob("*.json"))
+            payload = spool.read(wal)
+            spool.mark_replayed(wal, payload)  # simulate crash before complete_chunk
+            recovered = []
+            restarted = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            restarted.on_raw_replayed = lambda rows: recovered.append(rows)
+            restarted.replay()
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(list(spool.intents.glob("*.json")), [])
     def test_normalization_empty_batch_and_stable_identity(self):
         normalized = normalize_bar("raw", raw_bar())
         self.assertEqual(normalized["open"], 100.0)

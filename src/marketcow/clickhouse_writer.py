@@ -80,9 +80,11 @@ class LocalClickHouseSpool:
         self.pending = self.root / "pending"
         self.replayed = self.root / "replayed"
         self.intents = self.root / "intents"
+        self.processing_intents = self.root / "processing-intents"
         self.pending.mkdir(parents=True, exist_ok=True)
         self.replayed.mkdir(parents=True, exist_ok=True)
         self.intents.mkdir(parents=True, exist_ok=True)
+        self.processing_intents.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _now() -> str:
@@ -139,21 +141,41 @@ class LocalClickHouseSpool:
             "callback_attempts": 0, "last_callback_error": "",
         })
 
-    def complete_chunk(self, intent_id: str, batch_id: str) -> Optional[Dict[str, Any]]:
+    def complete_chunk(self, intent_id: str, batch_id: str) -> None:
         path = self.intents / f"{intent_id}.json"
         if not path.exists():
-            return None
+            return
         intent = self.read(path)
         intent["pending"] = [value for value in intent["pending"] if value != batch_id]
         self._atomic_json(path, intent)
-        return intent if not intent["pending"] else None
+    def ready_intents(self, limit: int) -> List[Dict[str, Any]]:
+        # A crash while claimed is recoverable; rebuild itself is idempotent.
+        processing, _ = self._bounded_files(self.processing_intents, limit)
+        for path in processing:
+            os.replace(path, self.intents / path.name)
+        paths, _ = self._bounded_files(self.intents, limit)
+        ready = []
+        for path in paths:
+            intent = self.read(path)
+            remaining = [batch_id for batch_id in intent["pending"]
+                         if (self.pending / f"{batch_id}.json").exists()]
+            if remaining != intent["pending"]:
+                intent["pending"] = remaining
+                self._atomic_json(path, intent)
+            if not remaining:
+                claimed = self.processing_intents / path.name
+                os.replace(path, claimed)
+                ready.append(self.read(claimed))
+        return ready
 
     def callback_result(self, intent: Dict[str, Any], error: str = "") -> None:
-        path = self.intents / f"{intent['intent_id']}.json"
+        path = self.processing_intents / f"{intent['intent_id']}.json"
         if error:
             intent["callback_attempts"] = int(intent.get("callback_attempts", 0)) + 1
             intent["last_callback_error"] = error[:4000]
-            self._atomic_json(path, intent)
+            self._atomic_json(self.intents / path.name, intent)
+            if path.exists():
+                path.unlink()
         elif path.exists():
             path.unlink()
 
@@ -257,15 +279,16 @@ class ReliableClickHouseWriter:
             else:
                 self.spool.mark_replayed(path, payload)
                 outcome["replayed"] += 1
-                intent = (self.spool.complete_chunk(payload["intent_id"], payload["batch_id"])
-                          if payload["dataset"] == "raw" and payload.get("intent_id") else None)
-                if intent and self.on_raw_replayed:
-                    try:
-                        self.on_raw_replayed(intent["rows"])
-                    except Exception as error:
-                        self.spool.callback_result(intent, str(error))
-                        self.last_replay_callback = {"status": "error", "error": str(error)[:4000]}
-                    else:
-                        self.spool.callback_result(intent)
-                        self.last_replay_callback = {"status": "ok", "rows": len(intent["rows"])}
+                if payload["dataset"] == "raw" and payload.get("intent_id"):
+                    self.spool.complete_chunk(payload["intent_id"], payload["batch_id"])
+        if self.on_raw_replayed:
+            for intent in self.spool.ready_intents(limit):
+                try:
+                    self.on_raw_replayed(intent["rows"])
+                except Exception as error:
+                    self.spool.callback_result(intent, str(error))
+                    self.last_replay_callback = {"status": "error", "error": str(error)[:4000]}
+                else:
+                    self.spool.callback_result(intent)
+                    self.last_replay_callback = {"status": "ok", "rows": len(intent["rows"])}
         return outcome
