@@ -6,10 +6,35 @@ import json
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Iterator, List
 
 from .clickhouse_writer import LocalClickHouseSpool, normalize_bar, stable_batch_id
+from .telemetry import sanitize_text, telemetry_call
+
+
+MAX_AUDIT_BYTES = 256 * 1024
+MAX_AUDIT_EVENTS = 500
+
+
+def _serialized_read(action: str):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(self, *args, **kwargs):
+            lock_path = self.spool.root / ".operator.lock"
+            with lock_path.open("a+") as lock:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self._metric(action, "blocked")
+                    raise RuntimeError("another spool operation is active") from None
+                try:
+                    return function(self, *args, **kwargs)
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return wrapped
+    return decorate
 
 
 KINDS = {
@@ -142,6 +167,10 @@ class SpoolOperator:
         self.spool = spool
         self.scheduler_root = spool.root / "canonical-scheduler"
         self.audit_log = spool.root / "operator-audit.jsonl"
+        self.telemetry = getattr(spool, "telemetry", None)
+
+    def _metric(self, action: str, outcome: str) -> None:
+        telemetry_call(self.telemetry, "record_operator", action, outcome)
 
     @contextmanager
     def mutation(self, action: str) -> Iterator[None]:
@@ -154,8 +183,16 @@ class SpoolOperator:
             try:
                 yield
                 self._trace(action, "ok")
+                normalized = {
+                    "quarantine-corrupt": "quarantine",
+                    "retry-scheduler-failed": "retry",
+                    "cleanup-replayed": "cleanup",
+                    "migrate-legacy": "audit",
+                }.get(action, action)
+                self._metric(normalized, "ok")
             except Exception as error:
                 self._trace(action, "error", str(error))
+                self._metric("audit", "error")
                 raise
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -163,14 +200,48 @@ class SpoolOperator:
     def _trace(self, action: str, status: str, error: str = "") -> None:
         record = json.dumps({
             "at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "action": action, "status": status, "error": error[:1000],
+            "action": action, "status": status, "error": sanitize_text(error),
         }, sort_keys=True) + "\n"
-        descriptor = os.open(self.audit_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        descriptor = os.open(
+            self.audit_log,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
         try:
             os.write(descriptor, record.encode("utf-8"))
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        if self.audit_log.stat().st_size > MAX_AUDIT_BYTES:
+            lines = self.audit_log.read_bytes().splitlines()[-MAX_AUDIT_EVENTS:]
+            selected = []
+            used = 0
+            for line in reversed(lines):
+                size = len(line) + 1
+                if used + size > MAX_AUDIT_BYTES:
+                    break
+                selected.append(line)
+                used += size
+            bounded = b"\n".join(reversed(selected))
+            if selected:
+                bounded += b"\n"
+            temporary = self.audit_log.with_suffix(".tmp")
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.write(descriptor, bounded)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, self.audit_log)
+            directory = os.open(self.audit_log.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
 
     def _folder(self, kind: str) -> Path:
         if kind in KINDS:
@@ -184,6 +255,7 @@ class SpoolOperator:
             raise ValueError("spool item folder escapes the allowed spool root")
         return resolved
 
+    @_serialized_read("list")
     def list_items(self, kind: str, limit: int = 100) -> Dict[str, Any]:
         if not 1 <= limit <= 1000:
             raise ValueError("operator limit must be between 1 and 1000")
@@ -203,10 +275,12 @@ class SpoolOperator:
                         item[key] = payload[key]
             except Exception as error:
                 item = {"name": path.name, "status": "corrupt",
-                        "error": str(error)[:1000]}
+                        "error": sanitize_text(error)}
             items.append(item)
-        return {"status": "attention" if any(item["status"] != "ok" for item in items)
-                else "ok", "kind": kind, "items": items, "truncated": truncated}
+        result = {"status": "attention" if any(item["status"] != "ok" for item in items)
+                  else "ok", "kind": kind, "items": items, "truncated": truncated}
+        self._metric("list", "partial" if result["status"] != "ok" else "ok")
+        return result
 
     def migrate_legacy(self, limit: int = 100, already_locked: bool = False,
                        kinds: tuple[str, ...] = LEGACY_KINDS) -> Dict[str, Any]:
@@ -271,6 +345,7 @@ class SpoolOperator:
                 "truncated": bool(remaining or scan_truncated),
                 "scan_truncated": scan_truncated}
 
+    @_serialized_read("audit")
     def audit(self, limit: int = 1000) -> Dict[str, Any]:
         if not 1 <= limit <= 10000:
             raise ValueError("audit limit must be between 1 and 10000")
@@ -290,7 +365,7 @@ class SpoolOperator:
                     payload = self.spool.read(path, require_checksum=True)
                 except Exception as error:
                     corrupt.append({"kind": kind, "name": path.name,
-                                    "error": str(error)[:1000]})
+                                    "error": sanitize_text(error)})
                     continue
                 if kind == "wal-pending":
                     wal_ids.add(str(payload.get("batch_id")))
@@ -304,10 +379,12 @@ class SpoolOperator:
                 break
         missing_wal = sorted(intent_refs - wal_ids - replayed_ids)[:limit]
         orphan_wal = sorted(wal_ids - intent_refs)[:limit]
-        return {"status": "ok" if not corrupt and not missing_wal else "attention",
-                "checked": checked, "truncated": checked >= limit,
-                "corrupt": corrupt[:limit], "missing_wal_references": missing_wal,
-                "orphan_wal": orphan_wal, "quota": self.spool.usage(limit)}
+        result = {"status": "ok" if not corrupt and not missing_wal else "attention",
+                  "checked": checked, "truncated": checked >= limit,
+                  "corrupt": corrupt[:limit], "missing_wal_references": missing_wal,
+                  "orphan_wal": orphan_wal, "quota": self.spool.usage(limit)}
+        self._metric("audit", "partial" if result["status"] != "ok" else "ok")
+        return result
 
     def quarantine_corrupt(self, limit: int = 100) -> Dict[str, Any]:
         if not 1 <= limit <= 1000:

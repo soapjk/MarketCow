@@ -1737,7 +1737,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：预检后原子恢复；断点可续；恢复目标通过全域契约；canonical 不越过 verified raw watermark。
 - **必要测试**：真实 disposable 联合恢复、缺失/损坏/错密钥/版本、阶段故障、重复恢复、spool 单次消费。
 - **排除项**：production 备份、远程存储和 DuckDB 在线恢复。
-- **状态**：`本地实现完成，待独立验收`。新增 offline-only `marketcow.v2_backup_restore`，固定
+- **状态**：`已验收（f52e4bf）`。新增 offline-only `marketcow.v2_backup_restore`，固定
   `storage-v2.pg-ch-backup-manifest.v1` 八组件集合与顺序：PostgreSQL 18 权威域、ClickHouse raw/canonical、
   Artifact/Parquet、authoritative WAL/intents/quarantine、canonical scheduler state、V2 config version、BG-014
   migration watermark、authenticated-sealed cursor key；manifest 中不存在 DuckDB。通用 local backup/restore 原语
@@ -1761,7 +1761,17 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：无 DuckDB label/探针；基数有界、脱敏、并发安全、fail-open；运维变更串行可追溯。
 - **必要测试**：时钟/并发/故障、配额/权限/损坏、schema golden、PG/CH outage→recovery。
 - **排除项**：外部告警、dashboard 和 production 运维。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增版本化 `storage-v2.pg-ch-telemetry.v1` 在线契约，
+  仅发布固定 PG/CH、authoritative write/replay、WAL/quarantine/dead-letter、canonical queue/rebuild/lag、
+  cache freshness、backup/restore、operator 与 ClickHouse pressure 指标；单位、histogram buckets、label 枚举、
+  metric series 上限、200 条环形日志与 1000 字符文本上限均可机器读取。V2 snapshot 会拒绝/过滤 DuckDB 与
+  fallback label，disabled scheduler 仍只由 health 契约报告 disabled，不产生 active healthy series。所有新增业务
+  接入均经 fail-open adapter，telemetry clock/metric/log/snapshot 故障不改变 writer、repository 或 operator 结果。
+  Spool operator 的 list/audit/migrate/quarantine/retry/cleanup/replay 保持 development/test-only、有界 scan、统一
+  `.operator.lock`、checksum/containment/symlink 边界；审计错误统一凭证/DSN/绝对路径脱敏，文件权限 0600，并以
+  256 KiB/500 事件硬上限原子轮转。BG-009 固定枚举四态 health/readiness 继续作为唯一 V2 状态机，PG/CH/WAL/
+  scheduler/pressure 故障不暴露原始异常。专项覆盖固定时钟、schema/单位/桶/label、并发 snapshot、基数和日志上限、
+  telemetry 全面故障、authoritative outcome/replay、operator 审计脱敏与重启幂等；未启动 BG-018。
 
 ### `BG-018`：纯 PG/CH 性能容量与稳定性门禁
 

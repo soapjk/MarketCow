@@ -530,6 +530,16 @@ class ReliableClickHouseWriter:
                     )
             except Exception:
                 pass
+            status = str(outcome["status"])
+            authoritative = {
+                "success": "acknowledged",
+                "durable_pending": "durable_pending",
+                "canonical_intent_pending": "retryable",
+                "terminal_failure": "terminal",
+            }.get(status, "retryable")
+            telemetry_call(
+                self.spool.telemetry, "record_authoritative", authoritative,
+            )
         return outcome
 
     def replay(self, limit: int = 100) -> Dict[str, Any]:
@@ -650,4 +660,13 @@ class ReliableClickHouseWriter:
                 )
             except Exception:
                 pass
+            for key, label in (
+                ("replayed", "replayed"), ("quarantined", "quarantined"),
+                ("failed", "dead_letter"), ("legacy_blocked", "blocked"),
+            ):
+                amount = int(outcome.get(key, 0))
+                if amount:
+                    telemetry_call(
+                        self.spool.telemetry, "record_replay", label, amount,
+                    )
         return outcome

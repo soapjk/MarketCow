@@ -232,8 +232,8 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
 
 def operate_spool(settings: Settings, action: str, limit: int = 100,
                   kind: str = "", retention_seconds: int = 0) -> dict[str, Any]:
-    if settings.profile != "development":
-        raise ValueError("spool operator is development-only")
+    if settings.profile not in {"development", "test", "v2-development", "v2-test"}:
+        raise ValueError("spool operator is development-only/test-only")
     from .clickhouse_writer import LocalClickHouseSpool
     from .spool_operator import SpoolOperator
 

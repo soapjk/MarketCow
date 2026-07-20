@@ -11,7 +11,7 @@ from .clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
 from .config import Settings
 from .postgres_migrations import POSTGRES_TRANSACTION_DOMAINS
 from .postgres_repositories import PostgresDatabase, PostgresRepository
-from .telemetry import Telemetry
+from .v2_observability import V2Telemetry
 from .health import V2_HEALTH_SCHEMA
 
 
@@ -23,7 +23,7 @@ class V2FactoryDependencies:
     postgres_repository: Callable[..., Any] = PostgresRepository
     clickhouse_database: Callable[..., Any] = ClickHouseDatabase
     clickhouse_repository: Callable[..., Any] = ClickHouseMarketBarRepository
-    telemetry: Callable[..., Any] = Telemetry
+    telemetry: Callable[..., Any] = V2Telemetry
     spool: Callable[..., Any] = LocalClickHouseSpool
     writer: Callable[..., Any] = ReliableClickHouseWriter
     canonical_builder: Callable[..., Any] = CanonicalMarketBarBuilder
