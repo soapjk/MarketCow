@@ -159,6 +159,33 @@ class LocalStorageBackfill:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def _logical_fingerprint(self, path: Path | None = None) -> str:
+        """Fingerprint bounded logical rows, not mutable DuckDB file bytes."""
+        import duckdb
+
+        database = Path(path or self.source.path)
+        payload = []
+        with duckdb.connect(str(database), read_only=True) as connection:
+            for domain in (*POSTGRES_DOMAINS, Domain(
+                "market_price_bar",
+                ("symbol", "interval", "adjustment", "timestamp", "source"),
+            )):
+                columns = self._columns(connection, domain.table)
+                count = connection.execute(
+                    f'SELECT count(*) FROM "{domain.table}"'
+                ).fetchone()[0]
+                if count > MAX_RECONCILE_ROWS:
+                    raise ValueError("logical fingerprint exceeds bounded row limit")
+                order = ", ".join(f'"{key}"' for key in domain.key)
+                rows = connection.execute(
+                    f'SELECT {", ".join(chr(34) + name + chr(34) for name in columns)} '
+                    f'FROM "{domain.table}" ORDER BY {order}'
+                ).fetchall()
+                payload.append((domain.table, count, self._rows_checksum(
+                    columns, rows, domain.json_columns
+                )))
+        return _hash(_json(payload))
+
     def _preflight(self) -> None:
         source_path = Path(self.source.path).resolve()
         if source_path.is_symlink() or not source_path.is_file():
@@ -176,8 +203,8 @@ class LocalStorageBackfill:
         versions = {row[0] for row in client.query(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).result_rows}
-        if not versions or max(versions) < 4:
-            raise ValueError("ClickHouse migrations are incomplete")
+        if versions != {1, 2, 3, 4}:
+            raise ValueError("ClickHouse migrations are incomplete or unknown")
         if not self.checkpoint_path.exists():
             with self.targets.postgres.connection() as connection:
                 occupied = sum(int(connection.execute(
@@ -226,7 +253,7 @@ class LocalStorageBackfill:
             "phase": "backfill",
             "domains": {},
             "catchup_passes": 0,
-            "last_live_fingerprint": None,
+            "last_live_fingerprint": None, "completion_fingerprint": None,
             "errors": [],
         }
         self._save(checkpoint)
@@ -381,6 +408,36 @@ class LocalStorageBackfill:
         self._save(checkpoint)
         return state["rows"]
 
+    def _active_raw_rows(self) -> list[Dict[str, Any]]:
+        import duckdb
+
+        with duckdb.connect(str(self.source.path), read_only=True) as source:
+            count = source.execute("SELECT count(*) FROM market_price_bar").fetchone()[0]
+            if count > MAX_RECONCILE_ROWS:
+                raise ValueError("market canonicalization exceeds bounded row limit")
+            columns = self._columns(source, "market_price_bar")
+            rows = source.execute(
+                "SELECT * FROM market_price_bar ORDER BY symbol, interval, adjustment, "
+                "timestamp, source"
+            ).fetchall()
+        return [normalize_bar("raw", self._raw_row(columns, row)) for row in rows]
+
+    def _finalize_canonical(self, fault_hook: Any = None) -> list[Dict[str, Any]]:
+        """Create one deterministic canonical generation from the final raw set."""
+        raw = self._active_raw_rows()
+        expected, _, _ = self.targets.canonical_builder.build_rows(raw, [])
+        if fault_hook:
+            fault_hook("before_write", "clickhouse:canonical:final")
+        self.targets.clickhouse._require_client().command(
+            "TRUNCATE TABLE market_bar_canonical"
+        )
+        outcome = self.targets.writer.write("canonical", expected)
+        if outcome["spooled"] or outcome["written"] != len(expected):
+            raise RuntimeError("final canonical generation did not complete")
+        if fault_hook:
+            fault_hook("after_write", "clickhouse:canonical:final")
+        return expected
+
     def run(self, fault_hook: Any = None, max_catchup_passes: int = 10) -> Dict[str, Any]:
         started = self.clock()
         if not 1 <= max_catchup_passes <= 100:
@@ -397,27 +454,48 @@ class LocalStorageBackfill:
                     self._copy_market(checkpoint, self.snapshot_path, "snapshot", fault_hook)
                     checkpoint["phase"] = "catchup"
                     self._save(checkpoint)
-                stable = False
+                stable = checkpoint.get("phase") == "complete"
+                reconciliation = None
                 for _ in range(max_catchup_passes):
-                    fingerprint_before = self._source_fingerprint()
+                    fingerprint_before = self._logical_fingerprint()
                     pass_id = checkpoint["catchup_passes"] + 1
                     for domain in POSTGRES_DOMAINS:
                         self._copy_domain(checkpoint, Path(self.source.path), domain,
                                           f"catchup-{pass_id}", fault_hook)
                     self._copy_market(checkpoint, Path(self.source.path), f"catchup-{pass_id}", fault_hook)
-                    fingerprint_after = self._source_fingerprint()
+                    fingerprint_after = self._logical_fingerprint()
                     checkpoint["catchup_passes"] = pass_id
                     checkpoint["last_live_fingerprint"] = fingerprint_after
                     stable = fingerprint_before == fingerprint_after
-                    checkpoint["phase"] = "reconcile" if stable else "catchup"
+                    checkpoint["phase"] = "canonicalize" if stable else "catchup"
                     self._save(checkpoint)
-                    if stable:
-                        break
-                if not stable and checkpoint["phase"] != "reconcile":
+                    if not stable:
+                        continue
+                    expected_canonical = self._finalize_canonical(fault_hook)
+                    checkpoint["phase"] = "reconcile"
+                    self._save(checkpoint)
+                    before_reconcile = self._logical_fingerprint()
+                    if before_reconcile != checkpoint["last_live_fingerprint"]:
+                        checkpoint["phase"] = "catchup"
+                        self._save(checkpoint)
+                        stable = False
+                        continue
+                    reconciliation = self.reconcile(expected_canonical)
+                    after_reconcile = self._logical_fingerprint()
+                    if after_reconcile != before_reconcile:
+                        checkpoint["phase"] = "catchup"
+                        self._save(checkpoint)
+                        stable = False
+                        continue
+                    checkpoint["completion_fingerprint"] = after_reconcile
+                    break
+                if not stable or reconciliation is None:
                     raise RuntimeError("catch-up did not reach a stable source watermark")
-                reconciliation = self.reconcile()
                 if reconciliation["status"] != "ok":
-                    raise RuntimeError("backfill reconciliation failed")
+                    raise RuntimeError(
+                        "backfill reconciliation failed: " +
+                        json.dumps(reconciliation["mismatches"][:MAX_ERRORS], sort_keys=True)
+                    )
                 checkpoint["phase"] = "complete"
                 self._save(checkpoint)
                 report = self._report(
@@ -440,6 +518,14 @@ class LocalStorageBackfill:
     def _canonical_value(value: Any) -> Any:
         if isinstance(value, datetime):
             return _iso(value)
+        if isinstance(value, str) and "T" in value:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+            else:
+                if parsed.tzinfo is not None:
+                    return _iso(parsed)
         if isinstance(value, (bytes, bytearray)):
             return value.hex()
         if isinstance(value, float):
@@ -470,7 +556,16 @@ class LocalStorageBackfill:
         ]
         return _hash(_json(normalized))
 
-    def reconcile(self) -> Dict[str, Any]:
+    def _canonical_matches(
+        self, expected: Sequence[Mapping[str, Any]], actual: Sequence[Sequence[Any]],
+    ) -> bool:
+        columns = list(self.targets.writer.repository.CANONICAL_COLUMNS)
+        expected_rows = [tuple(row.get(column) for column in columns) for row in expected]
+        return (len(expected_rows) == len(actual) and
+                self._rows_checksum(columns, expected_rows) ==
+                self._rows_checksum(columns, actual))
+
+    def reconcile(self, expected_canonical: Sequence[Mapping[str, Any]] | None = None) -> Dict[str, Any]:
         import duckdb
 
         mismatches = []
@@ -533,20 +628,21 @@ class LocalStorageBackfill:
         domains.append({"domain": "market_bar_raw", "rows": market_rows,
                         "status": "ok" if market_rows == click_rows and raw_checksum_ok
                         else "mismatch"})
-        canonical_expected = self.targets.clickhouse._require_client().query(
-            "SELECT uniqExact(tuple(symbol, interval, adjustment, bar_time)) "
-            "FROM market_bar_raw FINAL"
-        ).result_rows[0][0]
+        expected_canonical = list(expected_canonical if expected_canonical is not None else
+                                  self.targets.canonical_builder.build_rows(normalized_raw, [])[0])
+        canonical_columns = list(self.targets.writer.repository.CANONICAL_COLUMNS)
         canonical_actual = self.targets.clickhouse._require_client().query(
-            "SELECT count() FROM market_bar_canonical FINAL"
-        ).result_rows[0][0]
-        canonical_ok = canonical_expected == canonical_actual
-        domains.append({"domain": "market_bar_canonical", "rows": canonical_expected,
+            "SELECT " + ", ".join(canonical_columns) +
+            " FROM market_bar_canonical FINAL ORDER BY symbol, interval, adjustment, bar_time"
+        ).result_rows
+        canonical_ok = self._canonical_matches(expected_canonical, canonical_actual)
+        domains.append({"domain": "market_bar_canonical", "rows": len(expected_canonical),
                         "status": "ok" if canonical_ok else "mismatch"})
         if not canonical_ok:
             mismatches.append({"domain": "market_bar_canonical",
-                               "source_rows": canonical_expected,
-                               "target_rows": canonical_actual})
+                               "source_rows": len(expected_canonical),
+                               "target_rows": len(canonical_actual),
+                               "reason": "business key/content/provenance/version checksum"})
         if self.targets.contract_gate is not None:
             gate = dict(self.targets.contract_gate())
             if gate.get("status") != "ok":
@@ -571,7 +667,9 @@ class LocalStorageBackfill:
                 for item in checkpoint.get("domains", {}).values()
             ),
             "duration_seconds": round(duration_seconds, 6),
-            "lag": 0,
+            "lag": (0 if checkpoint.get("completion_fingerprint") and
+                     checkpoint.get("completion_fingerprint") ==
+                     checkpoint.get("last_live_fingerprint") else 1),
             "domains": reconciliation["domains"],
             "mismatches": reconciliation["mismatches"],
             "recovery": "rerun the same bounded command; atomic checkpoints resume the current domain",
