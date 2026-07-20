@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from .telemetry import telemetry_call, telemetry_elapsed
+from .telemetry import sanitize_text, telemetry_call, telemetry_elapsed
 
 from .clickhouse_repositories import ClickHouseMarketBarRepository
 from .bar_version import raw_content_rank, raw_content_version
@@ -71,6 +71,18 @@ def stable_batch_id(dataset: str, rows: List[Dict[str, Any]]) -> str:
         allow_nan=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _bounded_error(error: BaseException) -> str:
+    return sanitize_text(f"{type(error).__name__}: {error}")[:1000]
+
+
+class AuthoritativeWriteError(RuntimeError):
+    """Fail-closed writer error carrying a bounded machine-readable outcome."""
+
+    def __init__(self, outcome: Dict[str, Any]) -> None:
+        self.outcome = outcome
+        super().__init__(f"ClickHouse authoritative write {outcome['status']}")
 
 
 class LocalClickHouseSpool:
@@ -164,14 +176,15 @@ class LocalClickHouseSpool:
                 os.unlink(temporary)
 
     def enqueue(
-        self, dataset: str, batch_id: str, rows: List[Dict[str, Any]], error: str
+        self, dataset: str, batch_id: str, rows: List[Dict[str, Any]], error: str,
+        increment_attempt: bool = True,
     ) -> Path:
         path = self.pending / f"{batch_id}.json"
         existing = self.read(path, require_checksum=True) if path.exists() else {}
         now = self._now()
         payload = {
             "dataset": dataset, "batch_id": batch_id, "rows": rows,
-            "attempts": int(existing.get("attempts", 0)) + 1,
+            "attempts": int(existing.get("attempts", 0)) + int(increment_attempt),
             "created_at": existing.get("created_at", now), "last_attempt_at": now,
             "last_error": error[:4000],
         }
@@ -207,6 +220,16 @@ class LocalClickHouseSpool:
         destination = self.replayed / path.name
         self._atomic_json(destination, payload)
         path.unlink()
+
+    def remove_intent(self, intent_id: str) -> None:
+        path = self.intents / f"{intent_id}.json"
+        if path.exists():
+            path.unlink()
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
 
     def save_intent(self, intent_id: str, rows: List[Dict[str, Any]], pending: List[str]) -> None:
         self._atomic_json(self.intents / f"{intent_id}.json", {
@@ -311,29 +334,137 @@ class ReliableClickHouseWriter:
                   else self.repository.insert_canonical_bars)
         return method(rows, batch_id=batch_id)
 
-    def write(self, dataset: str, rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    def write(self, dataset: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if dataset not in DATASET_COLUMNS:
             raise ValueError("dataset must be raw or canonical")
-        outcome = {"rows": len(rows), "written": 0, "spooled": 0, "batches": 0}
+        outcome: Dict[str, Any] = {
+            "status": "success", "acknowledged": True, "verified": True,
+            "durability": "committed", "retryable": False,
+            "terminal": False, "rows": len(rows), "written": 0,
+            "spooled": 0, "batches": 0, "intent_id": "",
+            "pending_batches": [], "error": "",
+        }
         started = telemetry_elapsed(self.spool.telemetry)
         normalized_rows = [normalize_bar(dataset, row) for row in rows]
-        failed_batches = []
         intent_id = stable_batch_id(dataset, normalized_rows)
+        outcome["intent_id"] = intent_id
+        chunks = []
         for chunk in self._chunks(normalized_rows, self.batch_size):
             batch_id = stable_batch_id(dataset, chunk)
+            chunks.append((batch_id, chunk))
             outcome["batches"] += 1
+        staged: List[tuple[Path, bool]] = []
+        try:
+            # WAL every micro-batch before the first ClickHouse mutation. A crash can
+            # therefore never leave an acknowledged or untracked partial logical write.
+            for batch_id, chunk in chunks:
+                target = self.spool.pending / f"{batch_id}.json"
+                existed = target.exists()
+                path = self.spool.enqueue(
+                    dataset, batch_id, chunk, "awaiting ClickHouse acknowledgement",
+                    increment_attempt=False,
+                )
+                staged.append((path, existed))
+            if dataset == "raw" and chunks:
+                self.spool.save_intent(
+                    intent_id, normalized_rows, [batch_id for batch_id, _ in chunks]
+                )
+        except Exception as error:
+            # No ClickHouse call has occurred yet. Remove only WAL created by this
+            # attempt; pre-existing durable items belong to an earlier retry.
+            for path, existed in staged:
+                if not existed and path.exists():
+                    path.unlink()
+            if staged:
+                try:
+                    directory = os.open(self.spool.pending, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                except OSError:
+                    pass
+            outcome.update({
+                "status": "terminal_failure", "acknowledged": False,
+                "verified": False, "durability": "not_durable",
+                "retryable": False, "terminal": True,
+                "pending_batches": [path.stem for path, existed in staged if existed],
+                "error": _bounded_error(error),
+            })
+            raise AuthoritativeWriteError(outcome) from None
+
+        failed_batches = []
+        for batch_id, chunk in chunks:
+            path = self.spool.pending / f"{batch_id}.json"
             try:
-                outcome["written"] += self._insert(dataset, chunk, batch_id)
+                written = self._insert(dataset, chunk, batch_id)
+                if written != len(chunk):
+                    raise RuntimeError("ClickHouse acknowledgement row count mismatch")
             except Exception as error:
-                self.spool.enqueue(dataset, batch_id, chunk, str(error))
+                try:
+                    self.spool.enqueue(dataset, batch_id, chunk, _bounded_error(error))
+                except Exception as wal_error:
+                    outcome.update({
+                        "status": "terminal_failure", "acknowledged": False,
+                        "verified": False, "durability": "partial_unrecoverable",
+                        "retryable": False, "terminal": True,
+                        "pending_batches": [batch_id],
+                        "error": _bounded_error(wal_error),
+                    })
+                    raise AuthoritativeWriteError(outcome) from None
                 failed_batches.append(batch_id)
                 outcome["spooled"] += len(chunk)
-        if dataset == "raw" and failed_batches:
-            self.spool.save_intent(intent_id, normalized_rows, failed_batches)
-            for batch_id in failed_batches:
-                path = self.spool.pending / f"{batch_id}.json"
-                payload = self.spool.read(path)
-                self.spool._atomic_json(path, {**payload, "intent_id": intent_id})
+            else:
+                outcome["written"] += written
+                try:
+                    payload = self.spool.read(path, require_checksum=True)
+                    if dataset == "raw":
+                        payload["intent_id"] = intent_id
+                    self.spool.mark_replayed(path, payload)
+                    if dataset == "raw":
+                        self.spool.complete_chunk(intent_id, batch_id)
+                except Exception as error:
+                    # The target may already contain the batch. Preserve/recreate its
+                    # stable WAL so retry remains safe and withholds caller acknowledgement.
+                    try:
+                        self.spool.enqueue(
+                            dataset, batch_id, chunk, _bounded_error(error)
+                        )
+                    except Exception as wal_error:
+                        outcome.update({
+                            "status": "terminal_failure", "acknowledged": False,
+                            "verified": False, "durability": "partial_unrecoverable",
+                            "retryable": False, "terminal": True,
+                            "pending_batches": [batch_id],
+                            "error": _bounded_error(wal_error),
+                        })
+                        raise AuthoritativeWriteError(outcome) from None
+                    failed_batches.append(batch_id)
+                    outcome["spooled"] += len(chunk)
+        if dataset == "raw" and chunks:
+            try:
+                for batch_id in failed_batches:
+                    path = self.spool.pending / f"{batch_id}.json"
+                    payload = self.spool.read(path, require_checksum=True)
+                    self.spool._atomic_json(path, {**payload, "intent_id": intent_id})
+                if not failed_batches:
+                    self.spool.remove_intent(intent_id)
+            except Exception as error:
+                outcome.update({
+                    "status": "terminal_failure", "acknowledged": False,
+                    "verified": False, "durability": "partial_unrecoverable",
+                    "retryable": False, "terminal": True,
+                    "pending_batches": failed_batches[:1000],
+                    "error": _bounded_error(error),
+                })
+                raise AuthoritativeWriteError(outcome) from None
+        if failed_batches:
+            outcome.update({
+                "status": "durable_pending", "acknowledged": False,
+                "verified": False, "durability": "wal_fsynced",
+                "retryable": True, "pending_batches": failed_batches,
+                "error": "ClickHouse batch unavailable; durable replay required",
+            })
         if self.spool.telemetry:
             elapsed = telemetry_elapsed(self.spool.telemetry, started)
             if elapsed is not None:
@@ -341,7 +472,7 @@ class ReliableClickHouseWriter:
                     self.spool.telemetry, "safe",
                     "histogram", "ingest_write_latency_seconds",
                     elapsed,
-                    backend="clickhouse", outcome="spooled" if outcome["spooled"] else "ok",
+                    backend="clickhouse", outcome=outcome["status"],
                 )
             try:
                 diagnostics = self.spool.diagnostics()
@@ -397,7 +528,7 @@ class ReliableClickHouseWriter:
                                 continue
                         except Exception as error:
                             try:
-                                self.spool.quarantine_item(path, str(error))
+                                self.spool.quarantine_item(path, _bounded_error(error))
                             except Exception:
                                 outcome["legacy_blocked"] += 1
                             else:
@@ -405,10 +536,16 @@ class ReliableClickHouseWriter:
                             continue
                         outcome["attempted"] += 1
                         try:
-                            self._insert(payload["dataset"], payload["rows"], payload["batch_id"])
+                            written = self._insert(
+                                payload["dataset"], payload["rows"], payload["batch_id"]
+                            )
+                            if written != len(payload["rows"]):
+                                raise RuntimeError(
+                                    "ClickHouse acknowledgement row count mismatch"
+                                )
                         except Exception as error:
                             self.spool.enqueue(payload["dataset"], payload["batch_id"],
-                                               payload["rows"], str(error))
+                                               payload["rows"], _bounded_error(error))
                             outcome["failed"] += 1
                         else:
                             self.spool.mark_replayed(path, payload)
@@ -422,10 +559,11 @@ class ReliableClickHouseWriter:
                             try:
                                 self.on_raw_replayed(intent["rows"])
                             except Exception as error:
-                                self.spool.callback_result(intent, str(error))
+                                bounded = _bounded_error(error)
+                                self.spool.callback_result(intent, bounded)
                                 outcome["callback_failed"] += 1
                                 self.last_replay_callback = {
-                                    "status": "error", "error": str(error)[:4000],
+                                    "status": "error", "error": bounded,
                                 }
                             else:
                                 self.spool.callback_result(intent)

@@ -1467,7 +1467,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：MarketBarRepository 全方法直接实现；FINAL/keyset/UTC/null/Decimal 语义确定；无 DuckDB fallback。
 - **必要测试**：真实 ClickHouse 全契约、版本冲突、分页、横截面、故障/超时错误结构。
 - **排除项**：在线工厂、WAL、旧 API 对比。
-- **状态**：`本地实现完成，待独立验收`。`ClickHouseMarketBarRepository` 现在直接满足完整
+- **状态**：`已验收`（Artifact `ad82092`）。`ClickHouseMarketBarRepository` 现在直接满足完整
   `MarketBarRepository`：raw/canonical 直接写入、recent、closed range、canonical/raw keyset page、
   exact cross-section、matrix、single/cross-section as-of 和 latest quotes 均由 ClickHouse 查询实现，
   不再需要 shadow adapter 才能获得接口方法。migration 5 新增以 `content_version` 收敛的 latest quote 表；
@@ -1487,7 +1487,17 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：写成功才确认；失败不伪装成功；重启/部分块/回调崩溃可恢复且无逻辑重复；状态有界可诊断。
 - **必要测试**：故障矩阵、并发锁、磁盘满、损坏、旧 spool migration、真实 ClickHouse outage→recovery。
 - **排除项**：DuckDB 写入、服务装配、后台无限扫描。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。`ReliableClickHouseWriter.write()` 现作为 ClickHouse
+  权威主写原语返回固定状态机：仅所有微批获得同步行数确认后返回 `status=success`、
+  `acknowledged=true`、`verified=true`；连接失败、部分成功或确认行数不符返回
+  `status=durable_pending`、`acknowledged=false`、`retryable=true`，并列出稳定 logical intent 与
+  pending batch IDs；WAL 无法持久化则以携带有界 machine outcome 的 `AuthoritativeWriteError`
+  fail-closed，绝不调用目标或伪装成功。所有微批在首个 ClickHouse mutation 前先 checksum 签名、
+  fsync 文件、原子 rename 并 fsync 目录；raw 完整 intent 在写前持久化，成功块移入 replayed，
+  失败块保持 pending，重启/显式有界 replay 后只有完整 intent ready 才推进既有 callback。
+  replay 同样校验确认行数，并沿用 operator/replay 双锁、共享预算、legacy 补签、quarantine、
+  配额/磁盘预检与幂等 batch token。异常及 callback diagnostics 使用统一脱敏和长度上限。
+  本项未接在线 factory，未修改 scheduler 或 API，也未引入 DuckDB primary/shadow/fallback。
 
 ### `BG-006`：canonical 直接构建与有界调度
 

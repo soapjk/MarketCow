@@ -1106,7 +1106,9 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                 ), 1)
             finally:
                 self.database.client = original
-            self.assertEqual(adapter.diagnostics()["shadow"]["status"], "spooled")
+            self.assertEqual(
+                adapter.diagnostics()["shadow"]["status"], "durable_pending"
+            )
             replayed = writer.replay()
             self.assertEqual({key: replayed[key] for key in ("attempted", "replayed", "failed")},
                              {"attempted": 1, "replayed": 1, "failed": 0})

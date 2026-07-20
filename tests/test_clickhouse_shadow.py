@@ -438,7 +438,9 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
                 "MU", "1m", "raw", "fixture", "2026-07-20T01:00:02Z", bars()
             )
             self.assertEqual(count, 1)
-            self.assertEqual(adapter.diagnostics()["shadow"]["status"], "spooled")
+            self.assertEqual(
+                adapter.diagnostics()["shadow"]["status"], "durable_pending"
+            )
             self.assertEqual(adapter.diagnostics()["spool"]["pending"], 1)
 
     def test_disabled_factory_has_zero_clickhouse_side_effects(self):

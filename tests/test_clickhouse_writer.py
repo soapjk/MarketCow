@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from marketcow.clickhouse_writer import (
+    AuthoritativeWriteError,
     LocalClickHouseSpool,
     ReliableClickHouseWriter,
     normalize_bar,
@@ -233,8 +234,15 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
                 FakeRepository(False),
                 LocalClickHouseSpool(Path(folder) / "spool", Path(folder)), 1000,
             )
-            self.assertEqual(writer.write("raw", []),
-                             {"rows": 0, "written": 0, "spooled": 0, "batches": 0})
+            empty = writer.write("raw", [])
+            self.assertEqual(
+                {key: empty[key] for key in (
+                    "status", "acknowledged", "verified", "rows", "written",
+                    "spooled", "batches",
+                )},
+                {"status": "success", "acknowledged": True, "verified": True,
+                 "rows": 0, "written": 0, "spooled": 0, "batches": 0},
+            )
             canonical = {**raw_bar(), "selected_source": "fixture", "source_count": 1,
                          "quality_status": "single_source", "input_fingerprint": "abc",
                          "version": 1,
@@ -249,8 +257,14 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
             spool = LocalClickHouseSpool(Path(folder) / "spool", Path(folder))
             writer = ReliableClickHouseWriter(repository, spool, 1000)
             result = writer.write("raw", [raw_bar(index) for index in range(2001)])
-            self.assertEqual(result, {"rows": 2001, "written": 0,
-                                      "spooled": 2001, "batches": 3})
+            self.assertEqual(result["status"], "durable_pending")
+            self.assertFalse(result["acknowledged"])
+            self.assertFalse(result["verified"])
+            self.assertTrue(result["retryable"])
+            self.assertEqual(
+                {key: result[key] for key in ("rows", "written", "spooled", "batches")},
+                {"rows": 2001, "written": 0, "spooled": 2001, "batches": 3},
+            )
             self.assertEqual(len(list(spool.pending.glob("*.json"))), 3)
             self.assertEqual(list(spool.pending.glob(".write-*")), [])
             diagnostics = spool.diagnostics(limit=2)
@@ -279,6 +293,91 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
             paths = list(spool.pending.glob("*.json"))
             self.assertEqual(len(paths), 1)
             self.assertEqual(spool.read(paths[0])["attempts"], 2)
+
+    def test_authoritative_ack_requires_complete_verified_batch(self):
+        class ShortWrite(FakeRepository):
+            def insert_raw_bars(self, rows, batch_id=""):
+                self.calls.append((rows, batch_id))
+                return len(rows) - 1
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            successful = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            result = successful.write("raw", [raw_bar()])
+            self.assertEqual(result["status"], "success")
+            self.assertTrue(result["acknowledged"])
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["durability"], "committed")
+
+            short = ReliableClickHouseWriter(ShortWrite(False), spool, 1000)
+            failed = short.write("raw", [raw_bar(2)])
+            self.assertEqual(failed["status"], "durable_pending")
+            self.assertFalse(failed["acknowledged"])
+            self.assertEqual(failed["durability"], "wal_fsynced")
+            self.assertEqual(len(failed["pending_batches"]), 1)
+
+    def test_wal_preflight_failure_is_terminal_bounded_and_does_not_write(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            repository = FakeRepository(False)
+            writer = ReliableClickHouseWriter(repository, spool, 1000)
+            with patch.object(
+                spool, "enqueue",
+                side_effect=PermissionError("password=hunter2 /Volumes/T9/private"),
+            ):
+                with self.assertRaises(AuthoritativeWriteError) as raised:
+                    writer.write("raw", [raw_bar()])
+            outcome = raised.exception.outcome
+            self.assertEqual(outcome["status"], "terminal_failure")
+            self.assertFalse(outcome["acknowledged"])
+            self.assertEqual(outcome["durability"], "not_durable")
+            self.assertEqual(repository.calls, [])
+            self.assertNotIn("hunter2", outcome["error"])
+            self.assertNotIn("/Volumes/T9", outcome["error"])
+
+    def test_atomic_wal_rename_and_fsync_fail_before_target_mutation(self):
+        from unittest.mock import patch
+
+        for operation in ("replace", "fsync"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                spool = LocalClickHouseSpool(root / "spool", root)
+                repository = FakeRepository(False)
+                writer = ReliableClickHouseWriter(repository, spool, 1000)
+                with patch(
+                    f"marketcow.clickhouse_writer.os.{operation}",
+                    side_effect=OSError(f"{operation} crash"),
+                ):
+                    with self.assertRaises(AuthoritativeWriteError) as raised:
+                        writer.write("raw", [raw_bar()])
+                self.assertEqual(raised.exception.outcome["status"], "terminal_failure")
+                self.assertFalse(raised.exception.outcome["acknowledged"])
+                self.assertEqual(repository.calls, [])
+                self.assertEqual(list(spool.pending.glob("*.json")), [])
+
+    def test_post_ack_archive_crash_withholds_success_and_remains_replayable(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            repository = FakeRepository(False)
+            writer = ReliableClickHouseWriter(repository, spool, 1000)
+            with patch.object(
+                spool, "mark_replayed", side_effect=OSError("archive fsync crash")
+            ):
+                result = writer.write("raw", [raw_bar()])
+            self.assertEqual(result["status"], "durable_pending")
+            self.assertFalse(result["acknowledged"])
+            self.assertEqual(result["written"], 1)
+            self.assertEqual(len(list(spool.pending.glob("*.json"))), 1)
+            replay = writer.replay()
+            self.assertEqual(replay["replayed"], 1)
+            self.assertEqual(len(repository.calls), 2)
 
     def test_allowed_root_rejects_formal_path_traversal_and_symlink_escape(self):
         formal = Path("/Volumes/T9/projects/market-data-service/data/spool/clickhouse")
