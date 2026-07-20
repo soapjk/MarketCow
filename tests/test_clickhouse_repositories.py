@@ -19,6 +19,7 @@ from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouse
 from marketcow.storage import Warehouse
 from marketcow.clickhouse_writer import normalize_bar
 from marketcow.config import Settings
+from marketcow.contract_gate import LEGACY_PAYLOAD_DIFFERENCE, assert_contract_equal
 
 
 class MarketBarService:
@@ -49,6 +50,118 @@ class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
     "set MARKETCOW_TEST_CLICKHOUSE_HOST to run ClickHouse integration tests",
 )
 class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
+    def test_sv2_contract_gate_all_query_types_and_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            warehouse = Warehouse(root / "warehouse.duckdb")
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(root / "spool", root), 1000
+            )
+            builder = CanonicalMarketBarBuilder(self.repository, writer)
+            raw_rows = []
+            for symbol, close in (("GATE-A", 10.25), ("GATE-B", 20.5)):
+                bars = []
+                for timestamp in (1784527200, 1784527260):
+                    bar = {
+                        "timestamp": timestamp,
+                        "bar_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+                        "open": close - 1, "high": close + 1, "low": close - 2,
+                        "close": close, "raw_close": close,
+                        "adjustment_factor": 1.0, "volume": 0, "amount": close * 10,
+                    }
+                    bars.append(bar)
+                    raw_rows.append(normalize_bar("raw", {
+                        "symbol": symbol, "market": "US", "interval": "1m",
+                        "adjustment": "raw", "bar_time": bar["bar_at"], **bar,
+                        "volume": 0,
+                        "source": "tushare", "source_sequence": str(timestamp),
+                        "observed_at": "2026-07-20T12:01:00.456Z",
+                        "ingested_at": "2026-07-20T12:02:00.123Z",
+                        "raw_artifact_id": f"gate-{symbol}",
+                    }))
+                warehouse.upsert_price_bars(
+                    symbol, "1m", "raw", "tushare",
+                    "2026-07-20T12:02:00.123Z", bars,
+                    {"observed_at": "2026-07-20T12:01:00.456Z",
+                     "raw_artifact_id": f"gate-{symbol}"},
+                )
+            self.repository.insert_raw_bars(raw_rows)
+            for symbol in ("GATE-A", "GATE-B"):
+                outcome = builder.rebuild(
+                    symbol, "1m", "raw", "2026-07-20T06:00:00Z",
+                    "2026-07-20T06:01:00Z", 100,
+                )
+                self.assertEqual(outcome["status"], "ok")
+            adapter = ShadowMarketBarRepository(
+                warehouse, writer, builder, canonical_reads_enabled=True,
+                raw_reads_enabled=True,
+            )
+            cases = {
+                "recent": ("get_price_bars", ("GATE-A", "1m", "raw", 2)),
+                "range": ("get_price_bars_range", ("GATE-A", "1m", "raw", "2026-07-20T06:00:00Z", "2026-07-20T06:01:00Z", 2)),
+                "canonical_page": ("get_price_bars_page", ("GATE-A", "1m", "raw", "2026-07-20T06:00:00Z", "2026-07-20T06:01:00Z", 1, None)),
+                "exact_cross_section_page": ("get_price_bars_cross_section_page", ("1m", "raw", "2026-07-20T06:00:00Z", 1, ["GATE-A", "GATE-B"], None)),
+                "matrix": ("get_price_bars_matrix_page", ("1m", "raw", ["2026-07-20T06:00:00Z", "2026-07-20T06:01:00Z"], ["GATE-A", "GATE-B"], 3, None)),
+                "raw_range": ("get_raw_price_bars_range", ("GATE-A", "1m", "raw", "2026-07-20T06:00:00Z", "2026-07-20T06:01:00Z", 10, None)),
+                "raw_page": ("get_raw_price_bars_page", ("GATE-A", "1m", "raw", "2026-07-20T06:00:00Z", "2026-07-20T06:01:00Z", 1, None, None)),
+                "single_as_of": ("get_price_bar_as_of", ("GATE-A", "1m", "raw", "2026-07-20T06:01:30Z", 100)),
+                "cross_section_as_of": ("get_price_bars_as_of_page", ("1m", "raw", "2026-07-20T06:01:30Z", 100, ["GATE-A", "GATE-B"], 2, None)),
+            }
+            expected = {
+                label: getattr(warehouse, method)(*arguments)
+                for label, (method, arguments) in cases.items()
+            }
+            for label, (method, arguments) in cases.items():
+                assert_contract_equal(
+                    expected[label], getattr(adapter, method)(*arguments), label,
+                    LEGACY_PAYLOAD_DIFFERENCE
+                    if label in {"recent", "range", "raw_range", "raw_page"} else (),
+                )
+            settings = Settings(
+                root / "warehouse.duckdb", root / "raw", storage_root=root / "development",
+                market_bar_cursor_secret="real-contract-gate-secret-1234567890abcdef",
+            )
+            now = lambda: datetime(2026, 7, 20, 12, 5, tzinfo=timezone.utc)
+            paths = {
+                "recent": "/v1/quotes/GATE-A/history?refresh=false&limit=2",
+                "range": "/v1/quotes/GATE-A/history?start=2026-07-20T06:00:00Z&end=2026-07-20T06:01:00Z&limit=2",
+                "canonical_page": "/v1/quotes/GATE-A/history?start=2026-07-20T06:00:00Z&end=2026-07-20T06:01:00Z&page_size=1",
+                "exact_cross_section_page": "/v1/quotes/cross-section?bar_at=2026-07-20T06:00:00Z&symbols=GATE-A,GATE-B&page_size=1",
+                "matrix": "/v1/quotes/cross-section/matrix?bar_ats=2026-07-20T06:00:00Z,2026-07-20T06:01:00Z&symbols=GATE-A,GATE-B&page_size=3",
+                "raw_page": "/v1/quotes/GATE-A/raw-history?start=2026-07-20T06:00:00Z&end=2026-07-20T06:01:00Z&page_size=1",
+                "single_as_of": "/v1/quotes/GATE-A/as-of?as_of=2026-07-20T06:01:30Z&max_lookback_seconds=100",
+                "cross_section_as_of": "/v1/quotes/cross-section/as-of?as_of=2026-07-20T06:01:30Z&max_lookback_seconds=100&symbols=GATE-A,GATE-B&page_size=2",
+            }
+            with TestClient(create_app(settings, MarketBarService(warehouse), now)) as direct_client:
+                with TestClient(create_app(settings, MarketBarService(adapter), now)) as click_client:
+                    api_expected = {label: direct_client.get(path).json()
+                                    for label, path in paths.items()}
+                    for label, path in paths.items():
+                        assert_contract_equal(
+                            api_expected[label], click_client.get(path).json(), label + " api",
+                            LEGACY_PAYLOAD_DIFFERENCE
+                            if label in {"recent", "range", "raw_page"} else (),
+                        )
+            original = self.repository.database.client
+            self.repository.database.client = None
+            try:
+                for label, (method, arguments) in cases.items():
+                    assert_contract_equal(
+                        expected[label], getattr(adapter, method)(*arguments),
+                        label + " fallback",
+                        LEGACY_PAYLOAD_DIFFERENCE
+                        if label in {"recent", "range", "raw_range", "raw_page"} else (),
+                    )
+                with TestClient(create_app(settings, MarketBarService(adapter), now)) as fallback_client:
+                    for label, path in paths.items():
+                        assert_contract_equal(
+                            api_expected[label], fallback_client.get(path).json(),
+                            label + " api fallback", LEGACY_PAYLOAD_DIFFERENCE
+                            if label in {"recent", "range", "raw_page"} else (),
+                        )
+            finally:
+                self.repository.database.client = original
+
     def test_canonical_keyset_multisource_matches_duckdb_fallback(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
