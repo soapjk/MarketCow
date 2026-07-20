@@ -34,6 +34,11 @@ class Settings:
     storage_root: Path = Path("data")
     clickhouse_connect_timeout: float = 2.0
     clickhouse_read_timeout: float = 5.0
+    clickhouse_source_priority: tuple[str, ...] = (
+        "tushare", "sina", "eastmoney", "yahoo_chart", "baostock"
+    )
+    clickhouse_canonical_rel_tol: float = 1e-6
+    clickhouse_canonical_abs_tol: float = 1e-9
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -94,6 +99,16 @@ class Settings:
             clickhouse_read_timeout=float(os.getenv(
                 "MARKETCOW_CLICKHOUSE_READ_TIMEOUT", "5.0"
             )),
+            clickhouse_source_priority=tuple(value.strip() for value in os.getenv(
+                "MARKETCOW_CLICKHOUSE_SOURCE_PRIORITY",
+                "tushare,sina,eastmoney,yahoo_chart,baostock",
+            ).split(",") if value.strip()),
+            clickhouse_canonical_rel_tol=float(os.getenv(
+                "MARKETCOW_CLICKHOUSE_CANONICAL_REL_TOL", "1e-6"
+            )),
+            clickhouse_canonical_abs_tol=float(os.getenv(
+                "MARKETCOW_CLICKHOUSE_CANONICAL_ABS_TOL", "1e-9"
+            )),
         )
 
     def validate_runtime_isolation(self) -> None:
@@ -125,6 +140,14 @@ class Settings:
                 raise ValueError("ClickHouse connect timeout must be between 0.1 and 30 seconds")
             if not 0.1 <= self.clickhouse_read_timeout <= 30:
                 raise ValueError("ClickHouse read timeout must be between 0.1 and 30 seconds")
+            if not self.clickhouse_source_priority or len(set(
+                self.clickhouse_source_priority
+            )) != len(self.clickhouse_source_priority):
+                raise ValueError("ClickHouse source priority must be non-empty and unique")
+            if not 0 <= self.clickhouse_canonical_rel_tol <= 0.01:
+                raise ValueError("canonical relative tolerance must be between 0 and 0.01")
+            if not 0 <= self.clickhouse_canonical_abs_tol <= 1:
+                raise ValueError("canonical absolute tolerance must be between 0 and 1")
             storage_root = self.storage_root.resolve()
             root_name = storage_root.name.lower()
             if "development" not in root_name and not root_name.endswith(("_test", "-test")):

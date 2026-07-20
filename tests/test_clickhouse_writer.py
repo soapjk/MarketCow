@@ -51,7 +51,8 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
             self.assertEqual(writer.write("raw", []),
                              {"rows": 0, "written": 0, "spooled": 0, "batches": 0})
             canonical = {**raw_bar(), "selected_source": "fixture", "source_count": 1,
-                         "quality_status": "single_source", "version": 1,
+                         "quality_status": "single_source", "input_fingerprint": "abc",
+                         "version": 1,
                          "updated_at": "2026-07-20T01:31:03Z"}
             self.assertEqual(writer.write("canonical", [canonical])["written"], 1)
         with self.assertRaisesRegex(ValueError, "requires close"):

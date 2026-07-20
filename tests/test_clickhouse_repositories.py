@@ -11,6 +11,7 @@ from marketcow.clickhouse_repositories import (
     ClickHouseMarketBarRepository,
 )
 from marketcow.clickhouse_shadow import ShadowMarketBarRepository
+from marketcow.clickhouse_canonical import CanonicalMarketBarBuilder
 from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
 from marketcow.storage import Warehouse
 
@@ -70,7 +71,7 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         versions = self.database.client.query(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).result_rows
-        self.assertEqual(versions, [(1,)])
+        self.assertEqual(versions, [(1,), (2,)])
 
     def test_raw_and_canonical_round_trip_with_replacing_keys(self):
         raw = {
@@ -91,12 +92,14 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                 "bar_time", "open", "high", "low", "close", "volume", "amount",
                 "observed_at", "ingested_at", "raw_artifact_id"]},
             "selected_source": "fixture", "source_count": 1,
-            "quality_status": "single_source", "version": 1,
+            "quality_status": "single_source", "input_fingerprint": "fixture-hash",
+            "version": 1,
             "updated_at": "2026-07-20T01:31:03Z",
         }
         self.assertEqual(self.repository.insert_canonical_bars([canonical]), 1)
         count = self.database.client.query(
-            "SELECT count() FROM market_bar_canonical FINAL"
+            "SELECT count() FROM market_bar_canonical FINAL "
+            "WHERE symbol='600519.SH'"
         ).result_rows[0][0]
         self.assertEqual(count, 1)
 
@@ -127,6 +130,51 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             self.repository.database.client = None
             try:
                 failed = writer.write("raw", [rows[0]])
+            finally:
+                self.repository.database.client = original
+            self.assertEqual(failed["spooled"], 1)
+            self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
+
+    def test_canonical_bounded_build_is_stable_and_replayable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(root / "spool", root), 1000
+            )
+            builder = CanonicalMarketBarBuilder(
+                self.repository, writer, ("preferred_fixture", "other_fixture")
+            )
+            base = {
+                "symbol": "CANONICAL.HK", "market": "HK", "interval": "1m",
+                "adjustment": "raw", "open": 10, "high": 12, "low": 9,
+                "close": 11, "volume": 100, "amount": 1100,
+                "source_sequence": "1", "observed_at": "2026-07-20T03:00:01Z",
+                "ingested_at": "2026-07-20T03:00:02Z", "raw_artifact_id": "c1",
+            }
+            self.repository.insert_raw_bars([
+                {**base, "bar_time": "2026-07-20T02:59:59Z", "source": "outside_fixture"},
+                {**base, "bar_time": "2026-07-20T03:00:00Z", "source": "other_fixture"},
+                {**base, "bar_time": "2026-07-20T03:00:00Z",
+                 "source": "preferred_fixture", "close": 11.000000001,
+                 "raw_artifact_id": "c2"},
+            ])
+            arguments = ("CANONICAL.HK", "1m", "raw",
+                         "2026-07-20T03:00:00Z", "2026-07-20T03:00:00Z", 100)
+            self.assertEqual(builder.rebuild(*arguments)["status"], "ok")
+            self.assertEqual(builder.rebuild(*arguments)["status"], "ok")
+            canonical, truncated = self.repository.query_range(
+                "canonical", *arguments
+            )
+            self.assertFalse(truncated)
+            self.assertEqual(len(canonical), 1)
+            self.assertEqual(canonical[0]["selected_source"], "preferred_fixture")
+            self.assertEqual(canonical[0]["quality_status"], "multi_source_consistent")
+            self.assertEqual(canonical[0]["version"], 1)
+
+            original = self.repository.database.client
+            self.repository.database.client = None
+            try:
+                failed = writer.write("canonical", [canonical[0]])
             finally:
                 self.repository.database.client = original
             self.assertEqual(failed["spooled"], 1)

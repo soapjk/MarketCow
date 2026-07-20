@@ -19,9 +19,11 @@ def _market(symbol: str, provenance: Dict[str, Any]) -> str:
 class ShadowMarketBarRepository:
     """DuckDB-primary raw ClickHouse shadow adapter; all reads remain primary."""
 
-    def __init__(self, primary: Any, writer: ReliableClickHouseWriter) -> None:
+    def __init__(self, primary: Any, writer: ReliableClickHouseWriter,
+                 canonical_builder: Any = None) -> None:
         self.primary = primary
         self.writer = writer
+        self.canonical_builder = canonical_builder
         self._last_batch: Optional[Dict[str, Any]] = None
         self._last_shadow: Dict[str, Any] = {"status": "idle"}
         self._last_reconciliation: Dict[str, Any] = {"status": "not_run"}
@@ -168,4 +170,16 @@ class ShadowMarketBarRepository:
 
     def diagnostics(self) -> Dict[str, Any]:
         return {"shadow": self._last_shadow, "reconciliation": self._last_reconciliation,
+                "canonical": (self.canonical_builder.last_diagnostics
+                              if self.canonical_builder else {"status": "disabled"}),
                 "spool": self.writer.spool.diagnostics()}
+
+    def rebuild_canonical(
+        self, symbol: str, interval: str, adjustment: str,
+        start: Any, end: Any, limit: int = 50000,
+    ) -> Dict[str, Any]:
+        if self.canonical_builder is None:
+            return {"status": "disabled", "written": 0, "spooled": 0}
+        return self.canonical_builder.rebuild(
+            symbol, interval, adjustment, start, end, limit
+        )

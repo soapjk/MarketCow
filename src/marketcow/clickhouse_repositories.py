@@ -41,6 +41,14 @@ CLICKHOUSE_MIGRATIONS = [
             """,
         ],
     ),
+    (
+        2,
+        "canonical input fingerprint",
+        [
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "input_fingerprint String DEFAULT '' AFTER quality_status",
+        ],
+    ),
 ]
 
 
@@ -147,8 +155,8 @@ class ClickHouseMarketBarRepository:
     CANONICAL_COLUMNS = [
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
         "low", "close", "volume", "amount", "selected_source", "source_count",
-        "quality_status", "version", "observed_at", "ingested_at", "raw_artifact_id",
-        "updated_at",
+        "quality_status", "input_fingerprint", "version", "observed_at", "ingested_at",
+        "raw_artifact_id", "updated_at",
     ]
 
     def __init__(self, database: ClickHouseDatabase) -> None:
@@ -212,3 +220,25 @@ class ClickHouseMarketBarRepository:
                         "adjustment": adjustment, "source": source, "times": times},
         )
         return [dict(zip(result.column_names, row)) for row in result.result_rows]
+
+    def query_range(
+        self, dataset: str, symbol: str, interval: str, adjustment: str,
+        start: Any, end: Any, limit: int,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if dataset not in {"raw", "canonical"}:
+            raise ValueError("dataset must be raw or canonical")
+        if not 1 <= limit <= 100000:
+            raise ValueError("range limit must be between 1 and 100000")
+        table = f"market_bar_{dataset}"
+        suffix = ", source" if dataset == "raw" else ""
+        result = self.database._require_client().query(
+            f"SELECT * FROM {table} FINAL WHERE symbol={{symbol:String}} "
+            "AND interval={interval:String} AND adjustment={adjustment:String} "
+            "AND bar_time >= {start:DateTime64(3)} AND bar_time <= {end:DateTime64(3)} "
+            f"ORDER BY bar_time{suffix} LIMIT {{fetch:UInt32}}",
+            parameters={"symbol": symbol, "interval": interval,
+                        "adjustment": adjustment, "start": self._datetime(start),
+                        "end": self._datetime(end), "fetch": limit + 1},
+        )
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        return rows[:limit], len(rows) > limit

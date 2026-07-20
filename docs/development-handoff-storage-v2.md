@@ -47,7 +47,7 @@ DuckDB
   健康诊断，以及 `market_bar_raw`/`market_bar_canonical` 基础表；
 - 已实现独立的可靠影子写入原语：1000～50000 行可配置微批、字段和 UTC 时间
   规范化、稳定批次 ID、development 本地原子 WAL、显式有界重放与诊断。该 writer
-  尚未接入 ingestion/service 或 DuckDB 主写路径。
+  已用于 development raw 影子双写和显式 canonical 重建，但未改变 DuckDB 主写/读取。
 - WAL 隔离采用显式 development storage root 允许边界：配置层要求 root 名称明确包含
   development/test 且 spool resolve 后位于其中；`LocalClickHouseSpool` 构造层再次要求
   显式 allowed root 并在创建目录前校验。兄弟正式目录、`..` 穿越及 symlink 逃逸均拒绝。
@@ -57,6 +57,20 @@ DuckDB
 - 提供最后一个有界 raw 批次的显式只读对账：按业务键比较 DuckDB 与 ClickHouse
   `FINAL` 的行数、时间边界、OHLCVA、source 和 ingestion lag，结构化输出有限数量的
   mismatch；对账错误不会写数据或阻断主路径。
+- canonical 构建是显式、有界的 `rebuild_canonical(symbol, interval, adjustment,
+  start, end, limit)` 操作：只扫描 `market_bar_raw FINAL` 的指定闭区间，不在 raw 写入
+  时隐式重建，也不启动后台线程。达到限制时整次返回 `truncated` 且不写入，避免使用
+  不完整来源集合生成 canonical。
+- 来源选择使用配置的显式优先级，其后依次是最新 `observed_at`、最新 `ingested_at`，
+  最后使用 source、artifact 和 sequence 的稳定字典序 tie-break，不依赖查询返回顺序。
+  默认优先级为 tushare、sina、eastmoney、yahoo_chart、baostock。
+- 多来源 OHLCVA 使用 `rel_tol=1e-6`、`abs_tol=1e-9` 的数值容差；质量状态区分
+  `single_source`、`multi_source_consistent` 和
+  `multi_source_ohlcva_difference`，并保留来源数量、选中来源及其 provenance。
+- canonical 输入 fingerprint 相同则复用 version，输入变化才递增；
+  ReplacingMergeTree 按业务键和 version 收敛。写入复用可靠 writer，失败进入
+  development spool 并可显式 replay；诊断包含扫描行/组、写入/spool、质量与来源计数、
+  截断和有界错误。所有应用读取仍走 DuckDB。
 
 ## 二、仓库、分支和 worktree
 
@@ -481,16 +495,17 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 ## 十一、当前运行检查结果
 
-最近一次 PostgreSQL 单步开发检查：
+最近一次 Storage V2 检查：
 
 ```text
-feature/storage-v2 基线：9c21cf1
-默认测试：发现 82 项且整体通过；7 项 PostgreSQL、4 项 ClickHouse 集成测试因未
+feature/storage-v2 已验证基线：070e72e；本检查点为其上的 canonical 本地改动
+默认测试：发现 87 项且整体通过；7 项 PostgreSQL、5 项 ClickHouse 集成测试因未
 显式配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
-ClickHouse 测试：6 项通过（2 项隔离边界测试、4 项使用一次性 ClickHouse 25.8
-本地容器的集成测试；容器测试后删除）
-下一阶段：canonical 选择/写入或 history 查询切换，由验收方另行指定；尚未开始
+ClickHouse 测试：7 项通过（2 项隔离边界测试、5 项使用一次性 ClickHouse 25.8
+本地容器的集成测试；容器测试后停止并删除）
+本检查点已完成显式 canonical 选择/写入；history/API 读取仍只走 DuckDB，查询切换
+及后续阶段尚未开始，必须等待验收方指定。
 ```
 
 正式服务的当前进程是在加入 health `profile` 字段前启动的，因此它的 health 响应可能暂时没有 `profile`；这不代表配置错误。不要仅为补这个字段重启正式服务。

@@ -163,6 +163,7 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
                 ClickHouseMarketBarRepository,
             )
             from .clickhouse_shadow import ShadowMarketBarRepository
+            from .clickhouse_canonical import CanonicalMarketBarBuilder
             from .clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
 
             clickhouse = ClickHouseDatabase(
@@ -176,11 +177,17 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
             spool = LocalClickHouseSpool(
                 settings.clickhouse_spool_path, settings.storage_root
             )
+            clickhouse_repository = ClickHouseMarketBarRepository(clickhouse)
             writer = ReliableClickHouseWriter(
-                ClickHouseMarketBarRepository(clickhouse), spool,
+                clickhouse_repository, spool,
                 settings.clickhouse_batch_size,
             )
-            market_bars = ShadowMarketBarRepository(warehouse, writer)
+            canonical = CanonicalMarketBarBuilder(
+                clickhouse_repository, writer, settings.clickhouse_source_priority,
+                settings.clickhouse_canonical_rel_tol,
+                settings.clickhouse_canonical_abs_tol,
+            )
+            market_bars = ShadowMarketBarRepository(warehouse, writer, canonical)
     except Exception:
         RepositoryResources(resources).close()
         raise
