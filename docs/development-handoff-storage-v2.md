@@ -1595,6 +1595,12 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   与 `bg011_action=decide_compatibility_or_version`；任何新增、消失、改值或未观测条目均使 gate 失败，不使用字段名
   递归白名单。已知 quotes refresh 默认、batch error object、health.database 语义均由真实 scenario 精确记录；
   readiness、新增 market-data 端点和 history pagination 参数等本轮发现项也逐项归入 BG-011。本项不改变 API。
+  返修后旧基线文档同时冻结完整 `source_commit=701ffbde...`、capture tool/schema version、生成输入标识及
+  代码内 expected SHA-256；`scripts/capture_old_main_api.py` 只接受 HEAD 精确等于该提交的隔离 worktree，测试会
+  实际重跑并逐对象比对，不能通过同时替换 snapshot/ledger 绕过来源。另有 38-route union coverage inventory，
+  每条公开 method/path 均具备唯一双侧执行状态与逐类 applicability/不适用原因；32-route old-main 与 38-route V2
+  的全路由确定性请求/status/response shape 分别 checksum 固化。新增/遗漏路由、重复 route/scenario ID、缺任一侧
+  或未执行状态均 fail-closed；专项负向测试覆盖删路由和重复路由。本轮仍未做任何兼容行为修复。
 
 ### `BG-011`：API 兼容决策与 V2 修订
 

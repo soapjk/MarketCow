@@ -110,5 +110,8 @@
     }
   },
   "schema": "marketcow.old-main-api-contract.v1.scenarios",
-  "sha256": "e85566627c4482315372ca7595c53fce58f52e2245bbd26070c3343b6e3d3994"
+  "capture_tool_version": "marketcow.api-compat-capture.v2",
+  "source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4",
+  "generation_input": "isolated-deterministic-fixture:legacy-fixture-v1",
+  "sha256": "926219f0aba04098781587237c7a78ed1b10053f1e8107d2921a1ed3a553e091"
 }

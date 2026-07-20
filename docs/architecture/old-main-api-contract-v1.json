@@ -1,5 +1,8 @@
 {
   "schema": "marketcow.old-main-api-contract.v1",
+  "capture_tool_version": "marketcow.api-compat-capture.v2",
+  "source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4",
+  "generation_input": "isolated-fastapi-openapi:legacy-fixture-v1",
   "routes": {
     "GET /v1/admin/artifacts": {
       "parameters": [
@@ -1599,5 +1602,5 @@
       }
     }
   },
-  "sha256": "a8559e75339089236e6439b018c4fc91f7f9a98ef0bef3b7ea501684faaa81d8"
+  "sha256": "2e380c45863e3acc77fe919846f3ff6b97a65c204ef69c4010d61d9091787047"
 }

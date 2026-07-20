@@ -1,7 +1,7 @@
 {
   "schema": "marketcow.old-main-v2-api-differences.v1",
-  "legacy_sha256": "a8559e75339089236e6439b018c4fc91f7f9a98ef0bef3b7ea501684faaa81d8",
-  "v2_sha256": "f94ecfbcc583f6529858f2c6427e66cc414fc706f550d369f06dc25a8e8a4833",
+  "legacy_sha256": "2e380c45863e3acc77fe919846f3ff6b97a65c204ef69c4010d61d9091787047",
+  "v2_sha256": "f8f13495871e44f73e3731a7c657501aad2729d30cd023d915e0a299acdae5cf",
   "differences": [
     {
       "path": "$.routes.GET /v1/quotes.parameters[0].schema.default",
@@ -770,5 +770,5 @@
       "bg011_action": "decide_compatibility_or_version"
     }
   ],
-  "sha256": "3fd82f10688b8694154cd4660941ba36fcad5747fd3fb071efe0862a21bb2e19"
+  "sha256": "ac55a61fe679d0d571bfdfeaecf589d242a2d911e2de05e661b1bd2a0a4175e2"
 }

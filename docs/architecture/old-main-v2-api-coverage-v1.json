@@ -1,0 +1,1540 @@
+{
+  "legacy_capture_sha256": "c67f04bc3bb16bf5d38dbef68378e2fa103f4b4cd44b98321b8961e0396db779",
+  "legacy_matrix_sha256": "cbfdd6d30631acb0b339f926093e03802d883472a08582fb19578dd7748442c7",
+  "legacy_source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4",
+  "routes": [
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/admin/artifacts",
+      "scenarios": [
+        {
+          "id": "get-_v1_admin_artifacts-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_admin_artifacts-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_admin_artifacts-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_admin_artifacts-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/admin/jobs",
+      "scenarios": [
+        {
+          "id": "get-_v1_admin_jobs-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_admin_jobs-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_admin_jobs-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_admin_jobs-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/earnings-calendar",
+      "scenarios": [
+        {
+          "id": "get-_v1_earnings-calendar-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_earnings-calendar-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_earnings-calendar-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_earnings-calendar-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/economic-calendar",
+      "scenarios": [
+        {
+          "id": "get-_v1_economic-calendar-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_economic-calendar-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_economic-calendar-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_economic-calendar-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/economic-indicators",
+      "scenarios": [
+        {
+          "id": "get-_v1_economic-indicators-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_economic-indicators-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_economic-indicators-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_economic-indicators-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/financials/{symbol}/statements",
+      "scenarios": [
+        {
+          "id": "get-_v1_financials_symbol_statements-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_financials_symbol_statements-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_financials_symbol_statements-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_financials_symbol_statements-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/fundamentals",
+      "scenarios": [
+        {
+          "id": "get-_v1_fundamentals-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/fundamentals/{symbol}",
+      "scenarios": [
+        {
+          "id": "get-_v1_fundamentals_symbol-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals_symbol-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals_symbol-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals_symbol-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/fundamentals/{symbol}/history",
+      "scenarios": [
+        {
+          "id": "get-_v1_fundamentals_symbol_history-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals_symbol_history-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals_symbol_history-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_fundamentals_symbol_history-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/funnel/metrics",
+      "scenarios": [
+        {
+          "id": "get-_v1_funnel_metrics-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_funnel_metrics-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_funnel_metrics-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_funnel_metrics-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "reason": "GET /v1/health: backend_failure has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "reason": "GET /v1/health: validation_error has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        }
+      },
+      "route": "GET /v1/health",
+      "scenarios": [
+        {
+          "id": "get-_v1_health-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_health-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/instruments/search",
+      "scenarios": [
+        {
+          "id": "get-_v1_instruments_search-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_instruments_search-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_instruments_search-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_instruments_search-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/quotes",
+      "scenarios": [
+        {
+          "id": "get-_v1_quotes-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/quotes/cross-section",
+      "scenarios": [
+        {
+          "id": "get-_v1_quotes_cross-section-normal",
+          "kind": "normal",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section-empty",
+          "kind": "empty",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section-validation-error",
+          "kind": "validation_error",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "route_absent",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/quotes/cross-section/as-of",
+      "scenarios": [
+        {
+          "id": "get-_v1_quotes_cross-section_as-of-normal",
+          "kind": "normal",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section_as-of-empty",
+          "kind": "empty",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section_as-of-validation-error",
+          "kind": "validation_error",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section_as-of-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "route_absent",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/quotes/cross-section/matrix",
+      "scenarios": [
+        {
+          "id": "get-_v1_quotes_cross-section_matrix-normal",
+          "kind": "normal",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section_matrix-empty",
+          "kind": "empty",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section_matrix-validation-error",
+          "kind": "validation_error",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_cross-section_matrix-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "route_absent",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/quotes/{symbol}",
+      "scenarios": [
+        {
+          "id": "get-_v1_quotes_symbol-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/quotes/{symbol}/as-of",
+      "scenarios": [
+        {
+          "id": "get-_v1_quotes_symbol_as-of-normal",
+          "kind": "normal",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_as-of-empty",
+          "kind": "empty",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_as-of-validation-error",
+          "kind": "validation_error",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_as-of-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "route_absent",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/quotes/{symbol}/history",
+      "scenarios": [
+        {
+          "id": "get-_v1_quotes_symbol_history-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_history-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_history-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_history-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/quotes/{symbol}/raw-history",
+      "scenarios": [
+        {
+          "id": "get-_v1_quotes_symbol_raw-history-normal",
+          "kind": "normal",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_raw-history-empty",
+          "kind": "empty",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_raw-history-validation-error",
+          "kind": "validation_error",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_quotes_symbol_raw-history-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "route_absent",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "reason": "GET /v1/readiness: backend_failure has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "reason": "GET /v1/readiness: validation_error has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        }
+      },
+      "route": "GET /v1/readiness",
+      "scenarios": [
+        {
+          "id": "get-_v1_readiness-normal",
+          "kind": "normal",
+          "legacy": "route_absent",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_readiness-empty",
+          "kind": "empty",
+          "legacy": "route_absent",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/snapshot",
+      "scenarios": [
+        {
+          "id": "get-_v1_snapshot-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_snapshot-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_snapshot-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_snapshot-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "reason": "GET /v1/sources/health: validation_error has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        }
+      },
+      "route": "GET /v1/sources/health",
+      "scenarios": [
+        {
+          "id": "get-_v1_sources_health-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_sources_health-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_sources_health-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "reason": "GET /v1/sources/tdx/coverage: validation_error has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        }
+      },
+      "route": "GET /v1/sources/tdx/coverage",
+      "scenarios": [
+        {
+          "id": "get-_v1_sources_tdx_coverage-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_sources_tdx_coverage-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_sources_tdx_coverage-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/validation/{symbol}",
+      "scenarios": [
+        {
+          "id": "get-_v1_validation_symbol-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_validation_symbol-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_validation_symbol-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_validation_symbol-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "status": "covered"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "GET /v1/validation/{symbol}/results",
+      "scenarios": [
+        {
+          "id": "get-_v1_validation_symbol_results-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_validation_symbol_results-empty",
+          "kind": "empty",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_validation_symbol_results-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "get-_v1_validation_symbol_results-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/artifacts/backfill: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "reason": "POST /v1/admin/artifacts/backfill: validation_error has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        }
+      },
+      "route": "POST /v1/admin/artifacts/backfill",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_artifacts_backfill-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_artifacts_backfill-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/baostock/{symbol}/refresh: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/admin/baostock/{symbol}/refresh",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_baostock_symbol_refresh-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_baostock_symbol_refresh-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_baostock_symbol_refresh-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/earnings-calendar/refresh: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/admin/earnings-calendar/refresh",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_earnings-calendar_refresh-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_earnings-calendar_refresh-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_earnings-calendar_refresh-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/economic-calendar/refresh: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/admin/economic-calendar/refresh",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_economic-calendar_refresh-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_economic-calendar_refresh-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_economic-calendar_refresh-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/economic-indicators/refresh: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "reason": "POST /v1/admin/economic-indicators/refresh: validation_error has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        }
+      },
+      "route": "POST /v1/admin/economic-indicators/refresh",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_economic-indicators_refresh-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_economic-indicators_refresh-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/financials/{symbol}/refresh: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/admin/financials/{symbol}/refresh",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_financials_symbol_refresh-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_financials_symbol_refresh-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_financials_symbol_refresh-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/fundamentals/refresh: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/admin/fundamentals/refresh",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_fundamentals_refresh-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_fundamentals_refresh-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_fundamentals_refresh-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/funnel/metrics/rebuild: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "reason": "POST /v1/admin/funnel/metrics/rebuild: validation_error has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        }
+      },
+      "route": "POST /v1/admin/funnel/metrics/rebuild",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_funnel_metrics_rebuild-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_funnel_metrics_rebuild-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/tdx/financials/sync: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/admin/tdx/financials/sync",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_tdx_financials_sync-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_tdx_financials_sync-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_tdx_financials_sync-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/admin/validation/rebuild: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/admin/validation/rebuild",
+      "scenarios": [
+        {
+          "id": "post-_v1_admin_validation_rebuild-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_validation_rebuild-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_admin_validation_rebuild-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/tushare/realtime-quote: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/tushare/realtime-quote",
+      "scenarios": [
+        {
+          "id": "post-_v1_tushare_realtime-quote-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_tushare_realtime-quote-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_tushare_realtime-quote-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "status": "covered"
+        },
+        "empty": {
+          "reason": "POST /v1/tushare/{api_name}: empty has no meaningful HTTP contract for either route shape",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/tushare/{api_name}",
+      "scenarios": [
+        {
+          "id": "post-_v1_tushare_api_name-normal",
+          "kind": "normal",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_tushare_api_name-validation-error",
+          "kind": "validation_error",
+          "legacy": "executed",
+          "v2": "executed"
+        },
+        {
+          "id": "post-_v1_tushare_api_name-backend-failure",
+          "kind": "backend_failure",
+          "legacy": "executed",
+          "v2": "executed"
+        }
+      ]
+    }
+  ],
+  "schema": "marketcow.old-main-v2-api-coverage.v1",
+  "sha256": "ab827300fef8e2ac4d86c979ad92492a9220fab09c2617fa55168a4a9163703d",
+  "v2_capture_sha256": "965828edb92235ac8aeaff1b797c430b8d0d573ddb943cd9439ecb643aa9ce88",
+  "v2_matrix_sha256": "2491fa9b9f8d9ddf0d1ec6c3eb0e00cb456c1b7ddb3d367af7ef5cd7e13039b2"
+}

@@ -1,0 +1,2068 @@
+{
+  "capture_tool_version": "marketcow.api-compat-capture.v2",
+  "captures": {
+    "GET /v1/admin/artifacts::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/artifacts",
+        "query": {}
+      },
+      "route": "GET /v1/admin/artifacts",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/admin/artifacts::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/artifacts",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/admin/artifacts",
+      "shape": {
+        "count": "integer",
+        "items": {}
+      },
+      "status": 200
+    },
+    "GET /v1/admin/artifacts::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/artifacts",
+        "query": {}
+      },
+      "route": "GET /v1/admin/artifacts",
+      "shape": {
+        "count": "integer",
+        "items": {}
+      },
+      "status": 200
+    },
+    "GET /v1/admin/artifacts::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/artifacts",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/admin/artifacts",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/admin/jobs::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/jobs",
+        "query": {}
+      },
+      "route": "GET /v1/admin/jobs",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/admin/jobs::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/jobs",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/admin/jobs",
+      "shape": {
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/admin/jobs::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/jobs",
+        "query": {}
+      },
+      "route": "GET /v1/admin/jobs",
+      "shape": {
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/admin/jobs::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/jobs",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/admin/jobs",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/earnings-calendar::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/earnings-calendar",
+        "query": {}
+      },
+      "route": "GET /v1/earnings-calendar",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/earnings-calendar::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/earnings-calendar",
+        "query": {
+          "refresh": "false",
+          "symbols": "MISSING"
+        }
+      },
+      "route": "GET /v1/earnings-calendar",
+      "shape": {
+        "count": "integer",
+        "events": {
+          "items": null,
+          "type": "array"
+        },
+        "filter_timezone": "string",
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/earnings-calendar::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/earnings-calendar",
+        "query": {}
+      },
+      "route": "GET /v1/earnings-calendar",
+      "shape": {
+        "count": "integer",
+        "events": {
+          "items": null,
+          "type": "array"
+        },
+        "filter_timezone": "string",
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/earnings-calendar::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/earnings-calendar",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/earnings-calendar",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/economic-calendar::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-calendar",
+        "query": {}
+      },
+      "route": "GET /v1/economic-calendar",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/economic-calendar::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-calendar",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/economic-calendar",
+      "shape": {
+        "count": "integer",
+        "events": {
+          "items": null,
+          "type": "array"
+        },
+        "filter_timezone": "string",
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/economic-calendar::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-calendar",
+        "query": {}
+      },
+      "route": "GET /v1/economic-calendar",
+      "shape": {
+        "count": "integer",
+        "events": {
+          "items": null,
+          "type": "array"
+        },
+        "filter_timezone": "string",
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/economic-calendar::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-calendar",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/economic-calendar",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/economic-indicators::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-indicators",
+        "query": {}
+      },
+      "route": "GET /v1/economic-indicators",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/economic-indicators::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-indicators",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/economic-indicators",
+      "shape": {
+        "count": "integer",
+        "indicators": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/economic-indicators::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-indicators",
+        "query": {}
+      },
+      "route": "GET /v1/economic-indicators",
+      "shape": {
+        "count": "integer",
+        "indicators": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/economic-indicators::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-indicators",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/economic-indicators",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/financials/{symbol}/statements::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/financials/AAPL/statements",
+        "query": {}
+      },
+      "route": "GET /v1/financials/{symbol}/statements",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/financials/{symbol}/statements::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/financials/AAPL/statements",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/financials/{symbol}/statements",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "point_in_time": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/financials/{symbol}/statements::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/financials/AAPL/statements",
+        "query": {}
+      },
+      "route": "GET /v1/financials/{symbol}/statements",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "point_in_time": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/financials/{symbol}/statements::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/financials/AAPL/statements",
+        "query": {
+          "__invalid": "true"
+        }
+      },
+      "route": "GET /v1/financials/{symbol}/statements",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "point_in_time": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/fundamentals/{symbol}/history::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL/history",
+        "query": {}
+      },
+      "route": "GET /v1/fundamentals/{symbol}/history",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/fundamentals/{symbol}/history::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL/history",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/fundamentals/{symbol}/history",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "point_in_time": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/fundamentals/{symbol}/history::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL/history",
+        "query": {}
+      },
+      "route": "GET /v1/fundamentals/{symbol}/history",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "point_in_time": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/fundamentals/{symbol}/history::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL/history",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/fundamentals/{symbol}/history",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/fundamentals/{symbol}::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL",
+        "query": {}
+      },
+      "route": "GET /v1/fundamentals/{symbol}",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/fundamentals/{symbol}::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/fundamentals/{symbol}",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 404
+    },
+    "GET /v1/fundamentals/{symbol}::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL",
+        "query": {}
+      },
+      "route": "GET /v1/fundamentals/{symbol}",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 404
+    },
+    "GET /v1/fundamentals/{symbol}::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL",
+        "query": {
+          "__invalid": "true"
+        }
+      },
+      "route": "GET /v1/fundamentals/{symbol}",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 404
+    },
+    "GET /v1/fundamentals::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals",
+        "query": {}
+      },
+      "route": "GET /v1/fundamentals",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/fundamentals::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/fundamentals",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "limit": "integer",
+        "offset": "integer",
+        "point_in_time": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/fundamentals::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals",
+        "query": {}
+      },
+      "route": "GET /v1/fundamentals",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "limit": "integer",
+        "offset": "integer",
+        "point_in_time": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/fundamentals::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/fundamentals",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/funnel/metrics::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/funnel/metrics",
+        "query": {}
+      },
+      "route": "GET /v1/funnel/metrics",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/funnel/metrics::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/funnel/metrics",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/funnel/metrics",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "limit": "integer",
+        "offset": "integer",
+        "point_in_time": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/funnel/metrics::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/funnel/metrics",
+        "query": {}
+      },
+      "route": "GET /v1/funnel/metrics",
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "limit": "integer",
+        "offset": "integer",
+        "point_in_time": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/funnel/metrics::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/funnel/metrics",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/funnel/metrics",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/health::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/health",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/health",
+      "shape": {
+        "database": "string",
+        "profile": "string",
+        "status": "string",
+        "version": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/health::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/health",
+        "query": {}
+      },
+      "route": "GET /v1/health",
+      "shape": {
+        "database": "string",
+        "profile": "string",
+        "status": "string",
+        "version": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/instruments/search::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/instruments/search",
+        "query": {
+          "q": "AAPL"
+        }
+      },
+      "route": "GET /v1/instruments/search",
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/instruments/search::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/instruments/search",
+        "query": {
+          "q": "",
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/instruments/search",
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/instruments/search::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/instruments/search",
+        "query": {
+          "q": "AAPL"
+        }
+      },
+      "route": "GET /v1/instruments/search",
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/instruments/search::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/instruments/search",
+        "query": {}
+      },
+      "route": "GET /v1/instruments/search",
+      "shape": {
+        "detail": {
+          "items": {
+            "input": "null",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/quotes/{symbol}/history::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL/history",
+        "query": {}
+      },
+      "route": "GET /v1/quotes/{symbol}/history",
+      "shape": {
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "count": "integer",
+        "interval": "string",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}/history::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL/history",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/quotes/{symbol}/history",
+      "shape": {
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}/history::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL/history",
+        "query": {}
+      },
+      "route": "GET /v1/quotes/{symbol}/history",
+      "shape": {
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "count": "integer",
+        "interval": "string",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}/history::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL/history",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/quotes/{symbol}/history",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/quotes/{symbol}::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL",
+        "query": {}
+      },
+      "route": "GET /v1/quotes/{symbol}",
+      "shape": {
+        "close": "number",
+        "refresh_seen": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/quotes/{symbol}",
+      "shape": {
+        "close": "number",
+        "refresh_seen": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL",
+        "query": {}
+      },
+      "route": "GET /v1/quotes/{symbol}",
+      "shape": {
+        "close": "number",
+        "refresh_seen": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL",
+        "query": {
+          "__invalid": "true"
+        }
+      },
+      "route": "GET /v1/quotes/{symbol}",
+      "shape": {
+        "close": "number",
+        "refresh_seen": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes",
+        "query": {
+          "symbols": "AAPL"
+        }
+      },
+      "route": "GET /v1/quotes",
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/quotes::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes",
+        "query": {
+          "refresh": "false",
+          "symbols": "MISSING"
+        }
+      },
+      "route": "GET /v1/quotes",
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/quotes::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes",
+        "query": {
+          "symbols": "AAPL"
+        }
+      },
+      "route": "GET /v1/quotes",
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/quotes::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes",
+        "query": {}
+      },
+      "route": "GET /v1/quotes",
+      "shape": {
+        "detail": {
+          "items": {
+            "input": "null",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/snapshot::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/snapshot",
+        "query": {}
+      },
+      "route": "GET /v1/snapshot",
+      "shape": {
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/snapshot::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/snapshot",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/snapshot",
+      "shape": {
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/snapshot::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/snapshot",
+        "query": {}
+      },
+      "route": "GET /v1/snapshot",
+      "shape": {
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/snapshot::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/snapshot",
+        "query": {
+          "limit": "0"
+        }
+      },
+      "route": "GET /v1/snapshot",
+      "shape": {
+        "detail": {
+          "items": {
+            "ctx": {
+              "ge": "integer"
+            },
+            "input": "string",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/sources/health::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/sources/health",
+        "query": {}
+      },
+      "route": "GET /v1/sources/health",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/sources/health::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/sources/health",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/sources/health",
+      "shape": {
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/sources/health::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/sources/health",
+        "query": {}
+      },
+      "route": "GET /v1/sources/health",
+      "shape": {
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/sources/tdx/coverage::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/sources/tdx/coverage",
+        "query": {}
+      },
+      "route": "GET /v1/sources/tdx/coverage",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/sources/tdx/coverage::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/sources/tdx/coverage",
+        "query": {
+          "refresh": "false"
+        }
+      },
+      "route": "GET /v1/sources/tdx/coverage",
+      "shape": {
+        "periods": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/sources/tdx/coverage::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/sources/tdx/coverage",
+        "query": {}
+      },
+      "route": "GET /v1/sources/tdx/coverage",
+      "shape": {
+        "periods": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/validation/{symbol}/results::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL/results",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "route": "GET /v1/validation/{symbol}/results",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/validation/{symbol}/results::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL/results",
+        "query": {
+          "refresh": "false",
+          "report_period": "20241231"
+        }
+      },
+      "route": "GET /v1/validation/{symbol}/results",
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "report_period": "string",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/validation/{symbol}/results::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL/results",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "route": "GET /v1/validation/{symbol}/results",
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "report_period": "string",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/validation/{symbol}/results::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL/results",
+        "query": {}
+      },
+      "route": "GET /v1/validation/{symbol}/results",
+      "shape": {
+        "detail": {
+          "items": {
+            "input": "null",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "GET /v1/validation/{symbol}::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "route": "GET /v1/validation/{symbol}",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "GET /v1/validation/{symbol}::empty": {
+      "kind": "empty",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL",
+        "query": {
+          "refresh": "false",
+          "report_period": "20241231"
+        }
+      },
+      "route": "GET /v1/validation/{symbol}",
+      "shape": {},
+      "status": 200
+    },
+    "GET /v1/validation/{symbol}::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "route": "GET /v1/validation/{symbol}",
+      "shape": {},
+      "status": 200
+    },
+    "GET /v1/validation/{symbol}::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL",
+        "query": {}
+      },
+      "route": "GET /v1/validation/{symbol}",
+      "shape": {
+        "detail": {
+          "items": {
+            "input": "null",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "POST /v1/admin/artifacts/backfill::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/artifacts/backfill",
+        "query": {}
+      },
+      "route": "POST /v1/admin/artifacts/backfill",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "POST /v1/admin/artifacts/backfill::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/artifacts/backfill",
+        "query": {}
+      },
+      "route": "POST /v1/admin/artifacts/backfill",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/baostock/{symbol}/refresh::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/baostock/AAPL/refresh",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "route": "POST /v1/admin/baostock/{symbol}/refresh",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "POST /v1/admin/baostock/{symbol}/refresh::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/baostock/AAPL/refresh",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "route": "POST /v1/admin/baostock/{symbol}/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/baostock/{symbol}/refresh::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/baostock/AAPL/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/baostock/{symbol}/refresh",
+      "shape": {
+        "detail": {
+          "items": {
+            "input": "null",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "POST /v1/admin/earnings-calendar/refresh::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/earnings-calendar/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/earnings-calendar/refresh",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "POST /v1/admin/earnings-calendar/refresh::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/earnings-calendar/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/earnings-calendar/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/earnings-calendar/refresh::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/earnings-calendar/refresh",
+        "query": {
+          "__invalid": "true"
+        }
+      },
+      "route": "POST /v1/admin/earnings-calendar/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/economic-calendar/refresh::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/economic-calendar/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/economic-calendar/refresh",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "POST /v1/admin/economic-calendar/refresh::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/economic-calendar/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/economic-calendar/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/economic-calendar/refresh::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/economic-calendar/refresh",
+        "query": {
+          "__invalid": "true"
+        }
+      },
+      "route": "POST /v1/admin/economic-calendar/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/economic-indicators/refresh::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/economic-indicators/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/economic-indicators/refresh",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "POST /v1/admin/economic-indicators/refresh::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/economic-indicators/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/economic-indicators/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/financials/{symbol}/refresh::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/financials/AAPL/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/financials/{symbol}/refresh",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "POST /v1/admin/financials/{symbol}/refresh::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/financials/AAPL/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/financials/{symbol}/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/financials/{symbol}/refresh::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/financials/AAPL/refresh",
+        "query": {
+          "__invalid": "true"
+        }
+      },
+      "route": "POST /v1/admin/financials/{symbol}/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/fundamentals/refresh::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/fundamentals/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/fundamentals/refresh",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "POST /v1/admin/fundamentals/refresh::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/fundamentals/refresh",
+        "query": {}
+      },
+      "route": "POST /v1/admin/fundamentals/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/fundamentals/refresh::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/fundamentals/refresh",
+        "query": {
+          "__invalid": "true"
+        }
+      },
+      "route": "POST /v1/admin/fundamentals/refresh",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/funnel/metrics/rebuild::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/funnel/metrics/rebuild",
+        "query": {}
+      },
+      "route": "POST /v1/admin/funnel/metrics/rebuild",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "POST /v1/admin/funnel/metrics/rebuild::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/funnel/metrics/rebuild",
+        "query": {}
+      },
+      "route": "POST /v1/admin/funnel/metrics/rebuild",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/tdx/financials/sync::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/tdx/financials/sync",
+        "query": {}
+      },
+      "route": "POST /v1/admin/tdx/financials/sync",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "POST /v1/admin/tdx/financials/sync::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/tdx/financials/sync",
+        "query": {}
+      },
+      "route": "POST /v1/admin/tdx/financials/sync",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/tdx/financials/sync::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/tdx/financials/sync",
+        "query": {
+          "__invalid": "true"
+        }
+      },
+      "route": "POST /v1/admin/tdx/financials/sync",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/validation/rebuild::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/validation/rebuild",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "route": "POST /v1/admin/validation/rebuild",
+      "shape": {
+        "non_json": "boolean"
+      },
+      "status": 500
+    },
+    "POST /v1/admin/validation/rebuild::normal": {
+      "kind": "normal",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/validation/rebuild",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "route": "POST /v1/admin/validation/rebuild",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/validation/rebuild::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/validation/rebuild",
+        "query": {}
+      },
+      "route": "POST /v1/admin/validation/rebuild",
+      "shape": {
+        "detail": {
+          "items": {
+            "input": "null",
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "POST /v1/tushare/realtime-quote::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": {
+          "ts_code": "AAPL"
+        },
+        "method": "POST",
+        "path": "/v1/tushare/realtime-quote",
+        "query": {}
+      },
+      "route": "POST /v1/tushare/realtime-quote",
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "source": "string"
+      },
+      "status": 200
+    },
+    "POST /v1/tushare/realtime-quote::normal": {
+      "kind": "normal",
+      "request": {
+        "json": {
+          "ts_code": "AAPL"
+        },
+        "method": "POST",
+        "path": "/v1/tushare/realtime-quote",
+        "query": {}
+      },
+      "route": "POST /v1/tushare/realtime-quote",
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "source": "string"
+      },
+      "status": 200
+    },
+    "POST /v1/tushare/realtime-quote::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": {},
+        "method": "POST",
+        "path": "/v1/tushare/realtime-quote",
+        "query": {}
+      },
+      "route": "POST /v1/tushare/realtime-quote",
+      "shape": {
+        "detail": {
+          "items": {
+            "input": {},
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "POST /v1/tushare/{api_name}::backend_failure": {
+      "kind": "backend_failure",
+      "request": {
+        "json": {
+          "fields": "",
+          "params": {}
+        },
+        "method": "POST",
+        "path": "/v1/tushare/daily",
+        "query": {}
+      },
+      "route": "POST /v1/tushare/{api_name}",
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "POST /v1/tushare/{api_name}::normal": {
+      "kind": "normal",
+      "request": {
+        "json": {
+          "fields": "",
+          "params": {}
+        },
+        "method": "POST",
+        "path": "/v1/tushare/daily",
+        "query": {}
+      },
+      "route": "POST /v1/tushare/{api_name}",
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/tushare/{api_name}::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": {},
+        "method": "POST",
+        "path": "/v1/tushare/daily",
+        "query": {}
+      },
+      "route": "POST /v1/tushare/{api_name}",
+      "shape": {},
+      "status": 200
+    }
+  },
+  "generation_input": "isolated-deterministic-fixture:route-matrix-v1",
+  "schema": "marketcow.old-main-api-contract.v1.route-matrix",
+  "sha256": "cbfdd6d30631acb0b339f926093e03802d883472a08582fb19578dd7748442c7",
+  "source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4"
+}
