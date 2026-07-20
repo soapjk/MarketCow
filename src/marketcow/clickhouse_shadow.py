@@ -5,6 +5,7 @@ from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .clickhouse_writer import ReliableClickHouseWriter, normalize_bar
+from .telemetry import telemetry_call, telemetry_elapsed
 
 
 def _market(symbol: str, provenance: Dict[str, Any]) -> str:
@@ -534,10 +535,9 @@ class ShadowMarketBarRepository:
                 )}
         telemetry = getattr(self, "telemetry", None)
         if telemetry is not None:
-            try:
-                result["telemetry"] = telemetry.snapshot()
-            except Exception:
-                result["telemetry"] = {"schema": "unavailable"}
+            result["telemetry"] = telemetry_call(telemetry, "snapshot") or {
+                "schema": "unavailable"
+            }
         return result
 
     def rebuild_canonical(
@@ -573,10 +573,7 @@ def _telemetry_query(query: str) -> Callable[[Callable[..., Any]], Callable[...,
         @wraps(method)
         def measured(self: ShadowMarketBarRepository, *args: Any, **kwargs: Any) -> Any:
             telemetry = getattr(self, "telemetry", None)
-            try:
-                started = telemetry.clock() if telemetry is not None else 0.0
-            except Exception:
-                started = 0.0
+            started = telemetry_elapsed(telemetry)
             try:
                 result = method(self, *args, **kwargs)
             except Exception as error:
@@ -584,16 +581,14 @@ def _telemetry_query(query: str) -> Callable[[Callable[..., Any]], Callable[...,
                     backend = ("clickhouse_raw" if query == "raw" and self.raw_reads_enabled
                                else "clickhouse_canonical" if self.canonical_reads_enabled
                                else "duckdb")
-                    try:
-                        elapsed = max(0.0, telemetry.clock() - started)
-                    except Exception:
-                        elapsed = 0.0
-                    telemetry.safe("histogram", "query_latency_seconds", elapsed,
-                                   backend=backend, query=query, outcome="error")
-                    try:
-                        telemetry.log("query", "error", backend=backend, query=query, error=error)
-                    except Exception:
-                        pass
+                    elapsed = telemetry_elapsed(telemetry, started)
+                    if elapsed is not None:
+                        telemetry_call(
+                            telemetry, "safe", "histogram", "query_latency_seconds",
+                            elapsed, backend=backend, query=query, outcome="error",
+                        )
+                    telemetry_call(telemetry, "log", "query", "error",
+                                   backend=backend, query=query, error=error)
                 raise
             if telemetry is not None:
                 diagnostic = self._last_read
@@ -601,16 +596,16 @@ def _telemetry_query(query: str) -> Callable[[Callable[..., Any]], Callable[...,
                 outcome = "fallback" if diagnostic.get("fallback") else (
                     "empty" if diagnostic.get("count") == 0 else "ok"
                 )
-                try:
-                    elapsed = max(0.0, telemetry.clock() - started)
-                except Exception:
-                    elapsed = 0.0
-                telemetry.safe("histogram", "query_latency_seconds", elapsed,
-                               backend=backend, query=query, outcome=outcome)
+                elapsed = telemetry_elapsed(telemetry, started)
+                if elapsed is not None:
+                    telemetry_call(
+                        telemetry, "safe", "histogram", "query_latency_seconds",
+                        elapsed, backend=backend, query=query, outcome=outcome,
+                    )
                 attempted = diagnostic.get("attempted_backend")
                 if diagnostic.get("fallback") and attempted:
-                    telemetry.safe(
-                        "counter", "backend_fallback_total",
+                    telemetry_call(
+                        telemetry, "safe", "counter", "backend_fallback_total",
                         from_backend=attempted, to_backend="duckdb", query=query,
                     )
             return result

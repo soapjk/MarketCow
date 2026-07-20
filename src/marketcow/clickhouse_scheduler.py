@@ -8,6 +8,8 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
+from .telemetry import telemetry_call
+
 
 class BackgroundCanonicalScheduler:
     """Single-process, durable and bounded development canonical scheduler."""
@@ -175,7 +177,8 @@ class BackgroundCanonicalScheduler:
                 self._last = {"status": "failed", "task_id": task["task_id"],
                               "attempts": task["attempts"], "error": task["last_error"]}
             if self.spool.telemetry:
-                self.spool.telemetry.safe(
+                telemetry_call(
+                    self.spool.telemetry, "safe",
                     "counter", "canonical_rebuild_total", outcome="error"
                 )
         else:
@@ -184,7 +187,8 @@ class BackgroundCanonicalScheduler:
                 self._last = {"status": "ok", "task_id": task["task_id"],
                               "attempts": int(task.get("attempts", 0)) + 1}
             if self.spool.telemetry:
-                self.spool.telemetry.safe(
+                telemetry_call(
+                    self.spool.telemetry, "safe",
                     "counter", "canonical_rebuild_total", outcome="ok"
                 )
 
@@ -262,11 +266,12 @@ class BackgroundCanonicalScheduler:
         with self._state_lock:
             last = dict(self._last)
         if self.spool.telemetry:
-            self.spool.telemetry.safe("gauge", "canonical_queue_items", len(pending),
-                                      state="pending")
-            self.spool.telemetry.safe("gauge", "canonical_queue_items", len(failed),
-                                      state="failed")
-            self.spool.telemetry.safe("histogram", "canonical_lag_seconds", oldest)
+            telemetry_call(self.spool.telemetry, "safe", "gauge",
+                           "canonical_queue_items", len(pending), state="pending")
+            telemetry_call(self.spool.telemetry, "safe", "gauge",
+                           "canonical_queue_items", len(failed), state="failed")
+            telemetry_call(self.spool.telemetry, "safe", "histogram",
+                           "canonical_lag_seconds", oldest)
         return {
             "enabled": True, "paused": self._paused.is_set(),
             "thread_alive": self._thread.is_alive(), "pending": min(len(pending), self.queue_cap),

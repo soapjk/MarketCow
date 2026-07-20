@@ -11,7 +11,14 @@ from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.duckdb_repositories import create_stage1_repositories
 from marketcow.storage import Warehouse
-from marketcow.telemetry import MAX_LOG_EVENTS, SCHEMA_VERSION, Telemetry, sanitize_text
+from marketcow.telemetry import (
+    MAX_LOG_EVENTS,
+    SCHEMA_VERSION,
+    Telemetry,
+    instrument_duckdb_market_bars,
+    sanitize_text,
+    telemetry_call,
+)
 from marketcow.contract_gate import compare_contract
 
 
@@ -133,6 +140,57 @@ class TelemetryTest(unittest.TestCase):
         self.assertFalse(snapshot["clickhouse"]["enabled"])
         self.assertFalse(any(item["name"] == "clickhouse_pressure"
                              for item in snapshot["metrics"]))
+
+    def test_all_telemetry_surface_failures_preserve_primary_success_and_error(self):
+        class BrokenTelemetry:
+            def __getattribute__(self, name):
+                if name.startswith("__"):
+                    return super().__getattribute__(name)
+                raise RuntimeError(f"telemetry {name} failed")
+
+        with tempfile.TemporaryDirectory() as folder:
+            warehouse = Warehouse(Path(folder) / "warehouse.duckdb")
+            instrument_duckdb_market_bars(warehouse, BrokenTelemetry())
+            count = warehouse.upsert_price_bars(
+                "MU", "1d", "raw", "fixture", "2026-07-20T00:00:01Z",
+                [{"timestamp": 1784505600, "open": 1, "high": 2, "low": 1,
+                  "close": 2, "volume": 3}],
+            )
+            self.assertEqual(count, 1)
+            self.assertEqual(len(warehouse.get_price_bars("MU", "1d", "raw", 10)), 1)
+            settings = Settings(
+                Path(folder) / "warehouse.duckdb", Path(folder) / "raw",
+                storage_root=Path(folder) / "data-development",
+            )
+            service = type("Service", (), {
+                "market_bar_repository": warehouse, "close": lambda self: None,
+            })()
+            with TestClient(create_app(settings, service)) as client:
+                response = client.get(
+                    "/v1/quotes/MU/history?interval=1d&adjustment=raw&refresh=false"
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["count"], 1)
+
+        class PrimaryError(RuntimeError):
+            pass
+
+        class Repository:
+            _marketcow_telemetry_instrumented = False
+
+            def __getattr__(self, name):
+                if name == "upsert_price_bars":
+                    def fail(*args, **kwargs):
+                        raise PrimaryError("primary sentinel")
+                    return fail
+                if name.startswith("get_"):
+                    return lambda *args, **kwargs: []
+                return lambda *args, **kwargs: None
+
+        repository = instrument_duckdb_market_bars(Repository(), BrokenTelemetry())
+        with self.assertRaisesRegex(PrimaryError, "primary sentinel"):
+            repository.upsert_price_bars("MU", "1d", "raw", "fixture", "now", [])
+        self.assertIsNone(telemetry_call(BrokenTelemetry(), "snapshot"))
 
     def test_contract_cache_fallback_and_clickhouse_pressure_series(self):
         compare_contract({"bars": [1]}, {"bars": [2]}, telemetry=self.telemetry,

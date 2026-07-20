@@ -14,6 +14,7 @@ from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
+from .telemetry import telemetry_call
 
 
 class TushareRequest(BaseModel):
@@ -74,7 +75,8 @@ def create_app(
         repository = getattr(service, "market_bar_repository", None)
         telemetry = getattr(repository, "telemetry", None)
         if telemetry is not None:
-            telemetry.safe(
+            telemetry_call(
+                telemetry, "safe",
                 "histogram", "cache_age_seconds", 0.0 if age is None else age,
                 status=status,
             )

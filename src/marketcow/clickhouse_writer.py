@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from .telemetry import telemetry_call, telemetry_elapsed
+
 from .clickhouse_repositories import ClickHouseMarketBarRepository
 from .bar_version import raw_content_rank, raw_content_version
 
@@ -313,10 +315,7 @@ class ReliableClickHouseWriter:
         if dataset not in DATASET_COLUMNS:
             raise ValueError("dataset must be raw or canonical")
         outcome = {"rows": len(rows), "written": 0, "spooled": 0, "batches": 0}
-        try:
-            started = self.spool.telemetry.clock() if self.spool.telemetry else 0.0
-        except Exception:
-            started = 0.0
+        started = telemetry_elapsed(self.spool.telemetry)
         normalized_rows = [normalize_bar(dataset, row) for row in rows]
         failed_batches = []
         intent_id = stable_batch_id(dataset, normalized_rows)
@@ -336,15 +335,19 @@ class ReliableClickHouseWriter:
                 payload = self.spool.read(path)
                 self.spool._atomic_json(path, {**payload, "intent_id": intent_id})
         if self.spool.telemetry:
-            try:
-                self.spool.telemetry.safe(
+            elapsed = telemetry_elapsed(self.spool.telemetry, started)
+            if elapsed is not None:
+                telemetry_call(
+                    self.spool.telemetry, "safe",
                     "histogram", "ingest_write_latency_seconds",
-                    max(0.0, self.spool.telemetry.clock() - started),
+                    elapsed,
                     backend="clickhouse", outcome="spooled" if outcome["spooled"] else "ok",
                 )
+            try:
                 diagnostics = self.spool.diagnostics()
                 for state in ("pending", "failed", "replayed"):
-                    self.spool.telemetry.safe(
+                    telemetry_call(
+                        self.spool.telemetry, "safe",
                         "gauge", "wal_items", diagnostics[state], state=state
                     )
             except Exception:
@@ -451,11 +454,13 @@ class ReliableClickHouseWriter:
             try:
                 diagnostics = self.spool.diagnostics()
                 for state in ("pending", "failed", "replayed"):
-                    self.spool.telemetry.safe(
+                    telemetry_call(
+                        self.spool.telemetry, "safe",
                         "gauge", "wal_items", diagnostics[state], state=state
                     )
                 quarantine, _ = self.spool._bounded_files(self.spool.quarantine, 10000)
-                self.spool.telemetry.safe(
+                telemetry_call(
+                    self.spool.telemetry, "safe",
                     "gauge", "wal_items", len(quarantine), state="quarantine"
                 )
             except Exception:

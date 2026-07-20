@@ -87,6 +87,29 @@ def _sanitize(value: Any) -> Any:
     return sanitize_text(value)
 
 
+def telemetry_call(telemetry: Any, method: str, *args: Any, **kwargs: Any) -> Any:
+    """Invoke any telemetry surface without allowing it to affect business code."""
+    if telemetry is None:
+        return None
+    try:
+        return getattr(telemetry, method)(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def telemetry_elapsed(telemetry: Any, started: Any = None) -> Any:
+    """Return a duration when the telemetry clock works, otherwise no observation."""
+    current = telemetry_call(telemetry, "clock")
+    if started is None:
+        return current
+    if current is None:
+        return None
+    try:
+        return max(0.0, float(current) - float(started))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 _QUERY_METHODS = {
     "get_price_bars": "recent",
     "get_price_bars_range": "range",
@@ -113,23 +136,25 @@ def instrument_duckdb_market_bars(repository: Any, telemetry: "Telemetry") -> An
         @wraps(original)
         def measured_query(self: Any, *args: Any, _original: Any = original,
                            _query: str = query, **kwargs: Any) -> Any:
-            started = telemetry.clock()
+            started = telemetry_elapsed(telemetry)
             try:
                 result = _original(*args, **kwargs)
             except Exception:
-                telemetry.safe(
-                    "histogram", "query_latency_seconds",
-                    max(0.0, telemetry.clock() - started),
-                    backend="duckdb", query=_query, outcome="error",
-                )
+                elapsed = telemetry_elapsed(telemetry, started)
+                if elapsed is not None:
+                    telemetry_call(
+                        telemetry, "safe", "histogram", "query_latency_seconds",
+                        elapsed, backend="duckdb", query=_query, outcome="error",
+                    )
                 raise
             rows = result[0] if isinstance(result, tuple) else result
             outcome = "empty" if rows is None or rows == [] else "ok"
-            telemetry.safe(
-                "histogram", "query_latency_seconds",
-                max(0.0, telemetry.clock() - started),
-                backend="duckdb", query=_query, outcome=outcome,
-            )
+            elapsed = telemetry_elapsed(telemetry, started)
+            if elapsed is not None:
+                telemetry_call(
+                    telemetry, "safe", "histogram", "query_latency_seconds",
+                    elapsed, backend="duckdb", query=_query, outcome=outcome,
+                )
             return result
 
         setattr(repository, name, MethodType(measured_query, repository))
@@ -139,21 +164,23 @@ def instrument_duckdb_market_bars(repository: Any, telemetry: "Telemetry") -> An
         @wraps(original)
         def measured_write(self: Any, *args: Any, _original: Any = original,
                            **kwargs: Any) -> Any:
-            started = telemetry.clock()
+            started = telemetry_elapsed(telemetry)
             try:
                 result = _original(*args, **kwargs)
             except Exception:
-                telemetry.safe(
-                    "histogram", "ingest_write_latency_seconds",
-                    max(0.0, telemetry.clock() - started),
-                    backend="duckdb", outcome="error",
-                )
+                elapsed = telemetry_elapsed(telemetry, started)
+                if elapsed is not None:
+                    telemetry_call(
+                        telemetry, "safe", "histogram", "ingest_write_latency_seconds",
+                        elapsed, backend="duckdb", outcome="error",
+                    )
                 raise
-            telemetry.safe(
-                "histogram", "ingest_write_latency_seconds",
-                max(0.0, telemetry.clock() - started),
-                backend="duckdb", outcome="ok",
-            )
+            elapsed = telemetry_elapsed(telemetry, started)
+            if elapsed is not None:
+                telemetry_call(
+                    telemetry, "safe", "histogram", "ingest_write_latency_seconds",
+                    elapsed, backend="duckdb", outcome="ok",
+                )
             return result
 
         setattr(repository, name, MethodType(measured_write, repository))

@@ -6,6 +6,8 @@ from decimal import Decimal
 import re
 from typing import Any, Mapping, Sequence
 
+from .telemetry import telemetry_call
+
 
 CONTRACT_MATRIX = {
     "recent": ("bars", "cache", "ordering", "provenance"),
@@ -155,7 +157,8 @@ def compare_contract(
         ],
     }
     if mismatches and telemetry is not None:
-        telemetry.safe(
+        telemetry_call(
+            telemetry, "safe",
             "counter", "contract_mismatch_total", min(len(mismatches), MAX_MISMATCHES),
             contract=contract,
         )
