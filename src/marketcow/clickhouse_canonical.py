@@ -12,6 +12,7 @@ from .clickhouse_writer import ReliableClickHouseWriter, normalize_bar
 
 DEFAULT_SOURCE_PRIORITY = ("tushare", "sina", "eastmoney", "yahoo_chart", "baostock")
 VALUE_FIELDS = ("open", "high", "low", "close", "volume", "amount")
+CONTRACT_FIELDS = ("raw_close", "adjustment_factor")
 
 
 def _utc(value: Any) -> datetime:
@@ -59,6 +60,7 @@ class CanonicalMarketBarBuilder:
 
     def _fingerprint(self, rows: Iterable[Dict[str, Any]]) -> str:
         fields = ("symbol", "market", "interval", "adjustment", "bar_time", *VALUE_FIELDS,
+                  *CONTRACT_FIELDS,
                   "source", "source_sequence", "observed_at", "ingested_at",
                   "raw_artifact_id")
         normalized = []
@@ -112,6 +114,7 @@ class CanonicalMarketBarBuilder:
             row = normalize_bar("canonical", {
                 **{field: selected.get(field) for field in (
                     "symbol", "market", "interval", "adjustment", "bar_time", *VALUE_FIELDS,
+                    *CONTRACT_FIELDS,
                     "observed_at", "ingested_at", "raw_artifact_id")},
                 "selected_source": selected["source"], "source_count": len(sources),
                 "quality_status": quality, "input_fingerprint": fingerprint,

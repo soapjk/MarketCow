@@ -17,16 +17,21 @@ def _market(symbol: str, provenance: Dict[str, Any]) -> str:
 
 
 class ShadowMarketBarRepository:
-    """DuckDB-primary raw ClickHouse shadow adapter; all reads remain primary."""
+    """DuckDB-primary shadow adapter with an opt-in canonical history read."""
 
     def __init__(self, primary: Any, writer: ReliableClickHouseWriter,
-                 canonical_builder: Any = None) -> None:
+                 canonical_builder: Any = None,
+                 canonical_reads_enabled: bool = False) -> None:
         self.primary = primary
         self.writer = writer
         self.canonical_builder = canonical_builder
+        self.canonical_reads_enabled = canonical_reads_enabled
         self._last_batch: Optional[Dict[str, Any]] = None
         self._last_shadow: Dict[str, Any] = {"status": "idle"}
         self._last_reconciliation: Dict[str, Any] = {"status": "not_run"}
+        self._last_read: Dict[str, Any] = {
+            "backend": "duckdb", "fallback": False, "status": "not_run"
+        }
 
     def upsert_quote(self, row: Dict[str, Any]) -> None:
         self.primary.upsert_quote(row)
@@ -37,7 +42,28 @@ class ShadowMarketBarRepository:
     def get_price_bars(
         self, symbol: str, interval: str, adjustment: str, limit: int
     ) -> List[Dict[str, Any]]:
-        return self.primary.get_price_bars(symbol, interval, adjustment, limit)
+        if not self.canonical_reads_enabled:
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok"
+            }
+            return self.primary.get_price_bars(symbol, interval, adjustment, limit)
+        try:
+            rows = self.writer.repository.get_canonical_price_bars(
+                symbol, interval, adjustment, limit
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows),
+            }
+            return rows
+        except Exception as error:
+            rows = self.primary.get_price_bars(symbol, interval, adjustment, limit)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "error": str(error)[:4000],
+            }
+            return rows
 
     @staticmethod
     def _raw_rows(
@@ -52,7 +78,9 @@ class ShadowMarketBarRepository:
                 int(bar["timestamp"]), timezone.utc
             ),
             "open": bar.get("open"), "high": bar.get("high"), "low": bar.get("low"),
-            "close": bar.get("close"), "volume": bar.get("volume"),
+            "close": bar.get("close"), "raw_close": bar.get("raw_close"),
+            "adjustment_factor": bar.get("adjustment_factor"),
+            "volume": bar.get("volume"),
             "amount": bar.get("amount"), "source": source,
             "source_sequence": str(bar.get("timestamp")),
             "observed_at": observed_at, "ingested_at": ingested_at,
@@ -170,6 +198,7 @@ class ShadowMarketBarRepository:
 
     def diagnostics(self) -> Dict[str, Any]:
         return {"shadow": self._last_shadow, "reconciliation": self._last_reconciliation,
+                "read": self._last_read,
                 "canonical": (self.canonical_builder.last_diagnostics
                               if self.canonical_builder else {"status": "disabled"}),
                 "spool": self.writer.spool.diagnostics()}

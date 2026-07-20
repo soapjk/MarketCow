@@ -16,9 +16,13 @@ DATASET_COLUMNS = {
     "canonical": ClickHouseMarketBarRepository.CANONICAL_COLUMNS,
 }
 DATETIME_COLUMNS = {"bar_time", "observed_at", "ingested_at", "updated_at"}
-FLOAT_COLUMNS = {"open", "high", "low", "close", "volume", "amount"}
+FLOAT_COLUMNS = {
+    "open", "high", "low", "close", "raw_close", "adjustment_factor", "volume", "amount"
+}
 INTEGER_COLUMNS = {"source_count", "version"}
-OPTIONAL_COLUMNS = {"amount", "source_sequence", "raw_artifact_id"}
+OPTIONAL_COLUMNS = {
+    "amount", "raw_close", "adjustment_factor", "source_sequence", "raw_artifact_id"
+}
 
 
 def _utc_iso(value: Any) -> str:

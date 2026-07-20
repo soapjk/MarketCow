@@ -56,6 +56,11 @@ class ReconcileRepository:
     def query_raw_batch(self, *args):
         return self.rows
 
+    def get_canonical_price_bars(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows
+
 
 class FailingClickHouseRepository:
     def insert_raw_bars(self, rows, batch_id=""):
@@ -81,6 +86,25 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
         self.assertEqual(mapped["raw_artifact_id"], "artifact-1")
         self.assertEqual(adapter.get_price_bars("x", "1m", "raw", 1), ["duckdb-read"])
         self.assertEqual(adapter.get_latest_quotes(["x"]), [{"symbol": "x"}])
+
+    def test_opt_in_canonical_read_and_bounded_failure_fallback(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.repository = ReconcileRepository([{"timestamp": 1, "source": "canonical"}])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(
+            primary, writer, canonical_reads_enabled=True
+        )
+        self.assertEqual(adapter.get_price_bars("x", "1m", "raw", 1),
+                         [{"timestamp": 1, "source": "canonical"}])
+        self.assertEqual(adapter.diagnostics()["read"]["backend"],
+                         "clickhouse_canonical")
+        writer.repository.rows = ConnectionError("x" * 5000)
+        self.assertEqual(adapter.get_price_bars("x", "1m", "raw", 1),
+                         ["duckdb-read"])
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["fallback"])
+        self.assertEqual(diagnostics["backend"], "duckdb")
+        self.assertEqual(len(diagnostics["error"]), 4000)
 
     def test_primary_failure_never_attempts_shadow(self):
         writer = CapturingWriter()

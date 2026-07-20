@@ -71,7 +71,7 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         versions = self.database.client.query(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).result_rows
-        self.assertEqual(versions, [(1,), (2,)])
+        self.assertEqual(versions, [(1,), (2,), (3,)])
 
     def test_raw_and_canonical_round_trip_with_replacing_keys(self):
         raw = {
@@ -179,6 +179,42 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                 self.repository.database.client = original
             self.assertEqual(failed["spooled"], 1)
             self.assertEqual(writer.replay(), {"attempted": 1, "replayed": 1, "failed": 0})
+
+    def test_canonical_history_contract_filters_limits_orders_and_final(self):
+        base = {
+            "symbol": "HISTORY.HK", "market": "HK", "interval": "1m",
+            "adjustment": "raw", "open": 10, "high": 12, "low": 9,
+            "close": 11, "raw_close": 22, "adjustment_factor": 0.5,
+            "volume": 100, "amount": None,
+            "selected_source": "fixture", "source_count": 1,
+            "quality_status": "single_source", "input_fingerprint": "history-1",
+            "observed_at": "2026-07-20T04:00:01Z",
+            "ingested_at": "2026-07-20T04:00:02Z", "raw_artifact_id": None,
+            "updated_at": "2026-07-20T04:00:03Z",
+        }
+        self.repository.insert_canonical_bars([
+            {**base, "bar_time": "2026-07-20T04:00:00Z", "version": 1},
+            {**base, "bar_time": "2026-07-20T04:01:00Z", "version": 1,
+             "close": 12, "input_fingerprint": "history-old"},
+            {**base, "bar_time": "2026-07-20T04:01:00Z", "version": 2,
+             "close": 13, "input_fingerprint": "history-new"},
+            {**base, "bar_time": "2026-07-20T04:02:00Z", "version": 1,
+             "close": 14, "input_fingerprint": "history-3"},
+            {**base, "bar_time": "2026-07-20T04:03:00Z", "version": 1,
+             "interval": "5m", "input_fingerprint": "filtered"},
+        ])
+        bars = self.repository.get_canonical_price_bars(
+            "HISTORY.HK", "1m", "raw", 2
+        )
+        self.assertEqual([bar["timestamp"] for bar in bars], sorted(
+            bar["timestamp"] for bar in bars
+        ))
+        self.assertEqual([bar["close"] for bar in bars], [13.0, 14.0])
+        self.assertEqual(bars[0]["source"], "fixture")
+        self.assertIsNone(bars[0]["amount"])
+        self.assertEqual(bars[0]["source_payload"]["version"], 2)
+        self.assertEqual(bars[0]["raw_close"], 22.0)
+        self.assertEqual(bars[0]["adjustment_factor"], 0.5)
 
     def test_real_shadow_dual_write_replay_and_reconciliation(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -70,7 +70,17 @@ DuckDB
 - canonical 输入 fingerprint 相同则复用 version，输入变化才递增；
   ReplacingMergeTree 按业务键和 version 收敛。写入复用可靠 writer，失败进入
   development spool 并可显式 replay；诊断包含扫描行/组、写入/spool、质量与来源计数、
-  截断和有界错误。所有应用读取仍走 DuckDB。
+  截断和有界错误。默认应用读取仍走 DuckDB。
+- 历史读取现在支持 development-only 的显式切换：
+  `MARKETCOW_MARKET_BAR_READ_BACKEND=clickhouse_canonical` 必须与
+  `MARKETCOW_CLICKHOUSE_ENABLED=true` 同时设置；默认值和立即回滚值均为 `duckdb`，
+  production 会拒绝 canonical 读取配置。quotes、DuckDB-primary 写入和 shadow 写入
+  路由不变。
+- canonical 历史查询使用 `FINAL`，按 symbol/interval/adjustment 过滤，倒序取最近 limit
+  条后按时间升序返回。结果映射为原 `get_price_bars` 字段，包括 timestamp、bar_at、
+  OHLC、raw_close、adjustment_factor、volume、amount、source、ingested_at 与
+  source_payload；migration 3 将两个调整契约字段以 Nullable(Float64) 贯穿 raw 与
+  canonical。ClickHouse 读取失败会有界记录 error/backend/fallback 并同步回退 DuckDB。
 
 ## 二、仓库、分支和 worktree
 
@@ -498,14 +508,14 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 最近一次 Storage V2 检查：
 
 ```text
-feature/storage-v2 已验证基线：070e72e；本检查点为其上的 canonical 本地改动
-默认测试：发现 87 项且整体通过；7 项 PostgreSQL、5 项 ClickHouse 集成测试因未
+feature/storage-v2 已验证基线：dc98841；本检查点为其上的 canonical 历史读取改动
+默认测试：发现 90 项且整体通过；7 项 PostgreSQL、6 项 ClickHouse 集成测试因未
 显式配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
-ClickHouse 测试：7 项通过（2 项隔离边界测试、5 项使用一次性 ClickHouse 25.8
+ClickHouse 测试：8 项通过（2 项隔离边界测试、6 项使用一次性 ClickHouse 25.8
 本地容器的集成测试；容器测试后停止并删除）
-本检查点已完成显式 canonical 选择/写入；history/API 读取仍只走 DuckDB，查询切换
-及后续阶段尚未开始，必须等待验收方指定。
+本检查点已完成 development opt-in canonical history 读取与 DuckDB 回退；默认仍为
+DuckDB。其他查询切换、自动 canonical 调度及后续阶段尚未开始，必须等待验收方指定。
 ```
 
 正式服务的当前进程是在加入 health `profile` 字段前启动的，因此它的 health 响应可能暂时没有 `profile`；这不代表配置错误。不要仅为补这个字段重启正式服务。

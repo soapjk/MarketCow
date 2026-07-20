@@ -49,6 +49,20 @@ CLICKHOUSE_MIGRATIONS = [
             "input_fingerprint String DEFAULT '' AFTER quality_status",
         ],
     ),
+    (
+        3,
+        "history adjustment contract fields",
+        [
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "raw_close Nullable(Float64) AFTER close",
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "adjustment_factor Nullable(Float64) AFTER raw_close",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "raw_close Nullable(Float64) AFTER close",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "adjustment_factor Nullable(Float64) AFTER raw_close",
+        ],
+    ),
 ]
 
 
@@ -149,12 +163,14 @@ class ClickHouseDatabase:
 class ClickHouseMarketBarRepository:
     RAW_COLUMNS = [
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
-        "low", "close", "volume", "amount", "source", "source_sequence",
+        "low", "close", "raw_close", "adjustment_factor", "volume", "amount",
+        "source", "source_sequence",
         "observed_at", "ingested_at", "raw_artifact_id",
     ]
     CANONICAL_COLUMNS = [
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
-        "low", "close", "volume", "amount", "selected_source", "source_count",
+        "low", "close", "raw_close", "adjustment_factor", "volume", "amount",
+        "selected_source", "source_count",
         "quality_status", "input_fingerprint", "version", "observed_at", "ingested_at",
         "raw_artifact_id", "updated_at",
     ]
@@ -242,3 +258,58 @@ class ClickHouseMarketBarRepository:
         )
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
         return rows[:limit], len(rows) > limit
+
+    @staticmethod
+    def _iso(value: Any) -> str:
+        parsed = ClickHouseMarketBarRepository._datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+
+    def get_canonical_price_bars(
+        self, symbol: str, interval: str, adjustment: str, limit: int,
+    ) -> List[Dict[str, Any]]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("history limit must be between 1 and 5000")
+        result = self.database._require_client().query(
+            "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
+            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "observed_at, ingested_at, "
+            "raw_artifact_id, source_count, quality_status, version "
+            "FROM market_bar_canonical FINAL WHERE symbol={symbol:String} "
+            "AND interval={interval:String} AND adjustment={adjustment:String} "
+            "ORDER BY bar_time DESC LIMIT {limit:UInt32}",
+            parameters={"symbol": symbol, "interval": interval,
+                        "adjustment": adjustment, "limit": limit},
+        )
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        mapped = []
+        for row in reversed(rows):
+            bar_time = self._datetime(row["bar_time"])
+            if bar_time.tzinfo is None:
+                bar_time = bar_time.replace(tzinfo=timezone.utc)
+            bar_time = bar_time.astimezone(timezone.utc)
+            mapped.append({
+                "symbol": row["symbol"], "interval": row["interval"],
+                "adjustment": row["adjustment"], "timestamp": int(bar_time.timestamp()),
+                "bar_at": bar_time.isoformat(), "open": float(row["open"]),
+                "high": float(row["high"]), "low": float(row["low"]),
+                "close": float(row["close"]),
+                "raw_close": (None if row["raw_close"] is None
+                              else float(row["raw_close"])),
+                "adjustment_factor": (None if row["adjustment_factor"] is None
+                                      else float(row["adjustment_factor"])),
+                "volume": float(row["volume"]),
+                "amount": None if row["amount"] is None else float(row["amount"]),
+                "source": row["selected_source"],
+                "ingested_at": self._iso(row["ingested_at"]),
+                "source_payload": {
+                    "canonical": True, "selected_source": row["selected_source"],
+                    "source_count": int(row["source_count"]),
+                    "quality_status": row["quality_status"],
+                    "version": int(row["version"]),
+                    "observed_at": self._iso(row["observed_at"]),
+                    "raw_artifact_id": row["raw_artifact_id"],
+                },
+            })
+        return mapped
