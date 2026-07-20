@@ -40,3 +40,17 @@ def canonical_page_payload(
         "observed_at": utc_datetime(observed_at).isoformat(),
         "raw_artifact_id": raw_artifact_id,
     }
+
+
+def with_effective_time(row: Dict[str, Any], as_of: Any) -> Dict[str, Any]:
+    """Attach explicit non-exact as-of semantics without changing bar identity."""
+    result = dict(row)
+    effective = utc_datetime(result["bar_at"])
+    point = utc_datetime(as_of)
+    staleness = max(0, int(point.timestamp()) - int(effective.timestamp()))
+    result.update({
+        "effective_bar_at": effective.isoformat(),
+        "staleness_seconds": staleness,
+        "effective_status": "exact" if staleness == 0 else "prior_within_lookback",
+    })
+    return result

@@ -100,6 +100,15 @@ class MarketBarRepository(Protocol):
         symbols: Sequence[str], page_size: int,
         after: Optional[tuple[int, str]] = None,
     ) -> tuple[List[Dict[str, Any]], bool]: ...
+    def get_price_bar_as_of(
+        self, symbol: str, interval: str, adjustment: str,
+        as_of: str, max_lookback_seconds: int,
+    ) -> Optional[Dict[str, Any]]: ...
+    def get_price_bars_as_of_page(
+        self, interval: str, adjustment: str, as_of: str,
+        max_lookback_seconds: int, symbols: Sequence[str], page_size: int,
+        after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]: ...
     def get_raw_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
         start: str, end: str, limit: int,

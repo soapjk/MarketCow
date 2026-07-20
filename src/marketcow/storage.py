@@ -11,7 +11,11 @@ import duckdb
 import pandas as pd
 
 from .bar_version import raw_content_rank
-from .canonical_selection import DEFAULT_SOURCE_PRIORITY, canonical_page_payload
+from .canonical_selection import (
+    DEFAULT_SOURCE_PRIORITY,
+    canonical_page_payload,
+    with_effective_time,
+)
 
 
 FUNDAMENTAL_COLUMNS = [
@@ -1079,6 +1083,104 @@ class Warehouse:
             )
             result.append(row)
         return result, has_more
+
+    def get_price_bar_as_of(
+        self, symbol: str, interval: str, adjustment: str,
+        as_of: str, max_lookback_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not 1 <= max_lookback_seconds <= 31_536_000:
+            raise ValueError("max_lookback_seconds must be between 1 and 31536000")
+        point, _ = self._utc_range(as_of, as_of)
+        point_epoch = int(point.timestamp())
+        lower_epoch = point_epoch - max_lookback_seconds
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters: List[Any] = list(self.canonical_source_priority)
+        parameters.extend([
+            symbol, interval, adjustment, lower_epoch, point_epoch,
+        ])
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER (ORDER BY timestamp DESC, " +
+                priority_sql + " ASC, CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) "
+                "AS selected FROM market_price_bar WHERE symbol = ? AND interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?) "
+                "WHERE selected = 1 LIMIT 1",
+                parameters,
+            )
+        if not rows:
+            return None
+        return with_effective_time(self._canonical_duckdb_row(rows[0]), point)
+
+    def get_price_bars_as_of_page(
+        self, interval: str, adjustment: str, as_of: str,
+        max_lookback_seconds: int, symbols: Sequence[str], page_size: int,
+        after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= max_lookback_seconds <= 31_536_000:
+            raise ValueError("max_lookback_seconds must be between 1 and 31536000")
+        if not 1 <= page_size <= 1000:
+            raise ValueError("as-of page_size must be between 1 and 1000")
+        point, _ = self._utc_range(as_of, as_of)
+        point_epoch = int(point.timestamp())
+        lower_epoch = point_epoch - max_lookback_seconds
+        symbol_filter = sorted({str(value).strip() for value in symbols if str(value).strip()})
+        if not 1 <= len(symbol_filter) <= 1000:
+            raise ValueError("as-of symbols must contain between 1 and 1000 values")
+        filters = "symbol IN (" + ",".join("?" for _ in symbol_filter) + ")"
+        parameters: List[Any] = list(self.canonical_source_priority)
+        parameters.extend([
+            interval, adjustment, lower_epoch, point_epoch, *symbol_filter,
+        ])
+        if after is not None:
+            filters += " AND symbol > ?"
+            parameters.append(after)
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY "
+                "timestamp DESC, " + priority_sql +
+                " ASC, CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) "
+                "AS selected FROM market_price_bar WHERE interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ? AND " +
+                filters + ") WHERE selected = 1 ORDER BY symbol ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        return [with_effective_time(self._canonical_duckdb_row(row), point)
+                for row in rows[:page_size]], has_more
+
+    def _canonical_duckdb_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row.pop("payload_json", None)
+        row["timestamp"] = int(row["timestamp"])
+        row["bar_at"] = self._utc_iso(row["bar_at"])
+        row["ingested_at"] = self._utc_iso(row["ingested_at"])
+        observed_at = row.pop("observed_at")
+        raw_artifact_id = row.pop("raw_artifact_id")
+        row["source_payload"] = canonical_page_payload(
+            row["source"], observed_at, raw_artifact_id
+        )
+        return row
 
     def get_raw_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,

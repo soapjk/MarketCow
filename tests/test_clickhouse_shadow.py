@@ -47,6 +47,12 @@ class FakePrimary:
     def get_price_bars_matrix_page(self, *args):
         return (["duckdb-matrix-page"], True)
 
+    def get_price_bar_as_of(self, *args):
+        return {"symbol": "duckdb-as-of"}
+
+    def get_price_bars_as_of_page(self, *args):
+        return (["duckdb-as-of-page"], True)
+
     def get_raw_price_bars_range(self, *args):
         return (["duckdb-raw"], True)
 
@@ -103,6 +109,16 @@ class ReconcileRepository:
         return self.rows, False
 
     def get_canonical_price_bars_matrix_page(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows, False
+
+    def get_canonical_price_bar_as_of(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return None if not self.rows else self.rows[0]
+
+    def get_canonical_price_bars_as_of_page(self, *args):
         if isinstance(self.rows, Exception):
             raise self.rows
         return self.rows, False
@@ -302,6 +318,30 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
         diagnostics = adapter.diagnostics()["read"]
         self.assertTrue(diagnostics["fallback"])
         self.assertTrue(diagnostics["matrix"])
+
+    def test_as_of_single_and_page_bounded_fallback_diagnostics(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.repository = ReconcileRepository([{"symbol": "AAPL"}])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(
+            primary, writer, canonical_reads_enabled=True
+        )
+        single = ("AAPL", "1m", "raw", "1970-01-01T00:04:10Z", 100)
+        self.assertEqual(adapter.get_price_bar_as_of(*single), {"symbol": "AAPL"})
+        page = (
+            "1m", "raw", "1970-01-01T00:04:10Z", 100,
+            ["AAPL", "MSFT"], 10, "AAPL",
+        )
+        self.assertEqual(adapter.get_price_bars_as_of_page(*page),
+                         ([{"symbol": "AAPL"}], False))
+        writer.repository.rows = ConnectionError("as-of unavailable")
+        self.assertEqual(adapter.get_price_bar_as_of(*single),
+                         {"symbol": "duckdb-as-of"})
+        self.assertEqual(adapter.get_price_bars_as_of_page(*page),
+                         (["duckdb-as-of-page"], True))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["fallback"])
+        self.assertTrue(diagnostics["as_of"])
 
     def test_raw_multisource_opt_in_and_same_query_fallback_diagnostics(self):
         primary, writer = FakePrimary(), CapturingWriter()

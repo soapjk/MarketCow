@@ -244,6 +244,73 @@ class ShadowMarketBarRepository:
                 "keyset_page": True, "error": str(error)[:4000],
             }
             return rows, has_more
+
+    def get_price_bar_as_of(
+        self, symbol: str, interval: str, adjustment: str,
+        as_of: str, max_lookback_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        arguments = (symbol, interval, adjustment, as_of, max_lookback_seconds)
+        if not self.canonical_reads_enabled:
+            row = self.primary.get_price_bar_as_of(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": 0 if row is None else 1, "as_of": True,
+            }
+            return row
+        try:
+            row = self.writer.repository.get_canonical_price_bar_as_of(*arguments)
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": 0 if row is None else 1, "as_of": True,
+            }
+            return row
+        except Exception as error:
+            row = self.primary.get_price_bar_as_of(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback",
+                "count": 0 if row is None else 1, "as_of": True,
+                "error": str(error)[:4000],
+            }
+            return row
+
+    def get_price_bars_as_of_page(
+        self, interval: str, adjustment: str, as_of: str,
+        max_lookback_seconds: int, symbols: Sequence[str], page_size: int,
+        after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (
+            interval, adjustment, as_of, max_lookback_seconds,
+            symbols, page_size, after,
+        )
+        if not self.canonical_reads_enabled:
+            rows, has_more = self.primary.get_price_bars_as_of_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more, "as_of": True,
+                "keyset_page": True,
+            }
+            return rows, has_more
+        try:
+            rows, has_more = self.writer.repository.get_canonical_price_bars_as_of_page(
+                interval, adjustment, as_of, max_lookback_seconds,
+                list(symbols), page_size, after,
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": has_more,
+                "as_of": True, "keyset_page": True,
+            }
+            return rows, has_more
+        except Exception as error:
+            rows, has_more = self.primary.get_price_bars_as_of_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": has_more, "as_of": True, "keyset_page": True,
+                "error": str(error)[:4000],
+            }
+            return rows, has_more
     def get_raw_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
         start: str, end: str, limit: int,

@@ -551,6 +551,108 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             self.assertEqual(fallback_payload, clickhouse_payload)
             self.assertTrue(adapter.diagnostics()["read"]["fallback"])
 
+    def test_canonical_as_of_matches_duckdb_and_api_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            warehouse = Warehouse(root / "warehouse.duckdb")
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(root / "spool", root), 1000
+            )
+            fixtures = {
+                "ASOF-A": [(100, 11), (200, 22), (300, 33)],
+                "ASOF-B": [(150, 15)],
+                "ASOF-C": [(240, 24)],
+            }
+            canonical = []
+            for symbol, values in fixtures.items():
+                warehouse.upsert_price_bars(
+                    symbol, "1m", "raw", "tushare", "2026-07-20T05:50:02Z",
+                    [{"timestamp": timestamp,
+                      "bar_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+                      "open": close, "high": close + 1, "low": close - 1,
+                      "close": close, "raw_close": close,
+                      "adjustment_factor": 1.0, "volume": 100, "amount": 1000}
+                     for timestamp, close in values],
+                    {"observed_at": "2026-07-20T05:50:01Z",
+                     "raw_artifact_id": "as-of-artifact"},
+                )
+                for timestamp, close in values:
+                    point = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+                    canonical.append({
+                        "symbol": symbol, "market": "US", "interval": "1m",
+                        "adjustment": "raw", "bar_time": point, "open": close,
+                        "high": close + 1, "low": close - 1, "close": close,
+                        "raw_close": close, "adjustment_factor": 1.0,
+                        "volume": 100, "amount": 1000,
+                        "selected_source": "tushare", "source_count": 1,
+                        "quality_status": "single_source",
+                        "observed_at": "2026-07-20T05:50:01Z",
+                        "ingested_at": "2026-07-20T05:50:02Z",
+                        "raw_artifact_id": "as-of-artifact", "version": 1,
+                        "input_fingerprint": f"{symbol}-{timestamp}-v1",
+                        "updated_at": "2026-07-20T05:50:03Z",
+                    })
+            versioned = next(
+                row for row in canonical
+                if row["symbol"] == "ASOF-A" and row["bar_time"].endswith("03:20+00:00")
+            )
+            canonical.append({
+                **versioned, "version": 2, "input_fingerprint": "ASOF-A-200-v2"
+            })
+            self.repository.insert_canonical_bars(canonical)
+            adapter = ShadowMarketBarRepository(
+                warehouse, writer, canonical_reads_enabled=True
+            )
+            single = ("ASOF-A", "1m", "raw", "1970-01-01T08:04:10+08:00", 100)
+            clickhouse_single = adapter.get_price_bar_as_of(*single)
+            self.assertEqual(clickhouse_single, warehouse.get_price_bar_as_of(*single))
+            self.assertEqual(clickhouse_single["timestamp"], 200)
+            self.assertEqual(clickhouse_single["staleness_seconds"], 50)
+            page = (
+                "1m", "raw", "1970-01-01T00:04:10Z", 100,
+                ["ASOF-C", "ASOF-B", "ASOF-A", "ASOF-A"], 1, None,
+            )
+            clickhouse_page = adapter.get_price_bars_as_of_page(*page)
+            self.assertEqual(clickhouse_page, warehouse.get_price_bars_as_of_page(*page))
+            self.assertTrue(clickhouse_page[1])
+
+            settings = Settings(
+                root / "warehouse.duckdb", root / "raw",
+                market_bar_cursor_secret="clickhouse-as-of-secret-1234567890abcdef",
+                storage_root=root / "data-development",
+            )
+            path = (
+                "/v1/quotes/cross-section/as-of?interval=1m&adjustment=raw"
+                "&as_of=1970-01-01T08:04:10%2B08:00&max_lookback_seconds=100"
+                "&symbols=ASOF-C,ASOF-B,ASOF-A,ASOF-A&page_size=1"
+            )
+            single_path = (
+                "/v1/quotes/ASOF-A/as-of?interval=1m&adjustment=raw"
+                "&as_of=1970-01-01T08:04:10%2B08:00&max_lookback_seconds=100"
+            )
+            app = create_app(
+                settings, MarketBarService(adapter),
+                lambda: datetime(2026, 7, 20, 6, 0, tzinfo=timezone.utc),
+            )
+            with TestClient(app) as client:
+                clickhouse_payload = client.get(path).json()
+                clickhouse_single_payload = client.get(single_path).json()
+            original = self.repository.database.client
+            self.repository.database.client = None
+            try:
+                fallback_single = adapter.get_price_bar_as_of(*single)
+                fallback_page = adapter.get_price_bars_as_of_page(*page)
+                with TestClient(app) as client:
+                    fallback_payload = client.get(path).json()
+                    fallback_single_payload = client.get(single_path).json()
+            finally:
+                self.repository.database.client = original
+            self.assertEqual(fallback_single, clickhouse_single)
+            self.assertEqual(fallback_page, clickhouse_page)
+            self.assertEqual(fallback_payload, clickhouse_payload)
+            self.assertEqual(fallback_single_payload, clickhouse_single_payload)
+            self.assertTrue(adapter.diagnostics()["read"]["fallback"])
+
     def test_raw_multisource_range_filter_final_provenance_and_truncation(self):
         base = {
             "symbol": "RAW.HK", "market": "HK", "interval": "1m",

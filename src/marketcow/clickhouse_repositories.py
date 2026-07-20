@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import clickhouse_connect
 
 from .bar_version import raw_content_rank, raw_content_version
-from .canonical_selection import canonical_page_payload
+from .canonical_selection import canonical_page_payload, with_effective_time
 
 
 CLICKHOUSE_MIGRATIONS = [
@@ -716,3 +716,81 @@ class ClickHouseMarketBarRepository:
                 row["source"], payload["observed_at"], payload["raw_artifact_id"]
             )
         return mapped, len(rows) > page_size
+
+    def get_canonical_price_bar_as_of(
+        self, symbol: str, interval: str, adjustment: str,
+        as_of: str, max_lookback_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not 1 <= max_lookback_seconds <= 31_536_000:
+            raise ValueError("max_lookback_seconds must be between 1 and 31536000")
+        point = self._datetime(as_of).astimezone(timezone.utc)
+        point = datetime.fromtimestamp(int(point.timestamp()), timezone.utc)
+        lower = datetime.fromtimestamp(
+            int(point.timestamp()) - max_lookback_seconds, timezone.utc
+        )
+        result = self.database._require_client().query(
+            "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
+            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
+            "version FROM market_bar_canonical FINAL WHERE symbol={symbol:String} "
+            "AND interval={interval:String} AND adjustment={adjustment:String} "
+            "AND bar_time >= {lower:DateTime64(3)} AND bar_time <= {point:DateTime64(3)} "
+            "ORDER BY bar_time DESC LIMIT 1",
+            parameters={"symbol": symbol, "interval": interval,
+                        "adjustment": adjustment, "lower": lower, "point": point},
+        )
+        if not result.result_rows:
+            return None
+        row = dict(zip(result.column_names, result.result_rows[0]))
+        mapped = self._as_of_canonical_rows([row], point)
+        return mapped[0]
+
+    def get_canonical_price_bars_as_of_page(
+        self, interval: str, adjustment: str, as_of: str,
+        max_lookback_seconds: int, symbols: List[str], page_size: int,
+        after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= max_lookback_seconds <= 31_536_000:
+            raise ValueError("max_lookback_seconds must be between 1 and 31536000")
+        if not 1 <= page_size <= 1000:
+            raise ValueError("as-of page_size must be between 1 and 1000")
+        point = self._datetime(as_of).astimezone(timezone.utc)
+        point = datetime.fromtimestamp(int(point.timestamp()), timezone.utc)
+        lower = datetime.fromtimestamp(
+            int(point.timestamp()) - max_lookback_seconds, timezone.utc
+        )
+        symbol_filter = sorted({str(value).strip() for value in symbols if str(value).strip()})
+        if not 1 <= len(symbol_filter) <= 1000:
+            raise ValueError("as-of symbols must contain between 1 and 1000 values")
+        after_sql = "" if after is None else " AND symbol > {after:String}"
+        parameters: Dict[str, Any] = {
+            "interval": interval, "adjustment": adjustment, "lower": lower,
+            "point": point, "symbols": symbol_filter, "fetch": page_size + 1,
+        }
+        if after is not None:
+            parameters["after"] = after
+        result = self.database._require_client().query(
+            "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
+            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
+            "version FROM (SELECT *, row_number() OVER (PARTITION BY symbol "
+            "ORDER BY bar_time DESC) AS selected FROM market_bar_canonical FINAL "
+            "WHERE interval={interval:String} AND adjustment={adjustment:String} "
+            "AND bar_time >= {lower:DateTime64(3)} AND bar_time <= {point:DateTime64(3)} "
+            "AND symbol IN {symbols:Array(String)}) WHERE selected=1" + after_sql +
+            " ORDER BY symbol ASC LIMIT {fetch:UInt32}",
+            parameters=parameters,
+        )
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        return self._as_of_canonical_rows(rows[:page_size], point), len(rows) > page_size
+
+    def _as_of_canonical_rows(
+        self, rows: Any, point: datetime,
+    ) -> List[Dict[str, Any]]:
+        mapped = self._map_canonical_rows(rows)
+        for row in mapped:
+            payload = row["source_payload"]
+            row["source_payload"] = canonical_page_payload(
+                row["source"], payload["observed_at"], payload["raw_artifact_id"]
+            )
+        return [with_effective_time(row, point) for row in mapped]

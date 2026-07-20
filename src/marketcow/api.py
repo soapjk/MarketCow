@@ -530,6 +530,116 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.get("/v1/quotes/cross-section/as-of")
+    def quote_cross_section_as_of(
+        as_of: str,
+        symbols: str,
+        interval: str = "1d",
+        adjustment: str = "adjusted",
+        max_lookback_seconds: int = Query(86400, ge=1, le=31_536_000),
+        page_size: int = Query(500, ge=1, le=1000),
+        cursor: Optional[str] = None,
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            point = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            if point.tzinfo is None:
+                raise ValueError("as_of must include a timezone")
+            normalized_as_of = datetime.fromtimestamp(
+                int(point.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            symbol_filter = sorted({
+                value.strip() for value in symbols.split(",") if value.strip()
+            })
+            if not 1 <= len(symbol_filter) <= 1000:
+                raise ValueError("as-of symbols must contain between 1 and 1000 values")
+            query_binding = {
+                "interval": interval, "adjustment": adjustment,
+                "as_of": normalized_as_of,
+                "max_lookback_seconds": max_lookback_seconds,
+                "symbols": symbol_filter, "page_size": page_size,
+            }
+            cursor_secret = load_or_create_secret(
+                settings.market_bar_cursor_secret, settings.storage_root
+            )
+            cursor_now = clock()
+            if cursor_now.tzinfo is None:
+                cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+            now_epoch = int(cursor_now.timestamp())
+            after = None if cursor is None else decode_cursor(
+                cursor, query_binding, now_epoch,
+                settings.market_bar_cursor_ttl_seconds, cursor_secret,
+            )
+            if after is not None and not isinstance(after, str):
+                raise ValueError("invalid as-of cursor position")
+            bars, has_more = service.market_bar_repository.get_price_bars_as_of_page(
+                interval, adjustment, normalized_as_of, max_lookback_seconds,
+                symbol_filter, page_size, after,
+            )
+            next_cursor = None
+            if has_more and bars:
+                next_cursor = encode_cursor(
+                    query_binding, bars[-1]["symbol"], now_epoch, cursor_secret
+                )
+            return {
+                "as_of": normalized_as_of, "interval": interval,
+                "adjustment": adjustment,
+                "max_lookback_seconds": max_lookback_seconds,
+                "symbols": symbol_filter, "count": len(bars), "bars": bars,
+                "cached": True, "truncated": has_more,
+                "page_size": page_size, "next_cursor": next_cursor,
+                "max_staleness_seconds": max(
+                    (row["staleness_seconds"] for row in bars), default=None
+                ),
+                **cache_metadata(bars),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/v1/quotes/{symbol}/as-of")
+    def quote_as_of(
+        symbol: str,
+        as_of: str,
+        interval: str = "1d",
+        adjustment: str = "adjusted",
+        max_lookback_seconds: int = Query(86400, ge=1, le=31_536_000),
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            try:
+                normalized = normalize_a_symbol(symbol)
+            except ValueError:
+                normalized, _ = normalize_yahoo_symbol(symbol)
+            point = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            if point.tzinfo is None:
+                raise ValueError("as_of must include a timezone")
+            normalized_as_of = datetime.fromtimestamp(
+                int(point.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            row = service.market_bar_repository.get_price_bar_as_of(
+                normalized, interval, adjustment, normalized_as_of,
+                max_lookback_seconds,
+            )
+            bars = [] if row is None else [row]
+            return {
+                "symbol": normalized, "as_of": normalized_as_of,
+                "interval": interval, "adjustment": adjustment,
+                "max_lookback_seconds": max_lookback_seconds,
+                "count": len(bars), "bar": row, "cached": True,
+                "max_staleness_seconds": (
+                    None if row is None else row["staleness_seconds"]
+                ),
+                **cache_metadata(bars),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.get("/v1/quotes/{symbol}/raw-history")
     def quote_raw_history(
         symbol: str,
