@@ -141,6 +141,11 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
 
     settings.validate_runtime_isolation()
     warehouse.canonical_source_priority = tuple(settings.clickhouse_source_priority)
+    from .telemetry import Telemetry, instrument_duckdb_market_bars
+    telemetry = getattr(warehouse, "telemetry", None) or Telemetry(
+        clickhouse_enabled=settings.clickhouse_enabled
+    )
+    instrument_duckdb_market_bars(warehouse, telemetry)
     if settings.metadata_backend == "duckdb" and not settings.clickhouse_enabled:
         return create_duckdb_repositories(warehouse), None
     resources: List[Any] = []
@@ -180,8 +185,7 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
                 settings.clickhouse_spool_quota_bytes,
                 settings.clickhouse_spool_warning_ratio,
             )
-            from .telemetry import Telemetry
-            spool.telemetry = Telemetry(clickhouse_enabled=True)
+            spool.telemetry = telemetry
             from .spool_operator import SpoolOperator
             SpoolOperator(spool).migrate_legacy(1000)
             clickhouse_repository = ClickHouseMarketBarRepository(clickhouse)

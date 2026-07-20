@@ -1,7 +1,16 @@
 import threading
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
+from marketcow.api import create_app
+from marketcow.config import Settings
+from marketcow.duckdb_repositories import create_stage1_repositories
+from marketcow.storage import Warehouse
 from marketcow.telemetry import MAX_LOG_EVENTS, SCHEMA_VERSION, Telemetry, sanitize_text
 from marketcow.contract_gate import compare_contract
 
@@ -62,6 +71,60 @@ class TelemetryTest(unittest.TestCase):
         self.assertNotIn("token=abc", rendered)
         self.assertNotIn("/Volumes/T9", rendered)
         self.assertLessEqual(len(sanitize_text(secret)), 1000)
+
+    def test_nested_mapping_keys_are_redacted(self):
+        self.telemetry.log("query", payload={
+            "password=hunter2": {"/Volumes/T9/private/key": "value"},
+            "safe": {"token=abc": "ok"},
+        })
+        rendered = str(self.telemetry.snapshot())
+        self.assertNotIn("hunter2", rendered)
+        self.assertNotIn("/Volumes/T9", rendered)
+        self.assertNotIn("token=abc", rendered)
+
+    def test_default_duckdb_records_write_query_and_cache_without_clickhouse_effects(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = Settings(
+                root / "data-development/warehouse.duckdb",
+                root / "data-development/raw", profile="development", port=8791,
+                storage_root=root / "data-development",
+                clickhouse_spool_path=root / "data-development/spool/clickhouse",
+            )
+            warehouse = Warehouse(settings.database_path)
+            with patch("clickhouse_connect.get_client") as get_client:
+                repositories, resources = create_stage1_repositories(settings, warehouse)
+                repositories.market_bars.upsert_price_bars(
+                    "MU", "1d", "raw", "fixture", "2026-07-20T00:00:01Z",
+                    [{"timestamp": 1784505600, "open": 1, "high": 2, "low": 1,
+                      "close": 2, "volume": 3}],
+                )
+                repositories.market_bars.get_price_bars("MU", "1d", "raw", 10)
+                service = type("Service", (), {
+                    "market_bar_repository": repositories.market_bars,
+                    "close": lambda self: None,
+                })()
+                with TestClient(create_app(
+                    settings, service,
+                    lambda: datetime(2026, 7, 20, 0, 0, 2,
+                                     tzinfo=timezone.utc),
+                )) as client:
+                    response = client.get(
+                        "/v1/quotes/MU/history?interval=1d&adjustment=raw&refresh=false"
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["cache_status"], "fresh")
+            snapshot = repositories.market_bars.telemetry.snapshot()
+            names = {item["name"] for item in snapshot["metrics"]}
+            self.assertIn("ingest_write_latency_seconds", names)
+            self.assertIn("query_latency_seconds", names)
+            self.assertIn("cache_age_seconds", names)
+            self.assertIs(repositories.market_bars, warehouse)
+            self.assertIsNone(resources)
+            get_client.assert_not_called()
+            self.assertFalse(settings.clickhouse_spool_path.exists())
+            self.assertFalse(any(item["name"] == "clickhouse_pressure"
+                                 for item in snapshot["metrics"]))
 
     def test_safe_failure_is_fail_open_and_disabled_has_no_fake_pressure(self):
         self.telemetry.safe("gauge", "wal_items", 1, state="invalid")

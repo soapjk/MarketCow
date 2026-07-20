@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import re
 import threading
+from functools import wraps
+from types import MethodType
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Mapping
@@ -72,7 +74,10 @@ def sanitize_text(value: Any) -> str:
 
 def _sanitize(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(key)[:64]: _sanitize(item) for key, item in list(value.items())[:32]}
+        return {
+            sanitize_text(key)[:64]: _sanitize(item)
+            for key, item in list(value.items())[:32]
+        }
     if isinstance(value, (list, tuple)):
         return [_sanitize(item) for item in value[:32]]
     if isinstance(value, str) or isinstance(value, BaseException):
@@ -80,6 +85,80 @@ def _sanitize(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return sanitize_text(value)
+
+
+_QUERY_METHODS = {
+    "get_price_bars": "recent",
+    "get_price_bars_range": "range",
+    "get_price_bars_page": "page",
+    "get_price_bars_cross_section": "cross_section",
+    "get_price_bars_cross_section_page": "cross_section",
+    "get_price_bars_matrix_page": "matrix",
+    "get_raw_price_bars_range": "raw",
+    "get_raw_price_bars_page": "raw",
+    "get_price_bar_as_of": "as_of",
+    "get_price_bars_as_of_page": "as_of",
+    "get_latest_quotes": "recent",
+}
+
+
+def instrument_duckdb_market_bars(repository: Any, telemetry: "Telemetry") -> Any:
+    """Attach bounded process-local telemetry without changing repository identity."""
+    if getattr(repository, "_marketcow_telemetry_instrumented", False):
+        return repository
+    repository.telemetry = telemetry
+    for name, query in _QUERY_METHODS.items():
+        original = getattr(repository, name)
+
+        @wraps(original)
+        def measured_query(self: Any, *args: Any, _original: Any = original,
+                           _query: str = query, **kwargs: Any) -> Any:
+            started = telemetry.clock()
+            try:
+                result = _original(*args, **kwargs)
+            except Exception:
+                telemetry.safe(
+                    "histogram", "query_latency_seconds",
+                    max(0.0, telemetry.clock() - started),
+                    backend="duckdb", query=_query, outcome="error",
+                )
+                raise
+            rows = result[0] if isinstance(result, tuple) else result
+            outcome = "empty" if rows is None or rows == [] else "ok"
+            telemetry.safe(
+                "histogram", "query_latency_seconds",
+                max(0.0, telemetry.clock() - started),
+                backend="duckdb", query=_query, outcome=outcome,
+            )
+            return result
+
+        setattr(repository, name, MethodType(measured_query, repository))
+    for name in ("upsert_quote", "upsert_price_bars"):
+        original = getattr(repository, name)
+
+        @wraps(original)
+        def measured_write(self: Any, *args: Any, _original: Any = original,
+                           **kwargs: Any) -> Any:
+            started = telemetry.clock()
+            try:
+                result = _original(*args, **kwargs)
+            except Exception:
+                telemetry.safe(
+                    "histogram", "ingest_write_latency_seconds",
+                    max(0.0, telemetry.clock() - started),
+                    backend="duckdb", outcome="error",
+                )
+                raise
+            telemetry.safe(
+                "histogram", "ingest_write_latency_seconds",
+                max(0.0, telemetry.clock() - started),
+                backend="duckdb", outcome="ok",
+            )
+            return result
+
+        setattr(repository, name, MethodType(measured_write, repository))
+    repository._marketcow_telemetry_instrumented = True
+    return repository
 
 
 class Telemetry:
