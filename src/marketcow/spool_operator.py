@@ -212,23 +212,31 @@ class SpoolOperator:
                        kinds: tuple[str, ...] = LEGACY_KINDS) -> Dict[str, Any]:
         if not 1 <= limit <= 1000:
             raise ValueError("operator limit must be between 1 and 1000")
-        migrated = invalid = errors = checked = 0
+        migrated = invalid = errors = checked = scanned = remaining = 0
+        scan_truncated = False
+        scan_limit = 10000
 
         def perform() -> None:
-            nonlocal migrated, invalid, errors, checked
+            nonlocal migrated, invalid, errors, checked, scanned, remaining, scan_truncated
             for kind in kinds:
                 folder = self._folder(kind)
                 if not folder.exists():
                     continue
-                paths, _ = self.spool._bounded_files(folder, max(1, limit - checked))
+                # Scan every kind independently so a signed prefix in an earlier kind cannot
+                # consume the migration budget or starve later durable state. The spool's
+                # operational scan ceiling keeps each invocation bounded.
+                paths, truncated = self.spool._bounded_files(folder, scan_limit)
+                scan_truncated = scan_truncated or truncated
                 for path in paths:
-                    if checked >= limit:
-                        return
-                    checked += 1
+                    scanned += 1
                     try:
                         payload = self.spool.read(path)
                         if payload.get("_checksum"):
                             continue
+                        if checked >= limit:
+                            remaining += 1
+                            continue
+                        checked += 1
                         validate_legacy_item(kind, path, payload)
                         self.spool._atomic_json(path, payload)
                         migrated += 1
@@ -251,8 +259,12 @@ class SpoolOperator:
             with self.mutation("migrate-legacy"):
                 perform()
         return {"status": "ok" if not invalid and not errors else "attention",
-                "checked": checked, "migrated": migrated, "invalid": invalid,
-                "errors": errors, "limit": limit, "truncated": checked >= limit}
+                "checked": checked, "scanned": scanned, "migrated": migrated,
+                "invalid": invalid, "errors": errors, "remaining": remaining,
+                "remaining_exact": not scan_truncated,
+                "limit": limit, "scan_limit_per_kind": scan_limit,
+                "truncated": bool(remaining or scan_truncated),
+                "scan_truncated": scan_truncated}
 
     def audit(self, limit: int = 1000) -> Dict[str, Any]:
         if not 1 <= limit <= 10000:

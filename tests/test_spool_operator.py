@@ -113,6 +113,46 @@ class SpoolOperatorTest(unittest.TestCase):
         self.assertEqual(failed["errors"], 1)
         self.assertEqual(json.loads(healthy.read_text(encoding="utf-8")), original)
 
+    def test_legacy_migration_budget_ignores_signed_prefix_and_reaches_later_kinds(self):
+        from tests.test_clickhouse_writer import raw_bar
+
+        for index in range(5):
+            self.spool._atomic_json(self.spool.pending / f"signed-{index}.json", {
+                "fixture": index,
+            })
+        rows = [normalize_bar("raw", raw_bar())]
+        intent_id = stable_batch_id("raw", rows)
+        intent = self.spool.intents / f"{intent_id}.json"
+        intent.write_text(json.dumps({
+            "intent_id": intent_id, "rows": rows, "pending": [],
+            "callback_attempts": 0, "last_callback_error": "",
+        }), encoding="utf-8")
+        group = {"symbol": "MU", "interval": "1m", "adjustment": "raw",
+                 "start": rows[0]["bar_time"], "end": rows[0]["bar_time"]}
+        task_id = hashlib.sha256(json.dumps(
+            group, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        scheduler = self.spool.root / "canonical-scheduler/pending"
+        scheduler.mkdir(parents=True)
+        task = scheduler / f"{task_id}.json"
+        task.write_text(json.dumps({
+            "task_id": task_id, **group, "attempts": 0,
+            "created_at_epoch": 1.0, "next_attempt_epoch": 2.0, "last_error": "",
+        }), encoding="utf-8")
+
+        first = self.operator.migrate_legacy(limit=1)
+        self.assertEqual(first["checked"], 1)
+        self.assertEqual(first["migrated"], 1)
+        self.assertEqual(first["remaining"], 1)
+        self.assertTrue(first["truncated"])
+        restarted = SpoolOperator(self.spool)
+        second = restarted.migrate_legacy(limit=1)
+        self.assertEqual(second["migrated"], 1)
+        self.assertEqual(second["remaining"], 0)
+        self.assertFalse(second["truncated"])
+        for path in (intent, task):
+            self.spool.read(path, require_checksum=True)
+
     def test_quota_warns_then_rejects_before_atomic_write(self):
         self.spool._atomic_json(self.spool.pending / "warning.json", {
             "blob": "x" * 600000,
