@@ -105,4 +105,3 @@ production 源授权闸门。真实 production 数据的读取或复制不由本
 成本与约束：V2 启动需要 PostgreSQL 和 ClickHouse 两套必要依赖；跨库一致性必须通过 intent、watermark
 和对账管理；ClickHouse 故障期间不能依赖 DuckDB 维持行情读取；切换前必须完成迁移追平、API 兼容、
 备份恢复、容量和整体回滚演练。
-

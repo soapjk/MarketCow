@@ -36,6 +36,28 @@ def imports_for(path: Path) -> set[str]:
     return imports
 
 
+def forbidden_reachability_paths(
+    graph: dict[str, set[str]], entrypoints: list[str], forbidden: set[str]
+) -> set[tuple[str, ...]]:
+    """Return every online path at the first boundary crossing into forbidden code."""
+    violations: set[tuple[str, ...]] = set()
+    for entrypoint in entrypoints:
+        pending = [(entrypoint,)]
+        visited_prefixes: set[tuple[str, ...]] = set()
+        while pending:
+            path = pending.pop()
+            if path in visited_prefixes:
+                continue
+            visited_prefixes.add(path)
+            for imported in sorted(graph.get(path[-1], set())):
+                candidate = (*path, imported)
+                if imported in forbidden:
+                    violations.add(candidate)
+                elif imported in graph and imported not in path:
+                    pending.append(candidate)
+    return violations
+
+
 class OnlineDependencyPolicyTest(unittest.TestCase):
     def setUp(self):
         self.policy = json.loads(POLICY_PATH.read_text())
@@ -50,31 +72,65 @@ class OnlineDependencyPolicyTest(unittest.TestCase):
         declared.update(self.policy["offline_only_modules"])
         self.assertEqual(declared - known, set())
 
-    def test_online_direct_duckdb_debt_is_exact_and_cannot_grow(self):
+    def test_online_transitive_duckdb_debt_is_exact_and_cannot_grow(self):
         forbidden = set(self.policy["forbidden_internal_imports"])
         forbidden.update(self.policy["offline_only_modules"])
         forbidden.update(self.policy["forbidden_external_imports"])
-        actual = {
-            (owner, imported)
-            for owner in self.policy["online_entrypoints"]
-            for imported in self.graph[owner]
-            if imported in forbidden
-        }
+        actual = forbidden_reachability_paths(
+            self.graph, self.policy["online_entrypoints"], forbidden
+        )
         exceptions = {
-            (item["from"], item["to"])
-            for item in self.policy["temporary_direct_import_exceptions"]
+            tuple(item["path"])
+            for item in self.policy["temporary_reachability_exceptions"]
         }
         self.assertEqual(actual, exceptions)
         self.assertTrue(all(item["removal_item"].startswith("BG-")
-                            for item in self.policy["temporary_direct_import_exceptions"]))
+                            for item in self.policy["temporary_reachability_exceptions"]))
 
-    def test_exception_list_has_no_duplicates_or_unobserved_edges(self):
-        items = self.policy["temporary_direct_import_exceptions"]
-        pairs = [(item["from"], item["to"]) for item in items]
-        self.assertEqual(len(pairs), len(set(pairs)))
-        for owner, imported in pairs:
-            self.assertIn(owner, self.policy["online_entrypoints"])
-            self.assertIn(imported, self.graph[owner])
+    def test_exception_list_has_no_duplicates_or_unobserved_paths(self):
+        items = self.policy["temporary_reachability_exceptions"]
+        paths = [tuple(item["path"]) for item in items]
+        self.assertEqual(len(paths), len(set(paths)))
+        for path in paths:
+            self.assertIn(path[0], self.policy["online_entrypoints"])
+            for owner, imported in zip(path, path[1:]):
+                self.assertIn(imported, self.graph[owner])
+
+    def test_single_and_two_hop_indirect_forbidden_imports_are_reported(self):
+        graph = {
+            "online": {"bridge"},
+            "bridge": {"second"},
+            "second": {"duckdb"},
+        }
+        self.assertEqual(
+            forbidden_reachability_paths(graph, ["online"], {"duckdb"}),
+            {("online", "bridge", "second", "duckdb")},
+        )
+        graph["bridge"] = {"duckdb"}
+        self.assertEqual(
+            forbidden_reachability_paths(graph, ["online"], {"duckdb"}),
+            {("online", "bridge", "duckdb")},
+        )
+
+    def test_offline_reverse_import_is_reported_but_unrelated_offline_is_legal(self):
+        graph = {
+            "online": {"bridge"},
+            "bridge": {"offline.importer"},
+            "unrelated": {"offline.importer"},
+            "offline.importer": {"duckdb"},
+        }
+        self.assertEqual(
+            forbidden_reachability_paths(
+                graph, ["online"], {"offline.importer", "duckdb"}
+            ),
+            {("online", "bridge", "offline.importer")},
+        )
+
+    def test_unobserved_exception_cannot_hide_a_different_path(self):
+        graph = {"online": {"bridge"}, "bridge": {"duckdb"}}
+        actual = forbidden_reachability_paths(graph, ["online"], {"duckdb"})
+        declared = {("online", "other_bridge", "duckdb")}
+        self.assertNotEqual(actual, declared)
 
 
 if __name__ == "__main__":

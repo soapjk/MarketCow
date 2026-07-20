@@ -19,15 +19,35 @@
     "marketcow.local_benchmark",
     "marketcow.local_restore"
   ],
-  "temporary_direct_import_exceptions": [
+  "temporary_reachability_exceptions": [
     {
-      "from": "marketcow.service",
-      "to": "marketcow.duckdb_repositories",
+      "path": [
+        "marketcow.api",
+        "marketcow.service",
+        "marketcow.duckdb_repositories"
+      ],
       "removal_item": "BG-007"
     },
     {
-      "from": "marketcow.service",
-      "to": "marketcow.storage",
+      "path": [
+        "marketcow.api",
+        "marketcow.service",
+        "marketcow.storage"
+      ],
+      "removal_item": "BG-008"
+    },
+    {
+      "path": [
+        "marketcow.service",
+        "marketcow.duckdb_repositories"
+      ],
+      "removal_item": "BG-007"
+    },
+    {
+      "path": [
+        "marketcow.service",
+        "marketcow.storage"
+      ],
       "removal_item": "BG-008"
     }
   ],
