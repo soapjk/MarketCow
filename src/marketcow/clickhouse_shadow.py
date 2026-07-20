@@ -21,11 +21,13 @@ class ShadowMarketBarRepository:
 
     def __init__(self, primary: Any, writer: ReliableClickHouseWriter,
                  canonical_builder: Any = None,
-                 canonical_reads_enabled: bool = False) -> None:
+                 canonical_reads_enabled: bool = False,
+                 raw_reads_enabled: bool = False) -> None:
         self.primary = primary
         self.writer = writer
         self.canonical_builder = canonical_builder
         self.canonical_reads_enabled = canonical_reads_enabled
+        self.raw_reads_enabled = raw_reads_enabled
         self._last_batch: Optional[Dict[str, Any]] = None
         self._last_shadow: Dict[str, Any] = {"status": "idle"}
         self._last_reconciliation: Dict[str, Any] = {"status": "not_run"}
@@ -131,6 +133,39 @@ class ShadowMarketBarRepository:
                 "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
                 "fallback": True, "status": "fallback", "count": len(rows),
                 "truncated": truncated, "cross_section": True,
+                "error": str(error)[:4000],
+            }
+            return rows, truncated
+
+    def get_raw_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+        sources: Optional[Sequence[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (symbol, interval, adjustment, start, end, limit, sources)
+        if not self.raw_reads_enabled:
+            rows, truncated = self.primary.get_raw_price_bars_range(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": truncated, "raw_multisource": True,
+            }
+            return rows, truncated
+        try:
+            rows, truncated = self.writer.repository.get_raw_price_bars_range(
+                symbol, interval, adjustment, start, end, limit,
+                None if sources is None else list(sources),
+            )
+            self._last_read = {
+                "backend": "clickhouse_raw", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": truncated, "raw_multisource": True,
+            }
+            return rows, truncated
+        except Exception as error:
+            rows, truncated = self.primary.get_raw_price_bars_range(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_raw",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": truncated, "raw_multisource": True,
                 "error": str(error)[:4000],
             }
             return rows, truncated

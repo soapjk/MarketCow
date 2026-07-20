@@ -148,6 +148,29 @@ class SettingsTest(unittest.TestCase):
                 market_bar_read_backend="unknown",
             ).validate_runtime_isolation()
 
+    def test_raw_read_backend_is_independent_explicit_and_development_only(self):
+        root = Path("/tmp/marketcow-config-test/data-development")
+        base = dict(
+            database_path=root / "db.duckdb", raw_path=root / "raw",
+            storage_root=root, clickhouse_spool_path=root / "spool/clickhouse",
+            clickhouse_database="marketcow_test",
+            raw_market_bar_read_backend="clickhouse_raw",
+        )
+        with self.assertRaisesRegex(ValueError, "development-only"):
+            Settings(**base, clickhouse_enabled=True).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "CLICKHOUSE_ENABLED"):
+            Settings(**base, profile="development", port=8791).validate_runtime_isolation()
+        settings = Settings(
+            **base, profile="development", port=8791, clickhouse_enabled=True
+        )
+        settings.validate_runtime_isolation()
+        self.assertEqual(settings.market_bar_read_backend, "duckdb")
+        with self.assertRaisesRegex(ValueError, "must be duckdb or clickhouse_raw"):
+            Settings(
+                root / "db.duckdb", root / "raw", profile="development", port=8791,
+                raw_market_bar_read_backend="unknown",
+            ).validate_runtime_isolation()
+
     def test_clickhouse_rejects_unsafe_batch_and_spool_configuration(self):
         root = Path("/tmp/marketcow-config-test")
         base = dict(database_path=root / "db.duckdb", raw_path=root / "raw",

@@ -271,6 +271,50 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         self.assertEqual(empty, [])
         self.assertFalse(truncated)
 
+    def test_raw_multisource_range_filter_final_provenance_and_truncation(self):
+        base = {
+            "symbol": "RAW.HK", "market": "HK", "interval": "1m",
+            "adjustment": "raw", "bar_time": "2026-07-20T06:00:00Z",
+            "open": 10, "high": 12, "low": 9, "close": 11,
+            "raw_close": 22, "adjustment_factor": 0.5,
+            "volume": 100, "amount": 1100, "source_sequence": "1",
+            "observed_at": "2026-07-20T06:00:01Z",
+            "ingested_at": "2026-07-20T06:00:02Z",
+            "raw_artifact_id": "artifact-old",
+        }
+        self.repository.insert_raw_bars([
+            {**base, "source": "alpha"},
+            {**base, "source": "alpha", "close": 21,
+             "ingested_at": "2026-07-20T06:00:03Z",
+             "raw_artifact_id": "artifact-new"},
+            {**base, "source": "beta", "source_sequence": "2"},
+            {**base, "source": "alpha", "bar_time": "2026-07-20T06:01:00Z",
+             "source_sequence": "3"},
+            {**base, "source": "wrong", "interval": "5m"},
+        ])
+        bars, truncated = self.repository.get_raw_price_bars_range(
+            "RAW.HK", "1m", "raw", "2026-07-20T14:00:00+08:00",
+            "2026-07-20T06:01:00Z", 2,
+        )
+        self.assertEqual([(bar["timestamp"], bar["source"]) for bar in bars], [
+            (1784527200, "alpha"), (1784527200, "beta")
+        ])
+        self.assertEqual(bars[0]["close"], 21.0)
+        self.assertEqual(bars[0]["raw_artifact_id"], "artifact-new")
+        self.assertEqual(bars[0]["source_sequence"], "1")
+        self.assertTrue(truncated)
+        filtered, truncated = self.repository.get_raw_price_bars_range(
+            "RAW.HK", "1m", "raw", "2026-07-20T06:00:00Z",
+            "2026-07-20T06:01:00Z", 10, ["beta", "beta"],
+        )
+        self.assertEqual([bar["source"] for bar in filtered], ["beta"])
+        self.assertFalse(truncated)
+        with self.assertRaisesRegex(ValueError, "include a timezone"):
+            self.repository.get_raw_price_bars_range(
+                "RAW.HK", "1m", "raw", "2026-07-20T06:00:00",
+                "2026-07-20T06:01:00Z", 10,
+            )
+
     def test_real_shadow_dual_write_replay_and_reconciliation(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

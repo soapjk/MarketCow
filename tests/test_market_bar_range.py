@@ -164,6 +164,51 @@ class MarketBarRangeTest(unittest.TestCase):
             )
             self.assertEqual(invalid_limit.status_code, 400)
 
+    def test_duckdb_raw_multisource_range_provenance_filter_and_truncation(self):
+        rows, truncated = self.warehouse.get_raw_price_bars_range(
+            "AAPL", "1m", "raw", "1970-01-01T00:01:40Z",
+            "1970-01-01T00:05:00Z", 3,
+        )
+        self.assertEqual([(row["timestamp"], row["source"]) for row in rows],
+                         [(100, "fixture"), (200, "fixture"), (200, "newer")])
+        self.assertTrue(truncated)
+        self.assertEqual(rows[0]["source_sequence"], "100")
+        self.assertEqual(rows[0]["observed_at"], "1970-01-01T00:01:40+00:00")
+        self.assertEqual(rows[0]["ingested_at"], "2026-07-20T00:00:00+00:00")
+        filtered, truncated = self.warehouse.get_raw_price_bars_range(
+            "AAPL", "1m", "raw", "1970-01-01T00:01:40Z",
+            "1970-01-01T00:05:00Z", 10, ["newer", "newer"],
+        )
+        self.assertEqual([(row["timestamp"], row["source"]) for row in filtered],
+                         [(200, "newer")])
+        self.assertFalse(truncated)
+        self.assertEqual(self.warehouse.get_raw_price_bars_range(
+            "AAPL", "1m", "raw", "1970-01-01T00:01:40Z",
+            "1970-01-01T00:05:00Z", 10, [],
+        ), ([], False))
+
+    def test_raw_history_api_is_read_only_and_validates(self):
+        service = RangeService(self.warehouse)
+        settings = Settings(Path(self.folder.name) / "db", Path(self.folder.name) / "raw")
+        with TestClient(create_app(settings, service)) as client:
+            response = client.get(
+                "/v1/quotes/AAPL/raw-history?interval=1m&adjustment=raw"
+                "&start=1970-01-01T00:01:40Z&end=1970-01-01T00:05:00Z"
+                "&sources=newer,newer&limit=10"
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["bars"][0]["source"], "newer")
+            self.assertTrue(payload["cached"])
+            self.assertFalse(payload["truncated"])
+            self.assertEqual(service.refresh_calls, 0)
+            invalid = client.get(
+                "/v1/quotes/AAPL/raw-history?start=1970-01-01T00:00:00"
+                "&end=1970-01-01T00:01:00Z"
+            )
+            self.assertEqual(invalid.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

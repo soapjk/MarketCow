@@ -279,6 +279,7 @@ class Warehouse:
                 con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS {0} VARCHAR".format(name))
             con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS amount DOUBLE")
             con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS payload_json VARCHAR")
+            con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS source_sequence VARCHAR")
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS economic_calendar_event (
@@ -695,12 +696,12 @@ class Warehouse:
     def upsert_price_bars(self, symbol: str, interval: str, adjustment: str, source: str, ingested_at: str, bars: List[Dict[str, Any]], provenance: Optional[Dict[str, Any]] = None) -> int:
         provenance = provenance or {}
         values = [
-            [symbol, interval, adjustment, bar.get("timestamp"), bar.get("bar_at"), bar.get("open"), bar.get("high"), bar.get("low"), bar.get("close"), bar.get("raw_close"), bar.get("adjustment_factor"), bar.get("volume"), source, ingested_at, provenance.get("source_url"), provenance.get("observed_at") or bar.get("bar_at"), provenance.get("raw_response_locator"), provenance.get("raw_path"), provenance.get("raw_artifact_id"), bar.get("amount"), json.dumps(bar.get("source_payload") or bar, ensure_ascii=False, allow_nan=False)]
+            [symbol, interval, adjustment, bar.get("timestamp"), bar.get("bar_at"), bar.get("open"), bar.get("high"), bar.get("low"), bar.get("close"), bar.get("raw_close"), bar.get("adjustment_factor"), bar.get("volume"), source, ingested_at, provenance.get("source_url"), provenance.get("observed_at") or bar.get("bar_at"), provenance.get("raw_response_locator"), provenance.get("raw_path"), provenance.get("raw_artifact_id"), bar.get("amount"), json.dumps(bar.get("source_payload") or bar, ensure_ascii=False, allow_nan=False), str(bar.get("source_sequence") or bar.get("timestamp"))]
             for bar in bars
         ]
         if values:
             with self._lock, self.connect() as con:
-                con.executemany("INSERT OR REPLACE INTO market_price_bar (symbol, interval, adjustment, timestamp, bar_at, open, high, low, close, raw_close, adjustment_factor, volume, source, ingested_at, source_url, observed_at, raw_response_locator, raw_path, raw_artifact_id, amount, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+                con.executemany("INSERT OR REPLACE INTO market_price_bar (symbol, interval, adjustment, timestamp, bar_at, open, high, low, close, raw_close, adjustment_factor, volume, source, ingested_at, source_url, observed_at, raw_response_locator, raw_path, raw_artifact_id, amount, payload_json, source_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
         return len(values)
 
     def save_tushare_response(
@@ -837,6 +838,51 @@ class Warehouse:
             row["timestamp"] = int(row["timestamp"])
             row["bar_at"] = self._utc_iso(row["bar_at"])
             row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            row["source_payload"] = json.loads(payload) if payload else {}
+            result.append(row)
+        return result, truncated
+
+    def get_raw_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+        sources: Optional[Sequence[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("raw history limit must be between 1 and 5000")
+        start_at, end_at = self._utc_range(start, end)
+        source_filter = None if sources is None else sorted({
+            str(value).strip() for value in sources if str(value).strip()
+        })
+        if source_filter is not None and len(source_filter) > 100:
+            raise ValueError("raw history sources must contain at most 100 values")
+        if source_filter == []:
+            return [], False
+        filters = ""
+        parameters: List[Any] = [
+            symbol, interval, adjustment, int(start_at.timestamp()), int(end_at.timestamp())
+        ]
+        if source_filter is not None:
+            filters = " AND source IN (" + ",".join("?" for _ in source_filter) + ")"
+            parameters.extend(source_filter)
+        parameters.append(limit + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "source_sequence, observed_at, ingested_at, raw_artifact_id, payload_json "
+                "FROM market_price_bar WHERE symbol = ? AND interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?" + filters +
+                " ORDER BY timestamp ASC, source ASC LIMIT ?",
+                parameters,
+            )
+        truncated = len(rows) > limit
+        result = []
+        for row in rows[:limit]:
+            payload = row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            for field in ("bar_at", "observed_at", "ingested_at"):
+                row[field] = self._utc_iso(row[field])
             row["source_payload"] = json.loads(payload) if payload else {}
             result.append(row)
         return result, truncated

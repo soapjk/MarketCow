@@ -291,6 +291,56 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.get("/v1/quotes/{symbol}/raw-history")
+    def quote_raw_history(
+        symbol: str,
+        start: str,
+        end: str,
+        interval: str = "1d",
+        adjustment: str = "raw",
+        limit: int = 500,
+        sources: Optional[str] = None,
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            if not 1 <= limit <= 5000:
+                raise ValueError("raw history limit must be between 1 and 5000")
+            try:
+                normalized = normalize_a_symbol(symbol)
+            except ValueError:
+                normalized, _ = normalize_yahoo_symbol(symbol)
+            start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if start_at.tzinfo is None or end_at.tzinfo is None:
+                raise ValueError("history range timestamps must include a timezone")
+            normalized_start = datetime.fromtimestamp(
+                int(start_at.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            normalized_end = datetime.fromtimestamp(
+                int(end_at.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            source_filter = None
+            if sources is not None:
+                source_filter = sorted({value.strip() for value in sources.split(",")
+                                        if value.strip()})
+                if len(source_filter) > 100:
+                    raise ValueError("raw history sources must contain at most 100 values")
+            bars, truncated = service.market_bar_repository.get_raw_price_bars_range(
+                normalized, interval, adjustment, normalized_start, normalized_end,
+                limit, source_filter,
+            )
+            return {
+                "symbol": normalized, "interval": interval,
+                "adjustment": adjustment, "start": normalized_start,
+                "end": normalized_end, "count": len(bars), "bars": bars,
+                "cached": True, "truncated": truncated,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.get("/v1/quotes/{symbol}")
     def quote(symbol: str, refresh: bool = True):
         try:

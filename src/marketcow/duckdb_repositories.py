@@ -190,6 +190,7 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
             market_bars = ShadowMarketBarRepository(
                 warehouse, writer, canonical,
                 settings.market_bar_read_backend == "clickhouse_canonical",
+                settings.raw_market_bar_read_backend == "clickhouse_raw",
             )
     except Exception:
         RepositoryResources(resources).close()

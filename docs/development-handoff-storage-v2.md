@@ -100,6 +100,16 @@ DuckDB
   稳定选择；ClickHouse 查询 canonical `FINAL`，失败按同一查询回退 DuckDB。
 - 只读 API `GET /v1/quotes/cross-section` 返回规范化 bar_at、count、bars、cached=true 和
   truncated；不触发 refresh 或写入，语义参数错误返回 400。
+- raw 多来源范围读取契约为 `get_raw_price_bars_range(symbol, interval, adjustment,
+  start, end, limit, sources=None)`：带时区端点统一为 UTC 整数秒并使用闭区间；同一
+  bar_time 的各 source 分别保留，同一 raw 业务键只返回最新逻辑版本，按 bar_time、source
+  稳定升序并显式报告 truncated。sources 去重且最多 100 个，limit 为 1..5000。
+- raw 读取 backend 与 canonical 读取独立配置：默认
+  `MARKETCOW_RAW_MARKET_BAR_READ_BACKEND=duckdb`；只有 development、ClickHouse 已显式
+  启用时才允许 `clickhouse_raw`，production 拒绝。ClickHouse 查询使用 raw `FINAL`，失败
+  以同一查询回退 DuckDB，并记录 raw_multisource/backend/fallback/count/truncated/error。
+- 只读 API `GET /v1/quotes/{symbol}/raw-history` 返回规范化范围、全部 provenance、count、
+  bars、cached=true 和 truncated；不触发 refresh 或写入，语义参数错误返回 400。
 
 ## 二、仓库、分支和 worktree
 

@@ -38,6 +38,9 @@ class FakePrimary:
     def get_price_bars_cross_section(self, *args):
         return (["duckdb-cross-section"], True)
 
+    def get_raw_price_bars_range(self, *args):
+        return (["duckdb-raw"], True)
+
 
 class CapturingWriter:
     def __init__(self, result=None):
@@ -73,6 +76,11 @@ class ReconcileRepository:
         return self.rows, False
 
     def get_canonical_price_bars_cross_section(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows, False
+
+    def get_raw_price_bars_range(self, *args):
         if isinstance(self.rows, Exception):
             raise self.rows
         return self.rows, False
@@ -162,6 +170,25 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
         self.assertTrue(diagnostics["fallback"])
         self.assertTrue(diagnostics["truncated"])
         self.assertEqual(diagnostics["backend"], "duckdb")
+
+    def test_raw_multisource_opt_in_and_same_query_fallback_diagnostics(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.repository = ReconcileRepository([{"source": "fixture"}])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(primary, writer, raw_reads_enabled=True)
+        arguments = ("x", "1m", "raw", "2026-07-20T00:00:00Z",
+                     "2026-07-20T01:00:00Z", 10, ["fixture"])
+        self.assertEqual(adapter.get_raw_price_bars_range(*arguments),
+                         ([{"source": "fixture"}], False))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertEqual(diagnostics["backend"], "clickhouse_raw")
+        self.assertTrue(diagnostics["raw_multisource"])
+        writer.repository.rows = ConnectionError("raw unavailable")
+        self.assertEqual(adapter.get_raw_price_bars_range(*arguments),
+                         (["duckdb-raw"], True))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["fallback"])
+        self.assertTrue(diagnostics["truncated"])
 
     def test_primary_failure_never_attempts_shadow(self):
         writer = CapturingWriter()

@@ -40,6 +40,7 @@ class Settings:
     clickhouse_canonical_rel_tol: float = 1e-6
     clickhouse_canonical_abs_tol: float = 1e-9
     market_bar_read_backend: str = "duckdb"
+    raw_market_bar_read_backend: str = "duckdb"
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -113,6 +114,9 @@ class Settings:
             market_bar_read_backend=os.getenv(
                 "MARKETCOW_MARKET_BAR_READ_BACKEND", "duckdb"
             ).strip().lower(),
+            raw_market_bar_read_backend=os.getenv(
+                "MARKETCOW_RAW_MARKET_BAR_READ_BACKEND", "duckdb"
+            ).strip().lower(),
         )
 
     def validate_runtime_isolation(self) -> None:
@@ -126,6 +130,17 @@ class Settings:
             if not self.clickhouse_enabled:
                 raise ValueError(
                     "ClickHouse canonical reads require MARKETCOW_CLICKHOUSE_ENABLED"
+                )
+        if self.raw_market_bar_read_backend not in {"duckdb", "clickhouse_raw"}:
+            raise ValueError(
+                "MARKETCOW_RAW_MARKET_BAR_READ_BACKEND must be duckdb or clickhouse_raw"
+            )
+        if self.raw_market_bar_read_backend == "clickhouse_raw":
+            if self.profile != "development":
+                raise ValueError("ClickHouse raw reads are development-only")
+            if not self.clickhouse_enabled:
+                raise ValueError(
+                    "ClickHouse raw reads require MARKETCOW_CLICKHOUSE_ENABLED"
                 )
         if self.metadata_backend not in {"duckdb", "postgres"}:
             raise ValueError("MARKETCOW_METADATA_BACKEND must be duckdb or postgres")
