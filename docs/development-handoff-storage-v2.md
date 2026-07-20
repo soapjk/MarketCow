@@ -1781,7 +1781,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：固定方法、目标 checksum、真实深 keyset、运行中峰值、完整 SLO；无 OFFSET 或 DuckDB benchmark。
 - **必要测试**：disposable PG+CH benchmark、负向 bound gate、默认/契约回归、短 soak。
 - **排除项**：production 容量采购承诺和真实数据基准。
-- **状态**：`本地实现完成，待独立验收`。新增 offline-only `storage-v2.pg-ch-benchmark.v1` 门禁，
+- **状态**：`已验收（f2144fa + 5808848）`。新增 offline-only `storage-v2.pg-ch-benchmark.v1` 门禁，
   固定 13 个方法与三轮样本：ClickHouse distinct raw batch、共享 FINAL canonical、warm existing session、cold new
   connection、first/tail keyset+同 cursor EXPLAIN/depth、独立月份 Parquet、verified PG/CH restore、authoritative WAL
   replay、PG/CH concurrent query、system.parts/merges/disks、PostgreSQL repeatable-read/PIT 事务和短 soak reconcile。
@@ -1800,7 +1800,14 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：V2 内无 DuckDB fallback；绿故障时整体目标回蓝；新增增量追平后可再次切绿；重复演练幂等。
 - **必要测试**：两端真实本地 API golden、故障/lag/backlog/health、切换各 checkpoint 崩溃、cursor/cache/error 连续性。
 - **排除项**：修改真实消费者、launchd、8790 或任何 production 配置。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 offline-only `storage-v2.pg-ch-blue-green.v1` 演练，
+  仅通过单一消费者目标在独立 blue/green 服务间整体切换。preflight 对 BG-015 verified copy、BG-014 三次稳定
+  fingerprint/lag=0、BG-016 complete restore 与 BG-018 全 checks passed 做单次受限读取和内容哈希绑定；固定
+  lag/reconcile/contract、WAL/spool/quarantine、canonical queue、PG/CH 与 readiness stop condition，任一失败整体
+  回蓝。观察窗口运行共享路由、默认值、错误结构、quotes cache-only/partial failure、history cursor/cache 连续性及
+  health/readiness golden。持久 checkpoint 和有界脱敏审计支持切换点崩溃恢复、重复幂等；回蓝只注入一次合成
+  增量，必须重新 catch-up/reconcile 后才允许再次切绿。未修改真实消费者、8790/8791 或 production 配置，未启动
+  BG-020。
 
 ### `BG-020`：最终本地验收与交付冻结
 
