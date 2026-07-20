@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import re
+import hashlib
 import ipaddress
+import json
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import clickhouse_connect
 
@@ -99,7 +101,25 @@ CLICKHOUSE_MIGRATIONS = [
             "DROP TABLE market_bar_raw_v3",
         ],
     ),
+    (
+        5,
+        "direct V2 latest quote contract",
+        [
+            """
+            CREATE TABLE IF NOT EXISTS market_quote_latest (
+                symbol String, payload_json String,
+                observed_at DateTime64(3, 'UTC'), ingested_at DateTime64(3, 'UTC'),
+                source LowCardinality(String), content_rank String, content_version UInt256
+            ) ENGINE = ReplacingMergeTree(content_version)
+            ORDER BY symbol
+            """,
+        ],
+    ),
 ]
+
+
+class ClickHouseRepositoryError(RuntimeError):
+    """Bounded direct-repository failure with no backend fallback or secret text."""
 
 
 class ClickHouseDatabase:
@@ -211,9 +231,31 @@ class ClickHouseMarketBarRepository:
         "quality_status", "input_fingerprint", "version", "observed_at", "ingested_at",
         "raw_artifact_id", "updated_at",
     ]
+    QUOTE_COLUMNS = [
+        "symbol", "payload_json", "observed_at", "ingested_at", "source",
+        "content_rank", "content_version",
+    ]
 
     def __init__(self, database: ClickHouseDatabase) -> None:
         self.database = database
+
+    def _query(self, statement: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
+        try:
+            return self.database._require_client().query(
+                statement, parameters=parameters or {}
+            )
+        except Exception as error:
+            raise ClickHouseRepositoryError(
+                f"ClickHouse query failed ({type(error).__name__})"
+            ) from error
+
+    def _client_insert(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            self.database._require_client().insert(*args, **kwargs)
+        except Exception as error:
+            raise ClickHouseRepositoryError(
+                f"ClickHouse write failed ({type(error).__name__})"
+            ) from error
 
     @staticmethod
     def _datetime(value: Any) -> datetime:
@@ -234,7 +276,7 @@ class ClickHouseMarketBarRepository:
             for column in columns
         ] for row in rows]
         settings = {"insert_deduplication_token": batch_id} if batch_id else None
-        self.database._require_client().insert(
+        self._client_insert(
             table, values, column_names=columns, settings=settings
         )
         return len(rows)
@@ -258,8 +300,149 @@ class ClickHouseMarketBarRepository:
             "market_bar_canonical", self.CANONICAL_COLUMNS, rows, batch_id
         )
 
+    @staticmethod
+    def _market(symbol: str, provenance: Dict[str, Any]) -> str:
+        if provenance.get("market"):
+            return str(provenance["market"])
+        if symbol.endswith((".SH", ".SZ", ".BJ")):
+            return "CN"
+        if symbol.endswith(".HK"):
+            return "HK"
+        return "US"
+
+    def upsert_quote(self, row: Dict[str, Any]) -> None:
+        symbol = str(row.get("symbol") or "").strip()
+        source = str(row.get("source") or "").strip()
+        ingested_at = row.get("ingested_at")
+        observed_at = row.get("observed_at") or row.get("quote_at") or ingested_at
+        if not symbol or not source or not ingested_at or not observed_at:
+            raise ValueError(
+                "quote requires symbol, source, observed_at, and ingested_at"
+            )
+        payload = json.dumps(
+            row, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+        )
+        rank = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        self._insert("market_quote_latest", self.QUOTE_COLUMNS, [{
+            "symbol": symbol, "payload_json": payload,
+            "observed_at": observed_at, "ingested_at": ingested_at,
+            "source": source, "content_rank": rank,
+            "content_version": raw_content_version(ingested_at, rank),
+        }])
+
+    def get_latest_quotes(self, symbols: Sequence[str]) -> List[Dict[str, Any]]:
+        normalized = sorted({str(symbol).strip() for symbol in symbols if str(symbol).strip()})
+        if not normalized:
+            return []
+        if len(normalized) > 5000:
+            raise ValueError("latest quotes symbols must contain at most 5000 values")
+        result = self._query(
+            "SELECT symbol, argMax(payload_json, content_version) AS payload_json "
+            "FROM market_quote_latest FINAL WHERE symbol IN {symbols:Array(String)} "
+            "GROUP BY symbol ORDER BY symbol",
+            {"symbols": normalized},
+        )
+        return [json.loads(row[1]) for row in result.result_rows]
+
+    def upsert_price_bars(
+        self, symbol: str, interval: str, adjustment: str, source: str,
+        ingested_at: str, bars: List[Dict[str, Any]],
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        provenance = provenance or {}
+        normalized = []
+        for bar in bars:
+            bar_time = bar.get("bar_at")
+            if bar_time is None and bar.get("timestamp") is not None:
+                bar_time = datetime.fromtimestamp(
+                    int(bar["timestamp"]), timezone.utc
+                ).isoformat()
+            observed_at = provenance.get("observed_at") or bar_time
+            normalized.append({
+                "symbol": symbol, "market": self._market(symbol, provenance),
+                "interval": interval, "adjustment": adjustment,
+                "bar_time": bar_time, "open": bar.get("open"),
+                "high": bar.get("high"), "low": bar.get("low"),
+                "close": bar.get("close"), "raw_close": bar.get("raw_close"),
+                "adjustment_factor": bar.get("adjustment_factor"),
+                "volume": bar.get("volume"), "amount": bar.get("amount"),
+                "source": source,
+                "source_sequence": str(bar.get("source_sequence") or bar.get("timestamp")),
+                "observed_at": observed_at, "ingested_at": ingested_at,
+                "raw_artifact_id": provenance.get("raw_artifact_id"),
+            })
+        return self.insert_raw_bars(normalized)
+
+    # Direct MarketBarRepository contract. The canonical-prefixed methods remain as
+    # compatibility entry points for pre-blue/green offline tooling.
+    def get_price_bars(
+        self, symbol: str, interval: str, adjustment: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        return self.get_canonical_price_bars(symbol, interval, adjustment, limit)
+
+    def get_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        return self.get_canonical_price_bars_range(
+            symbol, interval, adjustment, start, end, limit
+        )
+
+    def get_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int, after: Optional[int] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        return self.get_canonical_price_bars_page(
+            symbol, interval, adjustment, start, end, page_size, after
+        )
+
+    def get_price_bars_cross_section(
+        self, interval: str, adjustment: str, bar_at: str, limit: int,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        return self.get_canonical_price_bars_cross_section(
+            interval, adjustment, bar_at, limit,
+            None if symbols is None else list(symbols),
+        )
+
+    def get_price_bars_cross_section_page(
+        self, interval: str, adjustment: str, bar_at: str, page_size: int,
+        symbols: Optional[Sequence[str]] = None, after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        return self.get_canonical_price_bars_cross_section_page(
+            interval, adjustment, bar_at, page_size,
+            None if symbols is None else list(symbols), after,
+        )
+
+    def get_price_bars_matrix_page(
+        self, interval: str, adjustment: str, bar_ats: Sequence[str],
+        symbols: Sequence[str], page_size: int,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        return self.get_canonical_price_bars_matrix_page(
+            interval, adjustment, list(bar_ats), list(symbols), page_size, after
+        )
+
+    def get_price_bar_as_of(
+        self, symbol: str, interval: str, adjustment: str,
+        as_of: str, max_lookback_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        return self.get_canonical_price_bar_as_of(
+            symbol, interval, adjustment, as_of, max_lookback_seconds
+        )
+
+    def get_price_bars_as_of_page(
+        self, interval: str, adjustment: str, as_of: str,
+        max_lookback_seconds: int, symbols: Sequence[str], page_size: int,
+        after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        return self.get_canonical_price_bars_as_of_page(
+            interval, adjustment, as_of, max_lookback_seconds,
+            list(symbols), page_size, after,
+        )
+
     def query_raw_bars(self, symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT * FROM market_bar_raw FINAL WHERE symbol = {symbol:String} "
             "ORDER BY bar_time DESC LIMIT {limit:UInt32}",
             parameters={"symbol": symbol, "limit": limit},
@@ -273,7 +456,7 @@ class ClickHouseMarketBarRepository:
         if not bar_times:
             return []
         times = [self._datetime(value) for value in bar_times]
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT * FROM market_bar_raw FINAL WHERE symbol={symbol:String} "
             "AND interval={interval:String} AND adjustment={adjustment:String} "
             "AND source={source:String} AND bar_time IN {times:Array(DateTime64(3))} "
@@ -293,7 +476,7 @@ class ClickHouseMarketBarRepository:
             raise ValueError("range limit must be between 1 and 100000")
         table = f"market_bar_{dataset}"
         suffix = ", source" if dataset == "raw" else ""
-        result = self.database._require_client().query(
+        result = self._query(
             f"SELECT * FROM {table} FINAL WHERE symbol={{symbol:String}} "
             "AND interval={interval:String} AND adjustment={adjustment:String} "
             "AND bar_time >= {start:DateTime64(3)} AND bar_time <= {end:DateTime64(3)} "
@@ -317,7 +500,7 @@ class ClickHouseMarketBarRepository:
     ) -> List[Dict[str, Any]]:
         if not 1 <= limit <= 5000:
             raise ValueError("history limit must be between 1 and 5000")
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, selected_source, "
             "observed_at, ingested_at, "
@@ -379,7 +562,7 @@ class ClickHouseMarketBarRepository:
             raise ValueError("history range start must not be after end")
         start_at = datetime.fromtimestamp(int(start_at.timestamp()), timezone.utc)
         end_at = datetime.fromtimestamp(int(end_at.timestamp()), timezone.utc)
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
@@ -413,7 +596,7 @@ class ClickHouseMarketBarRepository:
         }
         if after is not None:
             parameters["after"] = datetime.fromtimestamp(after, timezone.utc)
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
@@ -462,7 +645,7 @@ class ClickHouseMarketBarRepository:
         if source_filter is not None:
             source_sql = " AND source IN {sources:Array(String)}"
             parameters["sources"] = source_filter
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, toUnixTimestamp(bar_time) AS timestamp, "
             "open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, source, source_sequence, "
@@ -541,7 +724,7 @@ class ClickHouseMarketBarRepository:
             )
             parameters["after_time"] = datetime.fromtimestamp(after[0], timezone.utc)
             parameters["after_source"] = after[1]
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, toUnixTimestamp(bar_time) AS timestamp, "
             "open, high, low, close, raw_close, adjustment_factor, volume, amount, source, "
             "source_sequence, toUnixTimestamp64Milli(observed_at) AS observed_millis, "
@@ -607,7 +790,7 @@ class ClickHouseMarketBarRepository:
         if symbol_filter is not None:
             filter_sql = " AND symbol IN {symbols:Array(String)}"
             parameters["symbols"] = symbol_filter
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
@@ -647,7 +830,7 @@ class ClickHouseMarketBarRepository:
         if after is not None:
             filter_sql += " AND symbol > {after:String}"
             parameters["after"] = after
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
@@ -697,7 +880,7 @@ class ClickHouseMarketBarRepository:
             )
             parameters["after_time"] = datetime.fromtimestamp(after[0], timezone.utc)
             parameters["after_symbol"] = after[1]
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
@@ -728,7 +911,7 @@ class ClickHouseMarketBarRepository:
         lower = datetime.fromtimestamp(
             int(point.timestamp()) - max_lookback_seconds, timezone.utc
         )
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
@@ -769,7 +952,7 @@ class ClickHouseMarketBarRepository:
         }
         if after is not None:
             parameters["after"] = after
-        result = self.database._require_client().query(
+        result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "

@@ -1,5 +1,6 @@
 import os
 import json
+from decimal import Decimal
 import tempfile
 import unittest
 import uuid
@@ -11,9 +12,11 @@ from fastapi.testclient import TestClient
 
 from marketcow.api import create_app
 from marketcow.clickhouse_repositories import (
+    CLICKHOUSE_MIGRATIONS,
     ClickHouseDatabase,
     ClickHouseMarketBarRepository,
 )
+from marketcow.repositories import MarketBarRepository
 from marketcow.clickhouse_shadow import ShadowMarketBarRepository
 from marketcow.clickhouse_canonical import CanonicalMarketBarBuilder
 from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
@@ -328,7 +331,52 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         versions = self.database.client.query(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).result_rows
-        self.assertEqual(versions, [(1,), (2,), (3,), (4,)])
+        self.assertEqual(versions, [(1,), (2,), (3,), (4,), (5,)])
+
+    def test_upgrade_from_migration_four_and_repeat_migrate(self):
+        name = "marketcow_upgrade_" + uuid.uuid4().hex[:10] + "_test"
+        bootstrap = clickhouse_connect.get_client(
+            host=self.host, port=self.port, username=self.username,
+            password=self.password, database="default",
+        )
+        upgraded = None
+        try:
+            bootstrap.command(f"CREATE DATABASE `{name}`")
+            legacy = ClickHouseDatabase(
+                self.host, self.port, name, self.username, self.password
+            )
+            legacy.client = legacy._connect(name)
+            legacy.client.command(
+                "CREATE TABLE schema_migrations (version UInt32, description String, "
+                "applied_at DateTime64(3, 'UTC') DEFAULT now64(3)) "
+                "ENGINE = MergeTree ORDER BY version"
+            )
+            for version, description, statements in CLICKHOUSE_MIGRATIONS[:4]:
+                for statement in statements:
+                    legacy.client.command(statement)
+                legacy.client.insert(
+                    "schema_migrations", [[version, description]],
+                    column_names=["version", "description"],
+                )
+            legacy.close()
+            upgraded = ClickHouseDatabase(
+                self.host, self.port, name, self.username, self.password
+            )
+            upgraded.open()
+            upgraded.migrate()
+            versions = upgraded.client.query(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).result_rows
+            self.assertEqual(versions, [(1,), (2,), (3,), (4,), (5,)])
+            self.assertEqual(upgraded.client.query(
+                "SELECT count() FROM system.tables WHERE database=currentDatabase() "
+                "AND name='market_quote_latest'"
+            ).result_rows[0][0], 1)
+        finally:
+            if upgraded is not None:
+                upgraded.close()
+            bootstrap.command(f"DROP DATABASE IF EXISTS `{name}`")
+            bootstrap.close()
 
     def test_raw_and_canonical_round_trip_with_replacing_keys(self):
         raw = {
@@ -359,6 +407,67 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             "WHERE symbol='600519.SH'"
         ).result_rows[0][0]
         self.assertEqual(count, 1)
+
+    def test_direct_market_bar_repository_complete_contract(self):
+        self.assertIsInstance(self.repository, MarketBarRepository)
+        point = "2026-07-20T08:00:00Z"
+        timestamp = int(datetime.fromisoformat(point.replace("Z", "+00:00")).timestamp())
+        self.assertEqual(self.repository.upsert_price_bars(
+            "DIRECT.HK", "1m", "raw", "tushare", "2026-07-20T08:00:02.456Z",
+            [{"timestamp": timestamp, "bar_at": point, "open": Decimal("10.0"),
+              "high": Decimal("12.0"), "low": Decimal("9.0"),
+              "close": Decimal("11.0"), "raw_close": None,
+              "adjustment_factor": None, "volume": 100, "amount": None}],
+            {"observed_at": "2026-07-20T08:00:01.123Z",
+             "raw_artifact_id": "direct-artifact"},
+        ), 1)
+        self.repository.insert_canonical_bars([{
+            "symbol": "DIRECT.HK", "market": "HK", "interval": "1m",
+            "adjustment": "raw", "bar_time": point, "open": 10, "high": 12,
+            "low": 9, "close": 11, "raw_close": None,
+            "adjustment_factor": None, "volume": 100, "amount": None,
+            "selected_source": "tushare", "source_count": 1,
+            "quality_status": "single_source", "input_fingerprint": "direct-v1",
+            "version": 1, "observed_at": "2026-07-20T08:00:01.123Z",
+            "ingested_at": "2026-07-20T08:00:02.456Z",
+            "raw_artifact_id": "direct-artifact",
+            "updated_at": "2026-07-20T08:00:03Z",
+        }])
+        quote = {
+            "symbol": "DIRECT.HK", "price": 11.0, "source": "tushare",
+            "observed_at": "2026-07-20T08:00:01.123Z",
+            "ingested_at": "2026-07-20T08:00:02.456Z", "amount": None,
+        }
+        self.repository.upsert_quote(quote)
+        self.repository.upsert_quote(dict(reversed(list(quote.items()))))
+        self.assertEqual(self.repository.get_latest_quotes(["DIRECT.HK"]), [quote])
+        self.assertEqual(len(self.repository.get_price_bars(
+            "DIRECT.HK", "1m", "raw", 10
+        )), 1)
+        arguments = ("DIRECT.HK", "1m", "raw", point, point)
+        self.assertEqual(len(self.repository.get_price_bars_range(*arguments, 10)[0]), 1)
+        self.assertEqual(len(self.repository.get_price_bars_page(*arguments, 10)[0]), 1)
+        self.assertEqual(len(self.repository.get_price_bars_cross_section(
+            "1m", "raw", point, 10, ["DIRECT.HK"]
+        )[0]), 1)
+        self.assertEqual(len(self.repository.get_price_bars_cross_section_page(
+            "1m", "raw", point, 10, ["DIRECT.HK"]
+        )[0]), 1)
+        self.assertEqual(len(self.repository.get_price_bars_matrix_page(
+            "1m", "raw", [point], ["DIRECT.HK"], 10
+        )[0]), 1)
+        self.assertEqual(self.repository.get_price_bar_as_of(
+            "DIRECT.HK", "1m", "raw", point, 60
+        )["timestamp"], timestamp)
+        self.assertEqual(len(self.repository.get_price_bars_as_of_page(
+            "1m", "raw", point, 60, ["DIRECT.HK"], 10
+        )[0]), 1)
+        raw_range = self.repository.get_raw_price_bars_range(*arguments, 10)
+        raw_page = self.repository.get_raw_price_bars_page(*arguments, 10)
+        self.assertEqual(raw_range, raw_page)
+        self.assertEqual(raw_range[0][0]["observed_at"],
+                         "2026-07-20T08:00:01.123000+00:00")
+        self.assertIsNone(raw_range[0][0]["amount"])
 
     def test_chunked_writer_repeat_batch_and_spool_replay(self):
         with tempfile.TemporaryDirectory() as folder:

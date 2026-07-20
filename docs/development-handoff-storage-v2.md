@@ -1446,7 +1446,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：现有 DuckDB 事务域无遗漏；migration 幂等；16 个既有域及新增控制域语义等价。
 - **必要测试**：真实 disposable PostgreSQL 全域 CRUD、PIT、复合键、并发、migration upgrade。
 - **排除项**：服务工厂切换、行情表、真实数据导入。
-- **状态**：`本地实现完成，待独立验收`。PostgreSQL migration 5 将全域清单固定为 18 个表：
+- **状态**：`已验收`（Artifact `4320b6e` + 完整性返修 `e162286`）。PostgreSQL migration 5 将全域清单固定为 18 个表：
   16 个 DuckDB-compatible 事务域（`ingestion_runs`、`provider_health`、`raw_artifact_manifest`、
   三类日历/指标、Tushare request/row、fundamental current/history、statement、BaoStock、TDX
   current/history、validation 与 funnel），以及两个 V2-native 控制域 `runtime_config_version` 和
@@ -1467,7 +1467,17 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：MarketBarRepository 全方法直接实现；FINAL/keyset/UTC/null/Decimal 语义确定；无 DuckDB fallback。
 - **必要测试**：真实 ClickHouse 全契约、版本冲突、分页、横截面、故障/超时错误结构。
 - **排除项**：在线工厂、WAL、旧 API 对比。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。`ClickHouseMarketBarRepository` 现在直接满足完整
+  `MarketBarRepository`：raw/canonical 直接写入、recent、closed range、canonical/raw keyset page、
+  exact cross-section、matrix、single/cross-section as-of 和 latest quotes 均由 ClickHouse 查询实现，
+  不再需要 shadow adapter 才能获得接口方法。migration 5 新增以 `content_version` 收敛的 latest quote 表；
+  raw 继续按 ingestion millisecond + canonical content rank 的 UInt256 version 收敛，canonical 继续使用
+  ReplacingMergeTree version、`FINAL` 和共享 source-selection 产物。旧 `get_canonical_*`/insert 方法仅作为
+  offline 工具兼容入口保留。直接契约使用 limit+1、稳定业务键排序及 keyset `after`，所有 SQL 禁止
+  `OFFSET`；UTC 秒级 bar identity、DateTime64(3) provenance、Nullable raw_close/factor/amount 和 float
+  OHLCVA 映射保持既有契约。Repository 将连接/查询/写入故障转换为不含原始异常文本的有界
+  `ClickHouseRepositoryError`，不执行 DuckDB fallback。AST/运行时门禁验证该模块无 DuckDB、Warehouse、
+  shadow 或 offline import 依赖，并完整实现 Protocol。未接在线 factory，未改 WAL/spool 或 scheduler。
 
 ### `BG-005`：ClickHouse 主写 WAL/spool 语义
 
