@@ -187,6 +187,43 @@ class MarketBarRangeTest(unittest.TestCase):
             "1970-01-01T00:05:00Z", 10, [],
         ), ([], False))
 
+    def test_duckdb_raw_business_key_keeps_latest_utc_ingestion_deterministically(self):
+        key_bar = {**bars()[0], "close": 20, "source_payload": {"version": "new"}}
+        self.warehouse.upsert_price_bars(
+            "VERSION", "1m", "raw", "fixture", "2026-07-20T08:00:02+08:00",
+            [key_bar], {"observed_at": "2026-07-20T00:00:02.123Z"},
+        )
+        self.warehouse.upsert_price_bars(
+            "VERSION", "1m", "raw", "fixture", "2026-07-20T00:00:01Z",
+            [{**key_bar, "close": 10, "source_payload": {"version": "old"}}],
+        )
+        result = lambda: self.warehouse.get_raw_price_bars_range(
+            "VERSION", "1m", "raw", "1970-01-01T00:01:40Z",
+            "1970-01-01T00:01:40Z", 10,
+        )[0][0]
+        self.assertEqual(result()["close"], 20)
+        self.assertEqual(result()["ingested_at"], "2026-07-20T00:00:02+00:00")
+        self.warehouse.upsert_price_bars(
+            "VERSION", "1m", "raw", "fixture", "2026-07-20T00:00:03Z",
+            [{**key_bar, "close": 30, "source_payload": {"version": "latest"}}],
+        )
+        self.assertEqual(result()["close"], 30)
+        tied = [
+            ({**key_bar, "close": 31, "source_payload": {"tie": "a"}}, 31),
+            ({**key_bar, "close": 32, "source_payload": {"tie": "z"}}, 32),
+        ]
+        for bar, _ in reversed(tied):
+            self.warehouse.upsert_price_bars(
+                "VERSION", "1m", "raw", "fixture", "2026-07-20T00:00:04Z", [bar]
+            )
+        first_order = result()["close"]
+        for bar, _ in tied:
+            self.warehouse.upsert_price_bars(
+                "VERSION", "1m", "raw", "fixture", "2026-07-20T00:00:04Z", [bar]
+            )
+        self.assertEqual(result()["close"], first_order)
+        self.assertEqual(first_order, 32)
+
     def test_raw_history_api_is_read_only_and_validates(self):
         service = RangeService(self.warehouse)
         settings = Settings(Path(self.folder.name) / "db", Path(self.folder.name) / "raw")

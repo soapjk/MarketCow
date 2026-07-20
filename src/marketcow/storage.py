@@ -701,8 +701,47 @@ class Warehouse:
         ]
         if values:
             with self._lock, self.connect() as con:
-                con.executemany("INSERT OR REPLACE INTO market_price_bar (symbol, interval, adjustment, timestamp, bar_at, open, high, low, close, raw_close, adjustment_factor, volume, source, ingested_at, source_url, observed_at, raw_response_locator, raw_path, raw_artifact_id, amount, payload_json, source_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+                columns = (
+                    "symbol, interval, adjustment, timestamp, bar_at, open, high, low, "
+                    "close, raw_close, adjustment_factor, volume, source, ingested_at, "
+                    "source_url, observed_at, raw_response_locator, raw_path, "
+                    "raw_artifact_id, amount, payload_json, source_sequence"
+                )
+                for value in values:
+                    existing = con.execute(
+                        "SELECT " + columns + " FROM market_price_bar WHERE symbol=? "
+                        "AND interval=? AND adjustment=? AND timestamp=? AND source=?",
+                        [value[0], value[1], value[2], value[3], value[12]],
+                    ).fetchone()
+                    if existing is not None:
+                        incoming_time = self._utc_datetime(value[13])
+                        existing_time = self._utc_datetime(existing[13])
+                        if incoming_time < existing_time:
+                            continue
+                        if (incoming_time == existing_time and
+                                self._bar_version_rank(value) <=
+                                self._bar_version_rank(existing)):
+                            continue
+                    con.execute(
+                        "INSERT OR REPLACE INTO market_price_bar (" + columns + ") "
+                        "VALUES (" + ",".join("?" for _ in value) + ")", value,
+                    )
         return len(values)
+
+    @staticmethod
+    def _utc_datetime(value: Any) -> datetime:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("ingested_at must include a timezone")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _bar_version_rank(value: Sequence[Any]) -> str:
+        """Stable tie-break: lexicographically greatest complete row wins."""
+        return json.dumps(
+            list(value), ensure_ascii=False, allow_nan=False, default=str,
+            separators=(",", ":"),
+        )
 
     def save_tushare_response(
         self, request: Dict[str, Any], rows: List[Dict[str, Any]]

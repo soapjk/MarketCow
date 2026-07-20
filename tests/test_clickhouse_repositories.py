@@ -278,8 +278,8 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             "open": 10, "high": 12, "low": 9, "close": 11,
             "raw_close": 22, "adjustment_factor": 0.5,
             "volume": 100, "amount": 1100, "source_sequence": "1",
-            "observed_at": "2026-07-20T06:00:01Z",
-            "ingested_at": "2026-07-20T06:00:02Z",
+            "observed_at": "2026-07-20T06:00:01.123Z",
+            "ingested_at": "2026-07-20T06:00:02.456Z",
             "raw_artifact_id": "artifact-old",
         }
         self.repository.insert_raw_bars([
@@ -302,6 +302,8 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         self.assertEqual(bars[0]["close"], 21.0)
         self.assertEqual(bars[0]["raw_artifact_id"], "artifact-new")
         self.assertEqual(bars[0]["source_sequence"], "1")
+        self.assertEqual(bars[0]["observed_at"], "2026-07-20T06:00:01.123000+00:00")
+        self.assertEqual(bars[1]["ingested_at"], "2026-07-20T06:00:02.456000+00:00")
         self.assertTrue(truncated)
         filtered, truncated = self.repository.get_raw_price_bars_range(
             "RAW.HK", "1m", "raw", "2026-07-20T06:00:00Z",

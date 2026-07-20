@@ -382,8 +382,8 @@ class ClickHouseMarketBarRepository:
             "SELECT symbol, interval, adjustment, toUnixTimestamp(bar_time) AS timestamp, "
             "open, high, low, close, "
             "raw_close, adjustment_factor, volume, amount, source, source_sequence, "
-            "toUnixTimestamp(observed_at) AS observed_timestamp, "
-            "toUnixTimestamp(ingested_at) AS ingested_timestamp, raw_artifact_id "
+            "toUnixTimestamp64Milli(observed_at) AS observed_millis, "
+            "toUnixTimestamp64Milli(ingested_at) AS ingested_millis, raw_artifact_id "
             "FROM market_bar_raw FINAL "
             "WHERE symbol={symbol:String} AND interval={interval:String} "
             "AND adjustment={adjustment:String} AND bar_time >= {start:DateTime64(3)} "
@@ -395,8 +395,8 @@ class ClickHouseMarketBarRepository:
         mapped = []
         for row in rows[:limit]:
             timestamp = int(row.pop("timestamp"))
-            observed_timestamp = int(row.pop("observed_timestamp"))
-            ingested_timestamp = int(row.pop("ingested_timestamp"))
+            observed_millis = int(row.pop("observed_millis"))
+            ingested_millis = int(row.pop("ingested_millis"))
             mapped.append({
                 **row, "timestamp": timestamp,
                 "bar_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
@@ -408,10 +408,10 @@ class ClickHouseMarketBarRepository:
                 "volume": float(row["volume"]),
                 "amount": None if row["amount"] is None else float(row["amount"]),
                 "observed_at": datetime.fromtimestamp(
-                    observed_timestamp, timezone.utc
+                    observed_millis / 1000, timezone.utc
                 ).isoformat(),
                 "ingested_at": datetime.fromtimestamp(
-                    ingested_timestamp, timezone.utc
+                    ingested_millis / 1000, timezone.utc
                 ).isoformat(),
                 "source_payload": {},
             })
