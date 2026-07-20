@@ -20,37 +20,6 @@
     "marketcow.local_benchmark",
     "marketcow.local_restore"
   ],
-  "temporary_reachability_exceptions": [
-    {
-      "path": [
-        "marketcow.api",
-        "marketcow.service",
-        "marketcow.duckdb_repositories"
-      ],
-      "removal_item": "BG-008"
-    },
-    {
-      "path": [
-        "marketcow.api",
-        "marketcow.service",
-        "marketcow.storage"
-      ],
-      "removal_item": "BG-008"
-    },
-    {
-      "path": [
-        "marketcow.service",
-        "marketcow.duckdb_repositories"
-      ],
-      "removal_item": "BG-008"
-    },
-    {
-      "path": [
-        "marketcow.service",
-        "marketcow.storage"
-      ],
-      "removal_item": "BG-008"
-    }
-  ],
+  "temporary_reachability_exceptions": [],
   "exception_policy": "Exact migration debt only; additions require an accepted BG REV or BLOCK item."
 }

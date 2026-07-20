@@ -344,11 +344,11 @@ class ClickHouseMarketBarRepository:
         )
         return [json.loads(row[1]) for row in result.result_rows]
 
-    def upsert_price_bars(
+    def prepare_raw_bars(
         self, symbol: str, interval: str, adjustment: str, source: str,
         ingested_at: str, bars: List[Dict[str, Any]],
         provenance: Optional[Dict[str, Any]] = None,
-    ) -> int:
+    ) -> List[Dict[str, Any]]:
         provenance = provenance or {}
         normalized = []
         for bar in bars:
@@ -371,7 +371,16 @@ class ClickHouseMarketBarRepository:
                 "observed_at": observed_at, "ingested_at": ingested_at,
                 "raw_artifact_id": provenance.get("raw_artifact_id"),
             })
-        return self.insert_raw_bars(normalized)
+        return normalized
+
+    def upsert_price_bars(
+        self, symbol: str, interval: str, adjustment: str, source: str,
+        ingested_at: str, bars: List[Dict[str, Any]],
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        return self.insert_raw_bars(self.prepare_raw_bars(
+            symbol, interval, adjustment, source, ingested_at, bars, provenance
+        ))
 
     # Direct MarketBarRepository contract. The canonical-prefixed methods remain as
     # compatibility entry points for pre-blue/green offline tooling.

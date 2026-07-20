@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,9 +29,8 @@ from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normal
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
 from .providers.calendar import CalendarProvider
 from .providers.tushare_provider import TushareProvider
-from .duckdb_repositories import create_stage1_repositories
 from .repositories import Repositories
-from .storage import FUNDAMENTAL_COLUMNS, Warehouse
+from .domain_columns import FUNDAMENTAL_COLUMNS
 
 
 EASTMONEY_DATA_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
@@ -90,7 +90,7 @@ class FundamentalService:
     def __init__(
         self,
         settings: Settings,
-        warehouse: Optional[Warehouse] = None,
+        warehouse: Optional[Any] = None,
         repositories: Optional[Repositories] = None,
         spot_provider: Optional[EastmoneySpotProvider] = None,
         financial_provider: Optional[AkshareFinancialProvider] = None,
@@ -106,11 +106,34 @@ class FundamentalService:
         self.settings = settings
         self.warehouse = warehouse
         self.repository_database = None
+        self.v2_resources = None
         if repositories is None:
-            self.warehouse = self.warehouse or Warehouse(settings.database_path)
-            repositories, self.repository_database = create_stage1_repositories(
-                settings, self.warehouse
-            )
+            if settings.profile in {"v2-development", "v2-test"}:
+                from .artifact_store import LocalArtifactStore
+                from .v2_factory import create_v2_online_repositories
+                from .v2_market_bars import V2AuthoritativeMarketBarRepository
+
+                self.v2_resources = create_v2_online_repositories(settings)
+                market_bars = V2AuthoritativeMarketBarRepository(
+                    self.v2_resources.market_bars, self.v2_resources.writer,
+                    self.v2_resources.telemetry,
+                    self.v2_resources.canonical_scheduler,
+                )
+                repositories = Repositories(
+                    metadata=self.v2_resources.postgres,
+                    fundamentals=self.v2_resources.postgres,
+                    market_bars=market_bars,
+                    artifacts=LocalArtifactStore(self.v2_resources.postgres),
+                )
+            else:
+                legacy = importlib.import_module(
+                    ".legacy_service_factory", package=__package__
+                )
+                repositories, self.repository_database, self.warehouse = (
+                    legacy.create_legacy_service_repositories(
+                        settings, self.warehouse
+                    )
+                )
         self.repositories = repositories
         self.metadata_repository = self.repositories.metadata
         self.fundamental_repository = self.repositories.fundamentals
@@ -133,6 +156,8 @@ class FundamentalService:
         )
 
     def close(self) -> None:
+        if self.v2_resources is not None:
+            self.v2_resources.close()
         if self.repository_database is not None:
             self.repository_database.close()
 

@@ -9,12 +9,10 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-import duckdb
 import uvicorn
 
 from .config import Settings
 from .service import FundamentalService
-from .storage import Warehouse
 
 
 REQUIRED_MODULES = (
@@ -39,6 +37,14 @@ def is_loopback_host(host: str) -> bool:
 
 
 def initialize(settings: Settings) -> dict[str, Any]:
+    if settings.profile in {"v2-development", "v2-test"}:
+        settings.validate_v2_preflight()
+        return {
+            "status": "ready", "database": "postgres-clickhouse-v2",
+            "raw_path": str(settings.raw_path),
+        }
+    from .storage import Warehouse
+
     settings.raw_path.mkdir(parents=True, exist_ok=True)
     (settings.raw_path.parent / "tdx/financial").mkdir(parents=True, exist_ok=True)
     Warehouse(settings.database_path)
@@ -50,6 +56,8 @@ def initialize(settings: Settings) -> dict[str, Any]:
 
 
 def _database_status(path: Path) -> dict[str, Any]:
+    import duckdb
+
     if not path.exists():
         return {"ok": False, "path": str(path), "message": "not initialized; run marketcow init"}
     required_tables = {"fundamental_snapshot", "ingestion_runs", "market_quote_latest", "tdx_financial_snapshot"}
@@ -159,7 +167,8 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         description="Run and maintain the local market data API",
     )
     parser.add_argument(
-        "--profile", choices=("production", "development"), default=settings.profile,
+        "--profile", choices=("production", "development", "v2-development", "v2-test"),
+        default=settings.profile,
         help="runtime profile; must appear before the command",
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -307,7 +316,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "refusing a non-loopback host because admin endpoints have no authentication; "
                     "set MARKETCOW_ALLOW_NON_LOOPBACK=1 only in a trusted network"
                 )
-        initialize(settings)
+        if settings.profile in {"v2-development", "v2-test"}:
+            settings.validate_v2_preflight()
+        else:
+            initialize(settings)
         os.environ["MARKETCOW_PROFILE"] = settings.profile
         uvicorn.run("marketcow.api:app", host=args.host, port=args.port)
         return 0

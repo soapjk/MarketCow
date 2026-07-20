@@ -47,6 +47,8 @@ def create_app(
         return health_evaluator.evaluate(snapshot)
 
     def database_identifier() -> str:
+        if settings.database_path is None:
+            return "[REDACTED_PATH]"
         try:
             relative = settings.database_path.resolve().relative_to(
                 settings.storage_root.resolve()

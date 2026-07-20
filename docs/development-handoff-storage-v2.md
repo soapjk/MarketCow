@@ -1533,7 +1533,8 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：在线模块 import/启动期间不构造 `Warehouse`、不打开 `.duckdb`、不导入 DuckDB adapter；反向关闭完整。
 - **必要测试**：依赖注入、连接顺序、部分启动失败清理、资源关闭、DuckDB open/import trap。
 - **排除项**：Service/API 启动切换。
-- **状态**：`本地实施完成，待独立验收`。新增唯一 `marketcow.v2_factory` 装配入口，纯预检后按
+- **状态**：`已验收`（Artifact `7fb9cf8` + session 隔离返修 `5058efd`）。新增唯一
+  `marketcow.v2_factory` 装配入口，纯预检后按
   PostgreSQL → main ClickHouse → telemetry/spool/main writer → 独立 scheduler ClickHouse/repository/
   writer/builder → scheduler 顺序创建，显式暴露 18 个 PG
   权威事务域和 direct ClickHouse `MarketBarRepository`。部分启动失败关闭全部既有连接，正常关闭按
@@ -1551,7 +1552,15 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：V2 全路由在 DuckDB import/open trap 下可启动和运行；写读错误保持明确且有界。
 - **必要测试**：完整 API 路由、刷新/失败、Artifact、生命周期及旧 Service 单元回归。
 - **排除项**：health/readiness、旧 main API golden。
-- **状态**：`待实施`。
+- **状态**：`本地实施完成，待独立验收`。`FundamentalService` 仅在 legacy profile 动态加载隔离的
+  `legacy_service_factory`；V2 profile 唯一调用 BG-007 工厂，并把 metadata/fundamentals/artifact/control
+  全部绑定 PostgreSQL，把 quote/canonical/raw 查询绑定 direct ClickHouse。中立 `LocalArtifactStore` 仅把
+  body 写入隔离 raw root、manifest 写入 PostgreSQL。V2 行情适配器将 history refresh 规范化后交给 BG-005
+  authoritative writer；只有 acknowledged+verified 才返回成功，durable pending 与 terminal failure 均以
+  有界错误上抛且无 DuckDB fallback。API shutdown 幂等关闭完整工厂资源；legacy production/development
+  构造和 CLI 行为保持原路径。在线 import 闭包的临时 DuckDB 例外已收敛为空，V2 app 在 duckdb、Warehouse、
+  `.duckdb` open trap 下可导入、启动并执行 PG/CH 路由。health/readiness 状态机未在本项修改，双库判定留待
+  BG-009；旧 main 响应兼容决策仍留待 BG-010/BG-011。
 
 ### `BG-009`：V2 health/readiness 双数据库契约
 
