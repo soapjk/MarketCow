@@ -1709,7 +1709,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：无明确来源路径与复制授权时 fail-closed；本项仅以合成替身验证工具；报告不含真实数据或绝对路径。
 - **必要测试**：授权缺失、错误副本、schema 漂移、大数据边界、脱敏与报告 checksum。
 - **排除项**：读取、复制、上传或迁移任何真实 production 数据。
-- **状态**：`本地实现完成，待独立验收`。新增 offline-only
+- **状态**：`已验收（90279c9+9b1bc1c）`。新增 offline-only
   `marketcow.offline_copy_validator` 与版本化 `storage-v2.copy-manifest.v1` 契约。调用方必须在调用时另行提供
   `CopyAuthorization`，明确授权 evidence ID、source logical ID、唯一复制动作，并以 SHA-256 分别绑定 manifest
   原始字节、确切 source path 和 allowed root；此外必须由调用环境注入的 trusted authorization verifier 对该
@@ -1737,7 +1737,21 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：预检后原子恢复；断点可续；恢复目标通过全域契约；canonical 不越过 verified raw watermark。
 - **必要测试**：真实 disposable 联合恢复、缺失/损坏/错密钥/版本、阶段故障、重复恢复、spool 单次消费。
 - **排除项**：production 备份、远程存储和 DuckDB 在线恢复。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 offline-only `marketcow.v2_backup_restore`，固定
+  `storage-v2.pg-ch-backup-manifest.v1` 八组件集合与顺序：PostgreSQL 18 权威域、ClickHouse raw/canonical、
+  Artifact/Parquet、authoritative WAL/intents/quarantine、canonical scheduler state、V2 config version、BG-014
+  migration watermark、authenticated-sealed cursor key；manifest 中不存在 DuckDB。通用 local backup/restore 原语
+  仅被参数化，默认旧契约保持不变。V2 create 与 verify 均重新验证组件 kind/version、18 域清单、raw/canonical
+  内容、BG-014 complete/checksum/lag=0、由 raw FINAL payload 推导的最大 ingested_at 与 canonical rebuild boundary；
+  因此重签 manifest 与内部 checkpoint 也不能把不一致 watermark 变成有效。full/incremental chain、逐文件
+  checksum/bytes/mode、credential scan、cursor authenticated sealing、staging/file/directory fsync、原子 publish 沿用
+  已验证原语。`storage-v2.pg-ch-restore.v1` 在显式 allowed-root 和空 development/test 目标 preflight 后按上述固定
+  顺序 checkpoint 恢复，树组件物理落入 artifacts、spool/clickhouse、canonical-scheduler 与 `.storage-v2`，PG/CH
+  migration/restore 使用注入的 disposable targets；错误 wrapping key 在明文写出前拒绝，重复 restore 只校验已完成
+  checkpoint。恢复验证 schema 固定要求 PG 18 域/PIT、CH raw FINAL/canonical、行情 API/分页/cursor/cache、
+  Artifact/Parquet query、spool replay exactly-once 与 canonical boundary 九项全为 ok。专项覆盖纯 PG/CH inventory、
+  full+incremental/repeat、checkpoint crash/resume、缺组件、错误 watermark、损坏、错误密钥、symlink/nonempty target
+  以及重签语义篡改；未启动 BG-017，未接触真实副本或 production。
 
 ### `BG-017`：纯 PG/CH 可观测性与运维闭环
 

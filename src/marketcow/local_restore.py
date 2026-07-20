@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -13,7 +15,6 @@ from typing import Any, Callable, Dict, Iterable, Mapping
 
 from .local_backup import (
     LocalStorageBackup,
-    REQUIRED_COMPONENTS,
     _assert_no_sensitive,
     _fsync_dir,
     _hash,
@@ -67,7 +68,11 @@ class LocalStorageRestore:
     """Fail-closed, checkpointed empty-environment restore drill."""
 
     def __init__(self, backup: LocalStorageBackup, targets: RestoreTargets,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic, *,
+                 component_order: tuple[str, ...] = COMPONENT_ORDER,
+                 supported: Mapping[str, set[tuple[str, str]]] = SUPPORTED,
+                 tree_destinations: Mapping[str, str] | None = None,
+                 restore_version: str = RESTORE_VERSION) -> None:
         if targets.profile not in {"development", "test"}:
             raise ValueError("Storage V2 restore is development/test-only")
         supplied = Path(targets.root)
@@ -93,6 +98,15 @@ class LocalStorageRestore:
         self.backup = backup
         self.targets = targets
         self.clock = clock
+        self.component_order = tuple(component_order)
+        self.supported = {key: set(value) for key, value in supported.items()}
+        self.tree_destinations = dict(tree_destinations or {
+            "duckdb": "warehouse", "cold_archive": "archive",
+            "spool": "spool/clickhouse",
+        })
+        self.restore_version = restore_version
+        if set(self.component_order) != backup.required_components:
+            raise ValueError("restore component contract does not match backup")
         self.state_root = self.root / ".storage-v2-restore"
         self.checkpoint_path = self.state_root / "checkpoint.json"
 
@@ -101,15 +115,14 @@ class LocalStorageRestore:
         checkpoint.pop("checksum", None)
         checkpoint["checksum"] = _hash(_json(checkpoint))
 
-    @staticmethod
-    def _validate_checkpoint(checkpoint: Mapping[str, Any]) -> None:
+    def _validate_checkpoint(self, checkpoint: Mapping[str, Any]) -> None:
         unsigned = dict(checkpoint)
         checksum = unsigned.pop("checksum", None)
         if checksum != _hash(_json(unsigned)):
             raise ValueError("restore checkpoint checksum mismatch")
         completed = checkpoint.get("completed")
         if (not isinstance(completed, list) or
-                completed != list(COMPONENT_ORDER[:len(completed)])):
+                completed != list(self.component_order[:len(completed)])):
             raise ValueError("restore checkpoint component order is corrupt")
 
     def restore(self, artifacts: Iterable[Path], fault_hook: Any = None) -> Dict[str, Any]:
@@ -124,7 +137,7 @@ class LocalStorageRestore:
                 checkpoint = self._load_or_initialize(chain)
                 final_artifact, manifest = chain[-1]
                 components = {item["name"]: item for item in manifest["components"]}
-                for name in COMPONENT_ORDER:
+                for name in self.component_order:
                     if name in checkpoint["completed"]:
                         continue
                     if fault_hook:
@@ -149,7 +162,7 @@ class LocalStorageRestore:
             raise ValueError("restore must complete before verification is recorded")
         checkpoint = json.loads(self.checkpoint_path.read_text())
         self._validate_checkpoint(checkpoint)
-        if checkpoint["completed"] != list(COMPONENT_ORDER):
+        if checkpoint["completed"] != list(self.component_order):
             raise ValueError("restore is incomplete")
         if not isinstance(results, Mapping) or not 1 <= len(results) <= 50:
             raise ValueError("restore verification results must contain 1..50 checks")
@@ -175,10 +188,10 @@ class LocalStorageRestore:
             if index and (mode != "incremental" or
                           manifest.get("base_backup_id") != previous):
                 raise ValueError("incremental backup chain is incomplete or out of order")
-            if set(item["name"] for item in manifest["components"]) != REQUIRED_COMPONENTS:
+            if set(item["name"] for item in manifest["components"]) != self.backup.required_components:
                 raise ValueError("restore component set is incomplete")
             for item in manifest["components"]:
-                if (item.get("kind"), item.get("version")) not in SUPPORTED[item["name"]]:
+                if (item.get("kind"), item.get("version")) not in self.supported[item["name"]]:
                     raise ValueError("unsupported restore component version")
             if chain and _utc(manifest["snapshot_at"]) < _utc(chain[-1][1]["snapshot_at"]):
                 raise ValueError("incremental backup snapshots are out of order")
@@ -195,14 +208,11 @@ class LocalStorageRestore:
             allowed = {".storage-v2-restore"}
             completed = set(checkpoint.get("completed", ()))
             completed_order = checkpoint.get("completed", ())
-            next_name = (COMPONENT_ORDER[len(completed_order)]
-                         if len(completed_order) < len(COMPONENT_ORDER) else None)
-            if "duckdb" in completed or next_name == "duckdb":
-                allowed.add("warehouse")
-            if "cold_archive" in completed or next_name == "cold_archive":
-                allowed.add("archive")
-            if "spool" in completed or next_name == "spool":
-                allowed.add("spool")
+            next_name = (self.component_order[len(completed_order)]
+                         if len(completed_order) < len(self.component_order) else None)
+            for name, relative in self.tree_destinations.items():
+                if name in completed or next_name == name:
+                    allowed.add(Path(relative).parts[0])
             if "cursor_key" in completed or next_name == "cursor_key":
                 allowed.add(".market-bar-cursor.key")
             if not existing.issubset(allowed):
@@ -235,10 +245,10 @@ class LocalStorageRestore:
         if self.checkpoint_path.exists():
             checkpoint = json.loads(self.checkpoint_path.read_text())
             self._validate_checkpoint(checkpoint)
-            if checkpoint.get("version") != RESTORE_VERSION or checkpoint.get("chain") != ids:
+            if checkpoint.get("version") != self.restore_version or checkpoint.get("chain") != ids:
                 raise ValueError("restore checkpoint does not match backup chain")
             return checkpoint
-        checkpoint = {"version": RESTORE_VERSION, "chain": ids, "completed": []}
+        checkpoint = {"version": self.restore_version, "chain": ids, "completed": []}
         self._sign_checkpoint(checkpoint)
         _atomic_json(self.checkpoint_path, checkpoint)
         return checkpoint
@@ -247,6 +257,36 @@ class LocalStorageRestore:
     def _component_files(artifact: Path, component: Mapping[str, Any]):
         for item in component["files"]:
             yield item, artifact / item["path"]
+
+    @staticmethod
+    def _verified_component_bytes(source: Path, item: Mapping[str, Any]) -> bytes:
+        expected_size = item.get("bytes")
+        expected_hash = item.get("sha256")
+        if not isinstance(expected_size, int) or expected_size < 0:
+            raise ValueError("restore component size is invalid")
+        try:
+            descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size:
+                    raise ValueError("restore component identity mismatch")
+                data = handle.read(expected_size + 1)
+                after = os.fstat(handle.fileno())
+            current = source.lstat()
+        except ValueError:
+            raise
+        except OSError:
+            raise ValueError("restore component read failed") from None
+        if (
+            len(data) != expected_size
+            or hashlib.sha256(data).hexdigest() != expected_hash
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+        ):
+            raise ValueError("restore component checksum or identity mismatch")
+        return data
 
     def _restore_component(self, name: str, artifact: Path,
                            component: Mapping[str, Any]) -> None:
@@ -257,11 +297,7 @@ class LocalStorageRestore:
         elif name == "cursor_key":
             self._restore_cursor(artifact, component)
         else:
-            destination = {
-                "duckdb": self.root / "warehouse",
-                "cold_archive": self.root / "archive",
-                "spool": self.root / "spool" / "clickhouse",
-            }[name]
+            destination = self.root / self.tree_destinations[name]
             self._restore_tree(artifact, component, destination)
 
     def _restore_tree(self, artifact: Path, component: Mapping[str, Any],
@@ -274,8 +310,17 @@ class LocalStorageRestore:
             relative = Path(item["path"]).relative_to("components", component["name"])
             target = staging / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(source.read_bytes())
+            with target.open("wb") as output:
+                output.write(self._verified_component_bytes(source, item))
+                output.flush()
+                os.fsync(output.fileno())
             os.chmod(target, int(item["mode"], 8))
+        for directory in sorted(
+            {path.parent for path in staging.rglob("*") if path.is_file()},
+            key=lambda item: len(item.parts), reverse=True,
+        ):
+            _fsync_dir(directory)
+        _fsync_dir(staging)
         if destination.exists():
             if self._tree_digest(destination) == self._tree_digest(staging):
                 shutil.rmtree(staging)
@@ -303,7 +348,10 @@ class LocalStorageRestore:
         files = list(self._component_files(artifact, component))
         if len(files) != 1:
             raise ValueError("cursor backup must contain exactly one key")
-        plaintext = unseal_cursor_key(files[0][1].read_bytes(), self.backup.wrapping_key)
+        plaintext = unseal_cursor_key(
+            self._verified_component_bytes(files[0][1], files[0][0]),
+            self.backup.wrapping_key,
+        )
         target = self.root / ".market-bar-cursor.key"
         if target.exists():
             if target.read_bytes() != plaintext or target.stat().st_mode & 0o777 != 0o600:
@@ -329,7 +377,8 @@ class LocalStorageRestore:
         from psycopg import sql
         from psycopg.types.json import Jsonb
 
-        payload = json.loads(next(self._component_files(artifact, component))[1].read_text())
+        item, source = next(self._component_files(artifact, component))
+        payload = json.loads(self._verified_component_bytes(source, item))
         database.migrate()
         with database.pool.connection() as connection:
             connection.execute(sql.SQL("SET LOCAL search_path TO {}, public").format(
@@ -351,7 +400,8 @@ class LocalStorageRestore:
         database = self.targets.clickhouse
         if database is None:
             raise ValueError("ClickHouse restore target is required")
-        payload = json.loads(next(self._component_files(artifact, component))[1].read_text())
+        item, source = next(self._component_files(artifact, component))
+        payload = json.loads(self._verified_component_bytes(source, item))
         database.migrate()
         client = database._require_client()
         for table, content in payload.items():
@@ -378,7 +428,7 @@ class LocalStorageRestore:
     def _report(self, chain, checkpoint, elapsed: float) -> Dict[str, Any]:
         manifest = chain[-1][1]
         report = {
-            "report_version": RESTORE_VERSION,
+            "report_version": self.restore_version,
             "status": "complete",
             "backup_chain": checkpoint["chain"],
             "steps": list(checkpoint["completed"]),

@@ -173,6 +173,9 @@ class BackupComponent:
         from psycopg import sql
         payload: Dict[str, Any] = {}
         with database.pool.connection() as connection:
+            connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
             tables = connection.execute(
                 "SELECT table_name FROM information_schema.tables "
                 "WHERE table_schema=%s AND table_type='BASE TABLE' ORDER BY table_name",
@@ -202,7 +205,8 @@ class BackupComponent:
         )
         payload = {}
         for table in tables:
-            result = database.client.query(f"SELECT * FROM {table}")
+            final = " FINAL" if table in {"market_bar_raw", "market_bar_canonical"} else ""
+            result = database.client.query(f"SELECT * FROM {table}{final}")
             payload[table] = {
                 "columns": list(result.column_names),
                 "rows": sorted(result.result_rows, key=lambda row: repr(tuple(row))),
@@ -218,9 +222,11 @@ class LocalStorageBackup:
     """Atomic local-only backup bundle generator and pre-restore verifier."""
 
     def __init__(self, backup_root: Path, storage_root: Path, wrapping_key: bytes,
-                 profile: str = "development") -> None:
-        if profile != "development":
-            raise ValueError("Storage V2 backup is development-only")
+                 profile: str = "development", *,
+                 required_components: frozenset[str] = REQUIRED_COMPONENTS,
+                 manifest_version: str = MANIFEST_VERSION) -> None:
+        if profile not in {"development", "test"}:
+            raise ValueError("Storage V2 backup is development/test-only")
         self.storage_root = Path(storage_root).resolve()
         self.backup_root = Path(backup_root).resolve()
         try:
@@ -230,6 +236,10 @@ class LocalStorageBackup:
         if len(wrapping_key) < 32:
             raise ValueError("backup wrapping key must contain at least 32 bytes")
         self.wrapping_key = bytes(wrapping_key)
+        self.required_components = frozenset(required_components)
+        self.manifest_version = manifest_version
+        if not self.required_components or not self.manifest_version:
+            raise ValueError("backup component contract is empty")
         self.backup_root.mkdir(parents=True, exist_ok=True)
         self.staging = self.backup_root / ".staging"
         self.staging.mkdir(exist_ok=True)
@@ -242,9 +252,9 @@ class LocalStorageBackup:
         if mode == "incremental" and not base_backup_id:
             raise ValueError("incremental backup requires base backup id")
         normalized = {component.name: component for component in components}
-        if set(normalized) != REQUIRED_COMPONENTS:
-            missing = sorted(REQUIRED_COMPONENTS - set(normalized))
-            extra = sorted(set(normalized) - REQUIRED_COMPONENTS)
+        if set(normalized) != self.required_components:
+            missing = sorted(self.required_components - set(normalized))
+            extra = sorted(set(normalized) - self.required_components)
             raise ValueError(f"backup component set mismatch missing={missing} extra={extra}")
         lock_path = self.backup_root / ".backup.lock"
         with lock_path.open("a+") as lock:
@@ -298,7 +308,7 @@ class LocalStorageBackup:
                 "files": entries,
             })
         manifest = {
-            "manifest_version": MANIFEST_VERSION, "mode": mode,
+            "manifest_version": self.manifest_version, "mode": mode,
             "base_backup_id": base_backup_id, "snapshot_at": snapshot_at,
             "rpo_assumption": "RPO: component watermarks captured at explicit local snapshot",
             "rto_assumption": "RTO: local restore drill target <= 60 minutes",
@@ -372,7 +382,7 @@ class LocalStorageBackup:
             manifest = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError) as error:
             raise ValueError("backup manifest missing or corrupt") from error
-        if manifest.get("manifest_version") != MANIFEST_VERSION:
+        if manifest.get("manifest_version") != self.manifest_version:
             raise ValueError("unsupported backup manifest version")
         signature = manifest.pop("manifest_payload_sha256", None)
         if _hash(_json(manifest)) != signature:
@@ -383,7 +393,7 @@ class LocalStorageBackup:
         identity_document.pop("backup_id", None)
         components = manifest.get("components", [])
         names = {item.get("name") for item in components}
-        if names != REQUIRED_COMPONENTS or len(components) != len(REQUIRED_COMPONENTS):
+        if names != self.required_components or len(components) != len(self.required_components):
             raise ValueError("backup component set is incomplete")
         captured = []
         expected = {"manifest.json"}
