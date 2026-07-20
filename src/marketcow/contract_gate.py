@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import re
 from typing import Any, Mapping, Sequence
 
 
@@ -18,9 +19,19 @@ CONTRACT_MATRIX = {
     "cross_section_as_of": ("bars", "cursor", "effective_time", "cache"),
 }
 
-# Backend diagnostics describe how a result was obtained, not its data contract.
-ALLOWED_DIFFERENCES = frozenset({"backend", "attempted_backend", "fallback", "error"})
-LEGACY_PAYLOAD_DIFFERENCE = frozenset({"source_payload"})
+# Backend diagnostics describe how a result was obtained, not its data contract.  The
+# paths are deliberately exact: identically named fields inside bars remain data.
+ROUTING_DIAGNOSTIC_PATHS = frozenset({
+    "$.backend", "$.attempted_backend", "$.fallback", "$.error",
+    "$.diagnostics.backend", "$.diagnostics.attempted_backend",
+    "$.diagnostics.fallback", "$.diagnostics.error",
+})
+# Legacy provider JSON is excluded only where a query result actually carries a bar.
+# $[].source_payload is a bare row list, $[][].source_payload is a (rows, truncated)
+# repository tuple, and $.bars[].source_payload is an API response.
+LEGACY_PAYLOAD_PATHS = frozenset({
+    "$[].source_payload", "$[][].source_payload", "$.bars[].source_payload",
+})
 MAX_MISMATCHES = 50
 MAX_VALUE_TEXT = 500
 
@@ -62,7 +73,6 @@ def normalize_contract_value(value: Any) -> Any:
         return {
             str(key): normalize_contract_value(item)
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            if str(key) not in ALLOWED_DIFFERENCES
         }
     if isinstance(value, (list, tuple)):
         return [normalize_contract_value(item) for item in value]
@@ -80,19 +90,34 @@ def _safe(value: Any) -> Any:
 
 
 def compare_contract(
-    expected: Any, actual: Any, allowed_fields: Sequence[str] = (),
+    expected: Any, actual: Any, allowed_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Return a bounded, deterministic, data-only mismatch report."""
-    ignored = ALLOWED_DIFFERENCES | frozenset(allowed_fields)
+    ignored = ROUTING_DIAGNOSTIC_PATHS | frozenset(allowed_paths)
 
-    def without_allowed(value: Any) -> Any:
+    def canonical_path(path: str) -> str:
+        return re.sub(r"\[\d+\]", "[]", path)
+
+    def path_is_ignored(path: str) -> bool:
+        path = canonical_path(path)
+        return any(
+            path == prefix or path.startswith(prefix + ".") or path.startswith(prefix + "[")
+            for prefix in ignored
+        )
+
+    def without_allowed(value: Any, path: str = "$") -> Any:
         if isinstance(value, Mapping):
             return {
-                key: without_allowed(item) for key, item in value.items()
-                if str(key) not in ignored
+                key: without_allowed(item, f"{path}.{key}")
+                for key, item in value.items()
+                if not path_is_ignored(f"{path}.{key}")
             }
         if isinstance(value, list):
-            return [without_allowed(item) for item in value]
+            return [
+                without_allowed(item, f"{path}[{index}]")
+                for index, item in enumerate(value)
+                if not path_is_ignored(f"{path}[{index}]")
+            ]
         return value
 
     left = without_allowed(normalize_contract_value(expected))
@@ -132,8 +157,8 @@ def compare_contract(
 
 def assert_contract_equal(
     expected: Any, actual: Any, label: str = "contract",
-    allowed_fields: Sequence[str] = (),
+    allowed_paths: Sequence[str] = (),
 ) -> None:
-    report = compare_contract(expected, actual, allowed_fields)
+    report = compare_contract(expected, actual, allowed_paths)
     if report["status"] != "ok":
         raise AssertionError(f"{label} mismatch: {report}")

@@ -19,7 +19,7 @@ from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouse
 from marketcow.storage import Warehouse
 from marketcow.clickhouse_writer import normalize_bar
 from marketcow.config import Settings
-from marketcow.contract_gate import LEGACY_PAYLOAD_DIFFERENCE, assert_contract_equal
+from marketcow.contract_gate import LEGACY_PAYLOAD_PATHS, assert_contract_equal
 
 
 class MarketBarService:
@@ -114,7 +114,7 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             for label, (method, arguments) in cases.items():
                 assert_contract_equal(
                     expected[label], getattr(adapter, method)(*arguments), label,
-                    LEGACY_PAYLOAD_DIFFERENCE
+                    LEGACY_PAYLOAD_PATHS
                     if label in {"recent", "range", "raw_range", "raw_page"} else (),
                 )
             settings = Settings(
@@ -139,7 +139,7 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                     for label, path in paths.items():
                         assert_contract_equal(
                             api_expected[label], click_client.get(path).json(), label + " api",
-                            LEGACY_PAYLOAD_DIFFERENCE
+                            LEGACY_PAYLOAD_PATHS
                             if label in {"recent", "range", "raw_page"} else (),
                         )
             original = self.repository.database.client
@@ -149,14 +149,14 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                     assert_contract_equal(
                         expected[label], getattr(adapter, method)(*arguments),
                         label + " fallback",
-                        LEGACY_PAYLOAD_DIFFERENCE
+                        LEGACY_PAYLOAD_PATHS
                         if label in {"recent", "range", "raw_range", "raw_page"} else (),
                     )
                 with TestClient(create_app(settings, MarketBarService(adapter), now)) as fallback_client:
                     for label, path in paths.items():
                         assert_contract_equal(
                             api_expected[label], fallback_client.get(path).json(),
-                            label + " api fallback", LEGACY_PAYLOAD_DIFFERENCE
+                            label + " api fallback", LEGACY_PAYLOAD_PATHS
                             if label in {"recent", "range", "raw_page"} else (),
                         )
             finally:

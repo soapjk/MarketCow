@@ -12,9 +12,10 @@ from marketcow.api import create_app
 from marketcow.clickhouse_shadow import ShadowMarketBarRepository
 from marketcow.config import Settings
 from marketcow.contract_gate import (
-    ALLOWED_DIFFERENCES,
     CONTRACT_MATRIX,
+    LEGACY_PAYLOAD_PATHS,
     MAX_MISMATCHES,
+    ROUTING_DIAGNOSTIC_PATHS,
     assert_contract_equal,
     compare_contract,
 )
@@ -131,9 +132,34 @@ class StorageV2ContractGateTest(unittest.TestCase):
             "matrix", "raw_range", "raw_page", "single_as_of",
             "cross_section_as_of",
         })
-        self.assertEqual(ALLOWED_DIFFERENCES, {
-            "backend", "attempted_backend", "fallback", "error"
+        self.assertEqual(ROUTING_DIAGNOSTIC_PATHS, {
+            "$.backend", "$.attempted_backend", "$.fallback", "$.error",
+            "$.diagnostics.backend", "$.diagnostics.attempted_backend",
+            "$.diagnostics.fallback", "$.diagnostics.error",
         })
+
+    def test_allowlist_is_path_limited_and_never_hides_bar_data(self):
+        legal = compare_contract(
+            {"backend": "duckdb", "diagnostics": {"error": "left"}, "bars": []},
+            {"backend": "clickhouse", "diagnostics": {"error": "right"}, "bars": []},
+        )
+        self.assertEqual(legal["status"], "ok")
+        for field in ("backend", "error", "fallback", "attempted_backend"):
+            report = compare_contract(
+                {"bars": [{field: "data-a"}]}, {"bars": [{field: "data-b"}]}
+            )
+            self.assertEqual(report["status"], "mismatch", field)
+            self.assertEqual(report["mismatches"][0]["path"], f"$.bars[0].{field}")
+        self.assertEqual(compare_contract(
+            {"metadata": {"source_payload": {"private": "a"}}},
+            {"metadata": {"source_payload": {"private": "b"}}},
+            LEGACY_PAYLOAD_PATHS,
+        )["status"], "mismatch")
+        self.assertEqual(compare_contract(
+            {"bars": [{"source_payload": {"private": "a"}}]},
+            {"bars": [{"source_payload": {"private": "b"}}]},
+            LEGACY_PAYLOAD_PATHS,
+        )["status"], "ok")
 
     def test_all_repository_contracts_match_success_and_fallback(self):
         direct, success, fallback = self.warehouse, self.adapter(), self.adapter(True)
