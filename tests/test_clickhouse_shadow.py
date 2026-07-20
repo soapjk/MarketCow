@@ -149,7 +149,45 @@ class FakeCanonicalBuilder:
         return {"status": "ok", "written": 1, "spooled": 0, "truncated": False}
 
 
+class FakeBackgroundScheduler:
+    def __init__(self, status="ok"):
+        self.status = status
+        self.calls = []
+
+    def enqueue_rows(self, rows):
+        self.calls.append(rows)
+        return {"status": self.status, "accepted": int(self.status == "ok"),
+                "duplicate": 0, "full": int(self.status != "ok")}
+
+    def enqueue_replayed_rows(self, rows):
+        outcome = self.enqueue_rows(rows)
+        if outcome["full"]:
+            raise RuntimeError("canonical scheduler queue is full")
+
+    def diagnostics(self):
+        return {"enabled": True, "pending": len(self.calls)}
+
+
 class ShadowMarketBarRepositoryTest(unittest.TestCase):
+    def test_background_enqueue_is_primary_fail_open_and_replay_hooked(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.spool = FakeSpool()
+        scheduler = FakeBackgroundScheduler("full")
+        writer.on_raw_replayed = None
+        adapter = ShadowMarketBarRepository(
+            primary, writer, FakeCanonicalBuilder(), background_scheduler=scheduler
+        )
+        self.assertEqual(adapter.upsert_price_bars(
+            "MU", "1m", "raw", "fixture", "2026-07-20T01:00:02Z", bars()
+        ), 1)
+        self.assertEqual(len(primary.writes), 1)
+        self.assertEqual(adapter.diagnostics()["auto_canonical"]["status"], "full")
+        scheduler.status = "ok"
+        writer.on_raw_replayed([adapter._raw_rows(
+            "MU", "1m", "raw", "fixture", "2026-07-20T01:00:03Z", bars(), {}
+        )[0]])
+        self.assertEqual(len(scheduler.calls), 2)
+
     def test_keyset_page_read_and_same_cursor_fallback(self):
         arguments = (
             "MU", "1m", "raw", "2026-07-20T00:00:00Z",
@@ -436,6 +474,28 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
                 self.assertIsInstance(repositories.market_bars, ShadowMarketBarRepository)
                 resources.close()
             close.assert_called_once()
+
+    def test_background_factory_starts_and_reverse_closes_scheduler(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "data-development"
+            settings = Settings(
+                root / "warehouse.duckdb", root / "raw", profile="development", port=8791,
+                clickhouse_enabled=True, clickhouse_database="marketcow_test",
+                clickhouse_spool_path=root / "spool/clickhouse", storage_root=root,
+                clickhouse_background_canonical=True,
+                clickhouse_scheduler_poll_seconds=0.05,
+            )
+            with patch("marketcow.clickhouse_repositories.ClickHouseDatabase.open"), patch(
+                "marketcow.clickhouse_repositories.ClickHouseDatabase.close"
+            ) as close:
+                repositories, resources = create_stage1_repositories(
+                    settings, Warehouse(settings.database_path)
+                )
+                scheduler = repositories.market_bars.background_scheduler
+                self.assertTrue(scheduler.diagnostics()["thread_alive"])
+                resources.close()
+                self.assertFalse(scheduler._thread.is_alive())
+            self.assertEqual(close.call_count, 2)
 
     def test_enabled_factory_startup_failure_is_explicit_and_creates_no_spool(self):
         with tempfile.TemporaryDirectory() as folder:

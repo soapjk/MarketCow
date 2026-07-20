@@ -195,6 +195,39 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
                 settings.clickhouse_auto_canonical,
                 settings.clickhouse_auto_canonical_limit,
             )
+            if settings.clickhouse_background_canonical:
+                from .clickhouse_scheduler import BackgroundCanonicalScheduler
+
+                scheduler_clickhouse = ClickHouseDatabase(
+                    settings.clickhouse_host, settings.clickhouse_port,
+                    settings.clickhouse_database, settings.clickhouse_username,
+                    settings.clickhouse_password, settings.clickhouse_secure,
+                    settings.clickhouse_connect_timeout, settings.clickhouse_read_timeout,
+                )
+                scheduler_clickhouse.open()
+                resources.append(scheduler_clickhouse)
+                scheduler_repository = ClickHouseMarketBarRepository(scheduler_clickhouse)
+                scheduler_writer = ReliableClickHouseWriter(
+                    scheduler_repository, spool, settings.clickhouse_batch_size,
+                )
+                scheduler_canonical = CanonicalMarketBarBuilder(
+                    scheduler_repository, scheduler_writer,
+                    settings.clickhouse_source_priority,
+                    settings.clickhouse_canonical_rel_tol,
+                    settings.clickhouse_canonical_abs_tol,
+                )
+                scheduler = BackgroundCanonicalScheduler(
+                    scheduler_canonical, spool, settings.clickhouse_auto_canonical_limit,
+                    settings.clickhouse_scheduler_queue_cap,
+                    settings.clickhouse_scheduler_scan_limit,
+                    settings.clickhouse_scheduler_poll_seconds,
+                    settings.clickhouse_scheduler_backoff_base_seconds,
+                    settings.clickhouse_scheduler_backoff_max_seconds,
+                    settings.clickhouse_scheduler_max_attempts,
+                )
+                resources.append(scheduler)
+                market_bars.background_scheduler = scheduler
+                writer.on_raw_replayed = scheduler.enqueue_replayed_rows
     except Exception:
         RepositoryResources(resources).close()
         raise

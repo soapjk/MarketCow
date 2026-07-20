@@ -24,7 +24,8 @@ class ShadowMarketBarRepository:
                  canonical_reads_enabled: bool = False,
                  raw_reads_enabled: bool = False,
                  auto_canonical_enabled: bool = False,
-                 auto_canonical_limit: int = 50000) -> None:
+                 auto_canonical_limit: int = 50000,
+                 background_scheduler: Any = None) -> None:
         self.primary = primary
         self.writer = writer
         self.canonical_builder = canonical_builder
@@ -32,9 +33,12 @@ class ShadowMarketBarRepository:
         self.raw_reads_enabled = raw_reads_enabled
         self.auto_canonical_enabled = auto_canonical_enabled
         self.auto_canonical_limit = auto_canonical_limit
+        self.background_scheduler = background_scheduler
         self._last_auto_canonical: Dict[str, Any] = {"status": "disabled"}
         if auto_canonical_enabled:
             self.writer.on_raw_replayed = self._auto_rebuild_rows
+        elif background_scheduler is not None:
+            self.writer.on_raw_replayed = background_scheduler.enqueue_replayed_rows
         self._last_batch: Optional[Dict[str, Any]] = None
         self._last_shadow: Dict[str, Any] = {"status": "idle"}
         self._last_reconciliation: Dict[str, Any] = {"status": "not_run"}
@@ -425,6 +429,9 @@ class ShadowMarketBarRepository:
                                  **result}
             if self.auto_canonical_enabled and not result["spooled"]:
                 self._auto_rebuild_rows(rows)
+            elif self.background_scheduler is not None and not result["spooled"]:
+                enqueue = self.background_scheduler.enqueue_rows(rows)
+                self._last_auto_canonical = {"status": "queued", **enqueue}
         except Exception as error:
             self._last_shadow = {"status": "error", "error": str(error)[:4000]}
         return count
@@ -520,6 +527,9 @@ class ShadowMarketBarRepository:
                 "spool": self.writer.spool.diagnostics(),
                 "replay_callback": getattr(
                     self.writer, "last_replay_callback", {"status": "not_run"}
+                ), "background_scheduler": (
+                    self.background_scheduler.diagnostics()
+                    if self.background_scheduler else {"enabled": False}
                 )}
 
     def rebuild_canonical(

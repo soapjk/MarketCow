@@ -9,6 +9,33 @@ from marketcow.config import Settings
 
 
 class SettingsTest(unittest.TestCase):
+    def test_background_scheduler_is_explicit_bounded_and_development_only(self):
+        root = Path("/tmp/marketcow-scheduler/data-development")
+        base = dict(
+            database_path=root / "db", raw_path=root / "raw", storage_root=root,
+            clickhouse_spool_path=root / "spool/clickhouse",
+            clickhouse_database="marketcow_test", clickhouse_background_canonical=True,
+        )
+        with self.assertRaisesRegex(ValueError, "development-only"):
+            Settings(**base, clickhouse_enabled=True).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "CLICKHOUSE_ENABLED"):
+            Settings(**base, profile="development", port=8791).validate_runtime_isolation()
+        Settings(
+            **base, profile="development", port=8791, clickhouse_enabled=True,
+            clickhouse_scheduler_queue_cap=1, clickhouse_scheduler_scan_limit=1,
+            clickhouse_scheduler_poll_seconds=0.05,
+        ).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            Settings(
+                **base, profile="development", port=8791, clickhouse_enabled=True,
+                clickhouse_auto_canonical=True,
+            ).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "queue cap"):
+            Settings(
+                **base, profile="development", port=8791, clickhouse_enabled=True,
+                clickhouse_scheduler_queue_cap=0,
+            ).validate_runtime_isolation()
+
     def test_auto_canonical_is_explicit_development_only(self):
         root = Path("/tmp/marketcow-auto/data-development")
         base = dict(database_path=root / "db", raw_path=root / "raw",

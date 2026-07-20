@@ -43,6 +43,13 @@ class Settings:
     raw_market_bar_read_backend: str = "duckdb"
     clickhouse_auto_canonical: bool = False
     clickhouse_auto_canonical_limit: int = 50000
+    clickhouse_background_canonical: bool = False
+    clickhouse_scheduler_queue_cap: int = 1000
+    clickhouse_scheduler_scan_limit: int = 100
+    clickhouse_scheduler_poll_seconds: float = 1.0
+    clickhouse_scheduler_backoff_base_seconds: float = 1.0
+    clickhouse_scheduler_backoff_max_seconds: float = 60.0
+    clickhouse_scheduler_max_attempts: int = 10
     market_bar_cache_freshness_seconds: int = 900
     market_bar_cursor_secret: str = ""
     market_bar_cursor_ttl_seconds: int = 3600
@@ -128,6 +135,21 @@ class Settings:
             clickhouse_auto_canonical_limit=int(os.getenv(
                 "MARKETCOW_CLICKHOUSE_AUTO_CANONICAL_LIMIT", "50000"
             )),
+            clickhouse_background_canonical=os.getenv(
+                "MARKETCOW_CLICKHOUSE_BACKGROUND_CANONICAL", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
+            clickhouse_scheduler_queue_cap=int(os.getenv(
+                "MARKETCOW_CLICKHOUSE_SCHEDULER_QUEUE_CAP", "1000")),
+            clickhouse_scheduler_scan_limit=int(os.getenv(
+                "MARKETCOW_CLICKHOUSE_SCHEDULER_SCAN_LIMIT", "100")),
+            clickhouse_scheduler_poll_seconds=float(os.getenv(
+                "MARKETCOW_CLICKHOUSE_SCHEDULER_POLL_SECONDS", "1.0")),
+            clickhouse_scheduler_backoff_base_seconds=float(os.getenv(
+                "MARKETCOW_CLICKHOUSE_SCHEDULER_BACKOFF_BASE_SECONDS", "1.0")),
+            clickhouse_scheduler_backoff_max_seconds=float(os.getenv(
+                "MARKETCOW_CLICKHOUSE_SCHEDULER_BACKOFF_MAX_SECONDS", "60.0")),
+            clickhouse_scheduler_max_attempts=int(os.getenv(
+                "MARKETCOW_CLICKHOUSE_SCHEDULER_MAX_ATTEMPTS", "10")),
             market_bar_cache_freshness_seconds=int(os.getenv(
                 "MARKETCOW_MARKET_BAR_CACHE_FRESHNESS_SECONDS", "900"
             )),
@@ -154,6 +176,24 @@ class Settings:
                 raise ValueError("automatic canonical rebuild is development-only")
             if not self.clickhouse_enabled:
                 raise ValueError("automatic canonical rebuild requires MARKETCOW_CLICKHOUSE_ENABLED")
+        if self.clickhouse_background_canonical:
+            if self.profile != "development":
+                raise ValueError("background canonical scheduler is development-only")
+            if not self.clickhouse_enabled:
+                raise ValueError("background canonical scheduler requires MARKETCOW_CLICKHOUSE_ENABLED")
+            if self.clickhouse_auto_canonical:
+                raise ValueError("background and synchronous automatic canonical are mutually exclusive")
+        if not 1 <= self.clickhouse_scheduler_queue_cap <= 10000:
+            raise ValueError("scheduler queue cap must be between 1 and 10000")
+        if not 1 <= self.clickhouse_scheduler_scan_limit <= 1000:
+            raise ValueError("scheduler scan limit must be between 1 and 1000")
+        if not 0.05 <= self.clickhouse_scheduler_poll_seconds <= 60:
+            raise ValueError("scheduler poll seconds must be between 0.05 and 60")
+        if not (0.01 <= self.clickhouse_scheduler_backoff_base_seconds <=
+                self.clickhouse_scheduler_backoff_max_seconds <= 3600):
+            raise ValueError("scheduler backoff bounds are invalid")
+        if not 1 <= self.clickhouse_scheduler_max_attempts <= 100:
+            raise ValueError("scheduler max attempts must be between 1 and 100")
         if self.market_bar_read_backend not in {"duckdb", "clickhouse_canonical"}:
             raise ValueError(
                 "MARKETCOW_MARKET_BAR_READ_BACKEND must be duckdb or clickhouse_canonical"

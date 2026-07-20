@@ -20,6 +20,7 @@ from marketcow.storage import Warehouse
 from marketcow.clickhouse_writer import normalize_bar
 from marketcow.config import Settings
 from marketcow.contract_gate import LEGACY_PAYLOAD_PATHS, assert_contract_equal
+from marketcow.clickhouse_scheduler import BackgroundCanonicalScheduler
 
 
 class MarketBarService:
@@ -50,6 +51,56 @@ class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
     "set MARKETCOW_TEST_CLICKHOUSE_HOST to run ClickHouse integration tests",
 )
 class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
+    def test_background_scheduler_clickhouse_outage_recovery(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            scheduler_database = ClickHouseDatabase(
+                self.host, self.port, self.database_name, self.username, self.password
+            )
+            scheduler_database.open()
+            scheduler_repository = ClickHouseMarketBarRepository(scheduler_database)
+            writer = ReliableClickHouseWriter(scheduler_repository, spool, 1000)
+            builder = CanonicalMarketBarBuilder(scheduler_repository, writer)
+            raw = normalize_bar("raw", {
+                "symbol": "SCHEDULER-RECOVERY", "market": "US", "interval": "1m",
+                "adjustment": "raw", "bar_time": "2026-07-20T07:00:00Z",
+                "open": 10, "high": 11, "low": 9, "close": 10.5,
+                "raw_close": 10.5, "adjustment_factor": 1, "volume": 100,
+                "amount": 1050, "source": "fixture", "source_sequence": "1",
+                "observed_at": "2026-07-20T07:00:01Z",
+                "ingested_at": "2026-07-20T07:00:02Z", "raw_artifact_id": "sched-1",
+            })
+            self.repository.insert_raw_bars([raw])
+            original = scheduler_database.client
+            scheduler_database.client = None
+            scheduler = BackgroundCanonicalScheduler(
+                builder, spool, poll_seconds=0.05, backoff_base_seconds=0.05,
+                backoff_max_seconds=0.1, max_attempts=5,
+            )
+            try:
+                scheduler.enqueue_rows([raw])
+                deadline = __import__("time").monotonic() + 2
+                while scheduler.diagnostics()["last"].get("status") != "failed":
+                    self.assertLess(__import__("time").monotonic(), deadline)
+                    __import__("time").sleep(0.01)
+                self.assertEqual(scheduler.diagnostics()["pending"], 1)
+                scheduler_database.client = original
+                deadline = __import__("time").monotonic() + 3
+                while scheduler.diagnostics()["last"].get("status") != "ok":
+                    self.assertLess(__import__("time").monotonic(), deadline)
+                    __import__("time").sleep(0.01)
+                rows, truncated = self.repository.query_range(
+                    "canonical", "SCHEDULER-RECOVERY", "1m", "raw",
+                    "2026-07-20T07:00:00Z", "2026-07-20T07:00:00Z", 10,
+                )
+                self.assertFalse(truncated)
+                self.assertEqual(len(rows), 1)
+            finally:
+                scheduler_database.client = original
+                scheduler.close()
+                scheduler_database.close()
+
     def test_sv2_contract_gate_all_query_types_and_fallback(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
