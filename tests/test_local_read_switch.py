@@ -117,11 +117,16 @@ class LocalReadSwitchTest(unittest.TestCase):
     def test_incremental_write_is_observed_before_raw_switch(self):
         incremental = Mock()
         drill = LocalReadSwitchDrill(self.inputs(incremental_write=incremental))
-        drill.run(1)
+        first = drill.run(1)
+        repeated = LocalReadSwitchDrill(
+            self.inputs(incremental_write=incremental)
+        ).run(1)
         incremental.assert_called_once_with()
+        self.assertEqual(repeated["events"], first["events"])
         backends = [call.args[0] for call in self.golden.call_args_list]
         self.assertEqual(backends, [
             "duckdb", "clickhouse_canonical", "clickhouse_canonical", "clickhouse_raw",
+            "clickhouse_canonical", "clickhouse_raw",
         ])
 
     def test_crash_after_apply_recovers_conservatively_then_can_resume(self):
@@ -329,28 +334,94 @@ class LocalReadSwitchIntegrationTest(unittest.TestCase):
                     "2026-07-21T00:00:00Z", 100,
                 )
 
-            gate = lambda: {
-                "lag": 0, "reconcile": "ok", "contract": "ok",
-                "spool_pending": spool.diagnostics()["pending"],
-                "canonical_queue": 0, "readiness": "healthy",
-            }
+            def gate():
+                backfill_state = json.loads(cp.read_text())
+                backfill_result = json.loads(br.read_text())
+                try:
+                    readiness = (
+                        "healthy" if database.diagnostics()["status"] == "ok"
+                        else "unavailable"
+                    )
+                except Exception:
+                    readiness = "unavailable"
+                stable = (
+                    backfill_state.get("phase") == "complete" and
+                    backfill_state.get("completion_fingerprint") ==
+                    backfill_state.get("last_live_fingerprint")
+                )
+                contract = golden("duckdb")["status"]
+                canonical_pending = 0
+                for pending in spool.pending.glob("*.json"):
+                    try:
+                        canonical_pending += int(
+                            json.loads(pending.read_text()).get("dataset") == "canonical"
+                        )
+                    except (OSError, ValueError):
+                        canonical_pending += 1
+                return {
+                    "lag": backfill_result.get("lag", 1) if stable else 1,
+                    "reconcile": (
+                        "ok" if backfill_result.get("status") == "complete" and
+                        not backfill_result.get("mismatches", []) else "mismatch"
+                    ),
+                    "contract": contract,
+                    "spool_pending": spool.diagnostics()["pending"],
+                    "canonical_queue": canonical_pending, "readiness": readiness,
+                }
             inputs = ReadSwitchInputs(
                 root / "switch-test", adapter, cp, br, rr, "backup-verified",
                 "restore-verified", "test", root, gate, golden, incremental,
             )
             try:
                 drill = LocalReadSwitchDrill(inputs)
+                interrupted = {"value": False}
+
+                def interrupt(stage, name):
+                    if (stage == "after_apply" and name == "canonical_enabled" and
+                            not interrupted["value"]):
+                        interrupted["value"] = True
+                        raise RuntimeError("real switch interruption")
+
+                with self.assertRaisesRegex(RuntimeError, "real switch interruption"):
+                    drill.run(2, interrupt)
+                self.assertFalse(adapter.canonical_reads_enabled)
+                self.assertFalse(adapter.raw_reads_enabled)
+                drill = LocalReadSwitchDrill(inputs)
                 self.assertEqual(drill.run(2)["final_backend"], "clickhouse")
                 original = database.client
                 database.client = None
-                # Existing adapter synchronously falls back to DuckDB within one request.
+                adapter.upsert_price_bars(
+                    "MU", "1d", "none", "fixture", "2026-07-22T00:00:01Z",
+                    [{**bars[0], "timestamp": 1784678400,
+                      "bar_at": "2026-07-22T00:00:00Z", "close": 3.5,
+                      "raw_close": 3.5}],
+                    {"observed_at": "2026-07-22T00:00:00Z",
+                     "raw_artifact_id": "raw-outage"},
+                )
+                self.assertEqual(spool.diagnostics()["pending"], 1)
+                # The outage-period primary write is immediately readable via fallback.
                 self.assertEqual(golden("clickhouse_canonical")["status"], "ok")
                 self.assertGreaterEqual(fallback["count"], 1)
+                with self.assertRaisesRegex(RuntimeError, "stop condition"):
+                    drill.run(1)
+                self.assertFalse(adapter.canonical_reads_enabled)
+                self.assertFalse(adapter.raw_reads_enabled)
                 database.client = original
+                self.assertEqual(writer.replay(10)["replayed"], 1)
+                self.assertEqual(builder.rebuild(
+                    "MU", "1d", "none", "2026-07-22T00:00:00Z",
+                    "2026-07-22T00:00:00Z", 100,
+                )["status"], "ok")
+                self.assertEqual(spool.diagnostics()["pending"], 0)
+                self.assertEqual(golden("clickhouse_canonical")["status"], "ok")
+                self.assertEqual(golden("clickhouse_raw")["status"], "ok")
+                drill = LocalReadSwitchDrill(inputs)
+                self.assertEqual(drill.run(1)["final_backend"], "clickhouse")
                 rolled = drill.rollback("outage_drill")
                 self.assertEqual(rolled["final_backend"], "duckdb")
                 self.assertFalse(adapter.canonical_reads_enabled)
                 self.assertFalse(adapter.raw_reads_enabled)
+                self.assertEqual(golden("duckdb")["status"], "ok")
             finally:
                 database.close()
                 bootstrap = clickhouse_connect.get_client(
@@ -361,3 +432,217 @@ class LocalReadSwitchIntegrationTest(unittest.TestCase):
                 )
                 bootstrap.command(f"DROP DATABASE IF EXISTS `{database_name}`")
                 bootstrap.close()
+
+
+@unittest.skipUnless(
+    os.getenv("MARKETCOW_TEST_POSTGRES_DSN") and
+    os.getenv("MARKETCOW_TEST_CLICKHOUSE_HOST"),
+    "set PostgreSQL and ClickHouse integration settings for composed switch drill",
+)
+class LocalReadSwitchComposedIntegrationTest(unittest.TestCase):
+    def test_real_backup_restore_backfill_outputs_bind_the_switch(self):
+        import clickhouse_connect
+        import psycopg
+
+        from marketcow.clickhouse_canonical import CanonicalMarketBarBuilder
+        from marketcow.clickhouse_repositories import (
+            ClickHouseDatabase, ClickHouseMarketBarRepository,
+        )
+        from marketcow.clickhouse_shadow import ShadowMarketBarRepository
+        from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
+        from marketcow.contract_gate import LEGACY_PAYLOAD_PATHS, compare_contract
+        from marketcow.local_backup import (
+            BackupComponent, LocalStorageBackup, _hash, _json,
+        )
+        from marketcow.local_backfill import BackfillTargets, LocalStorageBackfill
+        from marketcow.local_restore import LocalStorageRestore, RestoreTargets
+        from marketcow.postgres_repositories import PostgresDatabase
+        from marketcow.storage import Warehouse
+        from tests.test_local_backfill import _seed_all_postgres_domains
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "source-development"
+            source = Warehouse(source_root / "warehouse/market_data.duckdb")
+            _seed_all_postgres_domains(source)
+            source.upsert_price_bars(
+                "MU", "1d", "none", "fixture", "2026-07-20T00:00:01Z",
+                [{"timestamp": 1784505600, "bar_at": "2026-07-20T00:00:00Z",
+                  "open": 1, "high": 2, "low": .5, "close": 1.5,
+                  "raw_close": 1.5, "adjustment_factor": 1, "volume": 100,
+                  "amount": 150}],
+                {"observed_at": "2026-07-20T00:00:00Z",
+                 "raw_artifact_id": "composed-raw"},
+            )
+            suffix = uuid.uuid4().hex[:10]
+            pg_schema = f"switch_chain_{suffix}_test"
+            ch_name = f"switch_chain_{suffix}_test"
+            postgres = PostgresDatabase(os.environ["MARKETCOW_TEST_POSTGRES_DSN"], pg_schema)
+            clickhouse = ClickHouseDatabase(
+                os.environ["MARKETCOW_TEST_CLICKHOUSE_HOST"],
+                int(os.getenv("MARKETCOW_TEST_CLICKHOUSE_PORT", "8123")), ch_name,
+                os.getenv("MARKETCOW_TEST_CLICKHOUSE_USERNAME", "default"),
+                os.getenv("MARKETCOW_TEST_CLICKHOUSE_PASSWORD", ""),
+            )
+            postgres.pool.open(wait=True)
+            bootstrap = clickhouse_connect.get_client(
+                host=os.environ["MARKETCOW_TEST_CLICKHOUSE_HOST"],
+                port=int(os.getenv("MARKETCOW_TEST_CLICKHOUSE_PORT", "8123")),
+                username=os.getenv("MARKETCOW_TEST_CLICKHOUSE_USERNAME", "default"),
+                password=os.getenv("MARKETCOW_TEST_CLICKHOUSE_PASSWORD", ""),
+            )
+            bootstrap.command(f"CREATE DATABASE `{ch_name}`")
+            bootstrap.close()
+            clickhouse.client = clickhouse._connect(ch_name)
+            try:
+                captured = "2026-07-20T00:01:00Z"
+                watermark = {"captured_at": captured}
+                cold = source_root / "archive"
+                cold.mkdir(parents=True)
+                (cold / "catalog.json").write_text(json.dumps({"artifacts": []}))
+                spool_source = source_root / "spool/clickhouse"
+                (spool_source / "replayed").mkdir(parents=True)
+                (spool_source / "replayed/marker.json").write_text(json.dumps({"done": True}))
+                components = [
+                    BackupComponent.json(
+                        "postgresql", "logical-json", "postgresql-schema-v1", {},
+                        watermark,
+                    ),
+                    BackupComponent.json(
+                        "clickhouse", "logical-json", "clickhouse-schema-v1", {},
+                        watermark, True,
+                    ),
+                    BackupComponent.tree("duckdb", "duckdb-file", "1",
+                                         source_root / "warehouse", source_root, watermark),
+                    BackupComponent.tree("cold_archive", "parquet-tree", "manifest-v1",
+                                         cold, source_root, watermark),
+                    BackupComponent.tree("spool", "wal-tree", "spool-v1",
+                                         spool_source, source_root, watermark, True),
+                    BackupComponent("cursor_key", "sealed-secret", "cursor-v1",
+                                    {"cursor.key": b"k" * 48}, watermark),
+                ]
+                backup = LocalStorageBackup(
+                    source_root / "backups", source_root, b"w" * 32,
+                )
+                backup_result = backup.create(components, "2026-07-20T00:01:01Z")
+                artifact = Path(backup_result["artifact_path"])
+                restored_root = root / "restored-test"
+                restore = LocalStorageRestore(backup, RestoreTargets(
+                    restored_root, postgres, clickhouse, "test", root,
+                ))
+                restore.restore([artifact])
+                restore_report = restore.record_verification({
+                    "bundle": "verified", "empty_environment": "verified",
+                })
+                restored = Warehouse(restored_root / "warehouse/market_data.duckdb")
+                repository = ClickHouseMarketBarRepository(clickhouse)
+                spool = LocalClickHouseSpool(restored_root / "spool/clickhouse", root)
+                writer = ReliableClickHouseWriter(repository, spool, 1000)
+                builder = CanonicalMarketBarBuilder(repository, writer)
+
+                def target_contract():
+                    expected = restored.get_raw_price_bars_range(
+                        "MU", "1d", "none", "2026-07-19T00:00:00Z",
+                        "2026-07-21T00:00:00Z", 100,
+                    )
+                    actual = repository.get_raw_price_bars_range(
+                        "MU", "1d", "none", "2026-07-19T00:00:00Z",
+                        "2026-07-21T00:00:00Z", 100,
+                    )
+                    pg_nonempty = 0
+                    with postgres.connection() as connection:
+                        for domain in __import__(
+                            "marketcow.local_backfill", fromlist=["POSTGRES_DOMAINS"]
+                        ).POSTGRES_DOMAINS:
+                            pg_nonempty += int(connection.execute(
+                                f'SELECT count(*) AS count FROM "{domain.table}"'
+                            ).fetchone()["count"] > 0)
+                    comparison = compare_contract(expected, actual, LEGACY_PAYLOAD_PATHS)
+                    return {"status": "ok" if comparison["status"] == "ok" and
+                            pg_nonempty == 16 else "mismatch", "checks": 17}
+
+                backfill = LocalStorageBackfill(restored, BackfillTargets(
+                    root / "backfill-test", postgres, clickhouse, writer, builder,
+                    "test", root, contract_gate=target_contract,
+                ), 2)
+                backfill_result = backfill.run()
+                self.assertEqual(backfill_result["lag"], 0)
+                backfill_report_path = backfill.state / "report.json"
+                restore_report_path = restore.state_root / "report.json"
+                adapter = ShadowMarketBarRepository(restored, writer, builder)
+
+                def golden(_backend):
+                    pairs = [
+                        (restored.get_price_bars_page(
+                            "MU", "1d", "none", "2026-07-19T00:00:00Z",
+                            "2026-07-21T00:00:00Z", 10, None,
+                        ), adapter.get_price_bars_page(
+                            "MU", "1d", "none", "2026-07-19T00:00:00Z",
+                            "2026-07-21T00:00:00Z", 10, None,
+                        )),
+                        (restored.get_raw_price_bars_page(
+                            "MU", "1d", "none", "2026-07-19T00:00:00Z",
+                            "2026-07-21T00:00:00Z", 10, None, None,
+                        ), adapter.get_raw_price_bars_page(
+                            "MU", "1d", "none", "2026-07-19T00:00:00Z",
+                            "2026-07-21T00:00:00Z", 10, None, None,
+                        )),
+                    ]
+                    ok = all(compare_contract(left, right, LEGACY_PAYLOAD_PATHS)[
+                        "status"] == "ok" for left, right in pairs)
+                    return {"status": "ok" if ok else "mismatch", "samples": 2,
+                            "fallbacks": int(bool(adapter._last_read.get("fallback")))}
+
+                def gate():
+                    checkpoint = json.loads(backfill.checkpoint_path.read_text())
+                    report = json.loads(backfill_report_path.read_text())
+                    contract = target_contract()["status"]
+                    canonical_pending = 0
+                    for pending in spool.pending.glob("*.json"):
+                        try:
+                            canonical_pending += int(
+                                json.loads(pending.read_text()).get("dataset") == "canonical"
+                            )
+                        except (OSError, ValueError):
+                            canonical_pending += 1
+                    return {
+                        "lag": report["lag"] if checkpoint["phase"] == "complete" else 1,
+                        "reconcile": "ok" if not report["mismatches"] else "mismatch",
+                        "contract": contract,
+                        "spool_pending": spool.diagnostics()["pending"],
+                        "canonical_queue": canonical_pending,
+                        "readiness": "healthy" if clickhouse.diagnostics()["status"] == "ok"
+                        else "unavailable",
+                    }
+
+                restore_id = _hash(_json(restore_report))[:24]
+                inputs = ReadSwitchInputs(
+                    root / "switch-test", adapter, backfill.checkpoint_path,
+                    backfill_report_path, restore_report_path,
+                    backup_result["backup_id"], restore_id, "test", root, gate, golden,
+                )
+                drill = LocalReadSwitchDrill(inputs)
+                self.assertEqual(drill.run(1)["final_backend"], "clickhouse")
+                self.assertEqual(LocalReadSwitchDrill(inputs).run(1)["final_backend"],
+                                 "clickhouse")
+                tampered = json.loads(restore_report_path.read_text())
+                tampered["verification"]["bundle"] = "tampered"
+                restore_report_path.write_text(json.dumps(tampered))
+                with self.assertRaisesRegex(ValueError, "binding mismatch"):
+                    LocalReadSwitchDrill(inputs)
+                self.assertFalse(adapter.canonical_reads_enabled)
+                self.assertFalse(adapter.raw_reads_enabled)
+            finally:
+                clickhouse.close()
+                bootstrap = clickhouse_connect.get_client(
+                    host=os.environ["MARKETCOW_TEST_CLICKHOUSE_HOST"],
+                    port=int(os.getenv("MARKETCOW_TEST_CLICKHOUSE_PORT", "8123")),
+                    username=os.getenv("MARKETCOW_TEST_CLICKHOUSE_USERNAME", "default"),
+                    password=os.getenv("MARKETCOW_TEST_CLICKHOUSE_PASSWORD", ""),
+                )
+                bootstrap.command(f"DROP DATABASE IF EXISTS `{ch_name}`")
+                bootstrap.close()
+                postgres.close()
+                with psycopg.connect(os.environ["MARKETCOW_TEST_POSTGRES_DSN"],
+                                     autocommit=True) as connection:
+                    connection.execute(f'DROP SCHEMA IF EXISTS "{pg_schema}" CASCADE')

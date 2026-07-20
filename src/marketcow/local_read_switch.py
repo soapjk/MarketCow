@@ -282,6 +282,11 @@ class LocalReadSwitchDrill:
             try:
                 if checkpoint["phase"].startswith("applying:"):
                     self._rollback_locked(checkpoint, "crash_recovery")
+                if checkpoint["phase"] == "switched":
+                    self._check_gate()
+                    self._golden("clickhouse_canonical")
+                    self._golden("clickhouse_raw")
+                    return self._report(checkpoint, "clickhouse")
                 self._check_gate()
                 baseline = self._golden("duckdb")
                 self._event(checkpoint, "preflight", baseline)
