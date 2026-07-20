@@ -1644,8 +1644,12 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   脱敏 code 拒绝。打开固定使用 DuckDB `read_only=True`、单线程和显式 memory limit，验证引擎 major 1、精确
   migration 集合 `2/3/4`、19 个固定业务表加 `schema_migrations`，未知/缺失表或 migration fail-closed。
   validation 绑定文件 SHA-256、大小、migration、逐表行数形成稳定 source fingerprint；读取前后 inode/size/mtime
-  必须不变。文件、总行数、单批行数、内存与 elapsed time 均有硬上限；抽取仅允许固定表白名单并分批返回，
-  不接 PostgreSQL/ClickHouse、不创建 spool/线程/目录。专项覆盖 fixture 字节与 mtime 不变、symlink/path/
+  必须不变。文件、总行数、单值/单行/单批/总输出字节、DuckDB 内存与 wall-clock 均有硬上限；抽取仅允许
+  固定表白名单。CLI 使用隔离、可强制终止的 worker，并逐帧转发 `manifest → batch* → complete` NDJSON；父进程
+  任一时刻仅保留一个受限 batch，成功 terminal 绑定 row/batch count、payload checksum 与 source fingerprint。
+  阻塞调用达到 deadline 会终止并回收 worker；中途异常、worker 消失或 timeout 均输出具名 `failed` terminal 并
+  非零退出，缺少 `complete` 不可视为完整导出。不接 PostgreSQL/ClickHouse、不创建 spool/线程/目录。专项覆盖
+  大量/超大字段的流式峰值上限、阻塞 worker 的硬超时和无遗留进程、不完整流拒绝、fixture 字节与 mtime 不变、symlink/path/
   production trap、未知 migration/额外恶意表/损坏文件、row/batch/memory/time 边界、SQL table 注入拒绝、CLI
   机器错误脱敏，以及在 PG/CH/V2 factory/API/Service import trap 下运行且零 `MARKETCOW_HOME` 副作用。
 
