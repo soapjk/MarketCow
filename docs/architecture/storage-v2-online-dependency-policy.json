@@ -18,6 +18,7 @@
     "marketcow.cold_archive",
     "marketcow.offline_duckdb_import",
     "marketcow.offline_full_import",
+    "marketcow.offline_incremental_catchup",
     "marketcow.local_backfill",
     "marketcow.local_benchmark",
     "marketcow.local_restore"

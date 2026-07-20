@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from marketcow.offline_full_import import FullImportTargets, OfflineFullImport, _StageSink
+from marketcow.offline_incremental_catchup import OfflineIncrementalCatchup
 from marketcow.offline_duckdb_import import ImportLimits, OfflineDuckDBImporter
 
 
@@ -126,6 +127,7 @@ class OfflineFullImportIntegrationTest(unittest.TestCase):
         from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
         from marketcow.postgres_migrations import POSTGRES_TRANSACTION_DOMAINS
         from marketcow.postgres_repositories import PostgresDatabase
+        from marketcow.postgres_repositories import PostgresRepository
         from marketcow.storage import Warehouse
         from tests.test_local_backfill import _seed_all_postgres_domains
 
@@ -199,6 +201,45 @@ class OfflineFullImportIntegrationTest(unittest.TestCase):
                 self.assertEqual(client.query("SELECT count() FROM market_bar_raw FINAL").result_rows[0][0], 1)
                 self.assertEqual(client.query("SELECT count() FROM market_bar_canonical FINAL").result_rows[0][0], 1)
                 self.assertEqual(drill.run(), report)
+
+                # The copied source remains active after the full checkpoint.  Update a
+                # PG domain and append a new market key, then converge through BG-012
+                # verified streams rather than reading DuckDB from the catch-up module.
+                with warehouse.connect() as connection:
+                    connection.execute(
+                        "UPDATE provider_health SET status='degraded', last_error='synthetic' "
+                        "WHERE provider='fixture'"
+                    )
+                warehouse.upsert_price_bars(
+                    "FULL", "1d", "none", "fixture", "2026-06-03T00:00:00Z",
+                    [{"timestamp": 1780358400, "bar_at": "2026-06-02T00:00:00Z", "open": 11,
+                      "high": 13, "low": 10, "close": 12, "volume": 120, "amount": 1440}],
+                    {"observed_at": "2026-06-02T00:01:00Z", "raw_artifact_id": "artifact-1"},
+                )
+                catchup_faults = set()
+                def interrupt_catchup(stage, domain):
+                    if stage == "after_write" and domain == "provider_health" and not catchup_faults:
+                        catchup_faults.add(domain)
+                        raise RuntimeError("synthetic catchup checkpoint window")
+                with self.assertRaisesRegex(RuntimeError, "catchup checkpoint window"):
+                    OfflineIncrementalCatchup(source, targets, interrupt_catchup).run(max_passes=3)
+                catchup = OfflineIncrementalCatchup(source, targets)
+                caught_up = catchup.run(max_passes=3)
+                self.assertEqual(caught_up["status"], "complete")
+                self.assertEqual(caught_up["lag"], 0)
+                self.assertEqual(len(set(caught_up["stability"])), 1)
+                with pg.connection() as connection:
+                    status = connection.execute(
+                        "SELECT status FROM provider_health WHERE provider='fixture'"
+                    ).fetchone()["status"]
+                self.assertEqual(status, "degraded")
+                pit = PostgresRepository(pg).query_fundamentals(
+                    symbol="FULL", as_of="2026-06-03", active_only=False,
+                )
+                self.assertTrue(pit)
+                self.assertEqual(client.query("SELECT count() FROM market_bar_raw FINAL").result_rows[0][0], 2)
+                self.assertEqual(client.query("SELECT count() FROM market_bar_canonical FINAL").result_rows[0][0], 2)
+                self.assertEqual(catchup.run(), caught_up)
             finally:
                 ch.close()
                 pg.close()

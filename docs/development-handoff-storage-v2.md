@@ -1661,7 +1661,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：全域 row/key/content/PIT/provenance 对账；中断可重入；未知版本或差异阻止完成。
 - **必要测试**：真实 disposable PG+CH、全部域非空 fixture、批次前后故障、重复/乱序/同版本冲突。
 - **排除项**：真实数据副本和在线切换。
-- **状态**：`本地实现完成，待独立验收`。新增 offline-only `marketcow.offline_full_import`，只消费
+- **状态**：`已验收（67dbbb6）`。新增 offline-only `marketcow.offline_full_import`，只消费
   BG-012 已验证的 `manifest → batch* → complete` 流；每张源表按完整业务键 keyset 排序抽取，stage
   逐批校验 sequence、source fingerprint、row/batch count 与 stream SHA-256 后原子发布。run ID 与
   checkpoint 绑定源 fingerprint、PG schema、CH database 和协议版本，批次写前/写后/checkpoint 前后均有
@@ -1683,7 +1683,20 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：并发新增、重启、乱序和重复均不丢不重；三次稳定 fingerprint + 全域对账后 lag 才为零。
 - **必要测试**：合成活动源、窗口注入、PG/CH outage、checkpoint 崩溃、canonical spool/replay。
 - **排除项**：直接读取 production 文件或接入生产 CDC。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 offline-only
+  `marketcow.offline_incremental_catchup`，以 BG-013 已签名且 `phase=complete` 的 full checkpoint 为唯一
+  起点，并把其 run ID/checksum、目标 PG schema/CH database 和协议版本绑定到独立原子 checkpoint。
+  每轮先通过 BG-012 worker 为全部 19 张旧源表生成有界 verified NDJSON snapshot；high-watermark 由 source
+  fingerprint 及逐表 row/batch/stream checksum 构成。16 个旧 PG 域和 CH raw 使用完整业务键 keyset batch
+  重放，依靠 PG upsert、CH stable batch/content version 幂等收敛；V2-native 两控制域保留并追加具名 catch-up
+  checkpoint。raw 全确认后按累计精确范围重建 canonical；短确认、写/回调/queue 失败均不推进 batch。
+  完成必须依次取得 catch-up 前、全域 reconcile 前、reconcile 后三个完全相同的 source fingerprint，并再次
+  通过 18 个 PG 域、CH raw/canonical FINAL selection/provenance、Artifact body/manifest、migration 版本及
+  spool pending/failed/intent/quarantine 空闸门；否则报告 `lag=1/status=incomplete`，只有全部成立才写
+  `lag=0/status=complete`。报告仅含逻辑目标、高水位 checksum、稳定窗口、批次数与有界域 checksum，不含
+  DSN、凭证、绝对路径或原始异常。真实 disposable PG16+CH25.8 合成演练覆盖 full→活动源 PG update +
+  market append→catch-up、批次/checkpoint 窗口中断续跑、重复运行幂等；固定时钟/Mock 回归覆盖窗口注入后
+  多轮稳定、伪造 full/checkpoint、短确认与不稳定窗口 fail-closed。未实现 CDC 或读取真实副本。
 
 ### `BG-015`：真实数据副本验证工具与授权闸门
 
