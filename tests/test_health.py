@@ -1,6 +1,7 @@
 import threading
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -133,6 +134,43 @@ class StorageHealthTest(unittest.TestCase):
         self.assertEqual(unavailable.status_code, 503)
         self.assertEqual(unavailable.json()["status"], "unavailable")
         self.assertNotIn("secret", str(unavailable.json()))
+
+    def test_complete_health_responses_redact_absolute_paths_and_credentials(self):
+        database = Path(
+            "/Volumes/T9/projects/marketcow-storage-v2/data-development/"
+            "password=hunter2/market_data.duckdb"
+        )
+        settings = Settings(
+            database, database.parent / "raw", profile="development",
+            storage_root=Path(
+                "/Volumes/T9/projects/marketcow-storage-v2/data-development"
+            ),
+            postgres_dsn="postgresql://user:secret@127.0.0.1/db",
+            clickhouse_password="clickhouse-secret",
+            tushare_token="token-secret",
+        )
+        broken = SimpleNamespace(snapshot=lambda: (_ for _ in ()).throw(
+            RuntimeError(
+                "postgresql://user:secret@127.0.0.1/db "
+                "/Volumes/T9/private/key token=token-secret"
+            )
+        ))
+        service = SimpleNamespace(
+            market_bar_repository=SimpleNamespace(telemetry=broken), close=lambda: None
+        )
+        with TestClient(create_app(settings, service)) as client:
+            health = client.get("/v1/health")
+            readiness = client.get("/v1/readiness")
+        rendered = health.text + readiness.text
+        for forbidden in (
+            "/Volumes/T9", "hunter2", "user:secret", "clickhouse-secret",
+            "token-secret",
+        ):
+            self.assertNotIn(forbidden, rendered)
+        self.assertEqual(health.json()["database"],
+                         "storage://password=[REDACTED]/market_data.duckdb")
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(readiness.status_code, 503)
 
 
 if __name__ == "__main__":

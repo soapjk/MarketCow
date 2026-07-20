@@ -14,7 +14,7 @@ from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
-from .telemetry import telemetry_call
+from .telemetry import sanitize_text, telemetry_call
 from .health import StorageHealthEvaluator
 
 
@@ -45,6 +45,15 @@ def create_app(
         telemetry = getattr(repository, "telemetry", None)
         snapshot = telemetry_call(telemetry, "snapshot")
         return health_evaluator.evaluate(snapshot)
+
+    def database_identifier() -> str:
+        try:
+            relative = settings.database_path.resolve().relative_to(
+                settings.storage_root.resolve()
+            )
+            return "storage://" + "/".join(sanitize_text(part) for part in relative.parts)
+        except (OSError, ValueError):
+            return "[REDACTED_PATH]"
 
     def cache_metadata(
         bars: list[Dict[str, Any]], fallback_ingested_at: Any = None,
@@ -119,7 +128,7 @@ def create_app(
             "status": "ok",
             "version": __version__,
             "profile": settings.profile,
-            "database": str(settings.database_path),
+            "database": database_identifier(),
             "metadata_backend": settings.metadata_backend,
             "storage_health": storage_health(),
         }
