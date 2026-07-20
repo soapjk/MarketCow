@@ -809,6 +809,25 @@ class Warehouse:
                 )
         return len(rows)
 
+    def get_tushare_response(self, request_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self.connect() as con:
+            requests = self._rows(
+                con, "SELECT * FROM tushare_request WHERE request_id = ?", [request_id]
+            )
+            if not requests:
+                return None
+            request = requests[0]
+            for key in ("params_json", "response_fields_json"):
+                request[key] = json.loads(request[key] or ("{}" if key == "params_json" else "[]"))
+            rows = self._rows(
+                con,
+                "SELECT * FROM tushare_data_row WHERE request_id = ? ORDER BY row_index",
+                [request_id],
+            )
+            for row in rows:
+                row["payload_json"] = json.loads(row["payload_json"] or "{}")
+            return {**request, "rows": rows}
+
     def get_price_bars(self, symbol: str, interval: str, adjustment: str, limit: int) -> List[Dict[str, Any]]:
         with self._lock, self.connect() as con:
             rows = self._rows(

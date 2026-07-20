@@ -1431,11 +1431,12 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：缺任一数据库、出现 DuckDB online 配置、production 标识或路径逃逸均在资源创建前拒绝；旧 profile 兼容。
 - **必要测试**：配置矩阵、零副作用失败、symlink/路径、凭证脱敏、旧版启动回归。
 - **排除项**：Repository 装配和数据库连接迁移。
-- **状态**：`本地实现完成，待独立验收`。新增 `v2-development`/`v2-test` profile 与纯 preflight：
+- **状态**：`已验收`（Artifact `3fceadc` + 返修 `30888a9`）。新增 `v2-development`/`v2-test` profile 与纯 preflight：
   必须同时使用 PostgreSQL 和 ClickHouse，canonical/raw read backend 固定为 ClickHouse，DuckDB 路径
   必须为空；storage/raw/spool resolve 后受隔离 root containment 约束，PG/CH 与服务目标必须 loopback
   且数据库/schema 带 development/test 标识。DSN/password 只通过环境变量名引用，所有连接/读取超时
-  显式有界；验证不创建连接、目录、线程或文件。旧 production/development profile 行为保持兼容。
+  显式有界；`MARKETCOW_V2_ALLOWED_ROOT`、PG DSN 引用值和 ClickHouse password 引用值均必须显式、
+  非空提供；验证不创建连接、目录、线程或文件。旧 production/development profile 行为保持兼容。
 
 ### `BG-003`：PostgreSQL 全域 schema 与 Repository 完整性
 
@@ -1445,7 +1446,16 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：现有 DuckDB 事务域无遗漏；migration 幂等；16 个既有域及新增控制域语义等价。
 - **必要测试**：真实 disposable PostgreSQL 全域 CRUD、PIT、复合键、并发、migration upgrade。
 - **排除项**：服务工厂切换、行情表、真实数据导入。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。PostgreSQL migration 5 将全域清单固定为 18 个表：
+  16 个 DuckDB-compatible 事务域（`ingestion_runs`、`provider_health`、`raw_artifact_manifest`、
+  三类日历/指标、Tushare request/row、fundamental current/history、statement、BaoStock、TDX
+  current/history、validation 与 funnel），以及两个 V2-native 控制域 `runtime_config_version` 和
+  `migration_checkpoint`。配置版本为不可变、内容寻址 JSONB history，支持严格 as-of；迁移 checkpoint
+  以 `(run_id, domain, shard)` 为复合键，通过 revision compare-and-swap 提供确定并发语义，cursor/evidence
+  使用 JSONB。migration 还为 run row count、provider failure count 和 Artifact byte size 增加非负约束。
+  Repository 增加配置版本 PIT、checkpoint 创建/读取/CAS 与 Tushare request+rows 读取；既有 16 域方法
+  保持不变。真实 PostgreSQL 测试覆盖从 migration 4 升级、全新 schema、重复 migrate、JSONB、复合键、
+  PIT/history、约束和双连接并发冲突。未装配在线工厂，未改 ClickHouse 行情契约。
 
 ### `BG-004`：ClickHouse 直接行情 Repository 契约
 

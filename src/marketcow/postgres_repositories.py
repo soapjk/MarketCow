@@ -146,6 +146,95 @@ class _PostgresControlPlaneRepository:
                 "SELECT * FROM provider_health ORDER BY provider"
             ).fetchall())
 
+    def save_runtime_config_version(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Append an immutable, content-addressed V2 runtime configuration version."""
+        config = row.get("config_json", row.get("config", {}))
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                INSERT INTO runtime_config_version
+                    (config_id, version, profile, schema_version, config_json,
+                     config_sha256, observed_at, actor)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (config_id, config_sha256) DO UPDATE SET
+                    config_sha256 = EXCLUDED.config_sha256
+                RETURNING *
+                """,
+                (
+                    row["config_id"], row["version"], row["profile"],
+                    row["schema_version"], Jsonb(config), row["config_sha256"],
+                    row["observed_at"], row["actor"],
+                ),
+            ).fetchone()
+
+    def get_runtime_config_version(
+        self, config_id: str, as_of: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        query = "SELECT * FROM runtime_config_version WHERE config_id = %s"
+        params: List[Any] = [config_id]
+        if as_of:
+            query += " AND observed_at <= %s"
+            params.append(as_of)
+        query += " ORDER BY observed_at DESC, version DESC LIMIT 1"
+        with self.database.connection() as connection:
+            return connection.execute(query, params).fetchone()
+
+    def upsert_migration_checkpoint(
+        self, row: Dict[str, Any], expected_revision: int = 0
+    ) -> Dict[str, Any]:
+        """Create or compare-and-swap a durable migration checkpoint."""
+        with self.database.connection() as connection:
+            if expected_revision == 0:
+                saved = connection.execute(
+                    """
+                    INSERT INTO migration_checkpoint
+                        (run_id, domain, shard, revision, status, source_watermark,
+                         target_watermark, cursor_json, evidence_json, error, updated_at)
+                    VALUES (%s, %s, %s, 1, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id, domain, shard) DO NOTHING
+                    RETURNING *
+                    """,
+                    (
+                        row["run_id"], row["domain"], row.get("shard", ""),
+                        row["status"], row.get("source_watermark"),
+                        row.get("target_watermark"), Jsonb(row.get("cursor_json", {})),
+                        Jsonb(row.get("evidence_json", {})), row.get("error"),
+                        row["updated_at"],
+                    ),
+                ).fetchone()
+            else:
+                saved = connection.execute(
+                    """
+                    UPDATE migration_checkpoint SET
+                        revision = revision + 1, status = %s, source_watermark = %s,
+                        target_watermark = %s, cursor_json = %s, evidence_json = %s,
+                        error = %s, updated_at = %s
+                    WHERE run_id = %s AND domain = %s AND shard = %s
+                      AND revision = %s
+                    RETURNING *
+                    """,
+                    (
+                        row["status"], row.get("source_watermark"),
+                        row.get("target_watermark"), Jsonb(row.get("cursor_json", {})),
+                        Jsonb(row.get("evidence_json", {})), row.get("error"),
+                        row["updated_at"], row["run_id"], row["domain"],
+                        row.get("shard", ""), expected_revision,
+                    ),
+                ).fetchone()
+            if saved is None:
+                raise RuntimeError("migration checkpoint revision conflict")
+            return saved
+
+    def get_migration_checkpoint(
+        self, run_id: str, domain: str, shard: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM migration_checkpoint WHERE run_id = %s "
+                "AND domain = %s AND shard = %s",
+                (run_id, domain, shard),
+            ).fetchone()
+
     def save_artifact(self, row: Dict[str, Any]) -> None:
         columns = [
             "artifact_id", "dataset", "source", "source_url", "observed_at",
@@ -721,6 +810,19 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                     ),
                 )
         return len(rows)
+
+    def get_tushare_response(self, request_id: str) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            request = connection.execute(
+                "SELECT * FROM tushare_request WHERE request_id = %s", (request_id,)
+            ).fetchone()
+            if request is None:
+                return None
+            rows = list(connection.execute(
+                "SELECT * FROM tushare_data_row WHERE request_id = %s ORDER BY row_index",
+                (request_id,),
+            ).fetchall())
+            return {**request, "rows": rows}
 
     def _upsert_rows(
         self, table: str, key: str, columns: Sequence[str], rows: List[Dict[str, Any]]

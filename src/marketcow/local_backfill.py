@@ -18,6 +18,7 @@ from psycopg.types.json import Jsonb
 from .clickhouse_shadow import _market
 from .clickhouse_writer import normalize_bar
 from .local_backup import _assert_no_sensitive, _fsync_dir, _hash, _json
+from .postgres_migrations import POSTGRES_MIGRATIONS
 
 
 BACKFILL_VERSION = "storage-v2.backfill.v1"
@@ -197,7 +198,7 @@ class LocalStorageBackfill:
                         for row in connection.execute(
                             "SELECT version FROM schema_migrations"
                         ).fetchall()}
-        if versions != {1, 2, 3, 4}:
+        if versions != {item[0] for item in POSTGRES_MIGRATIONS}:
             raise ValueError("PostgreSQL migrations are incomplete or unknown")
         client = self.targets.clickhouse._require_client()
         versions = {row[0] for row in client.query(

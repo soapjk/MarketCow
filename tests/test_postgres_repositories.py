@@ -1,6 +1,8 @@
 import os
 import unittest
 import uuid
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
 import json
@@ -11,6 +13,21 @@ from marketcow.postgres_repositories import (
     PostgresMetadataRepository,
 )
 from marketcow.local_backup import BackupComponent
+from marketcow.postgres_migrations import (
+    POSTGRES_MIGRATIONS,
+    POSTGRES_TRANSACTION_DOMAINS,
+)
+from marketcow.repositories import V2ControlPlaneRepository
+
+
+class PostgresDomainInventoryTest(unittest.TestCase):
+    def test_bg003_inventory_is_explicit_and_complete(self):
+        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 18)
+        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 18)
+        self.assertEqual(
+            POSTGRES_TRANSACTION_DOMAINS[-2:],
+            ("runtime_config_version", "migration_checkpoint"),
+        )
 
 
 @unittest.skipUnless(
@@ -42,12 +59,13 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
             connection.execute(f'DROP SCHEMA IF EXISTS "{cls.schema}" CASCADE')
 
     def test_migrations_control_plane_and_artifact_manifest(self):
+        self.assertIsInstance(self.repository, V2ControlPlaneRepository)
         self.database.migrate()
         with self.database.connection() as connection:
             versions = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4])
+        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5])
 
         run = ["run-1", "fixture", "running", None, "2026-07-20T00:00:00+00:00", None, 0, None]
         self.repository.save_run(run)
@@ -72,6 +90,110 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         saved = self.repository.latest_artifact("fixture", "report_period", "20260331")
         self.assertEqual(saved["artifact_id"], "artifact-1")
 
+    def test_runtime_config_pit_and_checkpoint_compare_and_swap(self):
+        def config(version, observed, value):
+            payload = {"metadata_backend": "postgres", "value": value}
+            digest = hashlib.sha256(json.dumps(
+                payload, sort_keys=True, separators=(",", ":")
+            ).encode()).hexdigest()
+            return {
+                "config_id": "v2-runtime", "version": version,
+                "profile": "v2-test", "schema_version": "marketcow.v2-runtime-config.v1",
+                "config_json": payload, "config_sha256": digest,
+                "observed_at": observed, "actor": "test",
+            }
+
+        first = self.repository.save_runtime_config_version(
+            config(1, "2026-07-20T00:00:00Z", "first")
+        )
+        repeated = self.repository.save_runtime_config_version(
+            config(1, "2026-07-20T00:00:00Z", "first")
+        )
+        self.repository.save_runtime_config_version(
+            config(2, "2026-07-21T00:00:00Z", "second")
+        )
+        self.assertEqual(first["version"], repeated["version"])
+        self.assertEqual(self.repository.get_runtime_config_version(
+            "v2-runtime", "2026-07-20T12:00:00Z"
+        )["config_json"]["value"], "first")
+        self.assertEqual(self.repository.get_runtime_config_version(
+            "v2-runtime"
+        )["config_json"]["value"], "second")
+
+        checkpoint = {
+            "run_id": "migration-1", "domain": "fundamental_snapshot", "shard": "a",
+            "status": "running", "source_watermark": "10", "target_watermark": "9",
+            "cursor_json": {"after": "600001"}, "evidence_json": {"rows": 10},
+            "updated_at": "2026-07-21T00:00:00Z",
+        }
+        created = self.repository.upsert_migration_checkpoint(checkpoint)
+        self.assertEqual(created["revision"], 1)
+        updated = self.repository.upsert_migration_checkpoint(
+            {**checkpoint, "status": "completed", "target_watermark": "10"},
+            expected_revision=1,
+        )
+        self.assertEqual(updated["revision"], 2)
+        self.assertEqual(updated["cursor_json"], {"after": "600001"})
+        with self.assertRaisesRegex(RuntimeError, "revision conflict"):
+            self.repository.upsert_migration_checkpoint(
+                {**checkpoint, "status": "failed"}, expected_revision=1
+            )
+        self.assertEqual(self.repository.get_migration_checkpoint(
+            "migration-1", "fundamental_snapshot", "a"
+        )["status"], "completed")
+
+        concurrent = {**checkpoint, "run_id": "migration-concurrent"}
+        self.repository.upsert_migration_checkpoint(concurrent)
+        def advance(status):
+            try:
+                return self.repository.upsert_migration_checkpoint(
+                    {**concurrent, "status": status}, expected_revision=1
+                )["status"]
+            except RuntimeError:
+                return "conflict"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(advance, ("completed", "failed")))
+        self.assertEqual(outcomes.count("conflict"), 1)
+        self.assertEqual(self.repository.get_migration_checkpoint(
+            "migration-concurrent", "fundamental_snapshot", "a"
+        )["revision"], 2)
+
+    def test_upgrade_from_migration_four_and_repeat_migrate(self):
+        schema = "marketcow_upgrade_" + uuid.uuid4().hex[:10] + "_test"
+        try:
+            with psycopg.connect(self.dsn, autocommit=True) as connection:
+                connection.execute(f'CREATE SCHEMA "{schema}"')
+                connection.execute(f'SET search_path TO "{schema}", public')
+                connection.execute("""
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY, description TEXT NOT NULL,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                for version, description, statement in POSTGRES_MIGRATIONS[:4]:
+                    connection.execute(statement)
+                    connection.execute(
+                        "INSERT INTO schema_migrations(version, description) VALUES (%s, %s)",
+                        (version, description),
+                    )
+            upgraded = PostgresDatabase(self.dsn, schema, min_size=1, max_size=2)
+            upgraded.open()
+            upgraded.migrate()
+            with upgraded.connection() as connection:
+                versions = [row["version"] for row in connection.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                ).fetchall()]
+                tables = {row["table_name"] for row in connection.execute(
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema=%s",
+                    (schema,),
+                ).fetchall()}
+            self.assertEqual(versions, [1, 2, 3, 4, 5])
+            self.assertTrue(set(POSTGRES_TRANSACTION_DOMAINS).issubset(tables))
+            upgraded.close()
+        finally:
+            with psycopg.connect(self.dsn, autocommit=True) as connection:
+                connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
     def test_calendar_round_trip(self):
         row = {
             "event_id": "event-1", "country": "US", "event_date": "2026-07-21",
@@ -85,6 +207,55 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(events[0]["event_id"], "event-1")
         self.assertEqual(events[0]["payload_json"], {"value": 1})
+
+    def test_indicator_earnings_and_tushare_json_round_trip(self):
+        observed = "2026-07-20T00:00:00Z"
+        self.repository.upsert_economic_indicators([{
+            "indicator_id": "us-cpi", "country": "US", "name": "CPI",
+            "source": "fixture", "period": "2026-06", "value": 2.5,
+            "latest_date": "2026-07-20", "observed_at": observed,
+            "ingested_at": observed, "payload": {"nested": {"unit": "%"}},
+        }])
+        indicator = self.repository.get_economic_indicators("US", "fixture", 1)[0]
+        self.assertEqual(indicator["payload_json"], {"nested": {"unit": "%"}})
+
+        self.repository.upsert_earnings_calendar([{
+            "event_id": "earnings-1", "market": "CN", "symbol": "600298",
+            "report_date": "2026-08-01", "source": "fixture",
+            "observed_at": observed, "ingested_at": observed,
+            "payload": {"forecast": {"eps": "1.20"}},
+        }])
+        earnings = self.repository.get_earnings_calendar(
+            "2026-08-01", "2026-08-01", "CN", ["600298"], 1
+        )[0]
+        self.assertEqual(earnings["payload_json"]["forecast"]["eps"], "1.20")
+
+        request = {
+            "request_id": "tushare-1", "api_name": "daily_basic",
+            "params": {"trade_date": "20260720"}, "response_fields": ["ts_code"],
+            "response_code": 0, "source": "tushare", "observed_at": observed,
+            "ingested_at": observed,
+        }
+        self.assertEqual(self.repository.save_tushare_response(
+            request, [{"ts_code": "600298.SH", "trade_date": "20260720", "pe": 12.3}]
+        ), 1)
+        response = self.repository.get_tushare_response("tushare-1")
+        self.assertEqual(response["params_json"], {"trade_date": "20260720"})
+        self.assertEqual(response["rows"][0]["payload_json"]["pe"], 12.3)
+
+    def test_database_constraints_reject_invalid_control_values(self):
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            with self.database.connection() as connection:
+                connection.execute(
+                    "INSERT INTO ingestion_runs "
+                    "(run_id,job_name,status,started_at,row_count) VALUES (%s,%s,%s,%s,%s)",
+                    ("negative", "fixture", "failed", "2026-07-20", -1),
+                )
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.repository.upsert_migration_checkpoint({
+                "run_id": "bad-status", "domain": "fixture", "status": "unknown",
+                "updated_at": "2026-07-20T00:00:00Z",
+            })
 
     def test_fundamental_history_and_strict_point_in_time_queries(self):
         base = {
@@ -223,6 +394,18 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         pit_symbols = {row["symbol"] for row in self.fundamentals.query_funnel_metrics(
             as_of="2026-06-01")}
         self.assertIn("000001", pit_symbols)
+
+    def test_z_all_eighteen_transaction_domains_are_nonempty(self):
+        """The integration class exercises every authoritative BG-003 domain."""
+        with self.database.connection() as connection:
+            counts = {
+                table: connection.execute(
+                    f'SELECT count(*) AS count FROM "{table}"'
+                ).fetchone()["count"]
+                for table in POSTGRES_TRANSACTION_DOMAINS
+            }
+        self.assertEqual(set(counts), set(POSTGRES_TRANSACTION_DOMAINS))
+        self.assertFalse({table: count for table, count in counts.items() if count < 1})
 
 
 if __name__ == "__main__":

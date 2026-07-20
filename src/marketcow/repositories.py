@@ -18,6 +18,7 @@ class MetadataRepository(Protocol):
     def save_tushare_response(
         self, request: Dict[str, Any], rows: List[Dict[str, Any]]
     ) -> int: ...
+    def get_tushare_response(self, request_id: str) -> Optional[Dict[str, Any]]: ...
     def upsert_economic_calendar(self, rows: List[Dict[str, Any]]) -> int: ...
     def get_economic_calendar(
         self, date_from: str, date_to: str, country: str = "US",
@@ -32,6 +33,22 @@ class MetadataRepository(Protocol):
         self, date_from: str, date_to: str, market: str = "",
         symbols: Optional[Sequence[str]] = None, limit: int = 50,
     ) -> List[Dict[str, Any]]: ...
+
+
+@runtime_checkable
+class V2ControlPlaneRepository(Protocol):
+    """V2-native configuration history and durable migration checkpoints."""
+
+    def save_runtime_config_version(self, row: Dict[str, Any]) -> Dict[str, Any]: ...
+    def get_runtime_config_version(
+        self, config_id: str, as_of: str = ""
+    ) -> Optional[Dict[str, Any]]: ...
+    def upsert_migration_checkpoint(
+        self, row: Dict[str, Any], expected_revision: int = 0
+    ) -> Dict[str, Any]: ...
+    def get_migration_checkpoint(
+        self, run_id: str, domain: str, shard: str = ""
+    ) -> Optional[Dict[str, Any]]: ...
 
 
 @runtime_checkable

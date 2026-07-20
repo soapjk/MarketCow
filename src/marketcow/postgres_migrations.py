@@ -1,6 +1,30 @@
 from __future__ import annotations
 
 
+# Authoritative BG-003 inventory. The first sixteen domains are compatible with the
+# legacy DuckDB copy; the final two are V2-native control-plane domains.
+POSTGRES_TRANSACTION_DOMAINS = (
+    "ingestion_runs",
+    "provider_health",
+    "raw_artifact_manifest",
+    "economic_calendar_event",
+    "economic_indicator_latest",
+    "earnings_calendar_event",
+    "tushare_request",
+    "tushare_data_row",
+    "fundamental_snapshot",
+    "fundamental_snapshot_history",
+    "financial_statement_rows",
+    "baostock_snapshot",
+    "tdx_financial_snapshot",
+    "tdx_financial_snapshot_history",
+    "validation_result",
+    "funnel_metrics",
+    "runtime_config_version",
+    "migration_checkpoint",
+)
+
+
 POSTGRES_MIGRATIONS = [
     (
         1,
@@ -203,6 +227,53 @@ POSTGRES_MIGRATIONS = [
         );
         CREATE INDEX IF NOT EXISTS funnel_metrics_filter_idx
             ON funnel_metrics (is_active, roe_annual_median DESC, symbol);
+        """,
+    ),
+    (
+        5,
+        "V2 runtime configuration versions and migration checkpoints",
+        """
+        ALTER TABLE ingestion_runs
+            ADD CONSTRAINT ingestion_runs_row_count_nonnegative
+            CHECK (row_count >= 0) NOT VALID;
+        ALTER TABLE provider_health
+            ADD CONSTRAINT provider_health_failures_nonnegative
+            CHECK (consecutive_failures >= 0) NOT VALID;
+        ALTER TABLE raw_artifact_manifest
+            ADD CONSTRAINT raw_artifact_manifest_byte_size_nonnegative
+            CHECK (byte_size >= 0) NOT VALID;
+
+        CREATE TABLE IF NOT EXISTS runtime_config_version (
+            config_id TEXT NOT NULL,
+            version BIGINT NOT NULL CHECK (version > 0),
+            profile TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            config_json JSONB NOT NULL,
+            config_sha256 TEXT NOT NULL CHECK (config_sha256 ~ '^[0-9a-f]{64}$'),
+            observed_at TIMESTAMPTZ NOT NULL,
+            actor TEXT NOT NULL,
+            PRIMARY KEY (config_id, version),
+            UNIQUE (config_id, config_sha256)
+        );
+        CREATE INDEX IF NOT EXISTS runtime_config_version_pit_idx
+            ON runtime_config_version (config_id, observed_at DESC, version DESC);
+
+        CREATE TABLE IF NOT EXISTS migration_checkpoint (
+            run_id TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            shard TEXT NOT NULL DEFAULT '',
+            revision BIGINT NOT NULL CHECK (revision > 0),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+            source_watermark TEXT,
+            target_watermark TEXT,
+            cursor_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            error TEXT,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (run_id, domain, shard)
+        );
+        CREATE INDEX IF NOT EXISTS migration_checkpoint_status_idx
+            ON migration_checkpoint (status, updated_at, run_id, domain, shard);
         """,
     ),
 ]
