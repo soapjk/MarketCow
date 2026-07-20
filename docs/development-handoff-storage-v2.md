@@ -1717,7 +1717,10 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   mkdir、worker/thread 或任何 PG/CH 组件之前拒绝。manifest 固定记录 timezone-aware copy time、copy method、
   授权声明、allowed-root logical ID、source fingerprint，以及 DuckDB/full checkpoint/catch-up checkpoint 的相对
   文件清单、大小和 hash；自身 payload checksum 之外仍须匹配不可随重签更新的外部授权 hash。
-  验证流程拒绝绝对/逃逸/symlink/缺失/重复组件，逐文件流式 checksum 并执行单文件/总容量硬上限；校验 BG-013
+  manifest 与两个 JSON checkpoint 均从单一受限 fd 读取为 immutable bytes，同一字节同时用于 byte count、SHA-256
+  和解析；fd 读取前后及解析后核对 device/inode/size/mtime，路径被 `os.replace` 换包即 fail-closed，绝不在授权
+  hash 通过后按路径二次打开解析。验证流程拒绝绝对/逃逸/symlink/缺失/重复组件，逐文件流式 checksum 并执行
+  单文件/总容量硬上限；校验 BG-013
   complete checkpoint 与 BG-014 complete checkpoint 的签名、版本、run binding 和 source high-watermark，随后
   复用 BG-012 read-only worker。`sample` 固定验证 provider/artifact/market 三域，`full` 验证全部 19 表；两种模式
   均受 row/batch/value/output/memory/wall-clock 上限，并在抽取前后重新验证 source fingerprint。只有全部成功才在

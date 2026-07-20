@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import marketcow.offline_copy_validator as copy_validator
+
 from marketcow.offline_copy_validator import (
     COPY_ACTION,
     COPY_MANIFEST_VERSION,
@@ -156,6 +158,48 @@ class OfflineCopyValidatorTest(unittest.TestCase):
         self.manifest_path.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
         with self.assertRaisesRegex(CopyValidationError, "manifest_authorization_mismatch"):
             self.validate()
+
+    def test_atomic_manifest_replacement_between_snapshot_and_parse_fails_closed(self):
+        replacement = self.root / "replacement-manifest.json"
+        document = json.loads(self.manifest_path.read_text())
+        document["copied_at"] = "2099-01-01T00:00:00Z"
+        document.pop("manifest_payload_sha256")
+        document["manifest_payload_sha256"] = _digest(document)
+        replacement.write_text(json.dumps(document, sort_keys=True, separators=(",", ":")))
+        original = copy_validator._json_from_snapshot
+
+        def replace_then_parse(path, snapshot, code):
+            if path == self.manifest_path.resolve():
+                replacement.replace(path)
+            return original(path, snapshot, code)
+
+        with (
+            patch.object(copy_validator, "_json_from_snapshot", side_effect=replace_then_parse),
+            patch.object(copy_validator, "OfflineDuckDBImporter", side_effect=AssertionError("online work")),
+        ):
+            with self.assertRaisesRegex(CopyValidationError, "file_changed_after_read"):
+                self.validate()
+        self.assertFalse((self.report / "copy-validation.json").exists())
+
+    def test_atomic_checkpoint_replacement_between_inventory_and_parse_fails_closed(self):
+        replacement = self.root / "replacement-full.json"
+        full = json.loads(self.full_path.read_text())
+        full["run_id"] = "attacker-run"
+        self._sign_write(replacement, full)
+        original = copy_validator._json_from_snapshot
+
+        def replace_then_parse(path, snapshot, code):
+            if path == self.full_path.resolve():
+                replacement.replace(path)
+            return original(path, snapshot, code)
+
+        with (
+            patch.object(copy_validator, "_json_from_snapshot", side_effect=replace_then_parse),
+            patch.object(copy_validator, "OfflineDuckDBImporter", side_effect=AssertionError("online work")),
+        ):
+            with self.assertRaisesRegex(CopyValidationError, "file_changed_after_read"):
+                self.validate()
+        self.assertFalse((self.report / "copy-validation.json").exists())
 
     def test_wrong_source_file_hash_missing_and_symlink_are_rejected(self):
         self.source.write_bytes(self.source.read_bytes() + b"tamper")

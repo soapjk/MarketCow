@@ -23,6 +23,7 @@ COPY_VALIDATION_VERSION = "storage-v2.copy-validation.v1"
 COPY_ACTION = "copy-legacy-database-to-isolated-root"
 MAX_FILES = 100
 MAX_TOTAL_BYTES = 64 * 1024**3
+MAX_JSON_BYTES = 4 * 1024**2
 _ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$")
 
 
@@ -30,6 +31,16 @@ class CopyValidationError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    content: bytes | None
+    sha256: str
+    size: int
+    device: int
+    inode: int
+    mtime_ns: int
 
 
 @dataclass(frozen=True)
@@ -54,21 +65,67 @@ class CopyAuthorization:
                 raise CopyValidationError("authorization_invalid")
 
 
-def _sha256_file(path: Path, limit: int) -> tuple[str, int]:
+def _read_file_snapshot(path: Path, limit: int, *, retain_content: bool) -> _FileSnapshot:
     digest = hashlib.sha256()
     size = 0
+    chunks: list[bytes] | None = [] if retain_content else None
     try:
-        with path.open("rb") as source:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise CopyValidationError("file_read_failed")
             while chunk := source.read(1024 * 1024):
                 size += len(chunk)
                 if size > limit:
                     raise CopyValidationError("file_limit_exceeded")
                 digest.update(chunk)
+                if chunks is not None:
+                    chunks.append(chunk)
+            after = os.fstat(source.fileno())
+            if (
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                or size != after.st_size
+            ):
+                raise CopyValidationError("file_changed_during_read")
     except CopyValidationError:
         raise
     except OSError:
         raise CopyValidationError("file_read_failed") from None
-    return digest.hexdigest(), size
+    return _FileSnapshot(
+        content=b"".join(chunks) if chunks is not None else None,
+        sha256=digest.hexdigest(),
+        size=size,
+        device=after.st_dev,
+        inode=after.st_ino,
+        mtime_ns=after.st_mtime_ns,
+    )
+
+
+def _assert_snapshot_current(path: Path, snapshot: _FileSnapshot) -> None:
+    try:
+        current = path.lstat()
+    except OSError:
+        raise CopyValidationError("file_changed_after_read") from None
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+        != (snapshot.device, snapshot.inode, snapshot.size, snapshot.mtime_ns)
+    ):
+        raise CopyValidationError("file_changed_after_read")
+
+
+def _json_from_snapshot(path: Path, snapshot: _FileSnapshot, code: str) -> dict[str, Any]:
+    try:
+        document = json.loads(snapshot.content)
+    except (UnicodeError, json.JSONDecodeError, TypeError):
+        raise CopyValidationError(code) from None
+    if not isinstance(document, dict):
+        raise CopyValidationError(code)
+    _assert_snapshot_current(path, snapshot)
+    return document
 
 
 def _has_symlink(path: Path) -> bool:
@@ -174,13 +231,10 @@ class OfflineCopyValidator:
             raise CopyValidationError("containment_rejected") from None
         if hashlib.sha256(str(root).encode()).hexdigest() != authorization.allowed_root_sha256:
             raise CopyValidationError("allowed_root_binding_mismatch")
-        manifest_hash, manifest_size = _sha256_file(manifest, 4 * 1024 * 1024)
-        if manifest_hash != authorization.manifest_sha256:
+        manifest_snapshot = _read_file_snapshot(manifest, MAX_JSON_BYTES, retain_content=True)
+        if manifest_snapshot.sha256 != authorization.manifest_sha256:
             raise CopyValidationError("manifest_authorization_mismatch")
-        try:
-            document = json.loads(manifest.read_text())
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            raise CopyValidationError("manifest_invalid") from None
+        document = _json_from_snapshot(manifest, manifest_snapshot, "manifest_invalid")
         if document.get("version") != COPY_MANIFEST_VERSION:
             raise CopyValidationError("manifest_version_unsupported")
         if document.get("source_logical_id") != authorization.source_logical_id:
@@ -206,7 +260,7 @@ class OfflineCopyValidator:
         if not isinstance(files, list) or not 3 <= len(files) <= MAX_FILES:
             raise CopyValidationError("file_inventory_invalid")
         seen: set[str] = set()
-        verified: dict[str, tuple[Path, dict[str, Any]]] = {}
+        verified: dict[str, tuple[Path, dict[str, Any], _FileSnapshot]] = {}
         total = 0
         for entry in files:
             if not isinstance(entry, dict) or entry.get("role") in seen:
@@ -222,21 +276,33 @@ class OfflineCopyValidator:
                 resolved.relative_to(root)
             except (OSError, ValueError):
                 raise CopyValidationError("file_missing_or_escape") from None
-            digest, size = _sha256_file(resolved, min(self.limits.max_file_bytes, MAX_TOTAL_BYTES))
-            if digest != entry.get("sha256") or size != entry.get("byte_size"):
+            retain_content = role in {"full_checkpoint", "catchup_checkpoint"}
+            snapshot = _read_file_snapshot(
+                resolved,
+                min(self.limits.max_file_bytes, MAX_JSON_BYTES if retain_content else MAX_TOTAL_BYTES),
+                retain_content=retain_content,
+            )
+            if snapshot.sha256 != entry.get("sha256") or snapshot.size != entry.get("byte_size"):
                 raise CopyValidationError("file_checksum_mismatch")
-            total += size
+            total += snapshot.size
             if total > min(MAX_TOTAL_BYTES, self.limits.max_output_bytes * MAX_FILES):
                 raise CopyValidationError("copy_size_limit_exceeded")
             seen.add(role)
-            verified[role] = (resolved, entry)
+            verified[role] = (resolved, entry, snapshot)
         if set(verified) != {"duckdb", "full_checkpoint", "catchup_checkpoint"}:
             raise CopyValidationError("component_inventory_invalid")
         source_path = verified["duckdb"][0]
+        source_snapshot = verified["duckdb"][2]
         if hashlib.sha256(str(source_path).encode()).hexdigest() != authorization.source_path_sha256:
             raise CopyValidationError("source_path_binding_mismatch")
-        full = json.loads(verified["full_checkpoint"][0].read_text())
-        catchup = json.loads(verified["catchup_checkpoint"][0].read_text())
+        full = _json_from_snapshot(
+            verified["full_checkpoint"][0], verified["full_checkpoint"][2],
+            "migration_evidence_invalid",
+        )
+        catchup = _json_from_snapshot(
+            verified["catchup_checkpoint"][0], verified["catchup_checkpoint"][2],
+            "migration_evidence_invalid",
+        )
         self._validate_evidence(full, FULL_IMPORT_VERSION, "complete")
         self._validate_evidence(catchup, CATCHUP_VERSION, "complete")
         if catchup.get("full_run_id") != full.get("run_id"):
@@ -245,6 +311,7 @@ class OfflineCopyValidator:
             "source_fingerprint"
         ):
             raise CopyValidationError("migration_evidence_binding_mismatch")
+        _assert_snapshot_current(source_path, source_snapshot)
         importer = OfflineDuckDBImporter(
             allowed_root=root,
             source=source_path,
@@ -271,14 +338,15 @@ class OfflineCopyValidator:
         after = importer.inspect()
         if after["source_fingerprint"] != before["source_fingerprint"]:
             raise CopyValidationError("source_changed_during_validation")
+        _assert_snapshot_current(source_path, source_snapshot)
         report_document = {
             "version": COPY_VALIDATION_VERSION,
             "status": "verified",
             "mode": mode,
             "source_logical_id": authorization.source_logical_id,
             "authorization_evidence_id": authorization.evidence_id,
-            "manifest_sha256": manifest_hash,
-            "manifest_bytes": manifest_size,
+            "manifest_sha256": manifest_snapshot.sha256,
+            "manifest_bytes": manifest_snapshot.size,
             "source_fingerprint": before["source_fingerprint"],
             "file_count": len(files),
             "total_bytes": total,
