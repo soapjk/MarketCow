@@ -51,6 +51,15 @@ class BackgroundCanonicalScheduler:
         except BlockingIOError:
             self._lease.close()
             raise RuntimeError("canonical scheduler lease is already held") from None
+        try:
+            from .spool_operator import SpoolOperator
+            SpoolOperator(spool).migrate_legacy(
+                1000, kinds=("scheduler-pending", "scheduler-processing", "scheduler-failed")
+            )
+        except Exception:
+            fcntl.flock(self._lease.fileno(), fcntl.LOCK_UN)
+            self._lease.close()
+            raise
         self._recover_processing()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -140,7 +149,7 @@ class BackgroundCanonicalScheduler:
             os.replace(path, claimed)
         except FileNotFoundError:
             return
-        task = self.spool.read(claimed)
+        task = self.spool.read(claimed, require_checksum=True)
         try:
             result = self.builder.rebuild(
                 task["symbol"], task["interval"], task["adjustment"],
@@ -186,7 +195,7 @@ class BackgroundCanonicalScheduler:
                     ready = []
                     for path in self._files(self.pending, self.scan_limit):
                         try:
-                            task = self.spool.read(path)
+                            task = self.spool.read(path, require_checksum=True)
                         except Exception as error:
                             with self._state_lock:
                                 self._last = {"status": "invalid", "error": str(error)[:4000]}
@@ -222,9 +231,15 @@ class BackgroundCanonicalScheduler:
         pending = self._files(self.pending, self.queue_cap + 1)
         failed = self._files(self.failed, self.queue_cap + 1)
         oldest = 0.0
+        invalid = 0
         if pending:
-            created = [float(self.spool.read(path).get("created_at_epoch", self.clock()))
-                       for path in pending[:self.scan_limit]]
+            created = []
+            for path in pending[:self.scan_limit]:
+                try:
+                    payload = self.spool.read(path, require_checksum=True)
+                    created.append(float(payload.get("created_at_epoch", self.clock())))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    invalid += 1
             oldest = max(0.0, float(self.clock()) - min(created)) if created else 0.0
         with self._state_lock:
             last = dict(self._last)
@@ -234,6 +249,7 @@ class BackgroundCanonicalScheduler:
             "failed": min(len(failed), self.queue_cap), "backlog_truncated": (
                 len(pending) > self.queue_cap or len(failed) > self.queue_cap
             ), "oldest_lag_seconds": round(oldest, 3), "last": last,
+            "invalid": invalid,
         }
 
     def close(self, timeout: float = 35.0) -> None:

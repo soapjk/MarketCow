@@ -2,6 +2,7 @@ import tempfile
 import threading
 import time
 import unittest
+import json
 from pathlib import Path
 
 from marketcow.clickhouse_scheduler import BackgroundCanonicalScheduler
@@ -48,6 +49,25 @@ def wait_until(predicate, seconds=2):
 
 
 class BackgroundCanonicalSchedulerTest(unittest.TestCase):
+    def test_startup_migrates_legacy_scheduler_intent_before_recovery(self):
+        builder = Builder()
+        group = {"symbol": "MU", "interval": "1m", "adjustment": "raw",
+                 "start": "2026-07-20T01:00:00Z", "end": "2026-07-20T01:00:00Z"}
+        task_id = BackgroundCanonicalScheduler._task_id(group)
+        processing = self.spool.root / "canonical-scheduler/processing"
+        processing.mkdir(parents=True)
+        legacy = processing / f"{task_id}.json"
+        legacy.write_text(json.dumps({
+            "task_id": task_id, **group, "attempts": 0,
+            "created_at_epoch": 1000.0, "next_attempt_epoch": 1000.0,
+            "last_error": "",
+        }), encoding="utf-8")
+        scheduler = self.scheduler(builder, clock=Clock(), start_paused=True)
+        pending = scheduler.pending / legacy.name
+        self.assertIn("_checksum", self.spool.read(pending, require_checksum=True))
+        scheduler.resume()
+        self.assertTrue(wait_until(lambda: len(builder.calls) == 1))
+
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.root = Path(self.folder.name)

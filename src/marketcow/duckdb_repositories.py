@@ -180,6 +180,8 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
                 settings.clickhouse_spool_quota_bytes,
                 settings.clickhouse_spool_warning_ratio,
             )
+            from .spool_operator import SpoolOperator
+            SpoolOperator(spool).migrate_legacy(1000)
             clickhouse_repository = ClickHouseMarketBarRepository(clickhouse)
             writer = ReliableClickHouseWriter(
                 clickhouse_repository, spool,

@@ -164,7 +164,7 @@ class LocalClickHouseSpool:
         self, dataset: str, batch_id: str, rows: List[Dict[str, Any]], error: str
     ) -> Path:
         path = self.pending / f"{batch_id}.json"
-        existing = self.read(path) if path.exists() else {}
+        existing = self.read(path, require_checksum=True) if path.exists() else {}
         now = self._now()
         payload = {
             "dataset": dataset, "batch_id": batch_id, "rows": rows,
@@ -215,7 +215,7 @@ class LocalClickHouseSpool:
         path = self.intents / f"{intent_id}.json"
         if not path.exists():
             return
-        intent = self.read(path)
+        intent = self.read(path, require_checksum=True)
         intent["pending"] = [value for value in intent["pending"] if value != batch_id]
         self._atomic_json(path, intent)
     def ready_intents(self, limit: int) -> List[Dict[str, Any]]:
@@ -226,7 +226,7 @@ class LocalClickHouseSpool:
         paths, _ = self._bounded_files(self.intents, limit)
         ready = []
         for path in paths:
-            intent = self.read(path)
+            intent = self.read(path, require_checksum=True)
             remaining = [batch_id for batch_id in intent["pending"]
                          if (self.pending / f"{batch_id}.json").exists()]
             if remaining != intent["pending"]:
@@ -235,7 +235,7 @@ class LocalClickHouseSpool:
             if not remaining:
                 claimed = self.processing_intents / path.name
                 os.replace(path, claimed)
-                ready.append(self.read(claimed))
+                ready.append(self.read(claimed, require_checksum=True))
         return ready
 
     def callback_result(self, intent: Dict[str, Any], error: str = "") -> None:
@@ -338,7 +338,8 @@ class ReliableClickHouseWriter:
         outcome = {"attempted": 0, "replayed": 0, "failed": 0, "quarantined": 0,
                    "callback_attempted": 0, "callback_ok": 0,
                    "callback_failed": 0, "remaining": 0,
-                   "truncated": False, "lock_busy": False}
+                   "truncated": False, "lock_busy": False,
+                   "legacy_migrated": 0, "legacy_invalid": 0, "legacy_errors": 0}
         operator_path = self.spool.root / ".operator.lock"
         with operator_path.open("a+") as operator_lock:
             try:
@@ -348,6 +349,15 @@ class ReliableClickHouseWriter:
                 outcome["remaining"] = 1
                 outcome["truncated"] = True
                 return outcome
+            from .spool_operator import SpoolOperator
+            migration = SpoolOperator(self.spool).migrate_legacy(
+                limit, already_locked=True,
+                kinds=("wal-pending", "raw-intents", "raw-processing"),
+            )
+            outcome["legacy_migrated"] = migration["migrated"]
+            outcome["legacy_invalid"] = migration["invalid"]
+            outcome["legacy_errors"] = migration["errors"]
+            outcome["quarantined"] += migration["invalid"]
             lock_path = self.spool.root / ".replay.lock"
             with lock_path.open("a+") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)

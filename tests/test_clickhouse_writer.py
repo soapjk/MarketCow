@@ -38,6 +38,27 @@ class FakeRepository:
 
 
 class ReliableClickHouseWriterTest(unittest.TestCase):
+    def test_replay_migrates_and_recovers_pre_checksum_wal(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            rows = [normalize_bar("raw", raw_bar())]
+            batch_id = stable_batch_id("raw", rows)
+            path = spool.pending / f"{batch_id}.json"
+            path.write_text(json.dumps({
+                "dataset": "raw", "batch_id": batch_id, "rows": rows, "attempts": 1,
+                "created_at": "2026-07-20T00:00:00Z",
+                "last_attempt_at": "2026-07-20T00:00:01Z", "last_error": "outage",
+            }), encoding="utf-8")
+            repository = FakeRepository(False)
+            result = ReliableClickHouseWriter(repository, spool, 1000).replay(10)
+            self.assertEqual(result["legacy_migrated"], 1)
+            self.assertEqual(result["replayed"], 1)
+            self.assertEqual(len(repository.calls), 1)
+            self.assertTrue((spool.replayed / path.name).exists())
+
     def test_replay_quarantines_corrupt_wal_and_continues_healthy_items(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

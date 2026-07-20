@@ -3,12 +3,14 @@ import json
 import os
 import tempfile
 import unittest
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from marketcow.__main__ import main, operate_spool
 from marketcow.clickhouse_writer import LocalClickHouseSpool
+from marketcow.clickhouse_writer import normalize_bar, stable_batch_id
 from marketcow.config import Settings
 from marketcow.spool_operator import SpoolOperator
 
@@ -43,6 +45,73 @@ class SpoolOperatorTest(unittest.TestCase):
         self.assertEqual(moved["moved"], 3)
         self.assertTrue(good.exists())
         self.assertGreaterEqual(len(list(self.spool.quarantine.glob("*.json"))), 3)
+
+    def test_legacy_migration_covers_wal_raw_intents_and_scheduler_restart(self):
+        from tests.test_clickhouse_writer import raw_bar
+
+        rows = [normalize_bar("raw", raw_bar())]
+        batch_id = stable_batch_id("raw", rows)
+        intent_id = stable_batch_id("raw", rows)
+        wal = self.spool.pending / f"{batch_id}.json"
+        wal.write_text(json.dumps({
+            "dataset": "raw", "batch_id": batch_id, "rows": rows, "attempts": 1,
+            "created_at": "2026-07-20T00:00:00Z",
+            "last_attempt_at": "2026-07-20T00:00:01Z", "last_error": "outage",
+            "intent_id": intent_id,
+        }), encoding="utf-8")
+        raw_intent = self.spool.processing_intents / f"{intent_id}.json"
+        raw_intent.write_text(json.dumps({
+            "intent_id": intent_id, "rows": rows, "pending": [batch_id],
+            "callback_attempts": 0, "last_callback_error": "",
+        }), encoding="utf-8")
+        group = {"symbol": "000000.SH", "interval": "1m", "adjustment": "raw",
+                 "start": rows[0]["bar_time"], "end": rows[0]["bar_time"]}
+        task_id = hashlib.sha256(json.dumps(
+            group, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        scheduler = self.spool.root / "canonical-scheduler/failed"
+        scheduler.mkdir(parents=True)
+        task = scheduler / f"{task_id}.json"
+        task.write_text(json.dumps({
+            "task_id": task_id, **group, "attempts": 10,
+            "created_at_epoch": 1.0, "next_attempt_epoch": 2.0,
+            "last_error": "outage",
+        }), encoding="utf-8")
+
+        result = self.operator.migrate_legacy(10)
+        self.assertEqual(result["migrated"], 3)
+        self.assertEqual(result["invalid"], 0)
+        for path in (wal, raw_intent, task):
+            self.assertIn("_checksum", self.spool.read(path, require_checksum=True))
+        again = self.operator.migrate_legacy(10)
+        self.assertEqual(again["migrated"], 0)
+
+    def test_legacy_migration_rejects_unknown_schema_and_preserves_on_write_failure(self):
+        malicious = self.spool.pending / ("a" * 64 + ".json")
+        malicious.write_text(json.dumps({
+            "dataset": "raw", "batch_id": "a" * 64, "rows": [], "attempts": 1,
+            "created_at": "2026-07-20T00:00:00Z",
+            "last_attempt_at": "2026-07-20T00:00:01Z", "last_error": "",
+            "unexpected": "bypass",
+        }), encoding="utf-8")
+        result = self.operator.migrate_legacy(10)
+        self.assertEqual(result["invalid"], 1)
+        self.assertFalse(malicious.exists())
+        quarantined = next(self.spool.quarantine.glob("*" + malicious.name))
+        self.assertNotIn("_checksum", json.loads(quarantined.read_text(encoding="utf-8")))
+
+        from tests.test_clickhouse_writer import raw_bar
+        rows = [normalize_bar("raw", raw_bar())]
+        batch_id = stable_batch_id("raw", rows)
+        healthy = self.spool.pending / f"{batch_id}.json"
+        original = {"dataset": "raw", "batch_id": batch_id, "rows": rows,
+                    "attempts": 1, "created_at": "2026-07-20T00:00:00Z",
+                    "last_attempt_at": "2026-07-20T00:00:01Z", "last_error": ""}
+        healthy.write_text(json.dumps(original), encoding="utf-8")
+        with patch.object(self.spool, "_atomic_json", side_effect=PermissionError("denied")):
+            failed = self.operator.migrate_legacy(10)
+        self.assertEqual(failed["errors"], 1)
+        self.assertEqual(json.loads(healthy.read_text(encoding="utf-8")), original)
 
     def test_quota_warns_then_rejects_before_atomic_write(self):
         self.spool._atomic_json(self.spool.pending / "warning.json", {

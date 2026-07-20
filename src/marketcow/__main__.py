@@ -179,7 +179,8 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     sync.add_argument("--skip-tdx", action="store_true")
     spool = commands.add_parser("spool", help="inspect or explicitly operate the development WAL/spool")
     spool_actions = spool.add_subparsers(dest="spool_action", required=True)
-    for action in ("status", "audit", "quarantine-corrupt", "retry-dead", "replay"):
+    for action in ("status", "audit", "migrate-legacy", "quarantine-corrupt",
+                   "retry-dead", "replay"):
         command = spool_actions.add_parser(action)
         command.add_argument("--limit", type=int, default=100)
     listing = spool_actions.add_parser("list")
@@ -219,6 +220,8 @@ def operate_spool(settings: Settings, action: str, limit: int = 100,
         return operator.list_items(kind, limit)
     if action == "audit":
         return operator.audit(limit)
+    if action == "migrate-legacy":
+        return operator.migrate_legacy(limit)
     if action == "quarantine-corrupt":
         return operator.quarantine_corrupt(limit)
     if action == "retry-dead":
