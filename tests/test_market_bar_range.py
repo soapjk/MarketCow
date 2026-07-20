@@ -44,6 +44,15 @@ class MarketBarRangeTest(unittest.TestCase):
         self.warehouse.upsert_price_bars(
             "AAPL", "1m", "raw", "fixture", "2026-07-20T00:00:00Z", bars()
         )
+        for symbol in ("GOOG", "MSFT"):
+            self.warehouse.upsert_price_bars(
+                symbol, "1m", "raw", "fixture", "2026-07-20T00:00:00Z",
+                [bars()[1]],
+            )
+        self.warehouse.upsert_price_bars(
+            "AAPL", "1m", "raw", "newer", "2026-07-20T00:00:01Z",
+            [{**bars()[1], "close": 9.5}],
+        )
 
     def tearDown(self):
         self.folder.cleanup()
@@ -100,6 +109,60 @@ class MarketBarRangeTest(unittest.TestCase):
             )
             self.assertEqual(old.status_code, 200)
             self.assertEqual(service.refresh_calls, 1)
+
+    def test_duckdb_cross_section_exact_time_dedup_filter_and_truncation(self):
+        rows, truncated = self.warehouse.get_price_bars_cross_section(
+            "1m", "raw", "1970-01-01T08:03:20+08:00", 2,
+            ["MSFT", "AAPL", "AAPL", "GOOG"],
+        )
+        self.assertEqual([row["symbol"] for row in rows], ["AAPL", "GOOG"])
+        self.assertEqual(rows[0]["source"], "newer")
+        self.assertEqual(rows[0]["close"], 9.5)
+        self.assertTrue(truncated)
+        empty, truncated = self.warehouse.get_price_bars_cross_section(
+            "1m", "raw", "1970-01-01T00:03:19Z", 10
+        )
+        self.assertEqual(empty, [])
+        self.assertFalse(truncated)
+        self.assertEqual(self.warehouse.get_price_bars_cross_section(
+            "1m", "raw", "1970-01-01T00:03:20Z", 10, []
+        ), ([], False))
+        with self.assertRaisesRegex(ValueError, "between 1 and 5000"):
+            self.warehouse.get_price_bars_cross_section(
+                "1m", "raw", "1970-01-01T00:03:20Z", 0
+            )
+        with self.assertRaisesRegex(ValueError, "at most 5000"):
+            self.warehouse.get_price_bars_cross_section(
+                "1m", "raw", "1970-01-01T00:03:20Z", 10,
+                [f"S{index}" for index in range(5001)],
+            )
+
+    def test_cross_section_api_is_read_only_and_validates_time(self):
+        service = RangeService(self.warehouse)
+        settings = Settings(
+            Path(self.folder.name) / "db", Path(self.folder.name) / "raw"
+        )
+        with TestClient(create_app(settings, service)) as client:
+            response = client.get(
+                "/v1/quotes/cross-section?interval=1m&adjustment=raw"
+                "&bar_at=1970-01-01T00:03:20Z&limit=2&symbols=MSFT,AAPL,AAPL,GOOG"
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            payload = response.json()
+            self.assertEqual([row["symbol"] for row in payload["bars"]],
+                             ["AAPL", "GOOG"])
+            self.assertTrue(payload["cached"])
+            self.assertTrue(payload["truncated"])
+            self.assertEqual(payload["bar_at"], "1970-01-01T00:03:20+00:00")
+            self.assertEqual(service.refresh_calls, 0)
+            invalid = client.get(
+                "/v1/quotes/cross-section?bar_at=1970-01-01T00:03:20"
+            )
+            self.assertEqual(invalid.status_code, 400)
+            invalid_limit = client.get(
+                "/v1/quotes/cross-section?bar_at=1970-01-01T00:03:20Z&limit=0"
+            )
+            self.assertEqual(invalid_limit.status_code, 400)
 
 
 if __name__ == "__main__":

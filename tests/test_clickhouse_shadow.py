@@ -35,6 +35,9 @@ class FakePrimary:
     def get_price_bars_range(self, *args):
         return (["duckdb-range"], True)
 
+    def get_price_bars_cross_section(self, *args):
+        return (["duckdb-cross-section"], True)
+
 
 class CapturingWriter:
     def __init__(self, result=None):
@@ -65,6 +68,11 @@ class ReconcileRepository:
         return self.rows
 
     def get_canonical_price_bars_range(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows, False
+
+    def get_canonical_price_bars_cross_section(self, *args):
         if isinstance(self.rows, Exception):
             raise self.rows
         return self.rows, False
@@ -133,6 +141,27 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
         self.assertTrue(diagnostics["fallback"])
         self.assertTrue(diagnostics["truncated"])
         self.assertTrue(diagnostics["range"])
+
+    def test_cross_section_read_and_same_query_fallback_diagnostics(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.repository = ReconcileRepository([{"symbol": "AAPL"}])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(
+            primary, writer, canonical_reads_enabled=True
+        )
+        arguments = ("1m", "raw", "2026-07-20T01:00:00Z", 10, ["AAPL"])
+        self.assertEqual(adapter.get_price_bars_cross_section(*arguments),
+                         ([{"symbol": "AAPL"}], False))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["cross_section"])
+        self.assertEqual(diagnostics["backend"], "clickhouse_canonical")
+        writer.repository.rows = ConnectionError("cross section unavailable")
+        self.assertEqual(adapter.get_price_bars_cross_section(*arguments),
+                         (["duckdb-cross-section"], True))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["fallback"])
+        self.assertTrue(diagnostics["truncated"])
+        self.assertEqual(diagnostics["backend"], "duckdb")
 
     def test_primary_failure_never_attempts_shadow(self):
         writer = CapturingWriter()

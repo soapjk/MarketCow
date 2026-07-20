@@ -234,6 +234,43 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
                 "2026-07-20T04:02:00", 10,
             )
 
+    def test_canonical_cross_section_exact_time_filter_final_and_truncation(self):
+        base = {
+            "market": "US", "interval": "1m", "adjustment": "raw",
+            "bar_time": "2026-07-20T05:00:00Z", "open": 10, "high": 12,
+            "low": 9, "close": 11, "raw_close": None,
+            "adjustment_factor": None, "volume": 100, "amount": None,
+            "selected_source": "fixture", "source_count": 1,
+            "quality_status": "single_source", "observed_at": "2026-07-20T05:00:01Z",
+            "ingested_at": "2026-07-20T05:00:02Z", "raw_artifact_id": None,
+            "updated_at": "2026-07-20T05:00:03Z",
+        }
+        rows = []
+        for symbol in ("CROSS-A", "CROSS-B", "CROSS-C"):
+            rows.append({**base, "symbol": symbol, "version": 1,
+                         "input_fingerprint": symbol + "-v1"})
+        rows.extend([
+            {**base, "symbol": "CROSS-B", "version": 2, "close": 22,
+             "input_fingerprint": "CROSS-B-v2"},
+            {**base, "symbol": "CROSS-STALE", "version": 1,
+             "bar_time": "2026-07-20T04:59:00Z", "input_fingerprint": "stale"},
+            {**base, "symbol": "CROSS-WRONG", "version": 1, "interval": "5m",
+             "input_fingerprint": "wrong"},
+        ])
+        self.repository.insert_canonical_bars(rows)
+        bars, truncated = self.repository.get_canonical_price_bars_cross_section(
+            "1m", "raw", "2026-07-20T13:00:00+08:00", 2,
+            ["CROSS-C", "CROSS-B", "CROSS-A", "CROSS-A"],
+        )
+        self.assertEqual([row["symbol"] for row in bars], ["CROSS-A", "CROSS-B"])
+        self.assertEqual(bars[1]["close"], 22.0)
+        self.assertTrue(truncated)
+        empty, truncated = self.repository.get_canonical_price_bars_cross_section(
+            "1m", "adjusted", "2026-07-20T05:00:00Z", 10
+        )
+        self.assertEqual(empty, [])
+        self.assertFalse(truncated)
+
     def test_real_shadow_dual_write_replay_and_reconciliation(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

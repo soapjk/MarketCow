@@ -250,6 +250,47 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.get("/v1/quotes/cross-section")
+    def quote_cross_section(
+        bar_at: str,
+        interval: str = "1d",
+        adjustment: str = "adjusted",
+        limit: int = 500,
+        symbols: Optional[str] = None,
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            if not 1 <= limit <= 5000:
+                raise ValueError("cross-section limit must be between 1 and 5000")
+            point = datetime.fromisoformat(bar_at.replace("Z", "+00:00"))
+            if point.tzinfo is None:
+                raise ValueError("cross-section bar_at must include a timezone")
+            normalized_bar_at = datetime.fromtimestamp(
+                int(point.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            symbol_filter = None
+            if symbols is not None:
+                symbol_filter = sorted({value.strip() for value in symbols.split(",")
+                                        if value.strip()})
+                if len(symbol_filter) > 5000:
+                    raise ValueError(
+                        "cross-section symbols must contain at most 5000 values"
+                    )
+            bars, truncated = service.market_bar_repository.get_price_bars_cross_section(
+                interval, adjustment, normalized_bar_at, limit, symbol_filter
+            )
+            return {
+                "bar_at": normalized_bar_at, "interval": interval,
+                "adjustment": adjustment,
+                "count": len(bars), "bars": bars, "cached": True,
+                "truncated": truncated,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.get("/v1/quotes/{symbol}")
     def quote(symbol: str, refresh: bool = True):
         try:

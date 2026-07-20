@@ -92,6 +92,14 @@ DuckDB
 - `/v1/quotes/{symbol}/history` 在同时提供 start/end 时执行本地范围读取并返回
   `cached=true` 与 `truncated`；只提供一个端点或非法范围返回 400。未提供 start/end 时，
   原有 refresh/cache 与最近 N 条行为保持不变。
+- canonical 横截面契约为 `get_price_bars_cross_section(interval, adjustment, bar_at,
+  limit, symbols=None)`：bar_at 必须是带时区 ISO-8601，规范化为 UTC 整数秒，只精确
+  匹配该 bar 时间点，不回填陈旧值。每个 symbol 最多一条并按 symbol 升序；symbols
+  可选、去重且最多 5000 个，显式空列表返回空；limit 1..5000，部分结果显式
+  `truncated=true`。DuckDB 对同 symbol/time 的多来源用最新 ingested_at、再按 source
+  稳定选择；ClickHouse 查询 canonical `FINAL`，失败按同一查询回退 DuckDB。
+- 只读 API `GET /v1/quotes/cross-section` 返回规范化 bar_at、count、bars、cached=true 和
+  truncated；不触发 refresh 或写入，语义参数错误返回 400。
 
 ## 二、仓库、分支和 worktree
 
@@ -444,8 +452,10 @@ fundamental / statements / PIT history
   读取最近 N 条，保留 backend 开关、DuckDB 默认值与失败回退路径；production 拒绝启用；
 - 已完成带时区 ISO-8601 起止时间的闭区间历史范围契约、API 扩展、limit/truncated 语义、
   DuckDB/ClickHouse canonical 实现及同范围故障回退；
+- 已完成精确单一 bar 时间点的 canonical 全市场横截面契约、可选有界 symbols 过滤、
+  DuckDB/ClickHouse canonical 实现、只读 API 与同查询故障回退；
 - 尚未完成大规模长时间范围基准与分页/游标契约；
-- 尚未完成全市场横截面查询、多来源 raw 查询及其 API/Repository 契约；
+- 尚未完成非精确时间（如最近有效 bar）或多时间点横截面，以及多来源 raw 查询契约；
 - 尚未完成缓存命中、失效、新鲜度和 ClickHouse/DuckDB 回退一致性契约测试；
 - 尚未实现自动或后台 canonical 调度；当前只能显式、有界重建；
 - 尚未对正式读取进行连接、迁移或切换；
@@ -513,7 +523,7 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 - 8790 不被停止、重启或修改；
 - development 只写独立存储；
-- 现有默认测试继续通过（检查点 7 为 93 项）；
+- 现有默认测试继续通过（检查点 8 的数量见第十一节）；
 - 新 backend 有单元测试和显式集成测试；
 - 上游失败仍有界，不占满服务线程；
 - 双写失败不能阻断现有 DuckDB 主路径，除非测试明确验证 fail-closed；
@@ -525,15 +535,16 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 最近一次 Storage V2 检查：
 
 ```text
-feature/storage-v2 检查点 7 基线：6648d15；本检查点为其上的历史范围查询改动
-默认测试：发现 93 项且整体通过；7 项 PostgreSQL、6 项 ClickHouse 集成测试因未
+feature/storage-v2 检查点 8 基线：f3e642c；本检查点为其上的 canonical 横截面改动
+默认测试：发现 97 项且整体通过；7 项 PostgreSQL、7 项 ClickHouse 集成测试因未
 显式配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
-ClickHouse 测试：8 项通过（2 项隔离边界测试、6 项使用一次性 ClickHouse 25.8
+ClickHouse 测试：9 项通过（2 项隔离边界测试、7 项使用一次性 ClickHouse 25.8
 本地容器的集成测试；容器测试后停止并删除）
-本检查点已完成任意起止时间的闭区间历史范围查询、API 向后兼容扩展、显式截断和
-DuckDB/ClickHouse canonical 等价回退；默认仍为 DuckDB。大规模范围分页/基准、横截面、
-多来源 raw、缓存契约、自动 canonical 调度及后续阶段尚未完成，必须等待验收方指定。
+本检查点已完成精确单一 bar 时间点的 canonical 全市场横截面、只读 API、显式截断和
+DuckDB/ClickHouse canonical 等价回退；默认仍为 DuckDB。非精确/多时间点横截面、
+大规模范围分页/基准、多来源 raw、缓存契约、自动 canonical 调度及后续阶段尚未完成，
+必须等待验收方指定。
 ```
 
 正式服务由 `com.marketcow.production` 管理；最近已验证 health 包含

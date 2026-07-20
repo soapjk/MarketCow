@@ -98,6 +98,42 @@ class ShadowMarketBarRepository:
                 "truncated": truncated, "range": True, "error": str(error)[:4000],
             }
             return rows, truncated
+
+    def get_price_bars_cross_section(
+        self, interval: str, adjustment: str, bar_at: str, limit: int,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not self.canonical_reads_enabled:
+            rows, truncated = self.primary.get_price_bars_cross_section(
+                interval, adjustment, bar_at, limit, symbols
+            )
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": truncated, "cross_section": True,
+            }
+            return rows, truncated
+        try:
+            rows, truncated = self.writer.repository.get_canonical_price_bars_cross_section(
+                interval, adjustment, bar_at, limit,
+                None if symbols is None else list(symbols),
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": truncated,
+                "cross_section": True,
+            }
+            return rows, truncated
+        except Exception as error:
+            rows, truncated = self.primary.get_price_bars_cross_section(
+                interval, adjustment, bar_at, limit, symbols
+            )
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": truncated, "cross_section": True,
+                "error": str(error)[:4000],
+            }
+            return rows, truncated
     @staticmethod
     def _raw_rows(
         symbol: str, interval: str, adjustment: str, source: str,
