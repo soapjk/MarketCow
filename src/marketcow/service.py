@@ -264,7 +264,9 @@ class FundamentalService:
         folder = self.settings.raw_path / "quotes" / safe_symbol
         return self._write_artifact(folder, "quote_" + dataset, payload, source, source_url, locator, ingested_at, ingested_at, {"symbol": symbol})
 
-    def refresh_quote(self, symbol: str) -> Dict[str, Any]:
+    def refresh_quote(
+        self, symbol: str, stale_max_seconds: Optional[float] = None
+    ) -> Dict[str, Any]:
         run_id, started_at = self._start_run("refresh_quote", symbol)
         try:
             a_symbol = normalize_a_symbol(symbol)
@@ -288,10 +290,16 @@ class FundamentalService:
                 provider_errors.append(f"{getattr(provider, 'name', provider.__class__.__name__)}: {exc}")
         if row is None:
             cached = self.warehouse.get_latest_quotes([normalized])
-            if cached:
+            if cached and (
+                stale_max_seconds is None
+                or self._quote_cache_age_seconds(cached[0]) <= stale_max_seconds
+            ):
                 cached_row = cached[0]
                 cached_row.update({
                     "is_cached": True,
+                    "cached": True,
+                    "stale": True,
+                    "cache_status": "stale_fallback",
                     "cache_reason": "; ".join(provider_errors),
                     "served_at": utc_now(),
                 })
@@ -309,10 +317,59 @@ class FundamentalService:
             "raw_path": artifact["storage_path"],
             "raw_artifact_id": artifact["artifact_id"],
             "is_cached": False,
+            "cached": False,
+            "stale": False,
+            "cache_status": "refreshed",
         })
         self.warehouse.upsert_quote(row)
         self._finish_run(run_id, "refresh_quote", started_at, symbol, 1)
         return row
+
+    @staticmethod
+    def _quote_cache_age_seconds(row: Dict[str, Any]) -> float:
+        value = row.get("ingested_at") or row.get("observed_at") or row.get("quote_at")
+        if not value:
+            return float("inf")
+        try:
+            timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            return float("inf")
+
+    def get_quote(self, symbol: str, force_refresh: bool = False) -> Dict[str, Any]:
+        cached = self.warehouse.get_latest_quotes([symbol])
+        cached_row = cached[0] if cached else None
+        cache_age = self._quote_cache_age_seconds(cached_row) if cached_row else float("inf")
+        if cached_row and not force_refresh and cache_age <= self.settings.quote_cache_ttl_seconds:
+            cached_row.update({
+                "is_cached": True,
+                "cached": True,
+                "stale": False,
+                "cache_status": "fresh",
+                "cache_age_seconds": round(cache_age, 3),
+                "served_at": utc_now(),
+            })
+            return cached_row
+        try:
+            return self.refresh_quote(
+                symbol, stale_max_seconds=self.settings.quote_stale_max_seconds
+            )
+        except Exception:
+            # refresh_quote already attempts a cache fallback; this guard primarily
+            # documents and enforces the maximum age if that behavior changes.
+            if cached_row and cache_age <= self.settings.quote_stale_max_seconds:
+                cached_row.update({
+                    "is_cached": True,
+                    "cached": True,
+                    "stale": True,
+                    "cache_status": "stale_fallback",
+                    "cache_age_seconds": round(cache_age, 3),
+                    "served_at": utc_now(),
+                })
+                return cached_row
+            raise
 
     def refresh_quote_history(self, symbol: str, range_: str, interval: str, adjustment: str) -> Dict[str, Any]:
         if interval in {"1m", "5m", "15m", "30m", "60m", "1h"} and symbol.endswith((".SH", ".SZ", ".BJ")):

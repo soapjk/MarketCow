@@ -17,6 +17,9 @@ class Settings:
     tushare_base_url: str = "https://fastapic.stockai888.top"
     tushare_realtime_url: str = "https://realtime.stockai888.top"
     tushare_min_interval: float = 0.5
+    quote_cache_ttl_seconds: float = 60.0
+    quote_stale_max_seconds: float = 604800.0
+    quote_refresh_workers: int = 8
     profile: str = "production"
 
     @classmethod
@@ -46,6 +49,9 @@ class Settings:
             tushare_base_url=os.getenv("TUSHARE_BASE_URL", "https://fastapic.stockai888.top").rstrip("/"),
             tushare_realtime_url=os.getenv("TUSHARE_REALTIME_URL", "https://realtime.stockai888.top").rstrip("/"),
             tushare_min_interval=float(os.getenv("TUSHARE_MIN_INTERVAL", "0.5")),
+            quote_cache_ttl_seconds=float(os.getenv("MARKETCOW_QUOTE_CACHE_TTL_SECONDS", "60")),
+            quote_stale_max_seconds=float(os.getenv("MARKETCOW_QUOTE_STALE_MAX_SECONDS", "604800")),
+            quote_refresh_workers=int(os.getenv("MARKETCOW_QUOTE_REFRESH_WORKERS", "8")),
             profile=profile,
         )
 
