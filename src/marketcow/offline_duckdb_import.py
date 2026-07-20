@@ -52,6 +52,27 @@ ALLOWED_TABLES = (
     "tushare_request",
     "validation_result",
 )
+TABLE_KEYS = {
+    "baostock_snapshot": ("symbol", "report_period"),
+    "economic_calendar_event": ("event_id",),
+    "economic_indicator_latest": ("indicator_id",),
+    "earnings_calendar_event": ("event_id",),
+    "financial_statement_rows": ("symbol", "statement", "report_date", "source"),
+    "fundamental_snapshot": ("symbol", "report_period"),
+    "fundamental_snapshot_history": ("version_id",),
+    "funnel_metrics": ("symbol",),
+    "ingestion_runs": ("run_id",),
+    "market_price_bar": ("symbol", "interval", "adjustment", "timestamp", "source"),
+    "market_quote_latest": ("symbol",),
+    "market_quote_observation": ("symbol", "observed_at", "source"),
+    "provider_health": ("provider",),
+    "raw_artifact_manifest": ("artifact_id",),
+    "tdx_financial_snapshot": ("symbol", "report_period"),
+    "tdx_financial_snapshot_history": ("version_id",),
+    "tushare_data_row": ("request_id", "row_index"),
+    "tushare_request": ("request_id",),
+    "validation_result": ("symbol", "report_period", "metric", "source_a", "source_b"),
+}
 _SAFE_TABLE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
@@ -337,14 +358,26 @@ class OfflineDuckDBImporter:
             with self._connect() as connection:
                 columns = [row[1] for row in connection.execute(f"PRAGMA table_info('{table}')").fetchall()]
                 self._validate_value_widths(connection, table, columns)
-                cursor = connection.execute(f'SELECT * FROM "{table}" LIMIT {self.limits.max_rows + 1}')
+                order = ", ".join(f'"{column}"' for column in TABLE_KEYS[table])
                 fetch_rows = min(
                     self.limits.batch_rows,
                     max(1, self.limits.max_batch_bytes // self.limits.max_row_bytes),
                 )
+                key_indexes = [columns.index(column) for column in TABLE_KEYS[table]]
+                after: tuple[Any, ...] | None = None
                 while True:
                     self._check_deadline(deadline)
-                    rows = cursor.fetchmany(fetch_rows)
+                    where = ""
+                    parameters: list[Any] = []
+                    if after is not None:
+                        keys = ", ".join(f'"{column}"' for column in TABLE_KEYS[table])
+                        marks = ", ".join("?" for _ in after)
+                        where = f" WHERE ({keys}) > ({marks})"
+                        parameters.extend(after)
+                    rows = connection.execute(
+                        f'SELECT * FROM "{table}"{where} ORDER BY {order} LIMIT ?',
+                        [*parameters, fetch_rows],
+                    ).fetchall()
                     if not rows:
                         break
                     emitted += len(rows)
@@ -360,6 +393,7 @@ class OfflineDuckDBImporter:
                                 "batch_bytes_rejected", "a source batch exceeds the configured byte bound"
                             )
                         batch.append(document)
+                    after = tuple(rows[-1][index] for index in key_indexes)
                     yield batch
         except OfflineDuckDBError:
             raise

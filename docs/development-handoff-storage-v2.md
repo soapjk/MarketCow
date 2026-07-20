@@ -1637,7 +1637,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：导入器不能被 API 工厂导入；只接受副本路径；拒绝 production 原路径、symlink、写模式和未知 schema。
 - **必要测试**：import graph、只读/路径 trap、schema migration fixtures、恶意文件、CLI 零在线副作用。
 - **排除项**：复制真实 production 数据或执行正式导入。
-- **状态**：`本地实现完成，待独立验收`。新增独立 console entrypoint `marketcow-offline-duckdb` 与
+- **状态**：`已验收（94b4675+d236f5f）`。新增独立 console entrypoint `marketcow-offline-duckdb` 与
   `marketcow.offline_duckdb_import` package；该模块被依赖策略登记为 offline-only，online entrypoint 的传递
   import closure 触达即失败。CLI 只接受显式绝对 `allowed_root`、`development-copy`/`test-fixture` 标识和其下
   无 symlink 的普通文件；路径或任一组件含 `prod`/`production`/`live`、containment 逃逸、损坏文件均以稳定
@@ -1661,7 +1661,19 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：全域 row/key/content/PIT/provenance 对账；中断可重入；未知版本或差异阻止完成。
 - **必要测试**：真实 disposable PG+CH、全部域非空 fixture、批次前后故障、重复/乱序/同版本冲突。
 - **排除项**：真实数据副本和在线切换。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 offline-only `marketcow.offline_full_import`，只消费
+  BG-012 已验证的 `manifest → batch* → complete` 流；每张源表按完整业务键 keyset 排序抽取，stage
+  逐批校验 sequence、source fingerprint、row/batch count 与 stream SHA-256 后原子发布。run ID 与
+  checkpoint 绑定源 fingerprint、PG schema、CH database 和协议版本，批次写前/写后/checkpoint 前后均有
+  故障注入点；重复 upsert/authoritative write 和重启续跑不产生逻辑重复。16 个旧副本域加 V2-native
+  runtime config/migration checkpoint 共 18 个 PG 权威域全部非空演练，Artifact body 在迁入前校验
+  size/SHA-256 并改写为稳定逻辑 URI；行情 raw 全量直接进入 ClickHouse authoritative writer，随后按精确
+  symbol/interval/adjustment 闭区间使用共享 canonical builder 重建。完成闸门重新验证源 fingerprint、
+  PG row/key/content/JSON/PIT 形态、ClickHouse raw FINAL provenance 与 canonical FINAL selection/content、
+  完整域集合及 WAL pending/failed/intent/quarantine 全空；任一短确认、损坏 terminal、版本/binding、
+  内容差异或未清队列均阻止 complete。真实 disposable PostgreSQL 16 + ClickHouse 25.8 联合测试覆盖全部
+  20 个目标域、Artifact 回读、批次写后/checkpoint 前中断续跑与重复整轮幂等；只使用合成 fixture，
+  `incremental_catchup=not_started_bg014`。
 
 ### `BG-014`：隔离副本增量追平协议
 
