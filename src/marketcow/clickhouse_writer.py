@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import fcntl
+import hashlib
 import json
 import os
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,31 +74,80 @@ def stable_batch_id(dataset: str, rows: List[Dict[str, Any]]) -> str:
 class LocalClickHouseSpool:
     """Atomic development-only filesystem WAL for failed ClickHouse batches."""
 
-    def __init__(self, root: Path, allowed_root: Path) -> None:
+    def __init__(self, root: Path, allowed_root: Path, quota_bytes: int = 1073741824,
+                 quota_warning_ratio: float = 0.8) -> None:
         self.root = root.resolve()
         self.allowed_root = allowed_root.resolve()
         if self.root != self.allowed_root and self.allowed_root not in self.root.parents:
             raise ValueError("ClickHouse spool must stay within its allowed development root")
+        if not 1048576 <= quota_bytes <= 1099511627776:
+            raise ValueError("spool quota must be between 1 MiB and 1 TiB")
+        if not 0.5 <= quota_warning_ratio < 1:
+            raise ValueError("spool quota warning ratio must be between 0.5 and 1")
+        self.quota_bytes = quota_bytes
+        self.quota_warning_ratio = quota_warning_ratio
         self.pending = self.root / "pending"
         self.replayed = self.root / "replayed"
         self.intents = self.root / "intents"
         self.processing_intents = self.root / "processing-intents"
+        self.quarantine = self.root / "quarantine"
         self.pending.mkdir(parents=True, exist_ok=True)
         self.replayed.mkdir(parents=True, exist_ok=True)
         self.intents.mkdir(parents=True, exist_ok=True)
         self.processing_intents.mkdir(parents=True, exist_ok=True)
+        self.quarantine.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
     @staticmethod
-    def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
+    def _payload_checksum(payload: Dict[str, Any]) -> str:
+        clean = {key: value for key, value in payload.items() if key != "_checksum"}
+        encoded = json.dumps(clean, ensure_ascii=False, allow_nan=False,
+                             sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def usage(self, limit: int = 10000) -> Dict[str, Any]:
+        total = files = 0
+        truncated = False
+        for folder, _, names in os.walk(self.root, followlinks=False):
+            for name in names:
+                path = Path(folder) / name
+                if path.is_symlink():
+                    continue
+                files += 1
+                if files > limit:
+                    truncated = True
+                    break
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    continue
+            if truncated:
+                break
+        free = shutil.disk_usage(self.root).free
+        return {"bytes": total, "files": min(files, limit), "truncated": truncated,
+                "quota_bytes": self.quota_bytes,
+                "warning": total >= self.quota_bytes * self.quota_warning_ratio,
+                "free_bytes": free}
+
+    def _atomic_json(self, path: Path, payload: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {key: value for key, value in payload.items() if key != "_checksum"}
+        payload["_checksum"] = self._payload_checksum(payload)
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False,
+                             sort_keys=True).encode("utf-8")
+        usage = self.usage()
+        previous = path.stat().st_size if path.exists() else 0
+        if usage["truncated"] or usage["bytes"] - previous + len(encoded) > self.quota_bytes:
+            raise OSError("ClickHouse spool quota exceeded")
+        if usage["free_bytes"] < len(encoded) + 4096:
+            raise OSError("insufficient disk space for ClickHouse spool write")
         descriptor, temporary = tempfile.mkstemp(prefix=".write-", dir=path.parent)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, allow_nan=False, sort_keys=True)
+                handle.write(encoded.decode("utf-8"))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
@@ -125,10 +175,29 @@ class LocalClickHouseSpool:
         self._atomic_json(path, payload)
         return path
 
-    @staticmethod
-    def read(path: Path) -> Dict[str, Any]:
+    @classmethod
+    def read(cls, path: Path, require_checksum: bool = False) -> Dict[str, Any]:
         with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError("spool item must be a JSON object")
+        checksum = payload.get("_checksum")
+        if checksum is None:
+            if require_checksum:
+                raise ValueError("spool item checksum is missing")
+            return payload
+        if checksum != cls._payload_checksum(payload):
+            raise ValueError("spool item checksum mismatch")
+        return payload
+
+    def quarantine_item(self, path: Path, reason: str) -> Path:
+        destination = self.quarantine / (self._now().replace(":", "-") + "-" + path.name)
+        os.replace(path, destination)
+        self._atomic_json(destination.with_suffix(".meta.json"), {
+            "original_path": str(path.relative_to(self.root)),
+            "quarantined_at": self._now(), "reason": reason[:4000],
+        })
+        return destination
 
     def mark_replayed(self, path: Path, payload: Dict[str, Any]) -> None:
         payload = {**payload, "replayed_at": self._now(), "last_error": ""}
@@ -185,7 +254,7 @@ class LocalClickHouseSpool:
         files = []
         with os.scandir(folder) as entries:
             for entry in entries:
-                if entry.is_file() and entry.name.endswith(".json"):
+                if entry.is_file(follow_symlinks=False) and entry.name.endswith(".json"):
                     if len(files) >= limit:
                         return sorted(files), True
                     files.append(Path(entry.path))
@@ -212,6 +281,7 @@ class LocalClickHouseSpool:
             "oldest_pending_lag_seconds": round(lag, 3),
             "truncated": pending_truncated or replayed_truncated,
             "scan_limit": limit,
+            "quota": self.usage(limit),
         }
 
 
@@ -265,52 +335,75 @@ class ReliableClickHouseWriter:
     def replay(self, limit: int = 100) -> Dict[str, Any]:
         if not 1 <= limit <= 1000:
             raise ValueError("replay limit must be between 1 and 1000")
-        outcome = {"attempted": 0, "replayed": 0, "failed": 0,
+        outcome = {"attempted": 0, "replayed": 0, "failed": 0, "quarantined": 0,
                    "callback_attempted": 0, "callback_ok": 0,
                    "callback_failed": 0, "remaining": 0,
                    "truncated": False, "lock_busy": False}
-        lock_path = self.spool.root / ".replay.lock"
-        with lock_path.open("a+") as lock:
+        operator_path = self.spool.root / ".operator.lock"
+        with operator_path.open("a+") as operator_lock:
             try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(operator_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 outcome["lock_busy"] = True
                 outcome["remaining"] = 1
                 outcome["truncated"] = True
                 return outcome
-            paths, wal_truncated = self.spool._bounded_files(self.spool.pending, limit)
-            for path in paths:
-                payload = self.spool.read(path)
-                outcome["attempted"] += 1
+            lock_path = self.spool.root / ".replay.lock"
+            with lock_path.open("a+") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
                 try:
-                    self._insert(payload["dataset"], payload["rows"], payload["batch_id"])
-                except Exception as error:
-                    self.spool.enqueue(payload["dataset"], payload["batch_id"],
-                                       payload["rows"], str(error))
-                    outcome["failed"] += 1
-                else:
-                    self.spool.mark_replayed(path, payload)
-                    outcome["replayed"] += 1
-                    if payload["dataset"] == "raw" and payload.get("intent_id"):
-                        self.spool.complete_chunk(payload["intent_id"], payload["batch_id"])
-            budget = limit - outcome["attempted"]
-            if self.on_raw_replayed and budget:
-                for intent in self.spool.ready_intents(budget):
-                    outcome["callback_attempted"] += 1
-                    try:
-                        self.on_raw_replayed(intent["rows"])
-                    except Exception as error:
-                        self.spool.callback_result(intent, str(error))
-                        outcome["callback_failed"] += 1
-                        self.last_replay_callback = {"status": "error", "error": str(error)[:4000]}
-                    else:
-                        self.spool.callback_result(intent)
-                        outcome["callback_ok"] += 1
-                        self.last_replay_callback = {"status": "ok", "rows": len(intent["rows"])}
-            pending, pending_more = self.spool._bounded_files(self.spool.pending, 10000)
-            intents, intents_more = self.spool._bounded_files(self.spool.intents, 10000)
-            outcome["remaining"] = len(pending) + len(intents)
-            outcome["truncated"] = bool(outcome["remaining"] or wal_truncated or
-                                        pending_more or intents_more)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    paths, wal_truncated = self.spool._bounded_files(self.spool.pending, limit)
+                    for path in paths:
+                        try:
+                            payload = self.spool.read(path, require_checksum=True)
+                        except Exception as error:
+                            try:
+                                self.spool.quarantine_item(path, str(error))
+                            except Exception:
+                                pass
+                            outcome["quarantined"] += 1
+                            continue
+                        outcome["attempted"] += 1
+                        try:
+                            self._insert(payload["dataset"], payload["rows"], payload["batch_id"])
+                        except Exception as error:
+                            self.spool.enqueue(payload["dataset"], payload["batch_id"],
+                                               payload["rows"], str(error))
+                            outcome["failed"] += 1
+                        else:
+                            self.spool.mark_replayed(path, payload)
+                            outcome["replayed"] += 1
+                            if payload["dataset"] == "raw" and payload.get("intent_id"):
+                                self.spool.complete_chunk(payload["intent_id"], payload["batch_id"])
+                    budget = limit - outcome["attempted"]
+                    if self.on_raw_replayed and budget:
+                        for intent in self.spool.ready_intents(budget):
+                            outcome["callback_attempted"] += 1
+                            try:
+                                self.on_raw_replayed(intent["rows"])
+                            except Exception as error:
+                                self.spool.callback_result(intent, str(error))
+                                outcome["callback_failed"] += 1
+                                self.last_replay_callback = {
+                                    "status": "error", "error": str(error)[:4000],
+                                }
+                            else:
+                                self.spool.callback_result(intent)
+                                outcome["callback_ok"] += 1
+                                self.last_replay_callback = {
+                                    "status": "ok", "rows": len(intent["rows"]),
+                                }
+                    pending, pending_more = self.spool._bounded_files(
+                        self.spool.pending, 10000
+                    )
+                    intents, intents_more = self.spool._bounded_files(
+                        self.spool.intents, 10000
+                    )
+                    outcome["remaining"] = len(pending) + len(intents)
+                    outcome["truncated"] = bool(
+                        outcome["remaining"] or wal_truncated or pending_more or intents_more
+                    )
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(operator_lock.fileno(), fcntl.LOCK_UN)
         return outcome

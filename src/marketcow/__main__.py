@@ -177,7 +177,74 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     sync.add_argument("--without-valuation", action="store_true", help="skip the full-market valuation snapshot")
     sync.add_argument("--skip-fundamentals", action="store_true")
     sync.add_argument("--skip-tdx", action="store_true")
+    spool = commands.add_parser("spool", help="inspect or explicitly operate the development WAL/spool")
+    spool_actions = spool.add_subparsers(dest="spool_action", required=True)
+    for action in ("status", "audit", "quarantine-corrupt", "retry-dead", "replay"):
+        command = spool_actions.add_parser(action)
+        command.add_argument("--limit", type=int, default=100)
+    listing = spool_actions.add_parser("list")
+    listing.add_argument("kind", choices=(
+        "wal-pending", "wal-replayed", "raw-intents", "raw-processing",
+        "scheduler-pending", "scheduler-processing", "scheduler-failed", "quarantine",
+    ))
+    listing.add_argument("--limit", type=int, default=100)
+    cleanup = spool_actions.add_parser("cleanup-replayed")
+    cleanup.add_argument("--retention-seconds", type=int, required=True)
+    cleanup.add_argument("--limit", type=int, default=100)
     return parser
+
+
+def operate_spool(settings: Settings, action: str, limit: int = 100,
+                  kind: str = "", retention_seconds: int = 0) -> dict[str, Any]:
+    if settings.profile != "development":
+        raise ValueError("spool operator is development-only")
+    from .clickhouse_writer import LocalClickHouseSpool
+    from .spool_operator import SpoolOperator
+
+    if action in {"status", "list", "audit"} and not settings.clickhouse_spool_path.exists():
+        empty = {"status": "ok", "present": False, "root": str(settings.clickhouse_spool_path)}
+        if action == "list":
+            empty.update({"kind": kind, "items": [], "truncated": False})
+        return empty
+    spool = LocalClickHouseSpool(
+        settings.clickhouse_spool_path, settings.storage_root,
+        settings.clickhouse_spool_quota_bytes, settings.clickhouse_spool_warning_ratio,
+    )
+    operator = SpoolOperator(spool)
+    if action == "status":
+        audit = operator.audit(limit)
+        return {"status": audit["status"], "spool": spool.diagnostics(limit),
+                "audit": audit}
+    if action == "list":
+        return operator.list_items(kind, limit)
+    if action == "audit":
+        return operator.audit(limit)
+    if action == "quarantine-corrupt":
+        return operator.quarantine_corrupt(limit)
+    if action == "retry-dead":
+        return operator.retry_scheduler_failed(limit)
+    if action == "cleanup-replayed":
+        return operator.cleanup_replayed(retention_seconds, limit)
+    if action == "replay":
+        if not settings.clickhouse_enabled:
+            raise ValueError("spool replay requires MARKETCOW_CLICKHOUSE_ENABLED")
+        service = FundamentalService(settings)
+        scheduler = getattr(service.market_bar_repository, "background_scheduler", None)
+        if scheduler:
+            scheduler.pause()
+        try:
+            writer = getattr(service.market_bar_repository, "writer", None)
+            if writer is None:
+                raise ValueError("ClickHouse writer is not assembled")
+            replay = writer.replay(limit)
+            unhealthy = (replay["failed"] or replay["quarantined"] or
+                         replay["callback_failed"] or replay["lock_busy"])
+            return {"status": "partial" if unhealthy else "ok", "replay": replay}
+        finally:
+            if scheduler:
+                scheduler.resume()
+            service.close()
+    raise ValueError("unknown spool action")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -223,6 +290,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
             return 0 if result["status"] == "success" else 1
+        if args.command == "spool":
+            result = operate_spool(
+                settings, args.spool_action, args.limit,
+                getattr(args, "kind", ""), getattr(args, "retention_seconds", 0),
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            return 0 if result.get("status") == "ok" else 2
         if not is_loopback_host(args.host):
             allowed = os.getenv("MARKETCOW_ALLOW_NON_LOOPBACK", "").lower() in {"1", "true", "yes"}
             if not allowed:

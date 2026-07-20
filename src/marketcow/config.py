@@ -50,6 +50,8 @@ class Settings:
     clickhouse_scheduler_backoff_base_seconds: float = 1.0
     clickhouse_scheduler_backoff_max_seconds: float = 60.0
     clickhouse_scheduler_max_attempts: int = 10
+    clickhouse_spool_quota_bytes: int = 1073741824
+    clickhouse_spool_warning_ratio: float = 0.8
     market_bar_cache_freshness_seconds: int = 900
     market_bar_cursor_secret: str = ""
     market_bar_cursor_ttl_seconds: int = 3600
@@ -150,6 +152,10 @@ class Settings:
                 "MARKETCOW_CLICKHOUSE_SCHEDULER_BACKOFF_MAX_SECONDS", "60.0")),
             clickhouse_scheduler_max_attempts=int(os.getenv(
                 "MARKETCOW_CLICKHOUSE_SCHEDULER_MAX_ATTEMPTS", "10")),
+            clickhouse_spool_quota_bytes=int(os.getenv(
+                "MARKETCOW_CLICKHOUSE_SPOOL_QUOTA_BYTES", "1073741824")),
+            clickhouse_spool_warning_ratio=float(os.getenv(
+                "MARKETCOW_CLICKHOUSE_SPOOL_WARNING_RATIO", "0.8")),
             market_bar_cache_freshness_seconds=int(os.getenv(
                 "MARKETCOW_MARKET_BAR_CACHE_FRESHNESS_SECONDS", "900"
             )),
@@ -194,6 +200,10 @@ class Settings:
             raise ValueError("scheduler backoff bounds are invalid")
         if not 1 <= self.clickhouse_scheduler_max_attempts <= 100:
             raise ValueError("scheduler max attempts must be between 1 and 100")
+        if not 1048576 <= self.clickhouse_spool_quota_bytes <= 1099511627776:
+            raise ValueError("spool quota must be between 1 MiB and 1 TiB")
+        if not 0.5 <= self.clickhouse_spool_warning_ratio < 1:
+            raise ValueError("spool warning ratio must be between 0.5 and 1")
         if self.market_bar_read_backend not in {"duckdb", "clickhouse_canonical"}:
             raise ValueError(
                 "MARKETCOW_MARKET_BAR_READ_BACKEND must be duckdb or clickhouse_canonical"

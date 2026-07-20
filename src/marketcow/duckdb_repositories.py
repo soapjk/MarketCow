@@ -176,7 +176,9 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
             clickhouse.open()
             resources.append(clickhouse)
             spool = LocalClickHouseSpool(
-                settings.clickhouse_spool_path, settings.storage_root
+                settings.clickhouse_spool_path, settings.storage_root,
+                settings.clickhouse_spool_quota_bytes,
+                settings.clickhouse_spool_warning_ratio,
             )
             clickhouse_repository = ClickHouseMarketBarRepository(clickhouse)
             writer = ReliableClickHouseWriter(

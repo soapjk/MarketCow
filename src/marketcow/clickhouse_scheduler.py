@@ -175,23 +175,31 @@ class BackgroundCanonicalScheduler:
         if not self._run_lock.acquire(blocking=False):
             return 0
         try:
-            now = float(self.clock())
-            self._recover_processing()
-            ready = []
-            for path in self._files(self.pending, self.scan_limit):
+            with (self.spool.root / ".operator.lock").open("a+") as operator_lock:
                 try:
-                    task = self.spool.read(path)
-                except Exception as error:
-                    with self._state_lock:
-                        self._last = {"status": "invalid", "error": str(error)[:4000]}
-                    continue
-                if float(task.get("next_attempt_epoch", 0)) <= now:
-                    ready.append(path)
-            for path in ready:
-                if self._stop.is_set():
-                    break
-                self._run_one(path)
-            return len(ready)
+                    fcntl.flock(operator_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return 0
+                try:
+                    now = float(self.clock())
+                    self._recover_processing()
+                    ready = []
+                    for path in self._files(self.pending, self.scan_limit):
+                        try:
+                            task = self.spool.read(path)
+                        except Exception as error:
+                            with self._state_lock:
+                                self._last = {"status": "invalid", "error": str(error)[:4000]}
+                            continue
+                        if float(task.get("next_attempt_epoch", 0)) <= now:
+                            ready.append(path)
+                    for path in ready:
+                        if self._stop.is_set():
+                            break
+                        self._run_one(path)
+                    return len(ready)
+                finally:
+                    fcntl.flock(operator_lock.fileno(), fcntl.LOCK_UN)
         finally:
             self._run_lock.release()
 

@@ -38,6 +38,20 @@ class FakeRepository:
 
 
 class ReliableClickHouseWriterTest(unittest.TestCase):
+    def test_replay_quarantines_corrupt_wal_and_continues_healthy_items(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            corrupt = spool.pending / "000-corrupt.json"
+            corrupt.write_text("{", encoding="utf-8")
+            spool.enqueue("raw", "healthy", [normalize_bar("raw", raw_bar())], "outage")
+            writer = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            result = writer.replay(10)
+            self.assertEqual(result["quarantined"], 1)
+            self.assertEqual(result["replayed"], 1)
+            self.assertFalse(corrupt.exists())
+            self.assertTrue(any(spool.quarantine.glob("*000-corrupt.json")))
+
     def test_replay_shared_budget_and_concurrent_claim_lock(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
