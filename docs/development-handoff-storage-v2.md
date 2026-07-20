@@ -1419,7 +1419,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：职责、故障模型、旧服务回滚边界、跨库一致性和 DuckDB 允许/禁止位置无歧义。
 - **必要测试**：ADR/依赖规则文本检查；模块 import 图静态基线。
 - **排除项**：运行时代码、数据复制、服务变更。
-- **状态**：`本地实现完成，待独立验收`。ADR-003 已固化独立蓝绿架构、PG/CH 职责、跨库
+- **状态**：`已验收`（Artifact `c937960` + 返修 `6b365fe`）。ADR-003 已固化独立蓝绿架构、PG/CH 职责、跨库
   intent/watermark 一致性、故障模型、旧服务整体回滚和 DuckDB offline-only 边界；版本化依赖策略与
   AST 静态测试精确冻结当前两条在线 DuckDB 直接依赖债务并禁止新增，分别由 BG-007/BG-008 移除。
 
@@ -1431,7 +1431,11 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：缺任一数据库、出现 DuckDB online 配置、production 标识或路径逃逸均在资源创建前拒绝；旧 profile 兼容。
 - **必要测试**：配置矩阵、零副作用失败、symlink/路径、凭证脱敏、旧版启动回归。
 - **排除项**：Repository 装配和数据库连接迁移。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 `v2-development`/`v2-test` profile 与纯 preflight：
+  必须同时使用 PostgreSQL 和 ClickHouse，canonical/raw read backend 固定为 ClickHouse，DuckDB 路径
+  必须为空；storage/raw/spool resolve 后受隔离 root containment 约束，PG/CH 与服务目标必须 loopback
+  且数据库/schema 带 development/test 标识。DSN/password 只通过环境变量名引用，所有连接/读取超时
+  显式有界；验证不创建连接、目录、线程或文件。旧 production/development profile 行为保持兼容。
 
 ### `BG-003`：PostgreSQL 全域 schema 与 Repository 完整性
 

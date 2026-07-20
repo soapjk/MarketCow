@@ -1,5 +1,7 @@
 import os
+import socket
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +11,153 @@ from marketcow.config import Settings
 
 
 class SettingsTest(unittest.TestCase):
+    @staticmethod
+    def _v2_settings(root: Path, **overrides):
+        values = dict(
+            database_path=None,
+            raw_path=root / "raw",
+            storage_root=root,
+            clickhouse_spool_path=root / "spool/clickhouse",
+            profile="v2-development",
+            port=8792,
+            runtime_architecture="postgres_clickhouse_v2",
+            metadata_backend="postgres",
+            postgres_dsn="postgresql://fixture:secret@127.0.0.1/marketcow_development",
+            postgres_dsn_ref="MARKETCOW_V2_POSTGRES_DSN",
+            postgres_schema="marketcow_development",
+            clickhouse_enabled=True,
+            clickhouse_host="127.0.0.1",
+            clickhouse_database="marketcow_development",
+            clickhouse_password="secret",
+            clickhouse_password_ref="MARKETCOW_V2_CLICKHOUSE_PASSWORD",
+            market_bar_read_backend="clickhouse_canonical",
+            raw_market_bar_read_backend="clickhouse_raw",
+            v2_allowed_root=root.parent,
+            runtime_config_schema="marketcow.v2-runtime-config.v1",
+        )
+        values.update(overrides)
+        return Settings(**values)
+
+    def test_v2_environment_defaults_to_pg_clickhouse_without_duckdb(self):
+        with tempfile.TemporaryDirectory() as folder:
+            environment = {
+                "MARKETCOW_V2_POSTGRES_DSN":
+                    "postgresql://fixture:secret@127.0.0.1/marketcow_development",
+                "MARKETCOW_POSTGRES_DSN_REF": "MARKETCOW_V2_POSTGRES_DSN",
+                "MARKETCOW_V2_CLICKHOUSE_PASSWORD": "secret",
+                "MARKETCOW_CLICKHOUSE_PASSWORD_REF":
+                    "MARKETCOW_V2_CLICKHOUSE_PASSWORD",
+            }
+            with patch.dict(os.environ, environment, clear=True), patch(
+                "pathlib.Path.cwd", return_value=Path(folder)
+            ):
+                settings = Settings.from_env("v2-development")
+        self.assertIsNone(settings.database_path)
+        self.assertEqual(settings.metadata_backend, "postgres")
+        self.assertTrue(settings.clickhouse_enabled)
+        self.assertEqual(settings.market_bar_read_backend, "clickhouse_canonical")
+        self.assertEqual(settings.raw_market_bar_read_backend, "clickhouse_raw")
+        self.assertEqual(settings.storage_root, Path(folder) / "data-v2-development")
+        settings.validate_runtime_isolation()
+
+    def test_v2_preflight_requires_both_databases_and_forbids_duckdb(self):
+        root = Path("/Volumes/T9/projects/marketcow-storage-v2/data-v2-development")
+        base = self._v2_settings(root)
+        base.validate_runtime_isolation()
+        cases = (
+            ({"postgres_dsn": ""}, "requires PostgreSQL"),
+            ({"clickhouse_enabled": False}, "requires ClickHouse"),
+            ({"metadata_backend": "duckdb"}, "must be PostgreSQL"),
+            ({"market_bar_read_backend": "duckdb"}, "must use ClickHouse"),
+            ({"raw_market_bar_read_backend": "duckdb"}, "must use ClickHouse"),
+            ({"database_path": root / "warehouse.duckdb"}, "must not define a DuckDB"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                ValueError, message
+            ):
+                self._v2_settings(root, **overrides).validate_runtime_isolation()
+
+    def test_v2_preflight_rejects_production_and_non_loopback_targets(self):
+        root = Path("/Volumes/T9/projects/marketcow-storage-v2/data-v2-development")
+        cases = (
+            ({"port": 8790}, "production identity"),
+            ({"host": "0.0.0.0"}, "service host must be loopback"),
+            ({"postgres_dsn": "postgresql://user:topsecret@db.example/marketcow_development"},
+             "PostgreSQL target must be loopback"),
+            ({"postgres_dsn": "postgresql://user:topsecret@127.0.0.1/marketcow_production"},
+             "database must match"),
+            ({"postgres_schema": "marketcow_production"},
+             "schema must match"),
+            ({"clickhouse_host": "clickhouse.example"},
+             "ClickHouse target must be loopback"),
+            ({"clickhouse_database": "marketcow_production"},
+             "ClickHouse database must match"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                ValueError, message
+            ) as captured:
+                self._v2_settings(root, **overrides).validate_runtime_isolation()
+            self.assertNotIn("topsecret", str(captured.exception))
+
+    def test_v2_preflight_is_pure_and_rejects_escape_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            root = base / "data-v2-development"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            link = root / "linked"
+            link.symlink_to(outside, target_is_directory=True)
+            settings = self._v2_settings(root, clickhouse_spool_path=link / "spool")
+            with patch.object(Path, "mkdir") as mkdir, patch.object(
+                socket, "create_connection"
+            ) as connect, patch.object(threading.Thread, "start") as start, patch(
+                "builtins.open"
+            ) as opened:
+                with self.assertRaisesRegex(ValueError, "must stay within"):
+                    settings.validate_runtime_isolation()
+            mkdir.assert_not_called()
+            connect.assert_not_called()
+            start.assert_not_called()
+            opened.assert_not_called()
+            allowed = base / "allowed"
+            allowed.mkdir()
+            root_link = allowed / "data-v2-development"
+            root_link.symlink_to(outside, target_is_directory=True)
+            escaped = self._v2_settings(
+                root_link, v2_allowed_root=allowed,
+                raw_path=root_link / "raw",
+                clickhouse_spool_path=root_link / "spool/clickhouse",
+            )
+            with self.assertRaisesRegex(ValueError, "escapes its allowed root"):
+                escaped.validate_runtime_isolation()
+
+    def test_v2_timeout_and_secret_reference_bounds(self):
+        root = Path("/tmp/marketcow/data-v2-test")
+        valid = self._v2_settings(
+            root, profile="v2-test", port=8793,
+            postgres_dsn="postgresql://user:secret@localhost/marketcow_test",
+            postgres_schema="marketcow_test", clickhouse_database="marketcow_test",
+        )
+        valid.validate_runtime_isolation()
+        for field in ("postgres_connect_timeout", "postgres_read_timeout",
+                      "clickhouse_connect_timeout", "clickhouse_read_timeout"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "timeout"):
+                self._v2_settings(root, profile="v2-test", port=8793,
+                                  postgres_dsn="postgresql://u:s@localhost/marketcow_test",
+                                  postgres_schema="marketcow_test",
+                                  clickhouse_database="marketcow_test",
+                                  **{field: 31}).validate_runtime_isolation()
+        with self.assertRaisesRegex(ValueError, "environment reference"):
+            self._v2_settings(
+                root, profile="v2-test", port=8793,
+                postgres_dsn="postgresql://u:s@localhost/marketcow_test",
+                postgres_schema="marketcow_test", clickhouse_database="marketcow_test",
+                postgres_dsn_ref="secret-value",
+            ).validate_runtime_isolation()
+
     def test_background_scheduler_is_explicit_bounded_and_development_only(self):
         root = Path("/tmp/marketcow-scheduler/data-development")
         base = dict(
