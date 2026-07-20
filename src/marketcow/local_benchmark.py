@@ -150,6 +150,9 @@ class LocalStorageBenchmark:
         durations: list[float] = []
         throughputs: list[float] = []
         checksums: list[str] = []
+        row_counts: list[int] = []
+        byte_counts: list[int] = []
+        uncompressed_byte_counts: list[int] = []
         peak_threads = threading.active_count()
         peak_memory_mb = self._rss_mb()
         memory_baseline_mb = peak_memory_mb
@@ -181,6 +184,11 @@ class LocalStorageBenchmark:
                 raise ValueError(f"benchmark {name} returned negative rows")
             durations.append(elapsed)
             throughputs.append(rows / elapsed)
+            row_counts.append(rows)
+            byte_counts.append(max(0, int(result.get("bytes", 0))))
+            uncompressed_byte_counts.append(max(
+                0, int(result.get("uncompressed_bytes", 0))
+            ))
             verification = result.get("verification")
             if not isinstance(verification, Mapping):
                 raise ValueError(f"benchmark {name} requires independent target verification")
@@ -202,6 +210,16 @@ class LocalStorageBenchmark:
             self.inputs.plan.trading_days * self.inputs.plan.bars_per_day * .8
         ):
             raise RuntimeError("benchmark page_deep cursor is not in the sample tail")
+        if name == "page_deep" and (
+            last.get("query_after") is None or
+            int(last["query_after"]) != int(last.get("explain_after", -1)) or
+            int(last["query_after"]) != int(last.get("depth_after", -1)) or
+            not str(last.get("cursor_predicate", "")) or
+            str(last["cursor_predicate"]) not in query_sql
+        ):
+            raise RuntimeError(
+                "benchmark deep query, EXPLAIN and depth cursor are not bound"
+            )
         path_kind = str(last.get("path_kind", ""))
         if name == "query_warm" and path_kind != "warm_existing_session":
             raise RuntimeError("benchmark warm query path is not explicit")
@@ -209,6 +227,7 @@ class LocalStorageBenchmark:
             raise RuntimeError("benchmark cold query path is not independently cold")
         return {
             "runs": len(durations), "rows": int(last.get("rows", 0)),
+            "rows_runs": row_counts,
             "latency_seconds": {
                 "p50": _percentile(durations, .50),
                 "p95": _percentile(durations, .95),
@@ -216,8 +235,9 @@ class LocalStorageBenchmark:
             },
             "rows_per_second": round(min(throughputs), 3),
             "checksums": checksums,
-            "bytes": max(0, int(last.get("bytes", 0))),
-            "uncompressed_bytes": max(0, int(last.get("uncompressed_bytes", 0))),
+            "bytes": sum(byte_counts), "bytes_runs": byte_counts,
+            "uncompressed_bytes": sum(uncompressed_byte_counts),
+            "uncompressed_bytes_runs": uncompressed_byte_counts,
             "query_plan": sanitize_text(plan)[:2000] if plan else None,
             "query_sql": sanitize_text(query_sql)[:2000] if query_sql else None,
             "free_bytes": max(0, int(last.get("free_bytes", 0))),
@@ -225,6 +245,9 @@ class LocalStorageBenchmark:
             "merge_backlog": max(0, int(last.get("merge_backlog", 0))),
             "path_kind": path_kind or None,
             "cursor_depth": max(0, int(last.get("cursor_depth", 0))),
+            "query_after": last.get("query_after"),
+            "explain_after": last.get("explain_after"),
+            "depth_after": last.get("depth_after"),
             "resource_peak": {
                 "threads": peak_threads,
                 "memory_mb": round(peak_memory_mb, 3),
@@ -279,9 +302,10 @@ class LocalStorageBenchmark:
     def _capacity(self, observations: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
         write = observations["raw_write"]
         stored = int(write["bytes"])
-        if stored <= 0 or self.inputs.plan.sample_raw_rows <= 0:
+        measured_rows = sum(int(value) for value in write["rows_runs"])
+        if stored <= 0 or measured_rows <= 0:
             raise ValueError("benchmark requires measured positive storage bytes")
-        bytes_per_raw_row = stored / self.inputs.plan.sample_raw_rows
+        bytes_per_raw_row = stored / measured_rows
         raw_bytes = bytes_per_raw_row * self.inputs.plan.model_raw_rows
         canonical_bytes = (raw_bytes / self.inputs.plan.sources) * 0.9
         online_bytes = raw_bytes + canonical_bytes
@@ -291,6 +315,8 @@ class LocalStorageBenchmark:
         free_ratio = free / total if total else 0.0
         return {
             "bytes_per_raw_row": round(bytes_per_raw_row, 6),
+            "measured_raw_rows": measured_rows,
+            "measured_raw_bytes": stored,
             "model_online_bytes": int(online_bytes),
             "model_required_disk_bytes_with_30pct_free": int(required_disk),
             "observed_clickhouse_free_ratio": round(free_ratio, 6),

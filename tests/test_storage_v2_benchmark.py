@@ -52,9 +52,16 @@ class StorageV2BenchmarkTest(unittest.TestCase):
                 result["query_plan"] = "ReadFromMergeTree Filter bar_time > cursor"
                 result["query_sql"] = (
                     "SELECT bars ORDER BY bar_time LIMIT 101" if name == "page_first" else
-                    "SELECT bars WHERE bar_time > cursor ORDER BY bar_time LIMIT 101"
+                    "SELECT bars WHERE bar_time > '2026-07-15 01:59:00.000' "
+                    "ORDER BY bar_time LIMIT 101"
                 )
                 result["cursor_depth"] = 0 if name == "page_first" else 4600
+                result["query_after"] = None if name == "page_first" else 1784075940
+                result["explain_after"] = None if name == "page_first" else 1784075940
+                result["depth_after"] = None if name == "page_first" else 1784075940
+                result["cursor_predicate"] = (
+                    "" if name == "page_first" else "2026-07-15 01:59:00.000"
+                )
             if name == "query_warm":
                 result["path_kind"] = "warm_existing_session"
             if name == "query_cold":
@@ -91,6 +98,24 @@ class StorageV2BenchmarkTest(unittest.TestCase):
         persisted = json.loads(self.benchmark().report_path.read_text())
         self.assertEqual(persisted["status"], "passed")
 
+    def test_capacity_uses_all_run_bytes_over_all_run_rows(self):
+        operations = self.operations()
+        run_rows = (100, 250, 625)
+
+        def raw_write(run_index):
+            rows = run_rows[run_index]
+            return {"rows": rows, "bytes": rows * 24, "verification": {
+                "expected_rows": rows, "actual_rows": rows,
+                "expected_checksum": f"raw-{run_index}",
+                "actual_checksum": f"raw-{run_index}",
+            }}
+
+        operations["raw_write"] = raw_write
+        report = self.benchmark(operations=operations).run()
+        self.assertEqual(report["capacity"]["bytes_per_raw_row"], 24)
+        self.assertEqual(report["capacity"]["measured_raw_rows"], sum(run_rows))
+        self.assertEqual(report["capacity"]["measured_raw_bytes"], sum(run_rows) * 24)
+
     def test_offset_target_mismatch_and_failed_slo_are_fail_closed(self):
         operations = self.operations()
         operations["page_deep"] = lambda _run: {
@@ -99,6 +124,27 @@ class StorageV2BenchmarkTest(unittest.TestCase):
             "query_plan": "ReadFromMergeTree", "query_sql": "SELECT bars OFFSET 10000",
         }
         with self.assertRaisesRegex(RuntimeError, "no-OFFSET"):
+            self.benchmark(operations=operations).run()
+
+        operations = self.operations()
+        deep = operations["page_deep"](0)
+        deep["explain_after"] += 60
+        operations["page_deep"] = lambda _run: dict(deep)
+        with self.assertRaisesRegex(RuntimeError, "depth cursor are not bound"):
+            self.benchmark(operations=operations).run()
+
+        operations = self.operations()
+        deep = operations["page_deep"](0)
+        deep["depth_after"] += 60
+        operations["page_deep"] = lambda _run: dict(deep)
+        with self.assertRaisesRegex(RuntimeError, "depth cursor are not bound"):
+            self.benchmark(operations=operations).run()
+
+        operations = self.operations()
+        deep = operations["page_deep"](0)
+        deep["cursor_predicate"] = "2026-07-01 01:00:00.000"
+        operations["page_deep"] = lambda _run: dict(deep)
+        with self.assertRaisesRegex(RuntimeError, "depth cursor are not bound"):
             self.benchmark(operations=operations).run()
 
         operations = self.operations()
@@ -300,7 +346,9 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
                     )[0])
                 stored = database.client.query(
                     "SELECT sum(bytes_on_disk) FROM system.parts WHERE active "
-                    "AND database=currentDatabase() AND table='market_bar_raw'"
+                    "AND database=currentDatabase() AND table='market_bar_raw' "
+                    "AND partition={partition:String}",
+                    parameters={"partition": run_start.strftime("%Y%m")},
                 ).result_rows[0][0] or 1
                 return {"rows": len(run_rows), "bytes": int(stored),
                         "verification": {"expected_rows": len(expected_rows),
@@ -371,7 +419,21 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
                             "actual_checksum": f"cold-count-{count}"}}
 
             def plan_query(_run_index, after=None):
-                predicate = "" if after is None else "AND bar_time > toDateTime64('2026-07-01 01:00:00',3,'UTC')"
+                predicate = ""
+                cursor_depth = 0
+                if after is not None:
+                    after_at = datetime.fromtimestamp(int(after), timezone.utc)
+                    predicate = (
+                        "AND bar_time > toDateTime64('" +
+                        after_at.strftime("%Y-%m-%d %H:%M:%S.000") + "',3,'UTC')"
+                    )
+                    cursor_depth = int(database.client.query(
+                        "SELECT count() FROM market_bar_canonical FINAL WHERE "
+                        "symbol='B0000' AND interval='1m' AND adjustment='raw' "
+                        "AND bar_time >= {start:DateTime64(3)} "
+                        "AND bar_time <= {after:DateTime64(3)}",
+                        parameters={"start": start, "after": after_at},
+                    ).result_rows[0][0])
                 sql = (
                     "SELECT * FROM market_bar_canonical FINAL WHERE symbol='B0000' "
                     "AND interval='1m' AND adjustment='raw' " + predicate +
@@ -383,7 +445,14 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
                 result = query_operation(0, after)
                 result["query_plan"] = " ".join(row[0] for row in explanation)
                 result["query_sql"] = sql
-                result["cursor_depth"] = 0 if after is None else 4600
+                result["cursor_depth"] = cursor_depth
+                result["query_after"] = after
+                result["explain_after"] = after
+                result["depth_after"] = after
+                result["cursor_predicate"] = (
+                    "" if after is None else
+                    after_at.strftime("%Y-%m-%d %H:%M:%S.000")
+                )
                 return result
 
             def archive_operation(run_index):
