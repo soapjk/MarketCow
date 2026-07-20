@@ -89,6 +89,12 @@ class Stage1FundamentalRepository:
         "query_fundamentals",
         "replace_statement_rows",
         "get_statement_rows",
+        "upsert_baostock",
+        "get_baostock",
+        "replace_tdx_period",
+        "get_tdx",
+        "tdx_coverage",
+        "get_tdx_history",
     }
 
     def __init__(self, postgres_repository: Any, duckdb_repository: Warehouse):

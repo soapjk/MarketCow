@@ -11,7 +11,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from .postgres_migrations import POSTGRES_MIGRATIONS
-from .storage import FUNDAMENTAL_COLUMNS
+from .storage import FUNDAMENTAL_COLUMNS, TDX_COLUMNS
 
 
 class PostgresDatabase:
@@ -352,6 +352,123 @@ class PostgresRepository(_PostgresControlPlaneRepository):
         for row in rows:
             row["payload"] = row.pop("payload_json")
         return rows
+
+    def upsert_baostock(self, row: Dict[str, Any]) -> None:
+        columns = [
+            "symbol", "report_period", "published_at", "trade_date", "close",
+            "pe_ttm", "pb_mrq", "ps_ttm", "pcf_ncf_ttm", "trade_status", "is_st",
+            "roe_avg", "net_margin", "gross_margin", "net_profit_all", "eps_ttm",
+            "total_share", "current_ratio", "quick_ratio", "liability_to_asset",
+            "asset_turnover", "inventory_turnover", "net_profit_yoy", "equity_yoy",
+            "asset_yoy", "cfo_to_revenue", "cfo_to_net_profit", "dupont_roe",
+            "payload_json", "fetched_at", "source", "source_url", "observed_at",
+            "ingested_at", "raw_response_locator", "raw_path", "raw_artifact_id",
+        ]
+        assignments = [column for column in columns if column not in {"symbol", "report_period"}]
+        statement = sql.SQL(
+            "INSERT INTO baostock_snapshot ({columns}) VALUES ({values}) "
+            "ON CONFLICT (symbol, report_period) DO UPDATE SET {assignments}"
+        ).format(
+            columns=sql.SQL(", ").join(map(sql.Identifier, columns)),
+            values=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+            assignments=sql.SQL(", ").join(
+                sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(column), sql.Identifier(column))
+                for column in assignments
+            ),
+        )
+        values = [
+            Jsonb(row.get("payload", row.get("payload_json", {})))
+            if column == "payload_json" else row.get(column)
+            for column in columns
+        ]
+        with self.database.connection() as connection:
+            connection.execute(statement, values)
+
+    def get_baostock(self, symbol: str, report_period: str) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM baostock_snapshot WHERE symbol = %s AND report_period = %s",
+                (symbol, report_period),
+            ).fetchone()
+        if row is not None:
+            row["payload"] = row.pop("payload_json")
+        return row
+
+    def replace_tdx_period(self, report_period: str, rows: List[Dict[str, Any]]) -> int:
+        columns = list(TDX_COLUMNS)
+        insert = sql.SQL("INSERT INTO tdx_financial_snapshot ({}) VALUES ({})").format(
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        )
+        history_columns = columns + ["version_id"]
+        insert_history = sql.SQL(
+            "INSERT INTO tdx_financial_snapshot_history ({}) VALUES ({})"
+        ).format(
+            sql.SQL(", ").join(map(sql.Identifier, history_columns)),
+            sql.SQL(", ").join(sql.Placeholder() for _ in history_columns),
+        )
+        with self.database.connection() as connection:
+            connection.execute(
+                "DELETE FROM tdx_financial_snapshot WHERE report_period = %s",
+                (report_period,),
+            )
+            for row in rows:
+                values = [row.get(column) for column in columns]
+                connection.execute(insert, values)
+                connection.execute(insert_history, values + [uuid.uuid4().hex])
+        return len(rows)
+
+    def get_tdx(self, symbol: str, report_period: str) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM tdx_financial_snapshot WHERE symbol = %s AND report_period = %s",
+                (symbol, report_period),
+            ).fetchone()
+
+    def tdx_coverage(self) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                """
+                SELECT report_period, COUNT(*) AS row_count,
+                       MIN(published_at) AS min_published_at,
+                       MAX(published_at) AS max_published_at, MAX(fetched_at) AS fetched_at
+                FROM tdx_financial_snapshot
+                GROUP BY report_period ORDER BY report_period DESC
+                """
+            ).fetchall())
+
+    def get_tdx_history(
+        self, symbol: str, annual_only: bool = False, limit: int = 40,
+        as_of: str = "",
+    ) -> List[Dict[str, Any]]:
+        where, params = ["symbol = %s"], [symbol]
+        if annual_only:
+            where.append("RIGHT(report_period, 4) = '1231'")
+        table = "tdx_financial_snapshot"
+        if as_of:
+            table = "tdx_financial_snapshot_history"
+            where.extend([
+                "published_at IS NOT NULL AND published_at <= %s",
+                "CAST(COALESCE(observed_at, ingested_at, fetched_at) AS DATE) <= CAST(%s AS DATE)",
+            ])
+            params.extend([as_of, as_of])
+        params.append(limit)
+        selected = ", ".join(TDX_COLUMNS)
+        if as_of:
+            query = (
+                f"SELECT {selected} FROM (SELECT *, ROW_NUMBER() OVER ("
+                "PARTITION BY symbol, report_period ORDER BY "
+                "COALESCE(ingested_at, fetched_at) DESC, version_id DESC) AS revision_rank "
+                f"FROM {table} WHERE {' AND '.join(where)}) revisions "
+                "WHERE revision_rank = 1 ORDER BY report_period DESC LIMIT %s"
+            )
+        else:
+            query = (
+                f"SELECT {selected} FROM {table} WHERE {' AND '.join(where)} "
+                "ORDER BY report_period DESC LIMIT %s"
+            )
+        with self.database.connection() as connection:
+            return list(connection.execute(query, params).fetchall())
 
     def latest_artifact(
         self, dataset: str, metadata_key: str = "", metadata_value: str = ""

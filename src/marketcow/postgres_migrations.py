@@ -121,4 +121,52 @@ POSTGRES_MIGRATIONS = [
             ON financial_statement_rows (symbol, report_date, published_at, ingested_at);
         """,
     ),
+    (
+        3,
+        "BaoStock snapshots and immutable TDX financial history",
+        """
+        CREATE TABLE IF NOT EXISTS baostock_snapshot (
+            symbol TEXT NOT NULL, report_period TEXT NOT NULL, published_at TEXT,
+            trade_date TEXT, close DOUBLE PRECISION, pe_ttm DOUBLE PRECISION,
+            pb_mrq DOUBLE PRECISION, ps_ttm DOUBLE PRECISION, pcf_ncf_ttm DOUBLE PRECISION,
+            trade_status INTEGER, is_st BOOLEAN, roe_avg DOUBLE PRECISION,
+            net_margin DOUBLE PRECISION, gross_margin DOUBLE PRECISION,
+            net_profit_all DOUBLE PRECISION, eps_ttm DOUBLE PRECISION,
+            total_share DOUBLE PRECISION, current_ratio DOUBLE PRECISION,
+            quick_ratio DOUBLE PRECISION, liability_to_asset DOUBLE PRECISION,
+            asset_turnover DOUBLE PRECISION, inventory_turnover DOUBLE PRECISION,
+            net_profit_yoy DOUBLE PRECISION, equity_yoy DOUBLE PRECISION,
+            asset_yoy DOUBLE PRECISION, cfo_to_revenue DOUBLE PRECISION,
+            cfo_to_net_profit DOUBLE PRECISION, dupont_roe DOUBLE PRECISION,
+            payload_json JSONB NOT NULL DEFAULT '{}'::jsonb, fetched_at TEXT,
+            source TEXT, source_url TEXT, observed_at TEXT, ingested_at TEXT,
+            raw_response_locator TEXT, raw_path TEXT, raw_artifact_id TEXT,
+            PRIMARY KEY (symbol, report_period)
+        );
+        CREATE TABLE IF NOT EXISTS tdx_financial_snapshot (
+            symbol TEXT NOT NULL, report_period TEXT NOT NULL, published_at TEXT,
+            roe_weighted DOUBLE PRECISION, eps DOUBLE PRECISION,
+            eps_adjusted DOUBLE PRECISION, book_value_per_share DOUBLE PRECISION,
+            ocf_per_share DOUBLE PRECISION, cash DOUBLE PRECISION,
+            accounts_receivable DOUBLE PRECISION, inventory DOUBLE PRECISION,
+            total_assets DOUBLE PRECISION, total_liabilities DOUBLE PRECISION,
+            total_equity DOUBLE PRECISION, revenue DOUBLE PRECISION,
+            revenue_ttm DOUBLE PRECISION, net_profit_parent DOUBLE PRECISION,
+            net_profit_parent_ttm DOUBLE PRECISION, operating_cashflow DOUBLE PRECISION,
+            capex DOUBLE PRECISION, source_file TEXT, source TEXT, source_url TEXT,
+            observed_at TEXT, ingested_at TEXT, raw_response_locator TEXT,
+            raw_path TEXT, raw_artifact_id TEXT, fetched_at TEXT,
+            PRIMARY KEY (symbol, report_period)
+        );
+        CREATE TABLE IF NOT EXISTS tdx_financial_snapshot_history (
+            LIKE tdx_financial_snapshot INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY
+        );
+        ALTER TABLE tdx_financial_snapshot_history ADD COLUMN IF NOT EXISTS version_id TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS tdx_history_version_idx
+            ON tdx_financial_snapshot_history (version_id);
+        CREATE INDEX IF NOT EXISTS tdx_history_pit_idx
+            ON tdx_financial_snapshot_history
+                (symbol, report_period, published_at, ingested_at);
+        """,
+    ),
 ]

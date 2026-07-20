@@ -36,7 +36,7 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
             versions = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1, 2])
+        self.assertEqual([row["version"] for row in versions], [1, 2, 3])
 
         run = ["run-1", "fixture", "running", None, "2026-07-20T00:00:00+00:00", None, 0, None]
         self.repository.save_run(run)
@@ -115,6 +115,38 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(available[0]["payload"], {"revenue": 123.0})
         self.assertEqual(unavailable, [])
+
+    def test_baostock_and_tdx_history_round_trip(self):
+        now = "2026-05-01"
+        self.fundamentals.upsert_baostock({
+            "symbol": "600298", "report_period": "20260331",
+            "published_at": "2026-04-30", "trade_date": "2026-04-30",
+            "pe_ttm": 20.5, "roe_avg": 8.0, "payload": {"provider": "baostock"},
+            "observed_at": now, "ingested_at": now, "fetched_at": now,
+        })
+        baostock = self.fundamentals.get_baostock("600298", "20260331")
+        self.assertEqual(baostock["payload"], {"provider": "baostock"})
+
+        first = {
+            "symbol": "600298", "report_period": "20251231",
+            "published_at": "2026-04-30", "roe_weighted": 15.0,
+            "revenue_ttm": 100.0, "net_profit_parent_ttm": 10.0,
+            "source": "tdx", "observed_at": now, "ingested_at": now,
+            "fetched_at": now,
+        }
+        self.fundamentals.replace_tdx_period("20251231", [first])
+        revised = {
+            **first, "roe_weighted": 16.0, "observed_at": "2026-07-01",
+            "ingested_at": "2026-07-01", "fetched_at": "2026-07-01",
+        }
+        self.fundamentals.replace_tdx_period("20251231", [revised])
+        current = self.fundamentals.get_tdx("600298", "20251231")
+        pit = self.fundamentals.get_tdx_history(
+            "600298", annual_only=True, as_of="2026-06-01"
+        )
+        self.assertEqual(current["roe_weighted"], 16.0)
+        self.assertEqual(pit[0]["roe_weighted"], 15.0)
+        self.assertEqual(self.fundamentals.tdx_coverage()[0]["row_count"], 1)
 
 
 if __name__ == "__main__":
