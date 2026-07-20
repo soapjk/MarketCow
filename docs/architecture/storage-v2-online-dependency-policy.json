@@ -21,6 +21,7 @@
     "marketcow.offline_incremental_catchup",
     "marketcow.offline_copy_validator",
     "marketcow.v2_backup_restore",
+    "marketcow.v2_benchmark",
     "marketcow.local_backfill",
     "marketcow.local_benchmark",
     "marketcow.local_restore"

@@ -1761,7 +1761,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：无 DuckDB label/探针；基数有界、脱敏、并发安全、fail-open；运维变更串行可追溯。
 - **必要测试**：时钟/并发/故障、配额/权限/损坏、schema golden、PG/CH outage→recovery。
 - **排除项**：外部告警、dashboard 和 production 运维。
-- **状态**：`本地实现完成，待独立验收`。新增版本化 `storage-v2.pg-ch-telemetry.v1` 在线契约，
+- **状态**：`已验收（d592d77）`。新增版本化 `storage-v2.pg-ch-telemetry.v1` 在线契约，
   仅发布固定 PG/CH、authoritative write/replay、WAL/quarantine/dead-letter、canonical queue/rebuild/lag、
   cache freshness、backup/restore、operator 与 ClickHouse pressure 指标；单位、histogram buckets、label 枚举、
   metric series 上限、200 条环形日志与 1000 字符文本上限均可机器读取。V2 snapshot 会拒绝/过滤 DuckDB 与
@@ -1781,7 +1781,16 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：固定方法、目标 checksum、真实深 keyset、运行中峰值、完整 SLO；无 OFFSET 或 DuckDB benchmark。
 - **必要测试**：disposable PG+CH benchmark、负向 bound gate、默认/契约回归、短 soak。
 - **排除项**：production 容量采购承诺和真实数据基准。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 offline-only `storage-v2.pg-ch-benchmark.v1` 门禁，
+  固定 13 个方法与三轮样本：ClickHouse distinct raw batch、共享 FINAL canonical、warm existing session、cold new
+  connection、first/tail keyset+同 cursor EXPLAIN/depth、独立月份 Parquet、verified PG/CH restore、authoritative WAL
+  replay、PG/CH concurrent query、system.parts/merges/disks、PostgreSQL repeatable-read/PIT 事务和短 soak reconcile。
+  每个 operation 必须声明 PostgreSQL/ClickHouse/local spool/local backup 后端并提供独立目标回读 row-count/content
+  checksum，任何 DuckDB backend、缺 target read、方法篡改或 checksum 差异立即失败。沿用运行中线程/RSS 峰值采样、
+  真实深游标三方绑定与 OFFSET 禁令、三轮增量 bytes/rows 容量公式、merge/free reserve、archive compression、
+  backup/restore/spool throughput SLO；新增 PG transaction throughput 与累计至少 30 次、零 mismatch 的短 soak 闸门。
+  报告原子发布、完整 SLO/method/样本/轮次预声明、敏感扫描且结果非全 true 时抛错；在线依赖图将该工具隔离为
+  offline-only，未启动 BG-019。
 
 ### `BG-019`：本地蓝绿切换与整体回滚演练
 
