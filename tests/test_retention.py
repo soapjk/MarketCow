@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from marketcow.cold_archive import ParquetColdArchive
-from marketcow.retention import RetentionDryRun, RetentionPolicy
+from marketcow.retention import MAX_ARTIFACTS, MAX_HOLDS, RetentionDryRun, RetentionPolicy
 from marketcow.storage import Warehouse
 
 
@@ -62,12 +62,15 @@ class RetentionDryRunTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first["candidate_count"], 1)
         self.assertEqual(first["mutations_performed"], 0)
+        self.assertEqual(first["action"], "candidate_only_no_delete")
         candidate = first["candidates"][0]
         self.assertTrue(candidate["cold_query_equivalent"])
         self.assertEqual(candidate["estimated_reclaim_bytes"],
                          first["estimated_reclaim_bytes"])
         self.assertTrue(candidate["manifest_payload_sha256"])
         self.assertTrue(candidate["parquet_sha256"])
+        self.assertEqual(candidate["policy_sha256"], first["policy_sha256"])
+        self.assertEqual(candidate["input_sha256"], first["input_sha256"])
 
     def test_hold_and_source_specific_policy_exclude(self):
         self.insert(source="long_hold_source")
@@ -135,6 +138,66 @@ class RetentionDryRunTest(unittest.TestCase):
             RetentionPolicy(default_retain_days=1)
         with self.assertRaisesRegex(ValueError, "timezone"):
             self.planner.dry_run([], "2026-01-01T00:00:00")
+
+    def test_policy_defensively_freezes_and_normalizes_external_rules(self):
+        rules = {" fixture ": 180}
+        policy = RetentionPolicy(source_retain_days=rules)
+        before = policy.document()
+        rules[" fixture "] = 365
+        rules["new"] = 90
+        self.assertEqual(policy.days_for("fixture"), 180)
+        self.assertEqual(policy.document(), before)
+        with self.assertRaises(TypeError):
+            policy.source_retain_days["fixture"] = 365
+        for invalid in ({"x": True}, {"x": 30.0}, {1: 30}):
+            with self.assertRaisesRegex(ValueError, "source retention"):
+                RetentionPolicy(source_retain_days=invalid)
+        with self.assertRaisesRegex(ValueError, "retention"):
+            RetentionPolicy(default_retain_days=True)
+
+    def test_single_artifact_read_failure_does_not_hide_healthy_candidate(self):
+        self.insert(source="fixture")
+        healthy = self.artifact("fixture")
+        self.insert(source="second")
+        failing = self.artifact("second")
+        real_coverage = self.planner._coverage
+
+        def coverage(artifact, manifest):
+            if Path(artifact) == failing:
+                raise PermissionError("password=secret /Volumes/T9/private")
+            return real_coverage(artifact, manifest)
+
+        with patch.object(self.planner, "_coverage", side_effect=coverage):
+            report = self.planner.dry_run(
+                [failing, healthy], "2026-01-01T00:00:00Z"
+            )
+        self.assertEqual(report["candidate_count"], 1)
+        self.assertEqual(report["excluded_count"], 1)
+        self.assertEqual(report["excluded"][0]["reason"], "artifact_read_failed")
+        rendered = str(report)
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("/Volumes/T9/private", rendered)
+
+    def test_input_limits_and_complete_no_mutation_schema(self):
+        with self.assertRaisesRegex(ValueError, "artifacts exceed"):
+            self.planner.dry_run(
+                [Path(f"artifact-{index}") for index in range(MAX_ARTIFACTS + 1)],
+                "2026-01-01T00:00:00Z",
+            )
+        with self.assertRaisesRegex(ValueError, "holds exceed"):
+            self.planner.dry_run(
+                [], "2026-01-01T00:00:00Z",
+                [f"hold-{index}" for index in range(MAX_HOLDS + 1)],
+            )
+        report = self.planner.dry_run([], "2026-01-01T00:00:00Z")
+        self.assertEqual(report["limits"], {
+            "artifacts": MAX_ARTIFACTS, "holds": MAX_HOLDS,
+            "excluded": MAX_ARTIFACTS,
+        })
+        self.assertEqual(report["action"], "candidate_only_no_delete")
+        self.assertEqual(report["mutations_performed"], 0)
+        self.assertTrue(report["policy_sha256"])
+        self.assertTrue(report["input_sha256"])
 
 
 class duckdb_connection:
