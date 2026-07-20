@@ -160,6 +160,27 @@ class V2FactoryTest(unittest.TestCase):
                 "close:clickhouse", "close:postgres"
             ])
 
+    def test_postgres_probe_timeouts_are_explicitly_forwarded(self):
+        with tempfile.TemporaryDirectory(suffix="-test") as folder:
+            captured = {}
+            dependencies = self.dependencies([])
+            original = dependencies.postgres_database
+
+            def postgres(*args, **kwargs):
+                captured.update(kwargs)
+                return original(*args, **kwargs)
+
+            resources = create_v2_online_repositories(
+                self.settings(Path(folder)),
+                V2FactoryDependencies(**{
+                    **dependencies.__dict__, "postgres_database": postgres,
+                }),
+            )
+            resources.close()
+            self.assertEqual(captured, {
+                "connect_timeout": 2.0, "read_timeout": 5.0,
+            })
+
     def test_partial_startup_failures_close_all_prior_connections(self):
         for failure, expected in (
             ("postgres", ["close:postgres"]),

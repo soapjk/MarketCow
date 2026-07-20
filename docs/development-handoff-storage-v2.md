@@ -1576,6 +1576,8 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
   均使用有界逻辑标识和原因。必要 PG/main CH/WAL probe 故障立即 fail-closed，压力、backlog 与 lag 使用持续窗口，
   恢复使用 60 秒滞回；disabled scheduler 明确报告 disabled 而不伪装 active healthy。V2 health/readiness 和
   doctor 不读取 database_path、不导入 DuckDB，完整响应不包含 DSN、凭证、异常原文或绝对路径；legacy 路径不变。
+  PostgreSQL 必要依赖探测不是 pool maintenance check，而是按 BG-002 显式 connect timeout 借出连接、按显式
+  read timeout 设置 statement timeout 后同步执行只读 `SELECT 1`；获取、执行或返回值异常均立即 unavailable。
 
 ### `BG-010`：旧 main API 契约捕获器
 

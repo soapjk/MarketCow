@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
 from psycopg import sql
+from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -19,16 +20,31 @@ class PostgresDatabase:
     """Development-only PostgreSQL connection and schema migration boundary."""
 
     def __init__(
-        self, dsn: str, schema: str, min_size: int = 1, max_size: int = 4
+        self, dsn: str, schema: str, min_size: int = 1, max_size: int = 4,
+        connect_timeout: float = 2.0, read_timeout: float = 5.0,
     ) -> None:
+        if not 0.1 <= connect_timeout <= 30 or not 0.1 <= read_timeout <= 60:
+            raise ValueError("PostgreSQL timeout bounds are invalid")
         self.schema = schema
+        self.connect_timeout = float(connect_timeout)
+        self.read_timeout = float(read_timeout)
         self.pool = ConnectionPool(
-            dsn,
+            make_conninfo(dsn, connect_timeout=max(1, int(connect_timeout + .999))),
             min_size=min_size,
             max_size=max_size,
             open=False,
             kwargs={"row_factory": dict_row},
         )
+
+    def health_probe(self) -> bool:
+        """Synchronously borrow a connection and execute a bounded read-only probe."""
+        with self.pool.connection(timeout=self.connect_timeout) as connection:
+            connection.execute(
+                "SELECT set_config('statement_timeout', %s, true)",
+                (f"{max(1, int(self.read_timeout * 1000))}ms",),
+            )
+            row = connection.execute("SELECT 1 AS probe_value").fetchone()
+            return bool(row and row["probe_value"] == 1)
 
     def open(self) -> None:
         self.pool.open(wait=True)

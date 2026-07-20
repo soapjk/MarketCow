@@ -91,7 +91,8 @@ class V2OnlineRepositories:
     def health_snapshot(self) -> dict[str, Any]:
         """Bounded logical-only dependency snapshot; never exposes connection details."""
         pg = self._safe_status(
-            lambda: self.postgres_database.pool.check(),
+            lambda: self.postgres_database.health_probe() or
+            (_ for _ in ()).throw(RuntimeError("probe failed")),
             f"postgresql://{self.postgres_database.schema}",
         )
         main = self._safe_status(
@@ -177,7 +178,9 @@ def create_v2_online_repositories(
     created: list[Any] = []
     try:
         postgres_database = deps.postgres_database(
-            settings.postgres_dsn, settings.postgres_schema
+            settings.postgres_dsn, settings.postgres_schema,
+            connect_timeout=settings.postgres_connect_timeout,
+            read_timeout=settings.postgres_read_timeout,
         )
         created.append(postgres_database)
         postgres_database.open()

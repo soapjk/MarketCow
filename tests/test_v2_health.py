@@ -13,6 +13,7 @@ from marketcow.__main__ import diagnose
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.health import V2_HEALTH_SCHEMA, V2HealthEvaluator, V2_THRESHOLDS
+from marketcow.postgres_repositories import PostgresDatabase
 
 
 class Clock:
@@ -153,6 +154,68 @@ class V2HealthTest(unittest.TestCase):
                 failed = diagnose(config)
             self.assertEqual(failed["status"], "attention")
             self.assertNotIn("secret", json.dumps(failed))
+
+    def test_factory_snapshot_requires_successful_postgres_select(self):
+        database = SimpleNamespace(
+            schema="marketcow_test", health_probe=MagicMock(return_value=True)
+        )
+        clickhouse = SimpleNamespace(
+            database="marketcow_test",
+            _require_client=lambda: SimpleNamespace(ping=lambda: True),
+        )
+        spool = SimpleNamespace(
+            quarantine=Path("quarantine"),
+            diagnostics=lambda _limit: {"pending": 0, "failed": 0, "replayed": 0,
+                                        "truncated": False, "quota": {
+                                            "bytes": 0, "free_bytes": 1000,
+                                        }},
+            _bounded_files=lambda *_args: ([], False),
+        )
+        from marketcow.v2_factory import V2OnlineRepositories
+        resources = V2OnlineRepositories(
+            postgres_database=database, postgres_repository=object(),
+            clickhouse_database=clickhouse, market_bars=object(),
+            telemetry=SimpleNamespace(snapshot=lambda: {"metrics": []}), spool=spool,
+            writer=object(), canonical_builder=object(), canonical_scheduler=None,
+        )
+        self.assertEqual(resources.health_snapshot()["components"]["postgresql"][
+            "status"], "healthy")
+        database.health_probe.return_value = False
+        self.assertEqual(resources.health_snapshot()["components"]["postgresql"][
+            "status"], "unavailable")
+        database.health_probe.side_effect = RuntimeError(
+            "postgresql://user:secret@127.0.0.1/db /Volumes/T9/private"
+        )
+        rendered = json.dumps(resources.health_snapshot())
+        self.assertIn('"status": "unavailable"', rendered)
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("/Volumes", rendered)
+
+    def test_postgres_probe_binds_acquisition_and_statement_timeouts(self):
+        executed = []
+
+        class Connection:
+            def execute(self, statement, parameters=None):
+                executed.append((statement, parameters))
+                return self
+
+            def fetchone(self):
+                return {"probe_value": 1}
+
+        class Borrow:
+            def __enter__(self): return Connection()
+            def __exit__(self, *_args): return None
+
+        pool = MagicMock()
+        pool.connection.return_value = Borrow()
+        database = PostgresDatabase.__new__(PostgresDatabase)
+        database.pool = pool
+        database.connect_timeout = 1.25
+        database.read_timeout = 3.5
+        self.assertTrue(database.health_probe())
+        pool.connection.assert_called_once_with(timeout=1.25)
+        self.assertEqual(executed[0][1], ("3500ms",))
+        self.assertIn("SELECT 1", executed[1][0])
 
 
 if __name__ == "__main__":
