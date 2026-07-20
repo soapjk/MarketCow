@@ -1534,10 +1534,13 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **必要测试**：依赖注入、连接顺序、部分启动失败清理、资源关闭、DuckDB open/import trap。
 - **排除项**：Service/API 启动切换。
 - **状态**：`本地实施完成，待独立验收`。新增唯一 `marketcow.v2_factory` 装配入口，纯预检后按
-  PostgreSQL → ClickHouse → telemetry/spool/writer/builder/scheduler 顺序创建，显式暴露 18 个 PG
+  PostgreSQL → main ClickHouse → telemetry/spool/main writer → 独立 scheduler ClickHouse/repository/
+  writer/builder → scheduler 顺序创建，显式暴露 18 个 PG
   权威事务域和 direct ClickHouse `MarketBarRepository`。部分启动失败关闭全部既有连接，正常关闭按
-  scheduler → ClickHouse → PostgreSQL 反序且幂等；scheduler disabled 不创建线程、lease、额外连接或
-  scheduler 目录。传递依赖门禁把本工厂列为 online entrypoint 并禁止 DuckDB/Warehouse/shadow/offline。
+  scheduler → scheduler ClickHouse → main ClickHouse → PostgreSQL 反序且幂等。主 writer 只负责 raw
+  commit/replay 后向 scheduler durable queue 提交，worker builder 使用独立 client/session，绝不与在线
+  repository/writer 并发复用；scheduler disabled 不创建线程、lease、额外连接或 scheduler 目录。传递依赖
+  门禁把本工厂列为 online entrypoint 并禁止 DuckDB/Warehouse/shadow/offline。
   旧 Service/API 仍保持原装配，留待 BG-008。
 
 ### `BG-008`：Service 与 API 去 DuckDB 化

@@ -58,8 +58,14 @@ class V2FactoryTest(unittest.TestCase):
                 self.telemetry = None
 
         class Scheduler(Resource):
-            def bind_writer(self, _writer):
+            def bind_writer(self, writer):
                 events.append("bind:scheduler")
+                writer.bound_scheduler = self
+
+        class Writer:
+            def __init__(self, name):
+                self.name = name
+                self.bound_scheduler = None
 
         def scheduler(enabled, **_kwargs):
             events.append("scheduler:" + str(enabled).lower())
@@ -70,17 +76,53 @@ class V2FactoryTest(unittest.TestCase):
                 raise RuntimeError("startup failed")
             return resource
 
+        clickhouse_count = 0
+
+        def clickhouse_database(**_kwargs):
+            nonlocal clickhouse_count
+            clickhouse_count += 1
+            name = "clickhouse" if clickhouse_count == 1 else "scheduler_clickhouse"
+            return Resource(name)
+
+        repository_count = 0
+
+        def clickhouse_repository(database):
+            nonlocal repository_count
+            repository_count += 1
+            name = "ch_repository" if repository_count == 1 else "scheduler_repository"
+            events.append("create:" + name)
+            if fail == name:
+                raise RuntimeError("startup failed")
+            return database
+
+        writer_count = 0
+
+        def writer(*_args, **_kwargs):
+            nonlocal writer_count
+            writer_count += 1
+            name = "writer" if writer_count == 1 else "scheduler_writer"
+            events.append("create:" + name)
+            if fail == name:
+                raise RuntimeError("startup failed")
+            return Writer(name)
+
+        def builder(*_args, **_kwargs):
+            name = ("scheduler_builder"
+                    if _args[0].name == "scheduler_clickhouse" else "builder")
+            events.append("create:" + name)
+            if fail == name:
+                raise RuntimeError("startup failed")
+            return {"name": name, "repository": _args[0], "writer": _args[1]}
+
         return V2FactoryDependencies(
             postgres_database=lambda *_a, **_k: Resource("postgres"),
             postgres_repository=lambda db: (events.append("create:pg_repository"), db)[1],
-            clickhouse_database=lambda **_k: Resource("clickhouse"),
-            clickhouse_repository=lambda db: (events.append("create:ch_repository"), db)[1],
+            clickhouse_database=clickhouse_database,
+            clickhouse_repository=clickhouse_repository,
             telemetry=lambda **_k: (events.append("create:telemetry"), object())[1],
             spool=Spool,
-            writer=lambda *_a, **_k: (events.append("create:writer"), object())[1],
-            canonical_builder=lambda *_a, **_k: (
-                events.append("create:builder"), object()
-            )[1],
+            writer=writer,
+            canonical_builder=builder,
             canonical_scheduler=scheduler,
         )
 
@@ -95,12 +137,27 @@ class V2FactoryTest(unittest.TestCase):
                                 for value in resources.transaction_domains.values()))
             self.assertLess(events.index("open:postgres"), events.index("open:clickhouse"))
             self.assertLess(events.index("open:clickhouse"), events.index("create:spool"))
-            self.assertLess(events.index("create:spool"), events.index("create:builder"))
-            self.assertLess(events.index("create:builder"), events.index("create:scheduler"))
+            self.assertLess(events.index("create:spool"),
+                            events.index("open:scheduler_clickhouse"))
+            self.assertNotIn("create:builder", events)
+            self.assertLess(events.index("open:scheduler_clickhouse"),
+                            events.index("create:scheduler_repository"))
+            self.assertLess(events.index("create:scheduler_builder"),
+                            events.index("create:scheduler"))
+            self.assertIsNot(resources.clickhouse_database,
+                             resources.scheduler_clickhouse_database)
+            self.assertIsNot(resources.market_bars, resources.scheduler_market_bars)
+            self.assertIsNot(resources.writer, resources.scheduler_writer)
+            self.assertIs(resources.writer.bound_scheduler,
+                          resources.canonical_scheduler)
+            self.assertIsNone(resources.scheduler_writer.bound_scheduler)
+            self.assertIs(resources.canonical_builder["repository"],
+                          resources.scheduler_market_bars)
             resources.close()
             resources.close()
-            self.assertEqual(events[-3:], [
-                "close:scheduler", "close:clickhouse", "close:postgres"
+            self.assertEqual(events[-4:], [
+                "close:scheduler", "close:scheduler_clickhouse",
+                "close:clickhouse", "close:postgres"
             ])
 
     def test_partial_startup_failures_close_all_prior_connections(self):
@@ -108,7 +165,21 @@ class V2FactoryTest(unittest.TestCase):
             ("postgres", ["close:postgres"]),
             ("clickhouse", ["close:clickhouse", "close:postgres"]),
             ("spool", ["close:clickhouse", "close:postgres"]),
-            ("scheduler", ["close:clickhouse", "close:postgres"]),
+            ("scheduler_clickhouse", [
+                "close:scheduler_clickhouse", "close:clickhouse", "close:postgres"
+            ]),
+            ("scheduler_repository", [
+                "close:scheduler_clickhouse", "close:clickhouse", "close:postgres"
+            ]),
+            ("scheduler_writer", [
+                "close:scheduler_clickhouse", "close:clickhouse", "close:postgres"
+            ]),
+            ("scheduler_builder", [
+                "close:scheduler_clickhouse", "close:clickhouse", "close:postgres"
+            ]),
+            ("scheduler", [
+                "close:scheduler_clickhouse", "close:clickhouse", "close:postgres"
+            ]),
         ):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory(
                 suffix="-test"
@@ -214,7 +285,7 @@ class V2FactoryIntegrationTest(unittest.TestCase):
                 runtime_config_schema="marketcow.v2-runtime-config.v1",
                 postgres_dsn_ref="MARKETCOW_TEST_POSTGRES_DSN",
                 clickhouse_password_ref="MARKETCOW_TEST_CLICKHOUSE_PASSWORD",
-                v2_allowed_root=root.parent, clickhouse_background_canonical=False,
+                v2_allowed_root=root.parent, clickhouse_background_canonical=True,
             )
             self.assertIn(parsed.hostname, {"127.0.0.1", "localhost", "::1"})
             resources = create_v2_online_repositories(settings)
@@ -226,7 +297,13 @@ class V2FactoryIntegrationTest(unittest.TestCase):
                         (settings.postgres_schema,),
                     ).fetchall()}
                 self.assertTrue(set(POSTGRES_TRANSACTION_DOMAINS).issubset(tables))
-                self.assertIsNone(resources.canonical_scheduler)
+                self.assertIsNotNone(resources.canonical_scheduler)
+                self.assertIsNot(resources.clickhouse_database.client,
+                                 resources.scheduler_clickhouse_database.client)
+                self.assertIsNot(resources.market_bars, resources.scheduler_market_bars)
+                self.assertIsNot(resources.writer, resources.scheduler_writer)
+                self.assertIs(resources.canonical_builder.repository,
+                              resources.scheduler_market_bars)
             finally:
                 resources.close()
                 resources.close()

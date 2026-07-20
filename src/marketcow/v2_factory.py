@@ -36,6 +36,8 @@ class V2OnlineRepositories:
         self, *, postgres_database: Any, postgres_repository: Any,
         clickhouse_database: Any, market_bars: Any, telemetry: Any, spool: Any,
         writer: Any, canonical_builder: Any, canonical_scheduler: Any,
+        scheduler_clickhouse_database: Any = None,
+        scheduler_market_bars: Any = None, scheduler_writer: Any = None,
     ) -> None:
         self.postgres_database = postgres_database
         self.postgres = postgres_repository
@@ -49,6 +51,9 @@ class V2OnlineRepositories:
         self.writer = writer
         self.canonical_builder = canonical_builder
         self.canonical_scheduler = canonical_scheduler
+        self.scheduler_clickhouse_database = scheduler_clickhouse_database
+        self.scheduler_market_bars = scheduler_market_bars
+        self.scheduler_writer = scheduler_writer
         self._closed = False
 
     def close(self) -> None:
@@ -59,6 +64,7 @@ class V2OnlineRepositories:
         errors = []
         for resource in (
             self.canonical_scheduler,
+            self.scheduler_clickhouse_database,
             self.clickhouse_database,
             self.postgres_database,
         ):
@@ -119,17 +125,47 @@ def create_v2_online_repositories(
         writer = deps.writer(
             market_bars, spool, batch_size=settings.clickhouse_batch_size
         )
-        canonical_builder = deps.canonical_builder(
-            market_bars,
-            writer,
-            source_priority=settings.clickhouse_source_priority,
-            rel_tol=settings.clickhouse_canonical_rel_tol,
-            abs_tol=settings.clickhouse_canonical_abs_tol,
-        )
+        scheduler_clickhouse_database = None
+        scheduler_market_bars = None
+        scheduler_writer = None
+        canonical_builder = None
+        if settings.clickhouse_background_canonical:
+            scheduler_clickhouse_database = deps.clickhouse_database(
+                host=settings.clickhouse_host,
+                port=settings.clickhouse_port,
+                database=settings.clickhouse_database,
+                username=settings.clickhouse_username,
+                password=settings.clickhouse_password,
+                secure=settings.clickhouse_secure,
+                connect_timeout=settings.clickhouse_connect_timeout,
+                read_timeout=settings.clickhouse_read_timeout,
+            )
+            created.append(scheduler_clickhouse_database)
+            scheduler_clickhouse_database.open()
+            scheduler_market_bars = deps.clickhouse_repository(
+                scheduler_clickhouse_database
+            )
+            scheduler_writer = deps.writer(
+                scheduler_market_bars, spool, batch_size=settings.clickhouse_batch_size
+            )
+            canonical_builder = deps.canonical_builder(
+                scheduler_market_bars,
+                scheduler_writer,
+                source_priority=settings.clickhouse_source_priority,
+                rel_tol=settings.clickhouse_canonical_rel_tol,
+                abs_tol=settings.clickhouse_canonical_abs_tol,
+            )
+        else:
+            canonical_builder = deps.canonical_builder(
+                market_bars,
+                writer,
+                source_priority=settings.clickhouse_source_priority,
+                rel_tol=settings.clickhouse_canonical_rel_tol,
+                abs_tol=settings.clickhouse_canonical_abs_tol,
+            )
         canonical_scheduler = deps.canonical_scheduler(
             settings.clickhouse_background_canonical,
-            builder=canonical_builder,
-            spool=spool,
+            builder=canonical_builder, spool=spool,
             canonical_limit=settings.clickhouse_auto_canonical_limit,
             queue_cap=settings.clickhouse_scheduler_queue_cap,
             scan_limit=settings.clickhouse_scheduler_scan_limit,
@@ -151,6 +187,9 @@ def create_v2_online_repositories(
             writer=writer,
             canonical_builder=canonical_builder,
             canonical_scheduler=canonical_scheduler,
+            scheduler_clickhouse_database=scheduler_clickhouse_database,
+            scheduler_market_bars=scheduler_market_bars,
+            scheduler_writer=scheduler_writer,
         )
     except Exception:
         for resource in reversed(created):
