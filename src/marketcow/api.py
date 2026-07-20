@@ -94,7 +94,7 @@ def create_app(
         include_past: bool = False,
     ):
         start, end = calendar_range(date_from, date_to, include_past=include_past)
-        events = service.warehouse.get_economic_calendar(start, end, country, impact, limit)
+        events = service.metadata_repository.get_economic_calendar(start, end, country, impact, limit)
         return {
             "count": len(events), "from": start, "to": end,
             "filter_timezone": "Asia/Shanghai", "past_events_excluded": not include_past,
@@ -105,7 +105,7 @@ def create_app(
     def economic_indicators(
         country: str = "US", source: str = "", limit: int = Query(50, ge=1, le=500)
     ):
-        indicators = service.warehouse.get_economic_indicators(country, source, limit)
+        indicators = service.metadata_repository.get_economic_indicators(country, source, limit)
         return {"count": len(indicators), "indicators": indicators}
 
     @app.get("/v1/earnings-calendar")
@@ -119,7 +119,7 @@ def create_app(
     ):
         start, end = calendar_range(date_from, date_to, include_past=include_past)
         requested = [item.strip().upper() for item in symbols.split(",") if item.strip()]
-        events = service.warehouse.get_earnings_calendar(start, end, market, requested, limit)
+        events = service.metadata_repository.get_earnings_calendar(start, end, market, requested, limit)
         return {
             "count": len(events), "from": start, "to": end,
             "filter_timezone": "Asia/Shanghai", "past_events_excluded": not include_past,
@@ -185,7 +185,7 @@ def create_app(
                 if refresh:
                     items.append(service.refresh_quote(normalized))
                 else:
-                    cached = service.warehouse.get_latest_quotes([normalized])
+                    cached = service.market_bar_repository.get_latest_quotes([normalized])
                     if cached:
                         items.extend(cached)
                     else:
@@ -227,7 +227,7 @@ def create_app(
                 result["bars"] = result["bars"][-limit:]
                 result["count"] = len(result["bars"])
                 return result
-            bars = service.warehouse.get_price_bars(normalized, interval, adjustment, limit)
+            bars = service.market_bar_repository.get_price_bars(normalized, interval, adjustment, limit)
             return {"symbol": normalized, "interval": interval, "adjustment": adjustment, "count": len(bars), "bars": bars, "cached": True}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -243,7 +243,7 @@ def create_app(
                 normalized, _ = normalize_yahoo_symbol(symbol)
             if refresh:
                 return service.refresh_quote(normalized)
-            cached = service.warehouse.get_latest_quotes([normalized])
+            cached = service.market_bar_repository.get_latest_quotes([normalized])
             if not cached:
                 raise HTTPException(status_code=404, detail="quote not cached")
             return cached[0]
@@ -270,7 +270,7 @@ def create_app(
             report_period = normalize_report_period(report_period)
         if as_of:
             as_of = parse_as_of(as_of)
-        rows = service.warehouse.query_fundamentals(
+        rows = service.fundamental_repository.query_fundamentals(
             limit=limit,
             offset=offset,
             symbol="".join(ch for ch in symbol if ch.isdigit()).zfill(6) if symbol else "",
@@ -286,7 +286,7 @@ def create_app(
     @app.get("/v1/fundamentals/{symbol}")
     def fundamental(symbol: str, report_period: str = "", as_of: str = ""):
         code = "".join(ch for ch in symbol if ch.isdigit()).zfill(6)
-        rows = service.warehouse.query_fundamentals(
+        rows = service.fundamental_repository.query_fundamentals(
             limit=1,
             symbol=code,
             report_period=normalize_report_period(report_period) if report_period else "",
@@ -306,7 +306,7 @@ def create_app(
     ):
         code = "".join(ch for ch in symbol if ch.isdigit()).zfill(6)
         normalized_as_of = parse_as_of(as_of)
-        rows = service.warehouse.get_statement_rows(code, statement, limit_periods, normalized_as_of)
+        rows = service.fundamental_repository.get_statement_rows(code, statement, limit_periods, normalized_as_of)
         return {"symbol": code, "count": len(rows), "as_of": normalized_as_of or None, "point_in_time": bool(normalized_as_of), "items": rows}
 
     @app.post("/v1/admin/fundamentals/refresh")
@@ -329,11 +329,11 @@ def create_app(
 
     @app.get("/v1/admin/jobs")
     def jobs(limit: int = Query(20, ge=1, le=200)):
-        return {"items": service.warehouse.latest_runs(limit)}
+        return {"items": service.metadata_repository.latest_runs(limit)}
 
     @app.get("/v1/admin/artifacts")
     def artifacts(dataset: str = "", limit: int = Query(100, ge=1, le=1000)):
-        rows = service.warehouse.list_artifacts(dataset, limit)
+        rows = service.artifact_store.list_artifacts(dataset, limit)
         return {"count": len(rows), "items": rows}
 
     @app.post("/v1/admin/artifacts/backfill")
@@ -364,7 +364,7 @@ def create_app(
 
     @app.get("/v1/sources/tdx/coverage")
     def tdx_coverage():
-        return {"periods": service.warehouse.tdx_coverage()}
+        return {"periods": service.fundamental_repository.tdx_coverage()}
 
     @app.get("/v1/validation/{symbol}")
     def validation(symbol: str, report_period: str):
@@ -382,18 +382,18 @@ def create_app(
     ):
         code = "".join(ch for ch in symbol if ch.isdigit()).zfill(6)
         normalized_as_of = parse_as_of(as_of)
-        rows = service.warehouse.get_tdx_history(code, annual_only, limit, normalized_as_of)
+        rows = service.fundamental_repository.get_tdx_history(code, annual_only, limit, normalized_as_of)
         return {"symbol": code, "count": len(rows), "as_of": normalized_as_of or None, "point_in_time": bool(normalized_as_of), "items": rows}
 
     @app.get("/v1/sources/health")
     def source_health():
-        return {"items": service.warehouse.provider_health()}
+        return {"items": service.metadata_repository.provider_health()}
 
     @app.get("/v1/validation/{symbol}/results")
     def validation_results(symbol: str, report_period: str):
         code = "".join(ch for ch in symbol if ch.isdigit()).zfill(6)
         period = normalize_report_period(report_period)
-        rows = service.warehouse.get_validation_results(code, period)
+        rows = service.fundamental_repository.get_validation_results(code, period)
         return {"symbol": code, "report_period": period, "count": len(rows), "items": rows}
 
     @app.post("/v1/admin/validation/rebuild")
@@ -421,7 +421,7 @@ def create_app(
         as_of: str = "",
     ):
         normalized_as_of = parse_as_of(as_of)
-        rows = service.warehouse.query_funnel_metrics(
+        rows = service.fundamental_repository.query_funnel_metrics(
             limit=limit,
             offset=offset,
             min_roe_median=min_roe_median,

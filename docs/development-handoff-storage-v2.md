@@ -49,7 +49,7 @@ https://github.com/soapjk/MarketCow
 ### Storage V2 开发工作区
 
 ```text
-路径：/Volumes/T9/projects/market-data-service-storage-v2
+路径：/Volumes/T9/projects/marketcow-storage-v2
 分支：feature/storage-v2
 基线提交：71f5b26
 远端状态：该分支目前仅存在于本地，尚未推送
@@ -59,7 +59,7 @@ https://github.com/soapjk/MarketCow
 新会话应将工作目录设为：
 
 ```bash
-cd /Volumes/T9/projects/market-data-service-storage-v2
+cd /Volumes/T9/projects/marketcow-storage-v2
 ```
 
 ## 三、正式版与开发版隔离
@@ -87,11 +87,11 @@ tmux session：marketcow-local
 
 ```text
 地址：http://127.0.0.1:8791
-数据：/Volumes/T9/projects/market-data-service-storage-v2/data-development/
+数据：/Volumes/T9/projects/marketcow-storage-v2/data-development/
 数据库：data-development/warehouse/market_data.duckdb
 日志：logs-development/marketcow.log
 tmux session：marketcow-development
-工作区：market-data-service-storage-v2
+工作区：marketcow-storage-v2
 ```
 
 开发服务启动命令：
@@ -99,7 +99,7 @@ tmux session：marketcow-development
 ```bash
 tmux kill-session -t marketcow-development 2>/dev/null || true
 tmux new-session -d -s marketcow-development \
-  'cd /Volumes/T9/projects/market-data-service-storage-v2 && exec .venv/bin/marketcow --profile development start >> logs-development/marketcow.log 2>&1'
+  'cd /Volumes/T9/projects/marketcow-storage-v2 && exec .venv/bin/marketcow --profile development start >> logs-development/marketcow.log 2>&1'
 ```
 
 检查两个环境：
@@ -371,7 +371,7 @@ fundamental / statements / PIT history
 
 ### Git 与 worktree
 
-- 只在 `/Volumes/T9/projects/market-data-service-storage-v2` 编辑 Storage V2；
+- 只在 `/Volumes/T9/projects/marketcow-storage-v2` 编辑 Storage V2；
 - 不在正式工作区切分支；
 - 不 reset、checkout、rebase 或清理正式 worktree；
 - 不删除其他 worktree；
@@ -399,7 +399,7 @@ fundamental / statements / PIT history
 完整测试：
 
 ```bash
-cd /Volumes/T9/projects/market-data-service-storage-v2
+cd /Volumes/T9/projects/marketcow-storage-v2
 test_root=$(mktemp -d)
 MARKETCOW_HOME="$test_root" uv run python -m unittest discover -s tests -v
 uv run ruff check src tests
@@ -447,7 +447,7 @@ tmux：marketcow-local 和 marketcow-development 均存在
 
 ```text
 请先完整阅读 docs/development-handoff-storage-v2.md、ADR-001、ADR-002 和 AGENTS.md。
-只在 /Volumes/T9/projects/market-data-service-storage-v2 的 feature/storage-v2 分支工作，
+只在 /Volumes/T9/projects/marketcow-storage-v2 的 feature/storage-v2 分支工作，
 不要影响 127.0.0.1:8790 正式服务。先实现 Storage Repository 接口隔离及 DuckDB backend，
 保持现有 API 契约和全部测试通过；暂时不要连接或迁移正式 PostgreSQL/ClickHouse，也不要远程推送。
 ```
