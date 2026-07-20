@@ -1,5 +1,5 @@
 {
-  "legacy_matrix_sha256": "96c0e85f868d01c6d6f06817afb4c4f4b40b1ed8350be9aeb3a10c1c53e96cef",
+  "legacy_matrix_sha256": "14d19d8122b36476ec38cae71a6fa2f16f6e59330e53c0163f72bab5348cfed1",
   "legacy_source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4",
   "routes": [
     {
@@ -29,7 +29,7 @@
           "id": "get-_v1_admin_artifacts-normal",
           "kind": "normal",
           "legacy": "executed",
-          "legacy_capture_sha256": "35f7d451cb582417b066dbb790ea7b5a14e0171d3c9ace68c6985063d27029b4",
+          "legacy_capture_sha256": "6eacfbc2fbb36bbb9c83fe4ac1b1d849715cdc40ddd109ab8b49084ea6e6f745",
           "v2": "executed",
           "v2_capture_sha256": "6eacfbc2fbb36bbb9c83fe4ac1b1d849715cdc40ddd109ab8b49084ea6e6f745"
         },
@@ -38,7 +38,7 @@
           "id": "get-_v1_admin_artifacts-empty",
           "kind": "empty",
           "legacy": "executed",
-          "legacy_capture_sha256": "a76c5721b3bac882fa02370947d6f09e3a5c8af7eb8623fd6e7eab3fd238a302",
+          "legacy_capture_sha256": "20252a2e562546a29fd06569871f451bf21099fdcd2a9bf77b3665ee3fcd0bdc",
           "v2": "executed",
           "v2_capture_sha256": "20252a2e562546a29fd06569871f451bf21099fdcd2a9bf77b3665ee3fcd0bdc"
         },
@@ -871,7 +871,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "669976d2baa84e7fde3fa1897c1ffa7771005b943280a94ece02f5cebb6e05a3",
           "v2": "executed",
-          "v2_capture_sha256": "38bf4aae263e68e854014cc62a111318c1af8eb8db8ee7b7106f74e2336d66cc"
+          "v2_capture_sha256": "669976d2baa84e7fde3fa1897c1ffa7771005b943280a94ece02f5cebb6e05a3"
         },
         {
           "capture_key": "GET /v1/quotes::validation_error",
@@ -898,7 +898,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "2d71ff16a57d84d6c475d1979c296f151f6816e4213938d9965c067f5ba38951",
           "v2": "executed",
-          "v2_capture_sha256": "aac1de627ec61c6bf09b80f83efe1b2d1e410b55774ab3938379c00a5af16f08"
+          "v2_capture_sha256": "2d71ff16a57d84d6c475d1979c296f151f6816e4213938d9965c067f5ba38951"
         }
       ]
     },
@@ -1148,7 +1148,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "559e55149cd0ce7020e35c3df620645ea747a4c03957135b1bcb7d32798f4ff4",
           "v2": "executed",
-          "v2_capture_sha256": "289b4942962d6e0bb213fb449fb57499ec2915ba30aa514009720af4fa968211"
+          "v2_capture_sha256": "559e55149cd0ce7020e35c3df620645ea747a4c03957135b1bcb7d32798f4ff4"
         },
         {
           "capture_key": "GET /v1/quotes/{symbol}::partial_failure",
@@ -1660,7 +1660,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "245a2b56b3a31c13a273788eb8b42eb8205848305fa6b24623b280573186ec59",
           "v2": "executed",
-          "v2_capture_sha256": "ce78cd2faed7958e3de673fcf7b9df1566791b25fe85c9c3dbbd79db81252869"
+          "v2_capture_sha256": "245a2b56b3a31c13a273788eb8b42eb8205848305fa6b24623b280573186ec59"
         },
         {
           "capture_key": "GET /v1/validation/{symbol}::empty",
@@ -1800,7 +1800,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "b3c85fbf26d499b37fe9f404d6de3acfffcda7704e38022d57b782edcca19259",
           "v2": "executed",
-          "v2_capture_sha256": "4a9d13efc7acf06b0ed2516db1b99cb53d66d613a93c2b5ab2e71cccbe1afa0c"
+          "v2_capture_sha256": "b3c85fbf26d499b37fe9f404d6de3acfffcda7704e38022d57b782edcca19259"
         },
         {
           "capture_key": "POST /v1/admin/artifacts/backfill::empty",
@@ -1869,7 +1869,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "6003cafb757316745aa20ee2e27846860e8f433724f95362cb2abee41dcae8f2",
           "v2": "executed",
-          "v2_capture_sha256": "eb8f4d0a6d313a11f2d696ebcd0b0b2b071a67179b5aaff578f59e2f2f776d1a"
+          "v2_capture_sha256": "6003cafb757316745aa20ee2e27846860e8f433724f95362cb2abee41dcae8f2"
         },
         {
           "capture_key": "POST /v1/admin/baostock/{symbol}/refresh::empty",
@@ -1939,7 +1939,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "58958498d8ebc65452bc5bbb6688c2f1d1082015f278ad86497ef290c68d6c49",
           "v2": "executed",
-          "v2_capture_sha256": "a18f88d5181cc57365300a2f5cdb780fbf8018e14bb67ce65020055417bae29c"
+          "v2_capture_sha256": "58958498d8ebc65452bc5bbb6688c2f1d1082015f278ad86497ef290c68d6c49"
         },
         {
           "capture_key": "POST /v1/admin/earnings-calendar/refresh::empty",
@@ -2009,7 +2009,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "4cd51a19dc96560ce78c8acb52523d4fc65c45423c2aa7eed265fe999436b9e3",
           "v2": "executed",
-          "v2_capture_sha256": "4bef73987df17c0776642dcf66591369734fcb5d59c060e74e3749f3a3d332b9"
+          "v2_capture_sha256": "4cd51a19dc96560ce78c8acb52523d4fc65c45423c2aa7eed265fe999436b9e3"
         },
         {
           "capture_key": "POST /v1/admin/economic-calendar/refresh::empty",
@@ -2079,7 +2079,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "4cac24629e5ad1a679b3b60e0dae940a58aa3c0c07040e930b166accb2bffa9c",
           "v2": "executed",
-          "v2_capture_sha256": "b8dbe3861e12a04902168e7e6cd550ef8060e5087b15668a5ec64f6e4fe6cbcf"
+          "v2_capture_sha256": "4cac24629e5ad1a679b3b60e0dae940a58aa3c0c07040e930b166accb2bffa9c"
         },
         {
           "capture_key": "POST /v1/admin/economic-indicators/refresh::empty",
@@ -2149,7 +2149,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "7858c2fa2e63633f6c3102a952415252a8752674469540becf560fa3c3ef708a",
           "v2": "executed",
-          "v2_capture_sha256": "7ed477fd44caaed6e12b7866664df90577151b046f52acd8f970eeac9bdcab40"
+          "v2_capture_sha256": "7858c2fa2e63633f6c3102a952415252a8752674469540becf560fa3c3ef708a"
         },
         {
           "capture_key": "POST /v1/admin/financials/{symbol}/refresh::empty",
@@ -2219,7 +2219,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "bd2be127d1c87e4cb59c02ec85ce1b7417b4dc16e6c3be9f8fe1c806adced122",
           "v2": "executed",
-          "v2_capture_sha256": "9b32fcad6b093a390821812c2546790904e613c3772670bd97c42274c01263c1"
+          "v2_capture_sha256": "bd2be127d1c87e4cb59c02ec85ce1b7417b4dc16e6c3be9f8fe1c806adced122"
         },
         {
           "capture_key": "POST /v1/admin/fundamentals/refresh::empty",
@@ -2290,7 +2290,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "a0d74e8ca25e4784af01c2c952526865750ef524f5c30d2daf27b262c038cbbd",
           "v2": "executed",
-          "v2_capture_sha256": "39b292eb86446b69216c48cef14c7c9693c03a93c5ca98012854a6ab4b8f8aba"
+          "v2_capture_sha256": "a0d74e8ca25e4784af01c2c952526865750ef524f5c30d2daf27b262c038cbbd"
         },
         {
           "capture_key": "POST /v1/admin/funnel/metrics/rebuild::empty",
@@ -2360,7 +2360,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "c84c660ace2b589076f5b0024fa093ca7025b792cf493602ce7b74caab9d6265",
           "v2": "executed",
-          "v2_capture_sha256": "8f52baf5aa389813f361cee902f951d7f6231ead19213a54827ae8dd16fa96e5"
+          "v2_capture_sha256": "c84c660ace2b589076f5b0024fa093ca7025b792cf493602ce7b74caab9d6265"
         },
         {
           "capture_key": "POST /v1/admin/tdx/financials/sync::empty",
@@ -2430,7 +2430,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "118dc2d486a0db03933652a7fd48961d6ba698a9a94da0b9ba2d7e667ce2a3f5",
           "v2": "executed",
-          "v2_capture_sha256": "86a866ef84bab0fd700cc6a1bef817baa625d23f11b0374d5dbcbafb72b58545"
+          "v2_capture_sha256": "118dc2d486a0db03933652a7fd48961d6ba698a9a94da0b9ba2d7e667ce2a3f5"
         },
         {
           "capture_key": "POST /v1/admin/validation/rebuild::empty",
@@ -2569,7 +2569,7 @@
           "legacy": "executed",
           "legacy_capture_sha256": "03bada53555b92f1066bde96c1ae100c8e9dbef269f68f341408fb7693912f66",
           "v2": "executed",
-          "v2_capture_sha256": "5cb96afaf14e2a50a13929d8e05cca9cfe65963f9261f78173892023c618d8c2"
+          "v2_capture_sha256": "03bada53555b92f1066bde96c1ae100c8e9dbef269f68f341408fb7693912f66"
         },
         {
           "capture_key": "POST /v1/tushare/{api_name}::empty",
@@ -2611,6 +2611,6 @@
     }
   ],
   "schema": "marketcow.old-main-v2-api-coverage.v1",
-  "sha256": "6cd880f1f65b16bd662ab0db111bda4b56441d1c055040f72b506d0d3ecb80f4",
-  "v2_matrix_sha256": "dde3b61ac882bf2e5f83132d68fb56eecf78ca859307ae816e20113f6293a2ed"
+  "sha256": "c194bf35120001d5dbee2bb68fbd10dd7ab5958bf6b22c87721c37b856b70fc6",
+  "v2_matrix_sha256": "ee20c17adea4e1953b3c04bf58c2a30371619ccf767f83ee3ebc9fe1faaaa66a"
 }

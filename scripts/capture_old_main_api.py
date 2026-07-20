@@ -104,6 +104,9 @@ class Repository:
             return [{"symbol": kwargs.get("symbol", "000001")}]
         return []
 
+    def list_artifacts(self, *_args):
+        return []
+
     def __getattr__(self, name):
         if name.startswith(("get_", "query_", "latest_", "provider_", "tdx_")):
             return lambda *_args, **_kwargs: []

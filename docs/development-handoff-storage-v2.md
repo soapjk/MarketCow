@@ -1587,7 +1587,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：逐端点清单完整；明确 quotes refresh 默认、批量错误对象、health.database 三项已知差异。
 - **必要测试**：main 合成服务 contract snapshot、路由覆盖率、schema 版本与变更检测。
 - **排除项**：访问 8790 真实数据、修改 main、决定兼容策略。
-- **状态**：`本地实现完成，待独立验收`。以旧 main `701ffbd` 的隔离 development app 与确定性 fake
+- **状态**：`已验收`（Artifacts `ebf1da0`、`f9a46e2`、`9a5656a`、`b1acd3c`）。以旧 main `701ffbd` 的隔离 development app 与确定性 fake
   service 生成版本化、checksum 绑定的 32-route OpenAPI contract 和 7-scenario response contract；当前 V2
   捕获 38 routes。`api_compat_gate` 对 method/path、参数位置/required/default/constraints、request body、声明
   response，以及正常、空、参数错误、backend fault 的 HTTP status/必需字段/type/错误 shape 做精确树路径比较。
@@ -1616,7 +1616,18 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：旧与 V2 golden gate 对方法、默认值、HTTP 状态、必需字段、类型和错误结构逐项通过；允许差异路径受限。
 - **必要测试**：双应用合成 golden、负向 schema、refresh 零/有上游副作用、完整 API snapshot。
 - **排除项**：真实 production 请求和消费者切换。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。旧 main 已有 quotes 单条/批量 `refresh` 默认恢复为 `false`：省略参数只读
+  cache，不触发上游刷新；显式 `refresh=true` 才调用 refresh，专项测试对两条路由分别验证零/有副作用。批量 cache
+  miss 与 refresh failure 恢复 legacy `status=unavailable` error object；单条 backend failure 恢复 legacy 503 与
+  `{symbol,status,error}` detail。参数比较改为按 `(in,name)` 稳定键，history 的 cursor/start/end/page_size 仅作为可选
+  additive，不改变旧 range/interval/limit/refresh 默认和请求行为。最终 route ledger 只剩 6 个 V2-only endpoint 与
+  4 个可选 pagination 参数，全部精确标为 `accepted_additive`；scenario ledger 只剩 health 的 logical database
+  identifier `versioned_break`（禁止恢复 DuckDB/path 泄露）和两个 PG/CH bounded diagnostic `accepted_additive`。
+  两份 ledger 另记录已消除的 strict-compatible 路径，均无 `decide_compatibility_or_version` 占位；gate 只接受精确
+  `accepted_additive`/`versioned_break` 差异，且保留 BG-010 原始 30+7 条 exact path 的逐条最终 disposition。
+  双应用全 route matrix 另绑定于 scenario ledger：共同 capture 的 status/shape 只剩 health PG/CH diagnostics 与
+  history cache freshness 共 15 个精确 additive field path；其他共同 capture 零差异。漏项、篡改、额外路径或
+  `$.captures[*]` 等宽泛声明均失败。
 
 ### `BG-012`：DuckDB 离线导入器物理隔离
 

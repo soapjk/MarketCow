@@ -257,7 +257,7 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes")
-    def quotes(symbols: str, refresh: bool = True):
+    def quotes(symbols: str, refresh: bool = False):
         requested = [item.strip() for item in symbols.split(",") if item.strip()]
         if not requested:
             raise HTTPException(status_code=400, detail="symbols is required")
@@ -277,9 +277,17 @@ def create_app(
                     if cached:
                         items.extend(cached)
                     else:
-                        errors.append({"symbol": normalized, "error": "quote not cached"})
+                        errors.append({
+                            "symbol": normalized,
+                            "status": "unavailable",
+                            "error": "quote not cached",
+                        })
             except Exception as exc:
-                errors.append({"symbol": symbol, "error": str(exc)})
+                errors.append({
+                    "symbol": symbol,
+                    "status": "unavailable",
+                    "error": str(exc),
+                })
         return {"count": len(items), "items": items, "errors": errors}
 
     @app.get("/v1/instruments/search")
@@ -788,7 +796,7 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes/{symbol}")
-    def quote(symbol: str, refresh: bool = True):
+    def quote(symbol: str, refresh: bool = False):
         try:
             try:
                 normalized = normalize_a_symbol(symbol)
@@ -805,7 +813,14 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "symbol": symbol,
+                    "status": "unavailable",
+                    "error": str(exc),
+                },
+            ) from exc
 
     @app.get("/v1/fundamentals")
     def fundamentals(

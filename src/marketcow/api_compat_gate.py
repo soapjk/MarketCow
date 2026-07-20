@@ -409,6 +409,31 @@ def contract_differences(legacy: Any, v2: Any) -> list[dict[str, Any]]:
                     walk(left[key], right[key], child)
             return
         if isinstance(left, list) and isinstance(right, list):
+            if path.endswith(".parameters") and all(
+                isinstance(item, Mapping) and item.get("in") and item.get("name")
+                for item in [*left, *right]
+            ):
+                old_parameters = {
+                    f"{item['in']}:{item['name']}": item for item in left
+                }
+                new_parameters = {
+                    f"{item['in']}:{item['name']}": item for item in right
+                }
+                for key in sorted(set(old_parameters) | set(new_parameters)):
+                    child = f"{path}[{key}]"
+                    if key not in old_parameters:
+                        differences.append({
+                            "path": child, "kind": "v2_added",
+                            "legacy": None, "v2": new_parameters[key],
+                        })
+                    elif key not in new_parameters:
+                        differences.append({
+                            "path": child, "kind": "v2_missing",
+                            "legacy": old_parameters[key], "v2": None,
+                        })
+                    else:
+                        walk(old_parameters[key], new_parameters[key], child)
+                return
             if len(left) != len(right):
                 differences.append({"path": path + ".length", "kind": "changed",
                                     "legacy": len(left), "v2": len(right)})
@@ -421,6 +446,58 @@ def contract_differences(legacy: Any, v2: Any) -> list[dict[str, Any]]:
 
     walk(_canonical(legacy), _canonical(v2), "$")
     return differences
+
+
+def route_matrix_differences(
+    legacy_matrix: Mapping[str, Any], v2_matrix: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Compare status and response shape for every capture shared by both apps."""
+    legacy = legacy_matrix.get("captures", {})
+    v2 = v2_matrix.get("captures", {})
+    differences: list[dict[str, Any]] = []
+    for capture_key in sorted(set(legacy).intersection(v2)):
+        old = {key: legacy[capture_key].get(key) for key in ("status", "shape")}
+        new = {key: v2[capture_key].get(key) for key in ("status", "shape")}
+        for item in contract_differences(old, new):
+            differences.append({
+                **item,
+                "path": f"$.captures[{capture_key}]" + item["path"].removeprefix("$"),
+            })
+    return differences
+
+
+def run_matrix_gate(
+    legacy_matrix: Mapping[str, Any], v2_matrix: Mapping[str, Any],
+    decision_document: Mapping[str, Any],
+) -> dict[str, Any]:
+    observed = route_matrix_differences(legacy_matrix, v2_matrix)
+    declared = decision_document.get("matrix_differences")
+    if not isinstance(declared, list):
+        raise ValueError("API matrix difference document is invalid")
+    observed_by_path = {item["path"]: item for item in observed}
+    declared_by_path = {item.get("path"): item for item in declared}
+    mismatches = []
+    if len(declared_by_path) != len(declared) or None in declared_by_path:
+        mismatches.append({"path": "$", "reason": "matrix paths are not unique"})
+    for path in sorted(set(observed_by_path) | set(declared_by_path)):
+        actual, expected = observed_by_path.get(path), declared_by_path.get(path)
+        if actual is None or expected is None:
+            mismatches.append({"path": path, "observed": actual, "declared": expected})
+            continue
+        if any(expected.get(key) != actual.get(key)
+               for key in ("kind", "legacy", "v2")):
+            mismatches.append({"path": path, "observed": actual, "declared": expected})
+            continue
+        if expected.get("disposition") not in {
+            "accepted_additive", "versioned_break",
+        } or not expected.get("reason"):
+            mismatches.append({"path": path, "declared": "invalid disposition"})
+    return {
+        "status": "ok" if not mismatches else "mismatch",
+        "difference_count": len(observed),
+        "mismatches": mismatches[:100],
+        "truncated": len(mismatches) > 100,
+    }
 
 
 def run_gate(legacy: Mapping[str, Any], v2: Mapping[str, Any],
@@ -450,9 +527,12 @@ def run_gate(legacy: Mapping[str, Any], v2: Mapping[str, Any],
                 mismatches.append({"path": path, "observed": actual,
                                    "declared": expected})
                 break
-        if not expected.get("bg011_action") or not expected.get("reason"):
+        disposition = expected.get("disposition")
+        if disposition not in {"accepted_additive", "versioned_break"} or not expected.get(
+            "reason"
+        ):
             mismatches.append({"path": path, "observed": actual,
-                               "declared": "missing BG-011 disposition"})
+                               "declared": "missing final BG-011 disposition"})
     return {
         "status": "ok" if not mismatches else "mismatch",
         "legacy_routes": len(legacy.get("routes", {})),

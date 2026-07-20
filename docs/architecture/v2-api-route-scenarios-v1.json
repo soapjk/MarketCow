@@ -614,10 +614,7 @@
           "report_period": "20241231"
         }
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "GET /v1/validation/{symbol}/results": {
@@ -647,10 +644,7 @@
         "path": "/v1/admin/artifacts/backfill",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/baostock/{symbol}/refresh": {
@@ -662,10 +656,7 @@
           "report_period": "20241231"
         }
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/earnings-calendar/refresh": {
@@ -675,10 +666,7 @@
         "path": "/v1/admin/earnings-calendar/refresh",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/economic-calendar/refresh": {
@@ -688,10 +676,7 @@
         "path": "/v1/admin/economic-calendar/refresh",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/economic-indicators/refresh": {
@@ -701,10 +686,7 @@
         "path": "/v1/admin/economic-indicators/refresh",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/financials/{symbol}/refresh": {
@@ -714,10 +696,7 @@
         "path": "/v1/admin/financials/AAPL/refresh",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/fundamentals/refresh": {
@@ -727,10 +706,7 @@
         "path": "/v1/admin/fundamentals/refresh",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/funnel/metrics/rebuild": {
@@ -740,10 +716,7 @@
         "path": "/v1/admin/funnel/metrics/rebuild",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/tdx/financials/sync": {
@@ -753,10 +726,7 @@
         "path": "/v1/admin/tdx/financials/sync",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/validation/rebuild": {
@@ -768,10 +738,7 @@
           "report_period": "20241231"
         }
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/tushare/realtime-quote": {
@@ -803,13 +770,10 @@
         "path": "/v1/tushare/daily",
         "query": {}
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     }
   },
   "schema": "marketcow.old-main-api-contract.v1.route-scenarios",
-  "sha256": "c688681c58333f9d9a8276a2dd2523f80859f4876abcbb37f2855a77b1ab3c9c"
+  "sha256": "e1081522662a410d0db9082fed91d04663dce394dd80f7e8967a44009284ad05"
 }

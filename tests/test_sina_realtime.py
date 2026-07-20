@@ -149,7 +149,7 @@ class AShareQuoteRoutingTest(unittest.TestCase):
         client = TestClient(create_app(self.settings, service))
 
         started = time.monotonic()
-        response = client.get("/v1/quotes/600036.SH")
+        response = client.get("/v1/quotes/600036.SH?refresh=true")
         quote_elapsed = time.monotonic() - started
         started = time.monotonic()
         snapshot = client.get("/v1/snapshot?limit=10")

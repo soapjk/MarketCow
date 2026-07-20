@@ -19,6 +19,7 @@ from marketcow.api_compat_gate import (
     capture_scenarios,
     load_document,
     run_gate,
+    run_matrix_gate,
     sha256_json,
     validate_coverage_inventory,
 )
@@ -96,11 +97,16 @@ class FixtureRepository:
         return []
 
     def __getattr__(self, _name):
-        return lambda *_args, **_kwargs: []
+        if _name.startswith((
+            "get_", "query_", "latest_", "provider_", "tdx_",
+        )):
+            return lambda *_args, **_kwargs: []
+        return lambda *_args, **_kwargs: {}
 
 
 class FixtureService:
     def __init__(self):
+        self.refresh_calls = 0
         repository = FixtureRepository()
         self.market_bar_repository = repository
         self.metadata_repository = repository
@@ -122,6 +128,7 @@ class FixtureService:
         })
 
     def refresh_quote(self, symbol):
+        self.refresh_calls += 1
         if symbol == "FAIL":
             raise RuntimeError("fixture unavailable")
         return {"symbol": symbol, "close": 1.0, "refresh_seen": True}
@@ -138,11 +145,16 @@ class FixtureService:
     def search_instruments(self, *_args):
         return []
 
+    def tushare_realtime_quote(self, _symbol):
+        return []
+
     def close(self):
         pass
 
     def __getattr__(self, _name):
-        return lambda *_args, **_kwargs: []
+        if _name.startswith(("get_", "query_", "search_")):
+            return lambda *_args, **_kwargs: []
+        return lambda *_args, **_kwargs: {}
 
 
 class FaultRepository:
@@ -181,7 +193,8 @@ class OldMainApiContractTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory(suffix="-test")
         self.settings = v2_settings(Path(self.tempdir.name))
-        self.app = create_app(self.settings, FixtureService())
+        self.service = FixtureService()
+        self.app = create_app(self.settings, self.service)
 
     def tearDown(self):
         self.tempdir.cleanup()
@@ -280,6 +293,13 @@ class OldMainApiContractTest(unittest.TestCase):
                          expected_legacy_matrix["sha256"])
         self.assertEqual(coverage["v2_matrix_sha256"],
                          observed_matrix["sha256"])
+        matrix_decisions = load_document(
+            DECLARED_SCENARIO_DIFFERENCES, DIFF_VERSION + ".scenarios",
+        )
+        matrix_report = run_matrix_gate(
+            expected_legacy_matrix, observed_matrix, matrix_decisions,
+        )
+        self.assertEqual(matrix_report["status"], "ok", matrix_report)
         self.assertTrue(expected_legacy_matrix["captures"])
         for route in legacy["routes"]:
             self.assertIn(route + "::normal", expected_legacy_matrix["captures"])
@@ -351,6 +371,14 @@ class OldMainApiContractTest(unittest.TestCase):
             )["status"],
             "mismatch",
         )
+        forged_decisions = json.loads(json.dumps(matrix_decisions))
+        forged_decisions["matrix_differences"][0]["path"] = "$.captures[*]"
+        self.assertEqual(
+            run_matrix_gate(
+                expected_legacy_matrix, observed_matrix, forged_decisions,
+            )["status"],
+            "mismatch",
+        )
 
         backend_scenario = next(
             scenario
@@ -413,6 +441,20 @@ class OldMainApiContractTest(unittest.TestCase):
             "quotes_missing_parameter",
         })
 
+    def test_legacy_refresh_defaults_are_cache_only_and_explicit_true_refreshes(self):
+        with TestClient(self.app) as client:
+            batch_default = client.get("/v1/quotes?symbols=AAPL")
+            single_default = client.get("/v1/quotes/AAPL")
+            self.assertEqual(self.service.refresh_calls, 0)
+            self.assertFalse(batch_default.json()["items"][0]["refresh_seen"])
+            self.assertFalse(single_default.json()["refresh_seen"])
+
+            batch_refresh = client.get("/v1/quotes?symbols=AAPL&refresh=true")
+            single_refresh = client.get("/v1/quotes/AAPL?refresh=true")
+            self.assertEqual(self.service.refresh_calls, 2)
+            self.assertTrue(batch_refresh.json()["items"][0]["refresh_seen"])
+            self.assertTrue(single_refresh.json()["refresh_seen"])
+
     def test_allowlist_is_exact_path_and_cannot_hide_nested_same_name(self):
         legacy = load_document(LEGACY_CONTRACT, SCHEMA_VERSION)
         declared = load_document(DECLARED_DIFFERENCES, DIFF_VERSION)
@@ -424,6 +466,16 @@ class OldMainApiContractTest(unittest.TestCase):
         self.assertEqual(report["status"], "mismatch")
         self.assertTrue(any("properties" in item["path"]
                             for item in report["mismatches"]))
+        forged = json.loads(json.dumps(declared))
+        forged["differences"][0]["path"] = "$.routes.*"
+        self.assertEqual(run_gate(legacy, capture_openapi_contract(self.app), forged)[
+            "status"
+        ], "mismatch")
+        invalid_disposition = json.loads(json.dumps(declared))
+        invalid_disposition["differences"][0]["disposition"] = "strict_compatible"
+        self.assertEqual(run_gate(
+            legacy, capture_openapi_contract(self.app), invalid_disposition,
+        )["status"], "mismatch")
 
     def test_documents_are_bounded_machine_readable_and_assign_every_diff_to_bg011(self):
         for path, schema in (
@@ -435,13 +487,36 @@ class OldMainApiContractTest(unittest.TestCase):
             self.assertTrue(document["differences"])
             self.assertTrue(all(
                 item["path"].startswith("$") and item["reason"] and
-                item["bg011_action"] == "decide_compatibility_or_version"
+                item["disposition"] in {"accepted_additive", "versioned_break"}
                 for item in document["differences"]
             ))
+            self.assertTrue(all(
+                item["path"].startswith("$") and item["reason"] and
+                item["disposition"] == "strict_compatible"
+                for item in document["resolved_strict_compatible"]
+            ))
+            self.assertTrue(document["prior_exact_dispositions"])
+            self.assertTrue(all(
+                item["path"].startswith("$") and item["reason"] and
+                item["disposition"] in {
+                    "strict_compatible", "accepted_additive", "versioned_break",
+                }
+                for item in document["prior_exact_dispositions"]
+            ))
+            self.assertNotIn("decide_compatibility_or_version", path.read_text())
+            if path == DECLARED_SCENARIO_DIFFERENCES:
+                self.assertTrue(all(
+                    item["path"].startswith("$.captures[") and item["reason"] and
+                    item["disposition"] in {
+                        "accepted_additive", "versioned_break",
+                    }
+                    for item in document["matrix_differences"]
+                ))
         scenario_text = DECLARED_SCENARIO_DIFFERENCES.read_text()
-        self.assertIn("quotes refresh default", scenario_text)
-        self.assertIn("batch error object", scenario_text)
-        self.assertIn("health.database", scenario_text)
+        self.assertIn("omitted refresh is cache-only", scenario_text)
+        self.assertIn("partial errors restore", scenario_text)
+        self.assertIn("filesystem paths and DuckDB semantics are prohibited",
+                      scenario_text)
 
 
 if __name__ == "__main__":

@@ -2418,9 +2418,13 @@
         ]
       },
       "shape": {
-        "detail": "string"
+        "detail": {
+          "error": "string",
+          "status": "string",
+          "symbol": "string"
+        }
       },
-      "status": 502
+      "status": 503
     },
     "GET /v1/quotes/{symbol}::empty": {
       "kind": "empty",
@@ -2525,6 +2529,7 @@
         "errors": {
           "items": {
             "error": "string",
+            "status": "string",
             "symbol": "string"
           },
           "type": "array"
@@ -2600,6 +2605,7 @@
         "errors": {
           "items": {
             "error": "string",
+            "status": "string",
             "symbol": "string"
           },
           "type": "array"
@@ -3235,13 +3241,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "GET /v1/validation/{symbol}::normal": {
@@ -3258,13 +3263,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "GET /v1/validation/{symbol}::validation_error": {
@@ -3336,13 +3340,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/baostock/{symbol}/refresh::backend_failure": {
@@ -3385,13 +3388,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/baostock/{symbol}/refresh::validation_error": {
@@ -3465,13 +3467,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/earnings-calendar/refresh::validation_error": {
@@ -3488,13 +3489,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/economic-calendar/refresh::backend_failure": {
@@ -3533,13 +3533,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/economic-calendar/refresh::validation_error": {
@@ -3556,13 +3555,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/economic-indicators/refresh::backend_failure": {
@@ -3601,13 +3599,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/financials/{symbol}/refresh::backend_failure": {
@@ -3646,13 +3643,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/financials/{symbol}/refresh::validation_error": {
@@ -3669,13 +3665,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/fundamentals/refresh::backend_failure": {
@@ -3714,13 +3709,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/fundamentals/refresh::validation_error": {
@@ -3737,13 +3731,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/funnel/metrics/rebuild::backend_failure": {
@@ -3780,13 +3773,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/tdx/financials/sync::backend_failure": {
@@ -3825,13 +3817,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/tdx/financials/sync::validation_error": {
@@ -3848,13 +3839,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/validation/rebuild::backend_failure": {
@@ -3895,13 +3885,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/admin/validation/rebuild::validation_error": {
@@ -4073,13 +4062,12 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     },
     "POST /v1/tushare/{api_name}::validation_error": {
@@ -4094,16 +4082,15 @@
       "semantics": {
         "count": null,
         "empty_collections": [],
+        "has_detail": false,
         "has_partial_errors": false,
+        "has_structured_error": false,
         "structured_error_fields": []
       },
-      "shape": {
-        "items": null,
-        "type": "array"
-      },
+      "shape": {},
       "status": 200
     }
   },
   "schema": "marketcow.old-main-api-contract.v1.route-matrix",
-  "sha256": "dde3b61ac882bf2e5f83132d68fb56eecf78ca859307ae816e20113f6293a2ed"
+  "sha256": "ee20c17adea4e1953b3c04bf58c2a30371619ccf767f83ee3ebc9fe1faaaa66a"
 }

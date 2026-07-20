@@ -36,7 +36,9 @@
       "route": "GET /v1/admin/artifacts",
       "semantics": {
         "count": 0,
-        "empty_collections": [],
+        "empty_collections": [
+          "items"
+        ],
         "has_detail": false,
         "has_partial_errors": false,
         "has_structured_error": false,
@@ -44,7 +46,10 @@
       },
       "shape": {
         "count": "integer",
-        "items": {}
+        "items": {
+          "items": null,
+          "type": "array"
+        }
       },
       "status": 200
     },
@@ -59,7 +64,9 @@
       "route": "GET /v1/admin/artifacts",
       "semantics": {
         "count": 0,
-        "empty_collections": [],
+        "empty_collections": [
+          "items"
+        ],
         "has_detail": false,
         "has_partial_errors": false,
         "has_structured_error": false,
@@ -67,7 +74,10 @@
       },
       "shape": {
         "count": "integer",
-        "items": {}
+        "items": {
+          "items": null,
+          "type": "array"
+        }
       },
       "status": 200
     },
@@ -3039,6 +3049,6 @@
   },
   "generation_input": "isolated-deterministic-fixture:route-matrix-v1",
   "schema": "marketcow.old-main-api-contract.v1.route-matrix",
-  "sha256": "96c0e85f868d01c6d6f06817afb4c4f4b40b1ed8350be9aeb3a10c1c53e96cef",
+  "sha256": "14d19d8122b36476ec38cae71a6fa2f16f6e59330e53c0163f72bab5348cfed1",
   "source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4"
 }
