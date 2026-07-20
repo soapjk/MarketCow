@@ -86,7 +86,7 @@ class CanonicalMarketBarBuilderTest(unittest.TestCase):
                 "0700.HK", "1m", "raw", "2026-07-20T01:00:00Z",
                 "2026-07-20T01:01:00Z", 10,
             )
-            self.assertEqual(result["status"], "spooled")
+            self.assertEqual(result["status"], "durable_pending")
             self.assertEqual(result["spooled"], 1)
             repository.fail = False
             replayed = builder.writer.replay()

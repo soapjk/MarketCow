@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from marketcow.clickhouse_scheduler import BackgroundCanonicalScheduler
-from marketcow.clickhouse_writer import LocalClickHouseSpool
+from marketcow.clickhouse_scheduler import create_canonical_scheduler
+from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
 
 
 ROWS = [{
@@ -40,6 +41,37 @@ class Builder:
         return {"status": "ok", "written": 1, "spooled": 0}
 
 
+class RawRepository:
+    def __init__(self, fail_calls=(), short_calls=()):
+        self.calls = []
+        self.fail_calls = set(fail_calls)
+        self.short_calls = set(short_calls)
+
+    def insert_raw_bars(self, rows, batch_id=""):
+        self.calls.append((rows, batch_id))
+        if len(self.calls) in self.fail_calls:
+            raise ConnectionError("clickhouse unavailable")
+        if len(self.calls) in self.short_calls:
+            return len(rows) - 1
+        return len(rows)
+
+    def insert_canonical_bars(self, rows, batch_id=""):
+        return len(rows)
+
+
+def raw_row(index: int) -> dict:
+    minute = index % 60
+    return {
+        "symbol": "MU", "market": "CN", "interval": "1m",
+        "adjustment": "raw", "bar_time": f"2026-07-20T01:{minute:02d}:00Z",
+        "open": 10, "high": 11, "low": 9, "close": 10,
+        "raw_close": None, "adjustment_factor": None, "volume": 100,
+        "amount": None, "source": "fixture", "source_sequence": str(index),
+        "observed_at": "2026-07-20T02:00:00Z",
+        "ingested_at": "2026-07-20T02:00:01Z", "raw_artifact_id": None,
+    }
+
+
 def wait_until(predicate, seconds=2):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -50,6 +82,67 @@ def wait_until(predicate, seconds=2):
 
 
 class BackgroundCanonicalSchedulerTest(unittest.TestCase):
+    def test_disabled_factory_has_no_thread_or_directory_side_effect(self):
+        absent = self.root / "disabled-spool"
+        before = {thread.name for thread in threading.enumerate()}
+        self.assertIsNone(create_canonical_scheduler(False, invalid="never evaluated"))
+        self.assertFalse(absent.exists())
+        self.assertEqual(before, {thread.name for thread in threading.enumerate()})
+
+    def test_sync_multichunk_commit_enqueues_one_exact_range_after_evidence(self):
+        scheduler = self.scheduler(Builder(), start_paused=True)
+        writer = ReliableClickHouseWriter(RawRepository(), self.spool, 1000)
+        scheduler.bind_writer(writer)
+        rows = [raw_row(index) for index in range(2501)]
+        result = writer.write("raw", rows)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["acknowledged"])
+        tasks = scheduler._files(scheduler.pending, 10)
+        self.assertEqual(len(tasks), 1)
+        task = self.spool.read(tasks[0], require_checksum=True)
+        self.assertEqual(
+            (task["symbol"], task["interval"], task["adjustment"]),
+            ("MU", "1m", "raw"),
+        )
+        self.assertEqual(task["start"], "2026-07-20T01:00:00.000+00:00")
+        self.assertEqual(task["end"], "2026-07-20T01:59:00.000+00:00")
+
+    def test_partial_raw_never_enqueues_until_replay_evidence_is_complete(self):
+        scheduler = self.scheduler(Builder(), start_paused=True)
+        repository = RawRepository(fail_calls={2})
+        writer = ReliableClickHouseWriter(repository, self.spool, 1000)
+        scheduler.bind_writer(writer)
+        rows = [raw_row(index) for index in range(2001)]
+        result = writer.write("raw", rows)
+        self.assertEqual(result["status"], "durable_pending")
+        self.assertEqual(scheduler._files(scheduler.pending, 10), [])
+        writer.replay(10)
+        self.assertEqual(len(scheduler._files(scheduler.pending, 10)), 1)
+
+    def test_short_acknowledgement_never_enqueues_canonical(self):
+        scheduler = self.scheduler(Builder(), start_paused=True)
+        writer = ReliableClickHouseWriter(
+            RawRepository(short_calls={1}), self.spool, 1000
+        )
+        scheduler.bind_writer(writer)
+        result = writer.write("raw", [raw_row(0)])
+        self.assertEqual(result["status"], "durable_pending")
+        self.assertEqual(scheduler._files(scheduler.pending, 10), [])
+
+    def test_queue_failure_keeps_raw_intent_for_bounded_retry(self):
+        scheduler = self.scheduler(Builder(), queue_cap=1, start_paused=True)
+        scheduler.enqueue_rows([{**ROWS[0], "symbol": "FULL"}])
+        writer = ReliableClickHouseWriter(RawRepository(), self.spool, 1000)
+        scheduler.bind_writer(writer)
+        result = writer.write("raw", [raw_row(0)])
+        self.assertEqual(result["status"], "canonical_intent_pending")
+        self.assertFalse(result["acknowledged"])
+        self.assertEqual(len(list(self.spool.intents.glob("*.json"))), 1)
+        scheduler._paused.clear()
+        self.assertEqual(scheduler.run_once(), 1)
+        writer.replay(1)
+        self.assertEqual(len(list(self.spool.intents.glob("*.json"))), 0)
+        self.assertEqual(len(scheduler._files(scheduler.pending, 10)), 1)
     def test_startup_migrates_legacy_scheduler_intent_before_recovery(self):
         builder = Builder()
         group = {"symbol": "MU", "interval": "1m", "adjustment": "raw",

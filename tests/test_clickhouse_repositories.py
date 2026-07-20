@@ -56,6 +56,61 @@ class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
     "set MARKETCOW_TEST_CLICKHOUSE_HOST to run ClickHouse integration tests",
 )
 class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
+    def test_direct_raw_commit_drives_exact_canonical_rebuild_idempotently(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            writer = ReliableClickHouseWriter(self.repository, spool, 1000)
+            builder = CanonicalMarketBarBuilder(self.repository, writer)
+            scheduler = BackgroundCanonicalScheduler(
+                builder, spool, poll_seconds=0.05, start_paused=True
+            )
+            scheduler.bind_writer(writer)
+            rows = [normalize_bar("raw", {
+                "symbol": "DIRECT-CANONICAL", "market": "US", "interval": "1m",
+                "adjustment": "raw", "bar_time": f"2026-07-20T09:0{minute}:00Z",
+                "open": 10, "high": 11, "low": 9, "close": 10.5,
+                "raw_close": 10.5, "adjustment_factor": 1, "volume": 100,
+                "amount": None, "source": "fixture", "source_sequence": str(minute),
+                "observed_at": "2026-07-20T09:10:01.123Z",
+                "ingested_at": "2026-07-20T09:10:02.456Z",
+                "raw_artifact_id": "direct-canonical",
+            }) for minute in range(3)]
+            try:
+                outcome = writer.write("raw", rows)
+                self.assertEqual(outcome["status"], "success")
+                task_path = scheduler._files(scheduler.pending, 10)
+                self.assertEqual(len(task_path), 1)
+                task = spool.read(task_path[0], require_checksum=True)
+                self.assertEqual(
+                    (task["start"], task["end"]),
+                    ("2026-07-20T09:00:00.000+00:00",
+                     "2026-07-20T09:02:00.000+00:00"),
+                )
+                scheduler.resume()
+                deadline = __import__("time").monotonic() + 3
+                while scheduler.diagnostics()["last"].get("status") != "ok":
+                    self.assertLess(__import__("time").monotonic(), deadline)
+                    __import__("time").sleep(0.01)
+                canonical, truncated = self.repository.query_range(
+                    "canonical", "DIRECT-CANONICAL", "1m", "raw",
+                    task["start"], task["end"], 10,
+                )
+                self.assertFalse(truncated)
+                self.assertEqual(len(canonical), 3)
+                versions = [row["version"] for row in canonical]
+                builder.rebuild(
+                    "DIRECT-CANONICAL", "1m", "raw",
+                    task["start"], task["end"], 10,
+                )
+                repeated, _ = self.repository.query_range(
+                    "canonical", "DIRECT-CANONICAL", "1m", "raw",
+                    task["start"], task["end"], 10,
+                )
+                self.assertEqual([row["version"] for row in repeated], versions)
+            finally:
+                scheduler.close()
+
     def test_backup_component_extracts_real_clickhouse_schema(self):
         component = BackupComponent.clickhouse(
             self.database, "2026-07-20T00:00:00Z"

@@ -8,7 +8,14 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
-from .telemetry import telemetry_call
+from .telemetry import sanitize_text, telemetry_call
+
+
+def create_canonical_scheduler(enabled: bool, **kwargs: Any) -> Any:
+    """Side-effect-free disabled boundary; online assembly belongs to BG-007."""
+    if not enabled:
+        return None
+    return BackgroundCanonicalScheduler(**kwargs)
 
 
 class BackgroundCanonicalScheduler:
@@ -141,11 +148,20 @@ class BackgroundCanonicalScheduler:
         return {"status": "ok" if not full else "full", "accepted": accepted,
                 "duplicate": duplicate, "full": full}
 
-    def enqueue_replayed_rows(self, rows: List[Dict[str, Any]]) -> None:
-        """Keep the upstream raw replay intent durable until enqueue is durable."""
+    def enqueue_committed_rows(self, rows: List[Dict[str, Any]]) -> None:
+        """Keep the upstream raw intent durable until canonical enqueue is durable."""
         outcome = self.enqueue_rows(rows)
         if outcome["full"]:
             raise RuntimeError("canonical scheduler queue is full")
+
+    def enqueue_replayed_rows(self, rows: List[Dict[str, Any]]) -> None:
+        """Compatibility name for already durable raw replay completion."""
+        self.enqueue_committed_rows(rows)
+
+    def bind_writer(self, writer: Any) -> None:
+        """Bind both synchronous commits and recovered commits to one durable queue."""
+        writer.on_raw_committed = self.enqueue_committed_rows
+        writer.on_raw_replayed = self.enqueue_committed_rows
 
     def _run_one(self, path: Path) -> None:
         claimed = self.processing / path.name
@@ -163,7 +179,9 @@ class BackgroundCanonicalScheduler:
                 raise RuntimeError("canonical rebuild did not complete")
         except Exception as error:
             task["attempts"] = int(task.get("attempts", 0)) + 1
-            task["last_error"] = str(error)[:4000]
+            task["last_error"] = sanitize_text(
+                f"{type(error).__name__}: {error}"
+            )[:1000]
             delay = min(
                 self.backoff_max_seconds,
                 self.backoff_base_seconds * (2 ** (task["attempts"] - 1)),
@@ -220,7 +238,12 @@ class BackgroundCanonicalScheduler:
                             task = self.spool.read(path, require_checksum=True)
                         except Exception as error:
                             with self._state_lock:
-                                self._last = {"status": "invalid", "error": str(error)[:4000]}
+                                self._last = {
+                                    "status": "invalid",
+                                    "error": sanitize_text(
+                                        f"{type(error).__name__}: {error}"
+                                    )[:1000],
+                                }
                             continue
                         if float(task.get("next_attempt_epoch", 0)) <= now:
                             ready.append(path)

@@ -92,6 +92,21 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
         source = (SOURCE / "clickhouse_repositories.py").read_text()
         self.assertNotIn(" OFFSET ", source.upper())
 
+    def test_writer_builder_scheduler_chains_have_no_duckdb_dependency(self):
+        graph = {_module_name(path): _imports_for(path) for path in SOURCE.rglob("*.py")}
+        forbidden = {
+            "duckdb", "marketcow.storage", "marketcow.duckdb_repositories",
+            "marketcow.clickhouse_shadow", "marketcow.local_backfill",
+            "marketcow.local_restore",
+        }
+        for entrypoint in (
+            "marketcow.clickhouse_writer", "marketcow.clickhouse_canonical",
+            "marketcow.clickhouse_scheduler",
+        ):
+            with self.subTest(entrypoint=entrypoint):
+                violations = _forbidden_paths(graph, entrypoint, forbidden)
+                self.assertEqual(violations, set(), sorted(violations))
+
     def test_transitive_gate_reports_complete_reachable_path(self):
         graph = {
             "marketcow.clickhouse_repositories": {"marketcow.bridge"},

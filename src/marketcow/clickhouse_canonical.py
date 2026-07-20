@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Sequence
 
+from .clickhouse_repositories import ClickHouseMarketBarRepository
 from .clickhouse_writer import ReliableClickHouseWriter, normalize_bar
 from .canonical_selection import (
     DEFAULT_SOURCE_PRIORITY,
@@ -28,10 +29,11 @@ def _iso(value: Any) -> str:
 
 
 class CanonicalMarketBarBuilder:
-    """Explicit, bounded raw-to-canonical shadow builder."""
+    """Bounded ClickHouse raw FINAL to ClickHouse canonical builder."""
 
     def __init__(
-        self, repository: Any, writer: ReliableClickHouseWriter,
+        self, repository: ClickHouseMarketBarRepository,
+        writer: ReliableClickHouseWriter,
         source_priority: Sequence[str] = DEFAULT_SOURCE_PRIORITY,
         rel_tol: float = 1e-6, abs_tol: float = 1e-9,
     ) -> None:
@@ -140,7 +142,8 @@ class CanonicalMarketBarBuilder:
                 )
                 rows, qualities, sources = self.build_rows(raw, existing)
                 write = self.writer.write("canonical", rows)
-                result = {"status": "spooled" if write["spooled"] else "ok",
+                complete = bool(write.get("acknowledged") and write.get("verified"))
+                result = {"status": "ok" if complete else write["status"],
                           "scanned_rows": len(raw), "scanned_groups": len(rows),
                           "written": write["written"], "spooled": write["spooled"],
                           "quality_counts": dict(qualities),

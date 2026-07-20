@@ -1487,7 +1487,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：写成功才确认；失败不伪装成功；重启/部分块/回调崩溃可恢复且无逻辑重复；状态有界可诊断。
 - **必要测试**：故障矩阵、并发锁、磁盘满、损坏、旧 spool migration、真实 ClickHouse outage→recovery。
 - **排除项**：DuckDB 写入、服务装配、后台无限扫描。
-- **状态**：`本地实现完成，待独立验收`。`ReliableClickHouseWriter.write()` 现作为 ClickHouse
+- **状态**：`已验收`（Artifact `c06e4e8` + evidence 返修 `2811842`）。`ReliableClickHouseWriter.write()` 现作为 ClickHouse
   权威主写原语返回固定状态机：仅所有微批获得同步行数确认后返回 `status=success`、
   `acknowledged=true`、`verified=true`；连接失败、部分成功或确认行数不符返回
   `status=durable_pending`、`acknowledged=false`、`retryable=true`，并列出稳定 logical intent 与
@@ -1512,7 +1512,18 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：无 DuckDB primary/fingerprint；重复输入稳定；raw 完整落库后才推进；lag/backoff/队列有界。
 - **必要测试**：选源 golden、重复/乱序、崩溃窗口、并发 lease、outage→recovery、短 soak。
 - **排除项**：服务工厂和 production 调度。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。`CanonicalMarketBarBuilder` 现显式绑定
+  `ClickHouseMarketBarRepository`，只通过 `market_bar_raw FINAL` 的有界精确范围读取构建，并由
+  BG-005 权威 writer 写回 canonical；canonical write 只有 `acknowledged && verified` 才报告 `ok`。
+  `BackgroundCanonicalScheduler.bind_writer()` 将同步 raw commit 与 replay commit 统一接入同一个原子
+  scheduler queue：writer 仅在 raw logical intent 的全部 chunk 已生成 checksum-valid replayed evidence
+  后调用 durable enqueue；queue full/atomic failure 会保留 ready raw intent 并返回
+  `canonical_intent_pending`，后续有界 replay 重试，绝不确认或丢失派生进度。任务按
+  `(symbol, interval, adjustment, exact min/max bar_time)` 稳定 ID 去重，继续采用单 lease/worker、有限
+  queue/scan、指数 backoff、processing crash recovery、pause/resume、反向 shutdown、telemetry 与 operator
+  lock/audit。`create_canonical_scheduler(False, ...)` 在 disabled 路径直接返回且不建目录、不持有 lease、
+  不启动线程。传递 import 图门禁覆盖 writer/builder/scheduler 全调用链并拒绝 DuckDB、Warehouse、shadow
+  和 offline-only 依赖。本项未接在线 factory/API，未实施 BG-007。
 
 ### `BG-007`：纯 PG/CH 在线 Repository 工厂
 

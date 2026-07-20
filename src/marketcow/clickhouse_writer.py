@@ -343,6 +343,7 @@ class ReliableClickHouseWriter:
         self.repository = repository
         self.spool = spool
         self.batch_size = batch_size
+        self.on_raw_committed: Optional[Callable[[List[Dict[str, Any]]], None]] = None
         self.on_raw_replayed: Optional[Callable[[List[Dict[str, Any]]], None]] = None
         self.last_replay_callback: Dict[str, Any] = {"status": "not_run"}
 
@@ -480,7 +481,21 @@ class ReliableClickHouseWriter:
                     payload = self.spool.read(path, require_checksum=True)
                     self.spool._atomic_json(path, {**payload, "intent_id": intent_id})
                 if not failed_batches and intent_created:
-                    self.spool.remove_intent(intent_id)
+                    if self.on_raw_committed is not None:
+                        try:
+                            self.on_raw_committed(normalized_rows)
+                        except Exception as error:
+                            outcome.update({
+                                "status": "canonical_intent_pending",
+                                "acknowledged": False, "verified": False,
+                                "durability": "raw_committed_intent_pending",
+                                "retryable": True, "terminal": False,
+                                "error": _bounded_error(error),
+                            })
+                        else:
+                            self.spool.remove_intent(intent_id)
+                    else:
+                        self.spool.remove_intent(intent_id)
             except Exception as error:
                 outcome.update({
                     "status": "terminal_failure", "acknowledged": False,
