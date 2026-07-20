@@ -107,6 +107,22 @@ def _verify_sealed(data: bytes, wrapping_key: bytes) -> bool:
     return hmac.compare_digest(tag, expected)
 
 
+def unseal_cursor_key(data: bytes, wrapping_key: bytes) -> bytes:
+    """Authenticate and decrypt one cursor key without ever writing on failure."""
+    if not _verify_sealed(data, wrapping_key):
+        raise ValueError("cursor key sealed payload authentication failed")
+    nonce, ciphertext = data[5:21], data[53:]
+    stream = bytearray()
+    counter = 0
+    while len(stream) < len(ciphertext):
+        stream.extend(hmac.new(
+            wrapping_key, b"stream:" + nonce + counter.to_bytes(8, "big"),
+            hashlib.sha256,
+        ).digest())
+        counter += 1
+    return bytes(left ^ right for left, right in zip(ciphertext, stream))
+
+
 def _utc(value: str) -> str:
     parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if parsed.tzinfo is None:
