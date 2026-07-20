@@ -158,7 +158,7 @@ https://github.com/soapjk/MarketCow
 ```text
 路径：/Volumes/T9/projects/marketcow-storage-v2
 分支：feature/storage-v2
-基线提交：71f5b26
+当前已验证基线：4e613bd
 远端状态：该分支目前仅存在于本地，尚未推送
 用途：PostgreSQL、ClickHouse、Repository 接口和迁移开发
 ```
@@ -484,10 +484,17 @@ fundamental / statements / PIT history
   DuckDB/ClickHouse canonical 实现及同范围故障回退；
 - 已完成精确单一 bar 时间点的 canonical 全市场横截面契约、可选有界 symbols 过滤、
   DuckDB/ClickHouse canonical 实现、只读 API 与同查询故障回退；
+- 已完成单 symbol、闭区间内的多来源 raw 范围查询契约、source 过滤、完整 provenance、
+  DuckDB/ClickHouse raw 等版本确定性收敛、只读 API 与同查询故障回退；
+- 已完成 development-only、default-off 的同步 automatic canonical 衔接：raw shadow 当前
+  逻辑批次完整成功，或其全部失败分块经 spool/replay 成功后，才按完整精确范围执行有界
+  rebuild；共享 replay 预算、持久化 intent、崩溃恢复和进程级互斥均已实现；
 - 尚未完成大规模长时间范围基准与分页/游标契约；
-- 尚未完成非精确时间（如最近有效 bar）或多时间点横截面，以及多来源 raw 查询契约；
+- 尚未完成非精确时间（如最近有效 bar）或多时间点横截面；
 - 尚未完成缓存命中、失效、新鲜度和 ClickHouse/DuckDB 回退一致性契约测试；
-- 尚未实现自动或后台 canonical 调度；当前只能显式、有界重建；
+- 尚未实现后台扫描、定时或异步 canonical 调度；当前 automatic canonical 仅为显式启用的
+  development 同步、有界衔接；
+- 尚未实现冷热分层；
 - 尚未对正式读取进行连接、迁移或切换；
 - 未经用户明确批准，不切换 8790 正式服务。
 
@@ -553,7 +560,7 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 - 8790 不被停止、重启或修改；
 - development 只写独立存储；
-- 现有默认测试继续通过（检查点 8 的数量见第十一节）；
+- 现有默认测试继续通过（检查点 10 的数量见第十一节）；
 - 新 backend 有单元测试和显式集成测试；
 - 上游失败仍有界，不占满服务线程；
 - 双写失败不能阻断现有 DuckDB 主路径，除非测试明确验证 fail-closed；
@@ -565,16 +572,18 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 最近一次 Storage V2 检查：
 
 ```text
-feature/storage-v2 检查点 8 基线：f3e642c；本检查点为其上的 canonical 横截面改动
-默认测试：发现 97 项且整体通过；7 项 PostgreSQL、7 项 ClickHouse 集成测试因未
-显式配置本地服务而跳过
+feature/storage-v2 检查点 10 已验证基线：4e613bd
+默认测试：111 项通过；16 项显式外部存储集成测试因未配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
-ClickHouse 测试：9 项通过（2 项隔离边界测试、7 项使用一次性 ClickHouse 25.8
-本地容器的集成测试；容器测试后停止并删除）
-本检查点已完成精确单一 bar 时间点的 canonical 全市场横截面、只读 API、显式截断和
-DuckDB/ClickHouse canonical 等价回退；默认仍为 DuckDB。非精确/多时间点横截面、
-大规模范围分页/基准、多来源 raw、缓存契约、自动 canonical 调度及后续阶段尚未完成，
-必须等待验收方指定。
+ClickHouse 集成测试：11 项通过（显式启用，使用一次性 ClickHouse 25.8 本地容器；
+容器测试后停止）
+检查点 9 已完成单 symbol 多来源 raw 闭区间查询、只读 API、provenance 与 DuckDB/
+ClickHouse 等版本确定性收敛。检查点 10 已完成 development-only、default-off 的同步
+automatic canonical：raw 逻辑批次完整成功或全部 spool 分块重放成功后按完整精确范围
+有界 rebuild，并具备共享 replay 预算、持久化 intent、崩溃恢复和并发互斥；DuckDB
+仍为 primary，所有失败保持 fail-open。尚未完成大规模范围分页/基准、非精确或多时间点
+横截面、缓存命中/失效/新鲜度一致性、后台扫描/调度、冷热分层及正式连接/切换，必须等待
+验收方指定。
 ```
 
 正式服务由 `com.marketcow.production` 管理；最近已验证 health 包含
