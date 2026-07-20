@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 import uuid
@@ -21,6 +22,7 @@ from marketcow.clickhouse_writer import normalize_bar
 from marketcow.config import Settings
 from marketcow.contract_gate import LEGACY_PAYLOAD_PATHS, assert_contract_equal
 from marketcow.clickhouse_scheduler import BackgroundCanonicalScheduler
+from marketcow.local_backup import BackupComponent
 
 
 class MarketBarService:
@@ -51,6 +53,15 @@ class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
     "set MARKETCOW_TEST_CLICKHOUSE_HOST to run ClickHouse integration tests",
 )
 class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
+    def test_backup_component_extracts_real_clickhouse_schema(self):
+        component = BackupComponent.clickhouse(
+            self.database, "2026-07-20T00:00:00Z"
+        )
+        payload = json.loads(component.files["logical.json"])
+        self.assertIn("schema_migrations", payload)
+        self.assertIn("market_bar_raw", payload)
+        self.assertTrue(component.canonical_rebuildable)
+
     def test_background_scheduler_clickhouse_outage_recovery(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

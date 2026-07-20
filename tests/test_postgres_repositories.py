@@ -3,12 +3,14 @@ import unittest
 import uuid
 
 import psycopg
+import json
 
 from marketcow.postgres_repositories import (
     PostgresDatabase,
     PostgresFundamentalRepository,
     PostgresMetadataRepository,
 )
+from marketcow.local_backup import BackupComponent
 
 
 @unittest.skipUnless(
@@ -16,6 +18,14 @@ from marketcow.postgres_repositories import (
     "set MARKETCOW_TEST_POSTGRES_DSN to run PostgreSQL integration tests",
 )
 class PostgresRepositoryIntegrationTest(unittest.TestCase):
+    def test_backup_component_extracts_real_postgres_schema(self):
+        component = BackupComponent.postgresql(
+            self.database, "2026-07-20T00:00:00Z"
+        )
+        payload = json.loads(component.files["logical.json"])
+        self.assertIn("schema_migrations", payload)
+        self.assertGreater(component.watermark["table_count"], 0)
+
     @classmethod
     def setUpClass(cls):
         cls.dsn = os.environ["MARKETCOW_TEST_POSTGRES_DSN"]
