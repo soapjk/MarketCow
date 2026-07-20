@@ -44,6 +44,9 @@ class FakePrimary:
     def get_price_bars_cross_section_page(self, *args):
         return (["duckdb-cross-section-page"], True)
 
+    def get_price_bars_matrix_page(self, *args):
+        return (["duckdb-matrix-page"], True)
+
     def get_raw_price_bars_range(self, *args):
         return (["duckdb-raw"], True)
 
@@ -95,6 +98,11 @@ class ReconcileRepository:
         return self.rows, False
 
     def get_canonical_price_bars_cross_section_page(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows, False
+
+    def get_canonical_price_bars_matrix_page(self, *args):
         if isinstance(self.rows, Exception):
             raise self.rows
         return self.rows, False
@@ -271,6 +279,29 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
         diagnostics = adapter.diagnostics()["read"]
         self.assertTrue(diagnostics["fallback"])
         self.assertTrue(diagnostics["truncated"])
+
+    def test_matrix_page_same_boundary_fallback_diagnostics(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.repository = ReconcileRepository([{"symbol": "MSFT", "timestamp": 2}])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(
+            primary, writer, canonical_reads_enabled=True
+        )
+        arguments = (
+            "1m", "raw", ["1970-01-01T00:00:01Z", "1970-01-01T00:00:02Z"],
+            ["AAPL", "MSFT"], 10, (1, "AAPL"),
+        )
+        self.assertEqual(adapter.get_price_bars_matrix_page(*arguments),
+                         ([{"symbol": "MSFT", "timestamp": 2}], False))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["matrix"])
+        self.assertTrue(diagnostics["keyset_page"])
+        writer.repository.rows = ConnectionError("matrix unavailable")
+        self.assertEqual(adapter.get_price_bars_matrix_page(*arguments),
+                         (["duckdb-matrix-page"], True))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["fallback"])
+        self.assertTrue(diagnostics["matrix"])
 
     def test_raw_multisource_opt_in_and_same_query_fallback_diagnostics(self):
         primary, writer = FakePrimary(), CapturingWriter()

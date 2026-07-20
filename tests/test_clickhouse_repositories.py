@@ -463,6 +463,94 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             self.assertEqual(fallback_payload, clickhouse_payload)
             self.assertTrue(adapter.diagnostics()["read"]["fallback"])
 
+    def test_canonical_matrix_keyset_page_matches_duckdb_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            warehouse = Warehouse(root / "warehouse.duckdb")
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(root / "spool", root), 1000
+            )
+            points = ("2026-07-20T05:40:00Z", "2026-07-20T05:41:00Z")
+            canonical = []
+            for point in points:
+                timestamp = int(datetime.fromisoformat(
+                    point.replace("Z", "+00:00")
+                ).timestamp())
+                for symbol in ("MATRIX-A", "MATRIX-B", "MATRIX-C"):
+                    if point == points[1] and symbol == "MATRIX-C":
+                        continue
+                    close = 22 if point == points[0] and symbol == "MATRIX-B" else 11
+                    warehouse.upsert_price_bars(
+                        symbol, "1m", "raw", "tushare", "2026-07-20T05:42:02Z",
+                        [{"timestamp": timestamp, "bar_at": point, "open": 10,
+                          "high": 12, "low": 9, "close": close, "raw_close": 22,
+                          "adjustment_factor": 0.5, "volume": 100, "amount": 1100}],
+                        {"observed_at": "2026-07-20T05:42:01Z",
+                         "raw_artifact_id": "matrix-artifact"},
+                    )
+                    canonical.append({
+                        "symbol": symbol, "market": "US", "interval": "1m",
+                        "adjustment": "raw", "bar_time": point, "open": 10,
+                        "high": 12, "low": 9, "close": close, "raw_close": 22,
+                        "adjustment_factor": 0.5, "volume": 100, "amount": 1100,
+                        "selected_source": "tushare", "source_count": 1,
+                        "quality_status": "single_source",
+                        "observed_at": "2026-07-20T05:42:01Z",
+                        "ingested_at": "2026-07-20T05:42:02Z",
+                        "raw_artifact_id": "matrix-artifact", "version": 1,
+                        "input_fingerprint": f"{point}-{symbol}-v1",
+                        "updated_at": "2026-07-20T05:42:03Z",
+                    })
+            canonical.append({
+                **next(row for row in canonical if row["symbol"] == "MATRIX-B"),
+                "close": 22, "version": 2, "input_fingerprint": "matrix-b-v2",
+            })
+            self.repository.insert_canonical_bars(canonical)
+            adapter = ShadowMarketBarRepository(
+                warehouse, writer, canonical_reads_enabled=True
+            )
+            arguments = (
+                "1m", "raw", ["2026-07-20T13:41:00+08:00", points[0]],
+                ["MATRIX-C", "MATRIX-B", "MATRIX-A", "MATRIX-A"], 2, None,
+            )
+            clickhouse_page = adapter.get_price_bars_matrix_page(*arguments)
+            duckdb_page = warehouse.get_price_bars_matrix_page(*arguments)
+            self.assertEqual(clickhouse_page, duckdb_page)
+            self.assertTrue(clickhouse_page[1])
+            after = (clickhouse_page[0][-1]["timestamp"],
+                     clickhouse_page[0][-1]["symbol"])
+            next_arguments = (*arguments[:-1], after)
+            self.assertEqual(adapter.get_price_bars_matrix_page(*next_arguments),
+                             warehouse.get_price_bars_matrix_page(*next_arguments))
+
+            settings = Settings(
+                root / "warehouse.duckdb", root / "raw",
+                market_bar_cursor_secret="clickhouse-matrix-secret-1234567890abcdef",
+                storage_root=root / "data-development",
+            )
+            path = (
+                "/v1/quotes/cross-section/matrix?interval=1m&adjustment=raw"
+                "&bar_ats=2026-07-20T13:41:00%2B08:00,2026-07-20T05:40:00Z"
+                "&symbols=MATRIX-C,MATRIX-B,MATRIX-A,MATRIX-A&page_size=2"
+            )
+            app = create_app(
+                settings, MarketBarService(adapter),
+                lambda: datetime(2026, 7, 20, 6, 0, tzinfo=timezone.utc),
+            )
+            with TestClient(app) as client:
+                clickhouse_payload = client.get(path).json()
+            original = self.repository.database.client
+            self.repository.database.client = None
+            try:
+                fallback_page = adapter.get_price_bars_matrix_page(*arguments)
+                with TestClient(app) as client:
+                    fallback_payload = client.get(path).json()
+            finally:
+                self.repository.database.client = original
+            self.assertEqual(fallback_page, clickhouse_page)
+            self.assertEqual(fallback_payload, clickhouse_payload)
+            self.assertTrue(adapter.diagnostics()["read"]["fallback"])
+
     def test_raw_multisource_range_filter_final_provenance_and_truncation(self):
         base = {
             "symbol": "RAW.HK", "market": "HK", "interval": "1m",

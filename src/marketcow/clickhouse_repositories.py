@@ -664,3 +664,55 @@ class ClickHouseMarketBarRepository:
                 row["source"], payload["observed_at"], payload["raw_artifact_id"]
             )
         return mapped, len(rows) > page_size
+
+    def get_canonical_price_bars_matrix_page(
+        self, interval: str, adjustment: str, bar_ats: List[str],
+        symbols: List[str], page_size: int,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("matrix page_size must be between 1 and 5000")
+        points = sorted({
+            datetime.fromtimestamp(
+                int(self._datetime(value).astimezone(timezone.utc).timestamp()),
+                timezone.utc,
+            ) for value in bar_ats
+        })
+        symbol_filter = sorted({str(value).strip() for value in symbols if str(value).strip()})
+        if not 1 <= len(points) <= 100:
+            raise ValueError("matrix bar_ats must contain between 1 and 100 values")
+        if not 1 <= len(symbol_filter) <= 1000:
+            raise ValueError("matrix symbols must contain between 1 and 1000 values")
+        if len(points) * len(symbol_filter) > 100_000:
+            raise ValueError("matrix request must contain at most 100000 cells")
+        after_sql = ""
+        parameters: Dict[str, Any] = {
+            "interval": interval, "adjustment": adjustment, "bar_ats": points,
+            "symbols": symbol_filter, "fetch": page_size + 1,
+        }
+        if after is not None:
+            after_sql = (
+                " AND (bar_time > {after_time:DateTime64(3)} OR "
+                "(bar_time = {after_time:DateTime64(3)} AND symbol > {after_symbol:String}))"
+            )
+            parameters["after_time"] = datetime.fromtimestamp(after[0], timezone.utc)
+            parameters["after_symbol"] = after[1]
+        result = self.database._require_client().query(
+            "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
+            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
+            "version FROM market_bar_canonical FINAL WHERE interval={interval:String} "
+            "AND adjustment={adjustment:String} "
+            "AND bar_time IN {bar_ats:Array(DateTime64(3))} "
+            "AND symbol IN {symbols:Array(String)}" + after_sql +
+            " ORDER BY bar_time ASC, symbol ASC LIMIT {fetch:UInt32}",
+            parameters=parameters,
+        )
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        mapped = self._map_canonical_rows(rows[:page_size])
+        for row in mapped:
+            payload = row["source_payload"]
+            row["source_payload"] = canonical_page_payload(
+                row["source"], payload["observed_at"], payload["raw_artifact_id"]
+            )
+        return mapped, len(rows) > page_size

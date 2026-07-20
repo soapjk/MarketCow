@@ -452,6 +452,84 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.get("/v1/quotes/cross-section/matrix")
+    def quote_cross_section_matrix(
+        bar_ats: str,
+        symbols: str,
+        interval: str = "1d",
+        adjustment: str = "adjusted",
+        page_size: int = Query(500, ge=1, le=5000),
+        cursor: Optional[str] = None,
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            normalized_points = set()
+            for value in (item.strip() for item in bar_ats.split(",")):
+                if not value:
+                    continue
+                point = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if point.tzinfo is None:
+                    raise ValueError("matrix bar_ats must include a timezone")
+                normalized_points.add(datetime.fromtimestamp(
+                    int(point.timestamp()), ZoneInfo("UTC")
+                ).isoformat())
+            normalized_bar_ats = sorted(normalized_points)
+            symbol_filter = sorted({
+                value.strip() for value in symbols.split(",") if value.strip()
+            })
+            if not 1 <= len(normalized_bar_ats) <= 100:
+                raise ValueError("matrix bar_ats must contain between 1 and 100 values")
+            if not 1 <= len(symbol_filter) <= 1000:
+                raise ValueError("matrix symbols must contain between 1 and 1000 values")
+            matrix_cells = len(normalized_bar_ats) * len(symbol_filter)
+            if matrix_cells > 100_000:
+                raise ValueError("matrix request must contain at most 100000 cells")
+            query_binding = {
+                "interval": interval, "adjustment": adjustment,
+                "bar_ats": normalized_bar_ats, "symbols": symbol_filter,
+                "page_size": page_size,
+            }
+            cursor_secret = load_or_create_secret(
+                settings.market_bar_cursor_secret, settings.storage_root
+            )
+            cursor_now = clock()
+            if cursor_now.tzinfo is None:
+                cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+            now_epoch = int(cursor_now.timestamp())
+            decoded_after = None if cursor is None else decode_cursor(
+                cursor, query_binding, now_epoch,
+                settings.market_bar_cursor_ttl_seconds, cursor_secret,
+            )
+            after = None
+            if decoded_after is not None:
+                if not isinstance(decoded_after, list):
+                    raise ValueError("invalid matrix cursor position")
+                after = (decoded_after[0], decoded_after[1])
+            bars, has_more = service.market_bar_repository.get_price_bars_matrix_page(
+                interval, adjustment, normalized_bar_ats, symbol_filter,
+                page_size, after,
+            )
+            next_cursor = None
+            if has_more and bars:
+                next_cursor = encode_cursor(
+                    query_binding,
+                    [int(bars[-1]["timestamp"]), bars[-1]["symbol"]],
+                    now_epoch, cursor_secret,
+                )
+            return {
+                "bar_ats": normalized_bar_ats, "symbols": symbol_filter,
+                "interval": interval, "adjustment": adjustment,
+                "matrix_cells": matrix_cells, "count": len(bars), "bars": bars,
+                "cached": True, "truncated": has_more,
+                "page_size": page_size, "next_cursor": next_cursor,
+                **cache_metadata(bars),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.get("/v1/quotes/{symbol}/raw-history")
     def quote_raw_history(
         symbol: str,

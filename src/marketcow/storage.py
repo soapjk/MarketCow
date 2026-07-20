@@ -1018,6 +1018,68 @@ class Warehouse:
             result.append(row)
         return result, has_more
 
+    def get_price_bars_matrix_page(
+        self, interval: str, adjustment: str, bar_ats: Sequence[str],
+        symbols: Sequence[str], page_size: int,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("matrix page_size must be between 1 and 5000")
+        points = sorted({
+            int(self._utc_range(value, value)[0].timestamp()) for value in bar_ats
+        })
+        symbol_filter = sorted({str(value).strip() for value in symbols if str(value).strip()})
+        if not 1 <= len(points) <= 100:
+            raise ValueError("matrix bar_ats must contain between 1 and 100 values")
+        if not 1 <= len(symbol_filter) <= 1000:
+            raise ValueError("matrix symbols must contain between 1 and 1000 values")
+        if len(points) * len(symbol_filter) > 100_000:
+            raise ValueError("matrix request must contain at most 100000 cells")
+        filters = (
+            "timestamp IN (" + ",".join("?" for _ in points) + ") AND symbol IN (" +
+            ",".join("?" for _ in symbol_filter) + ")"
+        )
+        parameters: List[Any] = list(self.canonical_source_priority)
+        parameters.extend([interval, adjustment, *points, *symbol_filter])
+        if after is not None:
+            filters += " AND (timestamp > ? OR (timestamp = ? AND symbol > ?))"
+            parameters.extend([after[0], after[0], after[1]])
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER (PARTITION BY timestamp, symbol ORDER BY " +
+                priority_sql + " ASC, CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) "
+                "AS selected FROM market_price_bar WHERE interval = ? "
+                "AND adjustment = ? AND " + filters +
+                ") WHERE selected = 1 ORDER BY timestamp ASC, symbol ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        result = []
+        for row in rows[:page_size]:
+            row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            row["bar_at"] = self._utc_iso(row["bar_at"])
+            row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            observed_at = row.pop("observed_at")
+            raw_artifact_id = row.pop("raw_artifact_id")
+            row["source_payload"] = canonical_page_payload(
+                row["source"], observed_at, raw_artifact_id
+            )
+            result.append(row)
+        return result, has_more
+
     def get_raw_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
         start: str, end: str, limit: int,
