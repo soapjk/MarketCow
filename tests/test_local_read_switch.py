@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -625,6 +626,13 @@ class LocalReadSwitchComposedIntegrationTest(unittest.TestCase):
                 self.assertEqual(drill.run(1)["final_backend"], "clickhouse")
                 self.assertEqual(LocalReadSwitchDrill(inputs).run(1)["final_backend"],
                                  "clickhouse")
+                rollback_report = drill.rollback("readiness_evidence")
+                self.assertEqual(rollback_report["final_backend"], "duckdb")
+                if export_root := os.getenv("MARKETCOW_READINESS_EVIDENCE_ROOT"):
+                    target = Path(export_root) / "SV2-022B"
+                    target.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(drill.report_path, target / "report.json")
+                    shutil.copy2(drill.checkpoint_path, target / "checkpoint.json")
                 tampered = json.loads(restore_report_path.read_text())
                 tampered["verification"]["bundle"] = "tampered"
                 restore_report_path.write_text(json.dumps(tampered))

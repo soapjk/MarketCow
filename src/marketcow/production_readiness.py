@@ -11,10 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
-from .local_backup import MANIFEST_VERSION, _assert_no_sensitive, _fsync_dir, _hash, _json
-from .local_backfill import BACKFILL_VERSION
-from .local_benchmark import BENCHMARK_VERSION
-from .local_read_switch import SWITCH_VERSION
+from .local_backup import (
+    MANIFEST_VERSION, REQUIRED_COMPONENTS, _assert_no_sensitive, _fsync_dir, _hash, _json,
+)
+from .local_backfill import BACKFILL_VERSION, POSTGRES_DOMAINS, LocalStorageBackfill
+from .local_benchmark import BENCHMARK_VERSION, OPERATIONS, LocalStorageBenchmark
+from .local_read_switch import SWITCH_VERSION, LocalReadSwitchDrill
 from .local_restore import RESTORE_VERSION
 
 
@@ -140,38 +142,131 @@ class ProductionReadinessPackage:
             raise ValueError("readiness target port is invalid")
 
     @staticmethod
-    def _validate_payload(item: str, value: Mapping[str, Any]) -> None:
+    def _validate_payload(item: str, value: Mapping[str, Any], payload_path: Path,
+                          acceptance: Mapping[str, Any]) -> Dict[str, Any]:
         if item == "SV2-021A":
-            ok = value.get("manifest_version") == MANIFEST_VERSION
+            unsigned = dict(value)
+            signature = unsigned.pop("manifest_payload_sha256", None)
+            identity = dict(unsigned)
+            backup_id = identity.pop("backup_id", None)
+            components = value.get("components", [])
+            names = {component.get("name") for component in components}
+            files_checked = 0
+            files_ok = True
+            for component in components:
+                for entry in component.get("files", []):
+                    relative = entry.get("path", "")
+                    file_path = payload_path.parent / relative
+                    if (not relative.startswith("components/") or file_path.is_symlink() or
+                            not file_path.is_file() or
+                            len(file_path.read_bytes()) != entry.get("bytes") or
+                            _hash(file_path.read_bytes()) != entry.get("sha256")):
+                        files_ok = False
+                    files_checked += 1
+            ok = (value.get("manifest_version") == MANIFEST_VERSION and
+                  signature == _hash(_json(unsigned)) and backup_id == payload_path.parent.name and
+                  backup_id == _hash(_json(identity))[:24] and names == REQUIRED_COMPONENTS and
+                  len(components) == len(REQUIRED_COMPONENTS) and files_checked >= len(REQUIRED_COMPONENTS)
+                  and files_ok)
+            facts = {"backup_id": backup_id, "components": sorted(names),
+                     "files_checked": files_checked}
         elif item == "SV2-021B":
+            verification = value.get("verification", {})
+            required = {"postgres_pit", "clickhouse_raw", "duckdb_api_contract",
+                        "cold_verify_query_backfill", "spool_replay_once", "canonical_boundary"}
             ok = (value.get("report_version") == RESTORE_VERSION and
-                  value.get("status") == "complete" and bool(value.get("verification")))
+                  value.get("status") == "complete" and isinstance(verification, Mapping) and
+                  set(verification) == required and all(result == "ok" for result in verification.values())
+                  and {item.get("name") for item in value.get("components", [])} == REQUIRED_COMPONENTS
+                  and len(value.get("backup_chain", [])) >= 1 and
+                  value.get("canonical_boundary") and value.get("watermark"))
+            facts = {"backup_chain": list(value.get("backup_chain", [])),
+                     "verification": dict(verification)}
         elif item == "SV2-022A":
-            reconcile = value.get("reconciliation", value.get("reconcile", {}))
-            ok = (value.get("version") == BACKFILL_VERSION and value.get("status") == "complete" and
-                  value.get("lag") == 0 and isinstance(reconcile, Mapping) and
-                  reconcile.get("status") == "ok")
-        elif item == "SV2-022B":
-            ok = value.get("version") == SWITCH_VERSION and value.get("status") in {
-                "switched", "rolled_back",
+            companion = ProductionReadinessPackage._companion(
+                acceptance, "checkpoint", payload_path, payload_path.parents[2]
+            )
+            checkpoint = json.loads(companion.read_text())
+            LocalStorageBackfill._validate_checkpoint(checkpoint)
+            domains = value.get("domains", [])
+            expected_domains = {domain.table for domain in POSTGRES_DOMAINS} | {
+                "market_bar_raw", "market_bar_canonical", "query_contracts",
             }
+            ok = (value.get("version") == BACKFILL_VERSION and value.get("status") == "complete" and
+                  value.get("lag") == 0 and not value.get("mismatches") and
+                  {domain.get("domain") for domain in domains} == expected_domains and
+                  all(domain.get("status") == "ok" for domain in domains) and
+                  checkpoint.get("phase") == "complete" and
+                  checkpoint.get("run_id") == value.get("run_id") and
+                  checkpoint.get("completion_fingerprint") == checkpoint.get("last_live_fingerprint"))
+            facts = {"run_id": value.get("run_id"), "lag": value.get("lag"),
+                     "domains_checked": len(domains), "checkpoint_sha256": _hash(companion.read_bytes())}
+        elif item == "SV2-022B":
+            companion = ProductionReadinessPackage._companion(
+                acceptance, "checkpoint", payload_path, payload_path.parents[2]
+            )
+            checkpoint = json.loads(companion.read_text())
+            LocalReadSwitchDrill._validate_signed(checkpoint, "read switch checkpoint")
+            ok = (value.get("version") == SWITCH_VERSION and value.get("status") == "rolled_back"
+                  and value.get("final_backend") == "duckdb" and value.get("canonical") == "duckdb"
+                  and value.get("raw") == "duckdb" and checkpoint.get("phase") == "rolled_back"
+                  and checkpoint.get("binding") == value.get("binding") and
+                  any(event.get("event") == "rollback" for event in value.get("events", [])))
+            facts = {"final_backend": value.get("final_backend"),
+                     "phase": checkpoint.get("phase"), "events": len(value.get("events", [])),
+                     "checkpoint_sha256": _hash(companion.read_bytes())}
         else:
             checks = value.get("checks", {})
             capacity = value.get("capacity", {})
+            plan = value.get("plan", {})
+            observations = value.get("observations", {})
+            measured_rows = int(capacity.get("measured_raw_rows", 0))
+            measured_bytes = int(capacity.get("measured_raw_bytes", 0))
+            sources = int(plan.get("sources", 0))
+            model_rows = int(plan.get("model_raw_rows", 0))
+            derived_bpr = measured_bytes / measured_rows if measured_rows else 0
+            derived_online = int(derived_bpr * model_rows * (1 + (.9 / sources))) if sources else 0
+            expected_required = int(derived_online / .70) if derived_online else 0
+            verification_ok = all(
+                observation.get("verification", {}).get("expected_rows") ==
+                observation.get("verification", {}).get("actual_rows") and
+                observation.get("verification", {}).get("expected_checksum") ==
+                observation.get("verification", {}).get("actual_checksum")
+                for observation in observations.values()
+            )
             ok = (
                 value.get("version") == BENCHMARK_VERSION and value.get("status") == "passed"
                 and isinstance(checks, Mapping) and set(checks) == REQUIRED_BENCHMARK_CHECKS
                 and all(check is True for check in checks.values())
-                and int(capacity.get("measured_raw_rows", 0)) > 0
-                and int(capacity.get("measured_raw_bytes", 0)) > 0
-                and float(capacity.get("bytes_per_raw_row", 0)) > 0
-                and int(capacity.get("model_online_bytes", 0)) > 0
-                and int(capacity.get("model_required_disk_bytes_with_30pct_free", 0)) > 0
+                and set(observations) == set(OPERATIONS) and value.get("slo") == LocalStorageBenchmark.SLO
+                and measured_rows > 0 and measured_bytes > 0 and sources > 0 and model_rows > 0
+                and abs(float(capacity.get("bytes_per_raw_row", 0)) - derived_bpr) < 1e-5
+                and abs(int(capacity.get("model_online_bytes", 0)) - derived_online) <= 1
+                and abs(int(capacity.get("model_required_disk_bytes_with_30pct_free", 0)) -
+                        expected_required) <= 2
                 and float(capacity.get("observed_clickhouse_free_ratio", 0)) >= .30
+                and verification_ok
             )
+            facts = {"checks": len(checks), "operations": len(observations),
+                     "measured_raw_rows": measured_rows, "measured_raw_bytes": measured_bytes,
+                     "required_disk_bytes": expected_required}
         if not ok:
             raise ValueError(f"{item} evidence payload is incomplete or failed")
         _assert_no_sensitive(value, f"{item} readiness evidence")
+        return facts
+
+    @staticmethod
+    def _companion(acceptance: Mapping[str, Any], name: str, payload_path: Path,
+                   allowed_root: Path) -> Path:
+        companions = acceptance.get("companions", {})
+        descriptor = companions.get(name, {}) if isinstance(companions, Mapping) else {}
+        uri, checksum = descriptor.get("uri"), descriptor.get("sha256")
+        if not isinstance(uri, str) or not isinstance(checksum, str):
+            raise ValueError(f"readiness {name} companion is missing")
+        path = _contained_file(allowed_root / uri, allowed_root, f"readiness {name} companion")
+        if _hash(path.read_bytes()) != checksum or path.parent != payload_path.parent:
+            raise ValueError(f"readiness {name} companion binding mismatch")
+        return path
 
     def _verify_evidence(self, paths: Mapping[str, Path], release_commit: str) -> Dict[str, Any]:
         head = _git(self.repository_root, "rev-parse", "HEAD")
@@ -204,7 +299,7 @@ class ProductionReadinessPackage:
             if acceptance.get("evidence_sha256") != _hash(payload_bytes):
                 raise ValueError(f"{item} evidence checksum mismatch")
             payload = json.loads(payload_bytes)
-            self._validate_payload(item, payload)
+            facts = self._validate_payload(item, payload, payload_path, acceptance)
             result[item] = {
                 "accepted_commit": _git(self.repository_root, "rev-parse", f"{commit}^{{commit}}"),
                 "acceptance_uri": acceptance_path.relative_to(self.allowed_root).as_posix(),
@@ -212,7 +307,8 @@ class ProductionReadinessPackage:
                 "evidence_uri": uri, "evidence_sha256": _hash(payload_bytes),
                 "evidence_version": payload.get("version", payload.get("report_version",
                                                 payload.get("manifest_version"))),
-                "status": payload.get("status", "verified"), "payload": payload,
+                "status": payload.get("status", "verified"), "facts": facts,
+                "payload": payload,
             }
         return result
 
@@ -397,9 +493,52 @@ class ProductionReadinessPackage:
             "read_switch": ("SV2-022B",), "observation": ("SV2-023",),
         }[stage]
         checked = [{"item": item, "evidence_sha256": self._evidence[item]["evidence_sha256"],
-                    "accepted_commit": self._evidence[item]["accepted_commit"]} for item in selected]
+                    "accepted_commit": self._evidence[item]["accepted_commit"],
+                    "facts": self._evidence[item]["facts"]} for item in selected]
+        document = self._document()
+        if stage == "configuration":
+            from .config import Settings
+            defaults = Settings.__dataclass_fields__
+            facts = {
+                "default_canonical_backend": defaults["market_bar_read_backend"].default,
+                "default_raw_backend": defaults["raw_market_bar_read_backend"].default,
+                "default_clickhouse_enabled": defaults["clickhouse_enabled"].default,
+                "production_logical_port": document["target"]["port"],
+                "credential_delivery": document["configuration_matrix"]["credential_delivery"],
+            }
+            if facts != {"default_canonical_backend": "duckdb", "default_raw_backend": "duckdb",
+                         "default_clickhouse_enabled": False, "production_logical_port": 8790,
+                         "credential_delivery": "out-of-band references only; no values stored"}:
+                raise ValueError("readiness configuration static audit failed")
+        elif stage == "schema":
+            from .clickhouse_repositories import CLICKHOUSE_MIGRATIONS
+            from .postgres_migrations import POSTGRES_MIGRATIONS
+            facts = {"postgres_source_version": max(row[0] for row in POSTGRES_MIGRATIONS),
+                     "clickhouse_source_version": max(row[0] for row in CLICKHOUSE_MIGRATIONS)}
+            if (facts["postgres_source_version"] != document["schema_preflight"]["postgres_expected_version"] or
+                    facts["clickhouse_source_version"] !=
+                    document["schema_preflight"]["clickhouse_expected_version"]):
+                raise ValueError("readiness schema static audit failed")
+        elif stage == "backup":
+            facts = {"backup": self._evidence["SV2-021A"]["facts"],
+                     "restore": self._evidence["SV2-021B"]["facts"]}
+            if facts["backup"]["backup_id"] not in facts["restore"]["backup_chain"]:
+                raise ValueError("readiness backup/restore binding failed")
+        elif stage == "backfill":
+            facts = dict(self._evidence["SV2-022A"]["facts"])
+            if facts["lag"] != 0 or facts["domains_checked"] != len(POSTGRES_DOMAINS) + 3:
+                raise ValueError("readiness backfill audit failed")
+        elif stage == "read_switch":
+            facts = dict(self._evidence["SV2-022B"]["facts"])
+            if facts["final_backend"] != "duckdb" or facts["phase"] != "rolled_back":
+                raise ValueError("readiness rollback audit failed")
+        else:
+            facts = dict(self._evidence["SV2-023"]["facts"])
+            if facts["checks"] != len(REQUIRED_BENCHMARK_CHECKS) or facts["operations"] != len(OPERATIONS):
+                raise ValueError("readiness observation audit failed")
         return {"version": READINESS_VERSION, "status": "ok", "stage": stage,
-                "checked_evidence": checked, "production_connection_attempted": False,
+                "checked_evidence": checked, "checked_facts": facts,
+                "production_connection_attempted": False,
                 "state_changed": False, "authorization_required": True}
 
     def rehearse(self) -> Dict[str, Any]:

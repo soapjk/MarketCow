@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -591,6 +592,17 @@ class LocalStorageRestoreIntegrationTest(unittest.TestCase):
                                  "ok")
                 self.assertNotIn(str(target_root), rendered)
                 self.assertNotIn(password, rendered)
+                if export_root := os.getenv("MARKETCOW_READINESS_EVIDENCE_ROOT"):
+                    target = Path(export_root)
+                    backup_target = target / "SV2-021A" / artifact.name
+                    backup_target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(artifact, backup_target, dirs_exist_ok=True)
+                    key_path = target / "SV2-021A/wrapping.key"
+                    key_path.write_bytes(b"w" * 32)
+                    os.chmod(key_path, 0o600)
+                    restore_target = target / "SV2-021B"
+                    restore_target.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(report_path, restore_target / "report.json")
         finally:
             source_pg.close()
             target_pg.close()

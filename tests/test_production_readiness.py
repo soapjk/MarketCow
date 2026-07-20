@@ -6,10 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from marketcow.local_backup import MANIFEST_VERSION, _hash, _json
-from marketcow.local_backfill import BACKFILL_VERSION
-from marketcow.local_benchmark import BENCHMARK_VERSION
-from marketcow.local_read_switch import SWITCH_VERSION
+from marketcow.local_backup import BackupComponent, LocalStorageBackup, _hash, _json
+from marketcow.local_backfill import BACKFILL_VERSION, POSTGRES_DOMAINS, LocalStorageBackfill
+from marketcow.local_benchmark import (
+    OPERATIONS, BenchmarkInputs, BenchmarkPlan, LocalStorageBenchmark,
+)
+from marketcow.local_read_switch import SWITCH_VERSION, LocalReadSwitchDrill
 from marketcow.local_restore import RESTORE_VERSION
 from marketcow.production_readiness import (
     EVIDENCE_VERSION,
@@ -46,40 +48,127 @@ class ProductionReadinessPackageTest(unittest.TestCase):
         self.folder.cleanup()
 
     def _write_evidence(self):
+        evidence_root = self.allowed / "accepted-evidence"
+        evidence_root.mkdir(exist_ok=True)
+        backup_root = evidence_root / "SV2-021A"
+        captured = "2026-07-20T00:00:00Z"
+        components = [BackupComponent(
+            name, f"{name}-kind", "1", {f"{name}.json": _json({"fixture": name})},
+            {"captured_at": captured}, name == "clickhouse",
+        ) for name in ("postgresql", "clickhouse", "duckdb", "cold_archive", "spool")]
+        components.append(BackupComponent(
+            "cursor_key", "sealed-secret", "1", {"cursor.key": b"c" * 48},
+            {"captured_at": captured},
+        ))
+        backup = LocalStorageBackup(backup_root, self.allowed, b"w" * 32)
+        backup_result = backup.create(components, captured)
+        backup_manifest = Path(backup_result["artifact_path"]) / "manifest.json"
+        backup_id = backup_result["backup_id"]
+        verification = {key: "ok" for key in (
+            "postgres_pit", "clickhouse_raw", "duckdb_api_contract",
+            "cold_verify_query_backfill", "spool_replay_once", "canonical_boundary",
+        )}
+        domain_names = [domain.table for domain in POSTGRES_DOMAINS] + [
+            "market_bar_raw", "market_bar_canonical", "query_contracts",
+        ]
+        fingerprint = {"logical": "same"}
+        checkpoint = {
+            "version": BACKFILL_VERSION, "run_id": "fixture-run", "phase": "complete",
+            "source_fingerprint": fingerprint, "completion_fingerprint": fingerprint,
+            "last_live_fingerprint": fingerprint, "snapshot_watermark": captured,
+            "source_path_hash": "fixture", "targets": {"postgres": "test", "clickhouse": "test"},
+            "domains": {}, "catchup_passes": 1, "errors": [],
+        }
+        LocalStorageBackfill._sign(checkpoint)
+        switch_checkpoint = {
+            "version": SWITCH_VERSION, "binding": {"fixture": "bound"},
+            "phase": "rolled_back", "canonical": "duckdb", "raw": "duckdb",
+            "events": [{"event": "rollback"}], "stop_reason": "fixture",
+        }
+        LocalReadSwitchDrill._sign(switch_checkpoint)
+        plan = BenchmarkPlan(10, 20, 240, 2, 3, max_peak_memory_mb=8192)
+        operations = {}
+        for name in OPERATIONS:
+            result = {"rows": plan.sample_raw_rows, "verification": {
+                "expected_rows": plan.sample_raw_rows, "actual_rows": plan.sample_raw_rows,
+                "expected_checksum": name, "actual_checksum": name,
+            }}
+            if name == "raw_write":
+                result["bytes"] = plan.sample_raw_rows * 24
+            if name == "archive":
+                result.update({"bytes": plan.sample_raw_rows * 12,
+                               "uncompressed_bytes": plan.sample_raw_rows * 40})
+            if name in {"page_first", "page_deep"}:
+                result.update({"query_plan": "ReadFromMergeTree Filter bar_time > cursor",
+                               "query_sql": ("SELECT bars WHERE bar_time > "
+                                             "'2026-07-15 01:59:00.000' LIMIT 101"),
+                               "cursor_depth": 0 if name == "page_first" else 4600,
+                               "query_after": None if name == "page_first" else 1784075940,
+                               "explain_after": None if name == "page_first" else 1784075940,
+                               "depth_after": None if name == "page_first" else 1784075940,
+                               "cursor_predicate": "" if name == "page_first" else
+                               "2026-07-15 01:59:00.000"})
+            if name == "query_warm":
+                result["path_kind"] = "warm_existing_session"
+            if name == "query_cold":
+                result["path_kind"] = "new_connection"
+            if name == "merge_probe":
+                result.update({"total_bytes": 1_000_000, "free_bytes": 400_000,
+                               "merge_backlog": 2})
+            operations[name] = lambda _run, result=result: dict(result)
+        class Clock:
+            value = 0.0
+            def __call__(self):
+                value = self.value
+                self.value += .01
+                return value
+        benchmark = LocalStorageBenchmark(BenchmarkInputs(
+            evidence_root / "benchmark-test", plan, operations, "test", self.allowed,
+            {"clickhouse": "disposable", "duckdb": "local"}, Clock(),
+        )).run()
         payloads = {
-            "SV2-021A": {"manifest_version": MANIFEST_VERSION, "mode": "full",
-                         "components": ["postgres", "clickhouse", "duckdb", "cold", "spool", "cursor"]},
+            "SV2-021A": json.loads(backup_manifest.read_text()),
             "SV2-021B": {"report_version": RESTORE_VERSION, "status": "complete",
-                         "verification": {"contracts": "ok"}},
+                         "verification": verification, "backup_chain": [backup_id],
+                         "components": [{"name": name} for name in (
+                             "postgresql", "clickhouse", "duckdb", "cold_archive", "spool", "cursor_key")],
+                         "canonical_boundary": "verified raw+spool only",
+                         "watermark": {"latest_captured_at": captured}},
             "SV2-022A": {"version": BACKFILL_VERSION, "status": "complete", "lag": 0,
-                         "reconciliation": {"status": "ok"}},
+                         "run_id": "fixture-run", "mismatches": [],
+                         "domains": [{"domain": name, "status": "ok"} for name in domain_names]},
             "SV2-022B": {"version": SWITCH_VERSION, "status": "rolled_back",
-                         "final_backend": "duckdb"},
-            "SV2-023": {
-                "version": BENCHMARK_VERSION, "status": "passed",
-                "checks": {name: True for name in REQUIRED_BENCHMARK_CHECKS},
-                "capacity": {
-                    "measured_raw_rows": 28_800, "measured_raw_bytes": 1_382_400,
-                    "bytes_per_raw_row": 48.0, "model_online_bytes": 12_000_000,
-                    "model_required_disk_bytes_with_30pct_free": 17_142_857,
-                    "observed_clickhouse_free_ratio": .42,
-                },
-            },
+                         "final_backend": "duckdb", "canonical": "duckdb", "raw": "duckdb",
+                         "binding": {"fixture": "bound"}, "events": [{"event": "rollback"}]},
+            "SV2-023": benchmark,
         }
         commits = {"SV2-021A": "25f833f", "SV2-021B": "8b6aa74", "SV2-022A": "6b44732",
                    "SV2-022B": "8a376d9", "SV2-023": "9a685e8"}
         result = {}
-        evidence_root = self.allowed / "accepted-evidence"
-        evidence_root.mkdir(exist_ok=True)
         for item, payload in payloads.items():
-            payload_path = evidence_root / f"{item}.json"
+            payload_path = backup_manifest if item == "SV2-021A" else evidence_root / item / "report.json"
+            payload_path.parent.mkdir(parents=True, exist_ok=True)
             payload_path.write_bytes(_json(payload))
             record = {
                 "version": EVIDENCE_VERSION, "item": item, "status": "accepted",
                 "accepted_commit": commits[item],
-                "evidence_uri": payload_path.relative_to(self.allowed).as_posix(),
+                "evidence_uri": payload_path.resolve().relative_to(self.allowed.resolve()).as_posix(),
                 "evidence_sha256": _hash(payload_path.read_bytes()),
             }
+            if item == "SV2-022A":
+                companion = payload_path.parent / "checkpoint.json"
+                companion.write_bytes(_json(checkpoint))
+                record["companions"] = {"checkpoint": {
+                    "uri": companion.resolve().relative_to(self.allowed.resolve()).as_posix(),
+                    "sha256": _hash(companion.read_bytes()),
+                }}
+            if item == "SV2-022B":
+                companion = payload_path.parent / "checkpoint.json"
+                companion.write_bytes(_json(switch_checkpoint))
+                record["companions"] = {"checkpoint": {
+                    "uri": companion.resolve().relative_to(self.allowed.resolve()).as_posix(),
+                    "sha256": _hash(companion.read_bytes()),
+                }}
             record["acceptance_sha256"] = _hash(_json(record))
             acceptance = evidence_root / f"{item}.acceptance.json"
             acceptance.write_bytes(_json(record))
@@ -97,7 +186,7 @@ class ProductionReadinessPackageTest(unittest.TestCase):
         document = json.loads(package.package_path.read_text())
         self.assertEqual(document["version"], READINESS_VERSION)
         self.assertEqual(set(document["slo_checks"]), REQUIRED_BENCHMARK_CHECKS)
-        self.assertEqual(document["capacity"]["measured_raw_rows"], 28_800)
+        self.assertEqual(document["capacity"]["measured_raw_rows"], 288_000)
         self.assertEqual(set(document["evidence"]), set(self.evidence))
         self.assertNotIn("payload", json.dumps(document["evidence"]))
         runbook = package.runbook_path.read_text()
@@ -137,7 +226,7 @@ class ProductionReadinessPackageTest(unittest.TestCase):
         self.assertEqual([item["stage"] for item in report["results"]], list(REHEARSAL_GATES))
 
     def test_tampered_swapped_failed_or_fake_evidence_is_rejected_before_build(self):
-        benchmark = self.allowed / "accepted-evidence/SV2-023.json"
+        benchmark = self.allowed / "accepted-evidence/SV2-023/report.json"
         value = json.loads(benchmark.read_text())
         value["checks"]["query_p99"] = False
         benchmark.write_bytes(_json(value))
@@ -145,7 +234,7 @@ class ProductionReadinessPackageTest(unittest.TestCase):
             self.package()
 
         self.evidence = self._write_evidence()
-        benchmark = self.allowed / "accepted-evidence/SV2-023.json"
+        benchmark = self.allowed / "accepted-evidence/SV2-023/report.json"
         value = json.loads(benchmark.read_text())
         value["checks"] = {"caller_says_ok": True}
         benchmark.write_bytes(_json(value))

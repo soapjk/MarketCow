@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -563,6 +564,11 @@ class StorageV2BenchmarkIntegrationTest(unittest.TestCase):
                 self.assertEqual(report["status"], "passed")
                 self.assertEqual(report["plan"]["sample_raw_rows"], len(rows_by_run[0]))
                 self.assertTrue(all(report["checks"].values()))
+                if export_root := os.getenv("MARKETCOW_READINESS_EVIDENCE_ROOT"):
+                    target = Path(export_root) / "SV2-023"
+                    target.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(root / "benchmark-test/storage-v2-benchmark.json",
+                                 target / "report.json")
             finally:
                 database.close()
                 bootstrap = clickhouse_connect.get_client(

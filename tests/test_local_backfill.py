@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -503,6 +504,12 @@ class LocalStorageBackfillIntegrationTest(unittest.TestCase):
                 repeated = LocalStorageBackfill(source, targets, 2).run()
                 self.assertEqual(repeated["run_id"], report["run_id"])
                 self.assertEqual(repeated["lag"], 0)
+                if export_root := os.getenv("MARKETCOW_READINESS_EVIDENCE_ROOT"):
+                    target = Path(export_root) / "SV2-022A"
+                    target.mkdir(parents=True, exist_ok=True)
+                    exported = LocalStorageBackfill(source, targets, 2)
+                    shutil.copy2(exported.state / "report.json", target / "report.json")
+                    shutil.copy2(exported.checkpoint_path, target / "checkpoint.json")
             finally:
                 clickhouse.close()
                 bootstrap = clickhouse_connect.get_client(
