@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,13 @@ class Settings:
     metadata_backend: str = "duckdb"
     postgres_dsn: str = ""
     postgres_schema: str = "marketcow_development"
+    clickhouse_enabled: bool = False
+    clickhouse_host: str = "127.0.0.1"
+    clickhouse_port: int = 8123
+    clickhouse_database: str = "marketcow_development"
+    clickhouse_username: str = "default"
+    clickhouse_password: str = ""
+    clickhouse_secure: bool = False
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -55,6 +63,21 @@ class Settings:
             postgres_schema=os.getenv(
                 "MARKETCOW_POSTGRES_SCHEMA", "marketcow_development"
             ).strip(),
+            clickhouse_enabled=os.getenv(
+                "MARKETCOW_CLICKHOUSE_ENABLED", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
+            clickhouse_host=os.getenv("MARKETCOW_CLICKHOUSE_HOST", "127.0.0.1").strip(),
+            clickhouse_port=int(os.getenv("MARKETCOW_CLICKHOUSE_PORT", "8123")),
+            clickhouse_database=os.getenv(
+                "MARKETCOW_CLICKHOUSE_DATABASE", "marketcow_development"
+            ).strip(),
+            clickhouse_username=os.getenv(
+                "MARKETCOW_CLICKHOUSE_USERNAME", "default"
+            ).strip(),
+            clickhouse_password=os.getenv("MARKETCOW_CLICKHOUSE_PASSWORD", ""),
+            clickhouse_secure=os.getenv(
+                "MARKETCOW_CLICKHOUSE_SECURE", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
         )
 
     def validate_runtime_isolation(self) -> None:
@@ -67,6 +90,19 @@ class Settings:
                 raise ValueError("MARKETCOW_POSTGRES_DSN is required for PostgreSQL metadata")
             if not self.postgres_schema.endswith(("_development", "_test")):
                 raise ValueError("development PostgreSQL schema must end in _development or _test")
+        if self.clickhouse_enabled:
+            if self.profile != "development":
+                raise ValueError("ClickHouse is development-only during the storage foundation stage")
+            try:
+                loopback = ipaddress.ip_address(self.clickhouse_host).is_loopback
+            except ValueError:
+                loopback = self.clickhouse_host.lower() == "localhost"
+            if not loopback:
+                raise ValueError("development ClickHouse host must be loopback")
+            if not self.clickhouse_database.endswith(("_development", "_test")):
+                raise ValueError(
+                    "development ClickHouse database must end in _development or _test"
+                )
         if self.profile != "development":
             return
         production_db = (Path.cwd() / "data/warehouse/market_data.duckdb").resolve()

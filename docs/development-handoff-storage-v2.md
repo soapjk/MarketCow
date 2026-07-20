@@ -42,6 +42,9 @@ DuckDB
   `_development` 或 `_test` 结尾；
 - 开发 profile 的 Stage 1 基本面关系数据可由 PostgreSQL 承担；行情仍由 DuckDB
   承担，未连接或迁移正式 PostgreSQL。
+- ClickHouse development/test 存储基础已建立：默认关闭且只允许显式连接本机回环
+  地址及 `_development`/`_test` database；包含客户端生命周期、幂等 migration、
+  健康诊断，以及 `market_bar_raw`/`market_bar_canonical` 基础表。尚未接入应用双写。
 
 ## 二、仓库、分支和 worktree
 
@@ -369,8 +372,10 @@ fundamental / statements / PIT history
 
 ### 第 4 步：ClickHouse 影子写入
 
-这是本步骤完成后仍未开始的下一阶段；不得把本次 PostgreSQL 迁移表述为已完成
-ClickHouse 或整个 Storage V2 项目。
+ClickHouse development/test 存储基础与 schema 边界已经完成。当前仅具备显式启用的
+客户端、幂等初始化、健康诊断和基础 round-trip；应用双写尚未开始。
+
+下一步仍是影子写入本身：
 
 - 建立 `market_bar_raw`；
 - 建立 `market_bar_canonical`；
@@ -461,8 +466,11 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 ```text
 feature/storage-v2 基线：9c21cf1
-默认测试：62 项通过，另有 7 项 PostgreSQL 测试因未显式配置 DSN 而跳过
+默认测试：发现 68 项且整体通过；7 项 PostgreSQL、2 项 ClickHouse 集成测试因未
+显式配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
+ClickHouse 测试：4 项通过（2 项隔离边界测试、2 项使用一次性 ClickHouse 25.8
+本地容器的集成测试；容器测试后删除）
 下一阶段：ClickHouse 影子写入，尚未开始
 ```
 
