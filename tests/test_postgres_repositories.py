@@ -32,11 +32,12 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
             connection.execute(f'DROP SCHEMA IF EXISTS "{cls.schema}" CASCADE')
 
     def test_migrations_control_plane_and_artifact_manifest(self):
+        self.database.migrate()
         with self.database.connection() as connection:
             versions = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3])
+        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4])
 
         run = ["run-1", "fixture", "running", None, "2026-07-20T00:00:00+00:00", None, 0, None]
         self.repository.save_run(run)
@@ -147,6 +148,71 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         self.assertEqual(current["roe_weighted"], 16.0)
         self.assertEqual(pit[0]["roe_weighted"], 15.0)
         self.assertEqual(self.fundamentals.tdx_coverage()[0]["row_count"], 1)
+
+    def test_validation_upsert_and_rebuild(self):
+        key = {
+            "symbol": "600519", "report_period": "20260331", "metric": "fixture",
+            "source_a": "a", "source_b": "b", "value_a": 10.0, "value_b": 10.1,
+            "difference_pct": 1.0, "status": "consistent", "observed_at": "2026-05-01",
+        }
+        self.assertEqual(self.fundamentals.save_validation_results([key]), 1)
+        self.fundamentals.save_validation_results([{**key, "value_b": 12.0,
+            "difference_pct": 20.0, "status": "difference_over_1pct",
+            "observed_at": "2026-05-02"}])
+        saved = self.fundamentals.get_validation_results("600519", "20260331")
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["value_b"], 12.0)
+        self.fundamentals.replace_fundamentals("20260331", [{
+            "symbol": "600519", "report_period": "20260331", "name": "Fixture",
+            "is_active": True, "published_at": "2026-04-30", "roe_weighted": 10.0,
+            "revenue": 100.0, "net_profit": 10.0, "total_assets": 200.0,
+            "total_liabilities": 80.0, "operating_cashflow": 12.0,
+            "observed_at": "2026-05-01", "ingested_at": "2026-05-01",
+            "fetched_at": "2026-05-01",
+        }])
+        self.fundamentals.upsert_baostock({"symbol": "600519",
+            "report_period": "20260331", "roe_avg": 10.0,
+            "observed_at": "2026-05-01", "ingested_at": "2026-05-01"})
+        self.fundamentals.replace_tdx_period("20260331", [{
+            "symbol": "600519", "report_period": "20260331", "roe_weighted": 10.0,
+            "revenue": 101.0, "net_profit_parent": 10.0, "total_assets": 200.0,
+            "total_liabilities": 80.0, "operating_cashflow": 12.0,
+            "observed_at": "2026-05-01", "ingested_at": "2026-05-01"}])
+        self.assertEqual(self.fundamentals.rebuild_validation_results(
+            "20260331", "2026-05-03"), 8)
+        rebuilt = self.fundamentals.get_validation_results("600519", "20260331")
+        self.assertEqual(sum(row["metric"] != "fixture" for row in rebuilt), 7)
+
+    def test_funnel_rebuild_filters_and_point_in_time_query(self):
+        observed = "2026-05-01"
+        self.fundamentals.replace_fundamentals("20260331", [{
+            "symbol": "000001", "report_period": "20260331", "name": "Fixture Bank",
+            "is_active": True, "published_at": "2026-04-30", "pe_dynamic": 8.0,
+            "pb": 1.0, "observed_at": observed, "ingested_at": observed,
+            "fetched_at": observed}])
+        for period, roe, revenue, profit in [("20231231", 12.0, 100.0, 10.0),
+            ("20241231", 14.0, 110.0, 11.0), ("20251231", 16.0, 121.0, 12.1)]:
+            self.fundamentals.replace_tdx_period(period, [{
+                "symbol": "000001", "report_period": period,
+                "published_at": "2026-04-30", "roe_weighted": roe,
+                "revenue_ttm": revenue, "net_profit_parent_ttm": profit,
+                "net_profit_parent": profit, "total_assets": 200.0,
+                "total_liabilities": 80.0, "cash": 40.0,
+                "operating_cashflow": 15.0, "capex": 5.0,
+                "observed_at": observed, "ingested_at": observed, "fetched_at": observed}])
+        self.fundamentals.upsert_baostock({"symbol": "000001",
+            "report_period": "20260331", "trade_date": "2026-04-30",
+            "pe_ttm": 7.5, "pb_mrq": 0.9, "observed_at": observed,
+            "ingested_at": observed, "fetched_at": observed})
+        self.assertEqual(self.fundamentals.rebuild_funnel_metrics("2026-05-02"), 1)
+        rows = self.fundamentals.query_funnel_metrics(min_roe_median=13,
+            min_revenue_cagr=9, max_pe=8, max_debt_ratio=50, min_annual_periods=3)
+        self.assertEqual(rows[0]["symbol"], "000001")
+        self.assertAlmostEqual(rows[0]["roe_annual_median"], 14.0)
+        self.assertEqual(rows[0]["quality_status"], "multi_source_pending_validation")
+        pit_symbols = {row["symbol"] for row in self.fundamentals.query_funnel_metrics(
+            as_of="2026-06-01")}
+        self.assertIn("000001", pit_symbols)
 
 
 if __name__ == "__main__":

@@ -34,10 +34,14 @@ DuckDB
 - 已迁移基本面当前快照、不可变版本历史、完整财务报表 JSONB 和严格
   point-in-time 查询；
 - BaoStock 快照、TDX 当前快照、TDX 不可变版本历史与 `as_of` 查询已迁移
-  PostgreSQL；验证结果和漏斗指标暂时继续读写 DuckDB；
+  PostgreSQL；
+- `validation_result` 与 `funnel_metrics` 已迁移 PostgreSQL，包括复合键幂等更新、
+  七项跨来源校验重建、漏斗重建/筛选及严格 `as_of` 查询；Stage 1 路由仅切换
+  这些已迁移的基本面数据域；
 - PostgreSQL 目前只允许 development profile 显式启用，schema 必须以
   `_development` 或 `_test` 结尾；
-- 基本面和行情仍由 DuckDB 承担，未连接或迁移正式 PostgreSQL。
+- 开发 profile 的 Stage 1 基本面关系数据可由 PostgreSQL 承担；行情仍由 DuckDB
+  承担，未连接或迁移正式 PostgreSQL。
 
 ## 二、仓库、分支和 worktree
 
@@ -358,7 +362,15 @@ fundamental / statements / PIT history
 
 先影子写入并对账，不切换正式读取。
 
+当前单步状态：控制面、核心基本面/PIT、财务报表、BaoStock、TDX、
+`validation_result` 和 `funnel_metrics` 的 PostgreSQL repository 与 development 路由
+均已实现。集成测试须通过 `MARKETCOW_TEST_POSTGRES_DSN` 显式启用；默认测试不依赖
+外部 PostgreSQL。正式环境尚未切换。
+
 ### 第 4 步：ClickHouse 影子写入
+
+这是本步骤完成后仍未开始的下一阶段；不得把本次 PostgreSQL 迁移表述为已完成
+ClickHouse 或整个 Storage V2 项目。
 
 - 建立 `market_bar_raw`；
 - 建立 `market_bar_canonical`；
@@ -445,13 +457,13 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 ## 十一、当前运行检查结果
 
-本文写入前确认：
+最近一次 PostgreSQL 单步开发检查：
 
 ```text
-main worktree：71f5b26，正式服务 8790 HTTP 200
-feature/storage-v2：71f5b26，开发服务 8791 HTTP 200
-tmux：marketcow-local 和 marketcow-development 均存在
-开发分支基线测试：51 个测试通过，Ruff 和 git diff --check 通过
+feature/storage-v2 基线：9c21cf1
+默认测试：62 项通过，另有 7 项 PostgreSQL 测试因未显式配置 DSN 而跳过
+PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
+下一阶段：ClickHouse 影子写入，尚未开始
 ```
 
 正式服务的当前进程是在加入 health `profile` 字段前启动的，因此它的 health 响应可能暂时没有 `profile`；这不代表配置错误。不要仅为补这个字段重启正式服务。

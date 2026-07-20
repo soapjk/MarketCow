@@ -470,6 +470,205 @@ class PostgresRepository(_PostgresControlPlaneRepository):
         with self.database.connection() as connection:
             return list(connection.execute(query, params).fetchall())
 
+    def save_validation_results(self, rows: List[Dict[str, Any]]) -> int:
+        columns = [
+            "symbol", "report_period", "metric", "source_a", "source_b",
+            "value_a", "value_b", "difference_pct", "status", "observed_at",
+        ]
+        statement = sql.SQL(
+            "INSERT INTO validation_result ({}) VALUES ({}) "
+            "ON CONFLICT (symbol, report_period, metric, source_a, source_b) "
+            "DO UPDATE SET value_a = EXCLUDED.value_a, value_b = EXCLUDED.value_b, "
+            "difference_pct = EXCLUDED.difference_pct, status = EXCLUDED.status, "
+            "observed_at = EXCLUDED.observed_at"
+        ).format(
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+            sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+        )
+        with self.database.connection() as connection:
+            for row in rows:
+                connection.execute(statement, [row.get(column) for column in columns])
+        return len(rows)
+
+    def get_validation_results(
+        self, symbol: str, report_period: str
+    ) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                "SELECT * FROM validation_result WHERE symbol = %s "
+                "AND report_period = %s ORDER BY metric, source_a, source_b",
+                (symbol, report_period),
+            ).fetchall())
+
+    def rebuild_validation_results(self, report_period: str, observed_at: str) -> int:
+        pairs = [
+            ("roe_eastmoney_vs_baostock", "eastmoney", "baostock", "f.roe_weighted", "b.roe_avg"),
+            ("roe_eastmoney_vs_tdx", "eastmoney", "tdx", "f.roe_weighted", "t.roe_weighted"),
+            ("revenue_eastmoney_vs_tdx", "eastmoney", "tdx", "f.revenue", "t.revenue"),
+            ("net_profit_eastmoney_vs_tdx", "eastmoney", "tdx", "f.net_profit", "t.net_profit_parent"),
+            ("assets_eastmoney_vs_tdx", "eastmoney", "tdx", "f.total_assets", "t.total_assets"),
+            ("liabilities_eastmoney_vs_tdx", "eastmoney", "tdx", "f.total_liabilities", "t.total_liabilities"),
+            ("ocf_eastmoney_vs_tdx", "eastmoney", "tdx", "f.operating_cashflow", "t.operating_cashflow"),
+        ]
+        selects, params = [], []
+        for metric, source_a, source_b, value_a, value_b in pairs:
+            selects.append(
+                "SELECT f.symbol, f.report_period, %s metric, %s source_a, %s source_b, "
+                f"{value_a} value_a, {value_b} value_b FROM fundamental_snapshot f "
+                "LEFT JOIN tdx_financial_snapshot t USING (symbol, report_period) "
+                "LEFT JOIN baostock_snapshot b USING (symbol, report_period) "
+                "WHERE f.report_period = %s"
+            )
+            params.extend([metric, source_a, source_b, report_period])
+        params.append(observed_at)
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO validation_result
+                    (symbol, report_period, metric, source_a, source_b, value_a,
+                     value_b, difference_pct, status, observed_at)
+                WITH pairs AS (""" + " UNION ALL ".join(selects) + """), scored AS (
+                    SELECT *, CASE WHEN value_a IS NULL OR value_b IS NULL OR value_a = 0
+                        THEN NULL ELSE ABS(value_a-value_b)/ABS(value_a)*100 END difference_pct
+                    FROM pairs
+                ) SELECT symbol, report_period, metric, source_a, source_b, value_a,
+                    value_b, ROUND(difference_pct::numeric, 4)::double precision,
+                    CASE WHEN difference_pct IS NULL THEN 'missing_comparison'
+                         WHEN difference_pct <= 1 THEN 'consistent'
+                         ELSE 'difference_over_1pct' END, %s FROM scored
+                ON CONFLICT (symbol, report_period, metric, source_a, source_b)
+                DO UPDATE SET value_a=EXCLUDED.value_a, value_b=EXCLUDED.value_b,
+                    difference_pct=EXCLUDED.difference_pct, status=EXCLUDED.status,
+                    observed_at=EXCLUDED.observed_at
+                """,
+                params,
+            )
+            return connection.execute(
+                "SELECT COUNT(*) count FROM validation_result WHERE report_period = %s",
+                (report_period,),
+            ).fetchone()["count"]
+
+    @staticmethod
+    def _funnel_select(source_ctes: str, rebuilt_expression: str) -> str:
+        return source_ctes + """
+        , annual AS (SELECT * FROM t_versions WHERE RIGHT(report_period, 4)='1231'),
+        latest_annual AS (SELECT DISTINCT ON (symbol) * FROM annual ORDER BY symbol, report_period DESC),
+        annual_agg AS (
+            SELECT symbol,
+              PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY roe_weighted) roe_annual_median,
+              MIN(roe_weighted) roe_annual_min, COUNT(*) annual_period_count,
+              MIN(report_period) history_start_period, MAX(report_period) history_end_period,
+              (ARRAY_AGG(revenue_ttm ORDER BY report_period)
+                FILTER (WHERE revenue_ttm IS NOT NULL))[1] revenue_first,
+              (ARRAY_AGG(revenue_ttm ORDER BY report_period DESC)
+                FILTER (WHERE revenue_ttm IS NOT NULL))[1] revenue_last,
+              (ARRAY_AGG(net_profit_parent_ttm ORDER BY report_period)
+                FILTER (WHERE net_profit_parent_ttm IS NOT NULL))[1] profit_first,
+              (ARRAY_AGG(net_profit_parent_ttm ORDER BY report_period DESC)
+                FILTER (WHERE net_profit_parent_ttm IS NOT NULL))[1] profit_last,
+              SUM(operating_cashflow) operating_cashflow_sum,
+              SUM(COALESCE(net_profit_parent,net_profit_parent_ttm)) net_profit_parent_sum,
+              LEFT(MAX(report_period),4)::integer-LEFT(MIN(report_period),4)::integer year_span
+            FROM annual GROUP BY symbol
+        ), validation_agg AS (
+            SELECT symbol, report_period,
+              COUNT(*) FILTER (WHERE status='consistent') consistent_count,
+              COUNT(*) FILTER (WHERE status='difference_over_1pct') difference_count
+            FROM validation_versions GROUP BY symbol, report_period
+        ) SELECT f.symbol,f.name,f.is_active,t.report_period latest_report_period,t.published_at,
+          b.pe_ttm,f.pe_dynamic,COALESCE(b.pe_ttm,f.pe_dynamic) pe_for_filter,
+          CASE WHEN b.pe_ttm IS NOT NULL THEN 'baostock_pe_ttm' ELSE 'eastmoney_pe_dynamic' END pe_source,
+          COALESCE(b.pb_mrq,f.pb) pb,
+          CASE WHEN b.pb_mrq IS NOT NULL THEN 'baostock_pb_mrq' ELSE 'eastmoney_pb' END pb_source,
+          t.roe_weighted roe_latest,a.roe_annual_median,a.roe_annual_min,
+          COALESCE(a.annual_period_count,0) annual_period_count,t.revenue_ttm,t.net_profit_parent_ttm,
+          CASE WHEN a.year_span>0 AND a.revenue_first>0 AND a.revenue_last>0
+            THEN (POWER(a.revenue_last/a.revenue_first,1.0/a.year_span)-1)*100 END revenue_cagr_pct,
+          CASE WHEN a.year_span>0 AND a.profit_first>0 AND a.profit_last>0
+            THEN (POWER(a.profit_last/a.profit_first,1.0/a.year_span)-1)*100 END net_profit_cagr_pct,
+          CASE WHEN t.total_assets>0 THEN t.total_liabilities/t.total_assets*100 END debt_ratio_latest,
+          CASE WHEN t.total_assets>0 THEN t.cash/t.total_assets*100 END cash_to_assets_pct,
+          t.operating_cashflow-t.capex fcf_latest_period,la.report_period latest_annual_period,
+          la.operating_cashflow operating_cashflow_latest_annual,
+          la.operating_cashflow-la.capex fcf_latest_annual,
+          CASE WHEN COALESCE(la.net_profit_parent,la.net_profit_parent_ttm)!=0
+            THEN la.operating_cashflow/COALESCE(la.net_profit_parent,la.net_profit_parent_ttm)*100 END ocf_to_net_profit_latest_annual_pct,
+          CASE WHEN a.net_profit_parent_sum!=0 THEN a.operating_cashflow_sum/a.net_profit_parent_sum*100 END ocf_to_net_profit_annual_sum_pct,
+          a.history_start_period,a.history_end_period,
+          CASE WHEN t.symbol IS NULL THEN 'missing_tdx_latest'
+            WHEN COALESCE(v.difference_count,0)>0 THEN 'cross_source_difference_over_1pct'
+            WHEN COALESCE(a.annual_period_count,0)<3 THEN 'insufficient_annual_history'
+            WHEN b.symbol IS NULL THEN 'history_ready_valuation_single_source'
+            WHEN COALESCE(v.consistent_count,0)>0 THEN 'multi_source_verified'
+            ELSE 'multi_source_pending_validation' END quality_status,
+          """ + rebuilt_expression + """ rebuilt_at
+        FROM current_f f LEFT JOIN latest_tdx t USING(symbol)
+        LEFT JOIN annual_agg a USING(symbol) LEFT JOIN latest_annual la USING(symbol)
+        LEFT JOIN latest_bao b USING(symbol)
+        LEFT JOIN validation_agg v ON v.symbol=t.symbol AND v.report_period=t.report_period
+        """
+
+    def rebuild_funnel_metrics(self, rebuilt_at: str) -> int:
+        sources = """
+        WITH current_f AS (SELECT DISTINCT ON (symbol) * FROM fundamental_snapshot ORDER BY symbol,report_period DESC),
+        t_versions AS (SELECT * FROM tdx_financial_snapshot),
+        latest_tdx AS (SELECT DISTINCT ON (symbol) * FROM t_versions ORDER BY symbol,report_period DESC),
+        latest_bao AS (SELECT DISTINCT ON (symbol) * FROM baostock_snapshot ORDER BY symbol,trade_date DESC,report_period DESC),
+        validation_versions AS (SELECT * FROM validation_result)
+        """
+        select = self._funnel_select(sources, "%s")
+        with self.database.connection() as connection:
+            connection.execute("DELETE FROM funnel_metrics")
+            connection.execute("INSERT INTO funnel_metrics " + select, (rebuilt_at,))
+            return connection.execute("SELECT COUNT(*) count FROM funnel_metrics").fetchone()["count"]
+
+    def query_funnel_metrics(
+        self, limit: int = 100, offset: int = 0,
+        min_roe_median: Optional[float] = None,
+        min_revenue_cagr: Optional[float] = None,
+        min_profit_cagr: Optional[float] = None, max_pe: Optional[float] = None,
+        max_debt_ratio: Optional[float] = None, min_annual_periods: int = 0,
+        active_only: bool = True, as_of: str = "",
+    ) -> List[Dict[str, Any]]:
+        params: List[Any] = []
+        query = "SELECT * FROM funnel_metrics"
+        if as_of:
+            sources = """
+            WITH cutoff AS (SELECT %s::date as_of),
+            f_ranked AS (SELECT f.*,ROW_NUMBER() OVER(PARTITION BY symbol,report_period ORDER BY COALESCE(ingested_at,fetched_at) DESC,version_id DESC) revision_rank FROM fundamental_snapshot_history f,cutoff c WHERE published_at IS NOT NULL AND published_at::date<=c.as_of AND COALESCE(observed_at,ingested_at,fetched_at)::date<=c.as_of),
+            f_versions AS (SELECT * FROM f_ranked WHERE revision_rank=1),
+            current_f AS (SELECT DISTINCT ON(symbol) * FROM f_versions ORDER BY symbol,report_period DESC),
+            t_ranked AS (SELECT t.*,ROW_NUMBER() OVER(PARTITION BY symbol,report_period ORDER BY COALESCE(ingested_at,fetched_at) DESC,version_id DESC) revision_rank FROM tdx_financial_snapshot_history t,cutoff c WHERE published_at IS NOT NULL AND published_at::date<=c.as_of AND COALESCE(observed_at,ingested_at,fetched_at)::date<=c.as_of),
+            t_versions AS (SELECT * FROM t_ranked WHERE revision_rank=1),
+            latest_tdx AS (SELECT DISTINCT ON(symbol) * FROM t_versions ORDER BY symbol,report_period DESC),
+            latest_bao AS (SELECT DISTINCT ON(symbol) b.* FROM baostock_snapshot b,cutoff c WHERE COALESCE(observed_at,ingested_at,fetched_at)::date<=c.as_of ORDER BY symbol,trade_date DESC,report_period DESC),
+            validation_versions AS (SELECT v.* FROM validation_result v,cutoff c WHERE observed_at::date<=c.as_of)
+            """
+            query = self._funnel_select(sources, "%s")
+            params.extend([as_of, as_of])
+        where = []
+        if active_only:
+            where.append("is_active IS TRUE")
+        for value, clause in [
+            (min_roe_median, "roe_annual_median >= %s"),
+            (min_revenue_cagr, "revenue_cagr_pct >= %s"),
+            (min_profit_cagr, "net_profit_cagr_pct >= %s"),
+            (max_pe, "pe_for_filter > 0 AND pe_for_filter <= %s"),
+            (max_debt_ratio, "debt_ratio_latest <= %s"),
+        ]:
+            if value is not None:
+                where.append(clause)
+                params.append(value)
+        if min_annual_periods:
+            where.append("annual_period_count >= %s")
+            params.append(min_annual_periods)
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY roe_annual_median DESC NULLS LAST,symbol LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
+        with self.database.connection() as connection:
+            return list(connection.execute(query, params).fetchall())
+
     def latest_artifact(
         self, dataset: str, metadata_key: str = "", metadata_value: str = ""
     ) -> Optional[Dict[str, Any]]:

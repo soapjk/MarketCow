@@ -169,4 +169,40 @@ POSTGRES_MIGRATIONS = [
                 (symbol, report_period, published_at, ingested_at);
         """,
     ),
+    (
+        4,
+        "cross-source validation results and fundamental funnel metrics",
+        """
+        CREATE TABLE IF NOT EXISTS validation_result (
+            symbol TEXT NOT NULL, report_period TEXT NOT NULL, metric TEXT NOT NULL,
+            source_a TEXT NOT NULL, source_b TEXT NOT NULL,
+            value_a DOUBLE PRECISION, value_b DOUBLE PRECISION,
+            difference_pct DOUBLE PRECISION, status TEXT NOT NULL, observed_at TEXT,
+            PRIMARY KEY (symbol, report_period, metric, source_a, source_b)
+        );
+        CREATE INDEX IF NOT EXISTS validation_result_period_idx
+            ON validation_result (report_period, symbol);
+        CREATE TABLE IF NOT EXISTS funnel_metrics (
+            symbol TEXT PRIMARY KEY, name TEXT, is_active BOOLEAN,
+            latest_report_period TEXT, published_at TEXT,
+            pe_ttm DOUBLE PRECISION, pe_dynamic DOUBLE PRECISION,
+            pe_for_filter DOUBLE PRECISION, pe_source TEXT,
+            pb DOUBLE PRECISION, pb_source TEXT, roe_latest DOUBLE PRECISION,
+            roe_annual_median DOUBLE PRECISION, roe_annual_min DOUBLE PRECISION,
+            annual_period_count BIGINT NOT NULL DEFAULT 0,
+            revenue_ttm DOUBLE PRECISION, net_profit_parent_ttm DOUBLE PRECISION,
+            revenue_cagr_pct DOUBLE PRECISION, net_profit_cagr_pct DOUBLE PRECISION,
+            debt_ratio_latest DOUBLE PRECISION, cash_to_assets_pct DOUBLE PRECISION,
+            fcf_latest_period DOUBLE PRECISION, latest_annual_period TEXT,
+            operating_cashflow_latest_annual DOUBLE PRECISION,
+            fcf_latest_annual DOUBLE PRECISION,
+            ocf_to_net_profit_latest_annual_pct DOUBLE PRECISION,
+            ocf_to_net_profit_annual_sum_pct DOUBLE PRECISION,
+            history_start_period TEXT, history_end_period TEXT,
+            quality_status TEXT NOT NULL, rebuilt_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS funnel_metrics_filter_idx
+            ON funnel_metrics (is_active, roe_annual_median DESC, symbol);
+        """,
+    ),
 ]

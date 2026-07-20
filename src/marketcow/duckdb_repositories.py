@@ -95,6 +95,11 @@ class Stage1FundamentalRepository:
         "get_tdx",
         "tdx_coverage",
         "get_tdx_history",
+        "save_validation_results",
+        "get_validation_results",
+        "rebuild_validation_results",
+        "rebuild_funnel_metrics",
+        "query_funnel_metrics",
     }
 
     def __init__(self, postgres_repository: Any, duckdb_repository: Warehouse):
