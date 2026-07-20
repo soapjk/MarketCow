@@ -65,6 +65,39 @@ class ShadowMarketBarRepository:
             }
             return rows
 
+    def get_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not self.canonical_reads_enabled:
+            rows, truncated = self.primary.get_price_bars_range(
+                symbol, interval, adjustment, start, end, limit
+            )
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": truncated, "range": True,
+            }
+            return rows, truncated
+        try:
+            rows, truncated = self.writer.repository.get_canonical_price_bars_range(
+                symbol, interval, adjustment, start, end, limit
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": truncated,
+                "range": True,
+            }
+            return rows, truncated
+        except Exception as error:
+            rows, truncated = self.primary.get_price_bars_range(
+                symbol, interval, adjustment, start, end, limit
+            )
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": truncated, "range": True, "error": str(error)[:4000],
+            }
+            return rows, truncated
     @staticmethod
     def _raw_rows(
         symbol: str, interval: str, adjustment: str, source: str,

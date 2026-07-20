@@ -215,6 +215,24 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         self.assertEqual(bars[0]["source_payload"]["version"], 2)
         self.assertEqual(bars[0]["raw_close"], 22.0)
         self.assertEqual(bars[0]["adjustment_factor"], 0.5)
+        ranged, truncated = self.repository.get_canonical_price_bars_range(
+            "HISTORY.HK", "1m", "raw", "2026-07-20T12:00:00+08:00",
+            "2026-07-20T04:02:00Z", 1,
+        )
+        self.assertTrue(truncated)
+        self.assertEqual(len(ranged), 1)
+        self.assertEqual(ranged[0]["bar_at"], "2026-07-20T04:00:00+00:00")
+        empty, truncated = self.repository.get_canonical_price_bars_range(
+            "HISTORY.HK", "1m", "raw", "2026-07-21T00:00:00Z",
+            "2026-07-21T01:00:00Z", 10,
+        )
+        self.assertEqual(empty, [])
+        self.assertFalse(truncated)
+        with self.assertRaisesRegex(ValueError, "include a timezone"):
+            self.repository.get_canonical_price_bars_range(
+                "HISTORY.HK", "1m", "raw", "2026-07-20T04:00:00",
+                "2026-07-20T04:02:00", 10,
+            )
 
     def test_real_shadow_dual_write_replay_and_reconciliation(self):
         with tempfile.TemporaryDirectory() as folder:

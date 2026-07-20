@@ -79,6 +79,10 @@ class MarketBarRepository(Protocol):
     def get_price_bars(
         self, symbol: str, interval: str, adjustment: str, limit: int
     ) -> List[Dict[str, Any]]: ...
+    def get_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+    ) -> tuple[List[Dict[str, Any]], bool]: ...
 
 
 @runtime_checkable

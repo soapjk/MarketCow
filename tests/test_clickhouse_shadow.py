@@ -32,6 +32,9 @@ class FakePrimary:
     def get_price_bars(self, *args):
         return ["duckdb-read"]
 
+    def get_price_bars_range(self, *args):
+        return (["duckdb-range"], True)
+
 
 class CapturingWriter:
     def __init__(self, result=None):
@@ -60,6 +63,11 @@ class ReconcileRepository:
         if isinstance(self.rows, Exception):
             raise self.rows
         return self.rows
+
+    def get_canonical_price_bars_range(self, *args):
+        if isinstance(self.rows, Exception):
+            raise self.rows
+        return self.rows, False
 
 
 class FailingClickHouseRepository:
@@ -105,6 +113,26 @@ class ShadowMarketBarRepositoryTest(unittest.TestCase):
         self.assertTrue(diagnostics["fallback"])
         self.assertEqual(diagnostics["backend"], "duckdb")
         self.assertEqual(len(diagnostics["error"]), 4000)
+
+    def test_range_read_reports_truncation_and_falls_back_same_range(self):
+        primary, writer = FakePrimary(), CapturingWriter()
+        writer.repository = ReconcileRepository([{"timestamp": 1}])
+        writer.spool = FakeSpool()
+        adapter = ShadowMarketBarRepository(
+            primary, writer, canonical_reads_enabled=True
+        )
+        arguments = ("x", "1m", "raw", "2026-07-20T00:00:00Z",
+                     "2026-07-20T01:00:00Z", 10)
+        self.assertEqual(adapter.get_price_bars_range(*arguments),
+                         ([{"timestamp": 1}], False))
+        self.assertFalse(adapter.diagnostics()["read"]["truncated"])
+        writer.repository.rows = ConnectionError("range unavailable")
+        self.assertEqual(adapter.get_price_bars_range(*arguments),
+                         (["duckdb-range"], True))
+        diagnostics = adapter.diagnostics()["read"]
+        self.assertTrue(diagnostics["fallback"])
+        self.assertTrue(diagnostics["truncated"])
+        self.assertTrue(diagnostics["range"])
 
     def test_primary_failure_never_attempts_shadow(self):
         writer = CapturingWriter()

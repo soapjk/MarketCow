@@ -283,8 +283,11 @@ class ClickHouseMarketBarRepository:
                         "adjustment": adjustment, "limit": limit},
         )
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        return self._map_canonical_rows(reversed(rows))
+
+    def _map_canonical_rows(self, rows: Any) -> List[Dict[str, Any]]:
         mapped = []
-        for row in reversed(rows):
+        for row in rows:
             bar_time = self._datetime(row["bar_time"])
             if bar_time.tzinfo is None:
                 bar_time = bar_time.replace(tzinfo=timezone.utc)
@@ -313,3 +316,34 @@ class ClickHouseMarketBarRepository:
                 },
             })
         return mapped
+
+    def get_canonical_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("history limit must be between 1 and 5000")
+        start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        if start_at.tzinfo is None or end_at.tzinfo is None:
+            raise ValueError("history range timestamps must include a timezone")
+        start_at = start_at.astimezone(timezone.utc)
+        end_at = end_at.astimezone(timezone.utc)
+        if start_at > end_at:
+            raise ValueError("history range start must not be after end")
+        start_at = datetime.fromtimestamp(int(start_at.timestamp()), timezone.utc)
+        end_at = datetime.fromtimestamp(int(end_at.timestamp()), timezone.utc)
+        result = self.database._require_client().query(
+            "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
+            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
+            "version FROM market_bar_canonical FINAL WHERE symbol={symbol:String} "
+            "AND interval={interval:String} AND adjustment={adjustment:String} "
+            "AND bar_time >= {start:DateTime64(3)} AND bar_time <= {end:DateTime64(3)} "
+            "ORDER BY bar_time ASC LIMIT {fetch:UInt32}",
+            parameters={"symbol": symbol, "interval": interval,
+                        "adjustment": adjustment, "start": start_at, "end": end_at,
+                        "fetch": limit + 1},
+        )
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        return self._map_canonical_rows(rows[:limit]), len(rows) > limit

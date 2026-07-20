@@ -84,6 +84,14 @@ DuckDB
   OHLC、raw_close、adjustment_factor、volume、amount、source、ingested_at 与
   source_payload；migration 3 将两个调整契约字段以 Nullable(Float64) 贯穿 raw 与
   canonical。ClickHouse 读取失败会有界记录 error/backend/fallback 并同步回退 DuckDB。
+- 历史范围契约为 `get_price_bars_range(symbol, interval, adjustment, start, end, limit)`：
+  start/end 必须是带时区 ISO-8601，统一为 UTC，使用闭区间并稳定升序返回。超过 limit
+  返回前 limit 条并显式 `truncated=true`，不得把部分结果伪装为完整结果。DuckDB 与
+  development opt-in ClickHouse canonical 实现字段和空值语义一致；ClickHouse 失败按
+  同一范围回退 DuckDB，并在 read diagnostics 记录 backend/fallback/count/truncated/error。
+- `/v1/quotes/{symbol}/history` 在同时提供 start/end 时执行本地范围读取并返回
+  `cached=true` 与 `truncated`；只提供一个端点或非法范围返回 400。未提供 start/end 时，
+  原有 refresh/cache 与最近 N 条行为保持不变。
 
 ## 二、仓库、分支和 worktree
 
@@ -434,7 +442,9 @@ fundamental / statements / PIT history
 
 - 已完成第一段：development 可显式让现有 `get_price_bars` 从 ClickHouse canonical
   读取最近 N 条，保留 backend 开关、DuckDB 默认值与失败回退路径；production 拒绝启用；
-- 尚未完成任意起止时间的历史范围查询契约与规模验证；
+- 已完成带时区 ISO-8601 起止时间的闭区间历史范围契约、API 扩展、limit/truncated 语义、
+  DuckDB/ClickHouse canonical 实现及同范围故障回退；
+- 尚未完成大规模长时间范围基准与分页/游标契约；
 - 尚未完成全市场横截面查询、多来源 raw 查询及其 API/Repository 契约；
 - 尚未完成缓存命中、失效、新鲜度和 ClickHouse/DuckDB 回退一致性契约测试；
 - 尚未实现自动或后台 canonical 调度；当前只能显式、有界重建；
@@ -503,7 +513,7 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 
 - 8790 不被停止、重启或修改；
 - development 只写独立存储；
-- 现有默认测试继续通过（检查点 6 为 90 项）；
+- 现有默认测试继续通过（检查点 7 为 93 项）；
 - 新 backend 有单元测试和显式集成测试；
 - 上游失败仍有界，不占满服务线程；
 - 双写失败不能阻断现有 DuckDB 主路径，除非测试明确验证 fail-closed；
@@ -515,15 +525,15 @@ curl --max-time 5 http://127.0.0.1:8791/v1/quotes/600519.SH
 最近一次 Storage V2 检查：
 
 ```text
-feature/storage-v2 检查点 6 实现提交：dfdf9a4
-默认测试：发现 90 项且整体通过；7 项 PostgreSQL、6 项 ClickHouse 集成测试因未
+feature/storage-v2 检查点 7 基线：6648d15；本检查点为其上的历史范围查询改动
+默认测试：发现 93 项且整体通过；7 项 PostgreSQL、6 项 ClickHouse 集成测试因未
 显式配置本地服务而跳过
 PostgreSQL 集成测试：7 项通过（显式启用，使用独立 UTF-8 临时数据库）
 ClickHouse 测试：8 项通过（2 项隔离边界测试、6 项使用一次性 ClickHouse 25.8
 本地容器的集成测试；容器测试后停止并删除）
-本检查点已完成 development opt-in canonical history 读取与 DuckDB 回退；默认仍为
-DuckDB。任意历史范围、横截面、多来源 raw、缓存契约、自动 canonical 调度及后续阶段
-尚未完成，必须等待验收方指定。
+本检查点已完成任意起止时间的闭区间历史范围查询、API 向后兼容扩展、显式截断和
+DuckDB/ClickHouse canonical 等价回退；默认仍为 DuckDB。大规模范围分页/基准、横截面、
+多来源 raw、缓存契约、自动 canonical 调度及后续阶段尚未完成，必须等待验收方指定。
 ```
 
 正式服务由 `com.marketcow.production` 管理；最近已验证 health 包含

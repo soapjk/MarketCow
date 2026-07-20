@@ -215,6 +215,8 @@ def create_app(
         adjustment: str = Query("adjusted", pattern="^(adjusted|raw)$"),
         refresh: bool = True,
         limit: int = Query(500, ge=1, le=5000),
+        start: Optional[str] = None,
+        end: Optional[str] = None,
     ):
         try:
             if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
@@ -224,6 +226,18 @@ def create_app(
                     normalized, _ = normalize_yahoo_symbol(symbol)
             else:
                 normalized, _ = normalize_yahoo_symbol(symbol)
+            if (start is None) != (end is None):
+                raise ValueError("history range requires both start and end")
+            if start is not None and end is not None:
+                bars, truncated = service.market_bar_repository.get_price_bars_range(
+                    normalized, interval, adjustment, start, end, limit
+                )
+                return {
+                    "symbol": normalized, "interval": interval,
+                    "adjustment": adjustment, "count": len(bars), "bars": bars,
+                    "cached": True, "start": start, "end": end,
+                    "truncated": truncated,
+                }
             if refresh:
                 result = service.refresh_quote_history(normalized, range_, interval, adjustment)
                 result["bars"] = result["bars"][-limit:]

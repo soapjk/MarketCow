@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -747,6 +748,57 @@ class Warehouse:
             row["source_payload"] = json.loads(payload) if payload else {}
             result.append(row)
         return result
+
+    @staticmethod
+    def _utc_range(start: str, end: str) -> tuple[datetime, datetime]:
+        def parse(value: str) -> datetime:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("history range timestamps must include a timezone")
+            return parsed.astimezone(timezone.utc)
+
+        start_at, end_at = parse(start), parse(end)
+        if start_at > end_at:
+            raise ValueError("history range start must not be after end")
+        return start_at, end_at
+
+    @staticmethod
+    def _utc_iso(value: Any) -> str:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+
+    def get_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("history limit must be between 1 and 5000")
+        start_at, end_at = self._utc_range(start, end)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "ingested_at, payload_json FROM market_price_bar WHERE symbol = ? "
+                "AND interval = ? AND adjustment = ? AND timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp ASC, source ASC LIMIT ?",
+                [symbol, interval, adjustment, int(start_at.timestamp()),
+                 int(end_at.timestamp()), limit + 1],
+            )
+        truncated = len(rows) > limit
+        result = []
+        for row in rows[:limit]:
+            payload = row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            row["bar_at"] = self._utc_iso(row["bar_at"])
+            row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            row["source_payload"] = json.loads(payload) if payload else {}
+            result.append(row)
+        return result, truncated
 
     def get_price_bars_for_reconciliation(
         self, symbol: str, interval: str, adjustment: str, source: str,
