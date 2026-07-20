@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import clickhouse_connect
@@ -37,6 +38,75 @@ class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
     "set MARKETCOW_TEST_CLICKHOUSE_HOST to run ClickHouse integration tests",
 )
 class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
+    def test_canonical_keyset_multisource_matches_duckdb_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            warehouse = Warehouse(root / "warehouse.duckdb")
+            writer = ReliableClickHouseWriter(
+                self.repository, LocalClickHouseSpool(root / "spool", root), 1000
+            )
+            builder = CanonicalMarketBarBuilder(self.repository, writer)
+            for timestamp in (1784527200, 1784527260):
+                bar = {
+                    "timestamp": timestamp,
+                    "bar_at": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+                    "open": 80, "high": 90, "low": 70,
+                    "close": 88, "volume": 100, "amount": 8800,
+                }
+                warehouse.upsert_price_bars(
+                    "PRIORITY.HK", "1m", "raw", "tushare",
+                    "2026-07-20T06:00:00Z", [bar],
+                    {"observed_at": "2026-07-20T05:00:00Z",
+                     "raw_artifact_id": "tushare-priority"},
+                )
+                warehouse.upsert_price_bars(
+                    "PRIORITY.HK", "1m", "raw", "yahoo_chart",
+                    "2026-07-20T07:00:00Z", [{**bar, "close": 99}],
+                    {"observed_at": "2026-07-20T06:30:00Z",
+                     "raw_artifact_id": "yahoo-newer"},
+                )
+                bar_time = warehouse.get_price_bars_page(
+                    "PRIORITY.HK", "1m", "raw", "2026-07-20T06:00:00Z",
+                    "2026-07-20T07:00:00Z", 10,
+                )[0][-1]["bar_at"]
+                self.repository.insert_raw_bars([
+                    {
+                        "symbol": "PRIORITY.HK", "market": "HK", "interval": "1m",
+                        "adjustment": "raw", "bar_time": bar_time, **bar,
+                        "source": "tushare", "source_sequence": str(timestamp),
+                        "observed_at": "2026-07-20T05:00:00Z",
+                        "ingested_at": "2026-07-20T06:00:00Z",
+                        "raw_artifact_id": "tushare-priority",
+                    },
+                    {
+                        "symbol": "PRIORITY.HK", "market": "HK", "interval": "1m",
+                        "adjustment": "raw", "bar_time": bar_time, **bar, "close": 99,
+                        "source": "yahoo_chart", "source_sequence": str(timestamp),
+                        "observed_at": "2026-07-20T06:30:00Z",
+                        "ingested_at": "2026-07-20T07:00:00Z",
+                        "raw_artifact_id": "yahoo-newer",
+                    },
+                ])
+            arguments = (
+                "PRIORITY.HK", "1m", "raw", "2026-07-20T06:00:00Z",
+                "2026-07-20T07:00:00Z", 1, None,
+            )
+            self.assertEqual(builder.rebuild(*arguments[:5], 100)["status"], "ok")
+            adapter = ShadowMarketBarRepository(
+                warehouse, writer, builder, canonical_reads_enabled=True
+            )
+            clickhouse_page = adapter.get_price_bars_page(*arguments)
+            self.assertTrue(clickhouse_page[1])
+            self.assertEqual(clickhouse_page[0][0]["source"], "tushare")
+            self.assertEqual(clickhouse_page[0][0]["close"], 88.0)
+            original = self.repository.database.client
+            self.repository.database.client = None
+            try:
+                fallback_page = adapter.get_price_bars_page(*arguments)
+            finally:
+                self.repository.database.client = original
+            self.assertEqual(fallback_page, clickhouse_page)
+
     @classmethod
     def setUpClass(cls):
         cls.host = os.environ["MARKETCOW_TEST_CLICKHOUSE_HOST"]
@@ -239,7 +309,7 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(more)
         self.assertEqual(second_page[0]["close"], 13.0)
-        self.assertEqual(second_page[0]["source_payload"]["version"], 2)
+        self.assertEqual(second_page[0]["source"], "fixture")
         last_page, more = self.repository.get_canonical_price_bars_page(
             "HISTORY.HK", "1m", "raw", "2026-07-20T04:00:00Z",
             "2026-07-20T04:02:00Z", 1, second_page[0]["timestamp"],

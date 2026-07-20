@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import clickhouse_connect
 
 from .bar_version import raw_content_rank, raw_content_version
+from .canonical_selection import canonical_page_payload
 
 
 CLICKHOUSE_MIGRATIONS = [
@@ -423,7 +424,13 @@ class ClickHouseMarketBarRepository:
             parameters=parameters,
         )
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
-        return self._map_canonical_rows(rows[:page_size]), len(rows) > page_size
+        mapped = self._map_canonical_rows(rows[:page_size])
+        for row in mapped:
+            payload = row["source_payload"]
+            row["source_payload"] = canonical_page_payload(
+                row["source"], payload["observed_at"], payload["raw_artifact_id"]
+            )
+        return mapped, len(rows) > page_size
 
     def get_raw_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,

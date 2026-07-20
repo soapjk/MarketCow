@@ -140,6 +140,7 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
     """Assemble opt-in development backends while DuckDB remains the primary."""
 
     settings.validate_runtime_isolation()
+    warehouse.canonical_source_priority = tuple(settings.clickhouse_source_priority)
     if settings.metadata_backend == "duckdb" and not settings.clickhouse_enabled:
         return create_duckdb_repositories(warehouse), None
     resources: List[Any] = []

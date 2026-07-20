@@ -52,12 +52,14 @@ class MarketBarPaginationTest(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         root = Path(self.folder.name)
+        self.root = root
         self.warehouse = Warehouse(root / "warehouse.duckdb")
         self.repository = CountingRepository(self.warehouse)
         self.settings = Settings(
             root / "warehouse.duckdb", root / "raw",
-            market_bar_cursor_secret="pagination-test-secret-123",
+            market_bar_cursor_secret="pagination-test-secret-1234567890abcdef",
             market_bar_cursor_ttl_seconds=3600,
+            storage_root=root / "data-development",
         )
 
     def tearDown(self):
@@ -131,6 +133,7 @@ class MarketBarPaginationTest(unittest.TestCase):
             self.assertEqual(client.get(self.path(2, tampered)).status_code, 400)
             self.assertEqual(client.get(self.path(2, token, symbol="MSFT")).status_code, 400)
             self.assertEqual(client.get(self.path(3, token)).status_code, 400)
+            self.assertEqual(client.get(self.path(2, "A" * 2049)).status_code, 400)
             self.assertEqual(self.repository.page_calls, calls)
 
         expired_now = datetime(2026, 7, 20, 14, 0, tzinfo=timezone.utc)
@@ -158,6 +161,78 @@ class MarketBarPaginationTest(unittest.TestCase):
         with self.client() as client:
             self.assertEqual(client.get(self.path(2, unknown)).status_code, 400)
         self.assertEqual(self.repository.page_calls, calls)
+
+    def test_generated_key_persists_across_restart_and_rotation_rejects_old_cursor(self):
+        self.seed(range(100, 105))
+        generated_settings = Settings(
+            self.root / "warehouse.duckdb", self.root / "raw",
+            market_bar_cursor_secret="", market_bar_cursor_ttl_seconds=3600,
+            storage_root=self.root / "cursor-development",
+        )
+        with TestClient(create_app(
+            generated_settings, Service(self.repository), lambda: NOW
+        )) as client:
+            token = client.get(self.path(2)).json()["next_cursor"]
+        key_path = generated_settings.storage_root / ".market-bar-cursor.key"
+        self.assertTrue(key_path.exists())
+        self.assertGreaterEqual(len(key_path.read_text().encode()), 32)
+
+        restarted = Settings(
+            self.root / "warehouse.duckdb", self.root / "raw",
+            market_bar_cursor_secret="", market_bar_cursor_ttl_seconds=3600,
+            storage_root=generated_settings.storage_root,
+        )
+        with TestClient(create_app(
+            restarted, Service(self.repository), lambda: NOW
+        )) as client:
+            self.assertEqual(client.get(self.path(2, token)).status_code, 200)
+
+        rotated = Settings(
+            self.root / "warehouse.duckdb", self.root / "raw",
+            market_bar_cursor_secret="rotated-pagination-secret-1234567890abcdef",
+            market_bar_cursor_ttl_seconds=3600,
+            storage_root=generated_settings.storage_root,
+        )
+        calls = self.repository.page_calls
+        with TestClient(create_app(
+            rotated, Service(self.repository), lambda: NOW
+        )) as client:
+            self.assertEqual(client.get(self.path(2, token)).status_code, 400)
+        self.assertEqual(self.repository.page_calls, calls)
+
+        Settings(
+            self.root / "warehouse.duckdb", self.root / "raw",
+            market_bar_cursor_secret="",
+        ).validate_runtime_isolation()
+        for placeholder in (
+            "marketcow-local-cursor-secret",
+            "replace-with-a-local-development-secret",
+        ):
+            with self.assertRaisesRegex(ValueError, "placeholder"):
+                Settings(
+                    self.root / "warehouse.duckdb", self.root / "raw",
+                    market_bar_cursor_secret=placeholder,
+                ).validate_runtime_isolation()
+
+    def test_duckdb_page_uses_shared_canonical_source_priority(self):
+        timestamp = 100
+        self.warehouse.upsert_price_bars(
+            "AAPL", "1m", "raw", "tushare", "2026-07-20T10:00:00Z",
+            [{**bar(timestamp), "close": 88.0}],
+            {"observed_at": "2026-07-20T09:00:00Z"},
+        )
+        self.warehouse.upsert_price_bars(
+            "AAPL", "1m", "raw", "yahoo_chart", "2026-07-20T11:00:00Z",
+            [{**bar(timestamp), "close": 99.0}],
+            {"observed_at": "2026-07-20T10:30:00Z"},
+        )
+        rows, more = self.warehouse.get_price_bars_page(
+            "AAPL", "1m", "raw", "1970-01-01T00:01:40Z",
+            "1970-01-01T00:01:40Z", 10,
+        )
+        self.assertFalse(more)
+        self.assertEqual(rows[0]["source"], "tushare")
+        self.assertEqual(rows[0]["close"], 88.0)
 
     def test_large_sample_keyset_pages_are_bounded_without_offset(self):
         self.seed(range(10_000, 20_001))

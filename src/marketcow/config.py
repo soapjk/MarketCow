@@ -44,7 +44,7 @@ class Settings:
     clickhouse_auto_canonical: bool = False
     clickhouse_auto_canonical_limit: int = 50000
     market_bar_cache_freshness_seconds: int = 900
-    market_bar_cursor_secret: str = "marketcow-local-cursor-secret"
+    market_bar_cursor_secret: str = ""
     market_bar_cursor_ttl_seconds: int = 3600
 
     @classmethod
@@ -132,7 +132,7 @@ class Settings:
                 "MARKETCOW_MARKET_BAR_CACHE_FRESHNESS_SECONDS", "900"
             )),
             market_bar_cursor_secret=os.getenv(
-                "MARKETCOW_MARKET_BAR_CURSOR_SECRET", "marketcow-local-cursor-secret"
+                "MARKETCOW_MARKET_BAR_CURSOR_SECRET", ""
             ),
             market_bar_cursor_ttl_seconds=int(os.getenv(
                 "MARKETCOW_MARKET_BAR_CURSOR_TTL_SECONDS", "3600"
@@ -142,8 +142,9 @@ class Settings:
     def validate_runtime_isolation(self) -> None:
         if not 1 <= self.market_bar_cache_freshness_seconds <= 86400:
             raise ValueError("market bar cache freshness must be between 1 and 86400 seconds")
-        if len(self.market_bar_cursor_secret) < 16:
-            raise ValueError("market bar cursor secret must contain at least 16 characters")
+        if self.market_bar_cursor_secret:
+            from .market_bar_cursor import validate_explicit_secret
+            validate_explicit_secret(self.market_bar_cursor_secret)
         if not 60 <= self.market_bar_cursor_ttl_seconds <= 86400:
             raise ValueError("market bar cursor TTL must be between 60 and 86400 seconds")
         if not 1 <= self.clickhouse_auto_canonical_limit <= 100000:

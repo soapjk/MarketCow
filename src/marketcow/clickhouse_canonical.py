@@ -4,24 +4,23 @@ import hashlib
 import json
 import math
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Sequence
 
 from .clickhouse_writer import ReliableClickHouseWriter, normalize_bar
+from .canonical_selection import (
+    DEFAULT_SOURCE_PRIORITY,
+    canonical_selection_key,
+    utc_datetime,
+)
 
 
-DEFAULT_SOURCE_PRIORITY = ("tushare", "sina", "eastmoney", "yahoo_chart", "baostock")
 VALUE_FIELDS = ("open", "high", "low", "close", "volume", "amount")
 CONTRACT_FIELDS = ("raw_close", "adjustment_factor")
 
 
 def _utc(value: Any) -> datetime:
-    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
-        str(value).replace("Z", "+00:00")
-    )
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    return utc_datetime(value)
 
 
 def _iso(value: Any) -> str:
@@ -48,15 +47,10 @@ class CanonicalMarketBarBuilder:
         return (row["symbol"], row["interval"], row["adjustment"], _iso(row["bar_time"]))
 
     def _selection_key(self, row: Dict[str, Any]) -> tuple[Any, ...]:
-        source = str(row["source"])
-        return (
-            self.priority.get(source, len(self.priority)),
-            -_utc(row["observed_at"]).timestamp(),
-            -_utc(row["ingested_at"]).timestamp(),
-            source,
-            str(row.get("raw_artifact_id") or ""),
-            str(row.get("source_sequence") or ""),
-        )
+        ordered = tuple(source for source, _ in sorted(
+            self.priority.items(), key=lambda item: item[1]
+        ))
+        return canonical_selection_key(row, ordered)
 
     def _fingerprint(self, rows: Iterable[Dict[str, Any]]) -> str:
         fields = ("symbol", "market", "interval", "adjustment", "bar_time", *VALUE_FIELDS,

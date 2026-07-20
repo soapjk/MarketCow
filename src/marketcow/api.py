@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings
-from .market_bar_cursor import decode_cursor, encode_cursor
+from .market_bar_cursor import decode_cursor, encode_cursor, load_or_create_secret
 from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
@@ -290,6 +290,9 @@ def create_app(
                         "adjustment": adjustment, "start": start_at.isoformat(),
                         "end": end_at.isoformat(), "page_size": page_size,
                     }
+                    cursor_secret = load_or_create_secret(
+                        settings.market_bar_cursor_secret, settings.storage_root
+                    )
                     cursor_now = clock()
                     if cursor_now.tzinfo is None:
                         cursor_now = cursor_now.replace(tzinfo=timezone.utc)
@@ -297,7 +300,7 @@ def create_app(
                     after = None if cursor is None else decode_cursor(
                         cursor, query_binding, now_epoch,
                         settings.market_bar_cursor_ttl_seconds,
-                        settings.market_bar_cursor_secret,
+                        cursor_secret,
                     )
                     if after is not None and not (
                         int(start_at.timestamp()) <= after <= int(end_at.timestamp())
@@ -311,7 +314,7 @@ def create_app(
                     if has_more and bars:
                         next_cursor = encode_cursor(
                             query_binding, int(bars[-1]["timestamp"]), now_epoch,
-                            settings.market_bar_cursor_secret,
+                            cursor_secret,
                         )
                     return {
                         "symbol": normalized, "interval": interval,

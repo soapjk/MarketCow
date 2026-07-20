@@ -94,6 +94,8 @@ class MarketBarCacheContractTest(unittest.TestCase):
         self.settings = Settings(
             root / "warehouse.duckdb", root / "raw",
             market_bar_cache_freshness_seconds=300,
+            market_bar_cursor_secret="market-cache-test-secret-1234567890abcdef",
+            storage_root=root / "data-development",
         )
 
     def tearDown(self):

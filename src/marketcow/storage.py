@@ -11,6 +11,7 @@ import duckdb
 import pandas as pd
 
 from .bar_version import raw_content_rank
+from .canonical_selection import DEFAULT_SOURCE_PRIORITY, canonical_page_payload
 
 
 FUNDAMENTAL_COLUMNS = [
@@ -46,8 +47,9 @@ TDX_COLUMNS = [
 
 
 class Warehouse:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, canonical_source_priority=DEFAULT_SOURCE_PRIORITY):
         self.path = Path(path)
+        self.canonical_source_priority = tuple(canonical_source_priority)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.init_schema()
@@ -878,6 +880,12 @@ class Warehouse:
         start_epoch, end_epoch = int(start_at.timestamp()), int(end_at.timestamp())
         after_sql = "" if after is None else " AND timestamp > ?"
         parameters: List[Any] = [symbol, interval, adjustment, start_epoch, end_epoch]
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters = list(self.canonical_source_priority) + parameters
         if after is not None:
             parameters.append(after)
         parameters.append(page_size + 1)
@@ -886,8 +894,12 @@ class Warehouse:
                 con,
                 "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
                 "low, close, raw_close, adjustment_factor, volume, amount, source, "
-                "ingested_at, payload_json FROM (SELECT *, ROW_NUMBER() OVER "
-                "(PARTITION BY timestamp ORDER BY ingested_at DESC, source ASC) selected "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER "
+                "(PARTITION BY timestamp ORDER BY " + priority_sql + " ASC, "
+                "CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) selected "
                 "FROM market_price_bar WHERE symbol = ? AND interval = ? "
                 "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?" + after_sql +
                 ") WHERE selected = 1 ORDER BY timestamp ASC LIMIT ?",
@@ -896,11 +908,15 @@ class Warehouse:
         has_more = len(rows) > page_size
         result = []
         for row in rows[:page_size]:
-            payload = row.pop("payload_json", None)
+            row.pop("payload_json", None)
             row["timestamp"] = int(row["timestamp"])
             row["bar_at"] = self._utc_iso(row["bar_at"])
             row["ingested_at"] = self._utc_iso(row["ingested_at"])
-            row["source_payload"] = json.loads(payload) if payload else {}
+            observed_at = row.pop("observed_at")
+            raw_artifact_id = row.pop("raw_artifact_id")
+            row["source_payload"] = canonical_page_payload(
+                row["source"], observed_at, raw_artifact_id
+            )
             result.append(row)
         return result, has_more
 
