@@ -4,6 +4,7 @@ import time
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from marketcow.clickhouse_scheduler import BackgroundCanonicalScheduler
 from marketcow.clickhouse_writer import LocalClickHouseSpool
@@ -67,6 +68,39 @@ class BackgroundCanonicalSchedulerTest(unittest.TestCase):
         self.assertIn("_checksum", self.spool.read(pending, require_checksum=True))
         scheduler.resume()
         self.assertTrue(wait_until(lambda: len(builder.calls) == 1))
+
+    def test_startup_preserves_legacy_intent_when_signing_fails_then_recovers(self):
+        builder = Builder()
+        group = {"symbol": "MU", "interval": "1m", "adjustment": "raw",
+                 "start": "2026-07-20T01:00:00Z", "end": "2026-07-20T01:00:00Z"}
+        task_id = BackgroundCanonicalScheduler._task_id(group)
+        processing = self.spool.root / "canonical-scheduler/processing"
+        processing.mkdir(parents=True)
+        legacy = processing / f"{task_id}.json"
+        original = json.dumps({
+            "task_id": task_id, **group, "attempts": 0,
+            "created_at_epoch": 1000.0, "next_attempt_epoch": 1000.0,
+            "last_error": "",
+        })
+        legacy.write_text(original, encoding="utf-8")
+        real_atomic = self.spool._atomic_json
+
+        def deny_signing(target, payload):
+            if target == legacy and "_checksum" not in payload:
+                raise PermissionError("denied")
+            return real_atomic(target, payload)
+
+        with patch.object(self.spool, "_atomic_json", side_effect=deny_signing):
+            scheduler = self.scheduler(builder, clock=Clock(), start_paused=True)
+        self.assertTrue(legacy.exists())
+        self.assertEqual(legacy.read_text(encoding="utf-8"), original)
+        self.assertEqual(scheduler.diagnostics()["legacy_migration"]["remaining"], 1)
+        self.assertEqual(builder.calls, [])
+
+        scheduler._paused.clear()
+        self.assertEqual(scheduler.run_once(), 1)
+        self.assertEqual(len(builder.calls), 1)
+        self.assertFalse(legacy.exists())
 
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()

@@ -339,7 +339,8 @@ class ReliableClickHouseWriter:
                    "callback_attempted": 0, "callback_ok": 0,
                    "callback_failed": 0, "remaining": 0,
                    "truncated": False, "lock_busy": False,
-                   "legacy_migrated": 0, "legacy_invalid": 0, "legacy_errors": 0}
+                   "legacy_migrated": 0, "legacy_invalid": 0, "legacy_errors": 0,
+                   "legacy_blocked": 0}
         operator_path = self.spool.root / ".operator.lock"
         with operator_path.open("a+") as operator_lock:
             try:
@@ -357,7 +358,8 @@ class ReliableClickHouseWriter:
             outcome["legacy_migrated"] = migration["migrated"]
             outcome["legacy_invalid"] = migration["invalid"]
             outcome["legacy_errors"] = migration["errors"]
-            outcome["quarantined"] += migration["invalid"]
+            outcome["legacy_blocked"] = migration["remaining"]
+            outcome["quarantined"] += migration["quarantined"]
             lock_path = self.spool.root / ".replay.lock"
             with lock_path.open("a+") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -365,13 +367,19 @@ class ReliableClickHouseWriter:
                     paths, wal_truncated = self.spool._bounded_files(self.spool.pending, limit)
                     for path in paths:
                         try:
-                            payload = self.spool.read(path, require_checksum=True)
+                            payload = self.spool.read(path)
+                            if not payload.get("_checksum"):
+                                outcome["legacy_blocked"] = max(
+                                    outcome["legacy_blocked"], 1
+                                )
+                                continue
                         except Exception as error:
                             try:
                                 self.spool.quarantine_item(path, str(error))
                             except Exception:
-                                pass
-                            outcome["quarantined"] += 1
+                                outcome["legacy_blocked"] += 1
+                            else:
+                                outcome["quarantined"] += 1
                             continue
                         outcome["attempted"] += 1
                         try:
@@ -386,7 +394,7 @@ class ReliableClickHouseWriter:
                             if payload["dataset"] == "raw" and payload.get("intent_id"):
                                 self.spool.complete_chunk(payload["intent_id"], payload["batch_id"])
                     budget = limit - outcome["attempted"]
-                    if self.on_raw_replayed and budget:
+                    if self.on_raw_replayed and budget and not migration["remaining"]:
                         for intent in self.spool.ready_intents(budget):
                             outcome["callback_attempted"] += 1
                             try:
@@ -409,9 +417,13 @@ class ReliableClickHouseWriter:
                     intents, intents_more = self.spool._bounded_files(
                         self.spool.intents, 10000
                     )
-                    outcome["remaining"] = len(pending) + len(intents)
+                    processing, processing_more = self.spool._bounded_files(
+                        self.spool.processing_intents, 10000
+                    )
+                    outcome["remaining"] = len(pending) + len(intents) + len(processing)
                     outcome["truncated"] = bool(
                         outcome["remaining"] or wal_truncated or pending_more or intents_more
+                        or processing_more or migration["truncated"]
                     )
                 finally:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

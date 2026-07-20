@@ -212,12 +212,13 @@ class SpoolOperator:
                        kinds: tuple[str, ...] = LEGACY_KINDS) -> Dict[str, Any]:
         if not 1 <= limit <= 1000:
             raise ValueError("operator limit must be between 1 and 1000")
-        migrated = invalid = errors = checked = scanned = remaining = 0
+        migrated = invalid = quarantined = errors = checked = scanned = remaining = 0
         scan_truncated = False
         scan_limit = 10000
 
         def perform() -> None:
-            nonlocal migrated, invalid, errors, checked, scanned, remaining, scan_truncated
+            nonlocal migrated, invalid, quarantined, errors
+            nonlocal checked, scanned, remaining, scan_truncated
             for kind in kinds:
                 folder = self._folder(kind)
                 if not folder.exists():
@@ -244,10 +245,13 @@ class SpoolOperator:
                         invalid += 1
                         try:
                             self.spool.quarantine_item(path, f"legacy migration rejected: {error}")
+                            quarantined += 1
                         except OSError:
                             errors += 1
+                            remaining += 1
                     except OSError:
                         errors += 1
+                        remaining += 1
 
         if already_locked:
             perform()
@@ -260,7 +264,8 @@ class SpoolOperator:
                 perform()
         return {"status": "ok" if not invalid and not errors else "attention",
                 "checked": checked, "scanned": scanned, "migrated": migrated,
-                "invalid": invalid, "errors": errors, "remaining": remaining,
+                "invalid": invalid, "quarantined": quarantined,
+                "errors": errors, "remaining": remaining,
                 "remaining_exact": not scan_truncated,
                 "limit": limit, "scan_limit_per_kind": scan_limit,
                 "truncated": bool(remaining or scan_truncated),
