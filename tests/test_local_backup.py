@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import threading
 import unittest
@@ -102,6 +103,32 @@ class LocalStorageBackupTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "sensitive"):
             self.backup.create(components, "2026-07-20T00:00:01Z")
+        sensitive_values = [
+            {"nested": {"password": "plain-secret"}},
+            {"connection": "postgresql://user:plain-secret@host/db"},
+            {"header": "Authorization: Bearer plain-secret"},
+            {"headers": {"cookie": "session=plain-secret"}},
+        ]
+        for value in sensitive_values:
+            with self.subTest(value=value):
+                components = self.components()
+                components[0] = BackupComponent.json(
+                    "postgresql", "logical-json", "postgres-16", value,
+                    {"captured_at": "2026-07-20T00:00:00Z"},
+                )
+                with self.assertRaisesRegex(ValueError, "sensitive"):
+                    self.backup.create(components, "2026-07-20T00:00:01Z")
+        components = self.components()
+        components[0] = BackupComponent.json(
+            "postgresql", "logical-json", "postgres-16",
+            {"columns": ["password", "api_key", "authorization"],
+             "schema": "credentials_metadata_v1"},
+            {"captured_at": "2026-07-20T00:00:00Z"},
+        )
+        self.assertEqual(
+            self.backup.create(components, "2026-07-20T00:00:01Z")["status"],
+            "verified",
+        )
         source = self.root / "source"
         source.mkdir()
         outside = Path(self.folder.name) / "outside"
@@ -116,6 +143,64 @@ class LocalStorageBackupTest(unittest.TestCase):
         cursor.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "permission"):
             self.backup.verify(artifact)
+
+    def test_manifest_sensitive_metadata_and_resigned_injection_are_rejected(self):
+        components = self.components()
+        components[0] = BackupComponent(
+            "postgresql", "logical-json", "password=manifest-secret",
+            {"logical.json": b'{"schema":"v1"}'},
+            {"captured_at": "2026-07-20T00:00:00Z"},
+        )
+        with self.assertRaisesRegex(ValueError, "manifest.*sensitive"):
+            self.backup.create(components, "2026-07-20T00:00:01Z")
+
+        result = self.backup.create(self.components(), "2026-07-20T00:00:01Z")
+        artifact = Path(result["artifact_path"])
+        manifest_path = artifact / "manifest.json"
+        document = json.loads(manifest_path.read_text())
+        document["rto_assumption"] = "authorization: Bearer injected-secret"
+        unsigned = dict(document)
+        unsigned.pop("manifest_payload_sha256")
+        document["manifest_payload_sha256"] = hashlib.sha256(
+            json.dumps(unsigned, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(document))
+        with self.assertRaisesRegex(ValueError, "manifest.*sensitive"):
+            self.backup.verify(artifact)
+
+    def test_resigned_sensitive_json_payload_is_rejected_and_cursor_is_sealed(self):
+        result = self.backup.create(self.components(), "2026-07-20T00:00:01Z")
+        artifact = Path(result["artifact_path"])
+        payload = next(artifact.glob("components/postgresql/*"))
+        injected = b'{"nested":{"password":"plain-secret"}}'
+        payload.write_bytes(injected)
+        manifest_path = artifact / "manifest.json"
+        document = json.loads(manifest_path.read_text())
+        entry = next(
+            item for component in document["components"]
+            if component["name"] == "postgresql" for item in component["files"]
+        )
+        entry["bytes"] = len(injected)
+        entry["sha256"] = hashlib.sha256(injected).hexdigest()
+        unsigned = dict(document)
+        unsigned.pop("manifest_payload_sha256")
+        document["manifest_payload_sha256"] = hashlib.sha256(
+            json.dumps(unsigned, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        manifest_path.write_text(json.dumps(document))
+        with self.assertRaisesRegex(ValueError, "sensitive"):
+            self.backup.verify(artifact)
+
+        clean = self.backup.create(self.components(), "2026-07-20T00:00:02Z")
+        rendered = b"".join(
+            path.read_bytes() for path in Path(clean["artifact_path"]).rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn(self.cursor_plaintext, rendered)
+        self.assertEqual(self.backup.verify(Path(clean["artifact_path"]))["status"],
+                         "verified")
 
     def test_crash_publish_and_concurrent_mutex_recover(self):
         def crash(stage):

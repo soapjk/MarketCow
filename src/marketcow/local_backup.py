@@ -19,10 +19,49 @@ REQUIRED_COMPONENTS = frozenset({
     "postgresql", "clickhouse", "duckdb", "cold_archive", "spool", "cursor_key",
 })
 MAX_FILES = 10000
-_SENSITIVE = re.compile(
-    rb"(?i)(postgres(?:ql)?|clickhouse)://|password\s*[=:]|token\s*[=:]|"
-    rb"api[_-]?key\s*[=:]|authorization\s*[=:]"
+_SENSITIVE_KEY = re.compile(
+    r"(?i)^(?:password|passwd|passphrase|secret|token|api[_-]?key|"
+    r"access[_-]?key(?:[_-]?id)?|authorization|cookie|set-cookie|dsn)$"
 )
+_SENSITIVE_TEXT = re.compile(
+    r"(?i)(?:postgres(?:ql)?|clickhouse|mysql|mariadb|mongodb(?:\+srv)?|redis)://"
+    r"[^\s/]+@|(?:password|passwd|passphrase|secret|token|api[_-]?key|"
+    r"access[_-]?key(?:[_-]?id)?|authorization|cookie|set-cookie|dsn)"
+    r"[\"']?\s*[:=]\s*[\"']?\s*(?!null\b|none\b|\[redacted\]\b)[^\s,}\]]+"
+)
+
+
+def _assert_no_sensitive(value: Any, context: str = "backup") -> None:
+    """Reject credential-bearing structured or textual data without key-name false positives."""
+    if isinstance(value, Mapping):
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            if _SENSITIVE_KEY.fullmatch(key.strip()):
+                if item not in (None, "", "[REDACTED]"):
+                    raise ValueError(f"{context} contains sensitive text")
+            if _SENSITIVE_TEXT.search(key):
+                raise ValueError(f"{context} contains sensitive text")
+            _assert_no_sensitive(item, context)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_no_sensitive(item, context)
+        return
+    if isinstance(value, str) and _SENSITIVE_TEXT.search(value):
+        raise ValueError(f"{context} contains sensitive text")
+
+
+def _assert_payload_safe(data: bytes, context: str) -> None:
+    """Inspect JSON structurally and other UTF-8 payloads as bounded credential text."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        value = text
+    _assert_no_sensitive(value, context)
 
 
 def _hash(data: bytes) -> str:
@@ -230,8 +269,7 @@ class LocalStorageBackup:
                     target = f"components/{name}/{relative}.sealed"
                     mode_bits = "0600"
                 else:
-                    if _SENSITIVE.search(data):
-                        raise ValueError(f"backup component {name} contains sensitive text")
+                    _assert_payload_safe(data, f"backup component {name}")
                     target = f"components/{name}/{relative}"
                     mode_bits = "0640"
                 payloads[target] = data
@@ -258,8 +296,10 @@ class LocalStorageBackup:
             },
             "components": component_document,
         }
+        _assert_no_sensitive(manifest, "backup manifest")
         manifest["backup_id"] = _hash(_json(manifest))[:24]
         manifest["manifest_payload_sha256"] = _hash(_json(manifest))
+        _assert_no_sensitive(manifest, "backup manifest")
         backup_id = manifest["backup_id"]
         final = self.backup_root / backup_id
         if final.exists():
@@ -321,11 +361,10 @@ class LocalStorageBackup:
         signature = manifest.pop("manifest_payload_sha256", None)
         if _hash(_json(manifest)) != signature:
             raise ValueError("backup manifest checksum mismatch")
+        _assert_no_sensitive(manifest, "backup manifest")
         backup_id = manifest.get("backup_id")
         identity_document = dict(manifest)
         identity_document.pop("backup_id", None)
-        if backup_id != _hash(_json(identity_document))[:24] or backup_id != artifact.name:
-            raise ValueError("backup id and directory mismatch")
         components = manifest.get("components", [])
         names = {item.get("name") for item in components}
         if names != REQUIRED_COMPONENTS or len(components) != len(REQUIRED_COMPONENTS):
@@ -357,8 +396,10 @@ class LocalStorageBackup:
                 if component["name"] == "cursor_key":
                     if not _verify_sealed(data, self.wrapping_key):
                         raise ValueError("cursor key sealed payload authentication failed")
-                elif _SENSITIVE.search(data):
-                    raise ValueError("backup contains sensitive text")
+                else:
+                    _assert_payload_safe(data, "backup")
+        if backup_id != _hash(_json(identity_document))[:24] or backup_id != artifact.name:
+            raise ValueError("backup id and directory mismatch")
         expected_watermark = {
             "earliest_captured_at": min(captured),
             "latest_captured_at": max(captured),
