@@ -174,11 +174,19 @@ class BackgroundCanonicalScheduler:
             with self._state_lock:
                 self._last = {"status": "failed", "task_id": task["task_id"],
                               "attempts": task["attempts"], "error": task["last_error"]}
+            if self.spool.telemetry:
+                self.spool.telemetry.safe(
+                    "counter", "canonical_rebuild_total", outcome="error"
+                )
         else:
             claimed.unlink(missing_ok=True)
             with self._state_lock:
                 self._last = {"status": "ok", "task_id": task["task_id"],
                               "attempts": int(task.get("attempts", 0)) + 1}
+            if self.spool.telemetry:
+                self.spool.telemetry.safe(
+                    "counter", "canonical_rebuild_total", outcome="ok"
+                )
 
     def run_once(self) -> int:
         if self._paused.is_set() or self._stop.is_set():
@@ -253,6 +261,12 @@ class BackgroundCanonicalScheduler:
             oldest = max(0.0, float(self.clock()) - min(created)) if created else 0.0
         with self._state_lock:
             last = dict(self._last)
+        if self.spool.telemetry:
+            self.spool.telemetry.safe("gauge", "canonical_queue_items", len(pending),
+                                      state="pending")
+            self.spool.telemetry.safe("gauge", "canonical_queue_items", len(failed),
+                                      state="failed")
+            self.spool.telemetry.safe("histogram", "canonical_lag_seconds", oldest)
         return {
             "enabled": True, "paused": self._paused.is_set(),
             "thread_alive": self._thread.is_alive(), "pending": min(len(pending), self.queue_cap),

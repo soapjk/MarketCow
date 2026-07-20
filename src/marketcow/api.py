@@ -71,6 +71,13 @@ def create_app(
         }
         if reason:
             result["cache_reason"] = reason[:1000]
+        repository = getattr(service, "market_bar_repository", None)
+        telemetry = getattr(repository, "telemetry", None)
+        if telemetry is not None:
+            telemetry.safe(
+                "histogram", "cache_age_seconds", 0.0 if age is None else age,
+                status=status,
+            )
         return result
 
     def parse_as_of(value: str) -> str:

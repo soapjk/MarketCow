@@ -180,6 +180,8 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
                 settings.clickhouse_spool_quota_bytes,
                 settings.clickhouse_spool_warning_ratio,
             )
+            from .telemetry import Telemetry
+            spool.telemetry = Telemetry(clickhouse_enabled=True)
             from .spool_operator import SpoolOperator
             SpoolOperator(spool).migrate_legacy(1000)
             clickhouse_repository = ClickHouseMarketBarRepository(clickhouse)
@@ -199,6 +201,7 @@ def create_stage1_repositories(settings: Any, warehouse: Warehouse) -> tuple[Rep
                 settings.clickhouse_auto_canonical,
                 settings.clickhouse_auto_canonical_limit,
             )
+            market_bars.telemetry = spool.telemetry
             if settings.clickhouse_background_canonical:
                 from .clickhouse_scheduler import BackgroundCanonicalScheduler
 

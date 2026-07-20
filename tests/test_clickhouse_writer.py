@@ -38,6 +38,21 @@ class FakeRepository:
 
 
 class ReliableClickHouseWriterTest(unittest.TestCase):
+    def test_telemetry_failure_does_not_change_writer_result(self):
+        class BrokenTelemetry:
+            def clock(self):
+                raise RuntimeError("telemetry clock failed")
+
+            def safe(self, *args, **kwargs):
+                raise RuntimeError("telemetry update failed")
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            spool = LocalClickHouseSpool(root / "spool", root)
+            spool.telemetry = BrokenTelemetry()
+            writer = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
+            self.assertEqual(writer.write("raw", [raw_bar()])["written"], 1)
+
     def test_replay_migrates_and_recovers_pre_checksum_wal(self):
         import json
 

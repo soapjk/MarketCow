@@ -91,6 +91,7 @@ def _safe(value: Any) -> Any:
 
 def compare_contract(
     expected: Any, actual: Any, allowed_paths: Sequence[str] = (),
+    telemetry: Any = None, contract: str = "range",
 ) -> dict[str, Any]:
     """Return a bounded, deterministic, data-only mismatch report."""
     ignored = ROUTING_DIAGNOSTIC_PATHS | frozenset(allowed_paths)
@@ -144,7 +145,7 @@ def compare_contract(
             mismatches.append(ContractMismatch(path, a, b))
 
     walk(left, right, "$")
-    return {
+    report = {
         "status": "ok" if not mismatches else "mismatch",
         "mismatch_count": len(mismatches),
         "truncated": len(mismatches) >= MAX_MISMATCHES,
@@ -153,6 +154,12 @@ def compare_contract(
             for item in mismatches
         ],
     }
+    if mismatches and telemetry is not None:
+        telemetry.safe(
+            "counter", "contract_mismatch_total", min(len(mismatches), MAX_MISMATCHES),
+            contract=contract,
+        )
+    return report
 
 
 def assert_contract_equal(

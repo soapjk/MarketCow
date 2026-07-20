@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from functools import wraps
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .clickhouse_writer import ReliableClickHouseWriter, normalize_bar
 
@@ -520,7 +521,7 @@ class ShadowMarketBarRepository:
         return result
 
     def diagnostics(self) -> Dict[str, Any]:
-        return {"shadow": self._last_shadow, "reconciliation": self._last_reconciliation,
+        result = {"shadow": self._last_shadow, "reconciliation": self._last_reconciliation,
                 "read": self._last_read, "auto_canonical": self._last_auto_canonical,
                 "canonical": (self.canonical_builder.last_diagnostics
                               if self.canonical_builder else {"status": "disabled"}),
@@ -531,6 +532,13 @@ class ShadowMarketBarRepository:
                     self.background_scheduler.diagnostics()
                     if self.background_scheduler else {"enabled": False}
                 )}
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is not None:
+            try:
+                result["telemetry"] = telemetry.snapshot()
+            except Exception:
+                result["telemetry"] = {"schema": "unavailable"}
+        return result
 
     def rebuild_canonical(
         self, symbol: str, interval: str, adjustment: str,
@@ -558,3 +566,65 @@ class ShadowMarketBarRepository:
             "status": "ok" if all(r.get("status") == "ok" for r in results) else "fail_open",
             "groups": len(results), "results": results[:100],
         }
+
+
+def _telemetry_query(query: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorate(method: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(method)
+        def measured(self: ShadowMarketBarRepository, *args: Any, **kwargs: Any) -> Any:
+            telemetry = getattr(self, "telemetry", None)
+            try:
+                started = telemetry.clock() if telemetry is not None else 0.0
+            except Exception:
+                started = 0.0
+            try:
+                result = method(self, *args, **kwargs)
+            except Exception as error:
+                if telemetry is not None:
+                    backend = ("clickhouse_raw" if query == "raw" and self.raw_reads_enabled
+                               else "clickhouse_canonical" if self.canonical_reads_enabled
+                               else "duckdb")
+                    try:
+                        elapsed = max(0.0, telemetry.clock() - started)
+                    except Exception:
+                        elapsed = 0.0
+                    telemetry.safe("histogram", "query_latency_seconds", elapsed,
+                                   backend=backend, query=query, outcome="error")
+                    try:
+                        telemetry.log("query", "error", backend=backend, query=query, error=error)
+                    except Exception:
+                        pass
+                raise
+            if telemetry is not None:
+                diagnostic = self._last_read
+                backend = diagnostic.get("backend", "duckdb")
+                outcome = "fallback" if diagnostic.get("fallback") else (
+                    "empty" if diagnostic.get("count") == 0 else "ok"
+                )
+                try:
+                    elapsed = max(0.0, telemetry.clock() - started)
+                except Exception:
+                    elapsed = 0.0
+                telemetry.safe("histogram", "query_latency_seconds", elapsed,
+                               backend=backend, query=query, outcome=outcome)
+                attempted = diagnostic.get("attempted_backend")
+                if diagnostic.get("fallback") and attempted:
+                    telemetry.safe(
+                        "counter", "backend_fallback_total",
+                        from_backend=attempted, to_backend="duckdb", query=query,
+                    )
+            return result
+        return measured
+    return decorate
+
+
+for _name, _query in {
+    "get_price_bars": "recent", "get_price_bars_range": "range",
+    "get_price_bars_page": "page", "get_price_bars_cross_section": "cross_section",
+    "get_price_bars_cross_section_page": "cross_section",
+    "get_price_bars_matrix_page": "matrix", "get_price_bar_as_of": "as_of",
+    "get_price_bars_as_of_page": "as_of", "get_raw_price_bars_range": "raw",
+    "get_raw_price_bars_page": "raw",
+}.items():
+    setattr(ShadowMarketBarRepository, _name,
+            _telemetry_query(_query)(getattr(ShadowMarketBarRepository, _name)))

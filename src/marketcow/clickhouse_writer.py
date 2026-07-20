@@ -86,6 +86,7 @@ class LocalClickHouseSpool:
             raise ValueError("spool quota warning ratio must be between 0.5 and 1")
         self.quota_bytes = quota_bytes
         self.quota_warning_ratio = quota_warning_ratio
+        self.telemetry: Any = None
         self.pending = self.root / "pending"
         self.replayed = self.root / "replayed"
         self.intents = self.root / "intents"
@@ -312,6 +313,10 @@ class ReliableClickHouseWriter:
         if dataset not in DATASET_COLUMNS:
             raise ValueError("dataset must be raw or canonical")
         outcome = {"rows": len(rows), "written": 0, "spooled": 0, "batches": 0}
+        try:
+            started = self.spool.telemetry.clock() if self.spool.telemetry else 0.0
+        except Exception:
+            started = 0.0
         normalized_rows = [normalize_bar(dataset, row) for row in rows]
         failed_batches = []
         intent_id = stable_batch_id(dataset, normalized_rows)
@@ -330,6 +335,20 @@ class ReliableClickHouseWriter:
                 path = self.spool.pending / f"{batch_id}.json"
                 payload = self.spool.read(path)
                 self.spool._atomic_json(path, {**payload, "intent_id": intent_id})
+        if self.spool.telemetry:
+            try:
+                self.spool.telemetry.safe(
+                    "histogram", "ingest_write_latency_seconds",
+                    max(0.0, self.spool.telemetry.clock() - started),
+                    backend="clickhouse", outcome="spooled" if outcome["spooled"] else "ok",
+                )
+                diagnostics = self.spool.diagnostics()
+                for state in ("pending", "failed", "replayed"):
+                    self.spool.telemetry.safe(
+                        "gauge", "wal_items", diagnostics[state], state=state
+                    )
+            except Exception:
+                pass
         return outcome
 
     def replay(self, limit: int = 100) -> Dict[str, Any]:
@@ -428,4 +447,17 @@ class ReliableClickHouseWriter:
                 finally:
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             fcntl.flock(operator_lock.fileno(), fcntl.LOCK_UN)
+        if self.spool.telemetry:
+            try:
+                diagnostics = self.spool.diagnostics()
+                for state in ("pending", "failed", "replayed"):
+                    self.spool.telemetry.safe(
+                        "gauge", "wal_items", diagnostics[state], state=state
+                    )
+                quarantine, _ = self.spool._bounded_files(self.spool.quarantine, 10000)
+                self.spool.telemetry.safe(
+                    "gauge", "wal_items", len(quarantine), state="quarantine"
+                )
+            except Exception:
+                pass
         return outcome
