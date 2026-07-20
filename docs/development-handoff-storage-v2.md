@@ -1683,7 +1683,7 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：并发新增、重启、乱序和重复均不丢不重；三次稳定 fingerprint + 全域对账后 lag 才为零。
 - **必要测试**：合成活动源、窗口注入、PG/CH outage、checkpoint 崩溃、canonical spool/replay。
 - **排除项**：直接读取 production 文件或接入生产 CDC。
-- **状态**：`本地实现完成，待独立验收`。新增 offline-only
+- **状态**：`已验收（2a7f75c+38791a0）`。新增 offline-only
   `marketcow.offline_incremental_catchup`，以 BG-013 已签名且 `phase=complete` 的 full checkpoint 为唯一
   起点，并把其 run ID/checksum、目标 PG schema/CH database 和协议版本绑定到独立原子 checkpoint。
   每轮先通过 BG-012 worker 为全部 19 张旧源表生成有界 verified NDJSON snapshot；high-watermark 由 source
@@ -1709,7 +1709,22 @@ Backlog，不影响 `BG-020` 完成判定，除非用户明确修改整体目标
 - **验收标准**：无明确来源路径与复制授权时 fail-closed；本项仅以合成替身验证工具；报告不含真实数据或绝对路径。
 - **必要测试**：授权缺失、错误副本、schema 漂移、大数据边界、脱敏与报告 checksum。
 - **排除项**：读取、复制、上传或迁移任何真实 production 数据。
-- **状态**：`待实施`。
+- **状态**：`本地实现完成，待独立验收`。新增 offline-only
+  `marketcow.offline_copy_validator` 与版本化 `storage-v2.copy-manifest.v1` 契约。调用方必须在调用时另行提供
+  `CopyAuthorization`，明确授权 evidence ID、source logical ID、唯一复制动作，并以 SHA-256 分别绑定 manifest
+  原始字节、确切 source path 和 allowed root；此外必须由调用环境注入的 trusted authorization verifier 对该
+  完整对象给出通过，单纯自报 `authorized=true` 无效。授权缺失/为空/未受信/动作不符时，验证器在 Path resolve/stat/open、
+  mkdir、worker/thread 或任何 PG/CH 组件之前拒绝。manifest 固定记录 timezone-aware copy time、copy method、
+  授权声明、allowed-root logical ID、source fingerprint，以及 DuckDB/full checkpoint/catch-up checkpoint 的相对
+  文件清单、大小和 hash；自身 payload checksum 之外仍须匹配不可随重签更新的外部授权 hash。
+  验证流程拒绝绝对/逃逸/symlink/缺失/重复组件，逐文件流式 checksum 并执行单文件/总容量硬上限；校验 BG-013
+  complete checkpoint 与 BG-014 complete checkpoint 的签名、版本、run binding 和 source high-watermark，随后
+  复用 BG-012 read-only worker。`sample` 固定验证 provider/artifact/market 三域，`full` 验证全部 19 表；两种模式
+  均受 row/batch/value/output/memory/wall-clock 上限，并在抽取前后重新验证 source fingerprint。只有全部成功才在
+  allowed root 下原子发布带 checksum 的 `storage-v2.copy-validation.v1` 报告；报告仅含逻辑 ID、hash、计数和
+  迁移 run ID，不含原始行、DSN、凭证、异常文本或绝对路径。专项使用合成替身覆盖 sample/full 成功、授权先行
+  零副作用、外部 hash 阻止篡改重签、错源/错 hash/缺失/escape/symlink、未知 manifest/evidence/schema、容量超限、
+  source 中途变化和报告脱敏；本项未读取或复制任何真实 production 数据。
 
 ### `BG-016`：PG/CH 备份恢复与 canonical 重建
 

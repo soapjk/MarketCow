@@ -19,6 +19,7 @@
     "marketcow.offline_duckdb_import",
     "marketcow.offline_full_import",
     "marketcow.offline_incremental_catchup",
+    "marketcow.offline_copy_validator",
     "marketcow.local_backfill",
     "marketcow.local_benchmark",
     "marketcow.local_restore"
