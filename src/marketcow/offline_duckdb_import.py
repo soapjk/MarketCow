@@ -28,7 +28,12 @@ import duckdb
 SCHEMA_VERSION = "marketcow.offline-duckdb.v1"
 SUPPORTED_MIGRATIONS = (2, 3, 4)
 SUPPORTED_DUCKDB_MAJOR = 1
-SUPPORTED_SCHEMA_SHA256 = "32acc64a6afe6fa2d25d5c9a0e0d5b54f8f07a5b870f6fc65b2323f1d9a13d12"
+SUPPORTED_SCHEMA_SHA256 = frozenset({
+    # Frozen synthetic fixture used by BG-012 through BG-015.
+    "32acc64a6afe6fa2d25d5c9a0e0d5b54f8f07a5b870f6fc65b2323f1d9a13d12",
+    # Read-only snapshot of the accepted legacy production schema at cutover.
+    "587f686925b549f2172cd4fa60dee3b62ab3b9927b9ffef0981b361f6f116693",
+})
 SOURCE_LABELS = frozenset({"development-copy", "test-fixture"})
 PRODUCTION_TOKENS = frozenset({"prod", "production", "live"})
 ALLOWED_TABLES = (
@@ -256,7 +261,7 @@ class OfflineDuckDBImporter:
                 schema_sha256 = hashlib.sha256(
                     json.dumps([list(row) for row in schema_rows], separators=(",", ":")).encode()
                 ).hexdigest()
-                if schema_sha256 != SUPPORTED_SCHEMA_SHA256:
+                if schema_sha256 not in SUPPORTED_SCHEMA_SHA256:
                     raise OfflineDuckDBError("schema_rejected", "source column schema is incompatible")
                 migrations = tuple(
                     int(row[0])

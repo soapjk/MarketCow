@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
+V2_PROFILES = frozenset({"v2-production", "v2-development", "v2-test"})
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -71,10 +73,11 @@ class Settings:
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
         profile = (profile or os.getenv("MARKETCOW_PROFILE", "production")).strip().lower()
-        profiles = {"production", "development", "v2-development", "v2-test"}
+        profiles = {"production", "development", "v2-production", "v2-development", "v2-test"}
         if profile not in profiles:
             raise ValueError(
-                "MARKETCOW_PROFILE must be production or development, or v2-development or v2-test"
+                "MARKETCOW_PROFILE must be production, development, v2-production, "
+                "v2-development or v2-test"
             )
         load_dotenv(Path.cwd() / (".env." + profile), override=False)
         load_dotenv(Path.cwd() / ".env", override=False)
@@ -82,11 +85,12 @@ class Settings:
         default_data_dir = {
             "production": "data",
             "development": "data-development",
+            "v2-production": "data-v2-production",
             "v2-development": "data-v2-development",
             "v2-test": "data-v2-test",
         }[profile]
         default_port = {
-            "production": "8790", "development": "8791",
+            "production": "8790", "development": "8791", "v2-production": "8790",
             "v2-development": "8792", "v2-test": "8793",
         }[profile]
         data_root = Path(
@@ -129,7 +133,9 @@ class Settings:
             ).strip(),
             postgres_schema=os.getenv(
                 "MARKETCOW_POSTGRES_SCHEMA",
-                "marketcow_test" if profile == "v2-test" else "marketcow_development",
+                "marketcow_test" if profile == "v2-test" else
+                "marketcow_production" if profile == "v2-production" else
+                "marketcow_development",
             ).strip(),
             clickhouse_enabled=os.getenv(
                 "MARKETCOW_CLICKHOUSE_ENABLED", "true" if v2 else "false"
@@ -138,7 +144,9 @@ class Settings:
             clickhouse_port=int(os.getenv("MARKETCOW_CLICKHOUSE_PORT", "8123")),
             clickhouse_database=os.getenv(
                 "MARKETCOW_CLICKHOUSE_DATABASE",
-                "marketcow_test" if profile == "v2-test" else "marketcow_development",
+                "marketcow_test" if profile == "v2-test" else
+                "marketcow_production" if profile == "v2-production" else
+                "marketcow_development",
             ).strip(),
             clickhouse_username=os.getenv(
                 "MARKETCOW_CLICKHOUSE_USERNAME", "default"
@@ -235,7 +243,7 @@ class Settings:
         )
 
     def validate_runtime_isolation(self) -> None:
-        if self.profile in {"v2-development", "v2-test"}:
+        if self.profile in V2_PROFILES:
             self.validate_v2_preflight()
             return
         if self.database_path is None:
@@ -354,8 +362,8 @@ class Settings:
 
     def validate_v2_preflight(self) -> None:
         """Pure validation: reject unsafe V2 configuration before any resource side effect."""
-        if self.profile not in {"v2-development", "v2-test"}:
-            raise ValueError("V2 preflight requires a V2 development or test profile")
+        if self.profile not in V2_PROFILES:
+            raise ValueError("V2 preflight requires an explicit V2 profile")
         if self.runtime_architecture != "postgres_clickhouse_v2":
             raise ValueError("V2 runtime architecture must be postgres_clickhouse_v2")
         if self.runtime_config_schema != "marketcow.v2-runtime-config.v1":
@@ -370,8 +378,11 @@ class Settings:
             raise ValueError("V2 canonical reads must use ClickHouse")
         if self.raw_market_bar_read_backend != "clickhouse_raw":
             raise ValueError("V2 raw reads must use ClickHouse")
-        if self.port == 8790 or "production" in self.profile:
-            raise ValueError("V2 local profile must not use a production identity")
+        if self.profile == "v2-production":
+            if self.port != 8790:
+                raise ValueError("V2 production profile must use port 8790")
+        elif self.port == 8790:
+            raise ValueError("V2 local profile must not use a production port")
         if not self._loopback(self.host):
             raise ValueError("V2 local service host must be loopback")
 
@@ -382,7 +393,11 @@ class Settings:
         if root != allowed_root and allowed_root not in root.parents:
             raise ValueError("V2 storage root escapes its allowed root")
         root_name = root.name.lower()
-        expected_suffix = "development" if self.profile == "v2-development" else "test"
+        expected_suffix = {
+            "v2-production": "production",
+            "v2-development": "development",
+            "v2-test": "test",
+        }[self.profile]
         if not root_name.endswith(expected_suffix):
             raise ValueError("V2 storage root must match the isolated profile")
         for path, label in ((self.raw_path, "raw"),
@@ -404,7 +419,11 @@ class Settings:
             raise ValueError("V2 PostgreSQL target is invalid")
         if not self._loopback(parsed.hostname):
             raise ValueError("V2 PostgreSQL target must be loopback")
-        database_suffix = "_development" if self.profile == "v2-development" else "_test"
+        database_suffix = {
+            "v2-production": "_production",
+            "v2-development": "_development",
+            "v2-test": "_test",
+        }[self.profile]
         postgres_database = parsed.path.lstrip("/").lower()
         if not postgres_database.endswith(database_suffix):
             raise ValueError("V2 PostgreSQL database must match the isolated profile")

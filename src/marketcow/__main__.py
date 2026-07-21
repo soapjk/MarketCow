@@ -11,7 +11,7 @@ from typing import Any, Callable, Sequence
 
 import uvicorn
 
-from .config import Settings
+from .config import Settings, V2_PROFILES
 from .service import FundamentalService
 
 
@@ -37,7 +37,7 @@ def is_loopback_host(host: str) -> bool:
 
 
 def initialize(settings: Settings) -> dict[str, Any]:
-    if settings.profile in {"v2-development", "v2-test"}:
+    if settings.profile in V2_PROFILES:
         settings.validate_v2_preflight()
         return {
             "status": "ready", "database": "postgres-clickhouse-v2",
@@ -89,7 +89,7 @@ def _database_status(path: Path) -> dict[str, Any]:
 
 
 def diagnose(settings: Settings) -> dict[str, Any]:
-    if settings.profile in {"v2-development", "v2-test"}:
+    if settings.profile in V2_PROFILES:
         settings.validate_v2_preflight()
         from .health import V2HealthEvaluator
         from .v2_factory import create_v2_online_repositories
@@ -193,7 +193,7 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         description="Run and maintain the local market data API",
     )
     parser.add_argument(
-        "--profile", choices=("production", "development", "v2-development", "v2-test"),
+        "--profile", choices=("production", "development", "v2-production", "v2-development", "v2-test"),
         default=settings.profile,
         help="runtime profile; must appear before the command",
     )
@@ -342,7 +342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "refusing a non-loopback host because admin endpoints have no authentication; "
                     "set MARKETCOW_ALLOW_NON_LOOPBACK=1 only in a trusted network"
                 )
-        if settings.profile in {"v2-development", "v2-test"}:
+        if settings.profile in V2_PROFILES:
             settings.validate_v2_preflight()
         else:
             initialize(settings)

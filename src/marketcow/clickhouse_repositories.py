@@ -123,7 +123,7 @@ class ClickHouseRepositoryError(RuntimeError):
 
 
 class ClickHouseDatabase:
-    """Explicit development/test ClickHouse lifecycle and schema boundary."""
+    """Explicit V2 ClickHouse lifecycle and schema boundary."""
 
     def __init__(
         self, host: str, port: int, database: str, username: str = "default",
@@ -138,8 +138,10 @@ class ClickHouseDatabase:
             loopback = host.lower() == "localhost"
         if not loopback:
             raise ValueError("ClickHouse foundation connections must use a loopback host")
-        if not database.endswith(("_development", "_test")):
-            raise ValueError("ClickHouse database must end in _development or _test")
+        if not database.endswith(("_production", "_development", "_test")):
+            raise ValueError(
+                "ClickHouse database must end in _production, _development or _test"
+            )
         self.host = host
         self.port = port
         self.database = database

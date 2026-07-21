@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .config import Settings
+from .config import Settings, V2_PROFILES
 from .market_bar_cursor import decode_cursor, encode_cursor, load_or_create_secret
 from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
@@ -63,7 +63,7 @@ def create_app(
     v2_health_evaluator = V2HealthEvaluator(wall_clock=clock)
 
     def storage_health() -> Dict[str, Any]:
-        if settings.profile in {"v2-development", "v2-test"}:
+        if settings.profile in V2_PROFILES:
             resources = getattr(service, "v2_resources", None)
             try:
                 snapshot = resources.health_snapshot() if resources is not None else None
@@ -76,7 +76,7 @@ def create_app(
         return health_evaluator.evaluate(snapshot)
 
     def database_identifier() -> str:
-        if settings.profile in {"v2-development", "v2-test"}:
+        if settings.profile in V2_PROFILES:
             return f"postgresql://{sanitize_text(settings.postgres_schema)}+clickhouse://{sanitize_text(settings.clickhouse_database)}"
         if settings.database_path is None:
             return "[REDACTED_PATH]"

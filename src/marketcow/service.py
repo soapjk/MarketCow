@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from .config import Settings
+from .config import Settings, V2_PROFILES
 from .normalize import (
     exchange_for_symbol,
     instrument_id,
@@ -115,7 +115,7 @@ class FundamentalService:
         self.repository_database = None
         self.v2_resources = None
         if repositories is None:
-            if settings.profile in {"v2-development", "v2-test"}:
+            if settings.profile in V2_PROFILES:
                 from .artifact_store import LocalArtifactStore
                 from .v2_factory import create_v2_online_repositories
                 from .v2_market_bars import V2AuthoritativeMarketBarRepository

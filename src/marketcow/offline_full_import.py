@@ -41,6 +41,7 @@ class FullImportTargets:
     writer: Any
     canonical_builder: Any
     profile: str = "test"
+    artifact_source_root: Path | None = None
 
 
 def _canonical(value: Any) -> Any:
@@ -165,8 +166,8 @@ class OfflineFullImport:
         targets: FullImportTargets,
         fault_hook: Callable[[str, str], None] | None = None,
     ) -> None:
-        if targets.profile not in {"development", "test"}:
-            raise ValueError("full import is development/test-only")
+        if targets.profile not in {"production", "development", "test"}:
+            raise ValueError("full import profile is invalid")
         root = Path(targets.root)
         allowed = Path(targets.allowed_root)
         if root.is_symlink() or allowed.is_symlink():
@@ -177,10 +178,18 @@ class OfflineFullImport:
         except ValueError as error:
             raise ValueError("full import root escapes allowed root") from error
         identifiers = (self.root.name, str(targets.postgres.schema), str(targets.clickhouse.database))
-        if any("production" in item.lower() for item in identifiers):
-            raise ValueError("full import rejects production targets")
-        if not all(item.endswith(("development", "test")) for item in identifiers):
-            raise ValueError("full import targets must be isolated")
+        expected_suffix = targets.profile
+        if not all(item.lower().endswith(expected_suffix) for item in identifiers):
+            raise ValueError(
+                "full import targets must match the explicit profile; "
+                "development/test-only unless production is explicit"
+            )
+        self.artifact_source_root = None
+        if targets.artifact_source_root is not None:
+            artifact_root = Path(targets.artifact_source_root)
+            if artifact_root.is_symlink() or not artifact_root.is_dir():
+                raise ValueError("artifact source root is invalid")
+            self.artifact_source_root = artifact_root.resolve()
         self.source = source
         self.targets = targets
         self.fault_hook = fault_hook
@@ -301,25 +310,17 @@ class OfflineFullImport:
             ),
         )
         with self.targets.postgres.connection() as connection:
+            values = []
             for row in rows:
-                values = []
+                item = []
                 for name in columns:
                     value = row.get(name)
                     if name in domain.json_columns:
                         value = Jsonb(json.loads(value) if isinstance(value, str) else value or {})
-                    values.append(value)
-                connection.execute(statement, values)
-            keys = sql.SQL(", ").join(map(sql.Identifier, domain.key))
-            for row in rows:
-                where = sql.SQL(" AND ").join(
-                    sql.SQL("{}=%s").format(sql.Identifier(key)) for key in domain.key
-                )
-                found = connection.execute(
-                    sql.SQL("SELECT {} FROM {} WHERE {}").format(keys, sql.Identifier(domain.table), where),
-                    [row[key] for key in domain.key],
-                ).fetchone()
-                if found is None:
-                    raise RuntimeError("PostgreSQL batch verification failed")
+                    item.append(value)
+                values.append(item)
+            with connection.cursor() as cursor:
+                cursor.executemany(statement, values)
 
     @staticmethod
     def _raw(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -337,12 +338,24 @@ class OfflineFullImport:
         })
 
     def _artifact_row(self, row: dict[str, Any]) -> dict[str, Any]:
-        source_path = (self.source.allowed_root / str(row["storage_path"])).resolve()
+        declared_path = Path(str(row["storage_path"]))
+        if declared_path.is_absolute() and self.artifact_source_root is not None:
+            try:
+                data_index = declared_path.parts.index("data")
+            except ValueError as error:
+                raise ValueError("artifact body has no stable data-relative path") from error
+            source_path = (
+                self.artifact_source_root / Path(*declared_path.parts[data_index + 1:])
+            ).resolve()
+            containment_root = self.artifact_source_root
+        else:
+            source_path = (self.source.allowed_root / declared_path).resolve()
+            containment_root = self.source.allowed_root
         try:
-            source_path.relative_to(self.source.allowed_root)
+            source_path.relative_to(containment_root)
         except ValueError as error:
             raise ValueError("artifact body escapes source root") from error
-        if _has_symlink(Path(self.source.allowed_root) / str(row["storage_path"])) or not source_path.is_file():
+        if _has_symlink(source_path) or not source_path.is_file():
             raise ValueError("artifact body is unavailable")
         declared_size = int(row["byte_size"])
         artifact_limit = min(self.source.limits.max_output_bytes, 1024 * 1024 * 1024)
