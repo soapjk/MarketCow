@@ -3928,6 +3928,265 @@
       },
       "status": 422
     },
+    "POST /v1/market-bars/query::normal": {
+      "kind": "normal",
+      "request": {
+        "json": {
+          "adjustment": "adjusted",
+          "interval": "1d",
+          "range": "1y",
+          "refresh": false,
+          "symbols": [
+            "AAPL"
+          ]
+        },
+        "method": "POST",
+        "path": "/v1/market-bars/query",
+        "query": {}
+      },
+      "route": "POST /v1/market-bars/query",
+      "semantics": {
+        "count": 1,
+        "empty_collections": [
+          "errors"
+        ],
+        "has_detail": false,
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "adjustment": "string",
+            "bars": {
+              "items": null,
+              "type": "array"
+            },
+            "cache_age_seconds": "null",
+            "cache_freshness_seconds": "integer",
+            "cache_status": "string",
+            "cached": "boolean",
+            "count": "integer",
+            "interval": "string",
+            "newest_ingested_at": "null",
+            "served_at": "string",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "routing": {
+          "allow_fallback": "boolean",
+          "provider_requested": "null"
+        }
+      },
+      "status": 200
+    },
+    "POST /v1/market-bars/query::partial_failure": {
+      "kind": "partial_failure",
+      "request": {
+        "json": {
+          "adjustment": "adjusted",
+          "interval": "1d",
+          "range": "1y",
+          "refresh": false,
+          "symbols": [
+            "AAPL"
+          ]
+        },
+        "method": "POST",
+        "path": "/v1/market-bars/query",
+        "query": {}
+      },
+      "route": "POST /v1/market-bars/query",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_partial_errors": true,
+        "has_structured_error": false,
+        "structured_error_fields": []
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": {
+            "error": "string",
+            "status": "integer",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "routing": {
+          "allow_fallback": "boolean",
+          "provider_requested": "null"
+        }
+      },
+      "status": 200
+    },
+    "POST /v1/market-bars/query::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": {},
+        "method": "POST",
+        "path": "/v1/market-bars/query",
+        "query": {}
+      },
+      "route": "POST /v1/market-bars/query",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
+      },
+      "shape": {
+        "detail": {
+          "items": {
+            "input": {},
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
+    "POST /v1/quotes/query::normal": {
+      "kind": "normal",
+      "request": {
+        "json": {
+          "refresh": false,
+          "symbols": [
+            "AAPL"
+          ]
+        },
+        "method": "POST",
+        "path": "/v1/quotes/query",
+        "query": {}
+      },
+      "route": "POST /v1/quotes/query",
+      "semantics": {
+        "count": 1,
+        "empty_collections": [
+          "errors"
+        ],
+        "has_detail": false,
+        "has_partial_errors": false,
+        "has_structured_error": false,
+        "structured_error_fields": []
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "POST /v1/quotes/query::partial_failure": {
+      "kind": "partial_failure",
+      "request": {
+        "json": {
+          "refresh": false,
+          "symbols": [
+            "AAPL"
+          ]
+        },
+        "method": "POST",
+        "path": "/v1/quotes/query",
+        "query": {}
+      },
+      "route": "POST /v1/quotes/query",
+      "semantics": {
+        "count": 0,
+        "empty_collections": [
+          "items"
+        ],
+        "has_detail": false,
+        "has_partial_errors": true,
+        "has_structured_error": false,
+        "structured_error_fields": []
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": {
+            "error": "string",
+            "status": "string",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "POST /v1/quotes/query::validation_error": {
+      "kind": "validation_error",
+      "request": {
+        "json": {},
+        "method": "POST",
+        "path": "/v1/quotes/query",
+        "query": {}
+      },
+      "route": "POST /v1/quotes/query",
+      "semantics": {
+        "count": null,
+        "empty_collections": [],
+        "has_detail": true,
+        "has_partial_errors": false,
+        "has_structured_error": true,
+        "structured_error_fields": [
+          "detail"
+        ]
+      },
+      "shape": {
+        "detail": {
+          "items": {
+            "input": {},
+            "loc": {
+              "items": "string",
+              "type": "array"
+            },
+            "msg": "string",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 422
+    },
     "POST /v1/tushare/realtime-quote::backend_failure": {
       "kind": "backend_failure",
       "request": {
@@ -4092,5 +4351,5 @@
     }
   },
   "schema": "marketcow.old-main-api-contract.v1.route-matrix",
-  "sha256": "ee20c17adea4e1953b3c04bf58c2a30371619ccf767f83ee3ebc9fe1faaaa66a"
+  "sha256": "a780c22580a36b29b21851cd76500714694bc08596f94e41d27bdb843dba83f3"
 }

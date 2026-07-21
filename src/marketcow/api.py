@@ -16,6 +16,7 @@ from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
 from .telemetry import sanitize_text, telemetry_call
 from .health import StorageHealthEvaluator, V2HealthEvaluator
+from .provider_routing import ProviderNotSupported, ProviderRoutingError
 
 
 class TushareRequest(BaseModel):
@@ -25,6 +26,25 @@ class TushareRequest(BaseModel):
 
 class TushareRealtimeRequest(BaseModel):
     ts_code: str
+
+
+class ProviderPolicy(BaseModel):
+    provider: Optional[str] = None
+    allow_fallback: bool = False
+
+
+class QuoteQuery(ProviderPolicy):
+    symbols: list[str] = Field(min_length=1, max_length=20)
+    refresh: bool = False
+
+
+class MarketBarQuery(ProviderPolicy):
+    symbols: list[str] = Field(min_length=1, max_length=20)
+    range: str = "1y"
+    interval: str = "1d"
+    adjustment: str = Field(default="adjusted", pattern="^(adjusted|raw)$")
+    refresh: bool = True
+    limit: int = Field(default=500, ge=1, le=5000)
 
 
 def create_app(
@@ -153,7 +173,11 @@ def create_app(
             return JSONResponse(status_code=503, content=result)
         return result
 
-    @app.post("/v1/tushare/realtime-quote")
+    def provider_http_error(exc: ProviderRoutingError) -> HTTPException:
+        status = 422 if isinstance(exc, ProviderNotSupported) else 503
+        return HTTPException(status_code=status, detail=exc.detail())
+
+    @app.post("/v1/tushare/realtime-quote", deprecated=True)
     def tushare_realtime_quote(request: TushareRealtimeRequest):
         try:
             items = service.tushare_realtime_quote(request.ts_code)
@@ -163,7 +187,7 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    @app.post("/v1/tushare/{api_name}")
+    @app.post("/v1/tushare/{api_name}", deprecated=True)
     def tushare_call(api_name: str, request: TushareRequest):
         try:
             return service.call_tushare(api_name, request.params, request.fields)
@@ -257,7 +281,10 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes")
-    def quotes(symbols: str, refresh: bool = False):
+    def quotes(
+        symbols: str, refresh: bool = False, provider: Optional[str] = None,
+        allow_fallback: bool = False,
+    ):
         requested = [item.strip() for item in symbols.split(",") if item.strip()]
         if not requested:
             raise HTTPException(status_code=400, detail="symbols is required")
@@ -270,8 +297,19 @@ def create_app(
                     normalized = normalize_a_symbol(symbol)
                 except ValueError:
                     normalized, _ = normalize_yahoo_symbol(symbol)
+                if provider and not refresh:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"code": "provider_requires_refresh",
+                                "message": "provider selection requires refresh=true"},
+                    )
                 if refresh:
-                    items.append(service.refresh_quote(normalized))
+                    if provider or allow_fallback:
+                        items.append(service.refresh_quote(
+                            normalized, provider=provider, allow_fallback=allow_fallback
+                        ))
+                    else:
+                        items.append(service.refresh_quote(normalized))
                 else:
                     cached = service.market_bar_repository.get_latest_quotes([normalized])
                     if cached:
@@ -282,13 +320,29 @@ def create_app(
                             "status": "unavailable",
                             "error": "quote not cached",
                         })
+            except ProviderNotSupported as exc:
+                raise provider_http_error(exc) from exc
+            except HTTPException:
+                raise
             except Exception as exc:
                 errors.append({
                     "symbol": symbol,
                     "status": "unavailable",
                     "error": str(exc),
                 })
-        return {"count": len(items), "items": items, "errors": errors}
+        result = {"count": len(items), "items": items, "errors": errors}
+        if provider or allow_fallback:
+            result["routing"] = {
+                "provider_requested": provider, "allow_fallback": allow_fallback
+            }
+        return result
+
+    @app.post("/v1/quotes/query")
+    def quotes_query(request: QuoteQuery):
+        return quotes(
+            ",".join(request.symbols), refresh=request.refresh,
+            provider=request.provider, allow_fallback=request.allow_fallback,
+        )
 
     @app.get("/v1/instruments/search")
     def instrument_search(q: str, limit: int = Query(12, ge=1, le=30)):
@@ -313,6 +367,8 @@ def create_app(
         end: Optional[str] = None,
         page_size: Optional[int] = Query(None, ge=1, le=5000),
         cursor: Optional[str] = None,
+        provider: Optional[str] = None,
+        allow_fallback: bool = False,
     ):
         try:
             if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
@@ -393,9 +449,15 @@ def create_app(
                 }
             if refresh:
                 try:
-                    result = service.refresh_quote_history(
-                        normalized, range_, interval, adjustment
-                    )
+                    if provider or allow_fallback:
+                        result = service.refresh_quote_history(
+                            normalized, range_, interval, adjustment,
+                            provider=provider, allow_fallback=allow_fallback,
+                        )
+                    else:
+                        result = service.refresh_quote_history(
+                            normalized, range_, interval, adjustment
+                        )
                 except Exception as error:
                     bars = service.market_bar_repository.get_price_bars(
                         normalized, interval, adjustment, limit
@@ -419,10 +481,34 @@ def create_app(
             return {"symbol": normalized, "interval": interval, "adjustment": adjustment,
                     "count": len(bars), "bars": bars, "cached": True,
                     **cache_metadata(bars)}
+        except ProviderRoutingError as exc:
+            raise provider_http_error(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/market-bars/query")
+    def market_bars_query(request: MarketBarQuery):
+        items, errors = [], []
+        for symbol in request.symbols:
+            try:
+                items.append(quote_history(
+                    symbol, range_=request.range, interval=request.interval,
+                    adjustment=request.adjustment, refresh=request.refresh,
+                    limit=request.limit, start=None, end=None, page_size=None, cursor=None,
+                    provider=request.provider,
+                    allow_fallback=request.allow_fallback,
+                ))
+            except HTTPException as exc:
+                if exc.status_code == 422:
+                    raise
+                errors.append({"symbol": symbol, "status": exc.status_code, "error": exc.detail})
+        return {
+            "count": len(items), "items": items, "errors": errors,
+            "routing": {"provider_requested": request.provider,
+                        "allow_fallback": request.allow_fallback},
+        }
 
     @app.get("/v1/quotes/cross-section")
     def quote_cross_section(
@@ -796,13 +882,26 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes/{symbol}")
-    def quote(symbol: str, refresh: bool = False):
+    def quote(
+        symbol: str, refresh: bool = False, provider: Optional[str] = None,
+        allow_fallback: bool = False,
+    ):
         try:
             try:
                 normalized = normalize_a_symbol(symbol)
             except ValueError:
                 normalized, _ = normalize_yahoo_symbol(symbol)
+            if provider and not refresh:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "provider_requires_refresh",
+                            "message": "provider selection requires refresh=true"},
+                )
             if refresh:
+                if provider or allow_fallback:
+                    return service.refresh_quote(
+                        normalized, provider=provider, allow_fallback=allow_fallback
+                    )
                 return service.refresh_quote(normalized)
             cached = service.market_bar_repository.get_latest_quotes([normalized])
             if not cached:
@@ -810,6 +909,8 @@ def create_app(
             return cached[0]
         except HTTPException:
             raise
+        except ProviderRoutingError as exc:
+            raise provider_http_error(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:

@@ -454,7 +454,7 @@
     }
   ],
   "schema": "marketcow.old-main-v2-api-differences.v1.scenarios",
-  "sha256": "268ccd17805054518a36dee1b9c9a38433ce1a125cb50fce731fde2aa01e2a6f",
-  "v2_matrix_sha256": "ee20c17adea4e1953b3c04bf58c2a30371619ccf767f83ee3ebc9fe1faaaa66a",
+  "sha256": "b48125769db05a910b926b2b852a91c7d6ccddb645b8687b4620b89e20f9ae2a",
+  "v2_matrix_sha256": "a780c22580a36b29b21851cd76500714694bc08596f94e41d27bdb843dba83f3",
   "v2_sha256": "e6da0754e7b6e3655761d3ebb8514607f104e23ca1085a3f1309f574f20709de"
 }

@@ -4,6 +4,46 @@
       "disposition": "accepted_additive",
       "kind": "v2_added",
       "legacy": null,
+      "path": "$.routes.GET /v1/quotes.parameters[query:allow_fallback]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "allow_fallback",
+        "required": false,
+        "schema": {
+          "default": false,
+          "title": "Allow Fallback",
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes.parameters[query:provider]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "provider",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
       "path": "$.routes.GET /v1/quotes/cross-section",
       "reason": "V2-only endpoint is additive and does not alter any legacy method/path request",
       "v2": {
@@ -327,6 +367,46 @@
       "disposition": "accepted_additive",
       "kind": "v2_added",
       "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}.parameters[query:allow_fallback]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "allow_fallback",
+        "required": false,
+        "schema": {
+          "default": false,
+          "title": "Allow Fallback",
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}.parameters[query:provider]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "provider",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
       "path": "$.routes.GET /v1/quotes/{symbol}/as-of",
       "reason": "V2-only endpoint is additive and does not alter any legacy method/path request",
       "v2": {
@@ -407,6 +487,23 @@
       "disposition": "accepted_additive",
       "kind": "v2_added",
       "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:allow_fallback]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "allow_fallback",
+        "required": false,
+        "schema": {
+          "default": false,
+          "title": "Allow Fallback",
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
       "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:cursor]",
       "reason": "optional pagination bound is additive; legacy request defaults and behavior remain unchanged",
       "v2": {
@@ -471,6 +568,29 @@
             }
           ],
           "title": "Page Size"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:provider]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "provider",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider"
         }
       }
     },
@@ -648,6 +768,82 @@
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.POST /v1/market-bars/query",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketBarQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.POST /v1/quotes/query",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuoteQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -1437,6 +1633,6 @@
     }
   ],
   "schema": "marketcow.old-main-v2-api-differences.v1",
-  "sha256": "dbbaa935a0e1255cd0099e8a80b027bd830016ac0ff25c784a8c414c768e7904",
-  "v2_sha256": "c11f233e4a560d5bb6506c114e083d6d3848504e17350abcb5e340814e781ffc"
+  "sha256": "a202da969eec840eb4b3cc8bda1e8b3d7e2682b8c2ffb1b6bc588b6d577aae74",
+  "v2_sha256": "78e37a582c209d679971ece7c2e1c53078be0d8cf5baa8b05c8fcdee23c77fba"
 }

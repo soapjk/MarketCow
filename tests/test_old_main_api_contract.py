@@ -206,7 +206,7 @@ class OldMainApiContractTest(unittest.TestCase):
         report = run_gate(legacy, current, declared)
         self.assertEqual(report["status"], "ok", report)
         self.assertEqual(report["legacy_routes"], 32)
-        self.assertEqual(report["v2_routes"], 38)
+        self.assertEqual(report["v2_routes"], 40)
         self.assertGreater(report["difference_count"], 0)
         self.assertEqual(declared["legacy_sha256"], legacy["sha256"])
         self.assertEqual(declared["v2_sha256"], current["sha256"])
@@ -281,7 +281,7 @@ class OldMainApiContractTest(unittest.TestCase):
             coverage, legacy, current, expected_legacy_matrix, expected_v2_matrix,
         )
         self.assertEqual(report["status"], "ok", report)
-        self.assertEqual(report["route_count"], 38)
+        self.assertEqual(report["route_count"], 40)
         fault_app = create_app(self.settings, FaultService())
         with TestClient(self.app, raise_server_exceptions=False) as normal_client, \
                 TestClient(fault_app, raise_server_exceptions=False) as fault_client:

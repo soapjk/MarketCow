@@ -24,6 +24,7 @@ from .providers.baostock_provider import BaoStockProvider, optional_float
 from .providers.eastmoney import EastmoneySpotProvider
 from .providers.tdx_financial import TdxFinancialProvider
 from .providers.yahoo_quote import YahooQuoteProvider
+from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.instrument_search import InstrumentSearchProvider
 from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normalize_a_symbol
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
@@ -31,6 +32,12 @@ from .providers.calendar import CalendarProvider
 from .providers.tushare_provider import TushareProvider
 from .repositories import Repositories
 from .domain_columns import FUNDAMENTAL_COLUMNS
+from .provider_routing import (
+    MARKET_BAR_HISTORY,
+    REALTIME_QUOTE,
+    ProviderUnavailable,
+    select_providers,
+)
 
 
 EASTMONEY_DATA_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
@@ -290,28 +297,86 @@ class FundamentalService:
         folder = self.settings.raw_path / "quotes" / safe_symbol
         return self._write_artifact(folder, "quote_" + dataset, payload, source, source_url, locator, ingested_at, ingested_at, {"symbol": symbol})
 
-    def refresh_quote(self, symbol: str) -> Dict[str, Any]:
-        run_id, started_at = self._start_run("refresh_quote", symbol)
+    @staticmethod
+    def _quote_market(symbol: str) -> tuple[str, str]:
         try:
-            a_symbol = normalize_a_symbol(symbol)
+            return "CN", normalize_a_symbol(symbol)
         except ValueError:
-            a_symbol = None
-        providers = (
-            [self.sina_quote_provider, self.a_quote_provider]
-            if a_symbol
-            else [self.quote_provider]
+            normalized, market = normalize_yahoo_symbol(symbol)
+            return market, normalized
+
+    def _quote_provider(self, name: str) -> Any:
+        return {
+            "sina": self.sina_quote_provider,
+            "eastmoney": self.a_quote_provider,
+            "yahoo": self.quote_provider,
+            "tushare": self.tushare_provider,
+        }[name]
+
+    def _fetch_realtime_quote(self, provider_name: str, symbol: str) -> Dict[str, Any]:
+        provider = self._quote_provider(provider_name)
+        if provider_name != "tushare":
+            return provider.fetch_quote(symbol)
+        rows = json_safe(provider.realtime_quote(symbol))
+        if not rows:
+            raise RuntimeError("Tushare returned no realtime quote")
+        item = rows[0]
+        price = _number(item.get("PRICE"))
+        if price is None:
+            raise RuntimeError("Tushare returned no usable price")
+        previous_close = _number(item.get("PRE_CLOSE"))
+        code = symbol.split(".")[0]
+        date_value, time_value = item.get("DATE"), item.get("TIME")
+        quote_at = None
+        if date_value and time_value:
+            try:
+                quote_at = datetime.strptime(
+                    f"{date_value} {time_value}", "%Y%m%d %H:%M:%S"
+                ).replace(tzinfo=timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+            except ValueError:
+                pass
+        return {
+            "instrument_id": instrument_id(code), "symbol": symbol,
+            "name": item.get("NAME") or code, "market": "CN",
+            "exchange": exchange_for_symbol(code), "currency": "CNY",
+            "price": price, "previous_close": previous_close,
+            "change": None if previous_close is None else price - previous_close,
+            "change_pct": None if not previous_close else (price / previous_close - 1) * 100,
+            "session": "regular", "quote_at": quote_at, "price_adjustment": "raw",
+            "quality_status": "single_source_unverified", "source": "tushare",
+            "source_url": provider.realtime_url,
+            "raw_response_locator": "realtime_quote row", "_raw_payload": item,
+        }
+
+    def refresh_quote(
+        self, symbol: str, provider: str | None = None, allow_fallback: bool = False
+    ) -> Dict[str, Any]:
+        run_id, started_at = self._start_run("refresh_quote", symbol)
+        market, normalized = self._quote_market(symbol)
+        priority = tuple(
+            {"sina_finance_hq": "sina", "eastmoney_quote_center": "eastmoney",
+             "yahoo_chart": "yahoo"}.get(item, item)
+            for item in self.settings.clickhouse_source_priority
         )
-        normalized = a_symbol or symbol
+        provider_names = select_providers(
+            REALTIME_QUOTE, market, provider, priority,
+            allow_fallback=allow_fallback if provider else True,
+        )
         row = None
         provider_errors = []
-        for provider in providers:
+        for provider_name in provider_names:
+            selected = self._quote_provider(provider_name)
+            if provider_name == "tushare" and not selected.configured:
+                if provider:
+                    provider_errors.append("tushare: provider is not configured")
+                continue
             try:
-                row = provider.fetch_quote(normalized)
-                self.metadata_repository.record_provider_health(getattr(provider, "name", provider.__class__.__name__), True, utc_now())
+                row = self._fetch_realtime_quote(provider_name, normalized)
+                self.metadata_repository.record_provider_health(provider_name, True, utc_now())
                 break
             except Exception as exc:
-                self.metadata_repository.record_provider_health(getattr(provider, "name", provider.__class__.__name__), False, utc_now(), str(exc))
-                provider_errors.append(f"{getattr(provider, 'name', provider.__class__.__name__)}: {exc}")
+                self.metadata_repository.record_provider_health(provider_name, False, utc_now(), str(exc))
+                provider_errors.append(f"{provider_name}: {exc}")
         if row is None:
             cached = self.market_bar_repository.get_latest_quotes([normalized])
             if cached:
@@ -325,7 +390,9 @@ class FundamentalService:
                 return cached_row
             error = "; ".join(provider_errors) or "no quote provider available"
             self._finish_run(run_id, "refresh_quote", started_at, symbol, 0, error)
-            raise RuntimeError(error)
+            raise ProviderUnavailable(
+                error, provider=provider or "auto", capability=REALTIME_QUOTE, market=market
+            )
         raw_payload = row.pop("_raw_payload")
         ingested_at = utc_now()
         artifact = self._save_quote_raw(row["symbol"], "latest", raw_payload, ingested_at, row["source"], row["source_url"], row["raw_response_locator"])
@@ -340,12 +407,39 @@ class FundamentalService:
         self._finish_run(run_id, "refresh_quote", started_at, symbol, 1)
         return row
 
-    def refresh_quote_history(self, symbol: str, range_: str, interval: str, adjustment: str) -> Dict[str, Any]:
-        if interval in {"1m", "5m", "15m", "30m", "60m", "1h"} and symbol.endswith((".SH", ".SZ", ".BJ")):
-            return self.refresh_tushare_minute_history(symbol, range_, interval, adjustment)
+    def refresh_quote_history(
+        self, symbol: str, range_: str, interval: str, adjustment: str,
+        provider: str | None = None, allow_fallback: bool = False,
+    ) -> Dict[str, Any]:
+        market, normalized = self._quote_market(symbol)
+        priority = tuple(
+            {"yahoo_chart": "yahoo"}.get(item, item)
+            for item in self.settings.clickhouse_source_priority
+        )
+        names = select_providers(
+            MARKET_BAR_HISTORY, market, provider, priority,
+            allow_fallback=allow_fallback if provider else True,
+        )
+        errors: list[str] = []
+        for name in names:
+            if name == "tushare":
+                if not self.tushare_provider.configured:
+                    errors.append("tushare: provider is not configured")
+                    continue
+                if interval not in {"1m", "5m", "15m", "30m", "60m", "1h"}:
+                    errors.append("tushare: interval is not supported by this adapter")
+                    continue
+                return self.refresh_tushare_minute_history(normalized, range_, interval, adjustment)
+            if name == "yahoo":
+                break
+        else:
+            raise ProviderUnavailable(
+                "; ".join(errors) or "no history provider available",
+                provider=provider or "auto", capability=MARKET_BAR_HISTORY, market=market,
+            )
         run_id, started_at = self._start_run("refresh_quote_history", symbol)
         try:
-            result = self.quote_provider.fetch_history(symbol, range_, interval, adjustment)
+            result = self.quote_provider.fetch_history(normalized, range_, interval, adjustment)
         except Exception as exc:
             provider = getattr(self.quote_provider, "name", self.quote_provider.__class__.__name__)
             self.metadata_repository.record_provider_health(provider, False, utc_now(), str(exc))

@@ -741,6 +741,82 @@
       "shape": {},
       "status": 200
     },
+    "POST /v1/market-bars/query": {
+      "request": {
+        "json": {
+          "adjustment": "adjusted",
+          "interval": "1d",
+          "range": "1y",
+          "refresh": false,
+          "symbols": [
+            "AAPL"
+          ]
+        },
+        "method": "POST",
+        "path": "/v1/market-bars/query",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "adjustment": "string",
+            "bars": {
+              "items": null,
+              "type": "array"
+            },
+            "cache_age_seconds": "null",
+            "cache_freshness_seconds": "integer",
+            "cache_status": "string",
+            "cached": "boolean",
+            "count": "integer",
+            "interval": "string",
+            "newest_ingested_at": "null",
+            "served_at": "string",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "routing": {
+          "allow_fallback": "boolean",
+          "provider_requested": "null"
+        }
+      },
+      "status": 200
+    },
+    "POST /v1/quotes/query": {
+      "request": {
+        "json": {
+          "refresh": false,
+          "symbols": [
+            "AAPL"
+          ]
+        },
+        "method": "POST",
+        "path": "/v1/quotes/query",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
     "POST /v1/tushare/realtime-quote": {
       "request": {
         "json": {
@@ -775,5 +851,5 @@
     }
   },
   "schema": "marketcow.old-main-api-contract.v1.route-scenarios",
-  "sha256": "e1081522662a410d0db9082fed91d04663dce394dd80f7e8967a44009284ad05"
+  "sha256": "a4c4293be098cb2d9f34974c74a478c661f912a39b614b73fbcf423ea93d937d"
 }

@@ -2473,6 +2473,108 @@
     {
       "applicability": {
         "backend_failure": {
+          "reason": "Batch capability reports bounded per-symbol failures as partial_failure",
+          "status": "not_applicable"
+        },
+        "empty": {
+          "reason": "Batch empty semantics are represented by per-symbol results; an empty symbols list is validation-invalid",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "partial_failure": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/market-bars/query",
+      "scenarios": [
+        {
+          "capture_key": "POST /v1/market-bars/query::normal",
+          "id": "post-_v1_market-bars_query-normal",
+          "kind": "normal",
+          "legacy": "route_absent",
+          "route": "POST /v1/market-bars/query",
+          "v2": "executed",
+          "v2_capture_sha256": "9e7332a594a1e00dd15e3811de075e6720f9bbcffce5584314d91d7da71b01d9"
+        },
+        {
+          "capture_key": "POST /v1/market-bars/query::validation_error",
+          "id": "post-_v1_market-bars_query-validation-error",
+          "kind": "validation_error",
+          "legacy": "route_absent",
+          "route": "POST /v1/market-bars/query",
+          "v2": "executed",
+          "v2_capture_sha256": "a87c0361ba488869cd8f49e02a6bfe3b76e60995dd4978b223610f0035a68982"
+        },
+        {
+          "capture_key": "POST /v1/market-bars/query::partial_failure",
+          "id": "post-_v1_market-bars_query-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "route_absent",
+          "route": "POST /v1/market-bars/query",
+          "v2": "executed",
+          "v2_capture_sha256": "fa8326fd3d8f350b3e1719facbee374bb95eddba398d04a0548045f5f677a001"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
+          "reason": "Batch capability reports bounded per-symbol failures as partial_failure",
+          "status": "not_applicable"
+        },
+        "empty": {
+          "reason": "Batch empty semantics are represented by per-symbol results; an empty symbols list is validation-invalid",
+          "status": "not_applicable"
+        },
+        "normal": {
+          "status": "covered"
+        },
+        "partial_failure": {
+          "status": "covered"
+        },
+        "validation_error": {
+          "status": "covered"
+        }
+      },
+      "route": "POST /v1/quotes/query",
+      "scenarios": [
+        {
+          "capture_key": "POST /v1/quotes/query::normal",
+          "id": "post-_v1_quotes_query-normal",
+          "kind": "normal",
+          "legacy": "route_absent",
+          "route": "POST /v1/quotes/query",
+          "v2": "executed",
+          "v2_capture_sha256": "0a8d21314b22787620fb1287a602e8bfe94cdb510c795f4d3d282c1c028a72fa"
+        },
+        {
+          "capture_key": "POST /v1/quotes/query::validation_error",
+          "id": "post-_v1_quotes_query-validation-error",
+          "kind": "validation_error",
+          "legacy": "route_absent",
+          "route": "POST /v1/quotes/query",
+          "v2": "executed",
+          "v2_capture_sha256": "22870dc759cc8741638f1af619644143b8cc71a163526a881e6a80a019302178"
+        },
+        {
+          "capture_key": "POST /v1/quotes/query::partial_failure",
+          "id": "post-_v1_quotes_query-partial-failure",
+          "kind": "partial_failure",
+          "legacy": "route_absent",
+          "route": "POST /v1/quotes/query",
+          "v2": "executed",
+          "v2_capture_sha256": "2261afe429dd496e78fe775814e24b067142ccda4d4da581782d6770c1cd9201"
+        }
+      ]
+    },
+    {
+      "applicability": {
+        "backend_failure": {
           "status": "covered"
         },
         "empty": {
@@ -2611,6 +2713,6 @@
     }
   ],
   "schema": "marketcow.old-main-v2-api-coverage.v1",
-  "sha256": "c194bf35120001d5dbee2bb68fbd10dd7ab5958bf6b22c87721c37b856b70fc6",
-  "v2_matrix_sha256": "ee20c17adea4e1953b3c04bf58c2a30371619ccf767f83ee3ebc9fe1faaaa66a"
+  "sha256": "c88a859982f882bf933e930e601c8f76b83d41ab31093dc07b5af0a5384b484e",
+  "v2_matrix_sha256": "a780c22580a36b29b21851cd76500714694bc08596f94e41d27bdb843dba83f3"
 }

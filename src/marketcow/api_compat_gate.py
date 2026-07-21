@@ -137,6 +137,13 @@ def route_request(route: str, parameters: list[Mapping[str, Any]]) -> dict[str, 
         body = {"ts_code": "AAPL"}
     elif method == "POST" and template == "/v1/tushare/{api_name}":
         body = {"params": {}, "fields": ""}
+    elif method == "POST" and template == "/v1/quotes/query":
+        body = {"symbols": ["AAPL"], "refresh": False}
+    elif method == "POST" and template == "/v1/market-bars/query":
+        body = {
+            "symbols": ["AAPL"], "range": "1y", "interval": "1d",
+            "adjustment": "adjusted", "refresh": False,
+        }
     return {"method": method, "path": path, "query": query, "json": body}
 
 
@@ -195,7 +202,8 @@ def capture_route_matrix(
             else:
                 invalid["query"]["__invalid"] = "true"
             variants.append(("validation_error", normal_client, invalid))
-        if route == "GET /v1/quotes":
+        if route in {"GET /v1/quotes", "POST /v1/quotes/query",
+                     "POST /v1/market-bars/query"}:
             variants.append(("partial_failure", fault_client, base))
         elif route not in {"GET /v1/health", "GET /v1/readiness"}:
             variants.append(("backend_failure", fault_client, base))
