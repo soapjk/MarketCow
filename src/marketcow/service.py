@@ -30,6 +30,7 @@ from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normal
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
 from .providers.calendar import CalendarProvider
 from .providers.tushare_provider import TushareProvider
+from .providers.contracts import DEFAULT_PROVIDER_MANIFESTS, ProviderRegistry
 from .repositories import Repositories
 from .domain_columns import FUNDAMENTAL_COLUMNS
 from .provider_routing import (
@@ -161,6 +162,12 @@ class FundamentalService:
             settings.tushare_token, settings.tushare_base_url,
             settings.tushare_realtime_url, settings.tushare_min_interval,
         )
+        self.provider_registry = ProviderRegistry(DEFAULT_PROVIDER_MANIFESTS)
+        quote_capability = (REALTIME_QUOTE,)
+        self.provider_registry.bind("sina", self.sina_quote_provider, quote_capability)
+        self.provider_registry.bind("eastmoney", self.a_quote_provider, quote_capability)
+        self.provider_registry.bind("yahoo", self.quote_provider, quote_capability)
+        self.provider_registry.bind("tushare", self.tushare_provider, quote_capability)
 
     def close(self) -> None:
         if self.v2_resources is not None:
@@ -306,12 +313,7 @@ class FundamentalService:
             return market, normalized
 
     def _quote_provider(self, name: str) -> Any:
-        return {
-            "sina": self.sina_quote_provider,
-            "eastmoney": self.a_quote_provider,
-            "yahoo": self.quote_provider,
-            "tushare": self.tushare_provider,
-        }[name]
+        return self.provider_registry.get(name)
 
     def _fetch_realtime_quote(self, provider_name: str, symbol: str) -> Dict[str, Any]:
         provider = self._quote_provider(provider_name)

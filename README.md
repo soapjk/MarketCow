@@ -322,6 +322,7 @@ uv pip check
 ```
 
 新增 provider 时必须保留来源、观测时间、入库时间和原始响应定位信息；财务类数据还必须保存公告时间。
+实现、能力注册和契约测试步骤见 [Provider 开发脚手架](docs/provider-development.md)。
 
 架构与决策文档：
 

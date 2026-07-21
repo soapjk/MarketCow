@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Iterable
 
+from .providers import contracts
+from .providers.contracts import DEFAULT_PROVIDER_MANIFESTS, ProviderRegistry
 
-REALTIME_QUOTE = "realtime_quote"
-MARKET_BAR_HISTORY = "market_bar_history"
+
+REALTIME_QUOTE = contracts.REALTIME_QUOTE
+MARKET_BAR_HISTORY = contracts.MARKET_BAR_HISTORY
+
 
 
 class ProviderRoutingError(ValueError):
@@ -38,28 +41,11 @@ class ProviderUnavailable(ProviderRoutingError):
         return {**super().detail(), "status": "unavailable"}
 
 
-@dataclass(frozen=True)
-class ProviderCapability:
-    provider: str
-    capability: str
-    markets: frozenset[str]
-
-    def supports(self, capability: str, market: str) -> bool:
-        return self.capability == capability and market in self.markets
-
-
-CAPABILITIES = (
-    ProviderCapability("tushare", REALTIME_QUOTE, frozenset({"CN"})),
-    ProviderCapability("sina", REALTIME_QUOTE, frozenset({"CN"})),
-    ProviderCapability("eastmoney", REALTIME_QUOTE, frozenset({"CN"})),
-    ProviderCapability("yahoo", REALTIME_QUOTE, frozenset({"US", "HK", "FX"})),
-    ProviderCapability("tushare", MARKET_BAR_HISTORY, frozenset({"CN"})),
-    ProviderCapability("yahoo", MARKET_BAR_HISTORY, frozenset({"US", "HK", "FX", "CN"})),
-)
+_CATALOG = ProviderRegistry(DEFAULT_PROVIDER_MANIFESTS)
 
 
 def supported_providers(capability: str, market: str) -> tuple[str, ...]:
-    return tuple(item.provider for item in CAPABILITIES if item.supports(capability, market))
+    return _CATALOG.supported(capability, market)
 
 
 def select_providers(
