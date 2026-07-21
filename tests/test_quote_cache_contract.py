@@ -2,6 +2,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -81,7 +82,9 @@ class QuoteCacheContractTest(unittest.TestCase):
 
     def expire_cache(self, symbol):
         row = self.service.warehouse.get_latest_quotes([symbol])[0]
-        row["ingested_at"] = "2026-07-20T09:30:00+00:00"
+        row["ingested_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=120)
+        ).isoformat(timespec="seconds")
         self.service.warehouse.upsert_quote(row)
 
     def test_single_cache_miss_auto_refreshes_and_persists(self):

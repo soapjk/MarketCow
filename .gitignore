@@ -15,6 +15,7 @@ dist/
 .ruff_cache/
 data/
 data-development/
+data-v2-development/
 logs/
 logs-development/
 state/

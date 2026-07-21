@@ -1,0 +1,1638 @@
+{
+  "differences": [
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes.parameters[query:allow_fallback]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "allow_fallback",
+        "required": false,
+        "schema": {
+          "default": false,
+          "title": "Allow Fallback",
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes.parameters[query:provider]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "provider",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/cross-section",
+      "reason": "V2-only endpoint is additive and does not alter any legacy method/path request",
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "bar_at",
+            "required": true,
+            "schema": {
+              "title": "Bar At",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 5000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page Size"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbols"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/cross-section/as-of",
+      "reason": "V2-only endpoint is additive and does not alter any legacy method/path request",
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "as_of",
+            "required": true,
+            "schema": {
+              "title": "As Of",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_lookback_seconds",
+            "required": false,
+            "schema": {
+              "default": 86400,
+              "maximum": 31536000,
+              "minimum": 1,
+              "title": "Max Lookback Seconds",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": true,
+            "schema": {
+              "title": "Symbols",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/cross-section/matrix",
+      "reason": "V2-only endpoint is additive and does not alter any legacy method/path request",
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "bar_ats",
+            "required": true,
+            "schema": {
+              "title": "Bar Ats",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 5000,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": true,
+            "schema": {
+              "title": "Symbols",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}.parameters[query:allow_fallback]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "allow_fallback",
+        "required": false,
+        "schema": {
+          "default": false,
+          "title": "Allow Fallback",
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}.parameters[query:provider]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "provider",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/as-of",
+      "reason": "V2-only endpoint is additive and does not alter any legacy method/path request",
+      "v2": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "symbol",
+            "required": true,
+            "schema": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "as_of",
+            "required": true,
+            "schema": {
+              "title": "As Of",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_lookback_seconds",
+            "required": false,
+            "schema": {
+              "default": 86400,
+              "maximum": 31536000,
+              "minimum": 1,
+              "title": "Max Lookback Seconds",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:allow_fallback]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "allow_fallback",
+        "required": false,
+        "schema": {
+          "default": false,
+          "title": "Allow Fallback",
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:cursor]",
+      "reason": "optional pagination bound is additive; legacy request defaults and behavior remain unchanged",
+      "v2": {
+        "in": "query",
+        "name": "cursor",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Cursor"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:end]",
+      "reason": "optional pagination bound is additive; legacy request defaults and behavior remain unchanged",
+      "v2": {
+        "in": "query",
+        "name": "end",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "End"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:page_size]",
+      "reason": "optional pagination bound is additive; legacy request defaults and behavior remain unchanged",
+      "v2": {
+        "in": "query",
+        "name": "page_size",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "maximum": 5000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Page Size"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:provider]",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "in": "query",
+        "name": "provider",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[query:start]",
+      "reason": "optional pagination bound is additive; legacy request defaults and behavior remain unchanged",
+      "v2": {
+        "in": "query",
+        "name": "start",
+        "required": false,
+        "schema": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Start"
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/raw-history",
+      "reason": "V2-only endpoint is additive and does not alter any legacy method/path request",
+      "v2": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "symbol",
+            "required": true,
+            "schema": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "raw",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": true,
+            "schema": {
+              "title": "End",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 5000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page Size"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sources",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sources"
+            }
+          },
+          {
+            "in": "query",
+            "name": "start",
+            "required": true,
+            "schema": {
+              "title": "Start",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/readiness",
+      "reason": "V2-only endpoint is additive and does not alter any legacy method/path request",
+      "v2": {
+        "parameters": [],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.POST /v1/market-bars/query",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketBarQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.POST /v1/quotes/query",
+      "reason": "Provider-neutral query capability added without changing omitted legacy request behavior",
+      "v2": {
+        "parameters": [],
+        "request_body": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QuoteQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "legacy_sha256": "2e380c45863e3acc77fe919846f3ff6b97a65c204ef69c4010d61d9091787047",
+  "prior_exact_dispositions": [
+    {
+      "disposition": "strict_compatible",
+      "kind": "changed",
+      "legacy": false,
+      "path": "$.routes.GET /v1/quotes.parameters[0].schema.default",
+      "reason": "V2 behavior and response shape were repaired to match this exact legacy path",
+      "v2": true
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/cross-section",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "bar_at",
+            "required": true,
+            "schema": {
+              "title": "Bar At",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 5000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page Size"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbols"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/cross-section/as-of",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "as_of",
+            "required": true,
+            "schema": {
+              "title": "As Of",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_lookback_seconds",
+            "required": false,
+            "schema": {
+              "default": 86400,
+              "maximum": 31536000,
+              "minimum": 1,
+              "title": "Max Lookback Seconds",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": true,
+            "schema": {
+              "title": "Symbols",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/cross-section/matrix",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "bar_ats",
+            "required": true,
+            "schema": {
+              "title": "Bar Ats",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 5000,
+              "minimum": 1,
+              "title": "Page Size",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "symbols",
+            "required": true,
+            "schema": {
+              "title": "Symbols",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "strict_compatible",
+      "kind": "changed",
+      "legacy": false,
+      "path": "$.routes.GET /v1/quotes/{symbol}.parameters[1].schema.default",
+      "reason": "V2 behavior and response shape were repaired to match this exact legacy path",
+      "v2": true
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/as-of",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "symbol",
+            "required": true,
+            "schema": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "adjusted",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "as_of",
+            "required": true,
+            "schema": {
+              "title": "As Of",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_lookback_seconds",
+            "required": false,
+            "schema": {
+              "default": 86400,
+              "maximum": 31536000,
+              "minimum": 1,
+              "title": "Max Lookback Seconds",
+              "type": "integer"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": 6,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters.length",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": 10
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "interval",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].name",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "cursor"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].schema.anyOf",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_missing",
+      "legacy": "1d",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].schema.default",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": null
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "Interval",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].schema.title",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "Cursor"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_missing",
+      "legacy": "string",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[2].schema.type",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": null
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "limit",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].name",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "end"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.anyOf",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_missing",
+      "legacy": 500,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.default",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": null
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_missing",
+      "legacy": 5000,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.maximum",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": null
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_missing",
+      "legacy": 1,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.minimum",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": null
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "Limit",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.title",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "End"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_missing",
+      "legacy": "integer",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[3].schema.type",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": null
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "range",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[4].name",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "interval"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "1y",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[4].schema.default",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "1d"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "Range",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[4].schema.title",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "Interval"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "refresh",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].name",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "limit"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": true,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.default",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": 500
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.maximum",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": 5000
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.minimum",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": 1
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "Refresh",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.title",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "Limit"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "changed",
+      "legacy": "boolean",
+      "path": "$.routes.GET /v1/quotes/{symbol}/history.parameters[5].schema.type",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": "integer"
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/quotes/{symbol}/raw-history",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "symbol",
+            "required": true,
+            "schema": {
+              "title": "Symbol",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "adjustment",
+            "required": false,
+            "schema": {
+              "default": "raw",
+              "title": "Adjustment",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "end",
+            "required": true,
+            "schema": {
+              "title": "End",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "interval",
+            "required": false,
+            "schema": {
+              "default": "1d",
+              "title": "Interval",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 5000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Page Size"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sources",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sources"
+            }
+          },
+          {
+            "in": "query",
+            "name": "start",
+            "required": true,
+            "schema": {
+              "title": "Start",
+              "type": "string"
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "disposition": "accepted_additive",
+      "kind": "v2_added",
+      "legacy": null,
+      "path": "$.routes.GET /v1/readiness",
+      "reason": "This exact prior diff is normalized to a named additive V2 route, parameter, or bounded health field without changing legacy requests",
+      "v2": {
+        "parameters": [],
+        "request_body": null,
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "resolved_strict_compatible": [
+    {
+      "disposition": "strict_compatible",
+      "path": "$.routes.GET /v1/quotes.parameters[query:refresh].schema.default",
+      "reason": "default restored to false; omitted request performs no upstream refresh"
+    },
+    {
+      "disposition": "strict_compatible",
+      "path": "$.routes.GET /v1/quotes/{symbol}.parameters[query:refresh].schema.default",
+      "reason": "default restored to false; omitted request performs no upstream refresh"
+    }
+  ],
+  "schema": "marketcow.old-main-v2-api-differences.v1",
+  "sha256": "a202da969eec840eb4b3cc8bda1e8b3d7e2682b8c2ffb1b6bc588b6d577aae74",
+  "v2_sha256": "78e37a582c209d679971ece7c2e1c53078be0d8cf5baa8b05c8fcdee23c77fba"
+}

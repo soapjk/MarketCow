@@ -3,48 +3,32 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import duckdb
 import pandas as pd
 
+from .bar_version import raw_content_rank
+from .canonical_selection import (
+    DEFAULT_SOURCE_PRIORITY,
+    canonical_page_payload,
+    with_effective_time,
+)
+from .domain_columns import (
+    FUNDAMENTAL_COLUMNS,
+    PROVENANCE_COLUMNS as _PROVENANCE_COLUMNS,
+    TDX_COLUMNS,
+)
 
-FUNDAMENTAL_COLUMNS = [
-    "instrument_id", "symbol", "exchange", "name", "is_active", "report_period",
-    "published_at", "valuation_as_of", "price", "change_pct", "pe_dynamic",
-    "pb", "total_market_cap", "float_market_cap", "roe_weighted", "eps",
-    "revenue", "revenue_yoy", "revenue_qoq", "net_profit", "net_profit_yoy",
-    "net_profit_qoq", "book_value_per_share", "ocf_per_share", "gross_margin",
-    "industry", "cash", "accounts_receivable", "inventory", "total_assets",
-    "total_assets_yoy", "accounts_payable", "advance_receipts",
-    "total_liabilities", "total_liabilities_yoy", "debt_ratio", "total_equity",
-    "operating_cost", "sales_expense", "admin_expense", "financial_expense",
-    "total_operating_expense", "operating_profit", "total_profit", "net_cashflow",
-    "net_cashflow_yoy", "operating_cashflow", "investing_cashflow",
-    "financing_cashflow", "source", "source_url", "observed_at", "ingested_at",
-    "raw_response_locator", "raw_path", "raw_artifact_id", "quality_status", "fetched_at",
-]
-
-PROVENANCE_COLUMNS = [
-    "source", "source_url", "observed_at", "ingested_at",
-    "raw_response_locator", "raw_path", "raw_artifact_id",
-]
-
-TDX_COLUMNS = [
-    "symbol", "report_period", "published_at", "roe_weighted", "eps",
-    "eps_adjusted", "book_value_per_share", "ocf_per_share", "cash",
-    "accounts_receivable", "inventory", "total_assets", "total_liabilities",
-    "total_equity", "revenue", "revenue_ttm", "net_profit_parent",
-    "net_profit_parent_ttm", "operating_cashflow", "capex", "source_file",
-    "source", "source_url", "observed_at", "ingested_at", "raw_response_locator",
-    "raw_path", "raw_artifact_id", "fetched_at",
-]
+PROVENANCE_COLUMNS = _PROVENANCE_COLUMNS
 
 
 class Warehouse:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, canonical_source_priority=DEFAULT_SOURCE_PRIORITY):
         self.path = Path(path)
+        self.canonical_source_priority = tuple(canonical_source_priority)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.init_schema()
@@ -278,6 +262,8 @@ class Warehouse:
                 con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS {0} VARCHAR".format(name))
             con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS amount DOUBLE")
             con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS payload_json VARCHAR")
+            con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS source_sequence VARCHAR")
+            con.execute("ALTER TABLE market_price_bar ADD COLUMN IF NOT EXISTS content_rank VARCHAR")
             con.execute(
                 """
                 CREATE TABLE IF NOT EXISTS economic_calendar_event (
@@ -693,14 +679,78 @@ class Warehouse:
 
     def upsert_price_bars(self, symbol: str, interval: str, adjustment: str, source: str, ingested_at: str, bars: List[Dict[str, Any]], provenance: Optional[Dict[str, Any]] = None) -> int:
         provenance = provenance or {}
-        values = [
-            [symbol, interval, adjustment, bar.get("timestamp"), bar.get("bar_at"), bar.get("open"), bar.get("high"), bar.get("low"), bar.get("close"), bar.get("raw_close"), bar.get("adjustment_factor"), bar.get("volume"), source, ingested_at, provenance.get("source_url"), provenance.get("observed_at") or bar.get("bar_at"), provenance.get("raw_response_locator"), provenance.get("raw_path"), provenance.get("raw_artifact_id"), bar.get("amount"), json.dumps(bar.get("source_payload") or bar, ensure_ascii=False, allow_nan=False)]
-            for bar in bars
-        ]
+        values = []
+        for bar in bars:
+            observed_at = provenance.get("observed_at") or bar.get("bar_at")
+            source_sequence = str(bar.get("source_sequence") or bar.get("timestamp"))
+            content_rank = raw_content_rank({
+                "symbol": symbol, "interval": interval, "adjustment": adjustment,
+                "bar_time": bar.get("bar_at"), "open": bar.get("open"),
+                "high": bar.get("high"), "low": bar.get("low"),
+                "close": bar.get("close"), "raw_close": bar.get("raw_close"),
+                "adjustment_factor": bar.get("adjustment_factor"),
+                "volume": bar.get("volume"), "amount": bar.get("amount"),
+                "source": source, "source_sequence": source_sequence,
+                "observed_at": observed_at,
+                "raw_artifact_id": provenance.get("raw_artifact_id"),
+            })
+            values.append([
+                symbol, interval, adjustment, bar.get("timestamp"), bar.get("bar_at"),
+                bar.get("open"), bar.get("high"), bar.get("low"), bar.get("close"),
+                bar.get("raw_close"), bar.get("adjustment_factor"), bar.get("volume"),
+                source, ingested_at, provenance.get("source_url"), observed_at,
+                provenance.get("raw_response_locator"), provenance.get("raw_path"),
+                provenance.get("raw_artifact_id"), bar.get("amount"),
+                json.dumps(bar.get("source_payload") or bar, ensure_ascii=False,
+                           allow_nan=False), source_sequence, content_rank,
+            ])
         if values:
             with self._lock, self.connect() as con:
-                con.executemany("INSERT OR REPLACE INTO market_price_bar (symbol, interval, adjustment, timestamp, bar_at, open, high, low, close, raw_close, adjustment_factor, volume, source, ingested_at, source_url, observed_at, raw_response_locator, raw_path, raw_artifact_id, amount, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+                columns = (
+                    "symbol, interval, adjustment, timestamp, bar_at, open, high, low, "
+                    "close, raw_close, adjustment_factor, volume, source, ingested_at, "
+                    "source_url, observed_at, raw_response_locator, raw_path, "
+                    "raw_artifact_id, amount, payload_json, source_sequence, content_rank"
+                )
+                for value in values:
+                    existing = con.execute(
+                        "SELECT " + columns + " FROM market_price_bar WHERE symbol=? "
+                        "AND interval=? AND adjustment=? AND timestamp=? AND source=?",
+                        [value[0], value[1], value[2], value[3], value[12]],
+                    ).fetchone()
+                    if existing is not None:
+                        incoming_time = self._utc_datetime(value[13])
+                        existing_time = self._utc_datetime(existing[13])
+                        if incoming_time < existing_time:
+                            continue
+                        if (incoming_time == existing_time and
+                                value[22] <= (existing[22] or
+                                              self._existing_bar_content_rank(existing))):
+                            continue
+                    con.execute(
+                        "INSERT OR REPLACE INTO market_price_bar (" + columns + ") "
+                        "VALUES (" + ",".join("?" for _ in value) + ")", value,
+                    )
         return len(values)
+
+    @staticmethod
+    def _utc_datetime(value: Any) -> datetime:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("ingested_at must include a timezone")
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _existing_bar_content_rank(value: Sequence[Any]) -> str:
+        return raw_content_rank({
+            "symbol": value[0], "interval": value[1], "adjustment": value[2],
+            "bar_time": value[4], "open": value[5], "high": value[6],
+            "low": value[7], "close": value[8], "raw_close": value[9],
+            "adjustment_factor": value[10], "volume": value[11],
+            "source": value[12], "observed_at": value[15],
+            "raw_artifact_id": value[18], "amount": value[19],
+            "source_sequence": value[21],
+        })
 
     def save_tushare_response(
         self, request: Dict[str, Any], rows: List[Dict[str, Any]]
@@ -734,6 +784,25 @@ class Warehouse:
                 )
         return len(rows)
 
+    def get_tushare_response(self, request_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self.connect() as con:
+            requests = self._rows(
+                con, "SELECT * FROM tushare_request WHERE request_id = ?", [request_id]
+            )
+            if not requests:
+                return None
+            request = requests[0]
+            for key in ("params_json", "response_fields_json"):
+                request[key] = json.loads(request[key] or ("{}" if key == "params_json" else "[]"))
+            rows = self._rows(
+                con,
+                "SELECT * FROM tushare_data_row WHERE request_id = ? ORDER BY row_index",
+                [request_id],
+            )
+            for row in rows:
+                row["payload_json"] = json.loads(row["payload_json"] or "{}")
+            return {**request, "rows": rows}
+
     def get_price_bars(self, symbol: str, interval: str, adjustment: str, limit: int) -> List[Dict[str, Any]]:
         with self._lock, self.connect() as con:
             rows = self._rows(
@@ -747,6 +816,480 @@ class Warehouse:
             row["source_payload"] = json.loads(payload) if payload else {}
             result.append(row)
         return result
+
+    @staticmethod
+    def _utc_range(start: str, end: str) -> tuple[datetime, datetime]:
+        def parse(value: str) -> datetime:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("history range timestamps must include a timezone")
+            return parsed.astimezone(timezone.utc)
+
+        start_at, end_at = parse(start), parse(end)
+        if start_at > end_at:
+            raise ValueError("history range start must not be after end")
+        return start_at, end_at
+
+    @staticmethod
+    def _utc_iso(value: Any) -> str:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+
+    def get_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("history limit must be between 1 and 5000")
+        start_at, end_at = self._utc_range(start, end)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "ingested_at, payload_json FROM market_price_bar WHERE symbol = ? "
+                "AND interval = ? AND adjustment = ? AND timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp ASC, source ASC LIMIT ?",
+                [symbol, interval, adjustment, int(start_at.timestamp()),
+                 int(end_at.timestamp()), limit + 1],
+            )
+        truncated = len(rows) > limit
+        result = []
+        for row in rows[:limit]:
+            payload = row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            row["bar_at"] = self._utc_iso(row["bar_at"])
+            row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            row["source_payload"] = json.loads(payload) if payload else {}
+            result.append(row)
+        return result, truncated
+
+    def get_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int, after: Optional[int] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("history page_size must be between 1 and 5000")
+        start_at, end_at = self._utc_range(start, end)
+        start_epoch, end_epoch = int(start_at.timestamp()), int(end_at.timestamp())
+        after_sql = "" if after is None else " AND timestamp > ?"
+        parameters: List[Any] = [symbol, interval, adjustment, start_epoch, end_epoch]
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters = list(self.canonical_source_priority) + parameters
+        if after is not None:
+            parameters.append(after)
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER "
+                "(PARTITION BY timestamp ORDER BY " + priority_sql + " ASC, "
+                "CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) selected "
+                "FROM market_price_bar WHERE symbol = ? AND interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?" + after_sql +
+                ") WHERE selected = 1 ORDER BY timestamp ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        result = []
+        for row in rows[:page_size]:
+            row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            row["bar_at"] = self._utc_iso(row["bar_at"])
+            row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            observed_at = row.pop("observed_at")
+            raw_artifact_id = row.pop("raw_artifact_id")
+            row["source_payload"] = canonical_page_payload(
+                row["source"], observed_at, raw_artifact_id
+            )
+            result.append(row)
+        return result, has_more
+
+    def get_price_bars_cross_section(
+        self, interval: str, adjustment: str, bar_at: str, limit: int,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("cross-section limit must be between 1 and 5000")
+        point, _ = self._utc_range(bar_at, bar_at)
+        symbol_filter = None if symbols is None else sorted(set(symbols))
+        if symbol_filter is not None and len(symbol_filter) > 5000:
+            raise ValueError("cross-section symbols must contain at most 5000 values")
+        if symbol_filter == []:
+            return [], False
+        filters = ""
+        parameters: List[Any] = [interval, adjustment, int(point.timestamp())]
+        if symbol_filter is not None:
+            filters = " AND symbol IN (" + ",".join("?" for _ in symbol_filter) + ")"
+            parameters.extend(symbol_filter)
+        parameters.append(limit + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "ingested_at, payload_json FROM (SELECT *, ROW_NUMBER() OVER "
+                "(PARTITION BY symbol ORDER BY ingested_at DESC, source ASC) AS selected "
+                "FROM market_price_bar WHERE interval = ? AND adjustment = ? "
+                "AND timestamp = ?" + filters + ") WHERE selected = 1 "
+                "ORDER BY symbol ASC LIMIT ?",
+                parameters,
+            )
+        truncated = len(rows) > limit
+        result = []
+        for row in rows[:limit]:
+            payload = row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            row["bar_at"] = self._utc_iso(row["bar_at"])
+            row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            row["source_payload"] = json.loads(payload) if payload else {}
+            result.append(row)
+        return result, truncated
+
+    def get_price_bars_cross_section_page(
+        self, interval: str, adjustment: str, bar_at: str, page_size: int,
+        symbols: Optional[Sequence[str]] = None, after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("cross-section page_size must be between 1 and 5000")
+        point, _ = self._utc_range(bar_at, bar_at)
+        symbol_filter = None if symbols is None else sorted(set(symbols))
+        if symbol_filter is not None and len(symbol_filter) > 5000:
+            raise ValueError("cross-section symbols must contain at most 5000 values")
+        if symbol_filter == []:
+            return [], False
+        filters = ""
+        parameters: List[Any] = list(self.canonical_source_priority)
+        parameters.extend([interval, adjustment, int(point.timestamp())])
+        if symbol_filter is not None:
+            filters += " AND symbol IN (" + ",".join("?" for _ in symbol_filter) + ")"
+            parameters.extend(symbol_filter)
+        if after is not None:
+            filters += " AND symbol > ?"
+            parameters.append(after)
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY " +
+                priority_sql + " ASC, CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) "
+                "AS selected FROM market_price_bar WHERE interval = ? "
+                "AND adjustment = ? AND timestamp = ?" + filters +
+                ") WHERE selected = 1 ORDER BY symbol ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        result = []
+        for row in rows[:page_size]:
+            row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            row["bar_at"] = self._utc_iso(row["bar_at"])
+            row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            observed_at = row.pop("observed_at")
+            raw_artifact_id = row.pop("raw_artifact_id")
+            row["source_payload"] = canonical_page_payload(
+                row["source"], observed_at, raw_artifact_id
+            )
+            result.append(row)
+        return result, has_more
+
+    def get_price_bars_matrix_page(
+        self, interval: str, adjustment: str, bar_ats: Sequence[str],
+        symbols: Sequence[str], page_size: int,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("matrix page_size must be between 1 and 5000")
+        points = sorted({
+            int(self._utc_range(value, value)[0].timestamp()) for value in bar_ats
+        })
+        symbol_filter = sorted({str(value).strip() for value in symbols if str(value).strip()})
+        if not 1 <= len(points) <= 100:
+            raise ValueError("matrix bar_ats must contain between 1 and 100 values")
+        if not 1 <= len(symbol_filter) <= 1000:
+            raise ValueError("matrix symbols must contain between 1 and 1000 values")
+        if len(points) * len(symbol_filter) > 100_000:
+            raise ValueError("matrix request must contain at most 100000 cells")
+        filters = (
+            "timestamp IN (" + ",".join("?" for _ in points) + ") AND symbol IN (" +
+            ",".join("?" for _ in symbol_filter) + ")"
+        )
+        parameters: List[Any] = list(self.canonical_source_priority)
+        parameters.extend([interval, adjustment, *points, *symbol_filter])
+        if after is not None:
+            filters += " AND (timestamp > ? OR (timestamp = ? AND symbol > ?))"
+            parameters.extend([after[0], after[0], after[1]])
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER (PARTITION BY timestamp, symbol ORDER BY " +
+                priority_sql + " ASC, CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) "
+                "AS selected FROM market_price_bar WHERE interval = ? "
+                "AND adjustment = ? AND " + filters +
+                ") WHERE selected = 1 ORDER BY timestamp ASC, symbol ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        result = []
+        for row in rows[:page_size]:
+            row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            row["bar_at"] = self._utc_iso(row["bar_at"])
+            row["ingested_at"] = self._utc_iso(row["ingested_at"])
+            observed_at = row.pop("observed_at")
+            raw_artifact_id = row.pop("raw_artifact_id")
+            row["source_payload"] = canonical_page_payload(
+                row["source"], observed_at, raw_artifact_id
+            )
+            result.append(row)
+        return result, has_more
+
+    def get_price_bar_as_of(
+        self, symbol: str, interval: str, adjustment: str,
+        as_of: str, max_lookback_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not 1 <= max_lookback_seconds <= 31_536_000:
+            raise ValueError("max_lookback_seconds must be between 1 and 31536000")
+        point, _ = self._utc_range(as_of, as_of)
+        point_epoch = int(point.timestamp())
+        lower_epoch = point_epoch - max_lookback_seconds
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters: List[Any] = list(self.canonical_source_priority)
+        parameters.extend([
+            symbol, interval, adjustment, lower_epoch, point_epoch,
+        ])
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER (ORDER BY timestamp DESC, " +
+                priority_sql + " ASC, CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) "
+                "AS selected FROM market_price_bar WHERE symbol = ? AND interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?) "
+                "WHERE selected = 1 LIMIT 1",
+                parameters,
+            )
+        if not rows:
+            return None
+        return with_effective_time(self._canonical_duckdb_row(rows[0]), point)
+
+    def get_price_bars_as_of_page(
+        self, interval: str, adjustment: str, as_of: str,
+        max_lookback_seconds: int, symbols: Sequence[str], page_size: int,
+        after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= max_lookback_seconds <= 31_536_000:
+            raise ValueError("max_lookback_seconds must be between 1 and 31536000")
+        if not 1 <= page_size <= 1000:
+            raise ValueError("as-of page_size must be between 1 and 1000")
+        point, _ = self._utc_range(as_of, as_of)
+        point_epoch = int(point.timestamp())
+        lower_epoch = point_epoch - max_lookback_seconds
+        symbol_filter = sorted({str(value).strip() for value in symbols if str(value).strip()})
+        if not 1 <= len(symbol_filter) <= 1000:
+            raise ValueError("as-of symbols must contain between 1 and 1000 values")
+        filters = "symbol IN (" + ",".join("?" for _ in symbol_filter) + ")"
+        parameters: List[Any] = list(self.canonical_source_priority)
+        parameters.extend([
+            interval, adjustment, lower_epoch, point_epoch, *symbol_filter,
+        ])
+        if after is not None:
+            filters += " AND symbol > ?"
+            parameters.append(after)
+        priority_sql = "CASE source " + " ".join(
+            f"WHEN ? THEN {index}" for index, _ in enumerate(
+                self.canonical_source_priority
+            )
+        ) + f" ELSE {len(self.canonical_source_priority)} END"
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "observed_at, ingested_at, raw_artifact_id, payload_json FROM "
+                "(SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY "
+                "timestamp DESC, " + priority_sql +
+                " ASC, CAST(observed_at AS TIMESTAMPTZ) DESC, "
+                "CAST(ingested_at AS TIMESTAMPTZ) DESC, source ASC, "
+                "COALESCE(raw_artifact_id, '') ASC, COALESCE(source_sequence, '') ASC) "
+                "AS selected FROM market_price_bar WHERE interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ? AND " +
+                filters + ") WHERE selected = 1 ORDER BY symbol ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        return [with_effective_time(self._canonical_duckdb_row(row), point)
+                for row in rows[:page_size]], has_more
+
+    def _canonical_duckdb_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row.pop("payload_json", None)
+        row["timestamp"] = int(row["timestamp"])
+        row["bar_at"] = self._utc_iso(row["bar_at"])
+        row["ingested_at"] = self._utc_iso(row["ingested_at"])
+        observed_at = row.pop("observed_at")
+        raw_artifact_id = row.pop("raw_artifact_id")
+        row["source_payload"] = canonical_page_payload(
+            row["source"], observed_at, raw_artifact_id
+        )
+        return row
+
+    def get_raw_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+        sources: Optional[Sequence[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= limit <= 5000:
+            raise ValueError("raw history limit must be between 1 and 5000")
+        start_at, end_at = self._utc_range(start, end)
+        source_filter = None if sources is None else sorted({
+            str(value).strip() for value in sources if str(value).strip()
+        })
+        if source_filter is not None and len(source_filter) > 100:
+            raise ValueError("raw history sources must contain at most 100 values")
+        if source_filter == []:
+            return [], False
+        filters = ""
+        parameters: List[Any] = [
+            symbol, interval, adjustment, int(start_at.timestamp()), int(end_at.timestamp())
+        ]
+        if source_filter is not None:
+            filters = " AND source IN (" + ",".join("?" for _ in source_filter) + ")"
+            parameters.extend(source_filter)
+        parameters.append(limit + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "source_sequence, observed_at, ingested_at, raw_artifact_id, payload_json "
+                "FROM market_price_bar WHERE symbol = ? AND interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?" + filters +
+                " ORDER BY timestamp ASC, source ASC LIMIT ?",
+                parameters,
+            )
+        truncated = len(rows) > limit
+        result = []
+        for row in rows[:limit]:
+            payload = row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            for field in ("bar_at", "observed_at", "ingested_at"):
+                row[field] = self._utc_iso(row[field])
+            row["source_payload"] = json.loads(payload) if payload else {}
+            result.append(row)
+        return result, truncated
+
+    def get_raw_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int,
+        sources: Optional[Sequence[str]] = None,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not 1 <= page_size <= 5000:
+            raise ValueError("raw history page_size must be between 1 and 5000")
+        start_at, end_at = self._utc_range(start, end)
+        source_filter = None if sources is None else sorted({
+            str(value).strip() for value in sources if str(value).strip()
+        })
+        if source_filter is not None and len(source_filter) > 100:
+            raise ValueError("raw history sources must contain at most 100 values")
+        if source_filter == []:
+            return [], False
+        filters = ""
+        parameters: List[Any] = [
+            symbol, interval, adjustment, int(start_at.timestamp()), int(end_at.timestamp())
+        ]
+        if source_filter is not None:
+            filters += " AND source IN (" + ",".join("?" for _ in source_filter) + ")"
+            parameters.extend(source_filter)
+        if after is not None:
+            filters += " AND (timestamp > ? OR (timestamp = ? AND source > ?))"
+            parameters.extend([after[0], after[0], after[1]])
+        parameters.append(page_size + 1)
+        with self._lock, self.connect() as con:
+            rows = self._rows(
+                con,
+                "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, "
+                "low, close, raw_close, adjustment_factor, volume, amount, source, "
+                "source_sequence, observed_at, ingested_at, raw_artifact_id, payload_json "
+                "FROM market_price_bar WHERE symbol = ? AND interval = ? "
+                "AND adjustment = ? AND timestamp >= ? AND timestamp <= ?" + filters +
+                " ORDER BY timestamp ASC, source ASC LIMIT ?",
+                parameters,
+            )
+        has_more = len(rows) > page_size
+        result = []
+        for row in rows[:page_size]:
+            row.pop("payload_json", None)
+            row["timestamp"] = int(row["timestamp"])
+            for field in ("bar_at", "observed_at", "ingested_at"):
+                row[field] = self._utc_iso(row[field])
+            # ClickHouse raw storage intentionally preserves the normalized
+            # provenance contract rather than the provider-specific payload.
+            # Keep paginated fallback pages byte-for-byte equivalent.
+            row["source_payload"] = {}
+            result.append(row)
+        return result, has_more
+
+    def get_price_bars_for_reconciliation(
+        self, symbol: str, interval: str, adjustment: str, source: str,
+        timestamps: Sequence[int],
+    ) -> List[Dict[str, Any]]:
+        if not timestamps:
+            return []
+        placeholders = ",".join("?" for _ in timestamps)
+        query = (
+            "SELECT symbol, interval, adjustment, timestamp, bar_at, open, high, low, "
+            "close, volume, amount, source, ingested_at, observed_at, raw_artifact_id "
+            "FROM market_price_bar WHERE symbol=? AND interval=? AND adjustment=? "
+            "AND source=? AND timestamp IN (" + placeholders + ") ORDER BY timestamp"
+        )
+        with self._lock, self.connect() as con:
+            return self._rows(
+                con, query, [symbol, interval, adjustment, source, *timestamps]
+            )
 
     @staticmethod
     def _calendar_payload(row: Dict[str, Any]) -> Dict[str, Any]:

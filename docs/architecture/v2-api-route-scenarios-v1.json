@@ -1,0 +1,855 @@
+{
+  "captures": {
+    "GET /v1/admin/artifacts": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/artifacts",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/admin/jobs": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/admin/jobs",
+        "query": {}
+      },
+      "shape": {
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/earnings-calendar": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/earnings-calendar",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "events": {
+          "items": null,
+          "type": "array"
+        },
+        "filter_timezone": "string",
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/economic-calendar": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-calendar",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "events": {
+          "items": null,
+          "type": "array"
+        },
+        "filter_timezone": "string",
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/economic-indicators": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/economic-indicators",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "indicators": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/financials/{symbol}/statements": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/financials/AAPL/statements",
+        "query": {}
+      },
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "point_in_time": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/fundamentals": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals",
+        "query": {}
+      },
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "limit": "integer",
+        "offset": "integer",
+        "point_in_time": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/fundamentals/{symbol}": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL",
+        "query": {}
+      },
+      "shape": {
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/fundamentals/{symbol}/history": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/fundamentals/AAPL/history",
+        "query": {}
+      },
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "point_in_time": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/funnel/metrics": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/funnel/metrics",
+        "query": {}
+      },
+      "shape": {
+        "as_of": "null",
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "limit": "integer",
+        "offset": "integer",
+        "point_in_time": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/health": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/health",
+        "query": {}
+      },
+      "shape": {
+        "database": "string",
+        "metadata_backend": "string",
+        "profile": "string",
+        "status": "string",
+        "storage_health": {
+          "backend": "string",
+          "candidate_since_monotonic": "null",
+          "candidate_status": "null",
+          "components": {
+            "authoritative_wal": {
+              "status": "string"
+            },
+            "canonical_scheduler": {
+              "status": "string"
+            },
+            "clickhouse_main": {
+              "logical_id": "string",
+              "status": "string"
+            },
+            "clickhouse_pressure": {
+              "disk_used_ratio": "number",
+              "merge_queue": "integer",
+              "status": "string"
+            },
+            "clickhouse_scheduler": {
+              "status": "string"
+            },
+            "postgresql": {
+              "logical_id": "string",
+              "status": "string"
+            }
+          },
+          "observed_at": "string",
+          "ready": "boolean",
+          "reasons": {
+            "items": null,
+            "type": "array"
+          },
+          "schema": "string",
+          "status": "string",
+          "thresholds": {
+            "canonical_failed_unavailable_items": "number",
+            "canonical_lag_degraded_seconds": "number",
+            "canonical_pending_degraded_items": "number",
+            "degrade_after_seconds": "number",
+            "disk_degraded_ratio": "number",
+            "disk_unavailable_ratio": "number",
+            "merge_degraded_items": "number",
+            "merge_unavailable_items": "number",
+            "recover_after_seconds": "number",
+            "unavailable_after_seconds": "number",
+            "wal_failed_degraded_items": "number",
+            "wal_lag_degraded_seconds": "number",
+            "wal_pending_degraded_items": "number",
+            "wal_quarantine_unavailable_items": "number"
+          },
+          "window": {
+            "kind": "string",
+            "process_local": "boolean"
+          }
+        },
+        "version": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/instruments/search": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/instruments/search",
+        "query": {
+          "q": "AAPL"
+        }
+      },
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/quotes": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes",
+        "query": {
+          "symbols": "AAPL"
+        }
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/cross-section": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/cross-section",
+        "query": {
+          "bar_at": "2026-01-02T00:00:00Z"
+        }
+      },
+      "shape": {
+        "adjustment": "string",
+        "bar_at": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "truncated": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/cross-section/as-of": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/cross-section/as-of",
+        "query": {
+          "as_of": "2026-01-02T00:00:00Z",
+          "symbols": "AAPL"
+        }
+      },
+      "shape": {
+        "adjustment": "string",
+        "as_of": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "max_lookback_seconds": "integer",
+        "max_staleness_seconds": "null",
+        "newest_ingested_at": "null",
+        "next_cursor": "null",
+        "page_size": "integer",
+        "served_at": "string",
+        "symbols": {
+          "items": "string",
+          "type": "array"
+        },
+        "truncated": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/cross-section/matrix": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/cross-section/matrix",
+        "query": {
+          "bar_ats": "2026-01-02T00:00:00Z",
+          "symbols": "AAPL"
+        }
+      },
+      "shape": {
+        "adjustment": "string",
+        "bar_ats": {
+          "items": "string",
+          "type": "array"
+        },
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "matrix_cells": "integer",
+        "newest_ingested_at": "null",
+        "next_cursor": "null",
+        "page_size": "integer",
+        "served_at": "string",
+        "symbols": {
+          "items": "string",
+          "type": "array"
+        },
+        "truncated": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL",
+        "query": {}
+      },
+      "shape": {
+        "close": "number",
+        "refresh_seen": "boolean",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}/as-of": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL/as-of",
+        "query": {
+          "as_of": "2026-01-02T00:00:00Z"
+        }
+      },
+      "shape": {
+        "adjustment": "string",
+        "as_of": "string",
+        "bar": "null",
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "max_lookback_seconds": "integer",
+        "max_staleness_seconds": "null",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}/history": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL/history",
+        "query": {}
+      },
+      "shape": {
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/quotes/{symbol}/raw-history": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/quotes/AAPL/raw-history",
+        "query": {
+          "end": "2026-01-02T00:00:00Z",
+          "start": "2026-01-01T00:00:00Z"
+        }
+      },
+      "shape": {
+        "adjustment": "string",
+        "bars": {
+          "items": null,
+          "type": "array"
+        },
+        "cache_age_seconds": "null",
+        "cache_freshness_seconds": "integer",
+        "cache_status": "string",
+        "cached": "boolean",
+        "count": "integer",
+        "end": "string",
+        "interval": "string",
+        "newest_ingested_at": "null",
+        "served_at": "string",
+        "start": "string",
+        "symbol": "string",
+        "truncated": "boolean"
+      },
+      "status": 200
+    },
+    "GET /v1/readiness": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/readiness",
+        "query": {}
+      },
+      "shape": {
+        "backend": "string",
+        "candidate_since_monotonic": "null",
+        "candidate_status": "null",
+        "components": {
+          "authoritative_wal": {
+            "status": "string"
+          },
+          "canonical_scheduler": {
+            "status": "string"
+          },
+          "clickhouse_main": {
+            "logical_id": "string",
+            "status": "string"
+          },
+          "clickhouse_pressure": {
+            "disk_used_ratio": "number",
+            "merge_queue": "integer",
+            "status": "string"
+          },
+          "clickhouse_scheduler": {
+            "status": "string"
+          },
+          "postgresql": {
+            "logical_id": "string",
+            "status": "string"
+          }
+        },
+        "observed_at": "string",
+        "ready": "boolean",
+        "reasons": {
+          "items": null,
+          "type": "array"
+        },
+        "schema": "string",
+        "status": "string",
+        "thresholds": {
+          "canonical_failed_unavailable_items": "number",
+          "canonical_lag_degraded_seconds": "number",
+          "canonical_pending_degraded_items": "number",
+          "degrade_after_seconds": "number",
+          "disk_degraded_ratio": "number",
+          "disk_unavailable_ratio": "number",
+          "merge_degraded_items": "number",
+          "merge_unavailable_items": "number",
+          "recover_after_seconds": "number",
+          "unavailable_after_seconds": "number",
+          "wal_failed_degraded_items": "number",
+          "wal_lag_degraded_seconds": "number",
+          "wal_pending_degraded_items": "number",
+          "wal_quarantine_unavailable_items": "number"
+        },
+        "window": {
+          "kind": "string",
+          "process_local": "boolean"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/snapshot": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/snapshot",
+        "query": {}
+      },
+      "shape": {
+        "from": "string",
+        "past_events_excluded": "boolean",
+        "to": "string"
+      },
+      "status": 200
+    },
+    "GET /v1/sources/health": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/sources/health",
+        "query": {}
+      },
+      "shape": {
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/sources/tdx/coverage": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/sources/tdx/coverage",
+        "query": {}
+      },
+      "shape": {
+        "periods": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "GET /v1/validation/{symbol}": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "shape": {},
+      "status": 200
+    },
+    "GET /v1/validation/{symbol}/results": {
+      "request": {
+        "json": null,
+        "method": "GET",
+        "path": "/v1/validation/AAPL/results",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "report_period": "string",
+        "symbol": "string"
+      },
+      "status": 200
+    },
+    "POST /v1/admin/artifacts/backfill": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/artifacts/backfill",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/baostock/{symbol}/refresh": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/baostock/AAPL/refresh",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/earnings-calendar/refresh": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/earnings-calendar/refresh",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/economic-calendar/refresh": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/economic-calendar/refresh",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/economic-indicators/refresh": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/economic-indicators/refresh",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/financials/{symbol}/refresh": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/financials/AAPL/refresh",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/fundamentals/refresh": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/fundamentals/refresh",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/funnel/metrics/rebuild": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/funnel/metrics/rebuild",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/tdx/financials/sync": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/tdx/financials/sync",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/admin/validation/rebuild": {
+      "request": {
+        "json": null,
+        "method": "POST",
+        "path": "/v1/admin/validation/rebuild",
+        "query": {
+          "report_period": "20241231"
+        }
+      },
+      "shape": {},
+      "status": 200
+    },
+    "POST /v1/market-bars/query": {
+      "request": {
+        "json": {
+          "adjustment": "adjusted",
+          "interval": "1d",
+          "range": "1y",
+          "refresh": false,
+          "symbols": [
+            "AAPL"
+          ]
+        },
+        "method": "POST",
+        "path": "/v1/market-bars/query",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "adjustment": "string",
+            "bars": {
+              "items": null,
+              "type": "array"
+            },
+            "cache_age_seconds": "null",
+            "cache_freshness_seconds": "integer",
+            "cache_status": "string",
+            "cached": "boolean",
+            "count": "integer",
+            "interval": "string",
+            "newest_ingested_at": "null",
+            "served_at": "string",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "routing": {
+          "allow_fallback": "boolean",
+          "provider_requested": "null"
+        }
+      },
+      "status": 200
+    },
+    "POST /v1/quotes/query": {
+      "request": {
+        "json": {
+          "refresh": false,
+          "symbols": [
+            "AAPL"
+          ]
+        },
+        "method": "POST",
+        "path": "/v1/quotes/query",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "POST /v1/tushare/realtime-quote": {
+      "request": {
+        "json": {
+          "ts_code": "AAPL"
+        },
+        "method": "POST",
+        "path": "/v1/tushare/realtime-quote",
+        "query": {}
+      },
+      "shape": {
+        "count": "integer",
+        "items": {
+          "items": null,
+          "type": "array"
+        },
+        "source": "string"
+      },
+      "status": 200
+    },
+    "POST /v1/tushare/{api_name}": {
+      "request": {
+        "json": {
+          "fields": "",
+          "params": {}
+        },
+        "method": "POST",
+        "path": "/v1/tushare/daily",
+        "query": {}
+      },
+      "shape": {},
+      "status": 200
+    }
+  },
+  "schema": "marketcow.old-main-api-contract.v1.route-scenarios",
+  "sha256": "a4c4293be098cb2d9f34974c74a478c661f912a39b614b73fbcf423ea93d937d"
+}

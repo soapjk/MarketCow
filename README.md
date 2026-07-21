@@ -307,6 +307,7 @@ uv pip check
 - [初始架构](docs/architecture/initial-architecture.md)
 - [ADR-001：本地优先、分层存储与统一 API](docs/decisions/ADR-001-local-first-data-platform.md)
 - [ADR-002：拆分事务型数据与大规模行情时序存储](docs/decisions/ADR-002-split-transactional-and-market-time-series-storage.md)
+- [Storage V2 开发交接](docs/development-handoff-storage-v2.md)
 - [实施路线](docs/roadmap.md)
 - [日历 API 契约](docs/calendar-api.md)
 

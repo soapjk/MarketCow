@@ -1,0 +1,117 @@
+{
+  "scenarios": {
+    "health": {
+      "semantic": {
+        "database": "filesystem_path"
+      },
+      "shape": {
+        "database": "string",
+        "profile": "string",
+        "status": "string",
+        "version": "string"
+      },
+      "status": 200
+    },
+    "history_invalid_parameter": {
+      "semantic": {},
+      "shape": {
+        "detail": "string"
+      },
+      "status": 502
+    },
+    "quotes_backend_failure": {
+      "semantic": {},
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": {
+            "error": "string",
+            "status": "string",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "quotes_batch_error": {
+      "semantic": {},
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": {
+            "error": "string",
+            "status": "string",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "quotes_default": {
+      "semantic": {
+        "refresh_seen": false
+      },
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": null,
+          "type": "array"
+        },
+        "items": {
+          "items": {
+            "close": "number",
+            "refresh_seen": "boolean",
+            "symbol": "string"
+          },
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "quotes_empty": {
+      "semantic": {},
+      "shape": {
+        "count": "integer",
+        "errors": {
+          "items": {
+            "error": "string",
+            "status": "string",
+            "symbol": "string"
+          },
+          "type": "array"
+        },
+        "items": {
+          "items": null,
+          "type": "array"
+        }
+      },
+      "status": 200
+    },
+    "quotes_missing_parameter": {
+      "semantic": {},
+      "shape": {
+        "detail": "string"
+      },
+      "status": 400
+    }
+  },
+  "schema": "marketcow.old-main-api-contract.v1.scenarios",
+  "capture_tool_version": "marketcow.api-compat-capture.v2",
+  "source_commit": "701ffbde1b25ae587845ea2bd021ca8fa12b93b4",
+  "generation_input": "isolated-deterministic-fixture:legacy-fixture-v1",
+  "sha256": "926219f0aba04098781587237c7a78ed1b10053f1e8107d2921a1ed3a553e091"
+}

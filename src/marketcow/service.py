@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,12 +24,20 @@ from .providers.baostock_provider import BaoStockProvider, optional_float
 from .providers.eastmoney import EastmoneySpotProvider
 from .providers.tdx_financial import TdxFinancialProvider
 from .providers.yahoo_quote import YahooQuoteProvider
+from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.instrument_search import InstrumentSearchProvider
 from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normalize_a_symbol
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
 from .providers.calendar import CalendarProvider
 from .providers.tushare_provider import TushareProvider
-from .storage import FUNDAMENTAL_COLUMNS, Warehouse
+from .repositories import Repositories
+from .domain_columns import FUNDAMENTAL_COLUMNS
+from .provider_routing import (
+    MARKET_BAR_HISTORY,
+    REALTIME_QUOTE,
+    ProviderUnavailable,
+    select_providers,
+)
 
 
 EASTMONEY_DATA_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
@@ -88,7 +97,8 @@ class FundamentalService:
     def __init__(
         self,
         settings: Settings,
-        warehouse: Optional[Warehouse] = None,
+        warehouse: Optional[Any] = None,
+        repositories: Optional[Repositories] = None,
         spot_provider: Optional[EastmoneySpotProvider] = None,
         financial_provider: Optional[AkshareFinancialProvider] = None,
         baostock_provider: Optional[BaoStockProvider] = None,
@@ -101,7 +111,41 @@ class FundamentalService:
         tushare_provider: Optional[TushareProvider] = None,
     ):
         self.settings = settings
-        self.warehouse = warehouse or Warehouse(settings.database_path)
+        self.warehouse = warehouse
+        self.repository_database = None
+        self.v2_resources = None
+        if repositories is None:
+            if settings.profile in {"v2-development", "v2-test"}:
+                from .artifact_store import LocalArtifactStore
+                from .v2_factory import create_v2_online_repositories
+                from .v2_market_bars import V2AuthoritativeMarketBarRepository
+
+                self.v2_resources = create_v2_online_repositories(settings)
+                market_bars = V2AuthoritativeMarketBarRepository(
+                    self.v2_resources.market_bars, self.v2_resources.writer,
+                    self.v2_resources.telemetry,
+                    self.v2_resources.canonical_scheduler,
+                )
+                repositories = Repositories(
+                    metadata=self.v2_resources.postgres,
+                    fundamentals=self.v2_resources.postgres,
+                    market_bars=market_bars,
+                    artifacts=LocalArtifactStore(self.v2_resources.postgres),
+                )
+            else:
+                legacy = importlib.import_module(
+                    ".legacy_service_factory", package=__package__
+                )
+                repositories, self.repository_database, self.warehouse = (
+                    legacy.create_legacy_service_repositories(
+                        settings, self.warehouse
+                    )
+                )
+        self.repositories = repositories
+        self.metadata_repository = self.repositories.metadata
+        self.fundamental_repository = self.repositories.fundamentals
+        self.market_bar_repository = self.repositories.market_bars
+        self.artifact_store = self.repositories.artifacts
         self.spot_provider = spot_provider or EastmoneySpotProvider()
         self.financial_provider = financial_provider or AkshareFinancialProvider()
         self.baostock_provider = baostock_provider or BaoStockProvider()
@@ -117,6 +161,12 @@ class FundamentalService:
             settings.tushare_token, settings.tushare_base_url,
             settings.tushare_realtime_url, settings.tushare_min_interval,
         )
+
+    def close(self) -> None:
+        if self.v2_resources is not None:
+            self.v2_resources.close()
+        if self.repository_database is not None:
+            self.repository_database.close()
 
     def _persist_tushare_response(
         self, api_name: str, params: Dict[str, Any], fields: str, result: Dict[str, Any]
@@ -135,7 +185,7 @@ class FundamentalService:
             ingested_at,
             {"api_name": api_name, "params": params, "fields": fields, "row_count": len(rows)},
         )
-        self.warehouse.save_tushare_response({
+        self.metadata_repository.save_tushare_response({
             "request_id": uuid.uuid4().hex, "api_name": api_name, "params": params,
             "requested_fields": fields, "response_fields": (result.get("data") or {}).get("fields") or [],
             "response_code": result.get("code"), "response_message": result.get("msg"),
@@ -148,7 +198,7 @@ class FundamentalService:
     def call_tushare(self, api_name: str, params: Dict[str, Any], fields: str = "") -> Dict[str, Any]:
         result = self.tushare_provider.call(api_name, params, fields)
         self._persist_tushare_response(api_name, params, fields, result)
-        self.warehouse.record_provider_health(self.tushare_provider.name, True, utc_now())
+        self.metadata_repository.record_provider_health(self.tushare_provider.name, True, utc_now())
         return result
 
     def tushare_realtime_quote(self, ts_code: str) -> List[Dict[str, Any]]:
@@ -180,13 +230,13 @@ class FundamentalService:
         artifact = self._persist_tushare_response("stk_mins", params, "", result)
         bars = self.tushare_provider.minute_bars(result)
         ingested_at = utc_now()
-        count = self.warehouse.upsert_price_bars(
+        count = self.market_bar_repository.upsert_price_bars(
             symbol, interval, "raw", self.tushare_provider.name, ingested_at, bars,
             {"source_url": self.tushare_provider.base_url + "/", "observed_at": ingested_at,
              "raw_response_locator": "data.items", "raw_path": artifact["storage_path"],
              "raw_artifact_id": artifact["artifact_id"]},
         )
-        self.warehouse.record_provider_health(self.tushare_provider.name, True, ingested_at)
+        self.metadata_repository.record_provider_health(self.tushare_provider.name, True, ingested_at)
         return {
             "symbol": symbol, "range": range_, "interval": interval, "adjustment": "raw",
             "source": self.tushare_provider.name, "source_url": self.tushare_provider.base_url + "/",
@@ -200,11 +250,11 @@ class FundamentalService:
 
     def _start_run(self, job_name: str, report_period: str = "") -> tuple[str, str]:
         run_id, started_at = uuid.uuid4().hex, utc_now()
-        self.warehouse.save_run([run_id, job_name, "running", report_period or None, started_at, None, 0, None])
+        self.metadata_repository.save_run([run_id, job_name, "running", report_period or None, started_at, None, 0, None])
         return run_id, started_at
 
     def _finish_run(self, run_id: str, job_name: str, started_at: str, report_period: str, row_count: int, error: str = "") -> None:
-        self.warehouse.save_run([
+        self.metadata_repository.save_run([
             run_id, job_name, "failed" if error else "success", report_period or None,
             started_at, utc_now(), row_count, error or None,
         ])
@@ -221,27 +271,10 @@ class FundamentalService:
         ingested_at: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        artifact_id = uuid.uuid4().hex
-        folder.mkdir(parents=True, exist_ok=True)
-        stamp = ingested_at.replace(":", "").replace("+", "_").replace(".", "")
-        path = folder / (dataset + "-" + stamp + "-" + artifact_id[:8] + ".json")
-        body = {
-            "artifact_id": artifact_id, "dataset": dataset, "source": source,
-            "source_url": source_url, "observed_at": observed_at,
-            "ingested_at": ingested_at, "raw_response_locator": raw_response_locator,
-            "metadata": metadata or {}, "payload": payload,
-        }
-        encoded = json.dumps(body, ensure_ascii=False, allow_nan=False, sort_keys=True).encode("utf-8")
-        path.write_bytes(encoded)
-        manifest = {
-            "artifact_id": artifact_id, "dataset": dataset, "source": source,
-            "source_url": source_url, "observed_at": observed_at,
-            "ingested_at": ingested_at, "raw_response_locator": raw_response_locator,
-            "storage_path": str(path), "sha256": hashlib.sha256(encoded).hexdigest(),
-            "byte_size": len(encoded), "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
-        }
-        self.warehouse.save_artifact(manifest)
-        return manifest
+        return self.artifact_store.write_json(
+            folder, dataset, payload, source, source_url, raw_response_locator,
+            observed_at, ingested_at, metadata,
+        )
 
     def _register_file_artifact(
         self, path: Path, dataset: str, source: str, source_url: str,
@@ -256,7 +289,7 @@ class FundamentalService:
             "sha256": hashlib.sha256(content).hexdigest(), "byte_size": len(content),
             "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
         }
-        self.warehouse.save_artifact(manifest)
+        self.artifact_store.save_artifact(manifest)
         return manifest
 
     def _save_quote_raw(self, symbol: str, dataset: str, payload: Dict[str, Any], ingested_at: str, source: str, source_url: str, locator: str) -> Dict[str, Any]:
@@ -264,41 +297,96 @@ class FundamentalService:
         folder = self.settings.raw_path / "quotes" / safe_symbol
         return self._write_artifact(folder, "quote_" + dataset, payload, source, source_url, locator, ingested_at, ingested_at, {"symbol": symbol})
 
+    @staticmethod
+    def _quote_market(symbol: str) -> tuple[str, str]:
+        try:
+            return "CN", normalize_a_symbol(symbol)
+        except ValueError:
+            normalized, market = normalize_yahoo_symbol(symbol)
+            return market, normalized
+
+    def _quote_provider(self, name: str) -> Any:
+        return {
+            "sina": self.sina_quote_provider,
+            "eastmoney": self.a_quote_provider,
+            "yahoo": self.quote_provider,
+            "tushare": self.tushare_provider,
+        }[name]
+
+    def _fetch_realtime_quote(self, provider_name: str, symbol: str) -> Dict[str, Any]:
+        provider = self._quote_provider(provider_name)
+        if provider_name != "tushare":
+            return provider.fetch_quote(symbol)
+        rows = json_safe(provider.realtime_quote(symbol))
+        if not rows:
+            raise RuntimeError("Tushare returned no realtime quote")
+        item = rows[0]
+        price = _number(item.get("PRICE"))
+        if price is None:
+            raise RuntimeError("Tushare returned no usable price")
+        previous_close = _number(item.get("PRE_CLOSE"))
+        code = symbol.split(".")[0]
+        date_value, time_value = item.get("DATE"), item.get("TIME")
+        quote_at = None
+        if date_value and time_value:
+            try:
+                quote_at = datetime.strptime(
+                    f"{date_value} {time_value}", "%Y%m%d %H:%M:%S"
+                ).replace(tzinfo=timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+            except ValueError:
+                pass
+        return {
+            "instrument_id": instrument_id(code), "symbol": symbol,
+            "name": item.get("NAME") or code, "market": "CN",
+            "exchange": exchange_for_symbol(code), "currency": "CNY",
+            "price": price, "previous_close": previous_close,
+            "change": None if previous_close is None else price - previous_close,
+            "change_pct": None if not previous_close else (price / previous_close - 1) * 100,
+            "session": "regular", "quote_at": quote_at, "price_adjustment": "raw",
+            "quality_status": "single_source_unverified", "source": "tushare",
+            "source_url": provider.realtime_url,
+            "raw_response_locator": "realtime_quote row", "_raw_payload": item,
+        }
+
     def refresh_quote(
-        self, symbol: str, stale_max_seconds: Optional[float] = None
+        self, symbol: str, provider: str | None = None, allow_fallback: bool = False,
+        stale_max_seconds: float | None = None,
     ) -> Dict[str, Any]:
         run_id, started_at = self._start_run("refresh_quote", symbol)
-        try:
-            a_symbol = normalize_a_symbol(symbol)
-        except ValueError:
-            a_symbol = None
-        providers = (
-            [self.sina_quote_provider, self.a_quote_provider]
-            if a_symbol
-            else [self.quote_provider]
+        market, normalized = self._quote_market(symbol)
+        priority = tuple(
+            {"sina_finance_hq": "sina", "eastmoney_quote_center": "eastmoney",
+             "yahoo_chart": "yahoo"}.get(item, item)
+            for item in self.settings.clickhouse_source_priority
         )
-        normalized = a_symbol or symbol
+        provider_names = select_providers(
+            REALTIME_QUOTE, market, provider, priority,
+            allow_fallback=allow_fallback if provider else True,
+        )
         row = None
         provider_errors = []
-        for provider in providers:
+        for provider_name in provider_names:
+            selected = self._quote_provider(provider_name)
+            if provider_name == "tushare" and not selected.configured:
+                if provider:
+                    provider_errors.append("tushare: provider is not configured")
+                continue
             try:
-                row = provider.fetch_quote(normalized)
-                self.warehouse.record_provider_health(getattr(provider, "name", provider.__class__.__name__), True, utc_now())
+                row = self._fetch_realtime_quote(provider_name, normalized)
+                self.metadata_repository.record_provider_health(provider_name, True, utc_now())
                 break
             except Exception as exc:
-                self.warehouse.record_provider_health(getattr(provider, "name", provider.__class__.__name__), False, utc_now(), str(exc))
-                provider_errors.append(f"{getattr(provider, 'name', provider.__class__.__name__)}: {exc}")
+                self.metadata_repository.record_provider_health(provider_name, False, utc_now(), str(exc))
+                provider_errors.append(f"{provider_name}: {exc}")
         if row is None:
-            cached = self.warehouse.get_latest_quotes([normalized])
+            cached = self.market_bar_repository.get_latest_quotes([normalized])
             if cached and (
                 stale_max_seconds is None
                 or self._quote_cache_age_seconds(cached[0]) <= stale_max_seconds
             ):
                 cached_row = cached[0]
                 cached_row.update({
-                    "is_cached": True,
-                    "cached": True,
-                    "stale": True,
+                    "is_cached": True, "cached": True, "stale": True,
                     "cache_status": "stale_fallback",
                     "cache_reason": "; ".join(provider_errors),
                     "served_at": utc_now(),
@@ -307,7 +395,9 @@ class FundamentalService:
                 return cached_row
             error = "; ".join(provider_errors) or "no quote provider available"
             self._finish_run(run_id, "refresh_quote", started_at, symbol, 0, error)
-            raise RuntimeError(error)
+            raise ProviderUnavailable(
+                error, provider=provider or "auto", capability=REALTIME_QUOTE, market=market
+            )
         raw_payload = row.pop("_raw_payload")
         ingested_at = utc_now()
         artifact = self._save_quote_raw(row["symbol"], "latest", raw_payload, ingested_at, row["source"], row["source_url"], row["raw_response_locator"])
@@ -316,12 +406,10 @@ class FundamentalService:
             "ingested_at": ingested_at,
             "raw_path": artifact["storage_path"],
             "raw_artifact_id": artifact["artifact_id"],
-            "is_cached": False,
-            "cached": False,
-            "stale": False,
+            "is_cached": False, "cached": False, "stale": False,
             "cache_status": "refreshed",
         })
-        self.warehouse.upsert_quote(row)
+        self.market_bar_repository.upsert_quote(row)
         self._finish_run(run_id, "refresh_quote", started_at, symbol, 1)
         return row
 
@@ -334,63 +422,89 @@ class FundamentalService:
             timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
             if timestamp.tzinfo is None:
                 timestamp = timestamp.replace(tzinfo=timezone.utc)
-            return max(0.0, (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds())
+            return max(
+                0.0,
+                (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds(),
+            )
         except (TypeError, ValueError):
             return float("inf")
 
-    def get_quote(self, symbol: str, force_refresh: bool = False) -> Dict[str, Any]:
-        cached = self.warehouse.get_latest_quotes([symbol])
+    def get_quote(
+        self, symbol: str, force_refresh: bool = False,
+        provider: str | None = None, allow_fallback: bool = False,
+    ) -> Dict[str, Any]:
+        cached = self.market_bar_repository.get_latest_quotes([symbol])
         cached_row = cached[0] if cached else None
         cache_age = self._quote_cache_age_seconds(cached_row) if cached_row else float("inf")
         if cached_row and not force_refresh and cache_age <= self.settings.quote_cache_ttl_seconds:
             cached_row.update({
-                "is_cached": True,
-                "cached": True,
-                "stale": False,
-                "cache_status": "fresh",
-                "cache_age_seconds": round(cache_age, 3),
+                "is_cached": True, "cached": True, "stale": False,
+                "cache_status": "fresh", "cache_age_seconds": round(cache_age, 3),
                 "served_at": utc_now(),
             })
             return cached_row
         try:
             return self.refresh_quote(
-                symbol, stale_max_seconds=self.settings.quote_stale_max_seconds
+                symbol, provider=provider, allow_fallback=allow_fallback,
+                stale_max_seconds=self.settings.quote_stale_max_seconds,
             )
         except Exception:
-            # refresh_quote already attempts a cache fallback; this guard primarily
-            # documents and enforces the maximum age if that behavior changes.
             if cached_row and cache_age <= self.settings.quote_stale_max_seconds:
                 cached_row.update({
-                    "is_cached": True,
-                    "cached": True,
-                    "stale": True,
+                    "is_cached": True, "cached": True, "stale": True,
                     "cache_status": "stale_fallback",
-                    "cache_age_seconds": round(cache_age, 3),
-                    "served_at": utc_now(),
+                    "cache_age_seconds": round(cache_age, 3), "served_at": utc_now(),
                 })
                 return cached_row
             raise
 
-    def refresh_quote_history(self, symbol: str, range_: str, interval: str, adjustment: str) -> Dict[str, Any]:
-        if interval in {"1m", "5m", "15m", "30m", "60m", "1h"} and symbol.endswith((".SH", ".SZ", ".BJ")):
-            return self.refresh_tushare_minute_history(symbol, range_, interval, adjustment)
+    def refresh_quote_history(
+        self, symbol: str, range_: str, interval: str, adjustment: str,
+        provider: str | None = None, allow_fallback: bool = False,
+    ) -> Dict[str, Any]:
+        market, normalized = self._quote_market(symbol)
+        priority = tuple(
+            {"yahoo_chart": "yahoo"}.get(item, item)
+            for item in self.settings.clickhouse_source_priority
+        )
+        names = select_providers(
+            MARKET_BAR_HISTORY, market, provider, priority,
+            allow_fallback=allow_fallback if provider else True,
+        )
+        errors: list[str] = []
+        for name in names:
+            if name == "tushare":
+                if not self.tushare_provider.configured:
+                    errors.append("tushare: provider is not configured")
+                    continue
+                if interval not in {"1m", "5m", "15m", "30m", "60m", "1h"}:
+                    errors.append("tushare: interval is not supported by this adapter")
+                    continue
+                return self.refresh_tushare_minute_history(normalized, range_, interval, adjustment)
+            if name == "yahoo":
+                break
+        else:
+            raise ProviderUnavailable(
+                "; ".join(errors) or "no history provider available",
+                provider=provider or "auto", capability=MARKET_BAR_HISTORY, market=market,
+            )
         run_id, started_at = self._start_run("refresh_quote_history", symbol)
         try:
-            result = self.quote_provider.fetch_history(symbol, range_, interval, adjustment)
+            result = self.quote_provider.fetch_history(normalized, range_, interval, adjustment)
         except Exception as exc:
             provider = getattr(self.quote_provider, "name", self.quote_provider.__class__.__name__)
-            self.warehouse.record_provider_health(provider, False, utc_now(), str(exc))
+            self.metadata_repository.record_provider_health(provider, False, utc_now(), str(exc))
             self._finish_run(run_id, "refresh_quote_history", started_at, symbol, 0, str(exc))
             raise
         raw_payload = result.pop("_raw_payload")
         ingested_at = utc_now()
         artifact = self._save_quote_raw(result["symbol"], "history-{0}-{1}-{2}".format(range_, interval, adjustment), raw_payload, ingested_at, result["source"], result["source_url"], result["raw_response_locator"])
-        count = self.warehouse.upsert_price_bars(
+        count = self.market_bar_repository.upsert_price_bars(
             result["symbol"], interval, adjustment, result["source"], ingested_at, result["bars"],
             {**result, "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"], "observed_at": ingested_at},
         )
         result.update({"count": count, "observed_at": ingested_at, "ingested_at": ingested_at, "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"]})
-        self.warehouse.record_provider_health(result["source"], True, ingested_at)
+        self.metadata_repository.record_provider_health(result["source"], True, ingested_at)
         self._finish_run(run_id, "refresh_quote_history", started_at, symbol, count)
         return result
 
@@ -435,12 +549,12 @@ class FundamentalService:
         try:
             rows = self.calendar_provider.fetch_economic_calendar(date_from, date_to, country)
             prepared = self._prepare_calendar_rows("economic_calendar", rows)
-            count = self.warehouse.upsert_economic_calendar(prepared)
-            self.warehouse.record_provider_health("economic_calendar", True, utc_now())
+            count = self.metadata_repository.upsert_economic_calendar(prepared)
+            self.metadata_repository.record_provider_health("economic_calendar", True, utc_now())
             self._finish_run(run_id, job_name, started_at, date_from + ":" + date_to, count)
             return {"status": "success", "saved": count, "events": prepared}
         except Exception as exc:
-            self.warehouse.record_provider_health("economic_calendar", False, utc_now(), str(exc))
+            self.metadata_repository.record_provider_health("economic_calendar", False, utc_now(), str(exc))
             self._finish_run(run_id, job_name, started_at, date_from + ":" + date_to, 0, str(exc))
             raise
 
@@ -450,12 +564,12 @@ class FundamentalService:
         try:
             rows = self.calendar_provider.fetch_economic_indicators()
             prepared = self._prepare_calendar_rows("economic_indicators", rows)
-            count = self.warehouse.upsert_economic_indicators(prepared)
-            self.warehouse.record_provider_health("economic_indicators", True, utc_now())
+            count = self.metadata_repository.upsert_economic_indicators(prepared)
+            self.metadata_repository.record_provider_health("economic_indicators", True, utc_now())
             self._finish_run(run_id, job_name, started_at, "", count)
             return {"status": "success", "saved": count, "indicators": prepared}
         except Exception as exc:
-            self.warehouse.record_provider_health("economic_indicators", False, utc_now(), str(exc))
+            self.metadata_repository.record_provider_health("economic_indicators", False, utc_now(), str(exc))
             self._finish_run(run_id, job_name, started_at, "", 0, str(exc))
             raise
 
@@ -467,12 +581,12 @@ class FundamentalService:
         try:
             rows = self.calendar_provider.fetch_earnings_calendar(date_from, date_to, market, symbols)
             prepared = self._prepare_calendar_rows("earnings_calendar", rows)
-            count = self.warehouse.upsert_earnings_calendar(prepared)
-            self.warehouse.record_provider_health("earnings_calendar", True, utc_now())
+            count = self.metadata_repository.upsert_earnings_calendar(prepared)
+            self.metadata_repository.record_provider_health("earnings_calendar", True, utc_now())
             self._finish_run(run_id, job_name, started_at, date_from + ":" + date_to, count)
             return {"status": "success", "saved": count, "events": prepared}
         except Exception as exc:
-            self.warehouse.record_provider_health("earnings_calendar", False, utc_now(), str(exc))
+            self.metadata_repository.record_provider_health("earnings_calendar", False, utc_now(), str(exc))
             self._finish_run(run_id, job_name, started_at, date_from + ":" + date_to, 0, str(exc))
             raise
 
@@ -482,9 +596,9 @@ class FundamentalService:
             "filter_timezone": "Asia/Shanghai",
             "date_format": "YYYY-MM-DD",
             "quotes": [],
-            "economic_calendar": self.warehouse.get_economic_calendar(date_from, date_to, limit=limit),
-            "economic_indicators": self.warehouse.get_economic_indicators(limit=limit),
-            "earnings_calendar": self.warehouse.get_earnings_calendar(date_from, date_to, limit=limit),
+            "economic_calendar": self.metadata_repository.get_economic_calendar(date_from, date_to, limit=limit),
+            "economic_indicators": self.metadata_repository.get_economic_indicators(limit=limit),
+            "earnings_calendar": self.metadata_repository.get_earnings_calendar(date_from, date_to, limit=limit),
         }
 
     def _save_raw(self, dataset: str, report_period: str, records: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -499,7 +613,7 @@ class FundamentalService:
         )
 
     def _load_raw(self, dataset: str, report_period: str) -> Optional[Dict[str, Any]]:
-        manifest = self.warehouse.latest_artifact("a_share_fundamentals_" + dataset, "report_period", report_period)
+        manifest = self.artifact_store.latest_artifact("a_share_fundamentals_" + dataset, "report_period", report_period)
         if manifest:
             try:
                 body = json.loads(Path(manifest["storage_path"]).read_text(encoding="utf-8"))
@@ -518,7 +632,7 @@ class FundamentalService:
         return artifact
 
     def backfill_legacy_artifacts(self) -> Dict[str, Any]:
-        existing = self.warehouse.artifact_paths()
+        existing = self.artifact_store.artifact_paths()
         candidates = list(self.settings.raw_path.rglob("*"))
         tdx_dir = self.settings.raw_path.parent / "tdx" / "financial"
         if tdx_dir.exists():
@@ -580,7 +694,7 @@ class FundamentalService:
                 "sha256": digest, "byte_size": len(content),
                 "metadata_json": json.dumps(metadata, ensure_ascii=False),
             })
-        count = self.warehouse.save_artifacts(rows)
+        count = self.artifact_store.save_artifacts(rows)
         return {"status": "success", "registered": count, "skipped": skipped}
 
     def refresh_market_fundamentals(
@@ -589,12 +703,12 @@ class FundamentalService:
         report_period = normalize_report_period(report_period or latest_broad_report_period())
         run_id = uuid.uuid4().hex
         started_at = utc_now()
-        self.warehouse.save_run(
+        self.metadata_repository.save_run(
             [run_id, "refresh_market_fundamentals", "running", report_period, started_at, None, 0, None]
         )
         try:
             frames = self.financial_provider.fetch_market_summaries(report_period)
-            self.warehouse.record_provider_health(getattr(self.financial_provider, "name", "akshare_eastmoney_financials"), True, utc_now())
+            self.metadata_repository.record_provider_health(getattr(self.financial_provider, "name", "akshare_eastmoney_financials"), True, utc_now())
             raw_records: Dict[str, List[Dict[str, Any]]] = {
                 name: [safe_record(item) for item in frame.to_dict("records")]
                 for name, frame in frames.items()
@@ -606,11 +720,11 @@ class FundamentalService:
             if include_valuation:
                 try:
                     valuations = self.spot_provider.fetch_all()
-                    self.warehouse.record_provider_health(getattr(self.spot_provider, "name", "eastmoney_quote_center"), True, utc_now())
+                    self.metadata_repository.record_provider_health(getattr(self.spot_provider, "name", "eastmoney_quote_center"), True, utc_now())
                     valuation_status = "fresh"
                     valuation_observed_at = utc_now()
                 except Exception as exc:
-                    self.warehouse.record_provider_health(getattr(self.spot_provider, "name", "eastmoney_quote_center"), False, utc_now(), str(exc))
+                    self.metadata_repository.record_provider_health(getattr(self.spot_provider, "name", "eastmoney_quote_center"), False, utc_now(), str(exc))
                     cached = self._load_raw("valuation", report_period)
                     if not cached:
                         raise
@@ -725,9 +839,9 @@ class FundamentalService:
                     "fetched_at": fetched_at,
                 }
                 rows.append({column: row.get(column) for column in FUNDAMENTAL_COLUMNS})
-            count = self.warehouse.replace_fundamentals(report_period, rows)
+            count = self.fundamental_repository.replace_fundamentals(report_period, rows)
             finished_at = utc_now()
-            self.warehouse.save_run(
+            self.metadata_repository.save_run(
                 [run_id, "refresh_market_fundamentals", "success", report_period, started_at, finished_at, count, None]
             )
             return {
@@ -743,8 +857,8 @@ class FundamentalService:
                 "finished_at": finished_at,
             }
         except Exception as exc:
-            self.warehouse.record_provider_health(getattr(self.financial_provider, "name", "akshare_eastmoney_financials"), False, utc_now(), str(exc))
-            self.warehouse.save_run(
+            self.metadata_repository.record_provider_health(getattr(self.financial_provider, "name", "akshare_eastmoney_financials"), False, utc_now(), str(exc))
+            self.metadata_repository.save_run(
                 [run_id, "refresh_market_fundamentals", "failed", report_period, started_at, utc_now(), 0, str(exc)]
             )
             raise
@@ -798,8 +912,8 @@ class FundamentalService:
                         "fetched_at": fetched_at,
                     }
                 )
-            counts[statement] = self.warehouse.replace_statement_rows(symbol, statement, rows)
-        self.warehouse.record_provider_health("akshare_eastmoney_financials", True, fetched_at)
+            counts[statement] = self.fundamental_repository.replace_statement_rows(symbol, statement, rows)
+        self.metadata_repository.record_provider_health("akshare_eastmoney_financials", True, fetched_at)
         self._finish_run(run_id, "refresh_company_statements", started_at, symbol, sum(counts.values()))
         return {"symbol": symbol, "source_symbol": source_symbol, "counts": counts, "fetched_at": fetched_at}
 
@@ -861,9 +975,9 @@ class FundamentalService:
             "raw_artifact_id": artifact["artifact_id"],
             "fetched_at": fetched_at,
         }
-        self.warehouse.upsert_baostock(row)
-        self.warehouse.record_provider_health("baostock", True, fetched_at)
-        self.warehouse.rebuild_funnel_metrics(utc_now())
+        self.fundamental_repository.upsert_baostock(row)
+        self.metadata_repository.record_provider_health("baostock", True, fetched_at)
+        self.fundamental_repository.rebuild_funnel_metrics(utc_now())
         self._finish_run(run_id, "refresh_baostock", started_at, report_period, 1)
         return {key: value for key, value in row.items() if key != "payload_json"}
 
@@ -896,7 +1010,7 @@ class FundamentalService:
                     "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"],
                     "fetched_at": ingested_at,
                 })
-            count = self.warehouse.replace_tdx_period(item["report_period"], rows)
+            count = self.fundamental_repository.replace_tdx_period(item["report_period"], rows)
             results.append(
                 {
                     "report_period": item["report_period"],
@@ -905,8 +1019,8 @@ class FundamentalService:
                     "filesize": item.get("filesize"),
                 }
             )
-        metric_count = self.warehouse.rebuild_funnel_metrics(utc_now())
-        self.warehouse.record_provider_health("tdx_financial_via_mootdx", True, utc_now())
+        metric_count = self.fundamental_repository.rebuild_funnel_metrics(utc_now())
+        self.metadata_repository.record_provider_health("tdx_financial_via_mootdx", True, utc_now())
         self._finish_run(run_id, "sync_tdx_financials", started_at, "", sum(item["row_count"] for item in results))
         return {
             "status": "success",
@@ -918,7 +1032,7 @@ class FundamentalService:
     def rebuild_funnel_metrics(self) -> Dict[str, Any]:
         run_id, started_at = self._start_run("rebuild_funnel_metrics")
         rebuilt_at = utc_now()
-        count = self.warehouse.rebuild_funnel_metrics(rebuilt_at)
+        count = self.fundamental_repository.rebuild_funnel_metrics(rebuilt_at)
         self._finish_run(run_id, "rebuild_funnel_metrics", started_at, "", count)
         return {"status": "success", "row_count": count, "rebuilt_at": rebuilt_at}
 
@@ -936,12 +1050,12 @@ class FundamentalService:
         symbol = "".join(ch for ch in str(symbol) if ch.isdigit()).zfill(6)
         report_period = normalize_report_period(report_period)
         run_id, started_at = self._start_run("validate_company", report_period)
-        eastmoney_rows = self.warehouse.query_fundamentals(
+        eastmoney_rows = self.fundamental_repository.query_fundamentals(
             symbol=symbol, report_period=report_period, limit=1, active_only=False
         )
         eastmoney = eastmoney_rows[0] if eastmoney_rows else None
-        baostock = self.warehouse.get_baostock(symbol, report_period)
-        tdx = self.warehouse.get_tdx(symbol, report_period)
+        baostock = self.fundamental_repository.get_baostock(symbol, report_period)
+        tdx = self.fundamental_repository.get_tdx(symbol, report_period)
         comparisons: Dict[str, Any] = {}
         pairs = {
             "roe_eastmoney_vs_baostock": (
@@ -993,8 +1107,8 @@ class FundamentalService:
                 "difference_pct": comparison["difference_pct"], "status": comparison["status"],
                 "observed_at": observed_at,
             })
-        self.warehouse.save_validation_results(validation_rows)
-        self.warehouse.rebuild_funnel_metrics(observed_at)
+        self.fundamental_repository.save_validation_results(validation_rows)
+        self.fundamental_repository.rebuild_funnel_metrics(observed_at)
         self._finish_run(run_id, "validate_company", started_at, report_period, len(validation_rows))
         return {
             "symbol": symbol,
@@ -1008,8 +1122,8 @@ class FundamentalService:
         report_period = normalize_report_period(report_period)
         run_id, started_at = self._start_run("rebuild_cached_validation", report_period)
         observed_at = utc_now()
-        count = self.warehouse.rebuild_validation_results(report_period, observed_at)
-        self.warehouse.rebuild_funnel_metrics(observed_at)
+        count = self.fundamental_repository.rebuild_validation_results(report_period, observed_at)
+        self.fundamental_repository.rebuild_funnel_metrics(observed_at)
         self._finish_run(run_id, "rebuild_cached_validation", started_at, report_period, count)
         return {
             "status": "success", "report_period": report_period,

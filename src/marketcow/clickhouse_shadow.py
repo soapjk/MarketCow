@@ -1,0 +1,625 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from functools import wraps
+from typing import Any, Callable, Dict, List, Optional, Sequence
+
+from .clickhouse_writer import ReliableClickHouseWriter, normalize_bar
+from .telemetry import telemetry_call, telemetry_elapsed
+
+
+def _market(symbol: str, provenance: Dict[str, Any]) -> str:
+    if provenance.get("market"):
+        return str(provenance["market"])
+    if symbol.endswith((".SH", ".SZ", ".BJ")):
+        return "CN"
+    if symbol.endswith(".HK"):
+        return "HK"
+    return "US"
+
+
+class ShadowMarketBarRepository:
+    """DuckDB-primary shadow adapter with an opt-in canonical history read."""
+
+    def __init__(self, primary: Any, writer: ReliableClickHouseWriter,
+                 canonical_builder: Any = None,
+                 canonical_reads_enabled: bool = False,
+                 raw_reads_enabled: bool = False,
+                 auto_canonical_enabled: bool = False,
+                 auto_canonical_limit: int = 50000,
+                 background_scheduler: Any = None) -> None:
+        self.primary = primary
+        self.writer = writer
+        self.canonical_builder = canonical_builder
+        self.canonical_reads_enabled = canonical_reads_enabled
+        self.raw_reads_enabled = raw_reads_enabled
+        self.auto_canonical_enabled = auto_canonical_enabled
+        self.auto_canonical_limit = auto_canonical_limit
+        self.background_scheduler = background_scheduler
+        self._last_auto_canonical: Dict[str, Any] = {"status": "disabled"}
+        if auto_canonical_enabled:
+            self.writer.on_raw_replayed = self._auto_rebuild_rows
+        elif background_scheduler is not None:
+            self.writer.on_raw_replayed = background_scheduler.enqueue_replayed_rows
+        self._last_batch: Optional[Dict[str, Any]] = None
+        self._last_shadow: Dict[str, Any] = {"status": "idle"}
+        self._last_reconciliation: Dict[str, Any] = {"status": "not_run"}
+        self._last_read: Dict[str, Any] = {
+            "backend": "duckdb", "fallback": False, "status": "not_run"
+        }
+
+    def upsert_quote(self, row: Dict[str, Any]) -> None:
+        self.primary.upsert_quote(row)
+
+    def get_latest_quotes(self, symbols: Sequence[str]) -> List[Dict[str, Any]]:
+        return self.primary.get_latest_quotes(symbols)
+
+    def get_price_bars(
+        self, symbol: str, interval: str, adjustment: str, limit: int
+    ) -> List[Dict[str, Any]]:
+        if not self.canonical_reads_enabled:
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok"
+            }
+            return self.primary.get_price_bars(symbol, interval, adjustment, limit)
+        try:
+            rows = self.writer.repository.get_canonical_price_bars(
+                symbol, interval, adjustment, limit
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows),
+            }
+            return rows
+        except Exception as error:
+            rows = self.primary.get_price_bars(symbol, interval, adjustment, limit)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "error": str(error)[:4000],
+            }
+            return rows
+
+    def get_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not self.canonical_reads_enabled:
+            rows, truncated = self.primary.get_price_bars_range(
+                symbol, interval, adjustment, start, end, limit
+            )
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": truncated, "range": True,
+            }
+            return rows, truncated
+        try:
+            rows, truncated = self.writer.repository.get_canonical_price_bars_range(
+                symbol, interval, adjustment, start, end, limit
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": truncated,
+                "range": True,
+            }
+            return rows, truncated
+        except Exception as error:
+            rows, truncated = self.primary.get_price_bars_range(
+                symbol, interval, adjustment, start, end, limit
+            )
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": truncated, "range": True, "error": str(error)[:4000],
+            }
+            return rows, truncated
+
+    def get_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int, after: Optional[int] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (symbol, interval, adjustment, start, end, page_size, after)
+        if not self.canonical_reads_enabled:
+            rows, has_more = self.primary.get_price_bars_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more, "keyset_page": True,
+            }
+            return rows, has_more
+        try:
+            rows, has_more = self.writer.repository.get_canonical_price_bars_page(
+                *arguments
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": has_more,
+                "keyset_page": True,
+            }
+            return rows, has_more
+        except Exception as error:
+            rows, has_more = self.primary.get_price_bars_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": has_more, "keyset_page": True,
+                "error": str(error)[:4000],
+            }
+            return rows, has_more
+    def get_price_bars_cross_section(
+        self, interval: str, adjustment: str, bar_at: str, limit: int,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        if not self.canonical_reads_enabled:
+            rows, truncated = self.primary.get_price_bars_cross_section(
+                interval, adjustment, bar_at, limit, symbols
+            )
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": truncated, "cross_section": True,
+            }
+            return rows, truncated
+        try:
+            rows, truncated = self.writer.repository.get_canonical_price_bars_cross_section(
+                interval, adjustment, bar_at, limit,
+                None if symbols is None else list(symbols),
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": truncated,
+                "cross_section": True,
+            }
+            return rows, truncated
+        except Exception as error:
+            rows, truncated = self.primary.get_price_bars_cross_section(
+                interval, adjustment, bar_at, limit, symbols
+            )
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": truncated, "cross_section": True,
+                "error": str(error)[:4000],
+            }
+            return rows, truncated
+
+    def get_price_bars_cross_section_page(
+        self, interval: str, adjustment: str, bar_at: str, page_size: int,
+        symbols: Optional[Sequence[str]] = None, after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (interval, adjustment, bar_at, page_size, symbols, after)
+        if not self.canonical_reads_enabled:
+            rows, has_more = self.primary.get_price_bars_cross_section_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more, "cross_section": True,
+                "keyset_page": True,
+            }
+            return rows, has_more
+        try:
+            rows, has_more = (
+                self.writer.repository.get_canonical_price_bars_cross_section_page(
+                    interval, adjustment, bar_at, page_size,
+                    None if symbols is None else list(symbols), after,
+                )
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": has_more,
+                "cross_section": True, "keyset_page": True,
+            }
+            return rows, has_more
+        except Exception as error:
+            rows, has_more = self.primary.get_price_bars_cross_section_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": has_more, "cross_section": True, "keyset_page": True,
+                "error": str(error)[:4000],
+            }
+            return rows, has_more
+
+    def get_price_bars_matrix_page(
+        self, interval: str, adjustment: str, bar_ats: Sequence[str],
+        symbols: Sequence[str], page_size: int,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (interval, adjustment, bar_ats, symbols, page_size, after)
+        if not self.canonical_reads_enabled:
+            rows, has_more = self.primary.get_price_bars_matrix_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more, "cross_section": True,
+                "matrix": True, "keyset_page": True,
+            }
+            return rows, has_more
+        try:
+            rows, has_more = self.writer.repository.get_canonical_price_bars_matrix_page(
+                interval, adjustment, list(bar_ats), list(symbols), page_size, after
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": has_more,
+                "cross_section": True, "matrix": True, "keyset_page": True,
+            }
+            return rows, has_more
+        except Exception as error:
+            rows, has_more = self.primary.get_price_bars_matrix_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": has_more, "cross_section": True, "matrix": True,
+                "keyset_page": True, "error": str(error)[:4000],
+            }
+            return rows, has_more
+
+    def get_price_bar_as_of(
+        self, symbol: str, interval: str, adjustment: str,
+        as_of: str, max_lookback_seconds: int,
+    ) -> Optional[Dict[str, Any]]:
+        arguments = (symbol, interval, adjustment, as_of, max_lookback_seconds)
+        if not self.canonical_reads_enabled:
+            row = self.primary.get_price_bar_as_of(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": 0 if row is None else 1, "as_of": True,
+            }
+            return row
+        try:
+            row = self.writer.repository.get_canonical_price_bar_as_of(*arguments)
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": 0 if row is None else 1, "as_of": True,
+            }
+            return row
+        except Exception as error:
+            row = self.primary.get_price_bar_as_of(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback",
+                "count": 0 if row is None else 1, "as_of": True,
+                "error": str(error)[:4000],
+            }
+            return row
+
+    def get_price_bars_as_of_page(
+        self, interval: str, adjustment: str, as_of: str,
+        max_lookback_seconds: int, symbols: Sequence[str], page_size: int,
+        after: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (
+            interval, adjustment, as_of, max_lookback_seconds,
+            symbols, page_size, after,
+        )
+        if not self.canonical_reads_enabled:
+            rows, has_more = self.primary.get_price_bars_as_of_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more, "as_of": True,
+                "keyset_page": True,
+            }
+            return rows, has_more
+        try:
+            rows, has_more = self.writer.repository.get_canonical_price_bars_as_of_page(
+                interval, adjustment, as_of, max_lookback_seconds,
+                list(symbols), page_size, after,
+            )
+            self._last_read = {
+                "backend": "clickhouse_canonical", "fallback": False,
+                "status": "ok", "count": len(rows), "truncated": has_more,
+                "as_of": True, "keyset_page": True,
+            }
+            return rows, has_more
+        except Exception as error:
+            rows, has_more = self.primary.get_price_bars_as_of_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_canonical",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": has_more, "as_of": True, "keyset_page": True,
+                "error": str(error)[:4000],
+            }
+            return rows, has_more
+    def get_raw_price_bars_range(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, limit: int,
+        sources: Optional[Sequence[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (symbol, interval, adjustment, start, end, limit, sources)
+        if not self.raw_reads_enabled:
+            rows, truncated = self.primary.get_raw_price_bars_range(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": truncated, "raw_multisource": True,
+            }
+            return rows, truncated
+        try:
+            rows, truncated = self.writer.repository.get_raw_price_bars_range(
+                symbol, interval, adjustment, start, end, limit,
+                None if sources is None else list(sources),
+            )
+            self._last_read = {
+                "backend": "clickhouse_raw", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": truncated, "raw_multisource": True,
+            }
+            return rows, truncated
+        except Exception as error:
+            rows, truncated = self.primary.get_raw_price_bars_range(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_raw",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": truncated, "raw_multisource": True,
+                "error": str(error)[:4000],
+            }
+            return rows, truncated
+
+    def get_raw_price_bars_page(
+        self, symbol: str, interval: str, adjustment: str,
+        start: str, end: str, page_size: int,
+        sources: Optional[Sequence[str]] = None,
+        after: Optional[tuple[int, str]] = None,
+    ) -> tuple[List[Dict[str, Any]], bool]:
+        arguments = (symbol, interval, adjustment, start, end, page_size, sources, after)
+        if not self.raw_reads_enabled:
+            rows, has_more = self.primary.get_raw_price_bars_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more,
+                "raw_multisource": True, "keyset_page": True,
+            }
+            return rows, has_more
+        try:
+            rows, has_more = self.writer.repository.get_raw_price_bars_page(
+                symbol, interval, adjustment, start, end, page_size,
+                None if sources is None else list(sources), after,
+            )
+            self._last_read = {
+                "backend": "clickhouse_raw", "fallback": False, "status": "ok",
+                "count": len(rows), "truncated": has_more,
+                "raw_multisource": True, "keyset_page": True,
+            }
+            return rows, has_more
+        except Exception as error:
+            rows, has_more = self.primary.get_raw_price_bars_page(*arguments)
+            self._last_read = {
+                "backend": "duckdb", "attempted_backend": "clickhouse_raw",
+                "fallback": True, "status": "fallback", "count": len(rows),
+                "truncated": has_more, "raw_multisource": True,
+                "keyset_page": True, "error": str(error)[:4000],
+            }
+            return rows, has_more
+    @staticmethod
+    def _raw_rows(
+        symbol: str, interval: str, adjustment: str, source: str,
+        ingested_at: str, bars: List[Dict[str, Any]], provenance: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        observed_at = provenance.get("observed_at") or ingested_at
+        return [normalize_bar("raw", {
+            "symbol": symbol, "market": _market(symbol, provenance),
+            "interval": interval, "adjustment": adjustment,
+            "bar_time": bar.get("bar_at") or datetime.fromtimestamp(
+                int(bar["timestamp"]), timezone.utc
+            ),
+            "open": bar.get("open"), "high": bar.get("high"), "low": bar.get("low"),
+            "close": bar.get("close"), "raw_close": bar.get("raw_close"),
+            "adjustment_factor": bar.get("adjustment_factor"),
+            "volume": bar.get("volume"),
+            "amount": bar.get("amount"), "source": source,
+            "source_sequence": str(bar.get("timestamp")),
+            "observed_at": observed_at, "ingested_at": ingested_at,
+            "raw_artifact_id": provenance.get("raw_artifact_id"),
+        }) for bar in bars]
+
+    def upsert_price_bars(
+        self, symbol: str, interval: str, adjustment: str, source: str,
+        ingested_at: str, bars: List[Dict[str, Any]],
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        provenance = provenance or {}
+        count = self.primary.upsert_price_bars(
+            symbol, interval, adjustment, source, ingested_at, bars, provenance
+        )
+        self._last_batch = None
+        try:
+            rows = self._raw_rows(
+                symbol, interval, adjustment, source, ingested_at, bars, provenance
+            )
+            result = self.writer.write("raw", rows)
+            self._last_batch = {
+                "symbol": symbol, "interval": interval, "adjustment": adjustment,
+                "source": source, "timestamps": [int(bar["timestamp"]) for bar in bars],
+                "bar_times": [row["bar_time"] for row in rows],
+            }
+            self._last_shadow = {"status": "ok" if not result["spooled"] else "spooled",
+                                 **result}
+            if self.auto_canonical_enabled and not result["spooled"]:
+                self._auto_rebuild_rows(rows)
+            elif self.background_scheduler is not None and not result["spooled"]:
+                enqueue = self.background_scheduler.enqueue_rows(rows)
+                self._last_auto_canonical = {"status": "queued", **enqueue}
+        except Exception as error:
+            self._last_shadow = {"status": "error", "error": str(error)[:4000]}
+        return count
+
+    @staticmethod
+    def _key(row: Dict[str, Any]) -> tuple[Any, ...]:
+        bar_time = row.get("bar_time") or row.get("bar_at")
+        if isinstance(bar_time, datetime):
+            if bar_time.tzinfo is None:
+                bar_time = bar_time.replace(tzinfo=timezone.utc)
+            bar_time = bar_time.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        else:
+            bar_time = str(bar_time).replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(bar_time)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            bar_time = parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        return (row["symbol"], row["interval"], row["adjustment"], bar_time, row["source"])
+
+    def reconcile_last_write(self, mismatch_limit: int = 100) -> Dict[str, Any]:
+        if not self._last_batch:
+            return {"status": "not_run", "reason": "no successful primary batch"}
+        if not 1 <= mismatch_limit <= 1000:
+            raise ValueError("mismatch limit must be between 1 and 1000")
+        batch = self._last_batch
+        try:
+            duck = self.primary.get_price_bars_for_reconciliation(
+                batch["symbol"], batch["interval"], batch["adjustment"],
+                batch["source"], batch["timestamps"],
+            )
+            click = self.writer.repository.query_raw_batch(
+                batch["symbol"], batch["interval"], batch["adjustment"],
+                batch["source"], batch["bar_times"],
+            )
+            duck_map = {self._key(row): row for row in duck}
+            click_map = {self._key(row): row for row in click}
+            keys = sorted(set(duck_map) | set(click_map))
+            mismatches = []
+            fields = ("open", "high", "low", "close", "volume", "amount")
+            for key in keys:
+                left, right = duck_map.get(key), click_map.get(key)
+                changed = [field for field in fields if left is None or right is None
+                           or left.get(field) != right.get(field)]
+                if changed and len(mismatches) < mismatch_limit:
+                    mismatches.append({"key": key, "fields": changed,
+                                       "duckdb": left, "clickhouse": right})
+            all_mismatch_count = sum(
+                1 for key in keys if duck_map.get(key) is None or click_map.get(key) is None
+                or any(duck_map[key].get(field) != click_map[key].get(field)
+                       for field in fields)
+            )
+            duck_times = [key[3] for key in duck_map]
+            click_times = [key[3] for key in click_map]
+            def utc_time(value: Any) -> datetime:
+                parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+                    str(value).replace("Z", "+00:00")
+                )
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+
+            duck_ingested = [utc_time(row["ingested_at"]) for row in duck
+                             if row.get("ingested_at")]
+            click_ingested = [utc_time(row["ingested_at"]) for row in click
+                              if row.get("ingested_at")]
+            lag = None
+            if duck_ingested and click_ingested:
+                lag = abs((max(duck_ingested) - max(click_ingested)).total_seconds())
+            result = {
+                "status": "consistent" if not all_mismatch_count else "mismatch",
+                "duckdb_count": len(duck_map), "clickhouse_count": len(click_map),
+                "duckdb_time_min": min(duck_times) if duck_times else None,
+                "duckdb_time_max": max(duck_times) if duck_times else None,
+                "clickhouse_time_min": min(click_times) if click_times else None,
+                "clickhouse_time_max": max(click_times) if click_times else None,
+                "ingestion_lag_seconds": lag,
+                "mismatch_count": all_mismatch_count, "mismatches": mismatches,
+                "mismatches_truncated": all_mismatch_count > len(mismatches),
+                "shadow": self._last_shadow,
+                "spool": self.writer.spool.diagnostics(),
+            }
+        except Exception as error:
+            result = {"status": "error", "error": str(error)[:4000],
+                      "shadow": self._last_shadow}
+        self._last_reconciliation = result
+        return result
+
+    def diagnostics(self) -> Dict[str, Any]:
+        result = {"shadow": self._last_shadow, "reconciliation": self._last_reconciliation,
+                "read": self._last_read, "auto_canonical": self._last_auto_canonical,
+                "canonical": (self.canonical_builder.last_diagnostics
+                              if self.canonical_builder else {"status": "disabled"}),
+                "spool": self.writer.spool.diagnostics(),
+                "replay_callback": getattr(
+                    self.writer, "last_replay_callback", {"status": "not_run"}
+                ), "background_scheduler": (
+                    self.background_scheduler.diagnostics()
+                    if self.background_scheduler else {"enabled": False}
+                )}
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is not None:
+            result["telemetry"] = telemetry_call(telemetry, "snapshot") or {
+                "schema": "unavailable"
+            }
+        return result
+
+    def rebuild_canonical(
+        self, symbol: str, interval: str, adjustment: str,
+        start: Any, end: Any, limit: int = 50000,
+    ) -> Dict[str, Any]:
+        if self.canonical_builder is None:
+            return {"status": "disabled", "written": 0, "spooled": 0}
+        return self.canonical_builder.rebuild(
+            symbol, interval, adjustment, start, end, limit
+        )
+
+    def _auto_rebuild_rows(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows or self.canonical_builder is None:
+            return
+        groups: Dict[tuple[str, str, str], List[str]] = {}
+        for row in rows:
+            groups.setdefault((row["symbol"], row["interval"], row["adjustment"]), []).append(row["bar_time"])
+        results = []
+        for (symbol, interval, adjustment), times in groups.items():
+            results.append(self.canonical_builder.rebuild(
+                symbol, interval, adjustment, min(times), max(times),
+                self.auto_canonical_limit,
+            ))
+        self._last_auto_canonical = {
+            "status": "ok" if all(r.get("status") == "ok" for r in results) else "fail_open",
+            "groups": len(results), "results": results[:100],
+        }
+
+
+def _telemetry_query(query: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorate(method: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(method)
+        def measured(self: ShadowMarketBarRepository, *args: Any, **kwargs: Any) -> Any:
+            telemetry = getattr(self, "telemetry", None)
+            started = telemetry_elapsed(telemetry)
+            try:
+                result = method(self, *args, **kwargs)
+            except Exception as error:
+                if telemetry is not None:
+                    backend = ("clickhouse_raw" if query == "raw" and self.raw_reads_enabled
+                               else "clickhouse_canonical" if self.canonical_reads_enabled
+                               else "duckdb")
+                    elapsed = telemetry_elapsed(telemetry, started)
+                    if elapsed is not None:
+                        telemetry_call(
+                            telemetry, "safe", "histogram", "query_latency_seconds",
+                            elapsed, backend=backend, query=query, outcome="error",
+                        )
+                    telemetry_call(telemetry, "log", "query", "error",
+                                   backend=backend, query=query, error=error)
+                raise
+            if telemetry is not None:
+                diagnostic = self._last_read
+                backend = diagnostic.get("backend", "duckdb")
+                outcome = "fallback" if diagnostic.get("fallback") else (
+                    "empty" if diagnostic.get("count") == 0 else "ok"
+                )
+                elapsed = telemetry_elapsed(telemetry, started)
+                if elapsed is not None:
+                    telemetry_call(
+                        telemetry, "safe", "histogram", "query_latency_seconds",
+                        elapsed, backend=backend, query=query, outcome=outcome,
+                    )
+                attempted = diagnostic.get("attempted_backend")
+                if diagnostic.get("fallback") and attempted:
+                    telemetry_call(
+                        telemetry, "safe", "counter", "backend_fallback_total",
+                        from_backend=attempted, to_backend="duckdb", query=query,
+                    )
+            return result
+        return measured
+    return decorate
+
+
+for _name, _query in {
+    "get_price_bars": "recent", "get_price_bars_range": "range",
+    "get_price_bars_page": "page", "get_price_bars_cross_section": "cross_section",
+    "get_price_bars_cross_section_page": "cross_section",
+    "get_price_bars_matrix_page": "matrix", "get_price_bar_as_of": "as_of",
+    "get_price_bars_as_of_page": "as_of", "get_raw_price_bars_range": "raw",
+    "get_raw_price_bars_page": "raw",
+}.items():
+    setattr(ShadowMarketBarRepository, _name,
+            _telemetry_query(_query)(getattr(ShadowMarketBarRepository, _name)))

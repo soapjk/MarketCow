@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
@@ -10,10 +10,14 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings
+from .market_bar_cursor import decode_cursor, encode_cursor, load_or_create_secret
 from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
+from .telemetry import sanitize_text, telemetry_call
+from .health import StorageHealthEvaluator, V2HealthEvaluator
+from .provider_routing import ProviderNotSupported, ProviderRoutingError
 
 
 class TushareRequest(BaseModel):
@@ -25,14 +29,108 @@ class TushareRealtimeRequest(BaseModel):
     ts_code: str
 
 
+class ProviderPolicy(BaseModel):
+    provider: Optional[str] = None
+    allow_fallback: bool = False
+
+
+class QuoteQuery(ProviderPolicy):
+    symbols: list[str] = Field(min_length=1, max_length=20)
+    refresh: bool = False
+
+
+class MarketBarQuery(ProviderPolicy):
+    symbols: list[str] = Field(min_length=1, max_length=20)
+    range: str = "1y"
+    interval: str = "1d"
+    adjustment: str = Field(default="adjusted", pattern="^(adjusted|raw)$")
+    refresh: bool = True
+    limit: int = Field(default=500, ge=1, le=5000)
+
+
 def create_app(
     settings: Optional[Settings] = None,
     service: Optional[FundamentalService] = None,
+    now_provider: Optional[Callable[[], datetime]] = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
     app.state.service = service
+    app.add_event_handler("shutdown", service.close)
+    clock = now_provider or (lambda: datetime.now(timezone.utc))
+    health_evaluator = StorageHealthEvaluator(wall_clock=clock)
+    v2_health_evaluator = V2HealthEvaluator(wall_clock=clock)
+
+    def storage_health() -> Dict[str, Any]:
+        if settings.profile in {"v2-development", "v2-test"}:
+            resources = getattr(service, "v2_resources", None)
+            try:
+                snapshot = resources.health_snapshot() if resources is not None else None
+            except Exception:
+                snapshot = None
+            return v2_health_evaluator.evaluate(snapshot)
+        repository = getattr(service, "market_bar_repository", None)
+        telemetry = getattr(repository, "telemetry", None)
+        snapshot = telemetry_call(telemetry, "snapshot")
+        return health_evaluator.evaluate(snapshot)
+
+    def database_identifier() -> str:
+        if settings.profile in {"v2-development", "v2-test"}:
+            return f"postgresql://{sanitize_text(settings.postgres_schema)}+clickhouse://{sanitize_text(settings.clickhouse_database)}"
+        if settings.database_path is None:
+            return "[REDACTED_PATH]"
+        try:
+            relative = settings.database_path.resolve().relative_to(
+                settings.storage_root.resolve()
+            )
+            return "storage://" + "/".join(sanitize_text(part) for part in relative.parts)
+        except (OSError, ValueError):
+            return "[REDACTED_PATH]"
+
+    def cache_metadata(
+        bars: list[Dict[str, Any]], fallback_ingested_at: Any = None,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        served = clock()
+        if served.tzinfo is None:
+            served = served.replace(tzinfo=timezone.utc)
+        served = served.astimezone(timezone.utc)
+        candidates = [row.get("ingested_at") for row in bars if row.get("ingested_at")]
+        if fallback_ingested_at:
+            candidates.append(fallback_ingested_at)
+        newest = None
+        for value in candidates:
+            parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            )
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.astimezone(timezone.utc)
+            newest = parsed if newest is None or parsed > newest else newest
+        age = None if newest is None else max(0.0, (served - newest).total_seconds())
+        status = "empty" if not bars else (
+            "fresh" if age is not None and
+            age <= settings.market_bar_cache_freshness_seconds else "stale"
+        )
+        result: Dict[str, Any] = {
+            "cache_status": status,
+            "newest_ingested_at": None if newest is None else newest.isoformat(),
+            "cache_age_seconds": age,
+            "served_at": served.isoformat(),
+            "cache_freshness_seconds": settings.market_bar_cache_freshness_seconds,
+        }
+        if reason:
+            result["cache_reason"] = reason[:1000]
+        repository = getattr(service, "market_bar_repository", None)
+        telemetry = getattr(repository, "telemetry", None)
+        if telemetry is not None:
+            telemetry_call(
+                telemetry, "safe",
+                "histogram", "cache_age_seconds", 0.0 if age is None else age,
+                status=status,
+            )
+        return result
 
     def parse_as_of(value: str) -> str:
         if not value:
@@ -63,10 +161,24 @@ def create_app(
             "status": "ok",
             "version": __version__,
             "profile": settings.profile,
-            "database": str(settings.database_path),
+            "database": database_identifier(),
+            "metadata_backend": settings.metadata_backend,
+            "storage_health": storage_health(),
         }
 
-    @app.post("/v1/tushare/realtime-quote")
+    @app.get("/v1/readiness")
+    def readiness():
+        result = storage_health()
+        if not result["ready"]:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=503, content=result)
+        return result
+
+    def provider_http_error(exc: ProviderRoutingError) -> HTTPException:
+        status = 422 if isinstance(exc, ProviderNotSupported) else 503
+        return HTTPException(status_code=status, detail=exc.detail())
+
+    @app.post("/v1/tushare/realtime-quote", deprecated=True)
     def tushare_realtime_quote(request: TushareRealtimeRequest):
         try:
             items = service.tushare_realtime_quote(request.ts_code)
@@ -76,7 +188,7 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    @app.post("/v1/tushare/{api_name}")
+    @app.post("/v1/tushare/{api_name}", deprecated=True)
     def tushare_call(api_name: str, request: TushareRequest):
         try:
             return service.call_tushare(api_name, request.params, request.fields)
@@ -95,7 +207,7 @@ def create_app(
         include_past: bool = False,
     ):
         start, end = calendar_range(date_from, date_to, include_past=include_past)
-        events = service.warehouse.get_economic_calendar(start, end, country, impact, limit)
+        events = service.metadata_repository.get_economic_calendar(start, end, country, impact, limit)
         return {
             "count": len(events), "from": start, "to": end,
             "filter_timezone": "Asia/Shanghai", "past_events_excluded": not include_past,
@@ -106,7 +218,7 @@ def create_app(
     def economic_indicators(
         country: str = "US", source: str = "", limit: int = Query(50, ge=1, le=500)
     ):
-        indicators = service.warehouse.get_economic_indicators(country, source, limit)
+        indicators = service.metadata_repository.get_economic_indicators(country, source, limit)
         return {"count": len(indicators), "indicators": indicators}
 
     @app.get("/v1/earnings-calendar")
@@ -120,7 +232,7 @@ def create_app(
     ):
         start, end = calendar_range(date_from, date_to, include_past=include_past)
         requested = [item.strip().upper() for item in symbols.split(",") if item.strip()]
-        events = service.warehouse.get_earnings_calendar(start, end, market, requested, limit)
+        events = service.metadata_repository.get_earnings_calendar(start, end, market, requested, limit)
         return {
             "count": len(events), "from": start, "to": end,
             "filter_timezone": "Asia/Shanghai", "past_events_excluded": not include_past,
@@ -170,12 +282,21 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes")
-    def quotes(symbols: str, refresh: bool = False):
+    def quotes(
+        symbols: str, refresh: bool = False, provider: Optional[str] = None,
+        allow_fallback: bool = False,
+    ):
         requested = [item.strip() for item in symbols.split(",") if item.strip()]
         if not requested:
             raise HTTPException(status_code=400, detail="symbols is required")
         if len(requested) > 20:
             raise HTTPException(status_code=400, detail="at most 20 symbols per request")
+        if provider and not refresh:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "provider_requires_refresh",
+                        "message": "provider selection requires refresh=true"},
+            )
         normalized_symbols, normalization_errors = [], []
         for symbol in requested:
             try:
@@ -185,26 +306,42 @@ def create_app(
                     normalized, _ = normalize_yahoo_symbol(symbol)
                 normalized_symbols.append(normalized)
             except Exception as exc:
-                normalization_errors.append({"symbol": symbol, "error": str(exc)})
+                normalization_errors.append({
+                    "symbol": symbol, "status": "unavailable", "error": str(exc),
+                })
         by_symbol, errors = {}, list(normalization_errors)
         workers = max(1, min(settings.quote_refresh_workers, len(normalized_symbols)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(service.get_quote, normalized, refresh): normalized
+                executor.submit(
+                    service.get_quote, normalized, refresh, provider, allow_fallback,
+                ): normalized
                 for normalized in normalized_symbols
             }
             for future in as_completed(futures):
                 normalized = futures[future]
                 try:
                     by_symbol[normalized] = future.result()
+                except ProviderNotSupported as exc:
+                    raise provider_http_error(exc) from exc
                 except Exception as exc:
                     errors.append({
-                        "symbol": normalized,
-                        "status": "unavailable",
-                        "error": str(exc),
+                        "symbol": normalized, "status": "unavailable", "error": str(exc),
                     })
         items = [by_symbol[symbol] for symbol in normalized_symbols if symbol in by_symbol]
-        return {"count": len(items), "items": items, "errors": errors}
+        result = {"count": len(items), "items": items, "errors": errors}
+        if provider or allow_fallback:
+            result["routing"] = {
+                "provider_requested": provider, "allow_fallback": allow_fallback
+            }
+        return result
+
+    @app.post("/v1/quotes/query")
+    def quotes_query(request: QuoteQuery):
+        return quotes(
+            ",".join(request.symbols), refresh=request.refresh,
+            provider=request.provider, allow_fallback=request.allow_fallback,
+        )
 
     @app.get("/v1/instruments/search")
     def instrument_search(q: str, limit: int = Query(12, ge=1, le=30)):
@@ -225,6 +362,12 @@ def create_app(
         adjustment: str = Query("adjusted", pattern="^(adjusted|raw)$"),
         refresh: bool = True,
         limit: int = Query(500, ge=1, le=5000),
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        page_size: Optional[int] = Query(None, ge=1, le=5000),
+        cursor: Optional[str] = None,
+        provider: Optional[str] = None,
+        allow_fallback: bool = False,
     ):
         try:
             if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
@@ -234,34 +377,543 @@ def create_app(
                     normalized, _ = normalize_yahoo_symbol(symbol)
             else:
                 normalized, _ = normalize_yahoo_symbol(symbol)
+            if (start is None) != (end is None):
+                raise ValueError("history range requires both start and end")
+            if cursor is not None and page_size is None:
+                raise ValueError("history cursor requires page_size")
+            if page_size is not None and (start is None or end is None):
+                raise ValueError("history pagination requires start and end")
+            if start is not None and end is not None:
+                start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                if start_at.tzinfo is None or end_at.tzinfo is None:
+                    raise ValueError("history range timestamps must include a timezone")
+                start_at = datetime.fromtimestamp(
+                    int(start_at.timestamp()), timezone.utc
+                )
+                end_at = datetime.fromtimestamp(int(end_at.timestamp()), timezone.utc)
+                if start_at > end_at:
+                    raise ValueError("history range start must not be after end")
+                if page_size is not None:
+                    query_binding = {
+                        "symbol": normalized, "interval": interval,
+                        "adjustment": adjustment, "start": start_at.isoformat(),
+                        "end": end_at.isoformat(), "page_size": page_size,
+                    }
+                    cursor_secret = load_or_create_secret(
+                        settings.market_bar_cursor_secret, settings.storage_root
+                    )
+                    cursor_now = clock()
+                    if cursor_now.tzinfo is None:
+                        cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+                    now_epoch = int(cursor_now.timestamp())
+                    after = None if cursor is None else decode_cursor(
+                        cursor, query_binding, now_epoch,
+                        settings.market_bar_cursor_ttl_seconds,
+                        cursor_secret,
+                    )
+                    if after is not None and not isinstance(after, int):
+                        raise ValueError("invalid history cursor position")
+                    if after is not None and not (
+                        int(start_at.timestamp()) <= after <= int(end_at.timestamp())
+                    ):
+                        raise ValueError("cursor position is outside the query range")
+                    bars, has_more = service.market_bar_repository.get_price_bars_page(
+                        normalized, interval, adjustment, start_at.isoformat(),
+                        end_at.isoformat(), page_size, after,
+                    )
+                    next_cursor = None
+                    if has_more and bars:
+                        next_cursor = encode_cursor(
+                            query_binding, int(bars[-1]["timestamp"]), now_epoch,
+                            cursor_secret,
+                        )
+                    return {
+                        "symbol": normalized, "interval": interval,
+                        "adjustment": adjustment, "count": len(bars), "bars": bars,
+                        "cached": True, "start": start_at.isoformat(),
+                        "end": end_at.isoformat(), "truncated": has_more,
+                        "page_size": page_size, "next_cursor": next_cursor,
+                        **cache_metadata(bars),
+                    }
+                bars, truncated = service.market_bar_repository.get_price_bars_range(
+                    normalized, interval, adjustment, start, end, limit
+                )
+                return {
+                    "symbol": normalized, "interval": interval,
+                    "adjustment": adjustment, "count": len(bars), "bars": bars,
+                    "cached": True, "start": start, "end": end,
+                    "truncated": truncated,
+                    **cache_metadata(bars),
+                }
             if refresh:
-                result = service.refresh_quote_history(normalized, range_, interval, adjustment)
+                try:
+                    if provider or allow_fallback:
+                        result = service.refresh_quote_history(
+                            normalized, range_, interval, adjustment,
+                            provider=provider, allow_fallback=allow_fallback,
+                        )
+                    else:
+                        result = service.refresh_quote_history(
+                            normalized, range_, interval, adjustment
+                        )
+                except Exception as error:
+                    bars = service.market_bar_repository.get_price_bars(
+                        normalized, interval, adjustment, limit
+                    )
+                    if not bars:
+                        raise
+                    return {
+                        "symbol": normalized, "interval": interval,
+                        "adjustment": adjustment, "count": len(bars), "bars": bars,
+                        "cached": True, "cache_degraded": True,
+                        **cache_metadata(bars, reason=str(error)),
+                    }
                 result["bars"] = result["bars"][-limit:]
                 result["count"] = len(result["bars"])
+                result.setdefault("cached", False)
+                result.update(cache_metadata(
+                    result["bars"], result.get("ingested_at") or result.get("observed_at")
+                ))
                 return result
-            bars = service.warehouse.get_price_bars(normalized, interval, adjustment, limit)
-            return {"symbol": normalized, "interval": interval, "adjustment": adjustment, "count": len(bars), "bars": bars, "cached": True}
+            bars = service.market_bar_repository.get_price_bars(normalized, interval, adjustment, limit)
+            return {"symbol": normalized, "interval": interval, "adjustment": adjustment,
+                    "count": len(bars), "bars": bars, "cached": True,
+                    **cache_metadata(bars)}
+        except ProviderRoutingError as exc:
+            raise provider_http_error(exc) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/market-bars/query")
+    def market_bars_query(request: MarketBarQuery):
+        items, errors = [], []
+        for symbol in request.symbols:
+            try:
+                items.append(quote_history(
+                    symbol, range_=request.range, interval=request.interval,
+                    adjustment=request.adjustment, refresh=request.refresh,
+                    limit=request.limit, start=None, end=None, page_size=None, cursor=None,
+                    provider=request.provider,
+                    allow_fallback=request.allow_fallback,
+                ))
+            except HTTPException as exc:
+                if exc.status_code == 422:
+                    raise
+                errors.append({"symbol": symbol, "status": exc.status_code, "error": exc.detail})
+        return {
+            "count": len(items), "items": items, "errors": errors,
+            "routing": {"provider_requested": request.provider,
+                        "allow_fallback": request.allow_fallback},
+        }
+
+    @app.get("/v1/quotes/cross-section")
+    def quote_cross_section(
+        bar_at: str,
+        interval: str = "1d",
+        adjustment: str = "adjusted",
+        limit: int = 500,
+        symbols: Optional[str] = None,
+        page_size: Optional[int] = Query(None, ge=1, le=5000),
+        cursor: Optional[str] = None,
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            if not 1 <= limit <= 5000:
+                raise ValueError("cross-section limit must be between 1 and 5000")
+            if cursor is not None and page_size is None:
+                raise ValueError("cross-section cursor requires page_size")
+            point = datetime.fromisoformat(bar_at.replace("Z", "+00:00"))
+            if point.tzinfo is None:
+                raise ValueError("cross-section bar_at must include a timezone")
+            normalized_bar_at = datetime.fromtimestamp(
+                int(point.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            symbol_filter = None
+            if symbols is not None:
+                symbol_filter = sorted({value.strip() for value in symbols.split(",")
+                                        if value.strip()})
+                if len(symbol_filter) > 5000:
+                    raise ValueError(
+                        "cross-section symbols must contain at most 5000 values"
+                    )
+            if page_size is not None:
+                query_binding = {
+                    "interval": interval, "adjustment": adjustment,
+                    "bar_at": normalized_bar_at, "symbols": symbol_filter,
+                    "page_size": page_size,
+                }
+                cursor_secret = load_or_create_secret(
+                    settings.market_bar_cursor_secret, settings.storage_root
+                )
+                cursor_now = clock()
+                if cursor_now.tzinfo is None:
+                    cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+                now_epoch = int(cursor_now.timestamp())
+                after = None if cursor is None else decode_cursor(
+                    cursor, query_binding, now_epoch,
+                    settings.market_bar_cursor_ttl_seconds, cursor_secret,
+                )
+                if after is not None and not isinstance(after, str):
+                    raise ValueError("invalid cross-section cursor position")
+                bars, has_more = (
+                    service.market_bar_repository.get_price_bars_cross_section_page(
+                        interval, adjustment, normalized_bar_at, page_size,
+                        symbol_filter, after,
+                    )
+                )
+                next_cursor = None
+                if has_more and bars:
+                    next_cursor = encode_cursor(
+                        query_binding, bars[-1]["symbol"], now_epoch, cursor_secret
+                    )
+                return {
+                    "bar_at": normalized_bar_at, "interval": interval,
+                    "adjustment": adjustment, "count": len(bars), "bars": bars,
+                    "cached": True, "truncated": has_more,
+                    "page_size": page_size, "next_cursor": next_cursor,
+                    **cache_metadata(bars),
+                }
+            bars, truncated = service.market_bar_repository.get_price_bars_cross_section(
+                interval, adjustment, normalized_bar_at, limit, symbol_filter
+            )
+            return {
+                "bar_at": normalized_bar_at, "interval": interval,
+                "adjustment": adjustment,
+                "count": len(bars), "bars": bars, "cached": True,
+                "truncated": truncated,
+                **cache_metadata(bars),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/v1/quotes/cross-section/matrix")
+    def quote_cross_section_matrix(
+        bar_ats: str,
+        symbols: str,
+        interval: str = "1d",
+        adjustment: str = "adjusted",
+        page_size: int = Query(500, ge=1, le=5000),
+        cursor: Optional[str] = None,
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            normalized_points = set()
+            for value in (item.strip() for item in bar_ats.split(",")):
+                if not value:
+                    continue
+                point = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if point.tzinfo is None:
+                    raise ValueError("matrix bar_ats must include a timezone")
+                normalized_points.add(datetime.fromtimestamp(
+                    int(point.timestamp()), ZoneInfo("UTC")
+                ).isoformat())
+            normalized_bar_ats = sorted(normalized_points)
+            symbol_filter = sorted({
+                value.strip() for value in symbols.split(",") if value.strip()
+            })
+            if not 1 <= len(normalized_bar_ats) <= 100:
+                raise ValueError("matrix bar_ats must contain between 1 and 100 values")
+            if not 1 <= len(symbol_filter) <= 1000:
+                raise ValueError("matrix symbols must contain between 1 and 1000 values")
+            matrix_cells = len(normalized_bar_ats) * len(symbol_filter)
+            if matrix_cells > 100_000:
+                raise ValueError("matrix request must contain at most 100000 cells")
+            query_binding = {
+                "interval": interval, "adjustment": adjustment,
+                "bar_ats": normalized_bar_ats, "symbols": symbol_filter,
+                "page_size": page_size,
+            }
+            cursor_secret = load_or_create_secret(
+                settings.market_bar_cursor_secret, settings.storage_root
+            )
+            cursor_now = clock()
+            if cursor_now.tzinfo is None:
+                cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+            now_epoch = int(cursor_now.timestamp())
+            decoded_after = None if cursor is None else decode_cursor(
+                cursor, query_binding, now_epoch,
+                settings.market_bar_cursor_ttl_seconds, cursor_secret,
+            )
+            after = None
+            if decoded_after is not None:
+                if not isinstance(decoded_after, list):
+                    raise ValueError("invalid matrix cursor position")
+                after = (decoded_after[0], decoded_after[1])
+            bars, has_more = service.market_bar_repository.get_price_bars_matrix_page(
+                interval, adjustment, normalized_bar_ats, symbol_filter,
+                page_size, after,
+            )
+            next_cursor = None
+            if has_more and bars:
+                next_cursor = encode_cursor(
+                    query_binding,
+                    [int(bars[-1]["timestamp"]), bars[-1]["symbol"]],
+                    now_epoch, cursor_secret,
+                )
+            return {
+                "bar_ats": normalized_bar_ats, "symbols": symbol_filter,
+                "interval": interval, "adjustment": adjustment,
+                "matrix_cells": matrix_cells, "count": len(bars), "bars": bars,
+                "cached": True, "truncated": has_more,
+                "page_size": page_size, "next_cursor": next_cursor,
+                **cache_metadata(bars),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/v1/quotes/cross-section/as-of")
+    def quote_cross_section_as_of(
+        as_of: str,
+        symbols: str,
+        interval: str = "1d",
+        adjustment: str = "adjusted",
+        max_lookback_seconds: int = Query(86400, ge=1, le=31_536_000),
+        page_size: int = Query(500, ge=1, le=1000),
+        cursor: Optional[str] = None,
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            point = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            if point.tzinfo is None:
+                raise ValueError("as_of must include a timezone")
+            normalized_as_of = datetime.fromtimestamp(
+                int(point.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            symbol_filter = sorted({
+                value.strip() for value in symbols.split(",") if value.strip()
+            })
+            if not 1 <= len(symbol_filter) <= 1000:
+                raise ValueError("as-of symbols must contain between 1 and 1000 values")
+            query_binding = {
+                "interval": interval, "adjustment": adjustment,
+                "as_of": normalized_as_of,
+                "max_lookback_seconds": max_lookback_seconds,
+                "symbols": symbol_filter, "page_size": page_size,
+            }
+            cursor_secret = load_or_create_secret(
+                settings.market_bar_cursor_secret, settings.storage_root
+            )
+            cursor_now = clock()
+            if cursor_now.tzinfo is None:
+                cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+            now_epoch = int(cursor_now.timestamp())
+            after = None if cursor is None else decode_cursor(
+                cursor, query_binding, now_epoch,
+                settings.market_bar_cursor_ttl_seconds, cursor_secret,
+            )
+            if after is not None and not isinstance(after, str):
+                raise ValueError("invalid as-of cursor position")
+            bars, has_more = service.market_bar_repository.get_price_bars_as_of_page(
+                interval, adjustment, normalized_as_of, max_lookback_seconds,
+                symbol_filter, page_size, after,
+            )
+            next_cursor = None
+            if has_more and bars:
+                next_cursor = encode_cursor(
+                    query_binding, bars[-1]["symbol"], now_epoch, cursor_secret
+                )
+            return {
+                "as_of": normalized_as_of, "interval": interval,
+                "adjustment": adjustment,
+                "max_lookback_seconds": max_lookback_seconds,
+                "symbols": symbol_filter, "count": len(bars), "bars": bars,
+                "cached": True, "truncated": has_more,
+                "page_size": page_size, "next_cursor": next_cursor,
+                "max_staleness_seconds": max(
+                    (row["staleness_seconds"] for row in bars), default=None
+                ),
+                **cache_metadata(bars),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/v1/quotes/{symbol}/as-of")
+    def quote_as_of(
+        symbol: str,
+        as_of: str,
+        interval: str = "1d",
+        adjustment: str = "adjusted",
+        max_lookback_seconds: int = Query(86400, ge=1, le=31_536_000),
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            try:
+                normalized = normalize_a_symbol(symbol)
+            except ValueError:
+                normalized, _ = normalize_yahoo_symbol(symbol)
+            point = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+            if point.tzinfo is None:
+                raise ValueError("as_of must include a timezone")
+            normalized_as_of = datetime.fromtimestamp(
+                int(point.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            row = service.market_bar_repository.get_price_bar_as_of(
+                normalized, interval, adjustment, normalized_as_of,
+                max_lookback_seconds,
+            )
+            bars = [] if row is None else [row]
+            return {
+                "symbol": normalized, "as_of": normalized_as_of,
+                "interval": interval, "adjustment": adjustment,
+                "max_lookback_seconds": max_lookback_seconds,
+                "count": len(bars), "bar": row, "cached": True,
+                "max_staleness_seconds": (
+                    None if row is None else row["staleness_seconds"]
+                ),
+                **cache_metadata(bars),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/v1/quotes/{symbol}/raw-history")
+    def quote_raw_history(
+        symbol: str,
+        start: str,
+        end: str,
+        interval: str = "1d",
+        adjustment: str = "raw",
+        limit: int = 500,
+        sources: Optional[str] = None,
+        page_size: Optional[int] = Query(None, ge=1, le=5000),
+        cursor: Optional[str] = None,
+    ):
+        try:
+            if adjustment not in {"adjusted", "raw"}:
+                raise ValueError("adjustment must be adjusted or raw")
+            if not 1 <= limit <= 5000:
+                raise ValueError("raw history limit must be between 1 and 5000")
+            if cursor is not None and page_size is None:
+                raise ValueError("raw history cursor requires page_size")
+            try:
+                normalized = normalize_a_symbol(symbol)
+            except ValueError:
+                normalized, _ = normalize_yahoo_symbol(symbol)
+            start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if start_at.tzinfo is None or end_at.tzinfo is None:
+                raise ValueError("history range timestamps must include a timezone")
+            normalized_start = datetime.fromtimestamp(
+                int(start_at.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            normalized_end = datetime.fromtimestamp(
+                int(end_at.timestamp()), ZoneInfo("UTC")
+            ).isoformat()
+            source_filter = None
+            if sources is not None:
+                source_filter = sorted({value.strip() for value in sources.split(",")
+                                        if value.strip()})
+                if len(source_filter) > 100:
+                    raise ValueError("raw history sources must contain at most 100 values")
+            if page_size is not None:
+                query_binding = {
+                    "symbol": normalized, "interval": interval,
+                    "adjustment": adjustment, "start": normalized_start,
+                    "end": normalized_end, "sources": source_filter,
+                    "page_size": page_size,
+                }
+                cursor_secret = load_or_create_secret(
+                    settings.market_bar_cursor_secret, settings.storage_root
+                )
+                cursor_now = clock()
+                if cursor_now.tzinfo is None:
+                    cursor_now = cursor_now.replace(tzinfo=timezone.utc)
+                now_epoch = int(cursor_now.timestamp())
+                decoded_after = None if cursor is None else decode_cursor(
+                    cursor, query_binding, now_epoch,
+                    settings.market_bar_cursor_ttl_seconds, cursor_secret,
+                )
+                after = None
+                if decoded_after is not None:
+                    if not isinstance(decoded_after, list):
+                        raise ValueError("invalid raw history cursor position")
+                    after = (decoded_after[0], decoded_after[1])
+                    if not (int(start_at.timestamp()) <= after[0]
+                            <= int(end_at.timestamp())):
+                        raise ValueError("cursor position is outside the query range")
+                bars, has_more = service.market_bar_repository.get_raw_price_bars_page(
+                    normalized, interval, adjustment, normalized_start, normalized_end,
+                    page_size, source_filter, after,
+                )
+                next_cursor = None
+                if has_more and bars:
+                    next_cursor = encode_cursor(
+                        query_binding,
+                        [int(bars[-1]["timestamp"]), bars[-1]["source"]],
+                        now_epoch, cursor_secret,
+                    )
+                return {
+                    "symbol": normalized, "interval": interval,
+                    "adjustment": adjustment, "start": normalized_start,
+                    "end": normalized_end, "count": len(bars), "bars": bars,
+                    "cached": True, "truncated": has_more,
+                    "page_size": page_size, "next_cursor": next_cursor,
+                    **cache_metadata(bars),
+                }
+            bars, truncated = service.market_bar_repository.get_raw_price_bars_range(
+                normalized, interval, adjustment, normalized_start, normalized_end,
+                limit, source_filter,
+            )
+            return {
+                "symbol": normalized, "interval": interval,
+                "adjustment": adjustment, "start": normalized_start,
+                "end": normalized_end, "count": len(bars), "bars": bars,
+                "cached": True, "truncated": truncated,
+                **cache_metadata(bars),
+            }
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes/{symbol}")
-    def quote(symbol: str, refresh: bool = False):
+    def quote(
+        symbol: str, refresh: bool = False, provider: Optional[str] = None,
+        allow_fallback: bool = False,
+    ):
         try:
             try:
                 normalized = normalize_a_symbol(symbol)
             except ValueError:
                 normalized, _ = normalize_yahoo_symbol(symbol)
-            return service.get_quote(normalized, force_refresh=refresh)
+            if provider and not refresh:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "provider_requires_refresh",
+                            "message": "provider selection requires refresh=true"},
+                )
+            return service.get_quote(
+                normalized, force_refresh=refresh, provider=provider,
+                allow_fallback=allow_fallback,
+            )
         except HTTPException:
             raise
+        except ProviderRoutingError as exc:
+            raise provider_http_error(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
-                detail={"symbol": symbol, "status": "unavailable", "error": str(exc)},
+                detail={
+                    "symbol": symbol,
+                    "status": "unavailable",
+                    "error": str(exc),
+                },
             ) from exc
 
     @app.get("/v1/fundamentals")
@@ -280,7 +932,7 @@ def create_app(
             report_period = normalize_report_period(report_period)
         if as_of:
             as_of = parse_as_of(as_of)
-        rows = service.warehouse.query_fundamentals(
+        rows = service.fundamental_repository.query_fundamentals(
             limit=limit,
             offset=offset,
             symbol="".join(ch for ch in symbol if ch.isdigit()).zfill(6) if symbol else "",
@@ -296,7 +948,7 @@ def create_app(
     @app.get("/v1/fundamentals/{symbol}")
     def fundamental(symbol: str, report_period: str = "", as_of: str = ""):
         code = "".join(ch for ch in symbol if ch.isdigit()).zfill(6)
-        rows = service.warehouse.query_fundamentals(
+        rows = service.fundamental_repository.query_fundamentals(
             limit=1,
             symbol=code,
             report_period=normalize_report_period(report_period) if report_period else "",
@@ -316,7 +968,7 @@ def create_app(
     ):
         code = "".join(ch for ch in symbol if ch.isdigit()).zfill(6)
         normalized_as_of = parse_as_of(as_of)
-        rows = service.warehouse.get_statement_rows(code, statement, limit_periods, normalized_as_of)
+        rows = service.fundamental_repository.get_statement_rows(code, statement, limit_periods, normalized_as_of)
         return {"symbol": code, "count": len(rows), "as_of": normalized_as_of or None, "point_in_time": bool(normalized_as_of), "items": rows}
 
     @app.post("/v1/admin/fundamentals/refresh")
@@ -339,11 +991,11 @@ def create_app(
 
     @app.get("/v1/admin/jobs")
     def jobs(limit: int = Query(20, ge=1, le=200)):
-        return {"items": service.warehouse.latest_runs(limit)}
+        return {"items": service.metadata_repository.latest_runs(limit)}
 
     @app.get("/v1/admin/artifacts")
     def artifacts(dataset: str = "", limit: int = Query(100, ge=1, le=1000)):
-        rows = service.warehouse.list_artifacts(dataset, limit)
+        rows = service.artifact_store.list_artifacts(dataset, limit)
         return {"count": len(rows), "items": rows}
 
     @app.post("/v1/admin/artifacts/backfill")
@@ -374,7 +1026,7 @@ def create_app(
 
     @app.get("/v1/sources/tdx/coverage")
     def tdx_coverage():
-        return {"periods": service.warehouse.tdx_coverage()}
+        return {"periods": service.fundamental_repository.tdx_coverage()}
 
     @app.get("/v1/validation/{symbol}")
     def validation(symbol: str, report_period: str):
@@ -392,18 +1044,18 @@ def create_app(
     ):
         code = "".join(ch for ch in symbol if ch.isdigit()).zfill(6)
         normalized_as_of = parse_as_of(as_of)
-        rows = service.warehouse.get_tdx_history(code, annual_only, limit, normalized_as_of)
+        rows = service.fundamental_repository.get_tdx_history(code, annual_only, limit, normalized_as_of)
         return {"symbol": code, "count": len(rows), "as_of": normalized_as_of or None, "point_in_time": bool(normalized_as_of), "items": rows}
 
     @app.get("/v1/sources/health")
     def source_health():
-        return {"items": service.warehouse.provider_health()}
+        return {"items": service.metadata_repository.provider_health()}
 
     @app.get("/v1/validation/{symbol}/results")
     def validation_results(symbol: str, report_period: str):
         code = "".join(ch for ch in symbol if ch.isdigit()).zfill(6)
         period = normalize_report_period(report_period)
-        rows = service.warehouse.get_validation_results(code, period)
+        rows = service.fundamental_repository.get_validation_results(code, period)
         return {"symbol": code, "report_period": period, "count": len(rows), "items": rows}
 
     @app.post("/v1/admin/validation/rebuild")
@@ -431,7 +1083,7 @@ def create_app(
         as_of: str = "",
     ):
         normalized_as_of = parse_as_of(as_of)
-        rows = service.warehouse.query_funnel_metrics(
+        rows = service.fundamental_repository.query_funnel_metrics(
             limit=limit,
             offset=offset,
             min_roe_median=min_roe_median,
