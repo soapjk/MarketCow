@@ -215,6 +215,33 @@ class ClickHouseDatabase:
             "tables": sorted(tables),
         }
 
+    def pressure_probe(self) -> Dict[str, Any]:
+        """Return bounded, read-only server pressure from the live target."""
+        timeout = max(0.1, min(float(self.read_timeout), 30.0))
+        settings = {"max_execution_time": timeout, "readonly": 1}
+        client = self._connect(self.database)
+        try:
+            merges = client.query(
+                "SELECT count() FROM system.merges WHERE database = currentDatabase()",
+                settings=settings,
+            ).result_rows
+            disks = client.query(
+                "SELECT sum(total_space), sum(free_space) FROM system.disks",
+                settings=settings,
+            ).result_rows
+        finally:
+            client.close()
+        if len(merges) != 1 or len(merges[0]) != 1 or len(disks) != 1 or len(disks[0]) != 2:
+            raise ClickHouseRepositoryError("ClickHouse pressure result is invalid")
+        merge_queue = int(merges[0][0])
+        total_bytes, free_bytes = int(disks[0][0]), int(disks[0][1])
+        if merge_queue < 0 or total_bytes <= 0 or not 0 <= free_bytes <= total_bytes:
+            raise ClickHouseRepositoryError("ClickHouse pressure values are invalid")
+        return {
+            "status": "observed", "merge_queue": merge_queue,
+            "disk_used_ratio": round(1.0 - free_bytes / total_bytes, 6),
+        }
+
 
 class ClickHouseMarketBarRepository:
     RAW_COLUMNS = [

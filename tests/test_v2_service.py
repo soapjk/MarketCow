@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from marketcow.api import create_app
 from marketcow.clickhouse_writer import AuthoritativeWriteError
 from marketcow.config import Settings
 from marketcow.service import FundamentalService
+from marketcow.health import V2_THRESHOLDS
 from marketcow.v2_market_bars import (
     V2AuthoritativeMarketBarRepository,
     V2AuthoritativeWriteError,
@@ -269,6 +271,13 @@ class V2ServiceIntegrationTest(unittest.TestCase):
                 readiness = client.get("/v1/readiness")
                 self.assertEqual(health.status_code, 200)
                 self.assertEqual(readiness.status_code, 200)
+                time.sleep(V2_THRESHOLDS["degrade_after_seconds"] + 0.1)
+                sustained_health = client.get("/v1/health")
+                sustained_readiness = client.get("/v1/readiness")
+                self.assertEqual(sustained_health.json()["storage_health"]["status"],
+                                 "healthy")
+                self.assertEqual(sustained_readiness.status_code, 200)
+                self.assertTrue(sustained_readiness.json()["ready"])
                 self.assertEqual(
                     health.json()["storage_health"]["components"]["postgresql"]["status"],
                     "healthy",

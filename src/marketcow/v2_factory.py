@@ -144,18 +144,20 @@ class V2OnlineRepositories:
                 f"clickhouse://{self.scheduler_clickhouse_database.database}",
             )
             scheduler_ch["enabled"] = True
-        pressure = {"status": "missing"}
+        pressure = {"status": "unavailable", "reason": "pressure_probe_failed"}
         try:
-            snapshot = self.telemetry.snapshot()
-            values = {}
-            for metric in snapshot.get("metrics", []):
-                if metric.get("name") == "clickhouse_pressure":
-                    values[metric.get("labels", {}).get("kind")] = metric.get("value")
-            if {"merge_queue", "disk_used_ratio"} <= values.keys():
-                pressure = {"status": "observed", "merge_queue": values["merge_queue"],
-                            "disk_used_ratio": values["disk_used_ratio"]}
+            observed = self.clickhouse_database.pressure_probe()
+            if (observed.get("status") != "observed"
+                    or float(observed.get("merge_queue", -1)) < 0
+                    or not 0 <= float(observed.get("disk_used_ratio", -1)) <= 1):
+                raise ValueError("invalid pressure probe")
+            pressure = {
+                "status": "observed",
+                "merge_queue": int(observed["merge_queue"]),
+                "disk_used_ratio": float(observed["disk_used_ratio"]),
+            }
         except Exception:
-            pressure = {"status": "missing"}
+            pass
         return {"schema": V2_HEALTH_SCHEMA, "components": {
             "postgresql": pg, "clickhouse_main": main, "authoritative_wal": wal,
             "canonical_scheduler": scheduler, "clickhouse_scheduler": scheduler_ch,

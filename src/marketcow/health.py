@@ -245,6 +245,8 @@ class V2HealthEvaluator:
                 "merge_degraded_items"
             ]:
                 reasons.append("clickhouse_pressure_high")
+        elif pressure.get("status") == "unavailable":
+            unavailable, reasons = True, reasons + ["clickhouse_pressure_unavailable"]
         else:
             reasons.append("clickhouse_pressure_missing")
         return "unavailable" if unavailable else "degraded" if reasons else "healthy", reasons
@@ -263,6 +265,7 @@ class V2HealthEvaluator:
                 "v2_dependency_snapshot_unavailable", "postgresql_unavailable",
                 "clickhouse_main_unavailable", "wal_diagnostics_unavailable",
                 "canonical_worker_unavailable",
+                "clickhouse_pressure_unavailable",
             } for reason in reasons)
             if immediate:
                 self._state, self._candidate, self._candidate_since = raw, None, None

@@ -6,6 +6,7 @@ import unittest
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import clickhouse_connect
 from fastapi.testclient import TestClient
@@ -49,6 +50,28 @@ class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
         database = ClickHouseDatabase("127.0.0.1", 8123, "marketcow_test")
         with self.assertRaisesRegex(RuntimeError, "not open"):
             database.migrate()
+
+    def test_pressure_probe_is_bounded_and_validated(self):
+        calls = []
+        class Client:
+            closed = False
+            def query(self, statement, settings=None):
+                calls.append((statement, settings))
+                rows = [(2,)] if "system.merges" in statement else [(1000, 250)]
+                return SimpleNamespace(result_rows=rows)
+            def close(self): self.closed = True
+        database = ClickHouseDatabase(
+            "127.0.0.1", 8123, "marketcow_test", read_timeout=1.25)
+        client = Client()
+        database._connect = lambda _database: client
+        self.assertEqual(database.pressure_probe(), {
+            "status": "observed", "merge_queue": 2, "disk_used_ratio": 0.75,
+        })
+        self.assertEqual([call[1] for call in calls], [
+            {"max_execution_time": 1.25, "readonly": 1},
+            {"max_execution_time": 1.25, "readonly": 1},
+        ])
+        self.assertTrue(client.closed)
 
 
 @unittest.skipUnless(
@@ -387,6 +410,11 @@ class ClickHouseRepositoryIntegrationTest(unittest.TestCase):
             "SELECT version FROM schema_migrations ORDER BY version"
         ).result_rows
         self.assertEqual(versions, [(1,), (2,), (3,), (4,), (5,)])
+        pressure = self.database.pressure_probe()
+        self.assertEqual(pressure["status"], "observed")
+        self.assertGreaterEqual(pressure["merge_queue"], 0)
+        self.assertGreaterEqual(pressure["disk_used_ratio"], 0)
+        self.assertLessEqual(pressure["disk_used_ratio"], 1)
 
     def test_upgrade_from_migration_four_and_repeat_migrate(self):
         name = "marketcow_upgrade_" + uuid.uuid4().hex[:10] + "_test"

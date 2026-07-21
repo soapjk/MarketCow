@@ -162,6 +162,8 @@ class V2HealthTest(unittest.TestCase):
         clickhouse = SimpleNamespace(
             database="marketcow_test",
             _require_client=lambda: SimpleNamespace(ping=lambda: True),
+            pressure_probe=lambda: {"status": "observed", "merge_queue": 0,
+                                    "disk_used_ratio": 0.1},
         )
         spool = SimpleNamespace(
             quarantine=Path("quarantine"),
@@ -189,6 +191,46 @@ class V2HealthTest(unittest.TestCase):
         rendered = json.dumps(resources.health_snapshot())
         self.assertIn('"status": "unavailable"', rendered)
         self.assertNotIn("secret", rendered)
+        self.assertNotIn("/Volumes", rendered)
+
+    def test_live_pressure_probe_is_required_and_fail_closed(self):
+        database = SimpleNamespace(
+            schema="marketcow_test", health_probe=lambda: True,
+        )
+        pressure = MagicMock(return_value={
+            "status": "observed", "merge_queue": 0, "disk_used_ratio": 0.01,
+        })
+        clickhouse = SimpleNamespace(
+            database="marketcow_test", pressure_probe=pressure,
+            _require_client=lambda: SimpleNamespace(ping=lambda: True),
+        )
+        spool = SimpleNamespace(
+            quarantine=Path("quarantine"),
+            diagnostics=lambda _limit: {"pending": 0, "failed": 0, "replayed": 0,
+                                        "truncated": False, "quota": {
+                                            "bytes": 0, "free_bytes": 1000}},
+            _bounded_files=lambda *_args: ([], False),
+        )
+        from marketcow.v2_factory import V2OnlineRepositories
+        resources = V2OnlineRepositories(
+            postgres_database=database, postgres_repository=object(),
+            clickhouse_database=clickhouse, market_bars=object(), telemetry=object(),
+            spool=spool, writer=object(), canonical_builder=object(),
+            canonical_scheduler=None,
+        )
+        observed = resources.health_snapshot()["components"]["clickhouse_pressure"]
+        self.assertEqual(observed["status"], "observed")
+        pressure.assert_called_once_with()
+        pressure.side_effect = TimeoutError("host=127.0.0.1 password=secret /Volumes/T9")
+        failed = resources.health_snapshot()
+        self.assertEqual(failed["components"]["clickhouse_pressure"], {
+            "status": "unavailable", "reason": "pressure_probe_failed",
+        })
+        result = V2HealthEvaluator(self.clock).evaluate(failed)
+        self.assertEqual(result["status"], "unavailable")
+        rendered = json.dumps(result)
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("127.0.0.1", rendered)
         self.assertNotIn("/Volumes", rendered)
 
     def test_postgres_probe_binds_acquisition_and_statement_timeouts(self):
