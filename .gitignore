@@ -16,6 +16,8 @@ dist/
 data/
 data-development/
 data-v2-development/
+data-v2-production/
+data-migration/
 logs/
 logs-development/
 state/
