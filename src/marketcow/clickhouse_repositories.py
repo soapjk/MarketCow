@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -151,6 +152,7 @@ class ClickHouseDatabase:
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.client: Optional[Any] = None
+        self.operation_lock = threading.RLock()
 
     def _connect(self, database: str) -> Any:
         return clickhouse_connect.get_client(
@@ -183,6 +185,10 @@ class ClickHouseDatabase:
         if self.client is None:
             raise RuntimeError("ClickHouse database is not open")
         return self.client
+
+    def health_probe(self) -> bool:
+        with self.operation_lock:
+            return bool(self._require_client().ping())
 
     def migrate(self) -> None:
         client = self._require_client()
@@ -270,9 +276,10 @@ class ClickHouseMarketBarRepository:
 
     def _query(self, statement: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
         try:
-            return self.database._require_client().query(
-                statement, parameters=parameters or {}
-            )
+            with self.database.operation_lock:
+                return self.database._require_client().query(
+                    statement, parameters=parameters or {}
+                )
         except Exception as error:
             raise ClickHouseRepositoryError(
                 f"ClickHouse query failed ({type(error).__name__})"
@@ -280,7 +287,8 @@ class ClickHouseMarketBarRepository:
 
     def _client_insert(self, *args: Any, **kwargs: Any) -> None:
         try:
-            self.database._require_client().insert(*args, **kwargs)
+            with self.database.operation_lock:
+                self.database._require_client().insert(*args, **kwargs)
         except Exception as error:
             raise ClickHouseRepositoryError(
                 f"ClickHouse write failed ({type(error).__name__})"

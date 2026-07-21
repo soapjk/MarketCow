@@ -96,7 +96,7 @@ class V2OnlineRepositories:
             f"postgresql://{self.postgres_database.schema}",
         )
         main = self._safe_status(
-            lambda: self.clickhouse_database._require_client().ping() or
+            lambda: self.clickhouse_database.health_probe() or
             (_ for _ in ()).throw(RuntimeError("ping failed")),
             f"clickhouse://{self.clickhouse_database.database}",
         )
@@ -139,7 +139,7 @@ class V2OnlineRepositories:
                 scheduler = {"status": "unavailable", "enabled": True,
                              "reason": "canonical_probe_failed"}
             scheduler_ch = self._safe_status(
-                lambda: self.scheduler_clickhouse_database._require_client().ping() or
+                lambda: self.scheduler_clickhouse_database.health_probe() or
                 (_ for _ in ()).throw(RuntimeError("ping failed")),
                 f"clickhouse://{self.scheduler_clickhouse_database.database}",
             )
