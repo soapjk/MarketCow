@@ -43,8 +43,9 @@ class ClickHouseDatabaseBoundaryTest(unittest.TestCase):
             ClickHouseDatabase("127.0.0.1", 8123, "bad-name_test")
         with self.assertRaisesRegex(ValueError, "loopback"):
             ClickHouseDatabase("clickhouse.example.com", 8123, "marketcow_test")
+        ClickHouseDatabase("127.0.0.1", 8123, "marketcow_production")
         with self.assertRaisesRegex(ValueError, "must end"):
-            ClickHouseDatabase("127.0.0.1", 8123, "marketcow_production")
+            ClickHouseDatabase("127.0.0.1", 8123, "marketcow_staging")
 
     def test_closed_database_rejects_operations(self):
         database = ClickHouseDatabase("127.0.0.1", 8123, "marketcow_test")

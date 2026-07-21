@@ -61,6 +61,37 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.storage_root, Path(folder) / "data-v2-development")
         settings.validate_runtime_isolation()
 
+    def test_v2_production_requires_dedicated_loopback_targets_and_root(self):
+        with tempfile.TemporaryDirectory() as folder:
+            environment = {
+                "MARKETCOW_V2_POSTGRES_DSN":
+                    "postgresql://fixture:secret@127.0.0.1/marketcow_production",
+                "MARKETCOW_POSTGRES_DSN_REF": "MARKETCOW_V2_POSTGRES_DSN",
+                "MARKETCOW_V2_CLICKHOUSE_PASSWORD": "secret",
+                "MARKETCOW_CLICKHOUSE_PASSWORD_REF":
+                    "MARKETCOW_V2_CLICKHOUSE_PASSWORD",
+                "MARKETCOW_V2_ALLOWED_ROOT": folder,
+            }
+            with patch.dict(os.environ, environment, clear=True), patch(
+                "pathlib.Path.cwd", return_value=Path(folder)
+            ):
+                settings = Settings.from_env("v2-production")
+        self.assertEqual(settings.port, 8790)
+        self.assertIsNone(settings.database_path)
+        self.assertEqual(settings.storage_root, Path(folder) / "data-v2-production")
+        self.assertEqual(settings.postgres_schema, "marketcow_production")
+        self.assertEqual(settings.clickhouse_database, "marketcow_production")
+        settings.validate_runtime_isolation()
+
+        with self.assertRaisesRegex(ValueError, "must use port 8790"):
+            self._v2_settings(
+                Path(folder) / "data-v2-production",
+                profile="v2-production", port=8792,
+                postgres_dsn="postgresql://fixture:secret@127.0.0.1/marketcow_production",
+                postgres_schema="marketcow_production",
+                clickhouse_database="marketcow_production",
+            ).validate_runtime_isolation()
+
     def test_v2_environment_requires_explicit_root_and_nonempty_secret_values(self):
         with tempfile.TemporaryDirectory() as folder:
             base = {
@@ -130,7 +161,7 @@ class SettingsTest(unittest.TestCase):
     def test_v2_preflight_rejects_production_and_non_loopback_targets(self):
         root = Path("/Volumes/T9/projects/marketcow-storage-v2/data-v2-development")
         cases = (
-            ({"port": 8790}, "production identity"),
+            ({"port": 8790}, "production port"),
             ({"host": "0.0.0.0"}, "service host must be loopback"),
             ({"postgres_dsn": "postgresql://user:topsecret@db.example/marketcow_development"},
              "PostgreSQL target must be loopback"),
@@ -275,7 +306,7 @@ class SettingsTest(unittest.TestCase):
 
     def test_unknown_profile_is_rejected(self):
         with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(ValueError, "production or development"):
+            with self.assertRaisesRegex(ValueError, "must be production"):
                 Settings.from_env("staging")
 
     def test_postgres_metadata_is_explicit_and_development_only(self):
