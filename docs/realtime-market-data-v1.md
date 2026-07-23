@@ -22,6 +22,10 @@ MarketCow validates every instrument against Instrument Master and requires an e
 `provider:longport` mapping. Success returns `subscription_ack`; invalid input,
 unavailable credentials, permission failures and unsupported instruments return the
 machine-readable `stream_error` frame. `unsubscribe` removes only the named subscriptions.
+At the provider boundary, quote and order-book filters share one LongPort Depth capability;
+trade and bar filters share one LongPort Trade capability. Refcounts and rollback are
+computed from these normalized capabilities, so partial unsubscribe and disconnect cannot
+cancel a capability still required by another filter.
 
 The server sends `stream_heartbeat` frames after 15 seconds without another frame by
 default. Heartbeats report `last_sequence` but do not consume a market-event sequence.

@@ -52,6 +52,18 @@ def _data_type(event_kind: str) -> str:
     return "order_book" if event_kind == "order_book_snapshot" else event_kind
 
 
+def _provider_capabilities(
+    filters: Iterable[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    return {
+        (
+            instrument,
+            "quote" if kind in {"quote", "order_book_snapshot"} else "trade",
+        )
+        for instrument, kind in filters
+    }
+
+
 @dataclass
 class ClientSubscription:
     queue_capacity: int
@@ -263,7 +275,9 @@ class RealtimeHub:
         self._clients.discard(id(client))
         self._client_by_id.pop(id(client), None)
         if self.provider is not None and client.filters:
-            await asyncio.to_thread(self.provider.unsubscribe, client.filters)
+            await asyncio.to_thread(
+                self.provider.unsubscribe, _provider_capabilities(client.filters)
+            )
 
     async def subscribe(
         self, client: ClientSubscription, request: SubscribeRequest
@@ -284,6 +298,11 @@ class RealtimeHub:
             for data_type in request.data_types
         }
         new_filters = requested - client.filters
+        current_capabilities = _provider_capabilities(client.filters)
+        requested_capabilities = _provider_capabilities(
+            client.filters | requested
+        )
+        new_capabilities = requested_capabilities - current_capabilities
         replay = []
         if request.resume_after is not None:
             if client.filters:
@@ -292,17 +311,23 @@ class RealtimeHub:
                 raise RuntimeError("gap_unrecoverable")
             replay = self._resume_frames(request.resume_after, requested)
             required = len(replay) + (
-                1 if isinstance(self.provider, LongPortRealtimeProvider) and new_filters
+                1
+                if isinstance(self.provider, LongPortRealtimeProvider)
+                and new_capabilities
                 else 0
             )
             if required > client.queue.maxsize - client.queue.qsize():
                 raise RuntimeError("replay_too_large")
-        if self.provider is not None and new_filters:
-            new_instruments = {instrument for instrument, _kind in new_filters}
+        if self.provider is not None and new_capabilities:
+            new_instruments = {
+                instrument for instrument, _kind in new_capabilities
+            }
             provider_mappings = {
                 instrument: mappings[instrument] for instrument in new_instruments
             }
-            provider_types = {_data_type(kind) for _instrument, kind in new_filters}
+            provider_types = {
+                kind for _instrument, kind in new_capabilities
+            }
             try:
                 await asyncio.to_thread(
                     self.provider.subscribe, provider_mappings, provider_types
@@ -330,7 +355,9 @@ class RealtimeHub:
             if request.resume_after is not None:
                 replay = self._resume_frames(request.resume_after, requested)
                 required = len(replay) + (
-                    1 if isinstance(self.provider, LongPortRealtimeProvider) and new_filters
+                    1
+                    if isinstance(self.provider, LongPortRealtimeProvider)
+                    and new_capabilities
                     else 0
                 )
                 replay_too_large = (
@@ -346,10 +373,12 @@ class RealtimeHub:
                 for frame in replay:
                     client.queue.put_nowait(frame)
         if replay_too_large:
-            if self.provider is not None and new_filters:
-                await asyncio.to_thread(self.provider.unsubscribe, new_filters)
+            if self.provider is not None and new_capabilities:
+                await asyncio.to_thread(
+                    self.provider.unsubscribe, new_capabilities
+                )
             raise RuntimeError("replay_too_large")
-        if isinstance(self.provider, LongPortRealtimeProvider) and new_filters:
+        if isinstance(self.provider, LongPortRealtimeProvider) and new_capabilities:
             await self.publish({
                 "event_type": "stream_status", "source": "longport",
                 "ts_event": _iso(self.clock()),
@@ -385,14 +414,10 @@ class RealtimeHub:
         }
         removed = requested & client.filters
         remaining = client.filters - removed
-        provider_removed = set()
-        for instrument, kind in removed:
-            if kind in {"trade", "bar"} and (
-                (instrument, "trade") in remaining
-                or (instrument, "bar") in remaining
-            ):
-                continue
-            provider_removed.add((instrument, kind))
+        provider_removed = (
+            _provider_capabilities(client.filters)
+            - _provider_capabilities(remaining)
+        )
         if self.provider is not None and provider_removed:
             await asyncio.to_thread(self.provider.unsubscribe, provider_removed)
         client.filters.difference_update(removed)
@@ -413,7 +438,7 @@ class RealtimeHub:
         self, after: int, filters: set[tuple[str, str]]
     ) -> list[dict[str, Any]]:
         if after > self._sequence:
-            raise ValueError("resume_after is ahead of stream")
+            raise RuntimeError("gap_unrecoverable")
         oldest = self._replay[0]["sequence"] if self._replay else self._sequence + 1
         if after < oldest - 1:
             raise RuntimeError("gap_unrecoverable")

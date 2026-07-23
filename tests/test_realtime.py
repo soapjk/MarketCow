@@ -232,6 +232,47 @@ class RealtimeHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed_client.filters, set())
         await hub.close()
 
+    async def test_provider_capability_deltas_pair_combined_filters(self):
+        provider = Provider()
+        hub = RealtimeHub(self.hub.instrument_lookup, provider)
+        client = hub.new_client()
+        quote_book = SubscribeRequest(
+            type="subscribe", request_id="qb", instruments=["AAPL.XNAS"],
+            data_types=["quote", "order_book"], bar_types=[], book_depth=1,
+        )
+        await hub.subscribe(client, quote_book)
+        self.assertEqual(provider.subscriptions[0][1], {"quote"})
+        await hub.unsubscribe(client, SimpleNamespace(
+            request_id="uq", instruments=["AAPL.XNAS"], data_types=["quote"]
+        ))
+        self.assertEqual(provider.unsubscriptions, [])
+        self.assertEqual(
+            client.filters, {("AAPL.XNAS", "order_book_snapshot")}
+        )
+        await hub.remove_client(client)
+        self.assertEqual(
+            provider.unsubscriptions[-1], {("AAPL.XNAS", "quote")}
+        )
+        await hub.close()
+
+        provider = Provider()
+        hub = RealtimeHub(self.hub.instrument_lookup, provider)
+        client = hub.new_client()
+        await hub.subscribe(client, SubscribeRequest(
+            type="subscribe", request_id="t", instruments=["AAPL.XNAS"],
+            data_types=["trade"], bar_types=[], book_depth=1,
+        ))
+        await hub.subscribe(client, SubscribeRequest(
+            type="subscribe", request_id="b", instruments=["AAPL.XNAS"],
+            data_types=["bar"], bar_types=["1-MINUTE"], book_depth=1,
+        ))
+        self.assertEqual(len(provider.subscriptions), 1)
+        await hub.remove_client(client)
+        self.assertEqual(
+            provider.unsubscriptions, [{("AAPL.XNAS", "trade")}]
+        )
+        await hub.close()
+
     async def test_order_book_snapshot_sequence_is_recovery_baseline(self):
         client = self.hub.new_client()
         request = SubscribeRequest(
@@ -496,6 +537,18 @@ class RealtimeWebSocketTest(unittest.TestCase):
                 websocket.send_text("{")
                 self.assertEqual(websocket.receive_json()["code"], "invalid_json")
                 self.assertEqual(websocket.receive_json()["type"], "heartbeat")
+                websocket.close()
+            with client.websocket_connect("/v1/market-data/stream") as websocket:
+                websocket.send_json({
+                    "type": "subscribe", "request_id": "ahead",
+                    "instruments": ["AAPL.XNAS"], "data_types": ["quote"],
+                    "bar_types": [], "book_depth": 1,
+                    "resume_after": 999,
+                    "resume_stream_id": hub.stream_id,
+                })
+                response = websocket.receive_json()
+                self.assertEqual(response["type"], "error")
+                self.assertEqual(response["code"], "gap_unrecoverable")
                 websocket.close()
 
     def test_slow_consumer_closes_with_1013_reason(self):
