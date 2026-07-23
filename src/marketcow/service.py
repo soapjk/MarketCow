@@ -31,16 +31,26 @@ from .providers.sina_realtime import SinaRealtimeQuoteProvider
 from .providers.calendar import CalendarProvider
 from .providers.tushare_provider import TushareProvider
 from .providers.longport_quote import LongPortQuoteProvider
+from .providers.sec_dividends import SecDividendProvider
+from .providers.cn_dividends import CnExchangeDividendProvider
+from .providers.hkex_dividends import HkexDividendProvider
 from .quote_persistence import AsyncQuotePersistence
 from .providers.contracts import DEFAULT_PROVIDER_MANIFESTS, ProviderRegistry
 from .repositories import Repositories
 from .domain_columns import FUNDAMENTAL_COLUMNS
+from .dividends import (
+    dividend_summary,
+    normalize_dividend_announcement,
+    normalize_dividend_symbol,
+)
+from .instruments import canonical_instrument
 from .provider_routing import (
     MARKET_BAR_HISTORY,
     REALTIME_QUOTE,
     ProviderUnavailable,
     select_providers,
 )
+from .exposure_facts import ExposureFactsService, RepositoryExposureFactSource
 
 
 EASTMONEY_DATA_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
@@ -113,6 +123,10 @@ class FundamentalService:
         calendar_provider: Optional[CalendarProvider] = None,
         tushare_provider: Optional[TushareProvider] = None,
         longport_quote_provider: Optional[LongPortQuoteProvider] = None,
+        sec_dividend_provider: Optional[SecDividendProvider] = None,
+        cn_dividend_provider: Optional[CnExchangeDividendProvider] = None,
+        hkex_dividend_provider: Optional[HkexDividendProvider] = None,
+        exposure_facts_service: Optional[ExposureFactsService] = None,
     ):
         self.settings = settings
         self.warehouse = warehouse
@@ -139,6 +153,11 @@ class FundamentalService:
         self.metadata_repository = self.repositories.metadata
         self.fundamental_repository = self.repositories.fundamentals
         self.market_bar_repository = self.repositories.market_bars
+        self.exposure_facts_service = exposure_facts_service or ExposureFactsService((
+            RepositoryExposureFactSource(
+                self.market_bar_repository, self.fundamental_repository
+            ),
+        ))
         self.artifact_store = self.repositories.artifacts
         self.spot_provider = spot_provider or EastmoneySpotProvider()
         self.financial_provider = financial_provider or AkshareFinancialProvider()
@@ -161,6 +180,11 @@ class FundamentalService:
             settings.longport_access_token,
             enable_overnight=settings.longport_enable_overnight,
         )
+        self.sec_dividend_provider = sec_dividend_provider or SecDividendProvider(
+            settings.sec_user_agent
+        )
+        self.cn_dividend_provider = cn_dividend_provider or CnExchangeDividendProvider()
+        self.hkex_dividend_provider = hkex_dividend_provider or HkexDividendProvider()
         self.provider_registry = ProviderRegistry(DEFAULT_PROVIDER_MANIFESTS)
         quote_capability = (REALTIME_QUOTE,)
         self.provider_registry.bind("sina", self.sina_quote_provider, quote_capability)
@@ -259,6 +283,98 @@ class FundamentalService:
 
     def search_instruments(self, query: str, limit: int = 12) -> List[Dict[str, Any]]:
         return self.search_provider.search(query, limit)
+
+    def ingest_dividend_announcements(
+        self, announcements: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        ingested_at = utc_now()
+        rows = [
+            normalize_dividend_announcement(announcement, ingested_at)
+            for announcement in announcements
+        ]
+        count = self.fundamental_repository.upsert_dividend_announcements(rows)
+        return {"status": "success", "count": count, "ingested_at": ingested_at}
+
+    def get_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
+        if not 1991 <= fiscal_year <= 2100:
+            raise ValueError("fiscal_year must be between 1991 and 2100")
+        normalized_symbol = normalize_dividend_symbol(symbol)
+        rows = self.fundamental_repository.get_dividend_announcements(
+            normalized_symbol, fiscal_year - 1, fiscal_year
+        )
+        return dividend_summary(normalized_symbol, fiscal_year, rows)
+
+    def refresh_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
+        instrument = canonical_instrument(symbol)
+        if instrument.market == "US":
+            provider = self.sec_dividend_provider
+        elif instrument.market == "CN":
+            provider = self.cn_dividend_provider
+        elif instrument.market == "HK":
+            provider = self.hkex_dividend_provider
+        else:
+            raise ValueError(
+                "automatic official refresh is not yet available for this market"
+            )
+        announcements = provider.fetch(instrument.symbol, fiscal_year)
+        for announcement in announcements:
+            content = announcement.pop("_raw_content", None)
+            extension = announcement.pop("_raw_extension", ".bin")
+            if content is None:
+                continue
+            digest = hashlib.sha256(content).hexdigest()
+            folder = self.settings.raw_path / "dividends" / instrument.market
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{digest}{extension}"
+            if not path.exists():
+                path.write_bytes(content)
+            artifact = self._register_file_artifact(
+                path, "dividend_announcement", announcement["source_name"],
+                announcement["source_url"], "document", utc_now(),
+                {"symbol": instrument.symbol, "fiscal_year": fiscal_year},
+            )
+            announcement["raw_artifact_id"] = artifact["artifact_id"]
+        ingestion = self.ingest_dividend_announcements(announcements) if announcements else {
+            "status": "success", "count": 0, "ingested_at": utc_now()
+        }
+        return {**ingestion, "data": self.get_dividends(instrument.symbol, fiscal_year)}
+
+    def discover_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
+        instrument = canonical_instrument(symbol)
+        if instrument.market != "CN":
+            raise ValueError("third-party dividend discovery currently supports A shares")
+        ts_code = instrument.symbol
+        result = self.tushare_provider.call("dividend", {"ts_code": ts_code}, "")
+        announcements = []
+        for row in self.tushare_provider.rows(result):
+            end_date = str(row.get("end_date") or "")
+            if not end_date.startswith(str(fiscal_year)):
+                continue
+            amount = row.get("cash_div_tax")
+            announced = str(row.get("ann_date") or "")
+            if amount in (None, "", 0) or len(announced) != 8:
+                continue
+            pay_date = str(row.get("pay_date") or "")
+            announcements.append({
+                "symbol": instrument.symbol, "fiscal_year": fiscal_year,
+                "amount_per_share": str(amount), "currency": "CNY",
+                "announcement_date": (
+                    f"{announced[:4]}-{announced[4:6]}-{announced[6:]}"
+                ),
+                "expected_payment_date": (
+                    f"{pay_date[:4]}-{pay_date[4:6]}-{pay_date[6:]}"
+                    if len(pay_date) == 8 else None
+                ),
+                "confirmation_status": "unverified", "source_type": "third_party",
+                "source_name": self.tushare_provider.name,
+                "source_url": self.tushare_provider.base_url + "/",
+                "source_document_id": str(row.get("div_proc") or ""),
+                "payload": row,
+            })
+        ingestion = self.ingest_dividend_announcements(announcements) if announcements else {
+            "status": "success", "count": 0, "ingested_at": utc_now()
+        }
+        return {**ingestion, "data": self.get_dividends(instrument.symbol, fiscal_year)}
 
     def _start_run(self, job_name: str, report_period: str = "") -> tuple[str, str]:
         run_id, started_at = uuid.uuid4().hex, utc_now()

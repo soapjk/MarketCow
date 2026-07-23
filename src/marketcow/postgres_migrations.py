@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-# Authoritative BG-003 inventory. The first sixteen domains are compatible with the
+# Authoritative BG-003 inventory. The first seventeen domains are compatible with the
 # The final two domains hold runtime configuration and migration checkpoints.
 POSTGRES_TRANSACTION_DOMAINS = (
     "ingestion_runs",
@@ -20,6 +20,7 @@ POSTGRES_TRANSACTION_DOMAINS = (
     "tdx_financial_snapshot_history",
     "validation_result",
     "funnel_metrics",
+    "dividend_announcement",
     "runtime_config_version",
     "migration_checkpoint",
 )
@@ -280,6 +281,48 @@ POSTGRES_MIGRATIONS = [
         );
         CREATE INDEX IF NOT EXISTS migration_checkpoint_status_idx
             ON migration_checkpoint (status, updated_at, run_id, domain, shard);
+        """,
+    ),
+    (
+        6,
+        "source-qualified dividend announcements",
+        """
+        CREATE TABLE IF NOT EXISTS dividend_announcement (
+            dividend_id TEXT PRIMARY KEY,
+            instrument_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            market TEXT NOT NULL CHECK (market IN ('CN', 'HK', 'US')),
+            exchange TEXT NOT NULL,
+            fiscal_year INTEGER NOT NULL CHECK (fiscal_year BETWEEN 1990 AND 2100),
+            amount_per_share NUMERIC NOT NULL CHECK (amount_per_share >= 0),
+            currency TEXT NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+            announcement_date DATE NOT NULL,
+            expected_payment_date DATE,
+            confirmation_status TEXT NOT NULL
+                CHECK (confirmation_status IN ('confirmed', 'unverified')),
+            event_status TEXT NOT NULL CHECK (event_status IN ('active', 'cancelled')),
+            source_type TEXT NOT NULL CHECK (source_type IN (
+                'fund_manager', 'issuer_announcement', 'exchange_announcement',
+                'ir_filing', 'regulatory_filing', 'third_party'
+            )),
+            source_priority INTEGER NOT NULL CHECK (source_priority BETWEEN 1 AND 9),
+            source_name TEXT,
+            source_url TEXT,
+            source_document_id TEXT,
+            observed_at TIMESTAMPTZ NOT NULL,
+            ingested_at TIMESTAMPTZ NOT NULL,
+            raw_artifact_id TEXT,
+            payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            CONSTRAINT dividend_third_party_not_confirmed CHECK (
+                source_type <> 'third_party' OR confirmation_status <> 'confirmed'
+            ),
+            CONSTRAINT dividend_confirmed_has_evidence CHECK (
+                confirmation_status <> 'confirmed'
+                OR (source_url <> '' AND source_document_id <> '')
+            )
+        );
+        CREATE INDEX IF NOT EXISTS dividend_symbol_year_idx
+            ON dividend_announcement (symbol, fiscal_year, announcement_date);
         """,
     ),
 ]

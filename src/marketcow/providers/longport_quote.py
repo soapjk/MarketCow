@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterable
+from zoneinfo import ZoneInfo
 
 from ..normalize import exchange_for_symbol, instrument_id
 from .eastmoney_realtime import normalize_a_symbol
@@ -19,6 +20,7 @@ _PROXY_VARIABLES = (
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
 )
 _PROXY_ENVIRONMENT_LOCK = threading.RLock()
+_LONGPORT_WALL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class LongPortError(RuntimeError):
@@ -79,7 +81,9 @@ def _timestamp(value: Any) -> datetime | None:
         except (TypeError, ValueError, OSError) as exc:
             raise LongPortError("LongPort returned an invalid quote timestamp") from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        # The Longbridge Python SDK exposes quote timestamps as naive UTC+8
+        # wall-clock datetimes for every market, including US sessions.
+        parsed = parsed.replace(tzinfo=_LONGPORT_WALL_TIMEZONE)
     return parsed.astimezone(timezone.utc)
 
 
