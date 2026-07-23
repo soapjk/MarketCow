@@ -401,6 +401,19 @@ def create_app(
                 "code": "instrument_conflict", "message": str(exc),
             }) from exc
 
+    # Register literal instrument subpaths before the catch-all instrument id.
+    # Starlette resolves routes in declaration order.
+    @app.get("/v1/instruments/search")
+    def instrument_search(q: str, limit: int = Query(12, ge=1, le=30)):
+        query = q.strip()
+        if not query:
+            return {"count": 0, "items": []}
+        try:
+            items = service.search_instruments(query, limit)
+            return {"count": len(items), "items": items}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.get("/v1/instruments/{instrument_id}")
     def get_instrument(instrument_id: str):
         row = service.metadata_repository.get_instrument(instrument_id)
@@ -840,17 +853,6 @@ def create_app(
             ",".join(request.symbols), refresh=request.refresh,
             provider=request.provider, allow_fallback=request.allow_fallback,
         )
-
-    @app.get("/v1/instruments/search")
-    def instrument_search(q: str, limit: int = Query(12, ge=1, le=30)):
-        query = q.strip()
-        if not query:
-            return {"count": 0, "items": []}
-        try:
-            items = service.search_instruments(query, limit)
-            return {"count": len(items), "items": items}
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/quotes/{symbol}/history")
     def quote_history(

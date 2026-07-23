@@ -71,9 +71,15 @@ class Service:
         self.metadata_repository = Metadata()
         self.market_bar_repository = Bars()
         self.online_resources = None
+        self.search_results = {}
+        self.search_calls = []
 
     def close(self):
         pass
+
+    def search_instruments(self, query, limit):
+        self.search_calls.append((query, limit))
+        return self.search_results.get(query, [])[:limit]
 
 
 class MarketDataApiTest(unittest.TestCase):
@@ -122,6 +128,32 @@ class MarketDataApiTest(unittest.TestCase):
         )
         InstrumentRecord.model_validate(resolved.json())
         self.assertEqual(resolved.json()["instrument_id"], "AAPL.XNAS")
+
+    def test_literal_instrument_search_precedes_dynamic_instrument_route(self):
+        self.service.search_results["信维通信"] = [{
+            "symbol": "300136.SZ",
+            "name": "信维通信",
+            "market": "CN",
+            "exchange": "SZ",
+            "currency": "CNY",
+            "source": "fixture",
+        }]
+
+        found = self.client.get(
+            "/v1/instruments/search", params={"q": "信维通信", "limit": 5}
+        )
+        missing = self.client.get(
+            "/v1/instruments/search", params={"q": "不存在的标的", "limit": 5}
+        )
+        dynamic = self.client.get("/v1/instruments/AAPL.XNAS")
+
+        self.assertEqual(found.status_code, 200)
+        self.assertEqual(found.json()["items"][0]["symbol"], "300136.SZ")
+        self.assertEqual(found.json()["items"][0]["name"], "信维通信")
+        self.assertEqual(missing.status_code, 200)
+        self.assertEqual(missing.json(), {"count": 0, "items": []})
+        self.assertEqual(dynamic.status_code, 404)
+        self.assertEqual(dynamic.json()["detail"]["instrument_id"], "AAPL.XNAS")
 
     def test_instrument_response_decodes_postgres_text_bytes(self):
         response = self.client.put(

@@ -51,6 +51,7 @@ from .dividends import (
     normalize_dividend_announcement,
     normalize_dividend_symbol,
 )
+from .dividend_assessment import assess_dividend
 from .instruments import canonical_instrument
 from .provider_routing import (
     MARKET_BAR_HISTORY,
@@ -395,7 +396,69 @@ class FundamentalService:
         result["refresh_completed_at"] = (
             str(state["completed_at"]) if state and state.get("completed_at") else None
         )
+        result["assessment"] = self._assess_dividend(result, state)
         return result
+
+    def _dividend_asset_type(self, symbol: str) -> str:
+        instrument = canonical_instrument(symbol)
+        settings = getattr(self, "settings", None)
+        configured = {
+            normalize_dividend_symbol(value)
+            for value in getattr(settings, "dividend_etf_symbols", ())
+        }
+        if instrument.symbol in configured:
+            return "etf"
+        if instrument.market == "CN" and instrument.symbol[:2] in {
+            "15", "16", "50", "51", "52", "56", "58",
+        }:
+            return "etf"
+        try:
+            master = self.metadata_repository.get_instrument(instrument.instrument_id)
+        except (AttributeError, RuntimeError):
+            master = None
+        value = str(
+            (master or {}).get("asset_class")
+            or (master or {}).get("instrument_type")
+            or ""
+        ).lower()
+        if value in {"etf", "fund"}:
+            return "etf"
+        if value == "equity":
+            return "equity"
+        return "equity" if instrument.market in {"US", "HK", "CN"} else "unknown"
+
+    def _assess_dividend(
+        self, data: Dict[str, Any], state: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        fiscal_year = int(data["fiscal_year"])
+        settings = getattr(self, "settings", None)
+        years = max(2, getattr(settings, "dividend_likely_zero_years", 3))
+        historical_states = {}
+        for year in range(fiscal_year - years, fiscal_year):
+            candidate = self._dividend_state(data["symbol"], year)
+            if candidate:
+                historical_states[year] = candidate
+        policy_evidence = []
+        for item in getattr(settings, "dividend_zero_policy_evidence", ()):
+            try:
+                evidence_symbol = normalize_dividend_symbol(
+                    str(item.get("symbol") or "")
+                )
+            except ValueError:
+                continue
+            if evidence_symbol == data["symbol"]:
+                policy_evidence.append(item)
+        return assess_dividend(
+            symbol=data["symbol"],
+            fiscal_year=fiscal_year,
+            announced_count=int(data.get("announced_count") or 0),
+            asset_type=self._dividend_asset_type(data["symbol"]),
+            refresh_state=state,
+            historical_states=historical_states,
+            previous_complete_year=data.get("previous_complete_year"),
+            likely_zero_years=years,
+            policy_evidence=policy_evidence,
+        )
 
     @staticmethod
     def _dividend_failure_status(exc: Exception) -> str:

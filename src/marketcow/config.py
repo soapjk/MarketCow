@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -81,6 +82,9 @@ class Settings:
     dividend_batch_timeout_seconds: float = 15.0
     dividend_longport_min_interval_seconds: float = 0.65
     dividend_longport_max_attempts: int = 3
+    dividend_likely_zero_years: int = 3
+    dividend_etf_symbols: tuple[str, ...] = ()
+    dividend_zero_policy_evidence: tuple[dict[str, object], ...] = ()
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -210,6 +214,17 @@ class Settings:
             dividend_longport_max_attempts=int(os.getenv(
                 "MARKETCOW_DIVIDEND_LONGPORT_MAX_ATTEMPTS", "3"
             )),
+            dividend_likely_zero_years=max(2, int(os.getenv(
+                "MARKETCOW_DIVIDEND_LIKELY_ZERO_YEARS", "3"
+            ))),
+            dividend_etf_symbols=tuple(
+                item.strip().upper()
+                for item in os.getenv("MARKETCOW_DIVIDEND_ETF_SYMBOLS", "").split(",")
+                if item.strip()
+            ),
+            dividend_zero_policy_evidence=tuple(json.loads(os.getenv(
+                "MARKETCOW_DIVIDEND_ZERO_POLICY_EVIDENCE", "[]"
+            ))),
         )
 
     def validate_runtime_isolation(self) -> None:

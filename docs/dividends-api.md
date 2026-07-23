@@ -183,6 +183,63 @@ stale 返回并触发后台刷新。因此 Investrace 无需逐标的调用管�
 `previous_complete_year` 明确标记为 `is_estimate_basis=true`，供调用方作为估算基线；
 它不是当前年度已公告股息。
 
+## 股息判断（assessment）
+
+单标的 GET 与批量接口每个 `data` 都包含同一个 `assessment` 对象。当前契约为
+`schema=dividend-assessment-v1`、`version=1`，稳定状态如下：
+
+- `pays_dividend`：查询年度已有股息事件。
+- `confirmed_zero`：已经结束的年度存在发行人/基金管理人明确不分红政策，或权威来源
+  对该完整年度给出零事件证明。一次成功空查询永远不满足此条件；当年尚未公告也不能
+  标为 `confirmed_zero`。
+- `likely_zero`：非 ETF 标的具有连续多个完整年度的成功空查询。默认要求 3 年，可用
+  `MARKETCOW_DIVIDEND_LIKELY_ZERO_YEARS` 调整，但不得低于 2 年。
+- `not_announced`：当前年度的查询已经完成但没有公告；如果上一完整年度曾派息，
+  `previous_complete_year` 会作为调用方可选的估算基准返回。
+- `unavailable`：历史覆盖、当前公告源、资产类型支持或基金分配政策不足，或上游发生
+  限流、超时、解析/来源失败。未知值不能按 0 使用。
+
+每个判断都包含 `as_of`、`asset_type`、`confidence`、`rule`、`reason`、
+`coverage`、`evidence`、`previous_complete_year`、`schema` 和 `version`。
+`coverage.complete_years` 只列出确实以 `success_empty` 完成的年度；
+`evidence` 保留查询来源、完成状态、完成时间、结果数和解析/缓存版本。A 股 ETF
+由场内基金代码规则识别；其他 ETF 应由证券主数据标为 `etf`，或配置
+`MARKETCOW_DIVIDEND_ETF_SYMBOLS=QQQI,SOXX,DRAM`。ETF 的 Tushare/Longport 空结果
+只会得到 `unavailable/fund_distribution_coverage_or_policy_missing`，不会得到零判断。
+
+权威零股息证据可通过
+`MARKETCOW_DIVIDEND_ZERO_POLICY_EVIDENCE` 配置为 JSON 数组。每项至少应包括
+`symbol`、`kind`（`explicit_no_dividend_policy` 或
+`authoritative_zero_year`）、`fiscal_year`、`verification_status=confirmed`、
+`source`、`source_url` 和稳定的 `source_document_id`。示例：
+
+```json
+[{
+  "symbol": "BRK.B",
+  "kind": "explicit_no_dividend_policy",
+  "fiscal_year": 2025,
+  "verification_status": "confirmed",
+  "source": "issuer annual report",
+  "source_url": "https://issuer.example/annual-report",
+  "source_document_id": "annual-report-2025"
+}]
+```
+
+Investrace 的建议处理：
+
+```text
+pays_dividend  -> 使用当年事件合计
+confirmed_zero -> 计为 0
+likely_zero    -> 可计为 0，但界面标注“推定”及置信度
+not_announced  -> 可沿用 previous_complete_year 基准，并明确标注为估算
+unavailable    -> 保持 null，不得写成 0
+```
+
+持仓市值覆盖率应只把 `pays_dividend`、`confirmed_zero` 和调用方明确接受的
+`likely_zero` 纳入已覆盖分母；`not_announced` 仅在采用上一年基准时纳入，
+`unavailable` 始终计入未覆盖市值。批量中单项 assessment 失败仍沿用现有逐项错误隔离，
+不会改变请求顺序或既有股息事件字段。
+
 请求字段 `fiscal_year` 保留兼容命名：Longport 历史路径按 `payment_date` 所在年份
 筛选，等价于 `payment_year`；Tushare A 股路径按 `end_date`（发行人报告期）筛选；
 SEC 路径按申报年份筛选。调用方若要计算某自然年已入账现金，应以事件
