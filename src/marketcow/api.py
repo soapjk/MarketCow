@@ -332,8 +332,20 @@ def create_app(
         return result
 
     def instrument_record(row):
+        def decode_database_value(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8")
+            if isinstance(value, dict):
+                return {
+                    decode_database_value(key): decode_database_value(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, (list, tuple)):
+                return [decode_database_value(item) for item in value]
+            return value
+
         payload = {
-            field: row[field]
+            field: decode_database_value(row[field])
             for field in InstrumentRecord.model_fields
         }
         for field in ("tick_size", "size_increment", "lot_size"):

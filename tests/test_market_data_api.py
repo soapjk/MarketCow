@@ -123,6 +123,27 @@ class MarketDataApiTest(unittest.TestCase):
         InstrumentRecord.model_validate(resolved.json())
         self.assertEqual(resolved.json()["instrument_id"], "AAPL.XNAS")
 
+    def test_instrument_response_decodes_postgres_text_bytes(self):
+        response = self.client.put(
+            "/v1/admin/instruments/AAPL.XNAS", json=self.instrument
+        )
+        self.assertEqual(response.status_code, 200)
+        row = self.service.metadata_repository.rows["AAPL.XNAS"]
+        for field in (
+            "instrument_id", "instrument_type", "asset_class", "symbol",
+            "market", "mic", "currency", "content_hash",
+        ):
+            row[field] = row[field].encode()
+        row["provider_symbols"] = {b"longport": b"AAPL.US"}
+        row["broker_symbols"] = {b"longport": b"AAPL.US"}
+
+        fetched = self.client.get("/v1/instruments/AAPL.XNAS")
+
+        self.assertEqual(fetched.status_code, 200)
+        record = InstrumentRecord.model_validate(fetched.json())
+        self.assertEqual(record.market, "US")
+        self.assertEqual(record.provider_symbols["longport"], "AAPL.US")
+
     def test_schema_is_machine_readable(self):
         response = self.client.get("/v1/schemas/instrument")
         self.assertEqual(response.status_code, 200)
