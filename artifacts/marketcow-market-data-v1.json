@@ -1,0 +1,22 @@
+{
+  "artifact_version": 1,
+  "resource": "marketcow-market-data-contract",
+  "resource_version": "v1-phase0-phase1-candidate",
+  "schema_version": 1,
+  "scope": [
+    "instrument-master",
+    "market-event-json-schema",
+    "deterministic-canonical-history"
+  ],
+  "excluded_until_contract_acceptance": [
+    "websocket-runtime",
+    "longport-trade-stream",
+    "realtime-bar-aggregation",
+    "tradude",
+    "order-execution"
+  ],
+  "documentation": "docs/market-data-v1.md",
+  "schema_endpoint": "/v1/schemas/{contract_name}",
+  "instrument_endpoint": "/v1/instruments/{instrument_id}",
+  "history_endpoint": "/v1/canonical-bars/{instrument_id}"
+}

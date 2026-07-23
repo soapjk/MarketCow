@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-# Authoritative BG-003 inventory. The first seventeen domains are compatible with the
+# Authoritative BG-003 inventory. The first eighteen domains are compatible with the
 # The final two domains hold runtime configuration and migration checkpoints.
 POSTGRES_TRANSACTION_DOMAINS = (
     "ingestion_runs",
@@ -21,6 +21,7 @@ POSTGRES_TRANSACTION_DOMAINS = (
     "validation_result",
     "funnel_metrics",
     "dividend_announcement",
+    "instrument_master",
     "runtime_config_version",
     "migration_checkpoint",
 )
@@ -323,6 +324,36 @@ POSTGRES_MIGRATIONS = [
         );
         CREATE INDEX IF NOT EXISTS dividend_symbol_year_idx
             ON dividend_announcement (symbol, fiscal_year, announcement_date);
+        """,
+    ),
+    (
+        7,
+        "provider-neutral instrument master",
+        """
+        CREATE TABLE IF NOT EXISTS instrument_master (
+            instrument_id TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+            symbol TEXT NOT NULL,
+            market TEXT NOT NULL CHECK (market IN ('US', 'HK', 'CN')),
+            mic TEXT NOT NULL CHECK (mic ~ '^[A-Z0-9]{4}$'),
+            currency TEXT NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+            price_precision INTEGER NOT NULL CHECK (price_precision BETWEEN 0 AND 18),
+            size_precision INTEGER NOT NULL CHECK (size_precision BETWEEN 0 AND 18),
+            tick_size NUMERIC NOT NULL CHECK (tick_size > 0),
+            lot_size NUMERIC NOT NULL CHECK (lot_size > 0),
+            provider_symbols JSONB NOT NULL,
+            broker_symbols JSONB NOT NULL,
+            content_hash TEXT NOT NULL CHECK (content_hash ~ '^sha256:[0-9a-f]{64}$'),
+            updated_at TIMESTAMPTZ NOT NULL,
+            UNIQUE (symbol, mic)
+        );
+        CREATE TABLE IF NOT EXISTS instrument_symbol_mapping (
+            namespace TEXT NOT NULL,
+            external_symbol TEXT NOT NULL,
+            instrument_id TEXT NOT NULL REFERENCES instrument_master(instrument_id)
+                ON DELETE CASCADE,
+            PRIMARY KEY (namespace, external_symbol)
+        );
         """,
     ),
 ]

@@ -864,6 +864,44 @@ class ClickHouseMarketBarRepository:
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
         return self._map_canonical_rows(rows[:limit]), len(rows) > limit
 
+    def get_canonical_dataset_identity(
+        self, symbol: str, interval: str, adjustment: str, start: str, end: str
+    ) -> Dict[str, Any]:
+        start_at = self._range_time(start, "start")
+        end_at = self._range_time(end, "end")
+        result = self._query(
+            """
+            SELECT count(), max(toUnixTimestamp64Milli(ingested_at)),
+                   groupBitXor(cityHash64(
+                       toString(bar_time), toString(open), toString(high),
+                       toString(low), toString(close), toString(volume),
+                       selected_source, toString(version)
+                   ))
+            FROM market_bar_canonical FINAL
+            WHERE symbol={symbol:String} AND interval={interval:String}
+              AND adjustment={adjustment:String}
+              AND bar_time >= {start:DateTime64(3)} AND bar_time <= {end:DateTime64(3)}
+            """,
+            parameters={
+                "symbol": symbol, "interval": interval, "adjustment": adjustment,
+                "start": start_at, "end": end_at,
+            },
+        )
+        count, max_ingested_millis, fingerprint = result.result_rows[0]
+        identity = {
+            "symbol": symbol, "interval": interval, "adjustment": adjustment,
+            "start": start_at.isoformat(), "end": end_at.isoformat(),
+            "row_count": int(count), "max_ingested_millis": int(max_ingested_millis or 0),
+            "fingerprint": str(fingerprint or 0),
+        }
+        digest = hashlib.sha256(json.dumps(
+            identity, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        return {
+            **identity, "canonical_version": str(identity["max_ingested_millis"]),
+            "snapshot_id": digest[:32], "content_hash": "sha256:" + digest,
+        }
+
     def get_canonical_price_bars_cross_section_page(
         self, interval: str, adjustment: str, bar_at: str, page_size: int,
         symbols: Optional[List[str]] = None, after: Optional[str] = None,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,13 @@ from .service import FundamentalService
 from .telemetry import sanitize_text, telemetry_call
 from .health import HealthEvaluator
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
+from .market_data_contracts import (
+    CONTRACT_SCHEMAS,
+    HistoricalManifest,
+    InstrumentContract,
+    canonical_hash,
+    validate_instrument_identity,
+)
 
 
 class TushareRequest(BaseModel):
@@ -182,6 +190,138 @@ def create_app(
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=503, content=result)
         return result
+
+    @app.get("/v1/schemas/{contract_name}")
+    def contract_schema(contract_name: str):
+        model = CONTRACT_SCHEMAS.get(contract_name)
+        if model is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "unknown_contract", "contract_name": contract_name,
+            })
+        return {
+            "schema_version": 1, "contract_name": contract_name,
+            "json_schema": model.model_json_schema(),
+        }
+
+    @app.put("/v1/admin/instruments/{instrument_id}")
+    def upsert_instrument(instrument_id: str, request: InstrumentContract):
+        try:
+            if request.instrument_id != instrument_id:
+                raise ValueError("path and payload instrument_id must match")
+            validate_instrument_identity(request)
+            payload = request.model_dump(mode="json")
+            row = {
+                **payload, "content_hash": canonical_hash(payload),
+                "updated_at": clock().astimezone(timezone.utc).isoformat(),
+            }
+            saved = service.metadata_repository.upsert_instrument(row)
+            return {**payload, "content_hash": saved["content_hash"]}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "instrument_conflict", "message": str(exc),
+            }) from exc
+
+    @app.get("/v1/instruments/{instrument_id}")
+    def get_instrument(instrument_id: str):
+        row = service.metadata_repository.get_instrument(instrument_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "instrument_not_found", "instrument_id": instrument_id,
+            })
+        return row
+
+    @app.get("/v1/instruments:resolve")
+    def resolve_instrument(namespace: str, external_symbol: str):
+        row = service.metadata_repository.find_instrument_by_mapping(
+            namespace, external_symbol
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "instrument_mapping_not_found",
+                "namespace": namespace, "external_symbol": external_symbol,
+            })
+        return row
+
+    @app.get("/v1/canonical-bars/{instrument_id}")
+    def canonical_bars_v1(
+        instrument_id: str,
+        start: str,
+        end: str,
+        interval: str,
+        adjustment: str = Query(pattern="^(raw|adjusted)$"),
+        page_size: int = Query(1000, ge=1, le=5000),
+        cursor: Optional[str] = None,
+    ):
+        instrument = service.metadata_repository.get_instrument(instrument_id)
+        if instrument is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "instrument_not_found", "instrument_id": instrument_id,
+            })
+        try:
+            start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if start_at.tzinfo is None or end_at.tzinfo is None or start_at > end_at:
+                raise ValueError("start/end must be ordered timezone-aware timestamps")
+            start_utc = start_at.astimezone(timezone.utc).isoformat()
+            end_utc = end_at.astimezone(timezone.utc).isoformat()
+            identity = service.market_bar_repository.get_canonical_dataset_identity(
+                instrument["symbol"], interval, adjustment, start_utc, end_utc
+            )
+            binding = {
+                "instrument_id": instrument_id, "start": start_utc, "end": end_utc,
+                "interval": interval, "adjustment": adjustment,
+                "page_size": page_size, "snapshot_id": identity["snapshot_id"],
+            }
+            secret = load_or_create_secret(
+                settings.market_bar_cursor_secret, settings.storage_root
+            )
+            now_epoch = int(clock().timestamp())
+            after = None if cursor is None else decode_cursor(
+                cursor, binding, now_epoch,
+                settings.market_bar_cursor_ttl_seconds, secret,
+            )
+            if after is not None and not isinstance(after, int):
+                raise ValueError("canonical cursor position is invalid")
+            rows, has_more = service.market_bar_repository.get_price_bars_page(
+                instrument["symbol"], interval, adjustment, start_utc, end_utc,
+                page_size, after,
+            )
+            bars = []
+            for row in rows:
+                bars.append({
+                    **row, "schema_version": 1, "instrument_id": instrument_id,
+                    **{
+                        key: format(Decimal(str(row[key])), "f")
+                        for key in ("open", "high", "low", "close", "volume")
+                    },
+                })
+            next_cursor = None
+            if has_more and rows:
+                next_cursor = encode_cursor(
+                    binding, int(rows[-1]["timestamp"]), now_epoch, secret
+                )
+            manifest = HistoricalManifest(
+                dataset_id=canonical_hash({
+                    "instrument_id": instrument_id, "interval": interval,
+                    "adjustment": adjustment, "start": start_utc, "end": end_utc,
+                })[7:31],
+                snapshot_id=identity["snapshot_id"],
+                canonical_version=identity["canonical_version"],
+                instruments=[instrument_id], interval=interval,
+                adjustment=adjustment, start=start_utc, end=end_utc,
+                row_count=identity["row_count"],
+                content_hash=identity["content_hash"],
+            )
+            return {
+                "schema_version": 1, "manifest": manifest.model_dump(mode="json"),
+                "count": len(bars), "bars": bars, "page_size": page_size,
+                "next_cursor": next_cursor, "truncated": has_more,
+                "provenance": {"layer": "canonical", "backend": "clickhouse"},
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={
+                "code": "invalid_canonical_query", "message": str(exc),
+            }) from exc
 
     def provider_http_error(exc: ProviderRoutingError) -> HTTPException:
         status = 422 if isinstance(exc, ProviderNotSupported) else 503

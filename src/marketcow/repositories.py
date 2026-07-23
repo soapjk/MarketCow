@@ -33,6 +33,11 @@ class MetadataRepository(Protocol):
         self, date_from: str, date_to: str, market: str = "",
         symbols: Optional[Sequence[str]] = None, limit: int = 50,
     ) -> List[Dict[str, Any]]: ...
+    def upsert_instrument(self, row: Dict[str, Any]) -> Dict[str, Any]: ...
+    def get_instrument(self, instrument_id: str) -> Optional[Dict[str, Any]]: ...
+    def find_instrument_by_mapping(
+        self, namespace: str, external_symbol: str
+    ) -> Optional[Dict[str, Any]]: ...
 
 
 @runtime_checkable
@@ -141,6 +146,9 @@ class MarketBarRepository(Protocol):
         sources: Optional[Sequence[str]] = None,
         after: Optional[tuple[int, str]] = None,
     ) -> tuple[List[Dict[str, Any]], bool]: ...
+    def get_canonical_dataset_identity(
+        self, symbol: str, interval: str, adjustment: str, start: str, end: str
+    ) -> Dict[str, Any]: ...
 
 
 @runtime_checkable

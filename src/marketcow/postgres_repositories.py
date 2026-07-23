@@ -308,6 +308,86 @@ class PostgresRepository(_PostgresControlPlaneRepository):
     def __init__(self, database: PostgresDatabase) -> None:
         self.database = database
 
+    def upsert_instrument(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        mappings = {
+            **{f"provider:{key}": value for key, value in row["provider_symbols"].items()},
+            **{f"broker:{key}": value for key, value in row["broker_symbols"].items()},
+        }
+        with self.database.connection() as connection:
+            for namespace, external_symbol in mappings.items():
+                conflict = connection.execute(
+                    """
+                    SELECT instrument_id FROM instrument_symbol_mapping
+                    WHERE namespace = %s AND external_symbol = %s
+                    """,
+                    (namespace, external_symbol),
+                ).fetchone()
+                if conflict and conflict["instrument_id"] != row["instrument_id"]:
+                    raise ValueError(
+                        f"symbol mapping conflict for {namespace}:{external_symbol}"
+                    )
+            saved = connection.execute(
+                """
+                INSERT INTO instrument_master
+                    (instrument_id, schema_version, symbol, market, mic, currency,
+                     price_precision, size_precision, tick_size, lot_size,
+                     provider_symbols, broker_symbols, content_hash, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (instrument_id) DO UPDATE SET
+                    schema_version=EXCLUDED.schema_version, symbol=EXCLUDED.symbol,
+                    market=EXCLUDED.market, mic=EXCLUDED.mic,
+                    currency=EXCLUDED.currency,
+                    price_precision=EXCLUDED.price_precision,
+                    size_precision=EXCLUDED.size_precision,
+                    tick_size=EXCLUDED.tick_size, lot_size=EXCLUDED.lot_size,
+                    provider_symbols=EXCLUDED.provider_symbols,
+                    broker_symbols=EXCLUDED.broker_symbols,
+                    content_hash=EXCLUDED.content_hash, updated_at=EXCLUDED.updated_at
+                RETURNING *
+                """,
+                (
+                    row["instrument_id"], row["schema_version"], row["symbol"],
+                    row["market"], row["mic"], row["currency"],
+                    row["price_precision"], row["size_precision"], row["tick_size"],
+                    row["lot_size"], Jsonb(row["provider_symbols"]),
+                    Jsonb(row["broker_symbols"]), row["content_hash"], row["updated_at"],
+                ),
+            ).fetchone()
+            connection.execute(
+                "DELETE FROM instrument_symbol_mapping WHERE instrument_id = %s",
+                (row["instrument_id"],),
+            )
+            for namespace, external_symbol in mappings.items():
+                connection.execute(
+                    """
+                    INSERT INTO instrument_symbol_mapping
+                        (namespace, external_symbol, instrument_id)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (namespace, external_symbol, row["instrument_id"]),
+                )
+            return saved
+
+    def get_instrument(self, instrument_id: str) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM instrument_master WHERE instrument_id = %s",
+                (instrument_id,),
+            ).fetchone()
+
+    def find_instrument_by_mapping(
+        self, namespace: str, external_symbol: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                SELECT i.* FROM instrument_master i
+                JOIN instrument_symbol_mapping m USING (instrument_id)
+                WHERE m.namespace = %s AND m.external_symbol = %s
+                """,
+                (namespace, external_symbol),
+            ).fetchone()
+
     def replace_fundamentals(self, report_period: str, rows: List[Dict[str, Any]]) -> int:
         if not rows:
             with self.database.connection() as connection:
