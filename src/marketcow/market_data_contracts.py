@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Annotated, Any, Dict, Literal, Optional, Union
@@ -220,6 +221,96 @@ class ErrorPayload(StrictModel):
     retryable: bool
 
 
+class SubscribeRequest(StrictModel):
+    type: Literal["subscribe"]
+    request_id: str = Field(min_length=1)
+    instruments: list[str] = Field(min_length=1, max_length=500)
+    data_types: list[Literal["quote", "trade", "bar", "order_book"]] = Field(
+        min_length=1, max_length=4
+    )
+    bar_types: list[Literal["1-MINUTE"]] = Field(default_factory=list, max_length=1)
+    book_depth: Literal[1] = 1
+    resume_after: Optional[int] = Field(default=None, ge=0)
+    resume_stream_id: Optional[str] = Field(default=None, min_length=1)
+
+    @field_validator("instruments")
+    @classmethod
+    def instrument_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("instruments must be unique")
+        for value in values:
+            if not re.fullmatch(INSTRUMENT_ID_PATTERN, value):
+                raise ValueError("instrument id is invalid")
+        return values
+
+    @field_validator("data_types")
+    @classmethod
+    def unique_types(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("data_types must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def bars(self):
+        if ("bar" in self.data_types) != bool(self.bar_types):
+            raise ValueError("bar data_type requires exactly one 1-MINUTE bar_type")
+        if (self.resume_after is None) != (self.resume_stream_id is None):
+            raise ValueError("resume_after and resume_stream_id must be supplied together")
+        return self
+
+
+class UnsubscribeRequest(StrictModel):
+    type: Literal["unsubscribe"]
+    request_id: str = Field(min_length=1)
+    instruments: list[str] = Field(min_length=1, max_length=500)
+    data_types: list[Literal["quote", "trade", "bar", "order_book"]] = Field(
+        min_length=1, max_length=4
+    )
+
+
+ClientCommand = Annotated[
+    Union[SubscribeRequest, UnsubscribeRequest],
+    Field(discriminator="type"),
+]
+CLIENT_COMMAND_ADAPTER = TypeAdapter(ClientCommand)
+
+
+class SubscriptionEntry(StrictModel):
+    instrument_id: str = Field(pattern=INSTRUMENT_ID_PATTERN)
+    data_type: Literal["quote", "trade", "bar", "order_book"]
+
+
+class SubscriptionAck(ContractModel):
+    type: Literal["ack"]
+    action: Literal["subscribe", "unsubscribe"]
+    request_id: str
+    stream_id: str
+    sequence: int = Field(ge=0)
+    subscriptions: list[SubscriptionEntry]
+    resume: Optional[Dict[str, Optional[int]]] = None
+
+
+class StreamHeartbeat(ContractModel):
+    type: Literal["heartbeat"]
+    stream_id: str
+    last_sequence: int = Field(ge=0)
+    server_time: str
+
+    @field_validator("server_time")
+    @classmethod
+    def timestamp(cls, value: str) -> str:
+        return utc(value)
+
+
+class StreamError(ContractModel):
+    type: Literal["error"]
+    request_id: Optional[str]
+    stream_id: str
+    code: str
+    message: str
+    retryable: bool
+
+
 class EnvelopeBase(ContractModel):
     stream_id: str = Field(min_length=1)
     sequence: int = Field(ge=1)
@@ -414,6 +505,11 @@ CONTRACT_SCHEMAS: Dict[str, Any] = {
     "stream_status": StreamStatusPayload,
     "heartbeat": HeartbeatPayload,
     "error": ErrorPayload,
+    "subscribe": SubscribeRequest,
+    "unsubscribe": UnsubscribeRequest,
+    "subscription_ack": SubscriptionAck,
+    "stream_heartbeat": StreamHeartbeat,
+    "stream_error": StreamError,
     "historical_manifest": HistoricalManifest,
     "historical_bar": HistoricalBar,
     "canonical_bar_page": CanonicalBarPage,

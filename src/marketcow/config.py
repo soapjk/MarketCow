@@ -68,6 +68,9 @@ class Settings:
     quote_refresh_workers: int = 8
     quote_persistence_queue_size: int = 256
     quote_persistence_shutdown_seconds: float = 5.0
+    realtime_queue_capacity: int = 256
+    realtime_replay_capacity: int = 4096
+    realtime_heartbeat_seconds: float = 15.0
     sec_user_agent: str = "MarketCow toczx@outlook.com"
 
     @classmethod
@@ -159,6 +162,15 @@ class Settings:
             quote_persistence_shutdown_seconds=float(os.getenv(
                 "MARKETCOW_QUOTE_PERSISTENCE_SHUTDOWN_SECONDS", "5.0"
             )),
+            realtime_queue_capacity=int(os.getenv(
+                "MARKETCOW_REALTIME_QUEUE_CAPACITY", "256"
+            )),
+            realtime_replay_capacity=int(os.getenv(
+                "MARKETCOW_REALTIME_REPLAY_CAPACITY", "4096"
+            )),
+            realtime_heartbeat_seconds=float(os.getenv(
+                "MARKETCOW_REALTIME_HEARTBEAT_SECONDS", "15"
+            )),
             sec_user_agent=os.getenv(
                 "MARKETCOW_SEC_USER_AGENT", "MarketCow toczx@outlook.com"
             ).strip(),
@@ -214,6 +226,12 @@ class Settings:
             raise ValueError("quote persistence queue size must be between 1 and 10000")
         if not 0.1 <= self.quote_persistence_shutdown_seconds <= 30:
             raise ValueError("quote persistence shutdown must be between 0.1 and 30 seconds")
+        if not 1 <= self.realtime_queue_capacity <= 10000:
+            raise ValueError("realtime queue capacity must be between 1 and 10000")
+        if not 1 <= self.realtime_replay_capacity <= 100000:
+            raise ValueError("realtime replay capacity must be between 1 and 100000")
+        if not 0.1 <= self.realtime_heartbeat_seconds <= 60:
+            raise ValueError("realtime heartbeat must be between 0.1 and 60 seconds")
 
     @staticmethod
     def _loopback(host: str) -> bool:

@@ -1,6 +1,6 @@
 # MarketCow Market Data Contract v1
 
-Status: Phase 0/Phase 1 integration candidate. Schema version: `1`.
+Status: Phase 0/Phase 1 frozen; Phase 2 local candidate. Schema version: `1`.
 
 ## Responsibility boundary
 
@@ -105,8 +105,8 @@ window-start range. Bars are strictly ascending without duplicate positions, and
 - One canonical row has one selected source; a row cannot mix providers.
 - Revisions change canonical content identity and invalidate prior snapshot cursors.
 
-Realtime 1-minute session, extended-hours, late-event and provider-switch rules remain
-Phase 2 work and must not be guessed by consumers before the WebSocket contract is accepted.
+Realtime lifecycle, recovery and bar rules are defined in
+[`realtime-market-data-v1.md`](realtime-market-data-v1.md).
 
 ## Examples
 

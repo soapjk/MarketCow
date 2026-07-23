@@ -1,22 +1,23 @@
 {
   "artifact_version": 1,
   "resource": "marketcow-market-data-contract",
-  "resource_version": "v1-phase0-phase1-candidate.3",
+  "resource_version": "v1-phase2-runtime-candidate",
   "schema_version": 1,
   "scope": [
     "instrument-master",
     "market-event-json-schema",
-    "deterministic-canonical-history"
+    "deterministic-canonical-history",
+    "longport-realtime-websocket",
+    "realtime-one-minute-bars"
   ],
-  "excluded_until_contract_acceptance": [
-    "websocket-runtime",
-    "longport-trade-stream",
-    "realtime-bar-aggregation",
+  "excluded": [
     "tradude",
     "order-execution"
   ],
   "documentation": "docs/market-data-v1.md",
   "schema_endpoint": "/v1/schemas/{contract_name}",
   "instrument_endpoint": "/v1/instruments/{instrument_id}",
-  "history_endpoint": "/v1/canonical-bars/{instrument_id}"
+  "history_endpoint": "/v1/canonical-bars/{instrument_id}",
+  "websocket_endpoint": "/v1/market-data/stream",
+  "realtime_documentation": "docs/realtime-market-data-v1.md"
 }

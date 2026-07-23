@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "marketcow"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-first API that turns free market sources into traceable financial data"
 readme = "README.md"
 requires-python = ">=3.11"

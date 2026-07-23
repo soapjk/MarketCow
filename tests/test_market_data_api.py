@@ -130,7 +130,11 @@ class MarketDataApiTest(unittest.TestCase):
         self.assertIn("required", response.json()["json_schema"])
         event = self.client.get("/v1/schemas/event").json()["json_schema"]
         self.assertIn("oneOf", event)
-        for name in ("historical_manifest", "historical_bar", "canonical_bar_page"):
+        for name in (
+            "historical_manifest", "historical_bar", "canonical_bar_page",
+            "subscribe", "unsubscribe", "subscription_ack",
+            "stream_heartbeat", "stream_error",
+        ):
             self.assertEqual(self.client.get(f"/v1/schemas/{name}").status_code, 200)
 
     def test_history_manifest_pagination_is_snapshot_bound(self):

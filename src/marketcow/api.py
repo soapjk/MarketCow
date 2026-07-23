@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__
 from .config import Settings
@@ -28,7 +29,10 @@ from .market_data_contracts import (
     InstrumentRecord,
     canonical_hash,
     validate_instrument_identity,
+    CLIENT_COMMAND_ADAPTER,
 )
+from .realtime import LongPortRealtimeProvider, RealtimeHub
+from .providers.longport_quote import LongPortError
 
 
 class TushareRequest(BaseModel):
@@ -85,14 +89,115 @@ def create_app(
     settings: Optional[Settings] = None,
     service: Optional[FundamentalService] = None,
     now_provider: Optional[Callable[[], datetime]] = None,
+    realtime_hub: Optional[RealtimeHub] = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
     app.state.service = service
-    app.add_event_handler("shutdown", service.close)
     clock = now_provider or (lambda: datetime.now(timezone.utc))
+    provider = LongPortRealtimeProvider(
+        settings.longport_app_key, settings.longport_app_secret,
+        settings.longport_access_token,
+        enable_overnight=settings.longport_enable_overnight,
+    )
+    metadata_repository = getattr(service, "metadata_repository", None)
+    instrument_lookup = (
+        metadata_repository.get_instrument
+        if metadata_repository is not None
+        else lambda _instrument_id: None
+    )
+
+    async def persist_realtime_bar(event: dict[str, Any]) -> None:
+        instrument = instrument_lookup(event["instrument_id"])
+        if instrument is None:
+            raise ValueError("realtime bar instrument is unavailable")
+        payload = event["payload"]
+        bar = {
+            "bar_at": payload["window_start"],
+            "open": float(payload["open"]), "high": float(payload["high"]),
+            "low": float(payload["low"]), "close": float(payload["close"]),
+            "volume": float(payload["volume"]), "amount": None,
+            "observed_at": payload["window_end"],
+        }
+        await asyncio.to_thread(
+            service.market_bar_repository.upsert_price_bars,
+            instrument["symbol"], "1m", "raw", event["source"],
+            clock().astimezone(timezone.utc).isoformat(), [bar],
+            {"stream_id": app.state.realtime_hub.stream_id},
+        )
+
+    hub = realtime_hub or RealtimeHub(
+        instrument_lookup, provider,
+        queue_capacity=settings.realtime_queue_capacity,
+        replay_capacity=settings.realtime_replay_capacity,
+        clock=clock, persist_bar=persist_realtime_bar,
+    )
+    app.state.realtime_hub = hub
+
+    async def shutdown() -> None:
+        try:
+            await hub.close()
+        finally:
+            service.close()
+
+    app.add_event_handler("shutdown", shutdown)
     health_evaluator = HealthEvaluator(wall_clock=clock)
+
+    @app.websocket("/v1/market-data/stream")
+    async def market_data_stream(websocket: WebSocket):
+        await websocket.accept()
+        client = hub.new_client()
+        receive = asyncio.create_task(websocket.receive_json())
+        outgoing = asyncio.create_task(client.queue.get())
+        try:
+            while True:
+                if client.closed_reason is not None:
+                    await websocket.close(code=1013, reason=client.closed_reason)
+                    return
+                done, _pending = await asyncio.wait(
+                    {receive, outgoing},
+                    timeout=settings.realtime_heartbeat_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    await websocket.send_json(hub.heartbeat())
+                    continue
+                if outgoing in done:
+                    await websocket.send_json(outgoing.result())
+                    outgoing = asyncio.create_task(client.queue.get())
+                if receive not in done:
+                    continue
+                message = receive.result()
+                receive = asyncio.create_task(websocket.receive_json())
+                try:
+                    command = CLIENT_COMMAND_ADAPTER.validate_python(message)
+                    response = (
+                        await hub.subscribe(client, command)
+                        if command.type == "subscribe"
+                        else await hub.unsubscribe(client, command)
+                    )
+                except (ValidationError, ValueError, RuntimeError, LongPortError) as exc:
+                    code = "invalid_request"
+                    if str(exc) == "gap_unrecoverable":
+                        code = "gap_unrecoverable"
+                    elif isinstance(exc, LongPortError):
+                        code = "provider_unavailable"
+                    response = {
+                        "type": "error", "schema_version": 1,
+                        "request_id": message.get("request_id"),
+                        "code": code, "message": str(exc)[:300],
+                        "retryable": code == "provider_unavailable",
+                        "stream_id": hub.stream_id,
+                    }
+                await websocket.send_json(response)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        finally:
+            for task in (receive, outgoing):
+                task.cancel()
+            await asyncio.gather(receive, outgoing, return_exceptions=True)
+            await hub.remove_client(client)
 
     def storage_health() -> Dict[str, Any]:
         resources = getattr(service, "online_resources", None)
