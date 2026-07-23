@@ -327,7 +327,7 @@ POSTGRES_MIGRATIONS = [
         """,
     ),
     (
-        7,
+        11,
         "provider-neutral instrument master",
         """
         CREATE TABLE IF NOT EXISTS instrument_master (

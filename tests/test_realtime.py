@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -386,6 +388,46 @@ class RealtimeHubTest(unittest.IsolatedAsyncioTestCase):
 
 
 class LongPortRealtimeProviderTest(unittest.TestCase):
+    def test_sdk_subscribe_and_unsubscribe_bypass_proxy_environment(self):
+        direct_depth = 0
+
+        @contextmanager
+        def direct_environment():
+            nonlocal direct_depth
+            direct_depth += 1
+            try:
+                yield
+            finally:
+                direct_depth -= 1
+
+        class Context:
+            def set_on_depth(self, callback):
+                self.depth_callback = callback
+
+            def set_on_trades(self, callback):
+                self.trade_callback = callback
+
+            def subscribe(self, _symbols, _sub_types):
+                self.assert_direct()
+
+            def unsubscribe(self, _symbols, _sub_types):
+                self.assert_direct()
+
+            @staticmethod
+            def assert_direct():
+                if direct_depth != 1:
+                    raise AssertionError("SDK network call used proxy environment")
+
+        provider = LongPortRealtimeProvider(
+            "key", "secret", "token", context_factory=Context
+        )
+        with patch(
+            "marketcow.realtime._direct_connection_environment",
+            direct_environment,
+        ):
+            provider.subscribe({"AAPL.XNAS": "AAPL.US"}, {"quote"})
+            provider.unsubscribe({("AAPL.XNAS", "quote")})
+
     def test_depth_and_trade_callbacks_normalize_contract_payloads(self):
         class Context:
             def __init__(self):

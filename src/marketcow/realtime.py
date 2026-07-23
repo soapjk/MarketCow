@@ -607,15 +607,17 @@ class LongPortRealtimeProvider:
                             new_trade.append(symbol)
                 subscribed_depth = False
                 try:
-                    if new_depth:
-                        context.subscribe(sorted(new_depth), [SubType.Depth])
-                        subscribed_depth = True
-                    if new_trade:
-                        context.subscribe(sorted(new_trade), [SubType.Trade])
+                    with _direct_connection_environment():
+                        if new_depth:
+                            context.subscribe(sorted(new_depth), [SubType.Depth])
+                            subscribed_depth = True
+                        if new_trade:
+                            context.subscribe(sorted(new_trade), [SubType.Trade])
                 except Exception:
                     if subscribed_depth:
                         try:
-                            context.unsubscribe(sorted(new_depth), [SubType.Depth])
+                            with _direct_connection_environment():
+                                context.unsubscribe(sorted(new_depth), [SubType.Depth])
                         except Exception:
                             pass
                     raise
@@ -661,17 +663,19 @@ class LongPortRealtimeProvider:
                         ).append(symbol)
             unsubscribed_depth = False
             try:
-                if self._context is not None and unsubscribe_depth:
-                    self._context.unsubscribe(sorted(unsubscribe_depth), [SubType.Depth])
-                    unsubscribed_depth = True
-                if self._context is not None and unsubscribe_trade:
-                    self._context.unsubscribe(sorted(unsubscribe_trade), [SubType.Trade])
+                with _direct_connection_environment():
+                    if self._context is not None and unsubscribe_depth:
+                        self._context.unsubscribe(sorted(unsubscribe_depth), [SubType.Depth])
+                        unsubscribed_depth = True
+                    if self._context is not None and unsubscribe_trade:
+                        self._context.unsubscribe(sorted(unsubscribe_trade), [SubType.Trade])
             except Exception:
                 if unsubscribed_depth:
                     try:
-                        self._context.subscribe(
-                            sorted(unsubscribe_depth), [SubType.Depth]
-                        )
+                        with _direct_connection_environment():
+                            self._context.subscribe(
+                                sorted(unsubscribe_depth), [SubType.Depth]
+                            )
                     except Exception:
                         pass
                 raise
