@@ -117,6 +117,10 @@ class ServiceRoutingTest(unittest.TestCase):
                 quote = client.get("/v1/quotes?symbols=AAPL&refresh=false")
                 self.assertEqual(quote.status_code, 200)
                 self.assertEqual(quote.json()["items"][0]["symbol"], "AAPL")
+                exposure = client.get("/v1/exposure-facts/AAPL")
+                self.assertEqual(exposure.status_code, 200)
+                self.assertEqual(exposure.json()["schema"], "marketcow.exposure-facts.v1")
+                self.assertEqual(exposure.json()["symbol"], "AAPL")
                 health = client.get("/v1/health")
                 self.assertEqual(
                     health.json()["database"],

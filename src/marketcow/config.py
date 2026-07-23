@@ -68,6 +68,7 @@ class Settings:
     quote_refresh_workers: int = 8
     quote_persistence_queue_size: int = 256
     quote_persistence_shutdown_seconds: float = 5.0
+    sec_user_agent: str = "MarketCow toczx@outlook.com"
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -158,6 +159,9 @@ class Settings:
             quote_persistence_shutdown_seconds=float(os.getenv(
                 "MARKETCOW_QUOTE_PERSISTENCE_SHUTDOWN_SECONDS", "5.0"
             )),
+            sec_user_agent=os.getenv(
+                "MARKETCOW_SEC_USER_AGENT", "MarketCow toczx@outlook.com"
+            ).strip(),
         )
 
     def validate_runtime_isolation(self) -> None:

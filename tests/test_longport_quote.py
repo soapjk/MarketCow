@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from marketcow.providers.contracts import validate_realtime_quote
 from marketcow.providers.longport_quote import (
@@ -112,6 +113,62 @@ class LongPortQuoteProviderTest(unittest.TestCase):
         result = provider.fetch_quote("AAPL")
         self.assertEqual(result["price"], 103.5)
         self.assertEqual(result["session"], "post_market")
+
+    def test_naive_sdk_timestamp_is_interpreted_as_utc_plus_eight(self):
+        context = FakeContext([
+            quote(
+                "700.HK", "448",
+                timestamp=datetime(2026, 7, 23, 10, 50, 21),
+            ),
+        ])
+        provider = LongPortQuoteProvider(
+            "key", "secret", "token", context_factory=lambda: context,
+        )
+
+        result = provider.fetch_quote("0700.HK")
+
+        self.assertEqual(result["quote_at"], "2026-07-23T02:50:21+00:00")
+        self.assertEqual(result["market"], "HK")
+        self.assertEqual(result["currency"], "HKD")
+
+    def test_naive_us_extended_session_uses_same_sdk_wall_timezone(self):
+        post = SimpleNamespace(
+            last_done=Decimal("103.5"),
+            timestamp=datetime(2026, 7, 23, 7, 59, 59),
+        )
+        context = FakeContext([
+            quote(
+                "AAPL.US",
+                timestamp=datetime(2026, 7, 23, 4, 0),
+                post_market_quote=post,
+            ),
+        ])
+        provider = LongPortQuoteProvider(
+            "key", "secret", "token", context_factory=lambda: context,
+        )
+
+        result = provider.fetch_quote("AAPL")
+
+        self.assertEqual(result["quote_at"], "2026-07-22T23:59:59+00:00")
+        self.assertEqual(result["session"], "post_market")
+
+    def test_aware_sdk_timestamp_preserves_the_instant(self):
+        context = FakeContext([
+            quote(
+                "700.HK", "448",
+                timestamp=datetime(
+                    2026, 7, 23, 10, 50, 21,
+                    tzinfo=ZoneInfo("Asia/Hong_Kong"),
+                ),
+            ),
+        ])
+        provider = LongPortQuoteProvider(
+            "key", "secret", "token", context_factory=lambda: context,
+        )
+
+        result = provider.fetch_quote("0700.HK")
+
+        self.assertEqual(result["quote_at"], "2026-07-23T02:50:21+00:00")
 
     def test_missing_credentials_and_sdk_errors_are_bounded_and_redacted(self):
         with self.assertRaisesRegex(LongPortError, "credentials are not configured"):

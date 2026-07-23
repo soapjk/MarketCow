@@ -954,6 +954,57 @@ class PostgresRepository(_PostgresControlPlaneRepository):
         with self.database.connection() as connection:
             return list(connection.execute(query, params).fetchall())
 
+    def upsert_dividend_announcements(self, rows: List[Dict[str, Any]]) -> int:
+        columns = [
+            "dividend_id", "instrument_id", "symbol", "market", "exchange",
+            "fiscal_year", "amount_per_share", "currency",
+            "announcement_date", "expected_payment_date", "confirmation_status",
+            "event_status",
+            "source_type", "source_priority", "source_name", "source_url", "source_document_id",
+            "observed_at", "ingested_at", "raw_artifact_id", "payload_json",
+        ]
+        assignments = [column for column in columns if column != "dividend_id"]
+        statement = sql.SQL(
+            "INSERT INTO dividend_announcement ({columns}) VALUES ({values}) "
+            "ON CONFLICT (dividend_id) DO UPDATE SET {assignments} "
+            "WHERE EXCLUDED.source_priority < dividend_announcement.source_priority "
+            "OR (EXCLUDED.source_priority = dividend_announcement.source_priority "
+            "AND (EXCLUDED.observed_at > dividend_announcement.observed_at "
+            "OR (EXCLUDED.confirmation_status = 'confirmed' "
+            "AND dividend_announcement.confirmation_status = 'unverified')))"
+        ).format(
+            columns=sql.SQL(", ").join(map(sql.Identifier, columns)),
+            values=sql.SQL(", ").join(sql.Placeholder() for _ in columns),
+            assignments=sql.SQL(", ").join(
+                sql.SQL("{} = EXCLUDED.{}").format(
+                    sql.Identifier(column), sql.Identifier(column)
+                )
+                for column in assignments
+            ),
+        )
+        with self.database.connection() as connection:
+            for row in rows:
+                values = [
+                    Jsonb(row.get(column, {})) if column == "payload_json"
+                    else row.get(column)
+                    for column in columns
+                ]
+                connection.execute(statement, values)
+        return len(rows)
+
+    def get_dividend_announcements(
+        self, symbol: str, fiscal_year_from: int, fiscal_year_to: int
+    ) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                """
+                SELECT * FROM dividend_announcement
+                WHERE symbol = %s AND fiscal_year BETWEEN %s AND %s
+                ORDER BY fiscal_year, announcement_date, dividend_id
+                """,
+                (symbol, fiscal_year_from, fiscal_year_to),
+            ).fetchall())
+
 
 PostgresMetadataRepository = PostgresRepository
 PostgresFundamentalRepository = PostgresRepository

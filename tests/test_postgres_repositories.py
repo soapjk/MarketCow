@@ -22,8 +22,8 @@ from marketcow.repositories import ControlPlaneRepository
 
 class PostgresDomainInventoryTest(unittest.TestCase):
     def test_bg003_inventory_is_explicit_and_complete(self):
-        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 18)
-        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 18)
+        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 19)
+        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 19)
         self.assertEqual(
             POSTGRES_TRANSACTION_DOMAINS[-2:],
             ("runtime_config_version", "migration_checkpoint"),
