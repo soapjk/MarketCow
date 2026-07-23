@@ -23,6 +23,14 @@ _PAY_DATE = re.compile(
     r"(?:现金红利发放日|红利发放日|派发日|现金红利将于)[：:\s]*"
     r"(\d{4})\s*[年/-]\s*(\d{1,2})\s*[月/-]\s*(\d{1,2})\s*日?"
 )
+_RECORD_DATE = re.compile(
+    r"(?:股权登记日|权益登记日)[：:\s]*(\d{4})\s*[年/-]\s*"
+    r"(\d{1,2})\s*[月/-]\s*(\d{1,2})\s*日?"
+)
+_EX_DATE = re.compile(
+    r"(?:除权除息日|除息日)[：:\s]*(\d{4})\s*[年/-]\s*"
+    r"(\d{1,2})\s*[月/-]\s*(\d{1,2})\s*日?"
+)
 _YEAR = re.compile(
     r"(20\d{2})\s*年?(?:年度|中期|半年度|前三季度)(?:权益分派|利润分配)"
 )
@@ -74,6 +82,11 @@ def parse_cn_implementation_announcement(
     payment_date = datetime(
         int(parts[0]), int(parts[1]), int(parts[2])
     ).date().isoformat()
+    def matched_iso(pattern: re.Pattern[str]) -> str | None:
+        match = pattern.search(compact)
+        if match is None:
+            return None
+        return datetime(*(int(part) for part in match.groups())).date().isoformat()
     period_match = _PERIOD.search(compact)
     period = period_match.group(1) if period_match else "unspecified"
     event_key = f"{symbol}|{year_match.group(1)}|{period}"
@@ -82,6 +95,9 @@ def parse_cn_implementation_announcement(
         "symbol": symbol, "fiscal_year": int(year_match.group(1)),
         "amount_per_share": str(Decimal(amount_match.group(1)) / divisor),
         "currency": "CNY", "announcement_date": announcement_date,
+        "record_date": matched_iso(_RECORD_DATE),
+        "ex_date": matched_iso(_EX_DATE),
+        "payment_date": payment_date,
         "expected_payment_date": payment_date,
         "confirmation_status": "confirmed",
         "source_type": "exchange_announcement", "source_name": source_name,

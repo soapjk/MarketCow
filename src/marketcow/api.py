@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import Settings
+from .dividends import normalize_dividend_symbol
 from .market_bar_cursor import decode_cursor, encode_cursor, load_or_create_secret
 from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
@@ -55,6 +56,10 @@ class DividendAnnouncementInput(BaseModel):
     currency: str
     announcement_date: str
     expected_payment_date: Optional[str] = None
+    record_date: Optional[str] = None
+    ex_date: Optional[str] = None
+    payment_date: Optional[str] = None
+    date_evidence: Dict[str, Any] = Field(default_factory=dict)
     confirmation_status: str
     event_status: str = "active"
     source_type: str
@@ -68,6 +73,11 @@ class DividendAnnouncementInput(BaseModel):
 
 class DividendIngestRequest(BaseModel):
     announcements: list[DividendAnnouncementInput] = Field(min_length=1, max_length=500)
+
+
+class DividendQuery(BaseModel):
+    symbols: list[str] = Field(min_length=1, max_length=50)
+    fiscal_year: int = Field(ge=1991, le=2100)
 
 
 def create_app(
@@ -254,6 +264,90 @@ def create_app(
             return service.get_dividends(symbol, fiscal_year)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/dividends/query")
+    def dividends_query(request: DividendQuery):
+        requested: list[tuple[str, Optional[str], Optional[str]]] = []
+        unique_symbols: list[str] = []
+        for symbol in request.symbols:
+            try:
+                normalized = normalize_dividend_symbol(symbol)
+                requested.append((symbol, normalized, None))
+                if normalized not in unique_symbols:
+                    unique_symbols.append(normalized)
+            except Exception as exc:
+                requested.append((symbol, None, str(exc)))
+
+        workers = max(1, min(settings.dividend_batch_workers, len(unique_symbols)))
+        executor = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="dividend-query"
+        )
+        futures = {
+            executor.submit(service.get_dividends, symbol, request.fiscal_year): symbol
+            for symbol in unique_symbols
+        }
+        done, unfinished = wait(
+            futures, timeout=settings.dividend_batch_timeout_seconds
+        )
+        results: Dict[str, Dict[str, Any]] = {}
+        for future in done:
+            symbol = futures[future]
+            try:
+                results[symbol] = {"data": future.result(), "error": None}
+            except Exception as exc:
+                results[symbol] = {"data": None, "error": str(exc)}
+        for future in unfinished:
+            symbol = futures[future]
+            future.cancel()
+            results[symbol] = {
+                "data": None,
+                "error": (
+                    "dividend query exceeded "
+                    f"{settings.dividend_batch_timeout_seconds:g}s batch timeout"
+                ),
+            }
+        executor.shutdown(wait=False, cancel_futures=True)
+
+        items = []
+        for original, normalized, normalization_error in requested:
+            if normalization_error is not None:
+                items.append({
+                    "requested_symbol": original,
+                    "symbol": None,
+                    "status": "error",
+                    "cache_status": None,
+                    "error": normalization_error,
+                    "data": None,
+                })
+                continue
+            outcome = results[normalized]
+            data, error = outcome["data"], outcome["error"]
+            if error is not None:
+                status, cache_status = "error", None
+            else:
+                cache_status = str(data.get("data_status") or "fresh")
+                if cache_status in {"refreshing", "stale"}:
+                    status = cache_status
+                elif int(data.get("announced_count") or 0) > 0:
+                    status = "available"
+                else:
+                    status = "unavailable"
+            items.append({
+                "requested_symbol": original,
+                "symbol": normalized,
+                "status": status,
+                "cache_status": cache_status,
+                "error": error,
+                "data": data,
+            })
+        return {
+            "fiscal_year": request.fiscal_year,
+            "requested_count": len(request.symbols),
+            "completed_count": sum(item["status"] != "error" for item in items),
+            "items": items,
+        }
 
     @app.post("/v1/admin/dividends/ingest")
     def ingest_dividends(request: DividendIngestRequest):

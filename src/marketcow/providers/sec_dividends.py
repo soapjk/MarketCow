@@ -18,6 +18,25 @@ _AMOUNT = re.compile(
 _PAYABLE = re.compile(
     r"payable\s+(?:on\s+)?([A-Z][a-z]+\s+\d{1,2},\s+\d{4})", re.IGNORECASE
 )
+_RECORD = re.compile(
+    r"(?:holders?|shareholders?)\s+of\s+record\s+(?:as\s+of\s+)?"
+    r"(?:on\s+)?([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
+_EX_DATE = re.compile(
+    r"(?:ex-dividend|ex dividend)\s+date\s+(?:is\s+|of\s+)?"
+    r"([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _matched_date(match: re.Match[str] | None) -> str | None:
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%B %d, %Y").date().isoformat()
+    except ValueError:
+        return None
 
 
 def parse_sec_dividend_filing(
@@ -27,10 +46,11 @@ def parse_sec_dividend_filing(
     payment = _PAYABLE.search(plain)
     if payment is None:
         return []
-    try:
-        payment_date = datetime.strptime(payment.group(1), "%B %d, %Y").date().isoformat()
-    except ValueError:
+    payment_date = _matched_date(payment)
+    if payment_date is None:
         return []
+    record_date = _matched_date(_RECORD.search(plain))
+    ex_date = _matched_date(_EX_DATE.search(plain))
     results = []
     for index, match in enumerate(_AMOUNT.finditer(plain)):
         amount = Decimal(match.group(1))
@@ -40,6 +60,9 @@ def parse_sec_dividend_filing(
             "symbol": symbol, "fiscal_year": int(filed_at[:4]),
             "amount_per_share": str(amount), "currency": "USD",
             "announcement_date": filed_at[:10],
+            "record_date": record_date,
+            "ex_date": ex_date,
+            "payment_date": payment_date,
             "expected_payment_date": payment_date,
             "confirmation_status": "confirmed",
             "source_type": "regulatory_filing", "source_name": "SEC EDGAR",

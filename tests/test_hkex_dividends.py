@@ -11,12 +11,16 @@ class HkexDividendParserTest(unittest.TestCase):
             "Dividend type Final Dividend nature Ordinary "
             "For the financial year end 31 December 2025 "
             "Dividend declared HKD 4.50 per share "
+            "Ex-dividend date 15 May 2026 Record date 18 May 2026 "
             "Payment date 01 June 2026",
             "00700.HK", "https://www1.hkexnews.hk/a.pdf", "a.pdf",
         )
         self.assertEqual(rows[0]["amount_per_share"], "4.50")
         self.assertEqual(rows[0]["fiscal_year"], 2025)
         self.assertEqual(rows[0]["expected_payment_date"], "2026-06-01")
+        self.assertEqual(rows[0]["record_date"], "2026-05-18")
+        self.assertEqual(rows[0]["ex_date"], "2026-05-15")
+        self.assertEqual(rows[0]["payment_date"], "2026-06-01")
 
     def test_missing_payment_date_is_not_confirmed(self):
         self.assertEqual(parse_hkex_dividend_form(

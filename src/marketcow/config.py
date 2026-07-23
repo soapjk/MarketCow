@@ -69,6 +69,15 @@ class Settings:
     quote_persistence_queue_size: int = 256
     quote_persistence_shutdown_seconds: float = 5.0
     sec_user_agent: str = "MarketCow toczx@outlook.com"
+    dividend_cache_ttl_seconds: int = 21600
+    dividend_empty_cache_ttl_seconds: int = 900
+    dividend_refresh_retry_seconds: int = 300
+    dividend_refresh_workers: int = 2
+    dividend_refresh_shutdown_seconds: float = 5.0
+    dividend_batch_workers: int = 8
+    dividend_batch_timeout_seconds: float = 15.0
+    dividend_longport_min_interval_seconds: float = 0.65
+    dividend_longport_max_attempts: int = 3
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -162,6 +171,33 @@ class Settings:
             sec_user_agent=os.getenv(
                 "MARKETCOW_SEC_USER_AGENT", "MarketCow toczx@outlook.com"
             ).strip(),
+            dividend_cache_ttl_seconds=int(os.getenv(
+                "MARKETCOW_DIVIDEND_CACHE_TTL_SECONDS", "21600"
+            )),
+            dividend_empty_cache_ttl_seconds=int(os.getenv(
+                "MARKETCOW_DIVIDEND_EMPTY_CACHE_TTL_SECONDS", "900"
+            )),
+            dividend_refresh_retry_seconds=int(os.getenv(
+                "MARKETCOW_DIVIDEND_REFRESH_RETRY_SECONDS", "300"
+            )),
+            dividend_refresh_workers=int(os.getenv(
+                "MARKETCOW_DIVIDEND_REFRESH_WORKERS", "2"
+            )),
+            dividend_refresh_shutdown_seconds=float(os.getenv(
+                "MARKETCOW_DIVIDEND_REFRESH_SHUTDOWN_SECONDS", "5"
+            )),
+            dividend_batch_workers=int(os.getenv(
+                "MARKETCOW_DIVIDEND_BATCH_WORKERS", "8"
+            )),
+            dividend_batch_timeout_seconds=float(os.getenv(
+                "MARKETCOW_DIVIDEND_BATCH_TIMEOUT_SECONDS", "15"
+            )),
+            dividend_longport_min_interval_seconds=float(os.getenv(
+                "MARKETCOW_DIVIDEND_LONGPORT_MIN_INTERVAL_SECONDS", "0.65"
+            )),
+            dividend_longport_max_attempts=int(os.getenv(
+                "MARKETCOW_DIVIDEND_LONGPORT_MAX_ATTEMPTS", "3"
+            )),
         )
 
     def validate_runtime_isolation(self) -> None:
@@ -214,6 +250,26 @@ class Settings:
             raise ValueError("quote persistence queue size must be between 1 and 10000")
         if not 0.1 <= self.quote_persistence_shutdown_seconds <= 30:
             raise ValueError("quote persistence shutdown must be between 0.1 and 30 seconds")
+        if not 60 <= self.dividend_cache_ttl_seconds <= 604800:
+            raise ValueError("dividend cache TTL must be between 60 and 604800 seconds")
+        if not 30 <= self.dividend_empty_cache_ttl_seconds <= 86400:
+            raise ValueError(
+                "dividend empty cache TTL must be between 30 and 86400 seconds"
+            )
+        if not 1 <= self.dividend_refresh_retry_seconds <= 86400:
+            raise ValueError("dividend refresh retry must be between 1 and 86400 seconds")
+        if not 1 <= self.dividend_refresh_workers <= 16:
+            raise ValueError("dividend refresh workers must be between 1 and 16")
+        if not 0.1 <= self.dividend_refresh_shutdown_seconds <= 30:
+            raise ValueError("dividend refresh shutdown must be between 0.1 and 30 seconds")
+        if not 1 <= self.dividend_batch_workers <= 32:
+            raise ValueError("dividend batch workers must be between 1 and 32")
+        if not 0.1 <= self.dividend_batch_timeout_seconds <= 60:
+            raise ValueError("dividend batch timeout must be between 0.1 and 60 seconds")
+        if not 0 <= self.dividend_longport_min_interval_seconds <= 10:
+            raise ValueError("LongPort dividend interval must be between 0 and 10 seconds")
+        if not 1 <= self.dividend_longport_max_attempts <= 10:
+            raise ValueError("LongPort dividend attempts must be between 1 and 10")
 
     @staticmethod
     def _loopback(host: str) -> bool:
