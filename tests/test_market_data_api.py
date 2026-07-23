@@ -32,6 +32,7 @@ class Metadata:
 class Bars:
     def __init__(self):
         self.revision = "snapshot-a"
+        self.revise_during_read = False
 
     def get_canonical_dataset_identity(self, *_args):
         return {
@@ -47,14 +48,20 @@ class Bars:
                 "timestamp": 100, "bar_at": "2026-07-23T01:00:00+00:00",
                 "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15,
                 "volume": 10.0, "selected_source": "longport",
+                "quality_status": "ok", "version": 17,
+                "ingested_at": "2026-07-23T01:01:01Z",
             },
             {
                 "timestamp": 200, "bar_at": "2026-07-23T01:01:00+00:00",
                 "open": 1.15, "high": 1.3, "low": 1.1, "close": 1.2,
                 "volume": 11.0, "selected_source": "longport",
+                "quality_status": "ok", "version": 17,
+                "ingested_at": "2026-07-23T01:02:01Z",
             },
         ]
         selected = [row for row in rows if after is None or row["timestamp"] > after]
+        if self.revise_during_read:
+            self.revision = "snapshot-during-read"
         return selected[:page_size], len(selected) > page_size
 
 
@@ -83,9 +90,12 @@ class MarketDataApiTest(unittest.TestCase):
         self.client = TestClient(create_app(self.settings, self.service))
         self.instrument = {
             "schema_version": 1, "instrument_id": "AAPL.XNAS", "symbol": "AAPL",
+            "instrument_type": "equity", "asset_class": "equity",
             "market": "US", "mic": "XNAS", "currency": "USD",
             "price_precision": 2, "size_precision": 0,
-            "tick_size": "0.01", "lot_size": "1",
+            "tick_size": "0.01", "size_increment": "1", "lot_size": "1",
+            "ts_event": "2026-07-23T00:00:00Z",
+            "ts_init": "2026-07-23T00:00:01Z",
             "provider_symbols": {"longport": "AAPL.US"},
             "broker_symbols": {"longport": "AAPL.US"},
         }
@@ -110,13 +120,17 @@ class MarketDataApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["schema_version"], 1)
         self.assertIn("required", response.json()["json_schema"])
+        event = self.client.get("/v1/schemas/event").json()["json_schema"]
+        self.assertIn("oneOf", event)
+        for name in ("historical_manifest", "historical_bar", "canonical_bar_page"):
+            self.assertEqual(self.client.get(f"/v1/schemas/{name}").status_code, 200)
 
     def test_history_manifest_pagination_is_snapshot_bound(self):
         self.client.put("/v1/admin/instruments/AAPL.XNAS", json=self.instrument)
         params = {
             "start": "2026-07-23T01:00:00Z",
             "end": "2026-07-23T01:02:00Z",
-            "interval": "1m", "adjustment": "raw", "page_size": 1,
+            "interval": "1-MINUTE", "adjustment": "raw", "page_size": 1,
         }
         first = self.client.get("/v1/canonical-bars/AAPL.XNAS", params=params)
         self.assertEqual(first.status_code, 200, first.text)
@@ -128,13 +142,26 @@ class MarketDataApiTest(unittest.TestCase):
             params={**params, "cursor": payload["next_cursor"]},
         )
         self.assertEqual(second.status_code, 200, second.text)
-        self.assertEqual(second.json()["bars"][0]["timestamp"], 200)
+        self.assertEqual(
+            second.json()["bars"][0]["window_start"], "1970-01-01T00:03:20Z"
+        )
         self.service.market_bar_repository.revision = "snapshot-b"
         changed = self.client.get(
             "/v1/canonical-bars/AAPL.XNAS",
             params={**params, "cursor": payload["next_cursor"]},
         )
         self.assertEqual(changed.status_code, 400)
+
+    def test_history_rejects_revision_during_current_page_read(self):
+        self.client.put("/v1/admin/instruments/AAPL.XNAS", json=self.instrument)
+        self.service.market_bar_repository.revise_during_read = True
+        response = self.client.get("/v1/canonical-bars/AAPL.XNAS", params={
+            "start": "2026-07-23T01:00:00Z",
+            "end": "2026-07-23T01:02:00Z",
+            "interval": "1-MINUTE", "adjustment": "raw", "page_size": 1,
+        })
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "canonical_snapshot_changed")
 
 
 if __name__ == "__main__":

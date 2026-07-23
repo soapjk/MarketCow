@@ -20,7 +20,9 @@ from .telemetry import sanitize_text, telemetry_call
 from .health import HealthEvaluator
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
 from .market_data_contracts import (
+    CanonicalBarPage,
     CONTRACT_SCHEMAS,
+    HistoricalBar,
     HistoricalManifest,
     InstrumentContract,
     canonical_hash,
@@ -200,7 +202,10 @@ def create_app(
             })
         return {
             "schema_version": 1, "contract_name": contract_name,
-            "json_schema": model.model_json_schema(),
+            "json_schema": (
+                model.json_schema() if hasattr(model, "json_schema")
+                else model.model_json_schema()
+            ),
         }
 
     @app.put("/v1/admin/instruments/{instrument_id}")
@@ -249,7 +254,7 @@ def create_app(
         end: str,
         interval: str,
         adjustment: str = Query(pattern="^(raw|adjusted)$"),
-        page_size: int = Query(1000, ge=1, le=5000),
+        page_size: int = Query(ge=1, le=5000),
         cursor: Optional[str] = None,
     ):
         instrument = service.metadata_repository.get_instrument(instrument_id)
@@ -264,8 +269,16 @@ def create_app(
                 raise ValueError("start/end must be ordered timezone-aware timestamps")
             start_utc = start_at.astimezone(timezone.utc).isoformat()
             end_utc = end_at.astimezone(timezone.utc).isoformat()
+            interval_map = {
+                "1-MINUTE": ("1m", 60), "5-MINUTE": ("5m", 300),
+                "15-MINUTE": ("15m", 900), "30-MINUTE": ("30m", 1800),
+                "1-HOUR": ("1h", 3600), "1-DAY": ("1d", 86400),
+            }
+            if interval not in interval_map:
+                raise ValueError("interval is not supported by schema v1")
+            storage_interval, interval_seconds = interval_map[interval]
             identity = service.market_bar_repository.get_canonical_dataset_identity(
-                instrument["symbol"], interval, adjustment, start_utc, end_utc
+                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc
             )
             binding = {
                 "instrument_id": instrument_id, "start": start_utc, "end": end_utc,
@@ -283,17 +296,38 @@ def create_app(
             if after is not None and not isinstance(after, int):
                 raise ValueError("canonical cursor position is invalid")
             rows, has_more = service.market_bar_repository.get_price_bars_page(
-                instrument["symbol"], interval, adjustment, start_utc, end_utc,
+                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc,
                 page_size, after,
             )
             bars = []
             for row in rows:
-                bars.append({
-                    **row, "schema_version": 1, "instrument_id": instrument_id,
-                    **{
-                        key: format(Decimal(str(row[key])), "f")
-                        for key in ("open", "high", "low", "close", "volume")
-                    },
+                window_start = datetime.fromtimestamp(
+                    int(row["timestamp"]), timezone.utc
+                )
+                window_end = window_start + timedelta(seconds=interval_seconds)
+                bars.append(HistoricalBar(
+                    instrument_id=instrument_id, interval=interval,
+                    adjustment=adjustment, price_type="LAST",
+                    aggregation_source="EXTERNAL",
+                    window_start=window_start.isoformat(),
+                    window_end=window_end.isoformat(),
+                    ts_event=window_end.isoformat(), ts_init=row["ingested_at"],
+                    open=format(Decimal(str(row["open"])), "f"),
+                    high=format(Decimal(str(row["high"])), "f"),
+                    low=format(Decimal(str(row["low"])), "f"),
+                    close=format(Decimal(str(row["close"])), "f"),
+                    volume=format(Decimal(str(row["volume"])), "f"),
+                    selected_source=row["selected_source"],
+                    quality_status=row["quality_status"],
+                    canonical_version=str(row["version"]),
+                ))
+            confirmed = service.market_bar_repository.get_canonical_dataset_identity(
+                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc
+            )
+            if confirmed != identity:
+                raise HTTPException(status_code=409, detail={
+                    "code": "canonical_snapshot_changed",
+                    "message": "canonical data changed during page read; restart query",
                 })
             next_cursor = None
             if has_more and rows:
@@ -312,12 +346,11 @@ def create_app(
                 row_count=identity["row_count"],
                 content_hash=identity["content_hash"],
             )
-            return {
-                "schema_version": 1, "manifest": manifest.model_dump(mode="json"),
-                "count": len(bars), "bars": bars, "page_size": page_size,
-                "next_cursor": next_cursor, "truncated": has_more,
-                "provenance": {"layer": "canonical", "backend": "clickhouse"},
-            }
+            return CanonicalBarPage(
+                manifest=manifest, count=len(bars), bars=bars, page_size=page_size,
+                next_cursor=next_cursor, truncated=has_more,
+                provenance={"layer": "canonical", "backend": "clickhouse"},
+            ).model_dump(mode="json")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={
                 "code": "invalid_canonical_query", "message": str(exc),

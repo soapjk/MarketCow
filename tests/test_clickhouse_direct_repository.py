@@ -95,6 +95,30 @@ class _InsertDatabase:
 
 
 class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
+    def test_canonical_identity_hashes_complete_ordered_rows(self):
+        class Result:
+            result_rows = [
+                (
+                    1000, "10", "11", "9", "10.5", "10.5", "1", "100",
+                    "1000", "longport", 1, "single_source", "fingerprint-a",
+                    "17", 1100, 1200, "artifact-a",
+                ),
+            ]
+
+        repository = object.__new__(ClickHouseMarketBarRepository)
+        repository._query = lambda *_args, **_kwargs: Result()
+        first = repository.get_canonical_dataset_identity(
+            "AAPL", "1m", "raw",
+            "2026-07-23T00:00:00Z", "2026-07-23T01:00:00Z",
+        )
+        Result.result_rows[0] = (*Result.result_rows[0][:-1], "artifact-b")
+        second = repository.get_canonical_dataset_identity(
+            "AAPL", "1m", "raw",
+            "2026-07-23T00:00:00Z", "2026-07-23T01:00:00Z",
+        )
+        self.assertNotEqual(first["content_hash"], second["content_hash"])
+        self.assertEqual(first["canonical_version"], "1200")
+
     def test_quote_version_reserves_high_bits_for_ingestion_time(self):
         database = _InsertDatabase()
         repository = ClickHouseMarketBarRepository(database)

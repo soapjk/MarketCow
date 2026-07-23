@@ -329,27 +329,36 @@ class PostgresRepository(_PostgresControlPlaneRepository):
             saved = connection.execute(
                 """
                 INSERT INTO instrument_master
-                    (instrument_id, schema_version, symbol, market, mic, currency,
-                     price_precision, size_precision, tick_size, lot_size,
+                    (instrument_id, schema_version, instrument_type, asset_class,
+                     symbol, market, mic, currency,
+                     price_precision, size_precision, tick_size, size_increment, lot_size,
+                     ts_event, ts_init,
                      provider_symbols, broker_symbols, content_hash, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s)
                 ON CONFLICT (instrument_id) DO UPDATE SET
-                    schema_version=EXCLUDED.schema_version, symbol=EXCLUDED.symbol,
+                    schema_version=EXCLUDED.schema_version,
+                    instrument_type=EXCLUDED.instrument_type,
+                    asset_class=EXCLUDED.asset_class, symbol=EXCLUDED.symbol,
                     market=EXCLUDED.market, mic=EXCLUDED.mic,
                     currency=EXCLUDED.currency,
                     price_precision=EXCLUDED.price_precision,
                     size_precision=EXCLUDED.size_precision,
-                    tick_size=EXCLUDED.tick_size, lot_size=EXCLUDED.lot_size,
+                    tick_size=EXCLUDED.tick_size,
+                    size_increment=EXCLUDED.size_increment, lot_size=EXCLUDED.lot_size,
+                    ts_event=EXCLUDED.ts_event, ts_init=EXCLUDED.ts_init,
                     provider_symbols=EXCLUDED.provider_symbols,
                     broker_symbols=EXCLUDED.broker_symbols,
                     content_hash=EXCLUDED.content_hash, updated_at=EXCLUDED.updated_at
                 RETURNING *
                 """,
                 (
-                    row["instrument_id"], row["schema_version"], row["symbol"],
+                    row["instrument_id"], row["schema_version"],
+                    row["instrument_type"], row["asset_class"], row["symbol"],
                     row["market"], row["mic"], row["currency"],
                     row["price_precision"], row["size_precision"], row["tick_size"],
-                    row["lot_size"], Jsonb(row["provider_symbols"]),
+                    row["size_increment"], row["lot_size"], row["ts_event"], row["ts_init"],
+                    Jsonb(row["provider_symbols"]),
                     Jsonb(row["broker_symbols"]), row["content_hash"], row["updated_at"],
                 ),
             ).fetchone()
