@@ -192,6 +192,7 @@ class MarketDataApiTest(unittest.TestCase):
 
     def test_history_manifest_pagination_is_snapshot_bound(self):
         self.client.put("/v1/admin/instruments/AAPL.XNAS", json=self.instrument)
+        self.service.metadata_repository.rows["AAPL.XNAS"]["symbol"] = b"AAPL"
         params = {
             "start": "2026-07-23T01:00:00Z",
             "end": "2026-07-23T01:02:00Z",
@@ -216,6 +217,36 @@ class MarketDataApiTest(unittest.TestCase):
             params={**params, "cursor": payload["next_cursor"]},
         )
         self.assertEqual(changed.status_code, 400)
+
+    def test_history_empty_dataset_returns_contract_valid_manifest(self):
+        class EmptyBars:
+            def get_canonical_dataset_identity(self, *_args):
+                return {
+                    "snapshot_id": "empty-snapshot",
+                    "canonical_version": "0",
+                    "row_count": 0,
+                    "content_hash": "sha256:" + "0" * 64,
+                }
+
+            def get_price_bars_page(self, *_args):
+                return [], False
+
+        self.client.put("/v1/admin/instruments/AAPL.XNAS", json=self.instrument)
+        self.service.market_bar_repository = EmptyBars()
+        response = self.client.get("/v1/canonical-bars/AAPL.XNAS", params={
+            "start": "2026-07-01T00:00:00Z",
+            "end": "2026-07-23T23:59:59Z",
+            "interval": "1-DAY", "adjustment": "raw", "page_size": 1000,
+        })
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["manifest"]["row_count"], 0)
+        self.assertEqual(payload["manifest"]["snapshot_id"], "empty-snapshot")
+        self.assertEqual(payload["count"], 0)
+        self.assertEqual(payload["bars"], [])
+        self.assertIsNone(payload["next_cursor"])
+        self.assertFalse(payload["truncated"])
 
     def test_history_rejects_revision_during_current_page_read(self):
         self.client.put("/v1/admin/instruments/AAPL.XNAS", json=self.instrument)

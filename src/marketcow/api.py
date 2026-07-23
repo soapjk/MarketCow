@@ -450,6 +450,7 @@ def create_app(
             raise HTTPException(status_code=404, detail={
                 "code": "instrument_not_found", "instrument_id": instrument_id,
             })
+        instrument = instrument_record(instrument)
         try:
             start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
             end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
@@ -489,6 +490,7 @@ def create_app(
             )
             bars = []
             for row in rows:
+                source_payload = row.get("source_payload") or {}
                 window_start = datetime.fromisoformat(
                     str(row["bar_at"]).replace("Z", "+00:00")
                 ).astimezone(timezone.utc)
@@ -505,9 +507,16 @@ def create_app(
                     low=format(Decimal(str(row["low"])), "f"),
                     close=format(Decimal(str(row["close"])), "f"),
                     volume=format(Decimal(str(row["volume"])), "f"),
-                    selected_source=row["selected_source"],
-                    quality_status=row["quality_status"],
-                    row_version=str(row["version"]),
+                    selected_source=(
+                        row.get("selected_source") or row.get("source")
+                    ),
+                    quality_status=(
+                        row.get("quality_status")
+                        or source_payload.get("quality_status")
+                    ),
+                    row_version=str(
+                        row.get("version") or source_payload.get("version")
+                    ),
                 ))
             confirmed = service.market_bar_repository.get_canonical_dataset_identity(
                 instrument["symbol"], storage_interval, adjustment, start_utc, end_utc

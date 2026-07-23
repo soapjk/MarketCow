@@ -1,4 +1,6 @@
 import ast
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 import threading
 import unittest
@@ -7,6 +9,7 @@ from marketcow.clickhouse_repositories import (
     ClickHouseDatabase,
     ClickHouseMarketBarRepository,
     ClickHouseRepositoryError,
+    canonical_json_value,
 )
 from marketcow.repositories import MarketBarRepository
 
@@ -95,6 +98,61 @@ class _InsertDatabase:
 
 
 class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
+    def test_canonical_json_normalizes_bytes_decimal_and_datetime(self):
+        timestamp = datetime(2026, 7, 23, 1, 2, 3, 456000, timezone.utc)
+        normalized = canonical_json_value([
+            b"longport", Decimal("10.5000"), timestamp, None,
+        ])
+
+        self.assertEqual(normalized, [
+            "longport", "10.5000", "2026-07-23T01:02:03.456000+00:00", None,
+        ])
+        self.assertEqual(
+            canonical_json_value(datetime(2026, 7, 23, 1, 2, 3)),
+            "2026-07-23T01:02:03+00:00",
+        )
+        with self.assertRaises(UnicodeDecodeError):
+            canonical_json_value(b"\xff")
+
+    def test_canonical_identity_is_stable_for_driver_value_types_and_empty_data(self):
+        class Result:
+            result_rows = [(
+                1000, Decimal("10.50"), b"11", "9", "10.5", "10.5", "1",
+                "100", "1000", b"longport", 1, b"single_source",
+                datetime(2026, 7, 23, 1, tzinfo=timezone.utc),
+                "17", 1100, 1200, b"artifact-a",
+            )]
+
+        repository = object.__new__(ClickHouseMarketBarRepository)
+        repository._query = lambda *_args, **_kwargs: Result()
+        first = repository.get_canonical_dataset_identity(
+            b"QQQ", b"1d", b"raw",
+            "2026-07-01T00:00:00Z", "2026-07-23T23:59:59Z",
+        )
+        second = repository.get_canonical_dataset_identity(
+            b"QQQ", b"1d", b"raw",
+            "2026-07-01T00:00:00Z", "2026-07-23T23:59:59Z",
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["symbol"], "QQQ")
+        self.assertEqual(first["row_count"], 1)
+        self.assertRegex(first["content_hash"], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(len(first["snapshot_id"]), 32)
+
+        Result.result_rows = []
+        empty_first = repository.get_canonical_dataset_identity(
+            "QQQ", "1d", "raw",
+            "2026-07-01T00:00:00Z", "2026-07-23T23:59:59Z",
+        )
+        empty_second = repository.get_canonical_dataset_identity(
+            "QQQ", "1d", "raw",
+            "2026-07-01T00:00:00Z", "2026-07-23T23:59:59Z",
+        )
+        self.assertEqual(empty_first, empty_second)
+        self.assertEqual(empty_first["row_count"], 0)
+        self.assertEqual(empty_first["canonical_version"], "0")
+        self.assertNotEqual(empty_first["content_hash"], first["content_hash"])
+
     def test_canonical_identity_hashes_complete_ordered_rows(self):
         class Result:
             result_rows = [

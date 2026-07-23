@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence
 
 import clickhouse_connect
@@ -121,6 +123,42 @@ CLICKHOUSE_MIGRATIONS = [
 
 class ClickHouseRepositoryError(RuntimeError):
     """Bounded direct-repository failure with no backend fallback or secret text."""
+
+
+def canonical_json_value(value: Any) -> Any:
+    """Normalize ClickHouse values without repr fallbacks or information loss."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="strict")
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("canonical Decimal values must be finite")
+        return format(value, "f")
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            # clickhouse-connect returns DateTime64(..., 'UTC') as naive datetime.
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("canonical float values must be finite")
+        return value
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [canonical_json_value(item) for item in value]
+    if isinstance(value, dict):
+        normalized: Dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = canonical_json_value(raw_key)
+            if not isinstance(key, str):
+                raise TypeError("canonical JSON object keys must be text")
+            if key in normalized:
+                raise ValueError("canonical JSON object keys collide after decoding")
+            normalized[key] = canonical_json_value(raw_value)
+        return normalized
+    raise TypeError(f"unsupported canonical JSON value type: {type(value).__name__}")
 
 
 class ClickHouseDatabase:
@@ -585,7 +623,8 @@ class ClickHouseMarketBarRepository:
 
     def _map_canonical_rows(self, rows: Any) -> List[Dict[str, Any]]:
         mapped = []
-        for row in rows:
+        for raw_row in rows:
+            row = canonical_json_value(raw_row)
             bar_time = self._datetime(row["bar_time"])
             if bar_time.tzinfo is None:
                 bar_time = bar_time.replace(tzinfo=timezone.utc)
@@ -603,6 +642,9 @@ class ClickHouseMarketBarRepository:
                 "volume": float(row["volume"]),
                 "amount": None if row["amount"] is None else float(row["amount"]),
                 "source": row["selected_source"],
+                "selected_source": row["selected_source"],
+                "quality_status": row["quality_status"],
+                "version": int(row["version"]),
                 "ingested_at": self._iso(row["ingested_at"]),
                 "source_payload": {
                     "canonical": True, "selected_source": row["selected_source"],
@@ -895,20 +937,20 @@ class ClickHouseMarketBarRepository:
                 "start": start_at, "end": end_at,
             },
         )
-        canonical_rows = [list(row) for row in result.result_rows]
+        canonical_rows = canonical_json_value(result.result_rows)
         max_ingested_millis = max(
             (int(row[-2]) for row in canonical_rows), default=0
         )
         content_hash = "sha256:" + hashlib.sha256(json.dumps(
             canonical_rows, separators=(",", ":"), ensure_ascii=True
         ).encode()).hexdigest()
-        identity = {
+        identity = canonical_json_value({
             "symbol": symbol, "interval": interval, "adjustment": adjustment,
             "start": start_at.isoformat(), "end": end_at.isoformat(),
             "row_count": len(canonical_rows),
             "max_ingested_millis": max_ingested_millis,
             "content_hash": content_hash,
-        }
+        })
         digest = hashlib.sha256(json.dumps(
             identity, sort_keys=True, separators=(",", ":")
         ).encode()).hexdigest()
