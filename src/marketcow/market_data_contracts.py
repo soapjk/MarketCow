@@ -78,6 +78,16 @@ class InstrumentContract(ContractModel):
         return self
 
 
+class InstrumentRecord(InstrumentContract):
+    content_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    updated_at: str
+
+    @field_validator("updated_at")
+    @classmethod
+    def timestamp(cls, value: str) -> str:
+        return utc(value)
+
+
 class QualityContract(StrictModel):
     status: Literal["live", "delayed", "stale", "degraded", "historical"]
     delayed: bool
@@ -145,8 +155,8 @@ class OrderBookSnapshotPayload(StrictModel):
     book_type: Literal["L1_MBP"]
     depth: Literal[1]
     baseline_sequence: int = Field(ge=0)
-    bids: list[BookLevel]
-    asks: list[BookLevel]
+    bids: list[BookLevel] = Field(max_length=1)
+    asks: list[BookLevel] = Field(max_length=1)
 
 
 class OrderBookDeltaPayload(StrictModel):
@@ -177,7 +187,7 @@ class BarPayload(StrictModel):
 
     @model_validator(mode="after")
     def valid(self):
-        if self.window_start >= self.window_end:
+        if instant(self.window_start) >= instant(self.window_end):
             raise ValueError("bar window_start must be before window_end")
         values = list(map(number, (self.open, self.high, self.low, self.close)))
         if min(values) <= 0 or number(self.high) != max(values):
@@ -334,7 +344,7 @@ class HistoricalBar(ContractModel):
     volume: DecimalString
     selected_source: str
     quality_status: str
-    canonical_version: str
+    row_version: str
 
     @field_validator("window_start", "window_end", "ts_event", "ts_init")
     @classmethod
@@ -369,17 +379,32 @@ class CanonicalBarPage(ContractModel):
     def consistent(self):
         if self.count != len(self.bars):
             raise ValueError("page count must equal bars length")
+        if self.count > self.page_size:
+            raise ValueError("page count must not exceed page_size")
         if self.truncated != (self.next_cursor is not None):
             raise ValueError("truncated must match next_cursor presence")
-        if any(
-            bar.instrument_id not in self.manifest.instruments for bar in self.bars
-        ):
-            raise ValueError("bar instrument is outside manifest")
+        previous = None
+        for bar in self.bars:
+            if bar.instrument_id not in self.manifest.instruments:
+                raise ValueError("bar instrument is outside manifest")
+            if (
+                bar.interval != self.manifest.interval
+                or bar.adjustment != self.manifest.adjustment
+            ):
+                raise ValueError("bar interval/adjustment must match manifest")
+            bar_start = instant(bar.window_start)
+            if not instant(self.manifest.start) <= bar_start <= instant(self.manifest.end):
+                raise ValueError("bar window_start is outside manifest range")
+            position = (bar_start, bar.instrument_id)
+            if previous is not None and position <= previous:
+                raise ValueError("bars must be strictly ordered without duplicates")
+            previous = position
         return self
 
 
 CONTRACT_SCHEMAS: Dict[str, Any] = {
     "instrument": InstrumentContract,
+    "instrument_record": InstrumentRecord,
     "event": STREAM_EVENT_ADAPTER,
     "quote": QuotePayload,
     "trade": TradePayload,

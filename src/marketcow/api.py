@@ -25,6 +25,7 @@ from .market_data_contracts import (
     HistoricalBar,
     HistoricalManifest,
     InstrumentContract,
+    InstrumentRecord,
     canonical_hash,
     validate_instrument_identity,
 )
@@ -193,6 +194,18 @@ def create_app(
             return JSONResponse(status_code=503, content=result)
         return result
 
+    def instrument_record(row):
+        payload = {
+            field: row[field]
+            for field in InstrumentRecord.model_fields
+        }
+        for field in ("tick_size", "size_increment", "lot_size"):
+            payload[field] = format(Decimal(str(payload[field])), "f")
+        for field in ("ts_event", "ts_init", "updated_at"):
+            if isinstance(payload[field], datetime):
+                payload[field] = payload[field].isoformat()
+        return InstrumentRecord.model_validate(payload).model_dump(mode="json")
+
     @app.get("/v1/schemas/{contract_name}")
     def contract_schema(contract_name: str):
         model = CONTRACT_SCHEMAS.get(contract_name)
@@ -220,7 +233,10 @@ def create_app(
                 "updated_at": clock().astimezone(timezone.utc).isoformat(),
             }
             saved = service.metadata_repository.upsert_instrument(row)
-            return {**payload, "content_hash": saved["content_hash"]}
+            return InstrumentRecord.model_validate({
+                **payload, "content_hash": saved["content_hash"],
+                "updated_at": row["updated_at"],
+            }).model_dump(mode="json")
         except ValueError as exc:
             raise HTTPException(status_code=409, detail={
                 "code": "instrument_conflict", "message": str(exc),
@@ -233,7 +249,7 @@ def create_app(
             raise HTTPException(status_code=404, detail={
                 "code": "instrument_not_found", "instrument_id": instrument_id,
             })
-        return row
+        return instrument_record(row)
 
     @app.get("/v1/instruments:resolve")
     def resolve_instrument(namespace: str, external_symbol: str):
@@ -245,7 +261,7 @@ def create_app(
                 "code": "instrument_mapping_not_found",
                 "namespace": namespace, "external_symbol": external_symbol,
             })
-        return row
+        return instrument_record(row)
 
     @app.get("/v1/canonical-bars/{instrument_id}")
     def canonical_bars_v1(
@@ -301,9 +317,9 @@ def create_app(
             )
             bars = []
             for row in rows:
-                window_start = datetime.fromtimestamp(
-                    int(row["timestamp"]), timezone.utc
-                )
+                window_start = datetime.fromisoformat(
+                    str(row["bar_at"]).replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
                 window_end = window_start + timedelta(seconds=interval_seconds)
                 bars.append(HistoricalBar(
                     instrument_id=instrument_id, interval=interval,
@@ -319,7 +335,7 @@ def create_app(
                     volume=format(Decimal(str(row["volume"])), "f"),
                     selected_source=row["selected_source"],
                     quality_status=row["quality_status"],
-                    canonical_version=str(row["version"]),
+                    row_version=str(row["version"]),
                 ))
             confirmed = service.market_bar_repository.get_canonical_dataset_identity(
                 instrument["symbol"], storage_interval, adjustment, start_utc, end_utc

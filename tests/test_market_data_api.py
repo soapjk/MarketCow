@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from marketcow.api import create_app
 from marketcow.config import Settings
+from marketcow.market_data_contracts import InstrumentRecord
 
 
 class Metadata:
@@ -106,13 +107,20 @@ class MarketDataApiTest(unittest.TestCase):
     def test_instrument_registration_query_and_resolution(self):
         saved = self.client.put("/v1/admin/instruments/AAPL.XNAS", json=self.instrument)
         self.assertEqual(saved.status_code, 200)
-        self.assertEqual(
-            self.client.get("/v1/instruments/AAPL.XNAS").json()["mic"], "XNAS"
-        )
+        record_schema = self.client.get("/v1/schemas/instrument_record").json()[
+            "json_schema"
+        ]
+        self.assertIn("content_hash", record_schema["properties"])
+        self.assertIn("updated_at", record_schema["properties"])
+        InstrumentRecord.model_validate(saved.json())
+        fetched = self.client.get("/v1/instruments/AAPL.XNAS").json()
+        InstrumentRecord.model_validate(fetched)
+        self.assertEqual(fetched["mic"], "XNAS")
         resolved = self.client.get(
             "/v1/instruments:resolve",
             params={"namespace": "provider:longport", "external_symbol": "AAPL.US"},
         )
+        InstrumentRecord.model_validate(resolved.json())
         self.assertEqual(resolved.json()["instrument_id"], "AAPL.XNAS")
 
     def test_schema_is_machine_readable(self):
@@ -143,7 +151,7 @@ class MarketDataApiTest(unittest.TestCase):
         )
         self.assertEqual(second.status_code, 200, second.text)
         self.assertEqual(
-            second.json()["bars"][0]["window_start"], "1970-01-01T00:03:20Z"
+            second.json()["bars"][0]["window_start"], "2026-07-23T01:01:00Z"
         )
         self.service.market_bar_repository.revision = "snapshot-b"
         changed = self.client.get(

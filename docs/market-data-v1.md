@@ -28,7 +28,8 @@ Mappings use explicit namespaces such as `provider:longport` and `broker:longpor
 
 `GET /v1/schemas/{name}` serves JSON Schema for:
 
-`instrument`, `event`, `quote`, `trade`, `order_book_snapshot`, `order_book_delta`,
+`instrument`, `instrument_record`, `event`, `quote`, `trade`,
+`order_book_snapshot`, `order_book_delta`,
 `bar`, `stream_status`, `heartbeat`, `error`, `historical_manifest`,
 `historical_bar`, and `canonical_bar_page`.
 
@@ -38,6 +39,10 @@ validate with another event type's payload. Quote, trade, book and bar events re
 `instrument_id`; heartbeat forbids it; status and error allow it when scoped to an instrument.
 Schema v1 only accepts `schema_version: 1`. Additive optional fields require a documented
 minor contract update; removing, renaming or changing meaning requires a new schema version.
+
+Instrument write/read/resolve endpoints return `InstrumentRecord`, which extends the
+consumer-supplied `InstrumentContract` with `content_hash` and `updated_at`. Repository-only
+columns are removed before response validation.
 
 ## Event time and sequence
 
@@ -59,6 +64,8 @@ Book v1 is explicitly top-of-book market-by-price (`L1_MBP`, depth 1), not MBO.
 Every synthetic MBP level uses `order_id="0"`. A snapshot establishes
 `baseline_sequence`; deltas refer to that same baseline. A sequence gap invalidates the
 baseline and requires a new snapshot before deltas may be applied.
+Each side contains zero or one level. An empty side is allowed for one-sided or unavailable
+top-of-book data; `depth=1` never permits multiple levels.
 
 ## Deterministic canonical history
 
@@ -76,6 +83,12 @@ OHLCV values in this v1 endpoint are decimal strings. Provenance identifies the 
 ClickHouse layer; individual bars retain selected source and quality fields.
 `content_hash` is SHA-256 over the complete, stably ordered canonical row content, not a
 sample or aggregate fingerprint.
+Each bar's `row_version` is its ClickHouse selected-row version. It is intentionally distinct
+from manifest `canonical_version`, which identifies the dataset revision.
+
+Every page enforces manifest agreement for instrument, interval, adjustment and requested
+window-start range. Bars are strictly ascending without duplicate positions, and
+`count <= page_size`.
 
 ## Bar semantics frozen for historical v1
 
