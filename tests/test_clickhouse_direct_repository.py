@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+import threading
 import unittest
 
 from marketcow.clickhouse_repositories import (
@@ -66,7 +67,61 @@ class _FailingClient:
         raise RuntimeError("password=secret " + "x" * 10000)
 
 
+class _InsertClient:
+    def __init__(self):
+        self.rows = []
+
+    def query(self, _statement, **_kwargs):
+        if not self.rows:
+            return type("Result", (), {"result_rows": [["", 0]]})()
+        payload_index = ClickHouseMarketBarRepository.QUOTE_COLUMNS.index("payload_json")
+        version_index = ClickHouseMarketBarRepository.QUOTE_COLUMNS.index("content_version")
+        latest = max(self.rows, key=lambda row: row[version_index])
+        return type("Result", (), {
+            "result_rows": [[latest[payload_index], latest[version_index]]]
+        })()
+
+    def insert(self, _table, rows, **_kwargs):
+        self.rows.extend(rows)
+
+
+class _InsertDatabase:
+    def __init__(self):
+        self.operation_lock = threading.RLock()
+        self.client = _InsertClient()
+
+    def _require_client(self):
+        return self.client
+
+
 class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
+    def test_quote_version_reserves_high_bits_for_ingestion_time(self):
+        database = _InsertDatabase()
+        repository = ClickHouseMarketBarRepository(database)
+        repository.upsert_quote({
+            "symbol": "AAPL", "source": "fixture", "price": 1,
+            "observed_at": "2026-07-22T00:00:00+00:00",
+            "ingested_at": "2026-07-22T00:00:01+00:00",
+        })
+        repository.upsert_quote({
+            "symbol": "AAPL", "source": "fixture", "price": 2,
+            "observed_at": "2026-07-22T00:00:00+00:00",
+            "ingested_at": "2026-07-22T00:00:02+00:00",
+        })
+        rank_index = repository.QUOTE_COLUMNS.index("content_rank")
+        version_index = repository.QUOTE_COLUMNS.index("content_version")
+        self.assertTrue(all(len(row[rank_index]) == 52 for row in database.client.rows))
+        self.assertLess(
+            database.client.rows[0][version_index],
+            database.client.rows[1][version_index],
+        )
+        repository.upsert_quote({
+            "symbol": "AAPL", "source": "fixture", "price": 2,
+            "observed_at": "2026-07-22T00:00:00+00:00",
+            "ingested_at": "2026-07-22T00:00:02+00:00",
+        })
+        self.assertEqual(len(database.client.rows), 2)
+
     def test_direct_repository_satisfies_complete_contract(self):
         repository = ClickHouseMarketBarRepository(
             ClickHouseDatabase("127.0.0.1", 8123, "marketcow_test")
@@ -83,7 +138,7 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
         forbidden = {
             "duckdb", "marketcow.storage", "marketcow.duckdb_repositories",
             "marketcow.clickhouse_shadow", "marketcow.local_backfill",
-            "marketcow.local_restore",
+            "marketcow.restore_bundle",
         }
         violations = _forbidden_paths(
             graph, "marketcow.clickhouse_repositories", forbidden
@@ -97,7 +152,7 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
         forbidden = {
             "duckdb", "marketcow.storage", "marketcow.duckdb_repositories",
             "marketcow.clickhouse_shadow", "marketcow.local_backfill",
-            "marketcow.local_restore",
+            "marketcow.restore_bundle",
         }
         for entrypoint in (
             "marketcow.clickhouse_writer", "marketcow.clickhouse_canonical",

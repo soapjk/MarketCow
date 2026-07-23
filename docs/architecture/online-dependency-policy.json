@@ -1,0 +1,12 @@
+{
+  "schema": "marketcow.online-dependency-policy.v1",
+  "online_entrypoints": [
+    "marketcow.api",
+    "marketcow.service",
+    "marketcow.factory"
+  ],
+  "forbidden_internal_modules": [],
+  "forbidden_external_modules": ["duckdb"],
+  "offline_only_modules": [],
+  "temporary_exceptions": []
+}

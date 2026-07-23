@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-keywords = ["market-data", "financial-data", "china-market", "fastapi", "duckdb", "point-in-time"]
+keywords = ["market-data", "financial-data", "china-market", "fastapi", "postgresql", "clickhouse"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Framework :: FastAPI",
@@ -22,10 +22,10 @@ dependencies = [
   "akshare>=1.18,<2",
   "baostock>=0.9.3,<1",
   "clickhouse-connect>=0.8,<1",
-  "duckdb>=1.1,<2",
   # Keep the tested FastAPI/TestClient combination while Mootdx requires HTTPX 0.25.
   "fastapi>=0.115,<0.129",
   "httpx>=0.25,<0.26",
+  "longbridge>=4.3,<5",
   "mootdx>=0.11,<1",
   "pandas>=2.1,<3",
   "psycopg[binary,pool]>=3.2,<4",
@@ -42,7 +42,6 @@ dev = [
 
 [project.scripts]
 marketcow = "marketcow.__main__:main"
-marketcow-offline-duckdb = "marketcow.offline_duckdb_import:main"
 
 [project.urls]
 Homepage = "https://github.com/soapjk/MarketCow"

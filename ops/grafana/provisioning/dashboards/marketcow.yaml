@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: MarketCow
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: ${MARKETCOW_GRAFANA_DASHBOARD_PATH}
+      foldersFromFilesStructure: false

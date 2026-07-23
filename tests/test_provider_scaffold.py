@@ -19,9 +19,9 @@ class ProviderScaffoldTest(unittest.TestCase):
     def test_manifest_and_registry_are_the_single_capability_inventory(self):
         registry = ProviderRegistry(DEFAULT_PROVIDER_MANIFESTS)
         self.assertEqual(registry.supported(REALTIME_QUOTE, "CN"), (
-            "tushare", "sina", "eastmoney",
+            "tushare", "sina", "eastmoney", "longport",
         ))
-        self.assertEqual(registry.supported(REALTIME_QUOTE, "US"), ("yahoo",))
+        self.assertEqual(registry.supported(REALTIME_QUOTE, "US"), ("yahoo", "longport"))
 
     def test_new_provider_template_binds_only_when_operations_exist(self):
         manifest = ProviderManifest("example", "example_api", (

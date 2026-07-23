@@ -1,0 +1,188 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT sum(rows) AS value FROM system.parts WHERE active AND database = currentDatabase() AND table IN ('market_bar_raw', 'market_bar_canonical', 'market_quote_latest')", "refId": "A"}],
+      "title": "Stored rows (physical)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT uniqExact(symbol) AS value FROM (SELECT symbol FROM market_bar_raw FINAL UNION ALL SELECT symbol FROM market_bar_canonical FINAL UNION ALL SELECT symbol FROM market_quote_latest FINAL)", "refId": "A"}],
+      "title": "Unique symbols",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT sum(bytes_on_disk) AS value FROM system.parts WHERE active AND database = currentDatabase() AND table IN ('market_bar_raw', 'market_bar_canonical', 'market_quote_latest')", "refId": "A"}],
+      "title": "ClickHouse disk",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "marketcow-postgres"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"datasource": {"type": "postgres", "uid": "marketcow-postgres"}, "editorMode": "code", "format": "table", "rawQuery": true, "rawSql": "SELECT count(*) AS value FROM marketcow_production.raw_artifact_manifest", "refId": "A", "sql": {"columns": [{"parameters": [], "type": "function"}], "groupBy": [{"property": {"type": "string"}, "type": "groupBy"}], "limit": 50}}],
+      "title": "Artifacts",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "id": 5,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT uniqExact(market) AS value FROM (SELECT market FROM market_bar_raw FINAL UNION ALL SELECT market FROM market_bar_canonical FINAL UNION ALL SELECT JSONExtractString(payload_json, 'market') AS market FROM market_quote_latest FINAL) WHERE market != ''", "refId": "A"}],
+      "title": "Markets",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "id": 6,
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT if(count() = 0, 0, dateDiff('second', max(observed_at), now())) AS value FROM market_quote_latest FINAL", "refId": "A"}],
+      "title": "Newest quote age",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 4},
+      "id": 10,
+      "options": {"displayLabels": ["name", "percent"], "legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "pieType": "donut", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": true}, "tooltip": {"mode": "single", "sort": "none"}},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT layer, rows FROM (SELECT 'raw' AS layer, count() AS rows FROM market_bar_raw FINAL UNION ALL SELECT 'canonical', count() FROM market_bar_canonical FINAL UNION ALL SELECT 'latest_quotes', count() FROM market_quote_latest FINAL)", "refId": "A"}],
+      "title": "Rows by storage layer",
+      "type": "piechart"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 4},
+      "id": 11,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "orientation": "auto", "showValue": "always", "stacking": "normal", "tooltip": {"mode": "single", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 0},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT market, count() AS rows FROM (SELECT market FROM market_bar_raw FINAL UNION ALL SELECT market FROM market_bar_canonical FINAL UNION ALL SELECT JSONExtractString(payload_json, 'market') AS market FROM market_quote_latest FINAL) WHERE market != '' AND ('$market' = 'All' OR market = '$market') GROUP BY market ORDER BY rows DESC", "refId": "A"}],
+      "title": "Rows by market",
+      "type": "barchart"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 4},
+      "id": 12,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "orientation": "auto", "showValue": "always", "stacking": "normal", "tooltip": {"mode": "single", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 0},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT interval, count() AS rows FROM (SELECT interval, market FROM market_bar_raw FINAL UNION ALL SELECT interval, market FROM market_bar_canonical FINAL) WHERE ('$market' = 'All' OR market = '$market') AND ('$interval' = 'All' OR interval = '$interval') GROUP BY interval ORDER BY rows DESC", "refId": "A"}],
+      "title": "Rows by interval",
+      "type": "barchart"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 14, "x": 0, "y": 12},
+      "id": 20,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "canonical_rows"}]},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT symbol, any(market) AS market_name, interval, count() AS canonical_rows, min(bar_time) AS first_bar, max(bar_time) AS last_bar, dateDiff('day', min(bar_time), max(bar_time)) AS span_days FROM market_bar_canonical FINAL WHERE ('$market' = 'All' OR market = '$market') AND ('$interval' = 'All' OR interval = '$interval') AND ('$symbol' = 'All' OR symbol = '$symbol') GROUP BY symbol, interval ORDER BY canonical_rows DESC LIMIT 200", "refId": "A"}],
+      "title": "Symbol coverage (top 200)",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 10, "w": 10, "x": 14, "y": 12},
+      "id": 21,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "rows"}]},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT layer, source, count() AS rows, uniqExact(symbol) AS symbols, min(observed_at) AS first_observed, max(observed_at) AS last_observed FROM (SELECT 'raw_bars' AS layer, source, symbol, market, interval, observed_at FROM market_bar_raw FINAL UNION ALL SELECT 'latest_quotes' AS layer, source, symbol, JSONExtractString(payload_json, 'market') AS market, '' AS interval, observed_at FROM market_quote_latest FINAL) WHERE ('$market' = 'All' OR market = '$market') AND ('$symbol' = 'All' OR symbol = '$symbol') AND (layer = 'latest_quotes' OR '$interval' = 'All' OR interval = '$interval') GROUP BY layer, source ORDER BY rows DESC", "refId": "A"}],
+      "title": "Provider/source distribution",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 3, "showPoints": "never", "spanNulls": false}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 22},
+      "id": 30,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"format": 0, "queryType": "sql", "rawSql": "SELECT toStartOfHour(ingested_at) AS time, source, count() AS rows FROM market_bar_raw FINAL WHERE $__timeFilter(ingested_at) AND ('$market' = 'All' OR market = '$market') GROUP BY time, source ORDER BY time", "refId": "A"}],
+      "title": "Raw ingestion over time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 22},
+      "id": 31,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "unexpected_gaps"}]},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "WITH ordered AS (SELECT symbol, market, interval, bar_time, lagInFrame(bar_time) OVER (PARTITION BY symbol, interval, adjustment ORDER BY bar_time ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS previous_bar FROM market_bar_canonical FINAL WHERE ('$market' = 'All' OR market = '$market') AND ('$interval' = 'All' OR interval = '$interval') AND ('$symbol' = 'All' OR symbol = '$symbol')), measured AS (SELECT *, dateDiff('second', previous_bar, bar_time) AS gap_seconds, multiIf(interval = '1m', 60, interval = '5m', 300, interval = '15m', 900, interval = '30m', 1800, interval IN ('60m','1h'), 3600, interval = '1d', 86400, 0) AS expected_seconds FROM ordered) SELECT symbol, any(market) AS market_name, interval, countIf(previous_bar IS NOT NULL AND expected_seconds > 0 AND gap_seconds > if(interval = '1d', toFloat64(expected_seconds) * 4.0, toFloat64(expected_seconds) * 1.5)) AS unexpected_gaps, maxIf(gap_seconds, previous_bar IS NOT NULL) AS max_gap_seconds FROM measured GROUP BY symbol, interval HAVING unexpected_gaps > 0 ORDER BY unexpected_gaps DESC LIMIT 200", "refId": "A"}],
+      "title": "Continuity: unexpected gaps",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 31},
+      "id": 40,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT table, sum(rows) AS physical_rows, uniqExact(partition_id) AS active_partitions, sum(bytes_on_disk) AS bytes_on_disk FROM system.parts WHERE active AND database = currentDatabase() AND table IN ('market_bar_raw','market_bar_canonical','market_quote_latest') GROUP BY table ORDER BY table", "refId": "A"}],
+      "title": "Physical storage",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 31},
+      "id": 41,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"format": 1, "queryType": "sql", "rawSql": "SELECT layer, physical_rows, logical_rows, physical_rows - logical_rows AS superseded_versions FROM (SELECT 'raw' AS layer, (SELECT count() FROM market_bar_raw) AS physical_rows, (SELECT count() FROM market_bar_raw FINAL) AS logical_rows UNION ALL SELECT 'canonical', (SELECT count() FROM market_bar_canonical), (SELECT count() FROM market_bar_canonical FINAL) UNION ALL SELECT 'latest_quotes', (SELECT count() FROM market_quote_latest), (SELECT count() FROM market_quote_latest FINAL))", "refId": "A"}],
+      "title": "Physical vs FINAL rows",
+      "type": "table"
+    },
+    {
+      "datasource": {"type": "postgres", "uid": "marketcow-postgres"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 31},
+      "id": 42,
+      "options": {"cellHeight": "sm", "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false}, "showHeader": true},
+      "targets": [{"datasource": {"type": "postgres", "uid": "marketcow-postgres"}, "editorMode": "code", "format": "table", "rawQuery": true, "rawSql": "SELECT dataset, source, count(*) AS artifacts, sum(byte_size) AS bytes, min(ingested_at) AS first_ingested, max(ingested_at) AS last_ingested FROM marketcow_production.raw_artifact_manifest GROUP BY dataset, source ORDER BY artifacts DESC LIMIT 200", "refId": "A", "sql": {"columns": [{"parameters": [], "type": "function"}], "groupBy": [{"property": {"type": "string"}, "type": "groupBy"}], "limit": 200}}],
+      "title": "Artifact inventory",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["marketcow", "data-quality", "inventory"],
+  "templating": {
+    "list": [
+      {"allValue": "All", "current": {"selected": true, "text": "All", "value": "All"}, "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"}, "definition": "SELECT DISTINCT market FROM (SELECT market FROM market_bar_canonical FINAL UNION ALL SELECT JSONExtractString(payload_json, 'market') AS market FROM market_quote_latest FINAL) WHERE market != '' ORDER BY market", "includeAll": true, "label": "Market", "name": "market", "options": [], "query": "SELECT DISTINCT market FROM (SELECT market FROM market_bar_canonical FINAL UNION ALL SELECT JSONExtractString(payload_json, 'market') AS market FROM market_quote_latest FINAL) WHERE market != '' ORDER BY market", "refresh": 1, "regex": "", "type": "query"},
+      {"allValue": "All", "current": {"selected": true, "text": "All", "value": "All"}, "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"}, "definition": "SELECT DISTINCT interval FROM market_bar_canonical FINAL ORDER BY interval", "includeAll": true, "label": "Interval", "name": "interval", "options": [], "query": "SELECT DISTINCT interval FROM market_bar_canonical FINAL ORDER BY interval", "refresh": 1, "regex": "", "type": "query"},
+      {"allValue": "All", "current": {"selected": true, "text": "All", "value": "All"}, "datasource": {"type": "grafana-clickhouse-datasource", "uid": "marketcow-clickhouse"}, "definition": "SELECT DISTINCT symbol FROM (SELECT symbol, market FROM market_bar_canonical FINAL UNION ALL SELECT symbol, JSONExtractString(payload_json, 'market') AS market FROM market_quote_latest FINAL) WHERE ('$market' = 'All' OR market = '$market') ORDER BY symbol", "includeAll": true, "label": "Symbol", "name": "symbol", "options": [], "query": "SELECT DISTINCT symbol FROM (SELECT symbol, market FROM market_bar_canonical FINAL UNION ALL SELECT symbol, JSONExtractString(payload_json, 'market') AS market FROM market_quote_latest FINAL) WHERE ('$market' = 'All' OR market = '$market') ORDER BY symbol", "refresh": 1, "regex": "", "type": "query"}
+    ]
+  },
+  "time": {"from": "now-30d", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "MarketCow Data Inventory & Quality",
+  "uid": "marketcow-data-inventory",
+  "version": 1,
+  "weekStart": "monday"
+}

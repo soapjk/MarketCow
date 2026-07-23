@@ -76,6 +76,9 @@ DEFAULT_PROVIDER_MANIFESTS = (
             MARKET_BAR_HISTORY, frozenset({"US", "HK", "FX", "CN"}), "fetch_history"
         ),
     )),
+    ProviderManifest("longport", "longbridge_openapi", (
+        CapabilityDeclaration(REALTIME_QUOTE, frozenset({"CN", "US", "HK"}), "fetch_quote"),
+    )),
 )
 
 

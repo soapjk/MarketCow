@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 # Authoritative BG-003 inventory. The first sixteen domains are compatible with the
-# legacy DuckDB copy; the final two are V2-native control-plane domains.
+# The final two domains hold runtime configuration and migration checkpoints.
 POSTGRES_TRANSACTION_DOMAINS = (
     "ingestion_runs",
     "provider_health",
@@ -231,7 +231,7 @@ POSTGRES_MIGRATIONS = [
     ),
     (
         5,
-        "V2 runtime configuration versions and migration checkpoints",
+        "current runtime configuration versions and migration checkpoints",
         """
         ALTER TABLE ingestion_runs
             ADD CONSTRAINT ingestion_runs_row_count_nonnegative

@@ -61,6 +61,7 @@ class ExampleQuoteProvider:
 
 - `realtime_quote`：标准化最新报价。
 - `market_bar_history`：标准化历史行情和 provenance。
+- provider 若有官方批量报价能力，应实现 `fetch_quotes()`；统一报价 API 会优先使用一次批量调用。
 - 显式指定 provider 时，若市场或能力不支持，返回 `provider_not_supported`，默认不得静默换源。
 - 未指定 provider 时，只在声明支持该能力与市场的 provider 中按配置优先级选择。
 - provider 私有字段只能放在原始 Artifact；公开响应和 ClickHouse 行情字段保持统一。

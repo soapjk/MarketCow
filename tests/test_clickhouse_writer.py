@@ -54,68 +54,6 @@ class ReliableClickHouseWriterTest(unittest.TestCase):
             writer = ReliableClickHouseWriter(FakeRepository(False), spool, 1000)
             self.assertEqual(writer.write("raw", [raw_bar()])["written"], 1)
 
-    def test_replay_migrates_and_recovers_pre_checksum_wal(self):
-        import json
-
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            spool = LocalClickHouseSpool(root / "spool", root)
-            rows = [normalize_bar("raw", raw_bar())]
-            batch_id = stable_batch_id("raw", rows)
-            path = spool.pending / f"{batch_id}.json"
-            path.write_text(json.dumps({
-                "dataset": "raw", "batch_id": batch_id, "rows": rows, "attempts": 1,
-                "created_at": "2026-07-20T00:00:00Z",
-                "last_attempt_at": "2026-07-20T00:00:01Z", "last_error": "outage",
-            }), encoding="utf-8")
-            repository = FakeRepository(False)
-            result = ReliableClickHouseWriter(repository, spool, 1000).replay(10)
-            self.assertEqual(result["legacy_migrated"], 1)
-            self.assertEqual(result["replayed"], 1)
-            self.assertEqual(len(repository.calls), 1)
-            self.assertTrue((spool.replayed / path.name).exists())
-
-    def test_replay_preserves_legacy_wal_when_signing_fails_then_recovers(self):
-        import json
-        from unittest.mock import patch
-
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            spool = LocalClickHouseSpool(root / "spool", root)
-            rows = [normalize_bar("raw", raw_bar())]
-            batch_id = stable_batch_id("raw", rows)
-            path = spool.pending / f"{batch_id}.json"
-            original = json.dumps({
-                "dataset": "raw", "batch_id": batch_id, "rows": rows, "attempts": 1,
-                "created_at": "2026-07-20T00:00:00Z",
-                "last_attempt_at": "2026-07-20T00:00:01Z", "last_error": "outage",
-            })
-            path.write_text(original, encoding="utf-8")
-            repository = FakeRepository(False)
-            writer = ReliableClickHouseWriter(repository, spool, 1000)
-            real_atomic = spool._atomic_json
-
-            def deny_signing(target, payload):
-                if target == path and "_checksum" not in payload:
-                    raise PermissionError("denied")
-                return real_atomic(target, payload)
-
-            with patch.object(spool, "_atomic_json", side_effect=deny_signing):
-                blocked = writer.replay(10)
-            self.assertEqual(blocked["legacy_errors"], 1)
-            self.assertGreaterEqual(blocked["legacy_blocked"], 1)
-            self.assertGreaterEqual(blocked["remaining"], 1)
-            self.assertTrue(blocked["truncated"])
-            self.assertEqual(path.read_text(encoding="utf-8"), original)
-            self.assertEqual(repository.calls, [])
-            self.assertEqual(list(spool.quarantine.glob("*" + path.name)), [])
-
-            recovered = writer.replay(10)
-            self.assertEqual(recovered["legacy_migrated"], 1)
-            self.assertEqual(recovered["replayed"], 1)
-            self.assertEqual(len(repository.calls), 1)
-            self.assertFalse(path.exists())
-
     def test_replay_quarantines_corrupt_wal_and_continues_healthy_items(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

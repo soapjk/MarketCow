@@ -38,12 +38,28 @@ class StubService:
     def close(self):
         pass
 
+    def get_quote_spread(self, symbol):
+        self.calls.append(("spread", symbol))
+        return {
+            "symbol": symbol, "best_bid": 100.0, "best_ask": 100.1,
+            "spread": 0.1, "spread_bps": 9.995,
+        }
+
+
+class BatchStubService(StubService):
+    def refresh_quotes_batch(self, symbols, provider, allow_fallback=False):
+        self.calls.append(("batch", tuple(symbols), provider, allow_fallback))
+        return [
+            {"symbol": symbol, "price": 1.0, "source": "longbridge_openapi"}
+            for symbol in symbols
+        ]
+
 
 class ProviderRoutingTest(unittest.TestCase):
     def setUp(self):
         self.folder = TemporaryDirectory()
         root = Path(self.folder.name)
-        self.settings = Settings(root / "db.duckdb", root / "raw")
+        self.settings = Settings(raw_path=root / "raw", storage_root=root / "test", allowed_root=root, postgres_dsn="postgresql://u:p@127.0.0.1/marketcow_test", clickhouse_password="secret", profile="test", port=8793, postgres_schema="marketcow_test", clickhouse_database="marketcow_test", clickhouse_spool_path=root / "test/spool/clickhouse")
 
     def tearDown(self):
         self.folder.cleanup()
@@ -113,6 +129,30 @@ class ProviderRoutingTest(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"]["code"], "provider_requires_refresh")
+
+    def test_longport_explicit_refresh_uses_one_batch_operation(self):
+        service = BatchStubService()
+        client = TestClient(create_app(self.settings, service))
+        response = client.post("/v1/quotes/query", json={
+            "symbols": ["AAPL", "0700.HK"],
+            "provider": "longport",
+            "refresh": True,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["count"], 2)
+        self.assertEqual(service.calls, [
+            ("batch", ("AAPL", "0700.HK"), "longport", False),
+        ])
+
+    def test_public_spread_route_uses_longport_depth_service(self):
+        service = StubService()
+        client = TestClient(create_app(self.settings, service))
+
+        response = client.get("/v1/quotes/AAPL/spread")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["best_bid"], 100.0)
+        self.assertEqual(service.calls, [("spread", "AAPL")])
 
 
 if __name__ == "__main__":

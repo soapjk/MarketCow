@@ -60,24 +60,13 @@ class BackgroundCanonicalScheduler:
         except BlockingIOError:
             self._lease.close()
             raise RuntimeError("canonical scheduler lease is already held") from None
-        try:
-            from .spool_operator import SpoolOperator
-            migration = SpoolOperator(spool).migrate_legacy(
-                1000, kinds=("scheduler-pending", "scheduler-processing", "scheduler-failed")
-            )
-        except Exception:
-            fcntl.flock(self._lease.fileno(), fcntl.LOCK_UN)
-            self._lease.close()
-            raise
-        if not migration["remaining"] and not migration["errors"]:
-            self._recover_processing()
+        self._recover_processing()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._paused = threading.Event()
         if start_paused:
             self._paused.set()
         self._state_lock = threading.Lock()
-        self._legacy_migration = migration
         self._last: Dict[str, Any] = {"status": "starting"}
         self._thread = threading.Thread(
             target=self._run, name="marketcow-canonical-scheduler", daemon=False
@@ -222,16 +211,8 @@ class BackgroundCanonicalScheduler:
                 except BlockingIOError:
                     return 0
                 try:
-                    from .spool_operator import SpoolOperator
-                    migration = SpoolOperator(self.spool).migrate_legacy(
-                        self.scan_limit, already_locked=True,
-                        kinds=("scheduler-pending", "scheduler-processing", "scheduler-failed"),
-                    )
-                    with self._state_lock:
-                        self._legacy_migration = migration
                     now = float(self.clock())
-                    if not migration["remaining"] and not migration["errors"]:
-                        self._recover_processing()
+                    self._recover_processing()
                     ready = []
                     for path in self._files(self.pending, self.scan_limit):
                         try:
@@ -302,7 +283,6 @@ class BackgroundCanonicalScheduler:
                 len(pending) > self.queue_cap or len(failed) > self.queue_cap
             ), "oldest_lag_seconds": round(oldest, 3), "last": last,
             "invalid": invalid,
-            "legacy_migration": dict(self._legacy_migration),
         }
 
     def close(self, timeout: float = 35.0) -> None:

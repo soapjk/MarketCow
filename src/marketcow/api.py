@@ -9,14 +9,14 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .config import Settings, V2_PROFILES
+from .config import Settings
 from .market_bar_cursor import decode_cursor, encode_cursor, load_or_create_secret
 from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
 from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
 from .telemetry import sanitize_text, telemetry_call
-from .health import StorageHealthEvaluator, V2HealthEvaluator
+from .health import HealthEvaluator
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
 
 
@@ -59,34 +59,21 @@ def create_app(
     app.state.service = service
     app.add_event_handler("shutdown", service.close)
     clock = now_provider or (lambda: datetime.now(timezone.utc))
-    health_evaluator = StorageHealthEvaluator(wall_clock=clock)
-    v2_health_evaluator = V2HealthEvaluator(wall_clock=clock)
+    health_evaluator = HealthEvaluator(wall_clock=clock)
 
     def storage_health() -> Dict[str, Any]:
-        if settings.profile in V2_PROFILES:
-            resources = getattr(service, "v2_resources", None)
-            try:
-                snapshot = resources.health_snapshot() if resources is not None else None
-            except Exception:
-                snapshot = None
-            return v2_health_evaluator.evaluate(snapshot)
-        repository = getattr(service, "market_bar_repository", None)
-        telemetry = getattr(repository, "telemetry", None)
-        snapshot = telemetry_call(telemetry, "snapshot")
+        resources = getattr(service, "online_resources", None)
+        try:
+            snapshot = resources.health_snapshot() if resources is not None else None
+        except Exception:
+            snapshot = None
         return health_evaluator.evaluate(snapshot)
 
     def database_identifier() -> str:
-        if settings.profile in V2_PROFILES:
-            return f"postgresql://{sanitize_text(settings.postgres_schema)}+clickhouse://{sanitize_text(settings.clickhouse_database)}"
-        if settings.database_path is None:
-            return "[REDACTED_PATH]"
-        try:
-            relative = settings.database_path.resolve().relative_to(
-                settings.storage_root.resolve()
-            )
-            return "storage://" + "/".join(sanitize_text(part) for part in relative.parts)
-        except (OSError, ValueError):
-            return "[REDACTED_PATH]"
+        return (
+            f"postgresql://{sanitize_text(settings.postgres_schema)}+"
+            f"clickhouse://{sanitize_text(settings.clickhouse_database)}"
+        )
 
     def cache_metadata(
         bars: list[Dict[str, Any]], fallback_ingested_at: Any = None,
@@ -162,7 +149,7 @@ def create_app(
             "version": __version__,
             "profile": settings.profile,
             "database": database_identifier(),
-            "metadata_backend": settings.metadata_backend,
+            "metadata_backend": "postgresql",
             "storage_health": storage_health(),
         }
 
@@ -310,6 +297,25 @@ def create_app(
                     "symbol": symbol, "status": "unavailable", "error": str(exc),
                 })
         by_symbol, errors = {}, list(normalization_errors)
+        batch_method = getattr(service, "refresh_quotes_batch", None)
+        if refresh and provider and callable(batch_method) and normalized_symbols:
+            try:
+                batch = batch_method(normalized_symbols, provider, allow_fallback)
+            except ProviderNotSupported as exc:
+                raise provider_http_error(exc) from exc
+            except Exception as exc:
+                batch = []
+                errors.extend({
+                    "symbol": symbol, "status": "unavailable", "error": str(exc),
+                } for symbol in normalized_symbols)
+            if batch is not None:
+                by_symbol.update({row["symbol"]: row for row in batch})
+                items = [by_symbol[symbol] for symbol in normalized_symbols if symbol in by_symbol]
+                result = {"count": len(items), "items": items, "errors": errors}
+                result["routing"] = {
+                    "provider_requested": provider, "allow_fallback": allow_fallback
+                }
+                return result
         workers = max(1, min(settings.quote_refresh_workers, len(normalized_symbols)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -916,6 +922,18 @@ def create_app(
                 },
             ) from exc
 
+    @app.get("/v1/quotes/{symbol}/spread")
+    def quote_spread(symbol: str):
+        try:
+            return service.get_quote_spread(symbol)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"symbol": symbol, "status": "unavailable"},
+            ) from exc
+
     @app.get("/v1/fundamentals")
     def fundamentals(
         limit: int = Query(100, ge=1, le=5000),
@@ -997,10 +1015,6 @@ def create_app(
     def artifacts(dataset: str = "", limit: int = Query(100, ge=1, le=1000)):
         rows = service.artifact_store.list_artifacts(dataset, limit)
         return {"count": len(rows), "items": rows}
-
-    @app.post("/v1/admin/artifacts/backfill")
-    def backfill_artifacts():
-        return service.backfill_legacy_artifacts()
 
     @app.post("/v1/admin/baostock/{symbol}/refresh")
     def refresh_baostock(symbol: str, report_period: str):
@@ -1098,6 +1112,3 @@ def create_app(
         return {"count": len(rows), "limit": limit, "offset": offset, "as_of": normalized_as_of or None, "point_in_time": bool(normalized_as_of), "items": rows}
 
     return app
-
-
-app = create_app()

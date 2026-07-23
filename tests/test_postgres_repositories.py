@@ -12,12 +12,12 @@ from marketcow.postgres_repositories import (
     PostgresFundamentalRepository,
     PostgresMetadataRepository,
 )
-from marketcow.local_backup import BackupComponent
+from marketcow.backup_bundle import BackupComponent
 from marketcow.postgres_migrations import (
     POSTGRES_MIGRATIONS,
     POSTGRES_TRANSACTION_DOMAINS,
 )
-from marketcow.repositories import V2ControlPlaneRepository
+from marketcow.repositories import ControlPlaneRepository
 
 
 class PostgresDomainInventoryTest(unittest.TestCase):
@@ -94,7 +94,7 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
                 )
 
     def test_migrations_control_plane_and_artifact_manifest(self):
-        self.assertIsInstance(self.repository, V2ControlPlaneRepository)
+        self.assertIsInstance(self.repository, ControlPlaneRepository)
         self.database.migrate()
         with self.database.connection() as connection:
             versions = connection.execute(
@@ -132,8 +132,8 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
                 payload, sort_keys=True, separators=(",", ":")
             ).encode()).hexdigest()
             return {
-                "config_id": "v2-runtime", "version": version,
-                "profile": "v2-test", "schema_version": "marketcow.v2-runtime-config.v1",
+                "config_id": "runtime", "version": version,
+                "profile": "test", "schema_version": "marketcow.runtime-config.v1",
                 "config_json": payload, "config_sha256": digest,
                 "observed_at": observed, "actor": "test",
             }
@@ -167,10 +167,10 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
                 "config_sha256": first_hash,
             })
         self.assertEqual(self.repository.get_runtime_config_version(
-            "v2-runtime", "2026-07-20T12:00:00Z"
+            "runtime", "2026-07-20T12:00:00Z"
         )["config_json"]["value"], "first")
         self.assertEqual(self.repository.get_runtime_config_version(
-            "v2-runtime"
+            "runtime"
         )["config_json"]["value"], "second")
 
         checkpoint = {

@@ -1,14 +1,13 @@
-import tempfile
 import threading
 import time
+import tempfile
 import unittest
-import json
 from pathlib import Path
-from unittest.mock import patch
 
 from marketcow.clickhouse_scheduler import BackgroundCanonicalScheduler
 from marketcow.clickhouse_scheduler import create_canonical_scheduler
-from marketcow.clickhouse_writer import LocalClickHouseSpool, ReliableClickHouseWriter
+from marketcow.clickhouse_writer import ReliableClickHouseWriter
+from marketcow.clickhouse_writer import LocalClickHouseSpool
 
 
 ROWS = [{
@@ -82,6 +81,27 @@ def wait_until(predicate, seconds=2):
 
 
 class BackgroundCanonicalSchedulerTest(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.root = Path(self.folder.name)
+        self.spool = LocalClickHouseSpool(self.root / "spool", self.root)
+        self.schedulers = []
+
+    def tearDown(self):
+        for scheduler in reversed(self.schedulers):
+            try:
+                scheduler.close()
+            except (RuntimeError, ValueError):
+                pass
+        self.folder.cleanup()
+
+    def scheduler(self, builder=None, **kwargs):
+        scheduler = BackgroundCanonicalScheduler(
+            builder or Builder(), self.spool, poll_seconds=0.05, **kwargs
+        )
+        self.schedulers.append(scheduler)
+        return scheduler
+
     def test_disabled_factory_has_no_thread_or_directory_side_effect(self):
         absent = self.root / "disabled-spool"
         before = {thread.name for thread in threading.enumerate()}
@@ -143,79 +163,6 @@ class BackgroundCanonicalSchedulerTest(unittest.TestCase):
         writer.replay(1)
         self.assertEqual(len(list(self.spool.intents.glob("*.json"))), 0)
         self.assertEqual(len(scheduler._files(scheduler.pending, 10)), 1)
-    def test_startup_migrates_legacy_scheduler_intent_before_recovery(self):
-        builder = Builder()
-        group = {"symbol": "MU", "interval": "1m", "adjustment": "raw",
-                 "start": "2026-07-20T01:00:00Z", "end": "2026-07-20T01:00:00Z"}
-        task_id = BackgroundCanonicalScheduler._task_id(group)
-        processing = self.spool.root / "canonical-scheduler/processing"
-        processing.mkdir(parents=True)
-        legacy = processing / f"{task_id}.json"
-        legacy.write_text(json.dumps({
-            "task_id": task_id, **group, "attempts": 0,
-            "created_at_epoch": 1000.0, "next_attempt_epoch": 1000.0,
-            "last_error": "",
-        }), encoding="utf-8")
-        scheduler = self.scheduler(builder, clock=Clock(), start_paused=True)
-        pending = scheduler.pending / legacy.name
-        self.assertIn("_checksum", self.spool.read(pending, require_checksum=True))
-        scheduler.resume()
-        self.assertTrue(wait_until(lambda: len(builder.calls) == 1))
-
-    def test_startup_preserves_legacy_intent_when_signing_fails_then_recovers(self):
-        builder = Builder()
-        group = {"symbol": "MU", "interval": "1m", "adjustment": "raw",
-                 "start": "2026-07-20T01:00:00Z", "end": "2026-07-20T01:00:00Z"}
-        task_id = BackgroundCanonicalScheduler._task_id(group)
-        processing = self.spool.root / "canonical-scheduler/processing"
-        processing.mkdir(parents=True)
-        legacy = processing / f"{task_id}.json"
-        original = json.dumps({
-            "task_id": task_id, **group, "attempts": 0,
-            "created_at_epoch": 1000.0, "next_attempt_epoch": 1000.0,
-            "last_error": "",
-        })
-        legacy.write_text(original, encoding="utf-8")
-        real_atomic = self.spool._atomic_json
-
-        def deny_signing(target, payload):
-            if target == legacy and "_checksum" not in payload:
-                raise PermissionError("denied")
-            return real_atomic(target, payload)
-
-        with patch.object(self.spool, "_atomic_json", side_effect=deny_signing):
-            scheduler = self.scheduler(builder, clock=Clock(), start_paused=True)
-        self.assertTrue(legacy.exists())
-        self.assertEqual(legacy.read_text(encoding="utf-8"), original)
-        self.assertEqual(scheduler.diagnostics()["legacy_migration"]["remaining"], 1)
-        self.assertEqual(builder.calls, [])
-
-        scheduler._paused.clear()
-        self.assertEqual(scheduler.run_once(), 1)
-        self.assertEqual(len(builder.calls), 1)
-        self.assertFalse(legacy.exists())
-
-    def setUp(self):
-        self.folder = tempfile.TemporaryDirectory()
-        self.root = Path(self.folder.name)
-        self.spool = LocalClickHouseSpool(self.root / "spool", self.root)
-        self.schedulers = []
-
-    def tearDown(self):
-        for scheduler in reversed(self.schedulers):
-            try:
-                scheduler.close()
-            except (RuntimeError, ValueError):
-                pass
-        self.folder.cleanup()
-
-    def scheduler(self, builder=None, **kwargs):
-        scheduler = BackgroundCanonicalScheduler(
-            builder or Builder(), self.spool, poll_seconds=0.05, **kwargs
-        )
-        self.schedulers.append(scheduler)
-        return scheduler
-
     def test_durable_enqueue_dedup_pause_resume_and_exact_range(self):
         builder = Builder()
         scheduler = self.scheduler(builder)

@@ -164,7 +164,7 @@ class _PostgresControlPlaneRepository:
             ).fetchall())
 
     def save_runtime_config_version(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """Append an immutable, content-addressed V2 runtime configuration version."""
+        """Append an immutable, content-addressed current runtime configuration version."""
         config = row.get("config_json", row.get("config", {}))
         canonical = json.dumps(
             config, ensure_ascii=False, sort_keys=True, separators=(",", ":"),

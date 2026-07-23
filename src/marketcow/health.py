@@ -7,8 +7,8 @@ from typing import Any, Callable, Dict, Mapping
 from .telemetry import sanitize_text
 
 
-HEALTH_SCHEMA = "storage-v2.health.v1"
-V2_HEALTH_SCHEMA = "marketcow.v2.health.v1"
+HEALTH_SCHEMA = "marketcow.health.v1"
+HEALTH_SCHEMA = "marketcow.health.v1"
 THRESHOLDS = {
     "degrade_after_seconds": 30.0,
     "unavailable_after_seconds": 10.0,
@@ -23,7 +23,7 @@ THRESHOLDS = {
 MAX_REASONS = 8
 MAX_REASON_CHARS = 240
 
-V2_THRESHOLDS = {
+HEALTH_THRESHOLDS = {
     "degrade_after_seconds": 30.0,
     "unavailable_after_seconds": 10.0,
     "recover_after_seconds": 60.0,
@@ -48,7 +48,7 @@ def _series(snapshot: Mapping[str, Any], name: str, **labels: str) -> Any:
     return None
 
 
-class StorageHealthEvaluator:
+class LegacyHealthEvaluator:
     """Thread-safe local health state with bounded hysteresis and no I/O."""
 
     def __init__(
@@ -67,7 +67,7 @@ class StorageHealthEvaluator:
         return [sanitize_text(reason)[:MAX_REASON_CHARS] for reason in reasons[:MAX_REASONS]]
 
     def _raw_state(self, snapshot: Any) -> tuple[str, list[str]]:
-        if not isinstance(snapshot, Mapping) or snapshot.get("schema") != "storage-v2.telemetry.v1":
+        if not isinstance(snapshot, Mapping) or snapshot.get("schema") != "marketcow.telemetry.v1":
             return "unavailable", ["telemetry_snapshot_unavailable"]
         clickhouse = snapshot.get("clickhouse")
         if not isinstance(clickhouse, Mapping) or not clickhouse.get("enabled"):
@@ -150,7 +150,7 @@ class StorageHealthEvaluator:
             "status": state,
             "ready": state in {"disabled", "healthy", "degraded"},
             "backend": "clickhouse" if clickhouse_enabled else (
-                "duckdb" if state == "disabled" else "unknown"
+                "clickhouse" if state == "disabled" else "unknown"
             ),
             "observed_at": observed,
             "candidate_status": candidate,
@@ -161,7 +161,7 @@ class StorageHealthEvaluator:
         }
 
 
-class V2HealthEvaluator:
+class HealthEvaluator:
     """Deterministic PG/CH/WAL/canonical health with sustained transitions."""
 
     def __init__(self, clock: Callable[[], float] | None = None,
@@ -179,8 +179,8 @@ class V2HealthEvaluator:
         return value if isinstance(value, Mapping) else {}
 
     def _raw_state(self, snapshot: Any) -> tuple[str, list[str]]:
-        if not isinstance(snapshot, Mapping) or snapshot.get("schema") != V2_HEALTH_SCHEMA:
-            return "unavailable", ["v2_dependency_snapshot_unavailable"]
+        if not isinstance(snapshot, Mapping) or snapshot.get("schema") != HEALTH_SCHEMA:
+            return "unavailable", ["dependency_snapshot_unavailable"]
         reasons: list[str] = []
         unavailable = False
         pg = self._component(snapshot, "postgresql")
@@ -198,17 +198,17 @@ class V2HealthEvaluator:
             quarantine = float(wal.get("quarantine", 0))
             lag = float(wal.get("oldest_pending_lag_seconds", 0))
             disk = float(wal.get("disk_used_ratio", 0))
-            if quarantine >= V2_THRESHOLDS["wal_quarantine_unavailable_items"]:
+            if quarantine >= HEALTH_THRESHOLDS["wal_quarantine_unavailable_items"]:
                 unavailable, reasons = True, reasons + ["wal_quarantine_present"]
-            if failed >= V2_THRESHOLDS["wal_failed_degraded_items"]:
+            if failed >= HEALTH_THRESHOLDS["wal_failed_degraded_items"]:
                 reasons.append("wal_failed_present")
-            if pending >= V2_THRESHOLDS["wal_pending_degraded_items"]:
+            if pending >= HEALTH_THRESHOLDS["wal_pending_degraded_items"]:
                 reasons.append("wal_backlog_high")
-            if lag >= V2_THRESHOLDS["wal_lag_degraded_seconds"]:
+            if lag >= HEALTH_THRESHOLDS["wal_lag_degraded_seconds"]:
                 reasons.append("wal_lag_high")
-            if disk >= V2_THRESHOLDS["disk_unavailable_ratio"]:
+            if disk >= HEALTH_THRESHOLDS["disk_unavailable_ratio"]:
                 unavailable, reasons = True, reasons + ["wal_disk_pressure_critical"]
-            elif disk >= V2_THRESHOLDS["disk_degraded_ratio"]:
+            elif disk >= HEALTH_THRESHOLDS["disk_degraded_ratio"]:
                 reasons.append("wal_disk_pressure_high")
             if wal.get("truncated"):
                 unavailable, reasons = True, reasons + ["wal_diagnostics_truncated"]
@@ -217,17 +217,17 @@ class V2HealthEvaluator:
             worker = self._component(snapshot, "clickhouse_scheduler")
             if worker.get("status") != "healthy" or not scheduler.get("thread_alive"):
                 unavailable, reasons = True, reasons + ["canonical_worker_unavailable"]
-            if float(scheduler.get("failed", 0)) >= V2_THRESHOLDS[
+            if float(scheduler.get("failed", 0)) >= HEALTH_THRESHOLDS[
                 "canonical_failed_unavailable_items"
             ]:
                 unavailable, reasons = True, reasons + ["canonical_failed_present"]
             if scheduler.get("backlog_truncated"):
                 unavailable, reasons = True, reasons + ["canonical_backlog_truncated"]
-            if float(scheduler.get("pending", 0)) >= V2_THRESHOLDS[
+            if float(scheduler.get("pending", 0)) >= HEALTH_THRESHOLDS[
                 "canonical_pending_degraded_items"
             ]:
                 reasons.append("canonical_backlog_high")
-            if float(scheduler.get("oldest_lag_seconds", 0)) >= V2_THRESHOLDS[
+            if float(scheduler.get("oldest_lag_seconds", 0)) >= HEALTH_THRESHOLDS[
                 "canonical_lag_degraded_seconds"
             ]:
                 reasons.append("canonical_lag_high")
@@ -237,11 +237,11 @@ class V2HealthEvaluator:
         if pressure.get("status") == "observed":
             disk = float(pressure.get("disk_used_ratio", 0))
             merge = float(pressure.get("merge_queue", 0))
-            if disk >= V2_THRESHOLDS["disk_unavailable_ratio"] or merge >= V2_THRESHOLDS[
+            if disk >= HEALTH_THRESHOLDS["disk_unavailable_ratio"] or merge >= HEALTH_THRESHOLDS[
                 "merge_unavailable_items"
             ]:
                 unavailable, reasons = True, reasons + ["clickhouse_pressure_critical"]
-            elif disk >= V2_THRESHOLDS["disk_degraded_ratio"] or merge >= V2_THRESHOLDS[
+            elif disk >= HEALTH_THRESHOLDS["disk_degraded_ratio"] or merge >= HEALTH_THRESHOLDS[
                 "merge_degraded_items"
             ]:
                 reasons.append("clickhouse_pressure_high")
@@ -259,10 +259,10 @@ class V2HealthEvaluator:
         try:
             raw, reasons = self._raw_state(snapshot)
         except Exception:
-            raw, reasons = "unavailable", ["v2_health_evaluation_failed"]
+            raw, reasons = "unavailable", ["health_evaluation_failed"]
         with self._lock:
             immediate = any(reason in {
-                "v2_dependency_snapshot_unavailable", "postgresql_unavailable",
+                "dependency_snapshot_unavailable", "postgresql_unavailable",
                 "clickhouse_main_unavailable", "wal_diagnostics_unavailable",
                 "canonical_worker_unavailable",
                 "clickhouse_pressure_unavailable",
@@ -274,11 +274,11 @@ class V2HealthEvaluator:
             else:
                 if self._candidate != raw:
                     self._candidate, self._candidate_since = raw, now
-                threshold = (V2_THRESHOLDS["recover_after_seconds"] if raw == "healthy"
+                threshold = (HEALTH_THRESHOLDS["recover_after_seconds"] if raw == "healthy"
                              or self._state == "unavailable" and raw == "degraded"
-                             else V2_THRESHOLDS["unavailable_after_seconds"]
+                             else HEALTH_THRESHOLDS["unavailable_after_seconds"]
                              if raw == "unavailable"
-                             else V2_THRESHOLDS["degrade_after_seconds"])
+                             else HEALTH_THRESHOLDS["degrade_after_seconds"])
                 elapsed = max(0.0, now - float(self._candidate_since))
                 if elapsed >= threshold:
                     self._state, self._candidate, self._candidate_since = raw, None, None
@@ -291,12 +291,12 @@ class V2HealthEvaluator:
             observed = None
         components = snapshot.get("components", {}) if isinstance(snapshot, Mapping) else {}
         return {
-            "schema": V2_HEALTH_SCHEMA, "status": state,
+            "schema": HEALTH_SCHEMA, "status": state,
             "ready": state != "unavailable", "backend": "postgresql+clickhouse",
             "observed_at": observed, "candidate_status": candidate,
             "candidate_since_monotonic": since,
-            "reasons": StorageHealthEvaluator._bounded_reasons(reasons),
-            "thresholds": dict(V2_THRESHOLDS),
+            "reasons": LegacyHealthEvaluator._bounded_reasons(reasons),
+            "thresholds": dict(HEALTH_THRESHOLDS),
             "window": {"kind": "sustained_condition", "process_local": True},
             "components": components,
         }

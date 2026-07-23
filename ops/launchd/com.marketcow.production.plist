@@ -14,7 +14,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>MARKETCOW_PROFILE</key>
-        <string>v2-production</string>
+        <string>production</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
     </dict>

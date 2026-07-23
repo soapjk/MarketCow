@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
+import copy
 import hashlib
-import importlib
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from .config import Settings, V2_PROFILES
+from .config import Settings
 from .normalize import (
     exchange_for_symbol,
     instrument_id,
@@ -30,6 +30,8 @@ from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normal
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
 from .providers.calendar import CalendarProvider
 from .providers.tushare_provider import TushareProvider
+from .providers.longport_quote import LongPortQuoteProvider
+from .quote_persistence import AsyncQuotePersistence
 from .providers.contracts import DEFAULT_PROVIDER_MANIFESTS, ProviderRegistry
 from .repositories import Repositories
 from .domain_columns import FUNDAMENTAL_COLUMNS
@@ -110,38 +112,29 @@ class FundamentalService:
         a_quote_provider: Optional[EastmoneyRealtimeQuoteProvider] = None,
         calendar_provider: Optional[CalendarProvider] = None,
         tushare_provider: Optional[TushareProvider] = None,
+        longport_quote_provider: Optional[LongPortQuoteProvider] = None,
     ):
         self.settings = settings
         self.warehouse = warehouse
         self.repository_database = None
-        self.v2_resources = None
+        self.online_resources = None
         if repositories is None:
-            if settings.profile in V2_PROFILES:
-                from .artifact_store import LocalArtifactStore
-                from .v2_factory import create_v2_online_repositories
-                from .v2_market_bars import V2AuthoritativeMarketBarRepository
+            from .artifact_store import LocalArtifactStore
+            from .factory import create_online_repositories
+            from .market_bars import AuthoritativeMarketBarRepository
 
-                self.v2_resources = create_v2_online_repositories(settings)
-                market_bars = V2AuthoritativeMarketBarRepository(
-                    self.v2_resources.market_bars, self.v2_resources.writer,
-                    self.v2_resources.telemetry,
-                    self.v2_resources.canonical_scheduler,
-                )
-                repositories = Repositories(
-                    metadata=self.v2_resources.postgres,
-                    fundamentals=self.v2_resources.postgres,
-                    market_bars=market_bars,
-                    artifacts=LocalArtifactStore(self.v2_resources.postgres),
-                )
-            else:
-                legacy = importlib.import_module(
-                    ".legacy_service_factory", package=__package__
-                )
-                repositories, self.repository_database, self.warehouse = (
-                    legacy.create_legacy_service_repositories(
-                        settings, self.warehouse
-                    )
-                )
+            self.online_resources = create_online_repositories(settings)
+            market_bars = AuthoritativeMarketBarRepository(
+                self.online_resources.market_bars, self.online_resources.writer,
+                self.online_resources.telemetry,
+                self.online_resources.canonical_scheduler,
+            )
+            repositories = Repositories(
+                metadata=self.online_resources.postgres,
+                fundamentals=self.online_resources.postgres,
+                market_bars=market_bars,
+                artifacts=LocalArtifactStore(self.online_resources.postgres),
+            )
         self.repositories = repositories
         self.metadata_repository = self.repositories.metadata
         self.fundamental_repository = self.repositories.fundamentals
@@ -162,16 +155,28 @@ class FundamentalService:
             settings.tushare_token, settings.tushare_base_url,
             settings.tushare_realtime_url, settings.tushare_min_interval,
         )
+        self.longport_quote_provider = longport_quote_provider or LongPortQuoteProvider(
+            settings.longport_app_key,
+            settings.longport_app_secret,
+            settings.longport_access_token,
+            enable_overnight=settings.longport_enable_overnight,
+        )
         self.provider_registry = ProviderRegistry(DEFAULT_PROVIDER_MANIFESTS)
         quote_capability = (REALTIME_QUOTE,)
         self.provider_registry.bind("sina", self.sina_quote_provider, quote_capability)
         self.provider_registry.bind("eastmoney", self.a_quote_provider, quote_capability)
         self.provider_registry.bind("yahoo", self.quote_provider, quote_capability)
         self.provider_registry.bind("tushare", self.tushare_provider, quote_capability)
+        self.provider_registry.bind("longport", self.longport_quote_provider, quote_capability)
+        self.quote_persistence = AsyncQuotePersistence(
+            capacity=settings.quote_persistence_queue_size
+        )
 
     def close(self) -> None:
-        if self.v2_resources is not None:
-            self.v2_resources.close()
+        self.quote_persistence.close(self.settings.quote_persistence_shutdown_seconds)
+        self.longport_quote_provider.close()
+        if self.online_resources is not None:
+            self.online_resources.close()
         if self.repository_database is not None:
             self.repository_database.close()
 
@@ -350,6 +355,87 @@ class FundamentalService:
             "raw_response_locator": "realtime_quote row", "_raw_payload": item,
         }
 
+    def _persist_quote(
+        self, row: Dict[str, Any], ingested_at: str | None = None
+    ) -> Dict[str, Any]:
+        raw_payload = row.pop("_raw_payload")
+        ingested_at = ingested_at or utc_now()
+        artifact = self._save_quote_raw(
+            row["symbol"], "latest", raw_payload, ingested_at, row["source"],
+            row["source_url"], row["raw_response_locator"],
+        )
+        row.update({
+            "observed_at": row.get("quote_at") or ingested_at,
+            "ingested_at": ingested_at,
+            "raw_path": artifact["storage_path"],
+            "raw_artifact_id": artifact["artifact_id"],
+            "is_cached": False, "cached": False, "stale": False,
+            "cache_status": "refreshed",
+        })
+        self.market_bar_repository.upsert_quote(row)
+        return row
+
+    def _persist_quotes_async(
+        self, rows: list[Dict[str, Any]], provider: str
+    ) -> list[Dict[str, Any]]:
+        ingested_at = utc_now()
+        pending_rows = copy.deepcopy(rows)
+
+        def persist() -> None:
+            for pending in pending_rows:
+                self._persist_quote(pending, ingested_at)
+            self.metadata_repository.record_provider_health(provider, True, ingested_at)
+
+        queued = self.quote_persistence.submit(persist)
+        status = "queued" if queued else "rejected"
+        responses = []
+        for row in rows:
+            response = {key: value for key, value in row.items() if key != "_raw_payload"}
+            response.update({
+                "observed_at": row.get("quote_at") or ingested_at,
+                "ingested_at": ingested_at,
+                "raw_path": None,
+                "raw_artifact_id": None,
+                "is_cached": False,
+                "cached": False,
+                "stale": False,
+                "cache_status": "refreshed",
+                "persistence_status": status,
+            })
+            responses.append(response)
+        return responses
+
+    def refresh_quotes_batch(
+        self, symbols: list[str], provider: str, allow_fallback: bool = False
+    ) -> list[Dict[str, Any]] | None:
+        adapter = self._quote_provider(provider)
+        fetch = getattr(adapter, "fetch_quotes", None)
+        if not callable(fetch):
+            return None
+        normalized: list[str] = []
+        for symbol in symbols:
+            market, value = self._quote_market(symbol)
+            select_providers(
+                REALTIME_QUOTE, market, provider, (), allow_fallback=allow_fallback
+            )
+            normalized.append(value)
+        if not getattr(adapter, "configured", True):
+            raise ProviderUnavailable(
+                f"{provider}: provider is not configured",
+                provider=provider, capability=REALTIME_QUOTE, market="mixed",
+            )
+        try:
+            rows = fetch(normalized)
+        except Exception as exc:
+            self.metadata_repository.record_provider_health(provider, False, utc_now(), str(exc))
+            raise
+        if len(rows) != len(normalized):
+            raise ProviderUnavailable(
+                f"{provider}: incomplete quote batch",
+                provider=provider, capability=REALTIME_QUOTE, market="mixed",
+            )
+        return self._persist_quotes_async(rows, provider)
+
     def refresh_quote(
         self, symbol: str, provider: str | None = None, allow_fallback: bool = False,
         stale_max_seconds: float | None = None,
@@ -369,13 +455,12 @@ class FundamentalService:
         provider_errors = []
         for provider_name in provider_names:
             selected = self._quote_provider(provider_name)
-            if provider_name == "tushare" and not selected.configured:
+            if not getattr(selected, "configured", True):
                 if provider:
-                    provider_errors.append("tushare: provider is not configured")
+                    provider_errors.append(f"{provider_name}: provider is not configured")
                 continue
             try:
                 row = self._fetch_realtime_quote(provider_name, normalized)
-                self.metadata_repository.record_provider_health(provider_name, True, utc_now())
                 break
             except Exception as exc:
                 self.metadata_repository.record_provider_health(provider_name, False, utc_now(), str(exc))
@@ -400,18 +485,7 @@ class FundamentalService:
             raise ProviderUnavailable(
                 error, provider=provider or "auto", capability=REALTIME_QUOTE, market=market
             )
-        raw_payload = row.pop("_raw_payload")
-        ingested_at = utc_now()
-        artifact = self._save_quote_raw(row["symbol"], "latest", raw_payload, ingested_at, row["source"], row["source_url"], row["raw_response_locator"])
-        row.update({
-            "observed_at": row.get("quote_at") or ingested_at,
-            "ingested_at": ingested_at,
-            "raw_path": artifact["storage_path"],
-            "raw_artifact_id": artifact["artifact_id"],
-            "is_cached": False, "cached": False, "stale": False,
-            "cache_status": "refreshed",
-        })
-        self.market_bar_repository.upsert_quote(row)
+        row = self._persist_quotes_async([row], provider_name)[0]
         self._finish_run(run_id, "refresh_quote", started_at, symbol, 1)
         return row
 
@@ -459,6 +533,11 @@ class FundamentalService:
                 })
                 return cached_row
             raise
+
+    def get_quote_spread(self, symbol: str) -> Dict[str, Any]:
+        """Return an uncached LongPort order-book snapshot and top-of-book spread."""
+
+        return self.longport_quote_provider.fetch_spread(symbol)
 
     def refresh_quote_history(
         self, symbol: str, range_: str, interval: str, adjustment: str,
@@ -632,72 +711,6 @@ class FundamentalService:
         if not isinstance(artifact, dict) or not isinstance(artifact.get("records"), list):
             return None
         return artifact
-
-    def backfill_legacy_artifacts(self) -> Dict[str, Any]:
-        existing = self.artifact_store.artifact_paths()
-        candidates = list(self.settings.raw_path.rglob("*"))
-        tdx_dir = self.settings.raw_path.parent / "tdx" / "financial"
-        if tdx_dir.exists():
-            candidates.extend(tdx_dir.glob("*.zip"))
-        rows: List[Dict[str, Any]] = []
-        skipped = 0
-        for path in candidates:
-            if not path.is_file() or str(path) in existing:
-                continue
-            try:
-                content = path.read_bytes()
-            except OSError:
-                skipped += 1
-                continue
-            observed_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
-            dataset, source, source_url, locator = "legacy_raw", "legacy_unknown", "https://example.invalid/legacy", path.name
-            metadata: Dict[str, Any] = {"legacy": True}
-            parts = path.parts
-            if path.suffix == ".zip" and path.name.startswith("gpcw"):
-                dataset, source = "tdx_financial_zip", "tdx_financial_via_mootdx"
-                source_url = "https://down.tdx.com.cn:8001/fin/" + path.name
-                locator = path.name
-                metadata["report_period"] = "".join(ch for ch in path.stem if ch.isdigit())
-            elif "quotes" in parts:
-                symbol = path.parent.name
-                metadata["symbol"] = symbol
-                dataset = "legacy_quote_history" if path.name.startswith("history-") else "legacy_quote_latest"
-                try:
-                    payload = json.loads(content)
-                except (ValueError, UnicodeDecodeError):
-                    payload = {}
-                if isinstance(payload, dict) and "chart" in payload:
-                    source, source_url, locator = "yahoo_chart", "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol, "chart.result[0]"
-                elif isinstance(payload, dict) and "raw_line" in payload:
-                    source, source_url, locator = "sina_finance_hq", "https://hq.sinajs.cn/", "hq_str payload fields"
-                else:
-                    source, source_url, locator = "eastmoney_quote_center", "https://push2.eastmoney.com/api/qt/stock/get", "data"
-            elif "a_share_fundamentals" in parts:
-                dataset, source, source_url = "legacy_a_share_fundamentals", "akshare_eastmoney_financials", EASTMONEY_DATA_URL
-                locator = "records"
-                metadata.update({"report_period": path.parent.name, "dataset_name": path.stem})
-                try:
-                    payload = json.loads(content)
-                    observed_at = payload.get("observed_at") or observed_at
-                except (ValueError, UnicodeDecodeError, AttributeError):
-                    pass
-            elif "company_statements" in parts:
-                dataset, source, source_url, locator = "legacy_company_statement", "akshare_eastmoney_financials", EASTMONEY_DATA_URL, "records"
-                metadata.update({"symbol": path.parent.name, "statement": path.stem})
-            elif "baostock" in parts:
-                dataset, source, source_url, locator = "legacy_baostock_snapshot", "baostock", BAOSTOCK_SOURCE_URL, "payload"
-                metadata.update({"symbol": path.parent.name, "report_period": path.stem})
-            digest = hashlib.sha256(content).hexdigest()
-            rows.append({
-                "artifact_id": "legacy_" + hashlib.sha256(str(path).encode("utf-8")).hexdigest(),
-                "dataset": dataset, "source": source, "source_url": source_url,
-                "observed_at": observed_at, "ingested_at": observed_at,
-                "raw_response_locator": locator, "storage_path": str(path),
-                "sha256": digest, "byte_size": len(content),
-                "metadata_json": json.dumps(metadata, ensure_ascii=False),
-            })
-        count = self.artifact_store.save_artifacts(rows)
-        return {"status": "success", "registered": count, "skipped": skipped}
 
     def refresh_market_fundamentals(
         self, report_period: str = "", include_valuation: bool = True

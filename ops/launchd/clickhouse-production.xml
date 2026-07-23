@@ -1,0 +1,26 @@
+<clickhouse>
+    <logger>
+        <level>warning</level>
+        <log>/Volumes/T9/projects/marketcow/data-production/runtime/clickhouse/clickhouse.log</log>
+        <errorlog>/Volumes/T9/projects/marketcow/data-production/runtime/clickhouse/clickhouse-error.log</errorlog>
+    </logger>
+    <path>/Volumes/T9/projects/marketcow/data-production/runtime/clickhouse/data/</path>
+    <tmp_path>/Volumes/T9/projects/marketcow/data-production/runtime/clickhouse/tmp/</tmp_path>
+    <user_files_path>/Volumes/T9/projects/marketcow/data-production/runtime/clickhouse/user_files/</user_files_path>
+    <format_schema_path>/Volumes/T9/projects/marketcow/data-production/runtime/clickhouse/format_schemas/</format_schema_path>
+    <listen_host>127.0.0.1</listen_host>
+    <http_port>18192</http_port>
+    <tcp_port>19092</tcp_port>
+    <max_connections>128</max_connections>
+    <users>
+        <marketcow>
+            <password from_env="MARKETCOW_CLICKHOUSE_PASSWORD"/>
+            <networks><ip>127.0.0.1</ip><ip>::1</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </marketcow>
+    </users>
+    <profiles><default/></profiles>
+    <quotas><default/></quotas>
+</clickhouse>

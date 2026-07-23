@@ -8,7 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src" / "marketcow"
-POLICY_PATH = ROOT / "docs" / "architecture" / "storage-v2-online-dependency-policy.json"
+POLICY_PATH = ROOT / "docs" / "architecture" / "online-dependency-policy.json"
 
 
 def module_name(path: Path) -> str:
@@ -65,30 +65,27 @@ class OnlineDependencyPolicyTest(unittest.TestCase):
 
     def test_policy_schema_and_modules_exist(self):
         self.assertEqual(self.policy["schema"], "marketcow.online-dependency-policy.v1")
-        self.assertEqual(self.policy["decision"], "ADR-003")
         known = set(self.graph)
         declared = set(self.policy["online_entrypoints"])
-        declared.update(self.policy["forbidden_internal_imports"])
+        declared.update(self.policy["forbidden_internal_modules"])
         declared.update(self.policy["offline_only_modules"])
         self.assertEqual(declared - known, set())
 
     def test_online_transitive_duckdb_debt_is_exact_and_cannot_grow(self):
-        forbidden = set(self.policy["forbidden_internal_imports"])
+        forbidden = set(self.policy["forbidden_internal_modules"])
         forbidden.update(self.policy["offline_only_modules"])
-        forbidden.update(self.policy["forbidden_external_imports"])
+        forbidden.update(self.policy["forbidden_external_modules"])
         actual = forbidden_reachability_paths(
             self.graph, self.policy["online_entrypoints"], forbidden
         )
         exceptions = {
             tuple(item["path"])
-            for item in self.policy["temporary_reachability_exceptions"]
+            for item in self.policy["temporary_exceptions"]
         }
         self.assertEqual(actual, exceptions)
-        self.assertTrue(all(item["removal_item"].startswith("BG-")
-                            for item in self.policy["temporary_reachability_exceptions"]))
 
     def test_exception_list_has_no_duplicates_or_unobserved_paths(self):
-        items = self.policy["temporary_reachability_exceptions"]
+        items = self.policy["temporary_exceptions"]
         paths = [tuple(item["path"]) for item in items]
         self.assertEqual(len(paths), len(set(paths)))
         for path in paths:

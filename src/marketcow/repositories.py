@@ -36,8 +36,8 @@ class MetadataRepository(Protocol):
 
 
 @runtime_checkable
-class V2ControlPlaneRepository(Protocol):
-    """V2-native configuration history and durable migration checkpoints."""
+class ControlPlaneRepository(Protocol):
+    """current configuration history and durable migration checkpoints."""
 
     def save_runtime_config_version(self, row: Dict[str, Any]) -> Dict[str, Any]: ...
     def get_runtime_config_version(

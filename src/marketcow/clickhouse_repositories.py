@@ -104,7 +104,7 @@ CLICKHOUSE_MIGRATIONS = [
     ),
     (
         5,
-        "direct V2 latest quote contract",
+        "direct latest quote contract",
         [
             """
             CREATE TABLE IF NOT EXISTS market_quote_latest (
@@ -124,7 +124,7 @@ class ClickHouseRepositoryError(RuntimeError):
 
 
 class ClickHouseDatabase:
-    """Explicit V2 ClickHouse lifecycle and schema boundary."""
+    """Explicit ClickHouse lifecycle and schema boundary."""
 
     def __init__(
         self, host: str, port: int, database: str, username: str = "default",
@@ -359,13 +359,29 @@ class ClickHouseMarketBarRepository:
         payload = json.dumps(
             row, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
         )
-        rank = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        self._insert("market_quote_latest", self.QUOTE_COLUMNS, [{
-            "symbol": symbol, "payload_json": payload,
-            "observed_at": observed_at, "ingested_at": ingested_at,
-            "source": source, "content_rank": rank,
-            "content_version": raw_content_version(ingested_at, rank),
-        }])
+        # Keep the deterministic tie-break inside the low 208 bits reserved by
+        # raw_content_version so ingestion time always dominates older content.
+        rank = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:52]
+        computed_version = raw_content_version(ingested_at, rank)
+        # Quote versions created before the rank-width fix may occupy timestamp
+        # bits. Serialize read/compare/write so a fresh quote always supersedes
+        # those rows while identical retries remain no-ops.
+        with self.database.operation_lock:
+            current = self.database._require_client().query(
+                "SELECT argMax(payload_json, content_version), max(content_version) "
+                "FROM market_quote_latest WHERE symbol = {symbol:String}",
+                parameters={"symbol": symbol},
+            ).result_rows[0]
+            current_payload, current_version = current
+            if current_payload == payload:
+                return
+            version = max(computed_version, int(current_version or 0) + 1)
+            self._insert("market_quote_latest", self.QUOTE_COLUMNS, [{
+                "symbol": symbol, "payload_json": payload,
+                "observed_at": observed_at, "ingested_at": ingested_at,
+                "source": source, "content_rank": rank,
+                "content_version": version,
+            }])
 
     def get_latest_quotes(self, symbols: Sequence[str]) -> List[Dict[str, Any]]:
         normalized = sorted({str(symbol).strip() for symbol in symbols if str(symbol).strip()})

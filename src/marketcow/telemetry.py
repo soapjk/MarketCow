@@ -3,14 +3,12 @@ from __future__ import annotations
 import copy
 import re
 import threading
-from functools import wraps
-from types import MethodType
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Mapping
 
 
-SCHEMA_VERSION = "storage-v2.telemetry.v1"
+SCHEMA_VERSION = "marketcow.telemetry.v1"
 MAX_LOG_EVENTS = 200
 MAX_TEXT = 1000
 _SECRET = re.compile(
@@ -23,7 +21,7 @@ _ABSOLUTE_PATH = re.compile(r"(?<![\w.-])/(?:Volumes|Users|home|var|tmp|private)
 METRICS: Dict[str, Dict[str, Any]] = {
     "ingest_write_latency_seconds": {
         "type": "histogram", "unit": "seconds", "labels": {
-            "backend": ("duckdb", "clickhouse"), "outcome": ("ok", "error", "spooled"),
+            "backend": ("clickhouse",), "outcome": ("ok", "error", "spooled"),
         }, "buckets": (0.005, 0.025, 0.1, 0.5, 2.0, 8.0, 30.0),
     },
     "wal_items": {"type": "gauge", "unit": "items", "labels": {
@@ -45,39 +43,34 @@ METRICS: Dict[str, Dict[str, Any]] = {
     }},
     "query_latency_seconds": {
         "type": "histogram", "unit": "seconds", "labels": {
-            "backend": ("duckdb", "clickhouse_canonical", "clickhouse_raw"),
+            "backend": ("clickhouse_canonical", "clickhouse_raw"),
             "query": ("recent", "range", "page", "cross_section", "matrix", "raw", "as_of"),
-            "outcome": ("ok", "empty", "error", "fallback"),
+            "outcome": ("ok", "empty", "error"),
         }, "buckets": (0.001, 0.005, 0.025, 0.1, 0.5, 2.0, 8.0),
     },
-    "backend_fallback_total": {"type": "counter", "unit": "operations", "labels": {
-        "from_backend": ("clickhouse_canonical", "clickhouse_raw"),
-        "to_backend": ("duckdb",),
-        "query": ("recent", "range", "page", "cross_section", "matrix", "raw", "as_of"),
-    }},
     "cache_age_seconds": {"type": "histogram", "unit": "seconds", "labels": {
         "status": ("fresh", "stale", "empty", "miss"),
     }, "buckets": (0.0, 1.0, 30.0, 300.0, 900.0, 3600.0, 86400.0)},
     "clickhouse_pressure": {"type": "gauge", "unit": "ratio_or_items", "labels": {
         "kind": ("merge_queue", "disk_used_ratio"),
     }},
-    "v2_authoritative_write_total": {"type": "counter", "unit": "operations", "labels": {
+    "authoritative_write_total": {"type": "counter", "unit": "operations", "labels": {
         "outcome": ("acknowledged", "durable_pending", "retryable", "terminal"),
     }},
-    "v2_replay_total": {"type": "counter", "unit": "operations", "labels": {
+    "replay_total": {"type": "counter", "unit": "operations", "labels": {
         "outcome": ("replayed", "quarantined", "dead_letter", "blocked"),
     }},
-    "v2_postgresql_query_latency_seconds": {
+    "postgresql_query_latency_seconds": {
         "type": "histogram", "unit": "seconds", "labels": {
             "operation": ("query", "write", "health"),
             "outcome": ("ok", "empty", "error"),
         }, "buckets": (0.001, 0.005, 0.025, 0.1, 0.5, 2.0, 8.0),
     },
-    "v2_backup_restore_total": {"type": "counter", "unit": "operations", "labels": {
+    "backup_restore_total": {"type": "counter", "unit": "operations", "labels": {
         "operation": ("backup", "verify", "restore", "rebuild"),
         "outcome": ("ok", "error", "resumed"),
     }},
-    "v2_operator_total": {"type": "counter", "unit": "operations", "labels": {
+    "operator_total": {"type": "counter", "unit": "operations", "labels": {
         "action": ("list", "audit", "replay", "retry", "quarantine", "cleanup"),
         "outcome": ("ok", "partial", "error", "blocked"),
     }},
@@ -128,84 +121,6 @@ def telemetry_elapsed(telemetry: Any, started: Any = None) -> Any:
         return max(0.0, float(current) - float(started))
     except (TypeError, ValueError, OverflowError):
         return None
-
-
-_QUERY_METHODS = {
-    "get_price_bars": "recent",
-    "get_price_bars_range": "range",
-    "get_price_bars_page": "page",
-    "get_price_bars_cross_section": "cross_section",
-    "get_price_bars_cross_section_page": "cross_section",
-    "get_price_bars_matrix_page": "matrix",
-    "get_raw_price_bars_range": "raw",
-    "get_raw_price_bars_page": "raw",
-    "get_price_bar_as_of": "as_of",
-    "get_price_bars_as_of_page": "as_of",
-    "get_latest_quotes": "recent",
-}
-
-
-def instrument_duckdb_market_bars(repository: Any, telemetry: "Telemetry") -> Any:
-    """Attach bounded process-local telemetry without changing repository identity."""
-    if getattr(repository, "_marketcow_telemetry_instrumented", False):
-        return repository
-    repository.telemetry = telemetry
-    for name, query in _QUERY_METHODS.items():
-        original = getattr(repository, name)
-
-        @wraps(original)
-        def measured_query(self: Any, *args: Any, _original: Any = original,
-                           _query: str = query, **kwargs: Any) -> Any:
-            started = telemetry_elapsed(telemetry)
-            try:
-                result = _original(*args, **kwargs)
-            except Exception:
-                elapsed = telemetry_elapsed(telemetry, started)
-                if elapsed is not None:
-                    telemetry_call(
-                        telemetry, "safe", "histogram", "query_latency_seconds",
-                        elapsed, backend="duckdb", query=_query, outcome="error",
-                    )
-                raise
-            rows = result[0] if isinstance(result, tuple) else result
-            outcome = "empty" if rows is None or rows == [] else "ok"
-            elapsed = telemetry_elapsed(telemetry, started)
-            if elapsed is not None:
-                telemetry_call(
-                    telemetry, "safe", "histogram", "query_latency_seconds",
-                    elapsed, backend="duckdb", query=_query, outcome=outcome,
-                )
-            return result
-
-        setattr(repository, name, MethodType(measured_query, repository))
-    for name in ("upsert_quote", "upsert_price_bars"):
-        original = getattr(repository, name)
-
-        @wraps(original)
-        def measured_write(self: Any, *args: Any, _original: Any = original,
-                           **kwargs: Any) -> Any:
-            started = telemetry_elapsed(telemetry)
-            try:
-                result = _original(*args, **kwargs)
-            except Exception:
-                elapsed = telemetry_elapsed(telemetry, started)
-                if elapsed is not None:
-                    telemetry_call(
-                        telemetry, "safe", "histogram", "ingest_write_latency_seconds",
-                        elapsed, backend="duckdb", outcome="error",
-                    )
-                raise
-            elapsed = telemetry_elapsed(telemetry, started)
-            if elapsed is not None:
-                telemetry_call(
-                    telemetry, "safe", "histogram", "ingest_write_latency_seconds",
-                    elapsed, backend="duckdb", outcome="ok",
-                )
-            return result
-
-        setattr(repository, name, MethodType(measured_write, repository))
-    repository._marketcow_telemetry_instrumented = True
-    return repository
 
 
 class Telemetry:
