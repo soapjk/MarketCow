@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -34,6 +36,12 @@ from .providers.longport_quote import LongPortQuoteProvider
 from .providers.sec_dividends import SecDividendProvider
 from .providers.cn_dividends import CnExchangeDividendProvider
 from .providers.hkex_dividends import HkexDividendProvider
+from .providers.structured_dividends import (
+    CnStructuredDividendProvider,
+    LongPortDividendProvider,
+    TushareDividendProvider,
+    UsStructuredDividendProvider,
+)
 from .quote_persistence import AsyncQuotePersistence
 from .providers.contracts import DEFAULT_PROVIDER_MANIFESTS, ProviderRegistry
 from .repositories import Repositories
@@ -56,6 +64,9 @@ from .exposure_facts import ExposureFactsService, RepositoryExposureFactSource
 EASTMONEY_DATA_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 EASTMONEY_QUOTE_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 BAOSTOCK_SOURCE_URL = "http://baostock.com/baostock/index.php/Python_API文档"
+DIVIDEND_CACHE_SCHEMA = "dividend-cache-v2"
+DIVIDEND_REFRESH_STRATEGY = "structured-v6-payment-year"
+DIVIDEND_SUCCESS_STATES = frozenset({"success_data", "success_empty"})
 
 
 def utc_now() -> str:
@@ -126,6 +137,8 @@ class FundamentalService:
         sec_dividend_provider: Optional[SecDividendProvider] = None,
         cn_dividend_provider: Optional[CnExchangeDividendProvider] = None,
         hkex_dividend_provider: Optional[HkexDividendProvider] = None,
+        cn_structured_dividend_provider: Optional[Any] = None,
+        longport_dividend_provider: Optional[LongPortDividendProvider] = None,
         exposure_facts_service: Optional[ExposureFactsService] = None,
     ):
         self.settings = settings
@@ -185,6 +198,24 @@ class FundamentalService:
         )
         self.cn_dividend_provider = cn_dividend_provider or CnExchangeDividendProvider()
         self.hkex_dividend_provider = hkex_dividend_provider or HkexDividendProvider()
+        self.longport_dividend_provider = (
+            longport_dividend_provider or LongPortDividendProvider(
+                settings.longport_app_key,
+                settings.longport_app_secret,
+                settings.longport_access_token,
+                min_interval_seconds=settings.dividend_longport_min_interval_seconds,
+                max_attempts=settings.dividend_longport_max_attempts,
+            )
+        )
+        self.cn_structured_dividend_provider = (
+            cn_structured_dividend_provider or CnStructuredDividendProvider(
+                TushareDividendProvider(self.tushare_provider),
+                self.longport_dividend_provider,
+            )
+        )
+        self.us_structured_dividend_provider = UsStructuredDividendProvider(
+            self.longport_dividend_provider, self.sec_dividend_provider
+        )
         self.provider_registry = ProviderRegistry(DEFAULT_PROVIDER_MANIFESTS)
         quote_capability = (REALTIME_QUOTE,)
         self.provider_registry.bind("sina", self.sina_quote_provider, quote_capability)
@@ -195,10 +226,24 @@ class FundamentalService:
         self.quote_persistence = AsyncQuotePersistence(
             capacity=settings.quote_persistence_queue_size
         )
+        self._dividend_refresh_executor = ThreadPoolExecutor(
+            max_workers=settings.dividend_refresh_workers,
+            thread_name_prefix="dividend-refresh",
+        )
+        self._dividend_refresh_guard = threading.Lock()
+        self._dividend_refresh_active: set[tuple[str, int]] = set()
+        self._dividend_refresh_futures: set[Future[Any]] = set()
+        self._dividend_refresh_locks: Dict[tuple[str, int], threading.Lock] = {}
 
     def close(self) -> None:
+        with self._dividend_refresh_guard:
+            futures = set(self._dividend_refresh_futures)
+        if futures:
+            wait(futures, timeout=self.settings.dividend_refresh_shutdown_seconds)
+        self._dividend_refresh_executor.shutdown(wait=False, cancel_futures=True)
         self.quote_persistence.close(self.settings.quote_persistence_shutdown_seconds)
         self.longport_quote_provider.close()
+        self.longport_dividend_provider.close()
         if self.online_resources is not None:
             self.online_resources.close()
         if self.repository_database is not None:
@@ -295,7 +340,18 @@ class FundamentalService:
         count = self.fundamental_repository.upsert_dividend_announcements(rows)
         return {"status": "success", "count": count, "ingested_at": ingested_at}
 
-    def get_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
+    @staticmethod
+    def _timestamp(value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _read_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
         if not 1991 <= fiscal_year <= 2100:
             raise ValueError("fiscal_year must be between 1991 and 2100")
         normalized_symbol = normalize_dividend_symbol(symbol)
@@ -304,19 +360,75 @@ class FundamentalService:
         )
         return dividend_summary(normalized_symbol, fiscal_year, rows)
 
-    def refresh_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
+    def _dividend_state(
+        self, symbol: str, fiscal_year: int
+    ) -> Optional[Dict[str, Any]]:
+        state = self.fundamental_repository.get_dividend_refresh_state(
+            symbol, fiscal_year
+        )
+        if state:
+            state = {
+                key: value.decode("utf-8") if isinstance(value, bytes) else value
+                for key, value in state.items()
+            }
+        if state and (
+            state.get("strategy_version") != DIVIDEND_REFRESH_STRATEGY
+            or state.get("cache_schema_version") != DIVIDEND_CACHE_SCHEMA
+            or state.get("parser_version") != DIVIDEND_REFRESH_STRATEGY
+        ):
+            return None
+        return state
+
+    def _with_dividend_cache_metadata(
+        self, data: Dict[str, Any], state: Optional[Dict[str, Any]], status: str
+    ) -> Dict[str, Any]:
+        result = dict(data)
+        result["data_status"] = status
+        result["last_refreshed_at"] = (
+            str(state["last_success_at"]) if state and state.get("last_success_at")
+            else None
+        )
+        result["cache_schema_version"] = DIVIDEND_CACHE_SCHEMA
+        result["parser_version"] = DIVIDEND_REFRESH_STRATEGY
+        result["refresh_status"] = state.get("status") if state else None
+        result["query_source"] = state.get("query_source") if state else None
+        result["refresh_completed_at"] = (
+            str(state["completed_at"]) if state and state.get("completed_at") else None
+        )
+        return result
+
+    @staticmethod
+    def _dividend_failure_status(exc: Exception) -> str:
+        text = str(exc).lower()
+        if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+            return "failed_timeout"
+        if "429" in text or "rate limit" in text or "too many requests" in text:
+            return "failed_rate_limited"
+        if isinstance(exc, (ValueError, KeyError, TypeError)) and any(
+            marker in text for marker in ("parse", "format", "date", "field", "payload")
+        ):
+            return "failed_parse"
+        return "failed_source"
+
+    @staticmethod
+    def _dividend_provider_name(provider: Any) -> str:
+        return str(
+            getattr(provider, "name", "") or provider.__class__.__name__
+        )
+
+    def _refresh_lock(self, key: tuple[str, int]) -> threading.Lock:
+        with self._dividend_refresh_guard:
+            return self._dividend_refresh_locks.setdefault(key, threading.Lock())
+
+    def _fetch_and_ingest_dividends(
+        self, provider: Any, symbol: str, fiscal_year: int
+    ) -> Dict[str, Any]:
         instrument = canonical_instrument(symbol)
-        if instrument.market == "US":
-            provider = self.sec_dividend_provider
-        elif instrument.market == "CN":
-            provider = self.cn_dividend_provider
-        elif instrument.market == "HK":
-            provider = self.hkex_dividend_provider
-        else:
-            raise ValueError(
-                "automatic official refresh is not yet available for this market"
-            )
         announcements = provider.fetch(instrument.symbol, fiscal_year)
+        query_sources = sorted({
+            str(row.get("source_name") or "").strip()
+            for row in announcements if row.get("source_name")
+        })
         for announcement in announcements:
             content = announcement.pop("_raw_content", None)
             extension = announcement.pop("_raw_extension", ".bin")
@@ -334,10 +446,208 @@ class FundamentalService:
                 {"symbol": instrument.symbol, "fiscal_year": fiscal_year},
             )
             announcement["raw_artifact_id"] = artifact["artifact_id"]
-        ingestion = self.ingest_dividend_announcements(announcements) if announcements else {
-            "status": "success", "count": 0, "ingested_at": utc_now()
+        result = (
+            self.ingest_dividend_announcements(announcements)
+            if announcements else
+            {"status": "success", "count": 0, "ingested_at": utc_now()}
+        )
+        return {
+            **result,
+            "query_source": (
+                ", ".join(query_sources) if query_sources
+                else self._dividend_provider_name(provider)
+            ),
         }
-        return {**ingestion, "data": self.get_dividends(instrument.symbol, fiscal_year)}
+
+    def _refresh_dividends_now(
+        self, symbol: str, fiscal_year: int
+    ) -> Dict[str, Any]:
+        instrument = canonical_instrument(symbol)
+        if instrument.market == "US":
+            provider = getattr(
+                self, "us_structured_dividend_provider", self.sec_dividend_provider
+            )
+        elif instrument.market == "CN":
+            provider = self.cn_structured_dividend_provider
+        elif instrument.market == "HK":
+            provider = self.longport_dividend_provider
+        else:
+            raise ValueError(
+                "automatic official refresh is not yet available for this market"
+            )
+        attempted_at = utc_now()
+        prior_state = self._dividend_state(instrument.symbol, fiscal_year)
+        source = self._dividend_provider_name(provider)
+        self.fundamental_repository.upsert_dividend_refresh_state({
+            "symbol": instrument.symbol, "fiscal_year": fiscal_year,
+            "status": "refreshing", "last_attempt_at": attempted_at,
+            "last_success_at": (
+                prior_state.get("last_success_at") if prior_state else None
+            ),
+            "last_error": "", "strategy_version": DIVIDEND_REFRESH_STRATEGY,
+            "cache_schema_version": DIVIDEND_CACHE_SCHEMA,
+            "parser_version": DIVIDEND_REFRESH_STRATEGY,
+            "query_source": source, "result_count": None, "completed_at": None,
+        })
+        try:
+            ingestion = self._fetch_and_ingest_dividends(
+                provider, instrument.symbol, fiscal_year
+            )
+            source = str(ingestion.get("query_source") or source)
+            succeeded_at = utc_now()
+            refreshed_data = self._read_dividends(instrument.symbol, fiscal_year)
+            count = int(refreshed_data.get("announced_count") or 0)
+            state = {
+                "symbol": instrument.symbol, "fiscal_year": fiscal_year,
+                "status": "success_data" if count else "success_empty",
+                "last_attempt_at": attempted_at,
+                "last_success_at": succeeded_at, "last_error": "",
+                "strategy_version": DIVIDEND_REFRESH_STRATEGY,
+                "cache_schema_version": DIVIDEND_CACHE_SCHEMA,
+                "parser_version": DIVIDEND_REFRESH_STRATEGY,
+                "query_source": source, "result_count": count,
+                "completed_at": succeeded_at,
+            }
+            self.fundamental_repository.upsert_dividend_refresh_state(state)
+            data = self._with_dividend_cache_metadata(
+                refreshed_data, state, "fresh"
+            )
+            return {**ingestion, "data": data}
+        except Exception as exc:
+            failed_at = utc_now()
+            self.fundamental_repository.upsert_dividend_refresh_state({
+                "symbol": instrument.symbol, "fiscal_year": fiscal_year,
+                "status": self._dividend_failure_status(exc),
+                "last_attempt_at": attempted_at,
+                "last_success_at": (
+                    prior_state.get("last_success_at") if prior_state else None
+                ),
+                "last_error": str(exc)[:2000],
+                "strategy_version": DIVIDEND_REFRESH_STRATEGY,
+                "cache_schema_version": DIVIDEND_CACHE_SCHEMA,
+                "parser_version": DIVIDEND_REFRESH_STRATEGY,
+                "query_source": source, "result_count": None,
+                "completed_at": failed_at,
+            })
+            raise
+
+    def _refresh_dividends_locked(
+        self, symbol: str, fiscal_year: int, force: bool = False
+    ) -> Dict[str, Any]:
+        normalized_symbol = normalize_dividend_symbol(symbol)
+        key = (normalized_symbol, fiscal_year)
+        with self._refresh_lock(key):
+            state = self._dividend_state(normalized_symbol, fiscal_year)
+            last_success = self._timestamp(
+                state.get("last_success_at") if state else None
+            )
+            if not force and last_success is not None:
+                age = (datetime.now(timezone.utc) - last_success).total_seconds()
+                ttl = (
+                    getattr(
+                        self.settings, "dividend_empty_cache_ttl_seconds", 900
+                    )
+                    if state and state.get("status") == "success_empty"
+                    else self.settings.dividend_cache_ttl_seconds
+                )
+                if (
+                    state and state.get("status") in DIVIDEND_SUCCESS_STATES
+                    and age <= ttl
+                ):
+                    data = self._with_dividend_cache_metadata(
+                        self._read_dividends(normalized_symbol, fiscal_year),
+                        state, "fresh",
+                    )
+                    return {"status": "success", "count": 0, "data": data}
+            last_attempt = self._timestamp(
+                state.get("last_attempt_at") if state else None
+            )
+            if (
+                not force
+                and state
+                and str(state.get("status", "")).startswith("failed_")
+                and last_attempt is not None
+                and (datetime.now(timezone.utc) - last_attempt).total_seconds()
+                < self.settings.dividend_refresh_retry_seconds
+            ):
+                raise RuntimeError(
+                    state.get("last_error") or "dividend refresh temporarily unavailable"
+                )
+            return self._refresh_dividends_now(normalized_symbol, fiscal_year)
+
+    def _schedule_dividend_refresh(self, symbol: str, fiscal_year: int) -> bool:
+        key = (symbol, fiscal_year)
+        with self._dividend_refresh_guard:
+            if key in self._dividend_refresh_active:
+                return False
+            self._dividend_refresh_active.add(key)
+            future = self._dividend_refresh_executor.submit(
+                self._refresh_dividends_locked, symbol, fiscal_year
+            )
+            self._dividend_refresh_futures.add(future)
+
+        def completed(done: Future[Any]) -> None:
+            # Consume background errors; freshness metadata exposes failed refreshes.
+            try:
+                done.exception()
+            except Exception:
+                pass
+            finally:
+                with self._dividend_refresh_guard:
+                    self._dividend_refresh_active.discard(key)
+                    self._dividend_refresh_futures.discard(done)
+
+        future.add_done_callback(completed)
+        return True
+
+    def get_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
+        if not 1991 <= fiscal_year <= 2100:
+            raise ValueError("fiscal_year must be between 1991 and 2100")
+        normalized_symbol = normalize_dividend_symbol(symbol)
+        data = self._read_dividends(normalized_symbol, fiscal_year)
+        state = self._dividend_state(normalized_symbol, fiscal_year)
+        now = datetime.now(timezone.utc)
+        last_success = self._timestamp(
+            state.get("last_success_at") if state else None
+        )
+        if last_success is not None:
+            age = (now - last_success).total_seconds()
+            ttl = (
+                getattr(self.settings, "dividend_empty_cache_ttl_seconds", 900)
+                if state and state.get("status") == "success_empty"
+                else self.settings.dividend_cache_ttl_seconds
+            )
+            if (
+                state and state.get("status") in DIVIDEND_SUCCESS_STATES
+                and age <= ttl
+            ):
+                return self._with_dividend_cache_metadata(data, state, "fresh")
+
+        has_cache = bool(data["announcements"]) or last_success is not None
+        if not has_cache:
+            return self._refresh_dividends_locked(
+                normalized_symbol, fiscal_year
+            )["data"]
+
+        last_attempt = self._timestamp(
+            state.get("last_attempt_at") if state else None
+        )
+        retry_due = (
+            last_attempt is None
+            or (now - last_attempt).total_seconds()
+            >= self.settings.dividend_refresh_retry_seconds
+        )
+        refreshing = False
+        if retry_due:
+            refreshing = self._schedule_dividend_refresh(
+                normalized_symbol, fiscal_year
+            )
+        return self._with_dividend_cache_metadata(
+            data, state, "refreshing" if refreshing else "stale"
+        )
+
+    def refresh_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
+        return self._refresh_dividends_locked(symbol, fiscal_year, force=True)
 
     def discover_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
         instrument = canonical_instrument(symbol)
@@ -361,9 +671,19 @@ class FundamentalService:
                 "announcement_date": (
                     f"{announced[:4]}-{announced[4:6]}-{announced[6:]}"
                 ),
-                "expected_payment_date": (
+                "payment_date": (
                     f"{pay_date[:4]}-{pay_date[4:6]}-{pay_date[6:]}"
                     if len(pay_date) == 8 else None
+                ),
+                "record_date": (
+                    f"{row['record_date'][:4]}-{row['record_date'][4:6]}-"
+                    f"{row['record_date'][6:]}"
+                    if len(str(row.get("record_date") or "")) == 8 else None
+                ),
+                "ex_date": (
+                    f"{row['ex_date'][:4]}-{row['ex_date'][4:6]}-"
+                    f"{row['ex_date'][6:]}"
+                    if len(str(row.get("ex_date") or "")) == 8 else None
                 ),
                 "confirmation_status": "unverified", "source_type": "third_party",
                 "source_name": self.tushare_provider.name,

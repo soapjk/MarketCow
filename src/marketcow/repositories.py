@@ -84,6 +84,10 @@ class FundamentalRepository(Protocol):
     def get_dividend_announcements(
         self, symbol: str, fiscal_year_from: int, fiscal_year_to: int
     ) -> List[Dict[str, Any]]: ...
+    def get_dividend_refresh_state(
+        self, symbol: str, fiscal_year: int
+    ) -> Optional[Dict[str, Any]]: ...
+    def upsert_dividend_refresh_state(self, row: Dict[str, Any]) -> None: ...
 
 
 @runtime_checkable

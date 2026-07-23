@@ -27,6 +27,13 @@ def parse_hkex_dividend_form(
         plain, re.IGNORECASE,
     )
     payment = re.search(r"Payment date\s+(\d{1,2}\s+[A-Z][a-z]+\s+20\d{2})", plain)
+    record = re.search(
+        r"(?:Record date|Book close date)\s+(\d{1,2}\s+[A-Z][a-z]+\s+20\d{2})",
+        plain,
+    )
+    ex_date = re.search(
+        r"Ex-dividend date\s+(\d{1,2}\s+[A-Z][a-z]+\s+20\d{2})", plain
+    )
     fiscal = re.search(
         r"(?:For the financial year end|Reporting period end for the dividend declared)"
         r"\s+(\d{1,2}\s+[A-Z][a-z]+\s+(20\d{2}))",
@@ -52,6 +59,17 @@ def parse_hkex_dividend_form(
         "currency": currency,
         "announcement_date": datetime.strptime(
             announced.group(1), "%d %B %Y"
+        ).date().isoformat(),
+        "record_date": (
+            datetime.strptime(record.group(1), "%d %B %Y").date().isoformat()
+            if record else None
+        ),
+        "ex_date": (
+            datetime.strptime(ex_date.group(1), "%d %B %Y").date().isoformat()
+            if ex_date else None
+        ),
+        "payment_date": datetime.strptime(
+            payment.group(1), "%d %B %Y"
         ).date().isoformat(),
         "expected_payment_date": datetime.strptime(
             payment.group(1), "%d %B %Y"

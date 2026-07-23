@@ -958,7 +958,9 @@ class PostgresRepository(_PostgresControlPlaneRepository):
         columns = [
             "dividend_id", "instrument_id", "symbol", "market", "exchange",
             "fiscal_year", "amount_per_share", "currency",
-            "announcement_date", "expected_payment_date", "confirmation_status",
+            "announcement_date", "expected_payment_date",
+            "record_date", "ex_date", "payment_date", "date_evidence_json",
+            "confirmation_status",
             "event_status",
             "source_type", "source_priority", "source_name", "source_url", "source_document_id",
             "observed_at", "ingested_at", "raw_artifact_id", "payload_json",
@@ -985,7 +987,8 @@ class PostgresRepository(_PostgresControlPlaneRepository):
         with self.database.connection() as connection:
             for row in rows:
                 values = [
-                    Jsonb(row.get(column, {})) if column == "payload_json"
+                    _jsonb(row.get(column, {}))
+                    if column in {"payload_json", "date_evidence_json"}
                     else row.get(column)
                     for column in columns
                 ]
@@ -1005,6 +1008,55 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 (symbol, fiscal_year_from, fiscal_year_to),
             ).fetchall())
 
+    def get_dividend_refresh_state(
+        self, symbol: str, fiscal_year: int
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM dividend_refresh_state
+                WHERE symbol = %s AND fiscal_year = %s
+                """,
+                (symbol, fiscal_year),
+            ).fetchone()
+
+    def upsert_dividend_refresh_state(self, row: Dict[str, Any]) -> None:
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO dividend_refresh_state (
+                    symbol, fiscal_year, status, last_attempt_at,
+                    last_success_at, last_error, strategy_version,
+                    cache_schema_version, parser_version, query_source,
+                    result_count, completed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (symbol, fiscal_year) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    last_attempt_at = EXCLUDED.last_attempt_at,
+                    last_success_at = COALESCE(
+                        EXCLUDED.last_success_at,
+                        dividend_refresh_state.last_success_at
+                    ),
+                    last_error = EXCLUDED.last_error,
+                    strategy_version = EXCLUDED.strategy_version,
+                    cache_schema_version = EXCLUDED.cache_schema_version,
+                    parser_version = EXCLUDED.parser_version,
+                    query_source = EXCLUDED.query_source,
+                    result_count = EXCLUDED.result_count,
+                    completed_at = EXCLUDED.completed_at
+                """,
+                (
+                    row["symbol"], row["fiscal_year"], row["status"],
+                    row["last_attempt_at"], row.get("last_success_at"),
+                    row.get("last_error", ""), row["strategy_version"],
+                    row["cache_schema_version"], row["parser_version"],
+                    row.get("query_source", ""), row.get("result_count"),
+                    row.get("completed_at"),
+                ),
+            )
+
 
 PostgresMetadataRepository = PostgresRepository
 PostgresFundamentalRepository = PostgresRepository
+def _jsonb(value: Any) -> Jsonb:
+    return Jsonb(value, dumps=lambda item: json.dumps(item, ensure_ascii=False))

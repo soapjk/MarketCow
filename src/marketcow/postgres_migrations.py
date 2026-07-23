@@ -21,6 +21,7 @@ POSTGRES_TRANSACTION_DOMAINS = (
     "validation_result",
     "funnel_metrics",
     "dividend_announcement",
+    "dividend_refresh_state",
     "runtime_config_version",
     "migration_checkpoint",
 )
@@ -323,6 +324,78 @@ POSTGRES_MIGRATIONS = [
         );
         CREATE INDEX IF NOT EXISTS dividend_symbol_year_idx
             ON dividend_announcement (symbol, fiscal_year, announcement_date);
+        """,
+    ),
+    (
+        7,
+        "durable dividend refresh state",
+        """
+        CREATE TABLE IF NOT EXISTS dividend_refresh_state (
+            symbol TEXT NOT NULL,
+            fiscal_year INTEGER NOT NULL CHECK (fiscal_year BETWEEN 1990 AND 2100),
+            status TEXT NOT NULL CHECK (status IN ('refreshing', 'success', 'failed')),
+            last_attempt_at TIMESTAMPTZ NOT NULL,
+            last_success_at TIMESTAMPTZ,
+            last_error TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (symbol, fiscal_year)
+        );
+        CREATE INDEX IF NOT EXISTS dividend_refresh_state_success_idx
+            ON dividend_refresh_state (last_success_at DESC);
+        """,
+    ),
+    (
+        8,
+        "version dividend refresh strategies",
+        """
+        ALTER TABLE dividend_refresh_state
+            ADD COLUMN IF NOT EXISTS strategy_version TEXT NOT NULL
+            DEFAULT 'official-pdf-v1';
+        """,
+    ),
+    (
+        9,
+        "dividend entitlement and actual payment dates",
+        """
+        ALTER TABLE dividend_announcement
+            ADD COLUMN IF NOT EXISTS record_date DATE,
+            ADD COLUMN IF NOT EXISTS ex_date DATE,
+            ADD COLUMN IF NOT EXISTS payment_date DATE,
+            ADD COLUMN IF NOT EXISTS date_evidence_json JSONB
+                NOT NULL DEFAULT '{}'::jsonb;
+        """,
+    ),
+    (
+        10,
+        "versioned dividend cache completion states",
+        """
+        ALTER TABLE dividend_refresh_state
+            DROP CONSTRAINT IF EXISTS dividend_refresh_state_status_check;
+        ALTER TABLE dividend_refresh_state
+            ADD COLUMN IF NOT EXISTS cache_schema_version TEXT NOT NULL
+                DEFAULT 'dividend-cache-v1',
+            ADD COLUMN IF NOT EXISTS parser_version TEXT NOT NULL
+                DEFAULT 'official-pdf-v1',
+            ADD COLUMN IF NOT EXISTS query_source TEXT NOT NULL DEFAULT '',
+            ADD COLUMN IF NOT EXISTS result_count INTEGER
+                CHECK (result_count IS NULL OR result_count >= 0),
+            ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+        UPDATE dividend_refresh_state
+        SET status = CASE
+                WHEN status = 'success' THEN 'success_empty'
+                WHEN status = 'failed' THEN 'failed_source'
+                ELSE status
+            END,
+            cache_schema_version = 'dividend-cache-v1',
+            parser_version = strategy_version
+        WHERE status IN ('success', 'failed');
+        ALTER TABLE dividend_refresh_state
+            ADD CONSTRAINT dividend_refresh_state_status_check CHECK (
+                status IN (
+                    'refreshing', 'success_data', 'success_empty',
+                    'failed_source', 'failed_rate_limited',
+                    'failed_timeout', 'failed_parse'
+                )
+            );
         """,
     ),
 ]
