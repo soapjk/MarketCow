@@ -27,9 +27,14 @@ from .market_data_contracts import (
     HistoricalManifest,
     InstrumentContract,
     InstrumentRecord,
+    SequenceWatermark,
+    StreamError,
+    StreamHeartbeat,
+    SubscriptionAck,
     canonical_hash,
     validate_instrument_identity,
     CLIENT_COMMAND_ADAPTER,
+    STREAM_EVENT_ADAPTER,
 )
 from .realtime import LongPortRealtimeProvider, RealtimeHub
 from .providers.longport_quote import LongPortError
@@ -146,6 +151,26 @@ def create_app(
 
     @app.websocket("/v1/market-data/stream")
     async def market_data_stream(websocket: WebSocket):
+        def error_frame(message: Any, code: str, detail: str, retryable: bool = False):
+            return StreamError(
+                type="error", request_id=(
+                    message.get("request_id") if isinstance(message, dict) else None
+                ),
+                stream_id=hub.stream_id, code=code,
+                message=detail[:300], retryable=retryable,
+            ).model_dump(mode="json")
+
+        def validate_outbound(frame: dict[str, Any]) -> dict[str, Any]:
+            if "event_type" in frame:
+                return STREAM_EVENT_ADAPTER.validate_python(frame).model_dump(mode="json")
+            models = {
+                "ack": SubscriptionAck,
+                "heartbeat": StreamHeartbeat,
+                "error": StreamError,
+                "sequence_watermark": SequenceWatermark,
+            }
+            return models[frame["type"]].model_validate(frame).model_dump(mode="json")
+
         await websocket.accept()
         client = hub.new_client()
         receive = asyncio.create_task(websocket.receive_json())
@@ -161,14 +186,23 @@ def create_app(
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    await websocket.send_json(hub.heartbeat())
+                    await websocket.send_json(validate_outbound(hub.heartbeat()))
                     continue
                 if outgoing in done:
-                    await websocket.send_json(outgoing.result())
+                    await websocket.send_json(validate_outbound(outgoing.result()))
                     outgoing = asyncio.create_task(client.queue.get())
                 if receive not in done:
                     continue
-                message = receive.result()
+                try:
+                    message = receive.result()
+                except WebSocketDisconnect:
+                    raise
+                except Exception as exc:
+                    await websocket.send_json(validate_outbound(error_frame(
+                        None, "invalid_json", f"invalid JSON frame: {type(exc).__name__}"
+                    )))
+                    receive = asyncio.create_task(websocket.receive_json())
+                    continue
                 receive = asyncio.create_task(websocket.receive_json())
                 try:
                     command = CLIENT_COMMAND_ADAPTER.validate_python(message)
@@ -181,16 +215,14 @@ def create_app(
                     code = "invalid_request"
                     if str(exc) == "gap_unrecoverable":
                         code = "gap_unrecoverable"
+                    elif str(exc) == "replay_too_large":
+                        code = "replay_too_large"
                     elif isinstance(exc, LongPortError):
                         code = "provider_unavailable"
-                    response = {
-                        "type": "error", "schema_version": 1,
-                        "request_id": message.get("request_id"),
-                        "code": code, "message": str(exc)[:300],
-                        "retryable": code == "provider_unavailable",
-                        "stream_id": hub.stream_id,
-                    }
-                await websocket.send_json(response)
+                    response = error_frame(
+                        message, code, str(exc), code == "provider_unavailable"
+                    )
+                await websocket.send_json(validate_outbound(response))
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:

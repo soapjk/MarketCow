@@ -15,6 +15,7 @@ from .market_data_contracts import (
     STREAM_EVENT_ADAPTER,
     BarPayload,
     QualityContract,
+    SequenceWatermark,
     SubscribeRequest,
     TradePayload,
     utc,
@@ -79,10 +80,18 @@ class MinuteTradeBarAggregator:
         self,
         emit: Callable[[dict[str, Any]], Any],
         persist: Optional[Callable[[dict[str, Any]], Any]] = None,
+        *,
+        clock: Callable[[], datetime] = _now,
+        sleep: Callable[[float], Any] = asyncio.sleep,
     ) -> None:
         self._emit = emit
         self._persist = persist
-        self._open: dict[tuple[str, str], dict[str, Any]] = {}
+        self._clock = clock
+        self._sleep = sleep
+        self._open: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._timers: dict[tuple[str, str, str], asyncio.Task[Any]] = {}
+        self._closed_through: dict[tuple[str, str, str], datetime] = {}
+        self._lock = asyncio.Lock()
 
     @staticmethod
     def _window(ts_event: str) -> tuple[datetime, datetime]:
@@ -93,52 +102,101 @@ class MinuteTradeBarAggregator:
     async def on_trade(
         self, instrument_id: str, source: str, ts_event: str, payload: TradePayload
     ) -> None:
-        start, end = self._window(ts_event)
-        key = (instrument_id, source)
-        current = self._open.get(key)
-        if current is not None and start < current["window_start_dt"]:
-            result = self._emit({
-                "event_type": "stream_status", "instrument_id": instrument_id,
-                "source": source, "ts_event": ts_event,
-                "quality": {
-                    "status": "degraded", "delayed": False,
-                    "stale": False, "degraded": True,
-                },
-                "payload": {
-                    "state": "degraded", "reason_code": "late_trade_dropped",
-                    "last_sequence": None, "resume_supported": True,
-                },
-            })
-            if asyncio.iscoroutine(result):
-                await result
-            return
-        if current is not None and start > current["window_start_dt"]:
-            await self._close(current)
-            current = None
-        price, size = Decimal(payload.price), Decimal(payload.size)
-        if current is None:
-            current = {
-                "instrument_id": instrument_id, "source": source,
-                "window_start_dt": start, "window_end_dt": end,
-                "open": price, "high": price, "low": price, "close": price,
-                "volume": size,
-            }
-            self._open[key] = current
-            return
-        current["high"] = max(current["high"], price)
-        current["low"] = min(current["low"], price)
-        current["close"] = price
-        current["volume"] += size
+        async with self._lock:
+            start, end = self._window(ts_event)
+            session = getattr(payload, "session", "regular")
+            key = (instrument_id, source, session)
+            if end <= self._closed_through.get(key, datetime.min.replace(tzinfo=timezone.utc)):
+                await self._status(
+                    instrument_id, source, ts_event, "late_trade_dropped"
+                )
+                return
+            current = self._open.get(key)
+            if current is not None and start < current["window_start_dt"]:
+                await self._status(
+                    instrument_id, source, ts_event, "late_trade_dropped"
+                )
+                return
+            if current is not None and start > current["window_start_dt"]:
+                self._cancel_timer(key)
+                self._open.pop(key, None)
+                self._closed_through[key] = current["window_end_dt"]
+                await self._close(current)
+                current = None
+            price, size = Decimal(payload.price), Decimal(payload.size)
+            if current is None:
+                current = {
+                    "instrument_id": instrument_id, "source": source,
+                    "session": session,
+                    "window_start_dt": start, "window_end_dt": end,
+                    "open": price, "high": price, "low": price, "close": price,
+                    "volume": size,
+                }
+                self._open[key] = current
+                self._timers[key] = asyncio.create_task(self._close_at(key, end))
+                return
+            current["high"] = max(current["high"], price)
+            current["low"] = min(current["low"], price)
+            current["close"] = price
+            current["volume"] += size
 
     async def flush(self) -> None:
-        for current in list(self._open.values()):
-            await self._close(current)
-        self._open.clear()
+        timers = list(self._timers.values())
+        for timer in timers:
+            timer.cancel()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
+        async with self._lock:
+            self._timers.clear()
+            for current in list(self._open.values()):
+                await self._close(current)
+            self._open.clear()
+
+    def _cancel_timer(self, key: tuple[str, str, str]) -> None:
+        timer = self._timers.pop(key, None)
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
+
+    async def _close_at(self, key: tuple[str, str, str], end: datetime) -> None:
+        delay = max(0.0, (end - self._clock().astimezone(timezone.utc)).total_seconds())
+        try:
+            result = self._sleep(delay)
+            if asyncio.iscoroutine(result):
+                await result
+            async with self._lock:
+                current = self._open.get(key)
+                if current is None or current["window_end_dt"] != end:
+                    return
+                self._open.pop(key, None)
+                self._timers.pop(key, None)
+                self._closed_through[key] = end
+                await self._close(current)
+        except asyncio.CancelledError:
+            return
+
+    async def _status(
+        self, instrument_id: str, source: str, ts_event: str, reason: str
+    ) -> None:
+        result = self._emit({
+            "event_type": "stream_status", "instrument_id": instrument_id,
+            "source": source, "ts_event": ts_event,
+            "quality": {
+                "status": "degraded", "delayed": False,
+                "stale": False, "degraded": True,
+            },
+            "payload": {
+                "state": "degraded", "reason_code": reason,
+                "last_sequence": None, "resume_supported": True,
+            },
+        })
+        if asyncio.iscoroutine(result):
+            await result
 
     async def _close(self, current: dict[str, Any]) -> None:
         payload = BarPayload(
             interval="1-MINUTE", adjustment="raw", price_type="LAST",
             aggregation_source="EXTERNAL",
+            session=current["session"],
             window_start=_iso(current["window_start_dt"]),
             window_end=_iso(current["window_end_dt"]),
             open=_decimal(current["open"]), high=_decimal(current["high"]),
@@ -151,9 +209,16 @@ class MinuteTradeBarAggregator:
             "payload": payload,
         }
         if self._persist is not None:
-            result = self._persist(event)
-            if asyncio.iscoroutine(result):
-                await result
+            try:
+                result = self._persist(event)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                await self._status(
+                    current["instrument_id"], current["source"],
+                    payload["window_end"], "bar_persist_failed",
+                )
+                return
         result = self._emit(event)
         if asyncio.iscoroutine(result):
             await result
@@ -181,7 +246,9 @@ class RealtimeHub:
         self._client_by_id: dict[int, ClientSubscription] = {}
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self.bars = MinuteTradeBarAggregator(self.publish, persist_bar)
+        self.bars = MinuteTradeBarAggregator(
+            self.publish, persist_bar, clock=clock
+        )
         if provider is not None:
             provider.set_sink(self.ingest_from_provider)
 
@@ -196,7 +263,7 @@ class RealtimeHub:
         self._clients.discard(id(client))
         self._client_by_id.pop(id(client), None)
         if self.provider is not None and client.filters:
-            self.provider.unsubscribe(client.filters)
+            await asyncio.to_thread(self.provider.unsubscribe, client.filters)
 
     async def subscribe(
         self, client: ClientSubscription, request: SubscribeRequest
@@ -211,22 +278,90 @@ class RealtimeHub:
             if not symbol:
                 raise ValueError(f"instrument lacks provider:longport mapping: {instrument_id}")
             mappings[instrument_id] = symbol
-        filters = {
+        requested = {
             (instrument, _event_kind(data_type))
             for instrument in request.instruments
             for data_type in request.data_types
         }
+        new_filters = requested - client.filters
+        replay = []
         if request.resume_after is not None:
+            if client.filters:
+                raise ValueError("resume is only valid on a new connection")
             if request.resume_stream_id != self.stream_id:
                 raise RuntimeError("gap_unrecoverable")
-            await self._resume(client, request.resume_after, filters)
-        client.filters.update(filters)
-        if self.provider is not None:
-            self.provider.subscribe(mappings, set(request.data_types))
+            replay = self._resume_frames(request.resume_after, requested)
+            required = len(replay) + (
+                1 if isinstance(self.provider, LongPortRealtimeProvider) and new_filters
+                else 0
+            )
+            if required > client.queue.maxsize - client.queue.qsize():
+                raise RuntimeError("replay_too_large")
+        if self.provider is not None and new_filters:
+            new_instruments = {instrument for instrument, _kind in new_filters}
+            provider_mappings = {
+                instrument: mappings[instrument] for instrument in new_instruments
+            }
+            provider_types = {_data_type(kind) for _instrument, kind in new_filters}
+            try:
+                await asyncio.to_thread(
+                    self.provider.subscribe, provider_mappings, provider_types
+                )
+            except Exception:
+                if isinstance(self.provider, LongPortRealtimeProvider):
+                    await self.publish({
+                        "event_type": "stream_status", "source": "longport",
+                        "ts_event": _iso(self.clock()),
+                        "quality": {
+                            "status": "degraded", "delayed": False,
+                            "stale": False, "degraded": True,
+                        },
+                        "payload": {
+                            "state": "degraded",
+                            "reason_code": "longport_subscription_failed",
+                            "last_sequence": self._sequence,
+                            "resume_supported": True,
+                        },
+                })
+                raise
+        replay_too_large = False
+        ack_sequence = self._sequence
+        async with self._lock:
+            if request.resume_after is not None:
+                replay = self._resume_frames(request.resume_after, requested)
+                required = len(replay) + (
+                    1 if isinstance(self.provider, LongPortRealtimeProvider) and new_filters
+                    else 0
+                )
+                replay_too_large = (
+                    required > client.queue.maxsize - client.queue.qsize()
+                )
+            if not replay_too_large:
+                ack_sequence = (
+                    request.resume_after
+                    if request.resume_after is not None
+                    else self._sequence
+                )
+                client.filters.update(new_filters)
+                for frame in replay:
+                    client.queue.put_nowait(frame)
+        if replay_too_large:
+            if self.provider is not None and new_filters:
+                await asyncio.to_thread(self.provider.unsubscribe, new_filters)
+            raise RuntimeError("replay_too_large")
+        if isinstance(self.provider, LongPortRealtimeProvider) and new_filters:
+            await self.publish({
+                "event_type": "stream_status", "source": "longport",
+                "ts_event": _iso(self.clock()),
+                "payload": {
+                    "state": "live", "reason_code": "longport_subscription_active",
+                    "last_sequence": self._sequence, "resume_supported": True,
+                },
+            })
         return {
             "type": "ack", "action": "subscribe", "request_id": request.request_id,
             "schema_version": 1, "stream_id": self.stream_id,
-            "sequence": self._sequence,
+            "sequence": ack_sequence,
             "subscriptions": [
                 {"instrument_id": instrument, "data_type": kind}
                 for instrument, kind in sorted(
@@ -243,22 +378,24 @@ class RealtimeHub:
     async def unsubscribe(
         self, client: ClientSubscription, request: Any
     ) -> dict[str, Any]:
-        removed = {
+        requested = {
             (instrument, _event_kind(kind))
             for instrument in request.instruments
             for kind in request.data_types
         }
+        removed = requested & client.filters
+        remaining = client.filters - removed
+        provider_removed = set()
+        for instrument, kind in removed:
+            if kind in {"trade", "bar"} and (
+                (instrument, "trade") in remaining
+                or (instrument, "bar") in remaining
+            ):
+                continue
+            provider_removed.add((instrument, kind))
+        if self.provider is not None and provider_removed:
+            await asyncio.to_thread(self.provider.unsubscribe, provider_removed)
         client.filters.difference_update(removed)
-        if self.provider is not None:
-            provider_removed = set()
-            for instrument, kind in removed:
-                if kind in {"trade", "bar"} and (
-                    (instrument, "trade") in client.filters
-                    or (instrument, "bar") in client.filters
-                ):
-                    continue
-                provider_removed.add((instrument, kind))
-            self.provider.unsubscribe(provider_removed)
         return {
             "type": "ack", "action": "unsubscribe", "request_id": request.request_id,
             "schema_version": 1, "stream_id": self.stream_id,
@@ -272,31 +409,42 @@ class RealtimeHub:
             ],
         }
 
-    async def _resume(
-        self, client: ClientSubscription, after: int,
-        filters: set[tuple[str, str]],
-    ) -> None:
+    def _resume_frames(
+        self, after: int, filters: set[tuple[str, str]]
+    ) -> list[dict[str, Any]]:
         if after > self._sequence:
             raise ValueError("resume_after is ahead of stream")
         oldest = self._replay[0]["sequence"] if self._replay else self._sequence + 1
         if after < oldest - 1:
             raise RuntimeError("gap_unrecoverable")
-        for event in self._replay:
-            if event["sequence"] > after and (
-                event.get("instrument_id"), event["event_type"]
-            ) in filters:
-                client.queue.put_nowait(event)
+        return [
+            self._delivery(event, filters)
+            for event in self._replay
+            if event["sequence"] > after
+        ]
+
+    def _delivery(
+        self, event: dict[str, Any], filters: set[tuple[str, str]]
+    ) -> dict[str, Any]:
+        if event["event_type"] == "stream_status" or (
+            event.get("instrument_id"), event["event_type"]
+        ) in filters:
+            return event
+        return SequenceWatermark(
+            type="sequence_watermark", stream_id=self.stream_id,
+            sequence=event["sequence"], reason="filtered",
+        ).model_dump(mode="json")
 
     async def publish(self, raw: dict[str, Any]) -> dict[str, Any]:
         now = _iso(self.clock())
         async with self._lock:
-            self._sequence += 1
+            next_sequence = self._sequence + 1
             payload = dict(raw["payload"])
             if raw["event_type"] == "order_book_snapshot":
-                payload["baseline_sequence"] = self._sequence
+                payload["baseline_sequence"] = next_sequence
             event = {
                 "schema_version": 1, "stream_id": self.stream_id,
-                "sequence": self._sequence, "source": raw["source"],
+                "sequence": next_sequence, "source": raw["source"],
                 "ts_event": utc(raw["ts_event"]),
                 "ts_ingest": utc(raw.get("ts_ingest", now)),
                 "ts_publish": now,
@@ -308,15 +456,16 @@ class RealtimeHub:
             if raw.get("instrument_id") is not None:
                 event["instrument_id"] = raw["instrument_id"]
             normalized = STREAM_EVENT_ADAPTER.validate_python(event).model_dump(mode="json")
+            self._sequence = next_sequence
             self._replay.append(normalized)
             for identity in tuple(self._clients):
                 client = self._client_by_id.get(identity)
-                if client is None or not client.matches(normalized):
+                if client is None or not client.filters:
                     continue
                 if client.queue.full():
                     client.closed_reason = "slow_consumer"
                     continue
-                client.queue.put_nowait(normalized)
+                client.queue.put_nowait(self._delivery(normalized, client.filters))
         if normalized["event_type"] == "trade":
             await self.bars.on_trade(
                 normalized["instrument_id"], normalized["source"],
@@ -328,7 +477,32 @@ class RealtimeHub:
         loop = self._loop
         if loop is None or loop.is_closed():
             return
-        asyncio.run_coroutine_threadsafe(self.publish(event), loop)
+        future = asyncio.run_coroutine_threadsafe(self.publish(event), loop)
+
+        def observed(result) -> None:
+            try:
+                result.result()
+            except Exception as exc:
+                degraded = {
+                    "event_type": "stream_status", "source": "longport",
+                    "ts_event": _iso(self.clock()),
+                    "quality": {
+                        "status": "degraded", "delayed": False,
+                        "stale": False, "degraded": True,
+                    },
+                    "payload": {
+                        "state": "degraded",
+                        "reason_code": f"provider_payload_invalid:{type(exc).__name__}",
+                        "last_sequence": self._sequence,
+                        "resume_supported": True,
+                    },
+                }
+                degraded_future = asyncio.run_coroutine_threadsafe(
+                    self.publish(degraded), loop
+                )
+                degraded_future.add_done_callback(lambda item: item.exception())
+
+        future.add_done_callback(observed)
 
     def heartbeat(self) -> dict[str, Any]:
         return {
@@ -341,7 +515,7 @@ class RealtimeHub:
             await self.bars.flush()
         finally:
             if self.provider is not None:
-                self.provider.close()
+                await asyncio.to_thread(self.provider.close)
             for identity in tuple(self._clients):
                 client = self._client_by_id.get(identity)
                 if client is not None:
@@ -391,7 +565,6 @@ class LongPortRealtimeProvider:
         from longbridge.openapi import SubType
 
         with self._lock:
-            self._status("connecting", "longport_subscription_starting")
             try:
                 context = self._context or self._connect()
                 self._context = context
@@ -399,28 +572,40 @@ class LongPortRealtimeProvider:
                 wants_trade = "trade" in data_types or "bar" in data_types
                 new_depth, new_trade = [], []
                 for instrument, symbol in mappings.items():
-                    self._mapping[symbol.upper()] = instrument
-                    self._symbol_by_instrument[instrument] = symbol
                     if wants_depth:
                         key = (symbol, "quote")
                         if self._references.get(key, 0) == 0:
                             new_depth.append(symbol)
-                        self._references[key] = self._references.get(key, 0) + 1
                     if wants_trade:
                         key = (symbol, "trade")
                         if self._references.get(key, 0) == 0:
                             new_trade.append(symbol)
+                subscribed_depth = False
+                try:
+                    if new_depth:
+                        context.subscribe(sorted(new_depth), [SubType.Depth])
+                        subscribed_depth = True
+                    if new_trade:
+                        context.subscribe(sorted(new_trade), [SubType.Trade])
+                except Exception:
+                    if subscribed_depth:
+                        try:
+                            context.unsubscribe(sorted(new_depth), [SubType.Depth])
+                        except Exception:
+                            pass
+                    raise
+                for instrument, symbol in mappings.items():
+                    self._mapping[symbol.upper()] = instrument
+                    self._symbol_by_instrument[instrument] = symbol
+                    if wants_depth:
+                        key = (symbol, "quote")
                         self._references[key] = self._references.get(key, 0) + 1
-                if new_depth:
-                    context.subscribe(sorted(new_depth), [SubType.Depth])
-                if new_trade:
-                    context.subscribe(sorted(new_trade), [SubType.Trade])
-                self._status("live", "longport_subscription_active")
+                    if wants_trade:
+                        key = (symbol, "trade")
+                        self._references[key] = self._references.get(key, 0) + 1
             except LongPortError:
-                self._status("degraded", "longport_subscription_failed")
                 raise
             except Exception as exc:
-                self._status("degraded", "longport_subscription_failed")
                 raise LongPortError("LongPort realtime subscription failed") from exc
 
     def unsubscribe(self, filters: Iterable[tuple[str, str]]) -> None:
@@ -443,17 +628,33 @@ class LongPortRealtimeProvider:
                 symbol = self._symbol_by_instrument.get(instrument)
                 key = (symbol, provider_kind)
                 if symbol is not None and key in self._references:
-                    self._references[key] = max(0, self._references[key] - 1)
-                    if self._references[key] == 0:
+                    if self._references[key] == 1:
                         (
                             unsubscribe_depth
                             if provider_kind == "quote"
                             else unsubscribe_trade
                         ).append(symbol)
-            if self._context is not None and unsubscribe_depth:
-                self._context.unsubscribe(sorted(unsubscribe_depth), [SubType.Depth])
-            if self._context is not None and unsubscribe_trade:
-                self._context.unsubscribe(sorted(unsubscribe_trade), [SubType.Trade])
+            unsubscribed_depth = False
+            try:
+                if self._context is not None and unsubscribe_depth:
+                    self._context.unsubscribe(sorted(unsubscribe_depth), [SubType.Depth])
+                    unsubscribed_depth = True
+                if self._context is not None and unsubscribe_trade:
+                    self._context.unsubscribe(sorted(unsubscribe_trade), [SubType.Trade])
+            except Exception:
+                if unsubscribed_depth:
+                    try:
+                        self._context.subscribe(
+                            sorted(unsubscribe_depth), [SubType.Depth]
+                        )
+                    except Exception:
+                        pass
+                raise
+            for instrument, provider_kind in normalized:
+                symbol = self._symbol_by_instrument.get(instrument)
+                key = (symbol, provider_kind)
+                if symbol is not None and key in self._references:
+                    self._references[key] = max(0, self._references[key] - 1)
 
     def _status(self, state: str, reason: str) -> None:
         now = _iso(_now())
@@ -503,11 +704,17 @@ class LongPortRealtimeProvider:
             return
         self._sink({
             "event_type": "quote", "instrument_id": instrument,
-            "source": "longport", "ts_event": now, "payload": {
+            "source": "longport", "ts_event": now,
+            "quality": {
+                "status": "degraded", "delayed": False,
+                "stale": False, "degraded": True,
+            },
+            "payload": {
                 "bid_price": _decimal(bids[0].price),
                 "ask_price": _decimal(asks[0].price),
                 "bid_size": _decimal(bids[0].volume),
                 "ask_size": _decimal(asks[0].volume),
+                "ts_event_source": "marketcow_observation",
             },
         })
 
@@ -519,6 +726,17 @@ class LongPortRealtimeProvider:
         for index, trade in enumerate(push.trades or ()):
             event_time = _timestamp(trade.timestamp)
             if event_time is None:
+                continue
+            raw_session = str(getattr(trade, "trade_session", "")).lower()
+            session = (
+                "pre_market" if "pre" in raw_session
+                else "post_market" if "post" in raw_session
+                else "overnight" if "overnight" in raw_session
+                else "regular" if raw_session in {"", "normal", "regular"}
+                else "unknown"
+            )
+            if session == "overnight" and not self.enable_overnight:
+                self._status("degraded", "overnight_trade_rejected")
                 continue
             raw = {
                 "symbol": symbol, "timestamp": _iso(event_time),
@@ -539,6 +757,7 @@ class LongPortRealtimeProvider:
                 "payload": {
                     "price": raw["price"], "size": _decimal(trade.volume),
                     "trade_id": trade_id, "aggressor_side": aggressor,
+                    "session": session,
                 },
             })
 

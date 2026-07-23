@@ -115,6 +115,7 @@ class QuotePayload(StrictModel):
     ask_price: DecimalString
     bid_size: DecimalString
     ask_size: DecimalString
+    ts_event_source: Literal["provider", "marketcow_observation"] = "provider"
 
     @model_validator(mode="after")
     def market(self):
@@ -132,6 +133,9 @@ class TradePayload(StrictModel):
     size: DecimalString
     trade_id: str = Field(min_length=1)
     aggressor_side: Literal["BUYER", "SELLER", "NO_AGGRESSOR"]
+    session: Literal["regular", "pre_market", "post_market", "overnight", "unknown"] = (
+        "regular"
+    )
 
     @model_validator(mode="after")
     def positive(self):
@@ -173,6 +177,9 @@ class BarPayload(StrictModel):
     adjustment: Literal["raw", "adjusted"]
     price_type: Literal["LAST", "BID", "ASK", "MID"]
     aggregation_source: Literal["EXTERNAL"]
+    session: Literal["regular", "pre_market", "post_market", "overnight", "unknown"] = (
+        "regular"
+    )
     window_start: str
     window_end: str
     open: DecimalString
@@ -221,17 +228,11 @@ class ErrorPayload(StrictModel):
     retryable: bool
 
 
-class SubscribeRequest(StrictModel):
-    type: Literal["subscribe"]
-    request_id: str = Field(min_length=1)
+class SubscriptionSelection(StrictModel):
     instruments: list[str] = Field(min_length=1, max_length=500)
     data_types: list[Literal["quote", "trade", "bar", "order_book"]] = Field(
         min_length=1, max_length=4
     )
-    bar_types: list[Literal["1-MINUTE"]] = Field(default_factory=list, max_length=1)
-    book_depth: Literal[1] = 1
-    resume_after: Optional[int] = Field(default=None, ge=0)
-    resume_stream_id: Optional[str] = Field(default=None, min_length=1)
 
     @field_validator("instruments")
     @classmethod
@@ -250,6 +251,15 @@ class SubscribeRequest(StrictModel):
             raise ValueError("data_types must be unique")
         return values
 
+
+class SubscribeRequest(SubscriptionSelection):
+    type: Literal["subscribe"]
+    request_id: str = Field(min_length=1)
+    bar_types: list[Literal["1-MINUTE"]] = Field(default_factory=list, max_length=1)
+    book_depth: Literal[1] = 1
+    resume_after: Optional[int] = Field(default=None, ge=0)
+    resume_stream_id: Optional[str] = Field(default=None, min_length=1)
+
     @model_validator(mode="after")
     def bars(self):
         if ("bar" in self.data_types) != bool(self.bar_types):
@@ -259,13 +269,9 @@ class SubscribeRequest(StrictModel):
         return self
 
 
-class UnsubscribeRequest(StrictModel):
+class UnsubscribeRequest(SubscriptionSelection):
     type: Literal["unsubscribe"]
     request_id: str = Field(min_length=1)
-    instruments: list[str] = Field(min_length=1, max_length=500)
-    data_types: list[Literal["quote", "trade", "bar", "order_book"]] = Field(
-        min_length=1, max_length=4
-    )
 
 
 ClientCommand = Annotated[
@@ -309,6 +315,13 @@ class StreamError(ContractModel):
     code: str
     message: str
     retryable: bool
+
+
+class SequenceWatermark(ContractModel):
+    type: Literal["sequence_watermark"]
+    stream_id: str
+    sequence: int = Field(ge=1)
+    reason: Literal["filtered"]
 
 
 class EnvelopeBase(ContractModel):
@@ -510,6 +523,7 @@ CONTRACT_SCHEMAS: Dict[str, Any] = {
     "subscription_ack": SubscriptionAck,
     "stream_heartbeat": StreamHeartbeat,
     "stream_error": StreamError,
+    "sequence_watermark": SequenceWatermark,
     "historical_manifest": HistoricalManifest,
     "historical_bar": HistoricalBar,
     "canonical_bar_page": CanonicalBarPage,

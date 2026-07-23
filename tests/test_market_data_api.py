@@ -133,7 +133,7 @@ class MarketDataApiTest(unittest.TestCase):
         for name in (
             "historical_manifest", "historical_bar", "canonical_bar_page",
             "subscribe", "unsubscribe", "subscription_ack",
-            "stream_heartbeat", "stream_error",
+            "stream_heartbeat", "stream_error", "sequence_watermark",
         ):
             self.assertEqual(self.client.get(f"/v1/schemas/{name}").status_code, 200)
 

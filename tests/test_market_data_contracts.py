@@ -13,6 +13,7 @@ from marketcow.market_data_contracts import (
     OrderBookSnapshotPayload,
     QualityContract,
     STREAM_EVENT_ADAPTER,
+    UnsubscribeRequest,
     canonical_hash,
     validate_instrument_identity,
 )
@@ -159,6 +160,14 @@ class MarketDataContractTest(unittest.TestCase):
             OrderBookSnapshotPayload.model_validate({
                 "book_type": "L1_MBP", "depth": 1, "baseline_sequence": 1,
                 "bids": [level, level], "asks": [],
+            })
+
+    def test_unsubscribe_reuses_subscription_selection_validation(self):
+        with self.assertRaises(ValidationError):
+            UnsubscribeRequest.model_validate({
+                "type": "unsubscribe", "request_id": "u1",
+                "instruments": ["bad", "bad"],
+                "data_types": ["quote", "quote"],
             })
 
     def test_canonical_page_rejects_manifest_mismatches(self):
