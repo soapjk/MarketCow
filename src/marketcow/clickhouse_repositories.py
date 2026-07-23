@@ -274,6 +274,13 @@ class ClickHouseMarketBarRepository:
     def __init__(self, database: ClickHouseDatabase) -> None:
         self.database = database
 
+    @staticmethod
+    def _range_time(value: str, name: str) -> datetime:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError(f"{name} must include a timezone")
+        return parsed.astimezone(timezone.utc)
+
     def _query(self, statement: str, parameters: Optional[Dict[str, Any]] = None) -> Any:
         try:
             with self.database.operation_lock:
@@ -863,6 +870,52 @@ class ClickHouseMarketBarRepository:
         )
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
         return self._map_canonical_rows(rows[:limit]), len(rows) > limit
+
+    def get_canonical_dataset_identity(
+        self, symbol: str, interval: str, adjustment: str, start: str, end: str
+    ) -> Dict[str, Any]:
+        start_at = self._range_time(start, "start")
+        end_at = self._range_time(end, "end")
+        result = self._query(
+            """
+            SELECT toUnixTimestamp64Milli(bar_time), toString(open), toString(high),
+                   toString(low), toString(close), toString(raw_close),
+                   toString(adjustment_factor), toString(volume), toString(amount),
+                   selected_source, source_count, quality_status, input_fingerprint,
+                   toString(version), toUnixTimestamp64Milli(observed_at),
+                   toUnixTimestamp64Milli(ingested_at), raw_artifact_id
+            FROM market_bar_canonical FINAL
+            WHERE symbol={symbol:String} AND interval={interval:String}
+              AND adjustment={adjustment:String}
+              AND bar_time >= {start:DateTime64(3)} AND bar_time <= {end:DateTime64(3)}
+            ORDER BY bar_time ASC
+            """,
+            parameters={
+                "symbol": symbol, "interval": interval, "adjustment": adjustment,
+                "start": start_at, "end": end_at,
+            },
+        )
+        canonical_rows = [list(row) for row in result.result_rows]
+        max_ingested_millis = max(
+            (int(row[-2]) for row in canonical_rows), default=0
+        )
+        content_hash = "sha256:" + hashlib.sha256(json.dumps(
+            canonical_rows, separators=(",", ":"), ensure_ascii=True
+        ).encode()).hexdigest()
+        identity = {
+            "symbol": symbol, "interval": interval, "adjustment": adjustment,
+            "start": start_at.isoformat(), "end": end_at.isoformat(),
+            "row_count": len(canonical_rows),
+            "max_ingested_millis": max_ingested_millis,
+            "content_hash": content_hash,
+        }
+        digest = hashlib.sha256(json.dumps(
+            identity, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+        return {
+            **identity, "canonical_version": str(identity["max_ingested_millis"]),
+            "snapshot_id": digest[:32],
+        }
 
     def get_canonical_price_bars_cross_section_page(
         self, interval: str, adjustment: str, bar_at: str, page_size: int,

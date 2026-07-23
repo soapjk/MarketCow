@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__
 from .config import Settings
@@ -19,6 +21,24 @@ from .service import FundamentalService
 from .telemetry import sanitize_text, telemetry_call
 from .health import HealthEvaluator
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
+from .market_data_contracts import (
+    CanonicalBarPage,
+    CONTRACT_SCHEMAS,
+    HistoricalBar,
+    HistoricalManifest,
+    InstrumentContract,
+    InstrumentRecord,
+    SequenceWatermark,
+    StreamError,
+    StreamHeartbeat,
+    SubscriptionAck,
+    canonical_hash,
+    validate_instrument_identity,
+    CLIENT_COMMAND_ADAPTER,
+    STREAM_EVENT_ADAPTER,
+)
+from .realtime import LongPortRealtimeProvider, RealtimeHub
+from .providers.longport_quote import LongPortError
 
 
 class TushareRequest(BaseModel):
@@ -84,14 +104,142 @@ def create_app(
     settings: Optional[Settings] = None,
     service: Optional[FundamentalService] = None,
     now_provider: Optional[Callable[[], datetime]] = None,
+    realtime_hub: Optional[RealtimeHub] = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
     app.state.service = service
-    app.add_event_handler("shutdown", service.close)
     clock = now_provider or (lambda: datetime.now(timezone.utc))
+    provider = LongPortRealtimeProvider(
+        settings.longport_app_key, settings.longport_app_secret,
+        settings.longport_access_token,
+        enable_overnight=settings.longport_enable_overnight,
+    )
+    metadata_repository = getattr(service, "metadata_repository", None)
+    instrument_lookup = (
+        metadata_repository.get_instrument
+        if metadata_repository is not None
+        else lambda _instrument_id: None
+    )
+
+    async def persist_realtime_bar(event: dict[str, Any]) -> None:
+        instrument = instrument_lookup(event["instrument_id"])
+        if instrument is None:
+            raise ValueError("realtime bar instrument is unavailable")
+        payload = event["payload"]
+        bar = {
+            "bar_at": payload["window_start"],
+            "open": float(payload["open"]), "high": float(payload["high"]),
+            "low": float(payload["low"]), "close": float(payload["close"]),
+            "volume": float(payload["volume"]), "amount": None,
+            "observed_at": payload["window_end"],
+        }
+        await asyncio.to_thread(
+            service.market_bar_repository.upsert_price_bars,
+            instrument["symbol"], "1m", "raw", event["source"],
+            clock().astimezone(timezone.utc).isoformat(), [bar],
+            {"stream_id": app.state.realtime_hub.stream_id},
+        )
+
+    hub = realtime_hub or RealtimeHub(
+        instrument_lookup, provider,
+        queue_capacity=settings.realtime_queue_capacity,
+        replay_capacity=settings.realtime_replay_capacity,
+        clock=clock, persist_bar=persist_realtime_bar,
+    )
+    app.state.realtime_hub = hub
+
+    async def shutdown() -> None:
+        try:
+            await hub.close()
+        finally:
+            service.close()
+
+    app.add_event_handler("shutdown", shutdown)
     health_evaluator = HealthEvaluator(wall_clock=clock)
+
+    @app.websocket("/v1/market-data/stream")
+    async def market_data_stream(websocket: WebSocket):
+        def error_frame(message: Any, code: str, detail: str, retryable: bool = False):
+            return StreamError(
+                type="error", request_id=(
+                    message.get("request_id") if isinstance(message, dict) else None
+                ),
+                stream_id=hub.stream_id, code=code,
+                message=detail[:300], retryable=retryable,
+            ).model_dump(mode="json")
+
+        def validate_outbound(frame: dict[str, Any]) -> dict[str, Any]:
+            if "event_type" in frame:
+                return STREAM_EVENT_ADAPTER.validate_python(frame).model_dump(mode="json")
+            models = {
+                "ack": SubscriptionAck,
+                "heartbeat": StreamHeartbeat,
+                "error": StreamError,
+                "sequence_watermark": SequenceWatermark,
+            }
+            return models[frame["type"]].model_validate(frame).model_dump(mode="json")
+
+        await websocket.accept()
+        client = hub.new_client()
+        receive = asyncio.create_task(websocket.receive_json())
+        outgoing = asyncio.create_task(client.queue.get())
+        try:
+            while True:
+                if client.closed_reason is not None:
+                    await websocket.close(code=1013, reason=client.closed_reason)
+                    return
+                done, _pending = await asyncio.wait(
+                    {receive, outgoing},
+                    timeout=settings.realtime_heartbeat_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    await websocket.send_json(validate_outbound(hub.heartbeat()))
+                    continue
+                if outgoing in done:
+                    await websocket.send_json(validate_outbound(outgoing.result()))
+                    outgoing = asyncio.create_task(client.queue.get())
+                if receive not in done:
+                    continue
+                try:
+                    message = receive.result()
+                except WebSocketDisconnect:
+                    raise
+                except Exception as exc:
+                    await websocket.send_json(validate_outbound(error_frame(
+                        None, "invalid_json", f"invalid JSON frame: {type(exc).__name__}"
+                    )))
+                    receive = asyncio.create_task(websocket.receive_json())
+                    continue
+                receive = asyncio.create_task(websocket.receive_json())
+                try:
+                    command = CLIENT_COMMAND_ADAPTER.validate_python(message)
+                    response = (
+                        await hub.subscribe(client, command)
+                        if command.type == "subscribe"
+                        else await hub.unsubscribe(client, command)
+                    )
+                except (ValidationError, ValueError, RuntimeError, LongPortError) as exc:
+                    code = "invalid_request"
+                    if str(exc) == "gap_unrecoverable":
+                        code = "gap_unrecoverable"
+                    elif str(exc) == "replay_too_large":
+                        code = "replay_too_large"
+                    elif isinstance(exc, LongPortError):
+                        code = "provider_unavailable"
+                    response = error_frame(
+                        message, code, str(exc), code == "provider_unavailable"
+                    )
+                await websocket.send_json(validate_outbound(response))
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        finally:
+            for task in (receive, outgoing):
+                task.cancel()
+            await asyncio.gather(receive, outgoing, return_exceptions=True)
+            await hub.remove_client(client)
 
     def storage_health() -> Dict[str, Any]:
         resources = getattr(service, "online_resources", None)
@@ -192,6 +340,196 @@ def create_app(
             from fastapi.responses import JSONResponse
             return JSONResponse(status_code=503, content=result)
         return result
+
+    def instrument_record(row):
+        def decode_database_value(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8")
+            if isinstance(value, dict):
+                return {
+                    decode_database_value(key): decode_database_value(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, (list, tuple)):
+                return [decode_database_value(item) for item in value]
+            return value
+
+        payload = {
+            field: decode_database_value(row[field])
+            for field in InstrumentRecord.model_fields
+        }
+        for field in ("tick_size", "size_increment", "lot_size"):
+            payload[field] = format(Decimal(str(payload[field])), "f")
+        for field in ("ts_event", "ts_init", "updated_at"):
+            if isinstance(payload[field], datetime):
+                payload[field] = payload[field].isoformat()
+        return InstrumentRecord.model_validate(payload).model_dump(mode="json")
+
+    @app.get("/v1/schemas/{contract_name}")
+    def contract_schema(contract_name: str):
+        model = CONTRACT_SCHEMAS.get(contract_name)
+        if model is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "unknown_contract", "contract_name": contract_name,
+            })
+        return {
+            "schema_version": 1, "contract_name": contract_name,
+            "json_schema": (
+                model.json_schema() if hasattr(model, "json_schema")
+                else model.model_json_schema()
+            ),
+        }
+
+    @app.put("/v1/admin/instruments/{instrument_id}")
+    def upsert_instrument(instrument_id: str, request: InstrumentContract):
+        try:
+            if request.instrument_id != instrument_id:
+                raise ValueError("path and payload instrument_id must match")
+            validate_instrument_identity(request)
+            payload = request.model_dump(mode="json")
+            row = {
+                **payload, "content_hash": canonical_hash(payload),
+                "updated_at": clock().astimezone(timezone.utc).isoformat(),
+            }
+            saved = service.metadata_repository.upsert_instrument(row)
+            return InstrumentRecord.model_validate({
+                **payload, "content_hash": saved["content_hash"],
+                "updated_at": row["updated_at"],
+            }).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "instrument_conflict", "message": str(exc),
+            }) from exc
+
+    @app.get("/v1/instruments/{instrument_id}")
+    def get_instrument(instrument_id: str):
+        row = service.metadata_repository.get_instrument(instrument_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "instrument_not_found", "instrument_id": instrument_id,
+            })
+        return instrument_record(row)
+
+    @app.get("/v1/instruments:resolve")
+    def resolve_instrument(namespace: str, external_symbol: str):
+        row = service.metadata_repository.find_instrument_by_mapping(
+            namespace, external_symbol
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "instrument_mapping_not_found",
+                "namespace": namespace, "external_symbol": external_symbol,
+            })
+        return instrument_record(row)
+
+    @app.get("/v1/canonical-bars/{instrument_id}")
+    def canonical_bars_v1(
+        instrument_id: str,
+        start: str,
+        end: str,
+        interval: str,
+        adjustment: str = Query(pattern="^(raw|adjusted)$"),
+        page_size: int = Query(ge=1, le=5000),
+        cursor: Optional[str] = None,
+    ):
+        instrument = service.metadata_repository.get_instrument(instrument_id)
+        if instrument is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "instrument_not_found", "instrument_id": instrument_id,
+            })
+        try:
+            start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            if start_at.tzinfo is None or end_at.tzinfo is None or start_at > end_at:
+                raise ValueError("start/end must be ordered timezone-aware timestamps")
+            start_utc = start_at.astimezone(timezone.utc).isoformat()
+            end_utc = end_at.astimezone(timezone.utc).isoformat()
+            interval_map = {
+                "1-MINUTE": ("1m", 60), "5-MINUTE": ("5m", 300),
+                "15-MINUTE": ("15m", 900), "30-MINUTE": ("30m", 1800),
+                "1-HOUR": ("1h", 3600), "1-DAY": ("1d", 86400),
+            }
+            if interval not in interval_map:
+                raise ValueError("interval is not supported by schema v1")
+            storage_interval, interval_seconds = interval_map[interval]
+            identity = service.market_bar_repository.get_canonical_dataset_identity(
+                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc
+            )
+            binding = {
+                "instrument_id": instrument_id, "start": start_utc, "end": end_utc,
+                "interval": interval, "adjustment": adjustment,
+                "page_size": page_size, "snapshot_id": identity["snapshot_id"],
+            }
+            secret = load_or_create_secret(
+                settings.market_bar_cursor_secret, settings.storage_root
+            )
+            now_epoch = int(clock().timestamp())
+            after = None if cursor is None else decode_cursor(
+                cursor, binding, now_epoch,
+                settings.market_bar_cursor_ttl_seconds, secret,
+            )
+            if after is not None and not isinstance(after, int):
+                raise ValueError("canonical cursor position is invalid")
+            rows, has_more = service.market_bar_repository.get_price_bars_page(
+                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc,
+                page_size, after,
+            )
+            bars = []
+            for row in rows:
+                window_start = datetime.fromisoformat(
+                    str(row["bar_at"]).replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+                window_end = window_start + timedelta(seconds=interval_seconds)
+                bars.append(HistoricalBar(
+                    instrument_id=instrument_id, interval=interval,
+                    adjustment=adjustment, price_type="LAST",
+                    aggregation_source="EXTERNAL",
+                    window_start=window_start.isoformat(),
+                    window_end=window_end.isoformat(),
+                    ts_event=window_end.isoformat(), ts_init=row["ingested_at"],
+                    open=format(Decimal(str(row["open"])), "f"),
+                    high=format(Decimal(str(row["high"])), "f"),
+                    low=format(Decimal(str(row["low"])), "f"),
+                    close=format(Decimal(str(row["close"])), "f"),
+                    volume=format(Decimal(str(row["volume"])), "f"),
+                    selected_source=row["selected_source"],
+                    quality_status=row["quality_status"],
+                    row_version=str(row["version"]),
+                ))
+            confirmed = service.market_bar_repository.get_canonical_dataset_identity(
+                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc
+            )
+            if confirmed != identity:
+                raise HTTPException(status_code=409, detail={
+                    "code": "canonical_snapshot_changed",
+                    "message": "canonical data changed during page read; restart query",
+                })
+            next_cursor = None
+            if has_more and rows:
+                next_cursor = encode_cursor(
+                    binding, int(rows[-1]["timestamp"]), now_epoch, secret
+                )
+            manifest = HistoricalManifest(
+                dataset_id=canonical_hash({
+                    "instrument_id": instrument_id, "interval": interval,
+                    "adjustment": adjustment, "start": start_utc, "end": end_utc,
+                })[7:31],
+                snapshot_id=identity["snapshot_id"],
+                canonical_version=identity["canonical_version"],
+                instruments=[instrument_id], interval=interval,
+                adjustment=adjustment, start=start_utc, end=end_utc,
+                row_count=identity["row_count"],
+                content_hash=identity["content_hash"],
+            )
+            return CanonicalBarPage(
+                manifest=manifest, count=len(bars), bars=bars, page_size=page_size,
+                next_cursor=next_cursor, truncated=has_more,
+                provenance={"layer": "canonical", "backend": "clickhouse"},
+            ).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={
+                "code": "invalid_canonical_query", "message": str(exc),
+            }) from exc
 
     def provider_http_error(exc: ProviderRoutingError) -> HTTPException:
         status = 422 if isinstance(exc, ProviderNotSupported) else 503
