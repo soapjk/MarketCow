@@ -48,6 +48,28 @@ class MarketBarQuery(ProviderPolicy):
     limit: int = Field(default=500, ge=1, le=5000)
 
 
+class DividendAnnouncementInput(BaseModel):
+    symbol: str
+    fiscal_year: int = Field(ge=1990, le=2100)
+    amount_per_share: str
+    currency: str
+    announcement_date: str
+    expected_payment_date: Optional[str] = None
+    confirmation_status: str
+    event_status: str = "active"
+    source_type: str
+    source_name: str = ""
+    source_url: str = ""
+    source_document_id: str = ""
+    observed_at: Optional[str] = None
+    raw_artifact_id: Optional[str] = None
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DividendIngestRequest(BaseModel):
+    announcements: list[DividendAnnouncementInput] = Field(min_length=1, max_length=500)
+
+
 def create_app(
     settings: Optional[Settings] = None,
     service: Optional[FundamentalService] = None,
@@ -225,6 +247,44 @@ def create_app(
             "filter_timezone": "Asia/Shanghai", "past_events_excluded": not include_past,
             "events": events,
         }
+
+    @app.get("/v1/dividends/{symbol}")
+    def dividends(symbol: str, fiscal_year: int = Query(ge=1991, le=2100)):
+        try:
+            return service.get_dividends(symbol, fiscal_year)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/admin/dividends/ingest")
+    def ingest_dividends(request: DividendIngestRequest):
+        try:
+            return service.ingest_dividend_announcements([
+                item.model_dump() for item in request.announcements
+            ])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/admin/dividends/{symbol}/refresh")
+    def refresh_dividends(
+        symbol: str, fiscal_year: int = Query(ge=1991, le=2100)
+    ):
+        try:
+            return service.refresh_dividends(symbol, fiscal_year)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/admin/dividends/{symbol}/discover")
+    def discover_dividends(
+        symbol: str, fiscal_year: int = Query(ge=1991, le=2100)
+    ):
+        try:
+            return service.discover_dividends(symbol, fiscal_year)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/snapshot")
     def data_snapshot(limit: int = Query(50, ge=1, le=500), days: int = Query(30, ge=1, le=120)):
@@ -920,6 +980,17 @@ def create_app(
                     "status": "unavailable",
                     "error": str(exc),
                 },
+            ) from exc
+
+    @app.get("/v1/exposure-facts/{symbol}")
+    def exposure_facts(symbol: str, refresh: bool = False):
+        """Auditable issuer/fund facts; no theme, factor or LLM inference."""
+        try:
+            return service.exposure_facts_service.get(symbol, refresh=refresh)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_symbol", "message": str(exc)},
             ) from exc
 
     @app.get("/v1/quotes/{symbol}/spread")
