@@ -717,6 +717,7 @@ dependencies = [
     { name = "requests", extra = ["socks"] },
     { name = "tushare" },
     { name = "uvicorn" },
+    { name = "websocket-client" },
     { name = "websockets" },
 ]
 
@@ -741,6 +742,7 @@ requires-dist = [
     { name = "requests", extras = ["socks"], specifier = ">=2.31,<3" },
     { name = "tushare", specifier = ">=1.4,<2" },
     { name = "uvicorn", specifier = ">=0.30,<1" },
+    { name = "websocket-client", specifier = ">=1.8,<2" },
     { name = "websockets", specifier = ">=13,<17" },
 ]
 

@@ -34,30 +34,33 @@ class Bars:
     def __init__(self):
         self.revision = "snapshot-a"
         self.revise_during_read = False
+        self.symbols = []
 
-    def get_canonical_dataset_identity(self, *_args):
+    def get_canonical_dataset_identity(self, symbol, *_args):
+        self.symbols.append(symbol)
         return {
             "snapshot_id": self.revision, "canonical_version": "17",
             "row_count": 2, "content_hash": "sha256:" + "a" * 64,
         }
 
     def get_price_bars_page(
-        self, _symbol, _interval, _adjustment, _start, _end, page_size, after
+        self, symbol, _interval, _adjustment, _start, _end, page_size, after
     ):
+        self.symbols.append(symbol)
         rows = [
             {
                 "timestamp": 100, "bar_at": "2026-07-23T01:00:00+00:00",
                 "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15,
                 "volume": 10.0, "selected_source": "longport",
                 "quality_status": "ok", "version": 17,
-                "ingested_at": "2026-07-23T01:01:01Z",
+                "ingested_at": "2026-07-23T02:01:01Z",
             },
             {
                 "timestamp": 200, "bar_at": "2026-07-23T01:01:00+00:00",
                 "open": 1.15, "high": 1.3, "low": 1.1, "close": 1.2,
                 "volume": 11.0, "selected_source": "longport",
                 "quality_status": "ok", "version": 17,
-                "ingested_at": "2026-07-23T01:02:01Z",
+                "ingested_at": "2026-07-23T02:02:01Z",
             },
         ]
         selected = [row for row in rows if after is None or row["timestamp"] > after]
@@ -128,6 +131,38 @@ class MarketDataApiTest(unittest.TestCase):
         )
         InstrumentRecord.model_validate(resolved.json())
         self.assertEqual(resolved.json()["instrument_id"], "AAPL.XNAS")
+
+    def test_crypto_canonical_storage_uses_venue_qualified_symbol(self):
+        crypto = {
+            **self.instrument,
+            "instrument_id": "BTC-PERP.HYPL", "symbol": "BTC-PERP",
+            "instrument_type": "crypto_perpetual", "asset_class": "crypto",
+            "market": "CRYPTO", "mic": "HYPL", "currency": "USDC",
+            "price_precision": 1, "size_precision": 5,
+            "tick_size": "0.1", "size_increment": "0.00001",
+            "lot_size": "0.00001",
+            "provider_symbols": {"hyperliquid": "BTC"}, "broker_symbols": {},
+        }
+        self.assertEqual(
+            self.client.put(
+                "/v1/admin/instruments/BTC-PERP.HYPL", json=crypto
+            ).status_code,
+            200,
+        )
+        response = self.client.get(
+            "/v1/canonical-bars/BTC-PERP.HYPL",
+            params={
+                "start": "2026-07-23T00:00:00Z",
+                "end": "2026-07-24T00:00:00Z",
+                "interval": "1-HOUR", "adjustment": "raw", "page_size": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.service.market_bar_repository.symbols)
+        self.assertEqual(
+            set(self.service.market_bar_repository.symbols),
+            {"BTC-PERP.HYPL"},
+        )
 
     def test_literal_instrument_search_precedes_dynamic_instrument_route(self):
         self.service.search_results["信维通信"] = [{

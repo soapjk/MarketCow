@@ -17,6 +17,7 @@ from .dividends import normalize_dividend_symbol
 from .market_bar_cursor import decode_cursor, encode_cursor, load_or_create_secret
 from .normalize import normalize_as_of, normalize_report_period
 from .providers.yahoo_quote import normalize_yahoo_symbol
+from .providers.hyperliquid import hyperliquid_instrument
 from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
 from .telemetry import sanitize_text, telemetry_call
@@ -40,7 +41,22 @@ from .market_data_contracts import (
     STREAM_EVENT_ADAPTER,
 )
 from .realtime import LongPortRealtimeProvider, RealtimeHub
+from .hyperliquid_realtime import (
+    HyperliquidRealtimeProvider,
+    RoutingRealtimeProvider,
+)
 from .providers.longport_quote import LongPortError
+
+
+def normalize_quote_symbol(value: str) -> str:
+    if str(value).strip().upper().endswith(".HYPL"):
+        instrument_id, _provider_symbol, _kind = hyperliquid_instrument(value)
+        return instrument_id
+    try:
+        return normalize_a_symbol(value)
+    except ValueError:
+        normalized, _market = normalize_yahoo_symbol(value)
+        return normalized
 
 
 class TushareRequest(BaseModel):
@@ -94,7 +110,7 @@ class HistoryJobRequest(BaseModel):
         self.symbols = normalized
         if self.provider == "yahoo_chart":
             self.provider = "yahoo"
-        if self.provider not in {"yahoo", "tushare"}:
+        if self.provider not in {"yahoo", "tushare", "hyperliquid"}:
             raise ValueError("unsupported history provider")
         return self
 
@@ -153,10 +169,14 @@ def create_app(
         )
     app.state.history_job_manager = history_manager
     clock = now_provider or (lambda: datetime.now(timezone.utc))
-    provider = LongPortRealtimeProvider(
+    longport_realtime = LongPortRealtimeProvider(
         settings.longport_app_key, settings.longport_app_secret,
         settings.longport_access_token,
         enable_overnight=settings.longport_enable_overnight,
+    )
+    provider = RoutingRealtimeProvider(
+        longport_realtime,
+        HyperliquidRealtimeProvider(settings.hyperliquid_base_url),
     )
     metadata_repository = getattr(service, "metadata_repository", None)
     instrument_lookup = (
@@ -424,6 +444,35 @@ def create_app(
             ),
         }
 
+    @app.post("/v1/admin/instruments/hyperliquid/refresh")
+    def refresh_hyperliquid_instruments():
+        try:
+            return service.refresh_hyperliquid_instruments()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "hyperliquid_refresh_failed", "message": sanitize_text(exc)},
+            ) from exc
+
+    @app.get("/v1/hyperliquid/{symbol}/funding-history")
+    def hyperliquid_funding_history(symbol: str, start: str, end: str):
+        try:
+            start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            return service.refresh_hyperliquid_funding(
+                normalize_quote_symbol(symbol), start_at, end_at
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "hyperliquid_funding_failed",
+                    "message": sanitize_text(exc),
+                },
+            ) from exc
+
     @app.put("/v1/admin/instruments/{instrument_id}")
     def upsert_instrument(instrument_id: str, request: InstrumentContract):
         try:
@@ -510,8 +559,13 @@ def create_app(
             if interval not in interval_map:
                 raise ValueError("interval is not supported by schema v1")
             storage_interval, interval_seconds = interval_map[interval]
+            storage_symbol = (
+                instrument_id
+                if instrument["market"] == "CRYPTO"
+                else instrument["symbol"]
+            )
             identity = service.market_bar_repository.get_canonical_dataset_identity(
-                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc
+                storage_symbol, storage_interval, adjustment, start_utc, end_utc
             )
             binding = {
                 "instrument_id": instrument_id, "start": start_utc, "end": end_utc,
@@ -529,7 +583,7 @@ def create_app(
             if after is not None and not isinstance(after, int):
                 raise ValueError("canonical cursor position is invalid")
             rows, has_more = service.market_bar_repository.get_price_bars_page(
-                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc,
+                storage_symbol, storage_interval, adjustment, start_utc, end_utc,
                 page_size, after,
             )
             bars = []
@@ -563,7 +617,7 @@ def create_app(
                     ),
                 ))
             confirmed = service.market_bar_repository.get_canonical_dataset_identity(
-                instrument["symbol"], storage_interval, adjustment, start_utc, end_utc
+                storage_symbol, storage_interval, adjustment, start_utc, end_utc
             )
             if confirmed != identity:
                 raise HTTPException(status_code=409, detail={
@@ -845,11 +899,7 @@ def create_app(
         normalized_symbols, normalization_errors = [], []
         for symbol in requested:
             try:
-                try:
-                    normalized = normalize_a_symbol(symbol)
-                except ValueError:
-                    normalized, _ = normalize_yahoo_symbol(symbol)
-                normalized_symbols.append(normalized)
+                normalized_symbols.append(normalize_quote_symbol(symbol))
             except Exception as exc:
                 normalization_errors.append({
                     "symbol": symbol, "status": "unavailable", "error": str(exc),
@@ -923,13 +973,7 @@ def create_app(
         allow_fallback: bool = False,
     ):
         try:
-            if interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
-                try:
-                    normalized = normalize_a_symbol(symbol)
-                except ValueError:
-                    normalized, _ = normalize_yahoo_symbol(symbol)
-            else:
-                normalized, _ = normalize_yahoo_symbol(symbol)
+            normalized = normalize_quote_symbol(symbol)
             if (start is None) != (end is None):
                 raise ValueError("history range requires both start and end")
             if cursor is not None and page_size is None:
@@ -1303,10 +1347,7 @@ def create_app(
         try:
             if adjustment not in {"adjusted", "raw"}:
                 raise ValueError("adjustment must be adjusted or raw")
-            try:
-                normalized = normalize_a_symbol(symbol)
-            except ValueError:
-                normalized, _ = normalize_yahoo_symbol(symbol)
+            normalized = normalize_quote_symbol(symbol)
             point = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
             if point.tzinfo is None:
                 raise ValueError("as_of must include a timezone")
@@ -1352,10 +1393,7 @@ def create_app(
                 raise ValueError("raw history limit must be between 1 and 5000")
             if cursor is not None and page_size is None:
                 raise ValueError("raw history cursor requires page_size")
-            try:
-                normalized = normalize_a_symbol(symbol)
-            except ValueError:
-                normalized, _ = normalize_yahoo_symbol(symbol)
+            normalized = normalize_quote_symbol(symbol)
             start_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
             end_at = datetime.fromisoformat(end.replace("Z", "+00:00"))
             if start_at.tzinfo is None or end_at.tzinfo is None:
@@ -1439,10 +1477,7 @@ def create_app(
         allow_fallback: bool = False,
     ):
         try:
-            try:
-                normalized = normalize_a_symbol(symbol)
-            except ValueError:
-                normalized, _ = normalize_yahoo_symbol(symbol)
+            normalized = normalize_quote_symbol(symbol)
             if provider and not refresh:
                 raise HTTPException(
                     status_code=400,

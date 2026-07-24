@@ -27,6 +27,7 @@ from .providers.eastmoney import EastmoneySpotProvider
 from .providers.tdx_financial import TdxFinancialProvider
 from .providers.yahoo_quote import YahooQuoteProvider
 from .providers.yahoo_quote import normalize_yahoo_symbol
+from .providers.hyperliquid import HyperliquidProvider, hyperliquid_instrument
 from .providers.instrument_search import InstrumentSearchProvider
 from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normalize_a_symbol
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
@@ -53,6 +54,11 @@ from .dividends import (
 )
 from .dividend_assessment import assess_dividend
 from .instruments import canonical_instrument
+from .market_data_contracts import (
+    InstrumentContract,
+    canonical_hash,
+    validate_instrument_identity,
+)
 from .provider_routing import (
     MARKET_BAR_HISTORY,
     REALTIME_QUOTE,
@@ -135,6 +141,7 @@ class FundamentalService:
         calendar_provider: Optional[CalendarProvider] = None,
         tushare_provider: Optional[TushareProvider] = None,
         longport_quote_provider: Optional[LongPortQuoteProvider] = None,
+        hyperliquid_provider: Optional[HyperliquidProvider] = None,
         sec_dividend_provider: Optional[SecDividendProvider] = None,
         cn_dividend_provider: Optional[CnExchangeDividendProvider] = None,
         hkex_dividend_provider: Optional[HkexDividendProvider] = None,
@@ -194,6 +201,10 @@ class FundamentalService:
             settings.longport_access_token,
             enable_overnight=settings.longport_enable_overnight,
         )
+        self.hyperliquid_provider = hyperliquid_provider or HyperliquidProvider(
+            settings.hyperliquid_base_url, settings.hyperliquid_timeout_seconds,
+            settings.hyperliquid_request_budget_seconds,
+        )
         self.sec_dividend_provider = sec_dividend_provider or SecDividendProvider(
             settings.sec_user_agent
         )
@@ -224,6 +235,10 @@ class FundamentalService:
         self.provider_registry.bind("yahoo", self.quote_provider, quote_capability)
         self.provider_registry.bind("tushare", self.tushare_provider, quote_capability)
         self.provider_registry.bind("longport", self.longport_quote_provider, quote_capability)
+        self.provider_registry.bind(
+            "hyperliquid", self.hyperliquid_provider,
+            (REALTIME_QUOTE, MARKET_BAR_HISTORY),
+        )
         self.quote_persistence = AsyncQuotePersistence(
             capacity=settings.quote_persistence_queue_size
         )
@@ -810,6 +825,9 @@ class FundamentalService:
 
     @staticmethod
     def _quote_market(symbol: str) -> tuple[str, str]:
+        if str(symbol).strip().upper().endswith(".HYPL"):
+            instrument_id, _provider_symbol, _kind = hyperliquid_instrument(symbol)
+            return "CRYPTO", instrument_id
         try:
             return "CN", normalize_a_symbol(symbol)
         except ValueError:
@@ -1063,6 +1081,27 @@ class FundamentalService:
                 return self.refresh_tushare_minute_history(normalized, range_, interval, adjustment)
             if name == "yahoo":
                 break
+            if name == "hyperliquid":
+                run_id, started_at = self._start_run(
+                    "refresh_quote_history", symbol
+                )
+                try:
+                    result = self.hyperliquid_provider.fetch_history(
+                        normalized, range_, interval, adjustment
+                    )
+                    return self._persist_history_result(
+                        result, range_, interval, adjustment,
+                        run_id, started_at, symbol,
+                    )
+                except Exception as exc:
+                    self.metadata_repository.record_provider_health(
+                        "hyperliquid", False, utc_now(), str(exc)
+                    )
+                    self._finish_run(
+                        run_id, "refresh_quote_history", started_at, symbol, 0,
+                        str(exc),
+                    )
+                    raise
         else:
             raise ProviderUnavailable(
                 "; ".join(errors) or "no history provider available",
@@ -1076,6 +1115,14 @@ class FundamentalService:
             self.metadata_repository.record_provider_health(provider, False, utc_now(), str(exc))
             self._finish_run(run_id, "refresh_quote_history", started_at, symbol, 0, str(exc))
             raise
+        return self._persist_history_result(
+            result, range_, interval, adjustment, run_id, started_at, symbol
+        )
+
+    def _persist_history_result(
+        self, result: Dict[str, Any], range_: str, interval: str,
+        adjustment: str, run_id: str, started_at: str, requested_symbol: str,
+    ) -> Dict[str, Any]:
         raw_payload = result.pop("_raw_payload")
         ingested_at = utc_now()
         artifact = self._save_quote_raw(result["symbol"], "history-{0}-{1}-{2}".format(range_, interval, adjustment), raw_payload, ingested_at, result["source"], result["source_url"], result["raw_response_locator"])
@@ -1085,8 +1132,59 @@ class FundamentalService:
         )
         result.update({"count": count, "observed_at": ingested_at, "ingested_at": ingested_at, "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"]})
         self.metadata_repository.record_provider_health(result["source"], True, ingested_at)
-        self._finish_run(run_id, "refresh_quote_history", started_at, symbol, count)
+        self._finish_run(
+            run_id, "refresh_quote_history", started_at, requested_symbol, count
+        )
         return result
+
+    def refresh_hyperliquid_instruments(self) -> Dict[str, Any]:
+        rows = self.hyperliquid_provider.instruments(force=True)
+        saved = []
+        observed_at = utc_now()
+        for source in rows:
+            payload = {
+                key: value for key, value in source.items()
+                if key != "venue_metadata"
+            }
+            payload["schema_version"] = 1
+            contract = InstrumentContract.model_validate(payload)
+            validate_instrument_identity(contract)
+            normalized = contract.model_dump(mode="json")
+            row = {
+                **normalized, "content_hash": canonical_hash(normalized),
+                "updated_at": observed_at,
+            }
+            self.metadata_repository.upsert_instrument(row)
+            saved.append(row)
+        return {
+            "provider": "hyperliquid", "count": len(saved),
+            "observed_at": observed_at,
+        }
+
+    def refresh_hyperliquid_funding(
+        self, symbol: str, start: datetime, end: datetime,
+    ) -> Dict[str, Any]:
+        result = self.hyperliquid_provider.fetch_funding_history(
+            symbol, start, end
+        )
+        payload = result.pop("_raw_payload")
+        observed_at = utc_now()
+        artifact = self._write_artifact(
+            self.settings.raw_path / "hyperliquid" / "funding",
+            "hyperliquid_funding", payload, result["source"],
+            result["source_url"], "fundingHistory", observed_at, observed_at,
+            {
+                "instrument_id": result["instrument_id"],
+                "start": start.astimezone(timezone.utc).isoformat(),
+                "end": end.astimezone(timezone.utc).isoformat(),
+                "row_count": result["count"],
+            },
+        )
+        return {
+            **result, "observed_at": observed_at,
+            "raw_path": artifact["storage_path"],
+            "raw_artifact_id": artifact["artifact_id"],
+        }
 
     def _prepare_calendar_rows(self, dataset: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         observed_at = utc_now()

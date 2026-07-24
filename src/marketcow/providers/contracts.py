@@ -10,7 +10,7 @@ REALTIME_QUOTE = "realtime_quote"
 MARKET_BAR_HISTORY = "market_bar_history"
 
 _PROVIDER_ID = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
-_MARKETS = frozenset({"CN", "US", "HK", "FX"})
+_MARKETS = frozenset({"CN", "US", "HK", "FX", "CRYPTO"})
 _QUOTE_REQUIRED_FIELDS = frozenset({
     "instrument_id",
     "symbol",
@@ -78,6 +78,14 @@ DEFAULT_PROVIDER_MANIFESTS = (
     )),
     ProviderManifest("longport", "longbridge_openapi", (
         CapabilityDeclaration(REALTIME_QUOTE, frozenset({"CN", "US", "HK"}), "fetch_quote"),
+    )),
+    ProviderManifest("hyperliquid", "hyperliquid_mainnet", (
+        CapabilityDeclaration(
+            REALTIME_QUOTE, frozenset({"CRYPTO"}), "fetch_quote"
+        ),
+        CapabilityDeclaration(
+            MARKET_BAR_HISTORY, frozenset({"CRYPTO"}), "fetch_history"
+        ),
     )),
 )
 

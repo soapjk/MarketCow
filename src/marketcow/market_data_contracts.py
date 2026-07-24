@@ -44,23 +44,23 @@ class ContractModel(StrictModel):
 
 class InstrumentContract(ContractModel):
     instrument_id: str = Field(pattern=INSTRUMENT_ID_PATTERN)
-    instrument_type: Literal["equity"]
-    asset_class: Literal["equity"]
+    instrument_type: Literal["equity", "crypto_spot", "crypto_perpetual"]
+    asset_class: Literal["equity", "crypto"]
     symbol: str = Field(min_length=1, max_length=32)
-    market: Literal["US", "HK", "CN"]
+    market: Literal["US", "HK", "CN", "CRYPTO"]
     mic: str = Field(pattern=r"^[A-Z0-9]{4}$")
-    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    currency: str = Field(pattern=r"^[A-Z0-9]{2,12}$")
     price_precision: int = Field(ge=0, le=18)
-    size_precision: Literal[0]
+    size_precision: int = Field(ge=0, le=18)
     tick_size: DecimalString
-    size_increment: Literal["1"]
+    size_increment: DecimalString
     lot_size: DecimalString
     ts_event: str
     ts_init: str
     provider_symbols: Dict[str, str] = Field(min_length=1)
     broker_symbols: Dict[str, str] = Field(default_factory=dict)
 
-    @field_validator("tick_size", "lot_size")
+    @field_validator("tick_size", "size_increment", "lot_size")
     @classmethod
     def positive_decimal(cls, value: str) -> str:
         if number(value) <= 0:

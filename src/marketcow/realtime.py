@@ -288,9 +288,15 @@ class RealtimeHub:
             row = self.instrument_lookup(instrument_id)
             if row is None:
                 raise ValueError(f"unknown instrument: {instrument_id}")
-            symbol = row.get("provider_symbols", {}).get("longport")
+            provider_symbols = row.get("provider_symbols", {})
+            provider_name = (
+                "hyperliquid" if instrument_id.endswith(".HYPL") else "longport"
+            )
+            symbol = provider_symbols.get(provider_name)
             if not symbol:
-                raise ValueError(f"instrument lacks provider:longport mapping: {instrument_id}")
+                raise ValueError(
+                    f"instrument lacks provider:{provider_name} mapping: {instrument_id}"
+                )
             mappings[instrument_id] = symbol
         requested = {
             (instrument, _event_kind(data_type))

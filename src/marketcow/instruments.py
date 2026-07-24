@@ -20,6 +20,14 @@ def canonical_instrument(value: str) -> CanonicalInstrument:
     if not raw:
         raise ValueError("symbol is required")
     compact = raw.replace(" ", "")
+    if compact.endswith(".HYPL"):
+        symbol = compact[:-5]
+        if not re.fullmatch(
+            r"(?:[A-Z0-9]{1,20}-PERP|[A-Z0-9]{1,20}-[A-Z0-9]{1,20})",
+            symbol,
+        ):
+            raise ValueError("invalid Hyperliquid instrument symbol")
+        return CanonicalInstrument(compact, symbol, "CRYPTO", "HYPL")
     suffixes = {
         ".SH": ("CN", "SSE"), ".SS": ("CN", "SSE"),
         ".SZ": ("CN", "SZSE"), ".BJ": ("CN", "BSE"),

@@ -473,4 +473,30 @@ POSTGRES_MIGRATIONS = [
             ON history_fetch_item (job_id, status);
         """,
     ),
+    (
+        13,
+        "crypto instruments",
+        """
+        ALTER TABLE instrument_master
+            DROP CONSTRAINT IF EXISTS instrument_master_instrument_type_check,
+            DROP CONSTRAINT IF EXISTS instrument_master_asset_class_check,
+            DROP CONSTRAINT IF EXISTS instrument_master_market_check,
+            DROP CONSTRAINT IF EXISTS instrument_master_currency_check,
+            DROP CONSTRAINT IF EXISTS instrument_master_size_precision_check,
+            DROP CONSTRAINT IF EXISTS instrument_master_size_increment_check;
+        ALTER TABLE instrument_master
+            ADD CONSTRAINT instrument_master_instrument_type_check
+                CHECK (instrument_type IN ('equity', 'crypto_spot', 'crypto_perpetual')),
+            ADD CONSTRAINT instrument_master_asset_class_check
+                CHECK (asset_class IN ('equity', 'crypto')),
+            ADD CONSTRAINT instrument_master_market_check
+                CHECK (market IN ('US', 'HK', 'CN', 'CRYPTO')),
+            ADD CONSTRAINT instrument_master_currency_check
+                CHECK (currency ~ '^[A-Z0-9]{2,12}$'),
+            ADD CONSTRAINT instrument_master_size_precision_check
+                CHECK (size_precision BETWEEN 0 AND 18),
+            ADD CONSTRAINT instrument_master_size_increment_check
+                CHECK (size_increment > 0);
+        """,
+    ),
 ]
