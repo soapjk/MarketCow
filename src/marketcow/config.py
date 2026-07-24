@@ -85,6 +85,7 @@ class Settings:
     dividend_likely_zero_years: int = 3
     dividend_etf_symbols: tuple[str, ...] = ()
     dividend_zero_policy_evidence: tuple[dict[str, object], ...] = ()
+    history_job_max_workers: int = 4
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -225,6 +226,9 @@ class Settings:
             dividend_zero_policy_evidence=tuple(json.loads(os.getenv(
                 "MARKETCOW_DIVIDEND_ZERO_POLICY_EVIDENCE", "[]"
             ))),
+            history_job_max_workers=max(1, min(16, int(os.getenv(
+                "MARKETCOW_HISTORY_JOB_MAX_WORKERS", "4"
+            )))),
         )
 
     def validate_runtime_isolation(self) -> None:

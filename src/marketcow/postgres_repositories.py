@@ -384,6 +384,74 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 (instrument_id,),
             ).fetchone()
 
+    def upsert_history_job(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                INSERT INTO history_fetch_job
+                    (job_id,idempotency_key,status,request_json,created_at,started_at,
+                     updated_at,finished_at,error_json)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (job_id) DO UPDATE SET
+                    status=EXCLUDED.status, request_json=EXCLUDED.request_json,
+                    started_at=EXCLUDED.started_at, updated_at=EXCLUDED.updated_at,
+                    finished_at=EXCLUDED.finished_at, error_json=EXCLUDED.error_json
+                RETURNING *
+                """,
+                (
+                    row["job_id"], row["idempotency_key"], row["status"],
+                    Jsonb(row["request_json"]), row["created_at"], row.get("started_at"),
+                    row["updated_at"], row.get("finished_at"),
+                    Jsonb(row["error_json"]) if row.get("error_json") else None,
+                ),
+            ).fetchone()
+
+    def upsert_history_item(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                INSERT INTO history_fetch_item
+                    (job_id,item_id,symbol,status,provider,source,attempt,rows_fetched,
+                     rows_persisted,canonical_status,error_code,error_message,started_at,
+                     updated_at,finished_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (job_id,item_id) DO UPDATE SET
+                    status=EXCLUDED.status, source=EXCLUDED.source,
+                    attempt=EXCLUDED.attempt, rows_fetched=EXCLUDED.rows_fetched,
+                    rows_persisted=EXCLUDED.rows_persisted,
+                    canonical_status=EXCLUDED.canonical_status,
+                    error_code=EXCLUDED.error_code,error_message=EXCLUDED.error_message,
+                    started_at=EXCLUDED.started_at,updated_at=EXCLUDED.updated_at,
+                    finished_at=EXCLUDED.finished_at
+                RETURNING *
+                """,
+                tuple(row.get(key) for key in (
+                    "job_id","item_id","symbol","status","provider","source","attempt",
+                    "rows_fetched","rows_persisted","canonical_status","error_code",
+                    "error_message","started_at","updated_at","finished_at",
+                )),
+            ).fetchone()
+
+    def get_history_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM history_fetch_job WHERE job_id=%s", (job_id,)
+            ).fetchone()
+
+    def list_history_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                "SELECT * FROM history_fetch_job ORDER BY updated_at DESC LIMIT %s",
+                (limit,),
+            ).fetchall())
+
+    def list_history_items(self, job_id: str) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                "SELECT * FROM history_fetch_item WHERE job_id=%s ORDER BY item_id",
+                (job_id,),
+            ).fetchall())
+
     def find_instrument_by_mapping(
         self, namespace: str, external_symbol: str
     ) -> Optional[Dict[str, Any]]:

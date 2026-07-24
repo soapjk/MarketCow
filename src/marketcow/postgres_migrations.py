@@ -434,4 +434,43 @@ POSTGRES_MIGRATIONS = [
         );
         """,
     ),
+    (
+        12,
+        "durable market history jobs",
+        """
+        CREATE TABLE IF NOT EXISTS history_fetch_job (
+            job_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            request_json JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            started_at TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ,
+            error_json JSONB
+        );
+        CREATE TABLE IF NOT EXISTS history_fetch_item (
+            job_id TEXT NOT NULL REFERENCES history_fetch_job(job_id) ON DELETE CASCADE,
+            item_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            status TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            source TEXT,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            rows_fetched BIGINT NOT NULL DEFAULT 0,
+            rows_persisted BIGINT NOT NULL DEFAULT 0,
+            canonical_status TEXT NOT NULL DEFAULT 'pending',
+            error_code TEXT,
+            error_message TEXT,
+            started_at TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ,
+            PRIMARY KEY (job_id, item_id)
+        );
+        CREATE INDEX IF NOT EXISTS history_fetch_job_updated_idx
+            ON history_fetch_job (updated_at DESC);
+        CREATE INDEX IF NOT EXISTS history_fetch_item_job_status_idx
+            ON history_fetch_item (job_id, status);
+        """,
+    ),
 ]

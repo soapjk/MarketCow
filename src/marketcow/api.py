@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field, ValidationError
+from starlette.responses import HTMLResponse, JSONResponse
 
 from . import __version__
 from .config import Settings
@@ -20,6 +21,7 @@ from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
 from .telemetry import sanitize_text, telemetry_call
 from .health import HealthEvaluator
+from .history_jobs import HistoryJobManager
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
 from .market_data_contracts import (
     CanonicalBarPage,
@@ -69,6 +71,20 @@ class MarketBarQuery(ProviderPolicy):
     limit: int = Field(default=500, ge=1, le=5000)
 
 
+class HistoryJobRequest(BaseModel):
+    symbols: list[str] = Field(min_length=1, max_length=100)
+    provider: str = Field(min_length=1)
+    range: str = Field(min_length=1)
+    interval: str = Field(min_length=1)
+    adjustment: str = Field(pattern="^(adjusted|raw)$")
+    allow_fallback: bool
+    max_concurrency: int = Field(ge=1, le=16)
+    max_attempts: int = Field(ge=1, le=10)
+    retry_backoff_seconds: float = Field(ge=0, le=60)
+    canonical_wait_seconds: float = Field(ge=0, le=60)
+    idempotency_key: str = Field(min_length=8, max_length=200)
+
+
 class DividendAnnouncementInput(BaseModel):
     symbol: str
     fiscal_year: int = Field(ge=1990, le=2100)
@@ -110,6 +126,17 @@ def create_app(
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
     app.state.service = service
+    history_repository = getattr(service, "metadata_repository", None)
+    history_manager = None
+    if history_repository is not None and all(hasattr(history_repository, name) for name in (
+        "upsert_history_job", "upsert_history_item", "get_history_job",
+        "list_history_jobs", "list_history_items",
+    )):
+        history_manager = HistoryJobManager(
+            service, history_repository,
+            max_workers=getattr(settings, "history_job_max_workers", 4),
+        )
+    app.state.history_job_manager = history_manager
     clock = now_provider or (lambda: datetime.now(timezone.utc))
     provider = LongPortRealtimeProvider(
         settings.longport_app_key, settings.longport_app_secret,
@@ -154,6 +181,8 @@ def create_app(
         try:
             await hub.close()
         finally:
+            if history_manager is not None:
+                history_manager.close()
             service.close()
 
     app.add_event_handler("shutdown", shutdown)
@@ -1524,6 +1553,74 @@ def create_app(
     @app.get("/v1/admin/jobs")
     def jobs(limit: int = Query(20, ge=1, le=200)):
         return {"items": service.metadata_repository.latest_runs(limit)}
+
+    def require_history_manager() -> HistoryJobManager:
+        if history_manager is None:
+            raise HTTPException(status_code=503, detail="history job store unavailable")
+        return history_manager
+
+    @app.post("/v1/admin/history-jobs")
+    def create_history_job(request: HistoryJobRequest):
+        payload = request.model_dump()
+        if request.provider not in {"yahoo", "yahoo_chart", "tushare"}:
+            raise HTTPException(status_code=400, detail="unsupported history provider")
+        job, created = require_history_manager().create(payload)
+        return JSONResponse(
+            status_code=202,
+            content={"job_id": job["job_id"], "created": created, "job": job},
+        )
+
+    @app.get("/v1/admin/history-jobs")
+    def list_history_jobs(limit: int = Query(50, ge=1, le=200)):
+        return {"items": require_history_manager().list(limit)}
+
+    @app.get("/v1/admin/history-jobs/{job_id}")
+    def get_history_job(job_id: str):
+        try:
+            return require_history_manager().detail(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="history job not found") from exc
+
+    @app.post("/v1/admin/history-jobs/{job_id}/cancel")
+    def cancel_history_job(job_id: str):
+        try:
+            return require_history_manager().cancel(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="history job not found") from exc
+
+    @app.post("/v1/admin/history-jobs/{job_id}/retry-failed")
+    def retry_history_job(job_id: str):
+        try:
+            return require_history_manager().retry_failed(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="history job not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/v1/admin/history-jobs-ui", response_class=HTMLResponse)
+    def history_jobs_ui():
+        return """<!doctype html><html><head><meta charset="utf-8">
+<title>MarketCow History Jobs</title><style>
+body{font:14px system-ui;margin:24px;background:#f6f7f9;color:#17202a}
+table{border-collapse:collapse;width:100%;background:white;margin:12px 0}
+th,td{padding:8px;border:1px solid #dfe3e8;text-align:left}
+progress{width:180px} pre{white-space:pre-wrap}</style></head><body>
+<h1>History fetch jobs</h1><div id="jobs">Loading…</div><script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
+ '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function load(){const r=await fetch('/v1/admin/history-jobs?limit=50');
+const d=await r.json();document.getElementById('jobs').innerHTML=d.items.map(j=>
+`<section><h2>${esc(j.job_id)} — ${esc(j.status)}</h2>
+<progress max="100" value="${j.progress_percent}"></progress> ${j.progress_percent}%
+<p>${j.completed_symbols}/${j.total_symbols}; fetched ${j.rows_fetched};
+persisted ${j.rows_persisted}; updated ${esc(j.updated_at)}</p><table><tr>
+<th>Symbol</th><th>Status</th><th>Provider/source</th><th>Attempt</th>
+<th>Rows</th><th>Canonical</th><th>Error</th></tr>${j.items.map(i=>`<tr>
+<td>${esc(i.symbol)}</td><td>${esc(i.status)}</td>
+<td>${esc(i.provider)}/${esc(i.source)}</td><td>${i.attempt}</td>
+<td>${i.rows_fetched}/${i.rows_persisted}</td><td>${esc(i.canonical_status)}</td>
+<td>${esc(i.error_code)} ${esc(i.error_message)}</td></tr>`).join('')}</table></section>`
+).join('')||'No jobs'} load();setInterval(load,2000);</script></body></html>"""
 
     @app.get("/v1/admin/artifacts")
     def artifacts(dataset: str = "", limit: int = Query(100, ge=1, le=1000)):
