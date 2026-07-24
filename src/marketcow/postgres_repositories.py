@@ -384,6 +384,52 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 (instrument_id,),
             ).fetchone()
 
+    def get_or_create_history_job(
+        self, row: Dict[str, Any], items: List[Dict[str, Any]]
+    ) -> tuple[Dict[str, Any], bool]:
+        with self.database.connection() as connection:
+            saved = connection.execute(
+                """
+                INSERT INTO history_fetch_job
+                    (job_id,idempotency_key,status,request_json,created_at,started_at,
+                     updated_at,finished_at,error_json)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING *
+                """,
+                (
+                    row["job_id"], row["idempotency_key"], row["status"],
+                    Jsonb(row["request_json"]), row["created_at"], row.get("started_at"),
+                    row["updated_at"], row.get("finished_at"),
+                    Jsonb(row["error_json"]) if row.get("error_json") else None,
+                ),
+            ).fetchone()
+            if saved is not None:
+                for item in items:
+                    connection.execute(
+                        """
+                        INSERT INTO history_fetch_item
+                            (job_id,item_id,symbol,status,provider,source,attempt,
+                             rows_fetched,rows_persisted,canonical_status,error_code,
+                             error_message,started_at,updated_at,finished_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        tuple(item.get(key) for key in (
+                            "job_id","item_id","symbol","status","provider","source",
+                            "attempt","rows_fetched","rows_persisted",
+                            "canonical_status","error_code","error_message","started_at",
+                            "updated_at","finished_at",
+                        )),
+                    )
+                return saved, True
+            existing = connection.execute(
+                "SELECT * FROM history_fetch_job WHERE idempotency_key=%s",
+                (row["idempotency_key"],),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError("idempotent history job was not visible")
+            return existing, False
+
     def upsert_history_job(self, row: Dict[str, Any]) -> Dict[str, Any]:
         with self.database.connection() as connection:
             return connection.execute(

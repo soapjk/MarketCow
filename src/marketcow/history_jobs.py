@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict
+
+from .telemetry import sanitize_text
 
 
 TERMINAL_JOB = {"succeeded", "partially_failed", "failed", "canceled"}
@@ -20,12 +21,7 @@ def _now() -> str:
 
 
 def _safe_error(exc: BaseException) -> tuple[str, str]:
-    text = str(exc)
-    text = re.sub(
-        r"(?i)(password|token|secret|authorization)\s*[=:]\s*\S+",
-        r"\1=[redacted]", text,
-    )
-    return type(exc).__name__.lower(), text[:1000]
+    return type(exc).__name__.lower(), sanitize_text(exc)
 
 
 def _clean(value: Any) -> Any:
@@ -48,11 +44,15 @@ class HistoryJobManager:
         self.repository = repository
         self.max_workers = max(1, min(int(max_workers), 16))
         self.executor = ThreadPoolExecutor(
-            max_workers=self.max_workers, thread_name_prefix="history-job"
+            max_workers=self.max_workers, thread_name_prefix="history-item"
+        )
+        self._coordinator = ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix="history-batch"
         )
         self._slots = threading.BoundedSemaphore(self.max_workers)
         self._guard = threading.Lock()
         self._active: set[str] = set()
+        self._closed = False
         self._recover()
 
     @staticmethod
@@ -99,23 +99,23 @@ class HistoryJobManager:
                 self._dispatch(job_id)
 
     def create(self, request: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
-        key = str(request["idempotency_key"])
-        for existing in map(_clean, self.repository.list_history_jobs(200)):
-            if str(existing["idempotency_key"]) == key:
-                return self.detail(str(existing["job_id"])), False
+        with self._guard:
+            if self._closed:
+                raise RuntimeError("history job manager is closed")
         now = _now()
         job_id = uuid.uuid4().hex
         job = {
-            "job_id": job_id, "idempotency_key": key, "status": "queued",
+            "job_id": job_id, "idempotency_key": str(request["idempotency_key"]),
+            "status": "queued",
             "request_json": request, "created_at": now, "started_at": None,
             "updated_at": now, "finished_at": None, "error_json": None,
         }
-        self.repository.upsert_history_job(job)
+        items = []
         for index, symbol in enumerate(request["symbols"]):
             item_id = hashlib.sha256(
                 f"{job_id}|{symbol}".encode()
             ).hexdigest()[:24]
-            self.repository.upsert_history_item({
+            items.append({
                 "job_id": job_id, "item_id": item_id, "symbol": symbol,
                 "status": "queued", "provider": request["provider"], "source": None,
                 "attempt": 0, "rows_fetched": 0, "rows_persisted": 0,
@@ -123,20 +123,19 @@ class HistoryJobManager:
                 "error_message": None, "started_at": None, "updated_at": now,
                 "finished_at": None, "_index": index,
             })
-        # Let independent PostgreSQL transactions for every item become visible
-        # before the coordinator reads the batch through another pooled connection.
-        threading.Timer(0.05, self._dispatch, args=(job_id,)).start()
+        saved, created = self.repository.get_or_create_history_job(job, items)
+        saved = _clean(saved)
+        if not created:
+            return self.detail(str(saved["job_id"])), False
+        self._dispatch(job_id)
         return self.detail(job_id), True
 
     def _dispatch(self, job_id: str) -> None:
         with self._guard:
-            if job_id in self._active:
+            if self._closed or job_id in self._active:
                 return
             self._active.add(job_id)
-        threading.Thread(
-            target=self._run_job, args=(job_id,), daemon=True,
-            name=f"history-batch-{job_id[:8]}",
-        ).start()
+            self._coordinator.submit(self._run_job, job_id)
 
     def _run_job(self, job_id: str) -> None:
         try:
@@ -152,23 +151,31 @@ class HistoryJobManager:
             ]
             queued = [item for item in items if item["status"] == "queued"]
             concurrency = min(int(request["max_concurrency"]), self.max_workers)
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futures = {
-                    pool.submit(self._run_item_bounded, job_id, item, request): item
-                    for item in queued
-                }
-                for future in as_completed(futures):
-                    future.result()
-            self._finalize(job_id)
+            job_slots = threading.BoundedSemaphore(concurrency)
+            futures = {}
+            for item in queued:
+                with self._guard:
+                    if self._closed:
+                        self._cancel_item(item)
+                        continue
+                    future = self.executor.submit(
+                        self._run_item_bounded, job_id, item, request, job_slots
+                    )
+                futures[future] = item
+            for future in as_completed(futures):
+                future.result()
         finally:
             with self._guard:
+                self._finalize(job_id)
                 self._active.discard(job_id)
 
     def _run_item_bounded(
-        self, job_id: str, item: Dict[str, Any], request: Dict[str, Any]
+        self, job_id: str, item: Dict[str, Any], request: Dict[str, Any],
+        job_slots: threading.BoundedSemaphore,
     ) -> None:
-        with self._slots:
-            self._run_item(job_id, item, request)
+        with job_slots:
+            with self._slots:
+                self._run_item(job_id, item, request)
 
     def _run_item(
         self, job_id: str, item: Dict[str, Any], request: Dict[str, Any]
@@ -307,26 +314,32 @@ class HistoryJobManager:
         return self.detail(job_id)
 
     def retry_failed(self, job_id: str) -> Dict[str, Any]:
-        job = _clean(self.repository.get_history_job(job_id))
-        if not job:
-            raise KeyError(job_id)
-        changed = False
-        for raw in map(_clean, self.repository.list_history_items(job_id)):
-            item = dict(raw)
-            if item["status"] == "failed":
-                changed = True
-                item.update({
-                    "status": "queued", "canonical_status": "pending",
-                    "error_code": None, "error_message": None,
-                    "updated_at": _now(), "finished_at": None,
-                })
-                self.repository.upsert_history_item(item)
-        if not changed:
-            raise ValueError("job has no failed items")
-        job = dict(job)
-        job.update({"status": "queued", "updated_at": _now(), "finished_at": None})
-        self.repository.upsert_history_job(job)
-        self._dispatch(job_id)
+        with self._guard:
+            if self._closed:
+                raise RuntimeError("history job manager is closed")
+            job = _clean(self.repository.get_history_job(job_id))
+            if not job:
+                raise KeyError(job_id)
+            if job_id in self._active:
+                raise ValueError("job is still finalizing")
+            changed = False
+            for raw in map(_clean, self.repository.list_history_items(job_id)):
+                item = dict(raw)
+                if item["status"] == "failed":
+                    changed = True
+                    item.update({
+                        "status": "queued", "canonical_status": "pending",
+                        "error_code": None, "error_message": None,
+                        "updated_at": _now(), "finished_at": None,
+                    })
+                    self.repository.upsert_history_item(item)
+            if not changed:
+                raise ValueError("job has no failed items")
+            job = dict(job)
+            job.update({"status": "queued", "updated_at": _now(), "finished_at": None})
+            self.repository.upsert_history_job(job)
+            self._active.add(job_id)
+            self._coordinator.submit(self._run_job, job_id)
         return self.detail(job_id)
 
     def detail(self, job_id: str) -> Dict[str, Any]:
@@ -369,4 +382,7 @@ class HistoryJobManager:
         ]
 
     def close(self) -> None:
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        with self._guard:
+            self._closed = True
+        self._coordinator.shutdown(wait=True, cancel_futures=True)
+        self.executor.shutdown(wait=True, cancel_futures=True)

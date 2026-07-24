@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from starlette.responses import HTMLResponse, JSONResponse
 
 from . import __version__
@@ -84,6 +84,20 @@ class HistoryJobRequest(BaseModel):
     canonical_wait_seconds: float = Field(ge=0, le=60)
     idempotency_key: str = Field(min_length=8, max_length=200)
 
+    @model_validator(mode="after")
+    def validate_symbols_and_provider(self):
+        normalized = [symbol.strip().upper() for symbol in self.symbols]
+        if any(not symbol for symbol in normalized):
+            raise ValueError("symbols must not contain empty values")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("symbols must be unique after normalization")
+        self.symbols = normalized
+        if self.provider == "yahoo_chart":
+            self.provider = "yahoo"
+        if self.provider not in {"yahoo", "tushare"}:
+            raise ValueError("unsupported history provider")
+        return self
+
 
 class DividendAnnouncementInput(BaseModel):
     symbol: str
@@ -129,7 +143,8 @@ def create_app(
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None
     if history_repository is not None and all(hasattr(history_repository, name) for name in (
-        "upsert_history_job", "upsert_history_item", "get_history_job",
+        "get_or_create_history_job", "upsert_history_job", "upsert_history_item",
+        "get_history_job",
         "list_history_jobs", "list_history_items",
     )):
         history_manager = HistoryJobManager(
@@ -1562,8 +1577,6 @@ def create_app(
     @app.post("/v1/admin/history-jobs")
     def create_history_job(request: HistoryJobRequest):
         payload = request.model_dump()
-        if request.provider not in {"yahoo", "yahoo_chart", "tushare"}:
-            raise HTTPException(status_code=400, detail="unsupported history provider")
         job, created = require_history_manager().create(payload)
         return JSONResponse(
             status_code=202,

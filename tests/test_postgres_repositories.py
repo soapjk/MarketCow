@@ -35,6 +35,35 @@ class PostgresDomainInventoryTest(unittest.TestCase):
     "set MARKETCOW_TEST_POSTGRES_DSN to run PostgreSQL integration tests",
 )
 class PostgresRepositoryIntegrationTest(unittest.TestCase):
+    def test_history_job_idempotency_is_atomic_under_concurrent_create(self):
+        key = "history-atomic-" + uuid.uuid4().hex
+        now = "2026-07-24T00:00:00+00:00"
+
+        def create(suffix):
+            job_id = "job-" + suffix
+            job = {
+                "job_id": job_id, "idempotency_key": key, "status": "queued",
+                "request_json": {"symbols": ["AAPL"]}, "created_at": now,
+                "started_at": None, "updated_at": now, "finished_at": None,
+                "error_json": None,
+            }
+            item = {
+                "job_id": job_id, "item_id": "item-" + suffix, "symbol": "AAPL",
+                "status": "queued", "provider": "yahoo", "source": None,
+                "attempt": 0, "rows_fetched": 0, "rows_persisted": 0,
+                "canonical_status": "pending", "error_code": None,
+                "error_message": None, "started_at": None, "updated_at": now,
+                "finished_at": None,
+            }
+            return self.repository.get_or_create_history_job(job, [item])
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(create, ("one", "two")))
+        self.assertEqual(len({row["job_id"] for row, _ in results}), 1)
+        self.assertEqual(sorted(created for _, created in results), [False, True])
+        winning_job_id = results[0][0]["job_id"]
+        self.assertEqual(len(self.repository.list_history_items(winning_job_id)), 1)
+
     def test_backup_component_extracts_real_postgres_schema(self):
         component = BackupComponent.postgresql(
             self.database, "2026-07-20T00:00:00Z"
