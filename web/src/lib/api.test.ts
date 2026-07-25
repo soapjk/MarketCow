@@ -23,3 +23,15 @@ test("normalizes structured API errors", async () => {
     new ApiError("not ready", 503, "req-1"),
   );
 });
+
+test("adds CSRF and request IDs only to mutations", async () => {
+  document.cookie = "marketcow_csrf=csrf-value";
+  const fetchImpl = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    expect(headers.get("X-CSRF-Token")).toBe("csrf-value");
+    expect(headers.get("X-Request-ID")).toBeTruthy();
+    return new Response(null, { status: 204 });
+  });
+  const client = createApiClient({ fetchImpl });
+  await client.request("/v1/admin/action", { method: "POST" });
+});

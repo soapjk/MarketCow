@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { useIdentity } from "../features/auth/authContext";
 
 const navigation = [
   ["overview", "总览", "01"],
@@ -12,6 +13,7 @@ const navigation = [
 const titles = Object.fromEntries(navigation.map(([path, title]) => [`/${path}`, title]));
 
 export function AppShell({ path, children }: { path: string; children: ReactNode }) {
+  const identity = useIdentity();
   const [theme, setTheme] = useState<"dark" | "light">(() => {
     return localStorage.getItem("marketcow-theme") === "light" ? "light" : "dark";
   });
@@ -69,6 +71,10 @@ export function AppShell({ path, children }: { path: string; children: ReactNode
               onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
             >
               {theme === "dark" ? "☼" : "◐"}
+            </button>
+            <button className="identity-button" type="button" onClick={identity?.logout} title="退出当前会话">
+              <span>{identity?.role ?? "local"}</span>
+              {identity?.actor ?? "development"}
             </button>
           </div>
         </header>

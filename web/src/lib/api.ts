@@ -14,16 +14,28 @@ export type ApiClientOptions = {
   fetchImpl?: typeof fetch;
 };
 
+function cookie(name: string) {
+  const prefix = `${encodeURIComponent(name)}=`;
+  const item = document.cookie.split(";").map((value) => value.trim())
+    .find((value) => value.startsWith(prefix));
+  return item ? decodeURIComponent(item.slice(prefix.length)) : "";
+}
+
 export function createApiClient(options: ApiClientOptions = {}) {
   const baseUrl = (options.baseUrl ?? import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
   const fetchImpl = options.fetchImpl;
 
   async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const method = (init.method ?? "GET").toUpperCase();
+    const mutating = !["GET", "HEAD", "OPTIONS"].includes(method);
+    const csrf = mutating ? cookie("marketcow_csrf") : "";
     const response = await (fetchImpl ?? fetch)(`${baseUrl}${path}`, {
       ...init,
       headers: {
         Accept: "application/json",
         ...(init.body ? { "Content-Type": "application/json" } : {}),
+        ...(mutating ? { "X-Request-ID": crypto.randomUUID() } : {}),
+        ...(csrf ? { "X-CSRF-Token": csrf } : {}),
         ...init.headers,
       },
       credentials: "same-origin",

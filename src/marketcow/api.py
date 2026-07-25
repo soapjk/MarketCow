@@ -7,7 +7,10 @@ from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Body, FastAPI, Header, HTTPException, Query, Request, WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
@@ -50,6 +53,9 @@ from .dashboard_registry import load_dashboard_registry, registry_document
 from .admin_control import AdminAuditService
 from .http_metrics import RequestMetrics, RequestMetricsMiddleware
 from .admin_events import ALLOWED_EVENT_TYPES, AdminEventHub, encode_sse
+from .admin_auth import (
+    CSRF_COOKIE, SESSION_COOKIE, AdminAuth, AdminSecurityMiddleware,
+)
 
 
 def normalize_quote_symbol(value: str) -> str:
@@ -159,6 +165,13 @@ def create_app(
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
+    admin_auth = AdminAuth(
+        settings.admin_auth_required,
+        settings.admin_tokens_json,
+        settings.admin_session_seconds,
+    )
+    app.add_middleware(AdminSecurityMiddleware, auth=admin_auth)
+    app.state.admin_auth = admin_auth
     admin_events = AdminEventHub(
         replay_capacity=min(settings.realtime_replay_capacity, 100000),
         subscriber_capacity=min(settings.realtime_queue_capacity, 10000),
@@ -231,6 +244,10 @@ def create_app(
     app.state.dashboard_registry = load_dashboard_registry(settings.dashboard_registry_json)
     admin_audit = AdminAuditService(metadata_repository)
     app.state.admin_audit = admin_audit
+
+    def authenticated_actor(request: Request) -> str:
+        identity = request.scope.get("admin_identity")
+        return getattr(identity, "actor", "local-development")
 
     async def shutdown() -> None:
         try:
@@ -416,6 +433,51 @@ def create_app(
             "metadata_backend": "postgresql",
             "storage_health": storage_health(),
         }
+
+    @app.post("/v1/auth/session")
+    def create_admin_session(token: str = Body(embed=True, min_length=1, max_length=500)):
+        try:
+            session_id, identity = admin_auth.login(token)
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=401, detail={"code": "invalid_credentials"}
+            ) from exc
+        response = JSONResponse({
+            "authenticated": True, "actor": identity.actor, "role": identity.role,
+        })
+        response.set_cookie(
+            SESSION_COOKIE, session_id, max_age=settings.admin_session_seconds,
+            httponly=True, secure=settings.admin_cookie_secure,
+            samesite="strict", path="/",
+        )
+        response.set_cookie(
+            CSRF_COOKIE, identity.csrf, max_age=settings.admin_session_seconds,
+            httponly=False, secure=settings.admin_cookie_secure,
+            samesite="strict", path="/",
+        )
+        return response
+
+    @app.get("/v1/auth/session")
+    def get_admin_session(request: Request):
+        identity = admin_auth.authenticate(request.headers, request.cookies)
+        if identity is None:
+            raise HTTPException(
+                status_code=401, detail={"code": "authentication_required"}
+            )
+        return {
+            "authenticated": True, "actor": identity.actor, "role": identity.role,
+        }
+
+    @app.delete("/v1/auth/session")
+    def delete_admin_session(request: Request):
+        identity = admin_auth.authenticate(request.headers, request.cookies)
+        if identity is not None and not admin_auth.csrf_valid(identity, request.headers):
+            raise HTTPException(status_code=403, detail={"code": "csrf_validation_failed"})
+        admin_auth.logout(request.cookies.get(SESSION_COOKIE, ""))
+        response = Response(status_code=204)
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        response.delete_cookie(CSRF_COOKIE, path="/")
+        return response
 
     @app.get("/metrics", include_in_schema=False)
     def prometheus_metrics():
@@ -1758,22 +1820,23 @@ def create_app(
     @app.post("/v1/admin/history-jobs")
     def create_history_job(
         request: HistoryJobRequest,
+        http_request: Request,
         x_request_id: str = Header("", max_length=120),
-        x_admin_actor: str = Header("local", max_length=120),
     ):
         payload = request.model_dump()
+        actor = authenticated_actor(http_request)
         try:
             job, created = require_history_manager().create(payload)
         except Exception as exc:
             admin_audit.append(
-                actor=x_admin_actor, action="history_job.create",
+                actor=actor, action="history_job.create",
                 target=request.idempotency_key, outcome="failed",
                 parameters={"symbols": request.symbols, "provider": request.provider},
                 request_id=x_request_id, detail=str(exc),
             )
             raise
         admin_audit.append(
-            actor=x_admin_actor, action="history_job.create",
+            actor=actor, action="history_job.create",
             target=job["job_id"], outcome="accepted" if created else "succeeded",
             parameters={
                 "symbols": request.symbols, "provider": request.provider,
@@ -1814,19 +1877,20 @@ def create_app(
     @app.post("/v1/admin/history-jobs/{job_id}/cancel")
     def cancel_history_job(
         job_id: str,
+        request: Request,
         x_request_id: str = Header("", max_length=120),
-        x_admin_actor: str = Header("local", max_length=120),
     ):
+        actor = authenticated_actor(request)
         try:
             result = require_history_manager().cancel(job_id)
         except KeyError as exc:
             admin_audit.append(
-                actor=x_admin_actor, action="history_job.cancel", target=job_id,
+                actor=actor, action="history_job.cancel", target=job_id,
                 outcome="rejected", request_id=x_request_id, detail="not found",
             )
             raise HTTPException(status_code=404, detail="history job not found") from exc
         admin_audit.append(
-            actor=x_admin_actor, action="history_job.cancel", target=job_id,
+            actor=actor, action="history_job.cancel", target=job_id,
             outcome="succeeded", request_id=x_request_id,
         )
         return result
@@ -1834,25 +1898,26 @@ def create_app(
     @app.post("/v1/admin/history-jobs/{job_id}/retry-failed")
     def retry_history_job(
         job_id: str,
+        request: Request,
         x_request_id: str = Header("", max_length=120),
-        x_admin_actor: str = Header("local", max_length=120),
     ):
+        actor = authenticated_actor(request)
         try:
             result = require_history_manager().retry_failed(job_id)
         except KeyError as exc:
             admin_audit.append(
-                actor=x_admin_actor, action="history_job.retry_failed", target=job_id,
+                actor=actor, action="history_job.retry_failed", target=job_id,
                 outcome="rejected", request_id=x_request_id, detail="not found",
             )
             raise HTTPException(status_code=404, detail="history job not found") from exc
         except ValueError as exc:
             admin_audit.append(
-                actor=x_admin_actor, action="history_job.retry_failed", target=job_id,
+                actor=actor, action="history_job.retry_failed", target=job_id,
                 outcome="rejected", request_id=x_request_id, detail=str(exc),
             )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         admin_audit.append(
-            actor=x_admin_actor, action="history_job.retry_failed", target=job_id,
+            actor=actor, action="history_job.retry_failed", target=job_id,
             outcome="succeeded", request_id=x_request_id,
         )
         return result

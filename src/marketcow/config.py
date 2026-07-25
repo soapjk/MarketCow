@@ -90,6 +90,10 @@ class Settings:
     hyperliquid_timeout_seconds: float = 3.0
     hyperliquid_request_budget_seconds: float = 10.0
     dashboard_registry_json: str = ""
+    admin_auth_required: bool = False
+    admin_tokens_json: str = ""
+    admin_session_seconds: int = 28800
+    admin_cookie_secure: bool = False
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -243,6 +247,14 @@ class Settings:
                 "MARKETCOW_HYPERLIQUID_REQUEST_BUDGET_SECONDS", "10"
             )),
             dashboard_registry_json=os.getenv("MARKETCOW_DASHBOARD_REGISTRY_JSON", ""),
+            admin_auth_required=_bool_env(
+                "MARKETCOW_ADMIN_AUTH_REQUIRED", profile == "production"
+            ),
+            admin_tokens_json=os.getenv("MARKETCOW_ADMIN_TOKENS_JSON", ""),
+            admin_session_seconds=int(os.getenv(
+                "MARKETCOW_ADMIN_SESSION_SECONDS", "28800"
+            )),
+            admin_cookie_secure=_bool_env("MARKETCOW_ADMIN_COOKIE_SECURE", False),
         )
 
     def validate_runtime_isolation(self) -> None:

@@ -25,9 +25,9 @@ history-job implementation can page through the 200 most recently updated jobs.
 - `POST /v1/admin/history-jobs/{job_id}/retry-failed` retries eligible failures and
   returns `409 Conflict` when the current state does not permit a retry.
 
-Clients may send `X-Request-ID` to correlate a command and `X-Admin-Actor` to label
-the local actor. MCHR-52 replaces trust in the actor header with authenticated
-identity enforcement.
+Clients may send `X-Request-ID` to correlate a command. The audit actor always comes
+from the authenticated server-side identity; actor headers supplied by a client are
+ignored.
 
 ## Audit
 

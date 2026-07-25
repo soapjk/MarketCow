@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../lib/api";
+import { useIdentity } from "../auth/authContext";
 
 type Provider = {
   provider: string; status: string; last_attempt_at: string; last_success_at?: string;
@@ -20,6 +21,8 @@ const defaultJob = {
 };
 
 export function OperationsPage() {
+  const identity = useIdentity();
+  const canOperate = identity?.role === "operator" || identity?.role === "admin";
   const client = useQueryClient();
   const [tab, setTab] = useState<"jobs" | "providers">("jobs");
   const [form, setForm] = useState(defaultJob);
@@ -62,7 +65,7 @@ export function OperationsPage() {
       <div className="page-intro"><div><p className="eyebrow">OPERATIONS / AUDITED</p><h2>任务与服务</h2></div><div className="tab-switch"><button className={tab === "jobs" ? "active" : ""} onClick={() => setTab("jobs")}>历史任务</button><button className={tab === "providers" ? "active" : ""} onClick={() => setTab("providers")}>Provider</button></div></div>
       {tab === "jobs" ? (
         <div className="split-layout">
-          <form className="data-card operation-form" onSubmit={submit}>
+          <form className="data-card operation-form" onSubmit={submit} aria-disabled={!canOperate}>
             <header><div><p className="eyebrow">NEW BATCH</p><h3>创建历史任务</h3></div></header>
             <label>标的（逗号分隔）<input value={form.symbols} onChange={(e) => setForm({ ...form, symbols: e.target.value })} required /></label>
             <div className="form-grid">
@@ -71,7 +74,7 @@ export function OperationsPage() {
               <label>周期<input value={form.interval} onChange={(e) => setForm({ ...form, interval: e.target.value })} /></label>
               <label>复权<select value={form.adjustment} onChange={(e) => setForm({ ...form, adjustment: e.target.value })}><option>raw</option><option>adjusted</option></select></label>
             </div>
-            <button className="primary-action" type="submit" disabled={createJob.isPending}>{createJob.isPending ? "提交中…" : "创建任务"}</button>
+            <button className="primary-action" type="submit" disabled={!canOperate || createJob.isPending}>{createJob.isPending ? "提交中…" : canOperate ? "创建任务" : "Viewer 无操作权限"}</button>
             {createJob.isError && <p className="inline-error">{createJob.error.message}</p>}
           </form>
           <article className="data-card">
@@ -82,8 +85,8 @@ export function OperationsPage() {
                   <div><code>{job.job_id.slice(0, 12)}</code><span>{job.provider ?? "—"} · {job.total_symbols ?? 0} symbols · {job.rows_persisted ?? 0} rows</span></div>
                   <div className="job-progress"><span className={`status-pill status-${job.status}`}>{job.status}</span><progress max="100" value={job.progress_percent ?? 0} /></div>
                   <div className="row-actions">
-                    {!["succeeded", "failed", "canceled", "partially_failed"].includes(job.status) && <button onClick={() => runCommand(job.job_id, "cancel")}>取消</button>}
-                    {["failed", "partially_failed"].includes(job.status) && <button onClick={() => runCommand(job.job_id, "retry-failed")}>重试</button>}
+                    {canOperate && !["succeeded", "failed", "canceled", "partially_failed"].includes(job.status) && <button onClick={() => runCommand(job.job_id, "cancel")}>取消</button>}
+                    {canOperate && ["failed", "partially_failed"].includes(job.status) && <button onClick={() => runCommand(job.job_id, "retry-failed")}>重试</button>}
                   </div>
                 </div>
               ))}</div>

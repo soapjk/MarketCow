@@ -75,6 +75,8 @@ nav a.active { color: var(--text); background: var(--accent-soft); border-color:
 }
 .project-switcher select { padding: 0 30px 0 12px; }
 .icon-button { width: 38px; }
+.identity-button { height: 38px; padding: 4px 10px; color: var(--text); text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 5px; font-size: 10px; }
+.identity-button span { display: block; color: var(--accent); font: 8px ui-monospace, monospace; text-transform: uppercase; }
 .content { padding: 30px; }
 .status-strip {
   display: flex; gap: 22px; padding: 9px 12px; color: var(--muted); font: 10px ui-monospace, monospace;
@@ -191,6 +193,14 @@ progress { width: 100%; height: 4px; accent-color: var(--accent); }
 .coverage-stats span, .coverage-stats strong { display: block; }
 .coverage-stats span { color: var(--muted); font: 9px ui-monospace, monospace; text-transform: uppercase; }
 .coverage-stats strong { margin-top: 5px; font-size: 12px; word-break: break-word; }
+.auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 24px; background:
+  linear-gradient(120deg, #07111f, #0c1929 60%, #142319); }
+.auth-panel { width: min(440px, 100%); padding: 36px; color: var(--text); border: 1px solid var(--line); background: #0c1929; box-shadow: 14px 14px 0 #020812; }
+.auth-panel .brand-mark { margin-bottom: 30px; }
+.auth-panel h1 { margin: 10px 0; font-size: 32px; letter-spacing: -.035em; }
+.auth-panel > p:not(.eyebrow) { color: var(--muted); line-height: 1.6; }
+.auth-panel label { display: block; margin: 28px 0 14px; }
+.auth-panel button { width: 100%; padding: 11px; color: #07111f; background: var(--accent); border: 0; font-weight: 800; }
 
 @media (max-width: 800px) {
   .app-shell { grid-template-columns: 1fr; }
