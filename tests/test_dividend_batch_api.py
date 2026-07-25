@@ -85,7 +85,7 @@ class DividendBatchApiTest(unittest.TestCase):
         client = TestClient(create_app(self.settings, service))
 
         response = client.post("/v1/dividends/query", json={
-            "symbols": ["600519.ss", "0700.HK", "AAPL"],
+            "symbols": ["600519.XSHG", "700.XHKG", "AAPL.XNAS"],
             "fiscal_year": 2026,
         })
 
@@ -94,7 +94,7 @@ class DividendBatchApiTest(unittest.TestCase):
         self.assertEqual(payload["requested_count"], 3)
         self.assertEqual(
             [item["symbol"] for item in payload["items"]],
-            ["600519.SH", "00700.HK", "AAPL"],
+            ["600519.XSHG", "700.XHKG", "AAPL.XNAS"],
         )
         self.assertEqual(
             [item["status"] for item in payload["items"]],
@@ -103,14 +103,14 @@ class DividendBatchApiTest(unittest.TestCase):
 
     def test_partial_failure_unavailable_and_refreshing_are_isolated(self):
         service = BatchDividendService({
-            "AAPL": RuntimeError("upstream unavailable"),
-            "MSFT": dividend_data("MSFT", count=0),
-            "00700.HK": dividend_data("00700.HK", cache_status="refreshing"),
+            "AAPL.XNAS": RuntimeError("upstream unavailable"),
+            "MSFT.XNAS": dividend_data("MSFT.XNAS", count=0),
+            "700.XHKG": dividend_data("700.XHKG", cache_status="refreshing"),
         })
         client = TestClient(create_app(self.settings, service))
 
         response = client.post("/v1/dividends/query", json={
-            "symbols": ["AAPL", "MSFT", "0700.HK"],
+            "symbols": ["AAPL.XNAS", "MSFT.XNAS", "700.XHKG"],
             "fiscal_year": 2026,
         })
 
@@ -129,7 +129,7 @@ class DividendBatchApiTest(unittest.TestCase):
         started = time.monotonic()
 
         response = client.post("/v1/dividends/query", json={
-            "symbols": ["AAPL", "MSFT", "NVDA", "MU"],
+            "symbols": ["AAPL.XNAS", "MSFT.XNAS", "NVDA.XNAS", "MU.XNAS"],
             "fiscal_year": 2026,
         })
         elapsed = time.monotonic() - started
@@ -144,7 +144,7 @@ class DividendBatchApiTest(unittest.TestCase):
             "symbols": [], "fiscal_year": 2026,
         })
         excessive = client.post("/v1/dividends/query", json={
-            "symbols": [f"SYM{i}" for i in range(51)], "fiscal_year": 2026,
+            "symbols": [f"SYM{i}.XNAS" for i in range(51)], "fiscal_year": 2026,
         })
 
         self.assertEqual(empty.status_code, 422)
@@ -155,22 +155,22 @@ class DividendBatchApiTest(unittest.TestCase):
         client = TestClient(create_app(self.settings, service))
 
         response = client.post("/v1/dividends/query", json={
-            "symbols": ["0700.HK", "00700.HK"], "fiscal_year": 2026,
+            "symbols": ["700.XHKG", "700.XHKG"], "fiscal_year": 2026,
         })
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(service.calls, [("00700.HK", 2026)])
+        self.assertEqual(service.calls, [("700.XHKG", 2026)])
         self.assertEqual(len(response.json()["items"]), 2)
 
     def test_batch_data_matches_single_symbol_business_result(self):
         service = BatchDividendService({
-            "AAPL": dividend_data("AAPL", cache_status="stale"),
+            "AAPL.XNAS": dividend_data("AAPL.XNAS", cache_status="stale"),
         })
         client = TestClient(create_app(self.settings, service))
 
-        single = client.get("/v1/dividends/AAPL?fiscal_year=2026").json()
+        single = client.get("/v1/dividends/AAPL.XNAS?fiscal_year=2026").json()
         batch = client.post("/v1/dividends/query", json={
-            "symbols": ["AAPL"], "fiscal_year": 2026,
+            "symbols": ["AAPL.XNAS"], "fiscal_year": 2026,
         }).json()
 
         self.assertEqual(batch["items"][0]["data"], single)
@@ -186,7 +186,7 @@ class DividendBatchApiTest(unittest.TestCase):
         ))
 
         response = client.post("/v1/dividends/query", json={
-            "symbols": ["AAPL", "MSFT"], "fiscal_year": 2026,
+            "symbols": ["AAPL.XNAS", "MSFT.XNAS"], "fiscal_year": 2026,
         })
 
         self.assertEqual(response.status_code, 200)

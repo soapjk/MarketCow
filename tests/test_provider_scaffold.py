@@ -55,7 +55,7 @@ class ProviderScaffoldTest(unittest.TestCase):
 
     def test_normalized_quote_contract_is_reusable(self):
         valid = {
-            "instrument_id": "US.XNAS.TEST",
+            "instrument_id": "TEST.XNAS",
             "symbol": "TEST",
             "market": "US",
             "price": 12.5,

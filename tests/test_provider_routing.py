@@ -90,7 +90,7 @@ class ProviderRoutingTest(unittest.TestCase):
         service = StubService()
         client = TestClient(create_app(self.settings, service))
         response = client.post("/v1/quotes/query", json={
-            "symbols": ["000001.SZ", "600519.SH"],
+            "symbols": ["000001.XSHE", "600519.XSHG"],
             "refresh": True,
             "provider": "eastmoney",
             "allow_fallback": False,
@@ -98,20 +98,20 @@ class ProviderRoutingTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["count"], 2)
         self.assertEqual(service.calls, [
-            ("quote", "000001.SZ", "eastmoney", False),
-            ("quote", "600519.SH", "eastmoney", False),
+            ("quote", "000001.XSHE", "eastmoney", False),
+            ("quote", "600519.XSHG", "eastmoney", False),
         ])
 
     def test_public_post_history_query_is_capability_named(self):
         service = StubService()
         client = TestClient(create_app(self.settings, service))
         response = client.post("/v1/market-bars/query", json={
-            "symbols": ["AAPL"], "range": "5d", "interval": "1d",
+            "symbols": ["AAPL.XNAS"], "range": "5d", "interval": "1d",
             "adjustment": "adjusted", "refresh": True, "provider": "yahoo",
         })
         self.assertEqual(response.status_code, 200)
         self.assertEqual(service.calls[0], (
-            "history", "AAPL", "5d", "1d", "adjusted", "yahoo", False,
+            "history", "AAPL.XNAS", "5d", "1d", "adjusted", "yahoo", False,
         ))
 
     def test_provider_specific_routes_are_not_public_schema(self):
@@ -125,7 +125,7 @@ class ProviderRoutingTest(unittest.TestCase):
     def test_provider_requires_upstream_refresh(self):
         client = TestClient(create_app(self.settings, StubService()))
         response = client.post("/v1/quotes/query", json={
-            "symbols": ["AAPL"], "provider": "yahoo", "refresh": False,
+            "symbols": ["AAPL.XNAS"], "provider": "yahoo", "refresh": False,
         })
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"]["code"], "provider_requires_refresh")
@@ -134,25 +134,25 @@ class ProviderRoutingTest(unittest.TestCase):
         service = BatchStubService()
         client = TestClient(create_app(self.settings, service))
         response = client.post("/v1/quotes/query", json={
-            "symbols": ["AAPL", "0700.HK"],
+            "symbols": ["AAPL.XNAS", "700.XHKG"],
             "provider": "longport",
             "refresh": True,
         })
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["count"], 2)
         self.assertEqual(service.calls, [
-            ("batch", ("AAPL", "0700.HK"), "longport", False),
+            ("batch", ("AAPL.XNAS", "700.XHKG"), "longport", False),
         ])
 
     def test_public_spread_route_uses_longport_depth_service(self):
         service = StubService()
         client = TestClient(create_app(self.settings, service))
 
-        response = client.get("/v1/quotes/AAPL/spread")
+        response = client.get("/v1/quotes/AAPL.XNAS/spread")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["best_bid"], 100.0)
-        self.assertEqual(service.calls, [("spread", "AAPL")])
+        self.assertEqual(service.calls, [("spread", "AAPL.XNAS")])
 
 
 if __name__ == "__main__":

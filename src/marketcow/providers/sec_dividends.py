@@ -124,7 +124,7 @@ class SecDividendProvider:
             url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{archive}/{primary}"
             filing_text = self.get_text(url, self.headers)
             parsed = parse_sec_dividend_filing(
-                filing_text, instrument.symbol,
+                filing_text, instrument.instrument_id,
                 filed_at, url, accession,
             )
             for row in parsed:

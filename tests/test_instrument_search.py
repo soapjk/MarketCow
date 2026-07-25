@@ -18,7 +18,7 @@ class InstrumentSearchProviderTest(unittest.TestCase):
 
         items = provider.search("美团")
 
-        self.assertEqual([item["symbol"] for item in items], ["3690.HK"])
+        self.assertEqual([item["symbol"] for item in items], ["3690.XHKG"])
         self.assertEqual(items[0]["name"], "美团-W")
         self.assertEqual(items[0]["currency"], "HKD")
 
@@ -33,7 +33,7 @@ class InstrumentSearchProviderTest(unittest.TestCase):
 
         items = provider.search("513180.HK")
 
-        self.assertEqual(items[0]["symbol"], "513180.SH")
+        self.assertEqual(items[0]["symbol"], "513180.XSHG")
         self.assertEqual(items[0]["currency"], "CNY")
         self.assertEqual(provider.session.get.call_args.kwargs["params"]["input"], "513180")
 

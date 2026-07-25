@@ -54,8 +54,8 @@ class ExposureFactsTest(unittest.TestCase):
             }],
             "evidence": ev(),
         })
-        result = ExposureFactsService([source], clock=lambda: NOW).get("MU")
-        self.assertEqual(result["symbol"], "MU")
+        result = ExposureFactsService([source], clock=lambda: NOW).get("MU.XNAS")
+        self.assertEqual(result["symbol"], "MU.XNAS")
         self.assertEqual(result["asset_type"], "equity")
         self.assertEqual(result["currency"], "USD")
         self.assertEqual(len(result["classifications"]), 2)
@@ -81,7 +81,7 @@ class ExposureFactsTest(unittest.TestCase):
             },
             "evidence": ev("fund_master"),
         })
-        result = ExposureFactsService([source], clock=lambda: NOW).get("SOXX")
+        result = ExposureFactsService([source], clock=lambda: NOW).get("SOXX.XNAS")
         self.assertEqual(result["holdings"]["status"], "available")
         self.assertEqual(result["holdings"]["constituents"][0]["weight"], 0.12)
         self.assertEqual(result["classifications"], [])
@@ -92,13 +92,13 @@ class ExposureFactsTest(unittest.TestCase):
             "as_of": "2026-07-22T07:00:00+00:00",
             "classifications": [], "company_materials": [], "evidence": ev(),
         })
-        result = ExposureFactsService([source], clock=lambda: NOW).get("513180.SH")
+        result = ExposureFactsService([source], clock=lambda: NOW).get("513180.XSHG")
         self.assertEqual(result["holdings"]["status"], "unavailable")
         self.assertEqual(result["holdings"]["reason"], "no_constituent_source")
         self.assertEqual(result["classifications"], [])
 
     def test_no_data_returns_stable_unavailable_contract(self):
-        result = ExposureFactsService([Source(None)], clock=lambda: NOW).get("0700.HK")
+        result = ExposureFactsService([Source(None)], clock=lambda: NOW).get("700.XHKG")
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["holdings"]["status"], "unavailable")
         self.assertEqual(result["cache_status"], "empty")
@@ -114,10 +114,10 @@ class ExposureFactsTest(unittest.TestCase):
         service = ExposureFactsService(
             [source], ttl_seconds=60, stale_max_seconds=3600, clock=lambda: clock[0]
         )
-        service.get("MU")
+        service.get("MU.XNAS")
         source.error = TimeoutError("upstream down")
         clock[0] += timedelta(seconds=120)
-        result = service.get("MU", refresh=True)
+        result = service.get("MU.XNAS", refresh=True)
         self.assertEqual(result["cache_status"], "stale")
         self.assertEqual(result["degradations"][0]["code"], "source_unavailable")
         self.assertNotIn("upstream down", str(result))
@@ -130,7 +130,7 @@ class ExposureFactsTest(unittest.TestCase):
             "classifications": [], "company_materials": [],
             "evidence": ev("fallback_master"),
         })
-        result = ExposureFactsService([primary, fallback], clock=lambda: NOW).get("MU")
+        result = ExposureFactsService([primary, fallback], clock=lambda: NOW).get("MU.XNAS")
         self.assertEqual(result["status"], "available")
         self.assertEqual(result["degradations"][0]["source_id"], "exchange_master")
         self.assertEqual(result["evidence"][0]["source_id"], "fallback_master")

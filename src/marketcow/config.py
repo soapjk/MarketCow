@@ -86,6 +86,7 @@ class Settings:
     dividend_etf_symbols: tuple[str, ...] = ()
     dividend_zero_policy_evidence: tuple[dict[str, object], ...] = ()
     history_job_max_workers: int = 4
+    history_job_lease_seconds: float = 30.0
     hyperliquid_base_url: str = "https://api.hyperliquid.xyz"
     hyperliquid_timeout_seconds: float = 3.0
     hyperliquid_request_budget_seconds: float = 10.0
@@ -231,6 +232,9 @@ class Settings:
             ))),
             history_job_max_workers=max(1, min(16, int(os.getenv(
                 "MARKETCOW_HISTORY_JOB_MAX_WORKERS", "4"
+            )))),
+            history_job_lease_seconds=max(1.0, min(300.0, float(os.getenv(
+                "MARKETCOW_HISTORY_JOB_LEASE_SECONDS", "30"
             )))),
             hyperliquid_base_url=os.getenv(
                 "MARKETCOW_HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"

@@ -44,8 +44,14 @@ class ContractModel(StrictModel):
 
 class InstrumentContract(ContractModel):
     instrument_id: str = Field(pattern=INSTRUMENT_ID_PATTERN)
-    instrument_type: Literal["equity", "crypto_spot", "crypto_perpetual"]
-    asset_class: Literal["equity", "crypto"]
+    instrument_type: Literal[
+        "equity", "crypto_spot", "crypto_perpetual", "equity_perpetual",
+        "index_perpetual", "hip3_perpetual",
+    ]
+    asset_class: Literal[
+        "equity", "crypto", "equity_derivative", "index_derivative",
+        "other_derivative",
+    ]
     symbol: str = Field(min_length=1, max_length=32)
     market: Literal["US", "HK", "CN", "CRYPTO"]
     mic: str = Field(pattern=r"^[A-Z0-9]{4}$")
@@ -148,6 +154,7 @@ class BookLevel(StrictModel):
     price: DecimalString
     size: DecimalString
     order_id: Literal["0"] = "0"
+    order_count: Optional[int] = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def valid(self):
@@ -157,11 +164,56 @@ class BookLevel(StrictModel):
 
 
 class OrderBookSnapshotPayload(StrictModel):
-    book_type: Literal["L1_MBP"]
-    depth: Literal[1]
+    book_type: Literal["L1_MBP", "L2_MBP"]
+    depth: Literal[1, 5, 10, 20]
     baseline_sequence: int = Field(ge=0)
-    bids: list[BookLevel] = Field(max_length=1)
-    asks: list[BookLevel] = Field(max_length=1)
+    bids: list[BookLevel] = Field(max_length=20)
+    asks: list[BookLevel] = Field(max_length=20)
+    ts_event_source: Literal["provider", "marketcow_observation"] = "provider"
+    provider_sequence: Optional[int] = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def levels_fit_depth(self):
+        if len(self.bids) > self.depth or len(self.asks) > self.depth:
+            raise ValueError("order book levels must not exceed declared depth")
+        return self
+
+
+class AssetContextPayload(StrictModel):
+    mark_price: Optional[DecimalString] = None
+    oracle_price: Optional[DecimalString] = None
+    external_oracle_price: Optional[DecimalString] = None
+    mid_price: Optional[DecimalString] = None
+    funding_rate: Optional[DecimalString] = None
+    funding_interval_seconds: Optional[int] = Field(default=None, ge=1)
+    next_funding_at: Optional[str] = None
+    open_interest: Optional[DecimalString] = None
+    open_interest_cap: Optional[DecimalString] = None
+    premium: Optional[DecimalString] = None
+    max_leverage: Optional[DecimalString] = None
+    market_status: Literal[
+        "active", "halted", "reduce_only", "delisted", "unknown",
+    ] = "unknown"
+    oracle_status: Literal[
+        "external_live", "external_frozen", "internal_only", "stale", "unavailable",
+    ] = "unavailable"
+
+    @field_validator("next_funding_at")
+    @classmethod
+    def optional_timestamp(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else utc(value)
+
+
+class MarketStatePayload(StrictModel):
+    trade_status: Literal[
+        "active", "halted", "volatility_halt", "opening", "delisted", "unknown",
+    ]
+    session: Literal[
+        "regular", "pre_market", "post_market", "overnight", "closed", "unknown",
+    ]
+    tradable: bool
+    provider_sequence: Optional[int] = Field(default=None, ge=0)
+    ts_event_source: Literal["provider", "marketcow_observation"] = "provider"
 
 
 class OrderBookDeltaPayload(StrictModel):
@@ -230,8 +282,13 @@ class ErrorPayload(StrictModel):
 
 class SubscriptionSelection(StrictModel):
     instruments: list[str] = Field(min_length=1, max_length=500)
-    data_types: list[Literal["quote", "trade", "bar", "order_book"]] = Field(
-        min_length=1, max_length=4
+    data_types: list[
+        Literal[
+            "quote", "trade", "bar", "order_book", "asset_context",
+            "market_state",
+        ]
+    ] = Field(
+        min_length=1, max_length=6
     )
 
     @field_validator("instruments")
@@ -256,7 +313,7 @@ class SubscribeRequest(SubscriptionSelection):
     type: Literal["subscribe"]
     request_id: str = Field(min_length=1)
     bar_types: list[Literal["1-MINUTE"]] = Field(default_factory=list, max_length=1)
-    book_depth: Literal[1] = 1
+    book_depth: Literal[1, 5, 10, 20] = 1
     resume_after: Optional[int] = Field(default=None, ge=0)
     resume_stream_id: Optional[str] = Field(default=None, min_length=1)
 
@@ -283,7 +340,9 @@ CLIENT_COMMAND_ADAPTER = TypeAdapter(ClientCommand)
 
 class SubscriptionEntry(StrictModel):
     instrument_id: str = Field(pattern=INSTRUMENT_ID_PATTERN)
-    data_type: Literal["quote", "trade", "bar", "order_book"]
+    data_type: Literal[
+        "quote", "trade", "bar", "order_book", "asset_context", "market_state",
+    ]
 
 
 class SubscriptionAck(ContractModel):
@@ -378,6 +437,16 @@ class BarEvent(InstrumentEventBase):
     payload: BarPayload
 
 
+class AssetContextEvent(InstrumentEventBase):
+    event_type: Literal["asset_context"]
+    payload: AssetContextPayload
+
+
+class MarketStateEvent(InstrumentEventBase):
+    event_type: Literal["market_state"]
+    payload: MarketStatePayload
+
+
 class StatusEvent(EnvelopeBase):
     event_type: Literal["stream_status"]
     instrument_id: Optional[str] = Field(default=None, pattern=INSTRUMENT_ID_PATTERN)
@@ -399,7 +468,7 @@ class ErrorEvent(EnvelopeBase):
 StreamEvent = Annotated[
     Union[
         QuoteEvent, TradeEvent, BookSnapshotEvent, BookDeltaEvent, BarEvent,
-        StatusEvent, HeartbeatEvent, ErrorEvent,
+        AssetContextEvent, MarketStateEvent, StatusEvent, HeartbeatEvent, ErrorEvent,
     ],
     Field(discriminator="event_type"),
 ]
@@ -514,6 +583,8 @@ CONTRACT_SCHEMAS: Dict[str, Any] = {
     "trade": TradePayload,
     "order_book_snapshot": OrderBookSnapshotPayload,
     "order_book_delta": OrderBookDeltaPayload,
+    "asset_context": AssetContextPayload,
+    "market_state": MarketStatePayload,
     "bar": BarPayload,
     "stream_status": StreamStatusPayload,
     "heartbeat": HeartbeatPayload,

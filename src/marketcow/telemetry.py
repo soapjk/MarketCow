@@ -74,6 +74,34 @@ METRICS: Dict[str, Dict[str, Any]] = {
         "action": ("list", "audit", "replay", "retry", "quarantine", "cleanup"),
         "outcome": ("ok", "partial", "error", "blocked"),
     }},
+    "history_items": {"type": "gauge", "unit": "items", "labels": {
+        "state": ("queued", "running", "succeeded", "failed", "canceled"),
+    }},
+    "history_lease_total": {
+        "type": "counter", "unit": "operations", "labels": {
+            "outcome": ("claimed", "renewed", "taken_over", "lost"),
+        },
+    },
+    "history_retry_total": {
+        "type": "counter", "unit": "operations", "labels": {
+            "reason": (
+                "connection", "timeout", "rate_limit", "server",
+                "storage", "other",
+            ),
+            "outcome": ("scheduled", "exhausted", "terminal"),
+        },
+    },
+    "history_shard_latency_seconds": {
+        "type": "histogram", "unit": "seconds", "labels": {
+            "outcome": ("succeeded", "failed", "canceled"),
+        },
+        "buckets": (0.01, 0.1, 0.5, 2.0, 10.0, 60.0, 300.0),
+    },
+    "history_reconcile_total": {
+        "type": "counter", "unit": "operations", "labels": {
+            "outcome": ("dry_run", "repaired", "no_change", "conflict"),
+        },
+    },
 }
 
 
@@ -192,7 +220,7 @@ class Telemetry:
     def log(self, event: str, severity: str = "info", **fields: Any) -> None:
         if event not in {"ingest", "wal", "canonical", "contract", "query", "cache",
                          "clickhouse_pressure", "telemetry", "postgresql", "backup",
-                         "restore", "operator"}:
+                         "restore", "operator", "history"}:
             raise ValueError("unknown telemetry event")
         if severity not in {"debug", "info", "warning", "error"}:
             raise ValueError("unknown telemetry severity")

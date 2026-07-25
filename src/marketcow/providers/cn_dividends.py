@@ -114,7 +114,7 @@ class CnExchangeDividendProvider:
         instrument = canonical_instrument(symbol)
         code = instrument.symbol[:6]
         begin, end = f"{year}-01-01", f"{year + 1}-12-31"
-        if instrument.exchange == "SSE":
+        if instrument.mic == "XSHG":
             seen = set()
             for keyword in ("权益分派", "利润分配"):
                 response = self.session.get(
@@ -146,7 +146,7 @@ class CnExchangeDividendProvider:
                     "id": str(row.get("BULLETIN_ID") or row["URL"]),
                     "source": "Shanghai Stock Exchange",
                     }
-        elif instrument.exchange == "SZSE":
+        elif instrument.mic == "XSHE":
             response = self.session.post(
                 "https://www.szse.cn/api/disc/announcement/annList",
                 json={
@@ -174,11 +174,11 @@ class CnExchangeDividendProvider:
         if instrument.market != "CN":
             raise ValueError("CN exchange provider only supports A shares")
         rows = []
-        for document in self._documents(instrument.symbol, fiscal_year):
+        for document in self._documents(instrument.instrument_id, fiscal_year):
             response = self.session.get(document["url"], timeout=20)
             response.raise_for_status()
             parsed = parse_cn_implementation_announcement(
-                pdf_text(response.content), instrument.symbol, document["date"],
+                pdf_text(response.content), instrument.instrument_id, document["date"],
                 document["url"], document["id"], document["source"],
             )
             for row in parsed:

@@ -12,6 +12,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from .migration_policy import validate_migration_history
 from .postgres_migrations import POSTGRES_MIGRATIONS
 from .domain_columns import FUNDAMENTAL_COLUMNS, TDX_COLUMNS
 
@@ -87,12 +88,14 @@ class PostgresDatabase:
                 )
                 """
             )
-            applied = {
-                row["version"]
-                for row in connection.execute(
-                    "SELECT version FROM schema_migrations"
-                ).fetchall()
-            }
+            applied_rows = connection.execute(
+                "SELECT version, description FROM schema_migrations"
+            ).fetchall()
+            applied = validate_migration_history(
+                ((row["version"], row["description"]) for row in applied_rows),
+                POSTGRES_MIGRATIONS,
+                "PostgreSQL",
+            )
             for version, description, statement in POSTGRES_MIGRATIONS:
                 if version in applied:
                     continue
@@ -384,8 +387,60 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 (instrument_id,),
             ).fetchone()
 
+    def upsert_instrument_relationship(
+        self, row: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                INSERT INTO instrument_relationship
+                    (relationship_id, schema_version, relationship_type,
+                     derivative_instrument_id, underlying_instrument_id,
+                     quantity_multiplier, price_multiplier, currency,
+                     hedge_quality, status, source_json, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (relationship_id) DO UPDATE SET
+                    schema_version=EXCLUDED.schema_version,
+                    relationship_type=EXCLUDED.relationship_type,
+                    derivative_instrument_id=EXCLUDED.derivative_instrument_id,
+                    underlying_instrument_id=EXCLUDED.underlying_instrument_id,
+                    quantity_multiplier=EXCLUDED.quantity_multiplier,
+                    price_multiplier=EXCLUDED.price_multiplier,
+                    currency=EXCLUDED.currency,
+                    hedge_quality=EXCLUDED.hedge_quality,
+                    status=EXCLUDED.status,
+                    source_json=EXCLUDED.source_json,
+                    updated_at=EXCLUDED.updated_at
+                RETURNING *
+                """,
+                (
+                    row["relationship_id"], row["schema_version"],
+                    row["relationship_type"], row["derivative_instrument_id"],
+                    row["underlying_instrument_id"], row["quantity_multiplier"],
+                    row["price_multiplier"], row["currency"],
+                    row["hedge_quality"], row["status"], Jsonb(row["source"]),
+                    row["updated_at"],
+                ),
+            ).fetchone()
+
+    def get_instrument_relationship(
+        self, relationship_id: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                SELECT relationship_id, schema_version, relationship_type,
+                       derivative_instrument_id, underlying_instrument_id,
+                       quantity_multiplier, price_multiplier, currency,
+                       hedge_quality, status, source_json AS source, updated_at
+                FROM instrument_relationship WHERE relationship_id = %s
+                """,
+                (relationship_id,),
+            ).fetchone()
+
     def get_or_create_history_job(
-        self, row: Dict[str, Any], items: List[Dict[str, Any]]
+        self, row: Dict[str, Any], items: List[Dict[str, Any]],
+        shards: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[Dict[str, Any], bool]:
         with self.database.connection() as connection:
             saved = connection.execute(
@@ -420,6 +475,34 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                             "canonical_status","error_code","error_message","started_at",
                             "updated_at","finished_at",
                         )),
+                    )
+                for shard in shards or []:
+                    connection.execute(
+                        """
+                        INSERT INTO history_fetch_shard
+                            (job_id,item_id,shard_key,ingestion_id,shard_index,range_start,
+                             range_end,status,attempt,rows_fetched,rows_persisted,
+                             cursor_json,write_receipt_json,error_code,error_message,
+                             owner_id,lease_token,lease_expires_at,heartbeat_at,
+                             created_at,updated_at,finished_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                                %s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            shard["job_id"], shard["item_id"], shard["shard_key"],
+                            shard.get("ingestion_id"), shard["shard_index"],
+                            shard["range_start"],
+                            shard["range_end"], shard["status"], shard["attempt"],
+                            shard["rows_fetched"], shard["rows_persisted"],
+                            Jsonb(shard.get("cursor_json") or {}),
+                            Jsonb(shard["write_receipt_json"])
+                            if shard.get("write_receipt_json") is not None else None,
+                            shard.get("error_code"), shard.get("error_message"),
+                            shard.get("owner_id"), shard.get("lease_token"),
+                            shard.get("lease_expires_at"), shard.get("heartbeat_at"),
+                            shard["created_at"], shard["updated_at"],
+                            shard.get("finished_at"),
+                        ),
                     )
                 return saved, True
             existing = connection.execute(
@@ -491,12 +574,307 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 (limit,),
             ).fetchall())
 
+    def list_recoverable_history_jobs(self) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                """
+                SELECT * FROM history_fetch_job
+                WHERE status IN ('queued', 'running', 'cancel_requested')
+                ORDER BY created_at, job_id
+                """
+            ).fetchall())
+
     def list_history_items(self, job_id: str) -> List[Dict[str, Any]]:
         with self.database.connection() as connection:
             return list(connection.execute(
                 "SELECT * FROM history_fetch_item WHERE job_id=%s ORDER BY item_id",
                 (job_id,),
             ).fetchall())
+
+    def upsert_history_shard(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                INSERT INTO history_fetch_shard
+                    (job_id,item_id,shard_key,ingestion_id,shard_index,range_start,range_end,
+                     status,attempt,rows_fetched,rows_persisted,cursor_json,
+                     write_receipt_json,error_code,error_message,owner_id,
+                     lease_token,lease_expires_at,heartbeat_at,created_at,
+                     updated_at,finished_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s)
+                ON CONFLICT (job_id,item_id,shard_key) DO UPDATE SET
+                    ingestion_id=EXCLUDED.ingestion_id,
+                    status=EXCLUDED.status,attempt=EXCLUDED.attempt,
+                    rows_fetched=EXCLUDED.rows_fetched,
+                    rows_persisted=EXCLUDED.rows_persisted,
+                    cursor_json=EXCLUDED.cursor_json,
+                    write_receipt_json=EXCLUDED.write_receipt_json,
+                    error_code=EXCLUDED.error_code,
+                    error_message=EXCLUDED.error_message,
+                    owner_id=EXCLUDED.owner_id,lease_token=EXCLUDED.lease_token,
+                    lease_expires_at=EXCLUDED.lease_expires_at,
+                    heartbeat_at=EXCLUDED.heartbeat_at,
+                    updated_at=EXCLUDED.updated_at,
+                    finished_at=EXCLUDED.finished_at
+                RETURNING *
+                """,
+                (
+                    row["job_id"], row["item_id"], row["shard_key"],
+                    row.get("ingestion_id"), row["shard_index"],
+                    row["range_start"], row["range_end"],
+                    row["status"], row["attempt"], row["rows_fetched"],
+                    row["rows_persisted"], Jsonb(row.get("cursor_json") or {}),
+                    Jsonb(row["write_receipt_json"])
+                    if row.get("write_receipt_json") is not None else None,
+                    row.get("error_code"), row.get("error_message"),
+                    row.get("owner_id"), row.get("lease_token"),
+                    row.get("lease_expires_at"), row.get("heartbeat_at"),
+                    row["created_at"], row["updated_at"], row.get("finished_at"),
+                ),
+            ).fetchone()
+
+    def list_history_shards(
+        self, job_id: str, item_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            if item_id:
+                return list(connection.execute(
+                    """
+                    SELECT * FROM history_fetch_shard
+                    WHERE job_id=%s AND item_id=%s ORDER BY shard_index
+                    """,
+                    (job_id, item_id),
+                ).fetchall())
+            return list(connection.execute(
+                """
+                SELECT * FROM history_fetch_shard
+                WHERE job_id=%s ORDER BY item_id, shard_index
+                """,
+                (job_id,),
+            ).fetchall())
+
+    def list_all_history_shards(
+        self, limit: int = 10000
+    ) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                """
+                SELECT * FROM history_fetch_shard
+                ORDER BY created_at, job_id, item_id, shard_index LIMIT %s
+                """,
+                (limit,),
+            ).fetchall())
+
+    def reconcile_history_shard(
+        self, row: Dict[str, Any], now: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                UPDATE history_fetch_shard SET
+                    status=%s,rows_fetched=%s,rows_persisted=%s,
+                    cursor_json=%s,write_receipt_json=%s,error_code=NULL,
+                    error_message=NULL,owner_id=NULL,lease_token=NULL,
+                    lease_expires_at=NULL,heartbeat_at=NULL,updated_at=%s,
+                    finished_at=%s
+                WHERE job_id=%s AND item_id=%s AND shard_key=%s
+                  AND status NOT IN ('succeeded','canceled')
+                  AND (
+                    status <> 'running'
+                    OR lease_expires_at IS NULL
+                    OR lease_expires_at <= %s
+                  )
+                RETURNING *
+                """,
+                (
+                    row["status"], row["rows_fetched"],
+                    row["rows_persisted"], Jsonb(row.get("cursor_json") or {}),
+                    Jsonb(row.get("write_receipt_json") or {}),
+                    row["updated_at"], row.get("finished_at"), row["job_id"],
+                    row["item_id"], row["shard_key"], now,
+                ),
+            ).fetchone()
+
+    def reconcile_history_item(
+        self, row: Dict[str, Any], now: str
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                UPDATE history_fetch_item SET
+                    status=%s,source=%s,rows_fetched=%s,rows_persisted=%s,
+                    canonical_status=%s,error_code=NULL,error_message=NULL,
+                    owner_id=NULL,lease_token=NULL,lease_expires_at=NULL,
+                    heartbeat_at=NULL,updated_at=%s,finished_at=%s
+                WHERE job_id=%s AND item_id=%s
+                  AND (
+                    status <> 'running'
+                    OR lease_expires_at IS NULL
+                    OR lease_expires_at <= %s
+                  )
+                RETURNING *
+                """,
+                (
+                    row["status"], row.get("source"), row["rows_fetched"],
+                    row["rows_persisted"], row["canonical_status"],
+                    row["updated_at"], row.get("finished_at"), row["job_id"],
+                    row["item_id"], now,
+                ),
+            ).fetchone()
+
+    def upsert_history_canonical_check(
+        self, row: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                INSERT INTO history_canonical_check
+                    (check_id,job_id,item_id,shard_key,symbol,interval,
+                     adjustment,range_start,range_end,expected_rows,status,
+                     attempt,error_code,error_message,created_at,updated_at,
+                     finished_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (check_id) DO UPDATE SET
+                    expected_rows=EXCLUDED.expected_rows,status=EXCLUDED.status,
+                    attempt=EXCLUDED.attempt,error_code=EXCLUDED.error_code,
+                    error_message=EXCLUDED.error_message,
+                    updated_at=EXCLUDED.updated_at,
+                    finished_at=EXCLUDED.finished_at
+                RETURNING *
+                """,
+                tuple(row.get(key) for key in (
+                    "check_id", "job_id", "item_id", "shard_key", "symbol",
+                    "interval", "adjustment", "range_start", "range_end",
+                    "expected_rows", "status", "attempt", "error_code",
+                    "error_message", "created_at", "updated_at", "finished_at",
+                )),
+            ).fetchone()
+
+    def list_pending_history_canonical_checks(
+        self, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                """
+                SELECT * FROM history_canonical_check
+                WHERE status IN ('pending','retry')
+                ORDER BY updated_at, check_id LIMIT %s
+                """,
+                (limit,),
+            ).fetchall())
+
+    def list_history_canonical_checks(
+        self, job_id: str, item_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            if item_id:
+                return list(connection.execute(
+                    """
+                    SELECT * FROM history_canonical_check
+                    WHERE job_id=%s AND item_id=%s ORDER BY check_id
+                    """,
+                    (job_id, item_id),
+                ).fetchall())
+            return list(connection.execute(
+                """
+                SELECT * FROM history_canonical_check
+                WHERE job_id=%s ORDER BY item_id, check_id
+                """,
+                (job_id,),
+            ).fetchall())
+
+    def claim_history_item(
+        self, job_id: str, item_id: str, owner_id: str, lease_token: str,
+        now: str, lease_expires_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                UPDATE history_fetch_item SET
+                    status='running', owner_id=%s, lease_token=%s,
+                    lease_expires_at=%s, heartbeat_at=%s,
+                    takeover_count=takeover_count + CASE
+                        WHEN status='running' THEN 1 ELSE 0 END,
+                    started_at=COALESCE(started_at, %s), updated_at=%s,
+                    finished_at=NULL
+                WHERE job_id=%s AND item_id=%s
+                  AND (
+                    status='queued'
+                    OR (
+                        status='running'
+                        AND (lease_expires_at IS NULL OR lease_expires_at <= %s)
+                    )
+                  )
+                RETURNING *
+                """,
+                (
+                    owner_id, lease_token, lease_expires_at, now, now, now,
+                    job_id, item_id, now,
+                ),
+            ).fetchone()
+
+    def renew_history_item_lease(
+        self, job_id: str, item_id: str, owner_id: str, lease_token: str,
+        now: str, lease_expires_at: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                UPDATE history_fetch_item SET
+                    heartbeat_at=%s, lease_expires_at=%s, updated_at=%s
+                WHERE job_id=%s AND item_id=%s AND status='running'
+                  AND owner_id=%s AND lease_token=%s AND lease_expires_at > %s
+                RETURNING *
+                """,
+                (
+                    now, lease_expires_at, now, job_id, item_id,
+                    owner_id, lease_token, now,
+                ),
+            ).fetchone()
+
+    def finish_claimed_history_item(
+        self, row: Dict[str, Any], owner_id: str, lease_token: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                UPDATE history_fetch_item SET
+                    status=%s, source=%s, attempt=%s, rows_fetched=%s,
+                    rows_persisted=%s, canonical_status=%s, error_code=%s,
+                    error_message=%s, updated_at=%s, finished_at=%s,
+                    owner_id=NULL, lease_token=NULL, lease_expires_at=NULL,
+                    heartbeat_at=NULL
+                WHERE job_id=%s AND item_id=%s
+                  AND owner_id=%s AND lease_token=%s
+                RETURNING *
+                """,
+                (
+                    row["status"], row.get("source"), row["attempt"],
+                    row["rows_fetched"], row["rows_persisted"],
+                    row["canonical_status"], row.get("error_code"),
+                    row.get("error_message"), row["updated_at"],
+                    row.get("finished_at"), row["job_id"], row["item_id"],
+                    owner_id, lease_token,
+                ),
+            ).fetchone()
+
+    def release_history_item_lease(
+        self, job_id: str, item_id: str, owner_id: str, lease_token: str,
+        now: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                UPDATE history_fetch_item SET
+                    owner_id=NULL, lease_token=NULL, lease_expires_at=NULL,
+                    heartbeat_at=NULL, updated_at=%s
+                WHERE job_id=%s AND item_id=%s
+                  AND owner_id=%s AND lease_token=%s
+                RETURNING *
+                """,
+                (now, job_id, item_id, owner_id, lease_token),
+            ).fetchone()
 
     def find_instrument_by_mapping(
         self, namespace: str, external_symbol: str

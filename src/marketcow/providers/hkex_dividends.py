@@ -90,7 +90,7 @@ class HkexDividendProvider:
         instrument = canonical_instrument(symbol)
         if instrument.market != "HK":
             raise ValueError("HKEX provider only supports Hong Kong securities")
-        code = instrument.symbol[:5]
+        code = instrument.symbol.zfill(5)
         prefix = self.session.get(
             "https://www1.hkexnews.hk/search/prefix.do",
             params={"callback": "callback", "lang": "EN", "type": "A", "name": code},
@@ -120,7 +120,7 @@ class HkexDividendProvider:
             document = self.session.get(url, timeout=20)
             document.raise_for_status()
             parsed = parse_hkex_dividend_form(
-                _pdf_text(document.content), instrument.symbol, url, link.group(1)
+                _pdf_text(document.content), instrument.instrument_id, url, link.group(1)
             )
             for row in parsed:
                 row["_raw_content"] = document.content

@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from marketcow.providers.yahoo_quote import YahooQuoteProvider, normalize_yahoo_symbol
@@ -31,16 +32,18 @@ PAYLOAD = {
 
 class YahooQuoteProviderTest(unittest.TestCase):
     def test_normalizes_hk_and_us_symbols(self):
-        self.assertEqual(normalize_yahoo_symbol("00700.HK"), ("0700.HK", "HK"))
-        self.assertEqual(normalize_yahoo_symbol("700"), ("0700.HK", "HK"))
-        self.assertEqual(normalize_yahoo_symbol("aapl"), ("AAPL", "US"))
-        self.assertEqual(normalize_yahoo_symbol("CNY=X"), ("CNY=X", "FX"))
-        self.assertEqual(normalize_yahoo_symbol("HKD=X"), ("HKD=X", "FX"))
+        self.assertEqual(normalize_yahoo_symbol("700.XHKG"), ("0700.HK", "HK"))
+        self.assertEqual(normalize_yahoo_symbol("AAPL.XNAS"), ("AAPL", "US"))
+        for value in ("00700.HK", "700", "aapl", "CNY=X"):
+            with self.assertRaises(ValueError):
+                normalize_yahoo_symbol(value)
 
     def test_quote_uses_latest_prepost_bar(self):
         provider = YahooQuoteProvider()
         with patch.object(provider, "_fetch_chart", return_value=(PAYLOAD, "https://example/0700.HK")):
-            quote = provider.fetch_quote("0700.HK")
+            quote = provider.fetch_quote("700.XHKG")
+        self.assertEqual(quote["instrument_id"], "700.XHKG")
+        self.assertEqual(quote["provider_symbol"], "0700.HK")
         self.assertEqual(quote["price"], 500.0)
         self.assertEqual(quote["previous_close"], 490.0)
         self.assertEqual(quote["session"], "post_market")
@@ -49,10 +52,28 @@ class YahooQuoteProviderTest(unittest.TestCase):
     def test_history_defaults_to_adjusted_ohlc(self):
         provider = YahooQuoteProvider()
         with patch.object(provider, "_fetch_chart", return_value=(PAYLOAD, "https://example/0700.HK")):
-            history = provider.fetch_history("0700.HK", "1y", "1d", "adjusted")
+            history = provider.fetch_history("700.XHKG", "1y", "1d", "adjusted")
+        self.assertEqual(history["instrument_id"], "700.XHKG")
         self.assertEqual(history["bars"][0]["close"], 242.5)
         self.assertEqual(history["bars"][0]["open"], 240.0)
         self.assertEqual(history["bars"][0]["adjustment_factor"], 0.5)
+
+    def test_history_window_uses_explicit_period_boundaries(self):
+        provider = YahooQuoteProvider()
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 1, 8, tzinfo=timezone.utc)
+        with patch.object(
+            provider, "_fetch_chart",
+            return_value=(PAYLOAD, "https://example/0700.HK"),
+        ) as fetch:
+            provider.fetch_history_window(
+                "700.XHKG", start, end, "1m", "raw"
+            )
+
+        params = fetch.call_args.args[1]
+        self.assertEqual(params["period1"], int(start.timestamp()))
+        self.assertEqual(params["period2"], int(end.timestamp()))
+        self.assertNotIn("range", params)
 
 
 if __name__ == "__main__":

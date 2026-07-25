@@ -8,7 +8,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List
 
 from ..instruments import canonical_instrument
-from .longport_quote import _direct_connection_environment, normalize_longport_symbol
+from .longport_quote import _direct_connection_environment
 from .tushare_provider import TushareProvider
 
 
@@ -45,11 +45,12 @@ class TushareDividendProvider:
         instrument = canonical_instrument(symbol)
         if instrument.market != "CN":
             raise ValueError("Tushare dividend provider only supports A shares")
+        tushare_symbol = instrument.provider_symbol("provider:tushare")
         if instrument.symbol[0] in {"1", "5"}:
-            return self._fetch_fund(instrument.symbol, fiscal_year)
+            return self._fetch_fund(tushare_symbol, fiscal_year)
         result = self.provider.call(
             "dividend",
-            {"ts_code": instrument.symbol},
+            {"ts_code": tushare_symbol},
             (
                 "ts_code,end_date,ann_date,div_proc,cash_div_tax,"
                 "cash_div,pay_date,record_date,ex_date"
@@ -72,7 +73,7 @@ class TushareDividendProvider:
             except (InvalidOperation, ValueError):
                 continue
             announcements.append({
-                "symbol": instrument.symbol,
+                "symbol": instrument.instrument_id,
                 "fiscal_year": fiscal_year,
                 "amount_per_share": str(amount),
                 "currency": "CNY",
@@ -234,7 +235,7 @@ class LongPortDividendProvider:
         instrument = canonical_instrument(symbol)
         if instrument.market not in {"CN", "HK", "US"}:
             raise ValueError("LongPort dividend provider only supports CN, HK and US")
-        _, _, longport_symbol = normalize_longport_symbol(instrument.symbol)
+        longport_symbol = instrument.provider_symbol("provider:longport")
         with _direct_connection_environment():
             context = self._fundamental_context()
             results = [self._call(context.dividend, longport_symbol)]
@@ -261,7 +262,7 @@ class LongPortDividendProvider:
                 continue
             seen.add(event_key)
             announcements.append({
-                "symbol": instrument.symbol,
+                "symbol": instrument.instrument_id,
                 # LongPort exposes payment-year events, not issuer report periods.
                 "fiscal_year": fiscal_year,
                 "amount_per_share": match.group(1),

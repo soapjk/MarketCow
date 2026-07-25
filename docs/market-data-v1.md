@@ -15,6 +15,13 @@ The authority is PostgreSQL `instrument_master`. IDs use `SYMBOL.MIC`, for examp
 currency, price/size precision, tick size and lot size. MarketCow never infers XNAS versus
 XNYS from `US`.
 
+Legacy internal IDs such as `CN:SSE:600519`, `HK:HKEX:00700`,
+`US:US:AAPL` and venue-first `US.XNAS.AAPL` are rejected. External
+provider or broker symbols such as `600519.SH`, `700.HK` and `AAPL.US`
+are resolved only at an explicit namespace boundary. A US mapping must
+also supply its MIC; a bare ticker or `.US` suffix is not enough to
+choose `XNAS` or `XNYS`.
+
 Contract v1 supports `instrument_type=equity` and `asset_class=equity` only. This is
 deliberately explicit: `size_precision` is fixed at `0` and `size_increment` at `"1"` to
 match Nautilus `Equity`. `ts_event` is the authoritative effective time of the instrument

@@ -43,7 +43,7 @@ def exchange_for_symbol(symbol: str) -> str:
 
 def instrument_id(symbol: str) -> str:
     code = str(symbol).zfill(6)
-    return "CN.{0}.{1}".format(exchange_for_symbol(code), code)
+    return "{0}.{1}".format(code, exchange_for_symbol(code))
 
 
 def latest_broad_report_period(today: Optional[date] = None) -> str:

@@ -24,7 +24,7 @@ from marketcow.service import (
 class DividendNormalizationTest(unittest.TestCase):
     def fixture(self, **updates):
         row = {
-            "symbol": "510300.SH",
+            "symbol": "510300.XSHG",
             "fiscal_year": 2025,
             "amount_per_share": "0.086",
             "currency": "CNY",
@@ -120,25 +120,25 @@ class DividendSummaryTest(unittest.TestCase):
     def test_summary_separates_announced_total_and_prior_year_estimate_basis(self):
         rows = [
             {
-                "dividend_id": "prior", "symbol": "510300.SH", "fiscal_year": 2024,
+                "dividend_id": "prior", "symbol": "510300.XSHG", "fiscal_year": 2024,
                 "amount_per_share": Decimal("0.12"), "currency": "CNY",
                 "announcement_date": "2024-11-01", "confirmation_status": "confirmed",
                 "expected_payment_date": "2024-11-08",
             },
             {
-                "dividend_id": "official", "symbol": "510300.SH", "fiscal_year": 2025,
+                "dividend_id": "official", "symbol": "510300.XSHG", "fiscal_year": 2025,
                 "amount_per_share": Decimal("0.08"), "currency": "CNY",
                 "announcement_date": "2025-06-01", "confirmation_status": "confirmed",
                 "expected_payment_date": "2025-06-08",
             },
             {
-                "dividend_id": "discovery", "symbol": "510300.SH", "fiscal_year": 2025,
+                "dividend_id": "discovery", "symbol": "510300.XSHG", "fiscal_year": 2025,
                 "amount_per_share": Decimal("0.02"), "currency": "CNY",
                 "announcement_date": "2025-09-01", "confirmation_status": "unverified",
                 "expected_payment_date": "2025-09-08",
             },
         ]
-        result = dividend_summary("510300.sh", 2025, rows)
+        result = dividend_summary("510300.XSHG", 2025, rows)
         self.assertEqual(result["amount_per_share_total"], Decimal("0.10"))
         self.assertFalse(result["total_is_fully_confirmed"])
         self.assertEqual(result["confirmed_amount_per_share_total"], Decimal("0.08"))
@@ -151,19 +151,19 @@ class DividendSummaryTest(unittest.TestCase):
 
     def test_cancelled_revision_is_excluded(self):
         rows = [{
-            "dividend_id": "cancelled", "symbol": "00700.HK", "fiscal_year": 2025,
+            "dividend_id": "cancelled", "symbol": "700.XHKG", "fiscal_year": 2025,
             "amount_per_share": Decimal("5.3"), "currency": "HKD",
             "announcement_date": "2026-03-18", "confirmation_status": "confirmed",
             "event_status": "cancelled",
         }]
-        result = dividend_summary("00700.HK", 2025, rows)
+        result = dividend_summary("700.XHKG", 2025, rows)
         self.assertEqual(result["announcements"], [])
         self.assertEqual(result["confirmed_amount_per_share_total"], Decimal("0"))
 
     def test_postgres_byte_text_fields_are_normalized(self):
-        result = dividend_summary("00700.HK", 2026, [{
+        result = dividend_summary("700.XHKG", 2026, [{
             "dividend_id": b"event",
-            "symbol": b"00700.HK",
+            "symbol": b"700.XHKG",
             "fiscal_year": 2026,
             "amount_per_share": Decimal("5.3"),
             "currency": b"HKD",
@@ -193,7 +193,7 @@ class DividendSummaryTest(unittest.TestCase):
 
     def test_longport_history_and_detail_precision_duplicates_collapse(self):
         common = {
-            "symbol": "SOXX", "fiscal_year": 2025, "currency": "USD",
+            "symbol": "SOXX.XNAS", "fiscal_year": 2025, "currency": "USD",
             "announcement_date": "2025-03-18",
             "expected_payment_date": "2025-03-21",
             "payment_date": "2025-03-21",
@@ -201,7 +201,7 @@ class DividendSummaryTest(unittest.TestCase):
             "event_status": "active", "source_priority": 9,
             "source_name": "LongPort OpenAPI",
         }
-        result = dividend_summary("SOXX", 2025, [
+        result = dividend_summary("SOXX.XNAS", 2025, [
             {**common, "dividend_id": "history", "amount_per_share": "0.2611",
              "source_document_id": "561692"},
             {**common, "dividend_id": "detail", "amount_per_share": "0.261115",
@@ -216,7 +216,7 @@ class DividendSummaryTest(unittest.TestCase):
 
     def test_payment_year_controls_summary_even_for_legacy_report_year_row(self):
         row = {
-            "dividend_id": "legacy", "symbol": "600036.SH",
+            "dividend_id": "legacy", "symbol": "600036.XSHG",
             "fiscal_year": 2025, "amount_per_share": "1.003",
             "currency": "CNY", "announcement_date": "2026-07-01",
             "expected_payment_date": "2026-07-10",
@@ -226,10 +226,10 @@ class DividendSummaryTest(unittest.TestCase):
         }
 
         self.assertEqual(
-            dividend_summary("600036.SH", 2025, [row])["announced_count"], 0
+            dividend_summary("600036.XSHG", 2025, [row])["announced_count"], 0
         )
         self.assertEqual(
-            dividend_summary("600036.SH", 2026, [row])["announced_count"], 1
+            dividend_summary("600036.XSHG", 2026, [row])["announced_count"], 1
         )
 
 
@@ -244,7 +244,7 @@ class DividendServiceTest(unittest.TestCase):
             })
         )
 
-        self.assertIsNone(service._dividend_state("AAPL", 2026))
+        self.assertIsNone(service._dividend_state("AAPL.XNAS", 2026))
 
     def test_current_byte_encoded_refresh_state_is_accepted(self):
         service = FundamentalService.__new__(FundamentalService)
@@ -257,7 +257,7 @@ class DividendServiceTest(unittest.TestCase):
             })
         )
 
-        state = service._dividend_state("AAPL", 2026)
+        state = service._dividend_state("AAPL.XNAS", 2026)
 
         self.assertEqual(state["status"], "success_data")
 
@@ -267,9 +267,9 @@ class DividendServiceTest(unittest.TestCase):
         service = FundamentalService.__new__(FundamentalService)
         service.fundamental_repository = repository
 
-        result = service._read_dividends("AAPL", 2026)
+        result = service._read_dividends("AAPL.XNAS", 2026)
 
-        repository.get_dividend_announcements.assert_called_once_with("AAPL", 2025, 2026)
+        repository.get_dividend_announcements.assert_called_once_with("AAPL.XNAS", 2025, 2026)
         self.assertEqual(result["fiscal_year"], 2026)
 
     def test_cache_miss_refreshes_transparently(self):
@@ -279,17 +279,17 @@ class DividendServiceTest(unittest.TestCase):
             dividend_refresh_retry_seconds=60,
         )
         service._read_dividends = Mock(return_value={
-            "symbol": "AAPL", "fiscal_year": 2026, "announcements": [],
+            "symbol": "AAPL.XNAS", "fiscal_year": 2026, "announcements": [],
         })
         service._dividend_state = Mock(return_value=None)
         service._refresh_dividends_locked = Mock(return_value={"data": {
-            "symbol": "AAPL", "fiscal_year": 2026, "announcements": [],
+            "symbol": "AAPL.XNAS", "fiscal_year": 2026, "announcements": [],
             "data_status": "fresh", "last_refreshed_at": "2026-07-23T00:00:00+00:00",
         }})
 
-        result = service.get_dividends("AAPL", 2026)
+        result = service.get_dividends("AAPL.XNAS", 2026)
 
-        service._refresh_dividends_locked.assert_called_once_with("AAPL", 2026)
+        service._refresh_dividends_locked.assert_called_once_with("AAPL.XNAS", 2026)
         self.assertEqual(result["data_status"], "fresh")
 
     def test_stale_cache_returns_immediately_and_schedules_refresh(self):
@@ -299,7 +299,7 @@ class DividendServiceTest(unittest.TestCase):
             dividend_refresh_retry_seconds=30,
         )
         service._read_dividends = Mock(return_value={
-            "symbol": "AAPL", "fiscal_year": 2026,
+            "symbol": "AAPL.XNAS", "fiscal_year": 2026,
             "announcements": [{"dividend_id": "cached"}],
         })
         service._dividend_state = Mock(return_value={
@@ -309,9 +309,9 @@ class DividendServiceTest(unittest.TestCase):
         })
         service._schedule_dividend_refresh = Mock(return_value=True)
 
-        result = service.get_dividends("AAPL", 2026)
+        result = service.get_dividends("AAPL.XNAS", 2026)
 
-        service._schedule_dividend_refresh.assert_called_once_with("AAPL", 2026)
+        service._schedule_dividend_refresh.assert_called_once_with("AAPL.XNAS", 2026)
         self.assertEqual(result["data_status"], "refreshing")
         self.assertEqual(result["announcements"][0]["dividend_id"], "cached")
 
@@ -323,7 +323,7 @@ class DividendServiceTest(unittest.TestCase):
             dividend_refresh_retry_seconds=300,
         )
         service._read_dividends = Mock(return_value={
-            "symbol": "AAPL", "fiscal_year": 2026,
+            "symbol": "AAPL.XNAS", "fiscal_year": 2026,
             "announcements": [{"dividend_id": "cached"}],
         })
         service._dividend_state = Mock(return_value={
@@ -333,7 +333,7 @@ class DividendServiceTest(unittest.TestCase):
         })
         service._schedule_dividend_refresh = Mock()
 
-        result = service.get_dividends("AAPL", 2026)
+        result = service.get_dividends("AAPL.XNAS", 2026)
 
         service._schedule_dividend_refresh.assert_not_called()
         self.assertEqual(result["data_status"], "stale")
@@ -359,13 +359,13 @@ class DividendServiceTest(unittest.TestCase):
         service._dividend_refresh_guard = threading.Lock()
         service._dividend_refresh_locks = {}
 
-        result = service.get_dividends("AAPL", 2026)
+        result = service.get_dividends("AAPL.XNAS", 2026)
 
         self.assertEqual(result["data_status"], "fresh")
         self.assertIsNotNone(result["last_refreshed_at"])
         self.assertEqual(repository.state["status"], "success_empty")
         self.assertEqual(repository.state["result_count"], 0)
-        service.sec_dividend_provider.fetch.assert_called_once_with("AAPL", 2026)
+        service.sec_dividend_provider.fetch.assert_called_once_with("AAPL.XNAS", 2026)
 
     def test_old_empty_cache_version_is_refetched_transparently(self):
         service = FundamentalService.__new__(FundamentalService)
@@ -384,20 +384,20 @@ class DividendServiceTest(unittest.TestCase):
             })
         )
         service._read_dividends = Mock(return_value={
-            "symbol": "600036.SH", "fiscal_year": 2026,
+            "symbol": "600036.XSHG", "fiscal_year": 2026,
             "announcements": [], "announced_count": 0,
         })
         refreshed = {
-            "symbol": "600036.SH", "fiscal_year": 2026,
+            "symbol": "600036.XSHG", "fiscal_year": 2026,
             "announcements": [{"amount_per_share": Decimal("1.013")}],
             "announced_count": 1, "data_status": "fresh",
         }
         service._refresh_dividends_locked = Mock(return_value={"data": refreshed})
 
-        result = service.get_dividends("600036.SH", 2026)
+        result = service.get_dividends("600036.XSHG", 2026)
 
         self.assertEqual(result["announced_count"], 1)
-        service._refresh_dividends_locked.assert_called_once_with("600036.SH", 2026)
+        service._refresh_dividends_locked.assert_called_once_with("600036.XSHG", 2026)
 
     def test_success_empty_uses_short_ttl_and_schedules_refresh(self):
         old = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
@@ -408,7 +408,7 @@ class DividendServiceTest(unittest.TestCase):
             dividend_refresh_retry_seconds=30,
         )
         service._read_dividends = Mock(return_value={
-            "symbol": "AAPL", "fiscal_year": 2026,
+            "symbol": "AAPL.XNAS", "fiscal_year": 2026,
             "announcements": [], "announced_count": 0,
         })
         service._dividend_state = Mock(return_value={
@@ -417,11 +417,11 @@ class DividendServiceTest(unittest.TestCase):
         })
         service._schedule_dividend_refresh = Mock(return_value=True)
 
-        result = service.get_dividends("AAPL", 2026)
+        result = service.get_dividends("AAPL.XNAS", 2026)
 
         self.assertEqual(result["data_status"], "refreshing")
         self.assertEqual(result["query_source"], "fixture")
-        service._schedule_dividend_refresh.assert_called_once_with("AAPL", 2026)
+        service._schedule_dividend_refresh.assert_called_once_with("AAPL.XNAS", 2026)
 
     def test_rate_limit_failure_does_not_write_success_empty(self):
         states = []
@@ -438,7 +438,7 @@ class DividendServiceTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(RuntimeError, "429002"):
-            service._refresh_dividends_now("AAPL", 2026)
+            service._refresh_dividends_now("AAPL.XNAS", 2026)
 
         self.assertEqual(states[-1]["status"], "failed_rate_limited")
         self.assertIsNone(states[-1]["last_success_at"])
@@ -475,7 +475,7 @@ class DividendServiceTest(unittest.TestCase):
         )
 
         with self.assertRaises(TimeoutError):
-            service._refresh_dividends_now("AAPL", 2026)
+            service._refresh_dividends_now("AAPL.XNAS", 2026)
 
         self.assertEqual(states[-1]["status"], "failed_timeout")
         self.assertIsNone(states[-1]["last_success_at"])
@@ -499,10 +499,10 @@ class DividendServiceTest(unittest.TestCase):
             "data": {"announced_count": 1}
         })
 
-        result = service.refresh_dividends("600036.SH", 2026)
+        result = service.refresh_dividends("600036.XSHG", 2026)
 
         self.assertEqual(result["data"]["announced_count"], 1)
-        service._refresh_dividends_now.assert_called_once_with("600036.SH", 2026)
+        service._refresh_dividends_now.assert_called_once_with("600036.XSHG", 2026)
 
     def test_cn_refresh_uses_only_structured_source(self):
         service = FundamentalService.__new__(FundamentalService)
@@ -515,14 +515,14 @@ class DividendServiceTest(unittest.TestCase):
             "status": "success", "count": 1, "ingested_at": "now",
         })
         service._read_dividends = Mock(return_value={
-            "symbol": "600519.SH", "fiscal_year": 2026,
+            "symbol": "600519.XSHG", "fiscal_year": 2026,
             "announcements": [{"confirmation_status": "unverified"}],
         })
 
-        result = service._refresh_dividends_now("600519.SH", 2026)
+        result = service._refresh_dividends_now("600519.XSHG", 2026)
 
         service._fetch_and_ingest_dividends.assert_called_once_with(
-            service.cn_structured_dividend_provider, "600519.SH", 2026
+            service.cn_structured_dividend_provider, "600519.XSHG", 2026
         )
         self.assertEqual(result["data"]["data_status"], "fresh")
 
@@ -559,7 +559,7 @@ class DividendApiTest(unittest.TestCase):
                 profile="test", port=8793,
             )
             response = TestClient(create_app(settings, Service())).get(
-                "/v1/dividends/510300.SH?fiscal_year=2025"
+                "/v1/dividends/510300.XSHG?fiscal_year=2025"
             )
 
         self.assertEqual(response.status_code, 200)

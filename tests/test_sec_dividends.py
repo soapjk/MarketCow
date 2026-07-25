@@ -9,7 +9,7 @@ class SecDividendProviderTest(unittest.TestCase):
             "declared a cash dividend of $0.25 per share, payable on August 8, 2026 "
             "to shareholders of record on August 1, 2026; "
             "the ex-dividend date is July 31, 2026",
-            "AAPL", "2026-07-20", "https://www.sec.gov/x", "0001",
+            "AAPL.XNAS", "2026-07-20", "https://www.sec.gov/x", "0001",
         )
         self.assertEqual(rows[0]["amount_per_share"], "0.25")
         self.assertEqual(rows[0]["expected_payment_date"], "2026-08-08")
@@ -17,7 +17,7 @@ class SecDividendProviderTest(unittest.TestCase):
         self.assertEqual(rows[0]["ex_date"], "2026-07-31")
         self.assertEqual(rows[0]["payment_date"], "2026-08-08")
         self.assertEqual(parse_sec_dividend_filing(
-            "cash dividend of $0.25 per share", "AAPL", "2026-07-20",
+            "cash dividend of $0.25 per share", "AAPL.XNAS", "2026-07-20",
             "https://www.sec.gov/x", "0001",
         ), [])
 
@@ -41,7 +41,7 @@ class SecDividendProviderTest(unittest.TestCase):
                 "payable on August 8, 2026"
             ),
         )
-        self.assertEqual(len(provider.fetch("AAPL", 2026)), 1)
+        self.assertEqual(len(provider.fetch("AAPL.XNAS", 2026)), 1)
         self.assertTrue(all(item == "MarketCow toczx@outlook.com" for item in calls))
 
 

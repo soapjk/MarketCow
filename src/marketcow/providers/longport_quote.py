@@ -8,9 +8,7 @@ from decimal import Decimal
 from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
-from ..normalize import exchange_for_symbol, instrument_id
-from .eastmoney_realtime import normalize_a_symbol
-from .yahoo_quote import normalize_yahoo_symbol
+from ..instruments import canonical_instrument
 
 
 LONGPORT_QUOTE_URL = "wss://openapi-quote.longbridge.com/v2"
@@ -25,6 +23,21 @@ _LONGPORT_WALL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 class LongPortError(RuntimeError):
     """Stable error boundary for Longbridge OpenAPI quote failures."""
+
+
+def normalize_trade_status(value: Any) -> str:
+    raw = str(getattr(value, "name", value) or "").lower().replace("_", "")
+    if raw in {"normal", "0"} or raw.endswith(".normal"):
+        return "active"
+    if any(token in raw for token in ("delisted", "expired")):
+        return "delisted"
+    if "fuse" in raw:
+        return "volatility_halt"
+    if any(token in raw for token in ("tobeopened", "preparelist")):
+        return "opening"
+    if any(token in raw for token in ("halt", "suspend")):
+        return "halted"
+    return "unknown"
 
 
 @contextmanager
@@ -45,19 +58,16 @@ def _direct_connection_environment():
 
 
 def normalize_longport_symbol(value: str) -> tuple[str, str, str]:
-    """Return MarketCow symbol, market and Longbridge ticker.region symbol."""
+    """Return canonical ID, market and explicit LongPort external symbol."""
 
-    try:
-        normalized = normalize_a_symbol(value)
-        return normalized, "CN", normalized
-    except ValueError:
-        normalized, market = normalize_yahoo_symbol(value)
-    if market == "HK":
-        ticker = str(int(normalized[:-3]))
-        return normalized, market, ticker + ".HK"
-    if market == "US":
-        return normalized, market, normalized.replace("-", ".") + ".US"
-    raise ValueError("LongPort quotes support CN, HK and US securities")
+    instrument = canonical_instrument(value)
+    if instrument.market not in {"CN", "HK", "US"}:
+        raise ValueError("LongPort quotes support CN, HK and US securities")
+    return (
+        instrument.instrument_id,
+        instrument.market,
+        instrument.provider_symbol("provider:longport"),
+    )
 
 
 def _decimal(value: Any) -> float | None:
@@ -185,26 +195,26 @@ class LongPortQuoteProvider:
         observed, session, price = max(candidates, key=lambda item: item[0])
         previous_close = _decimal(getattr(quote, "prev_close", None))
         change = None if previous_close is None else price - previous_close
-        exchange = (
-            exchange_for_symbol(marketcow_symbol.split(".")[0]) if market == "CN"
-            else "XHKG" if market == "HK" else "LONGPORT"
-        )
-        identifier = (
-            instrument_id(marketcow_symbol.split(".")[0]) if market == "CN"
-            else f"{market}.{exchange}.{marketcow_symbol.split('.')[0]}"
-        )
+        instrument = canonical_instrument(marketcow_symbol)
         return {
-            "instrument_id": identifier,
-            "symbol": marketcow_symbol,
+            "instrument_id": instrument.instrument_id,
+            "symbol": instrument.instrument_id,
             "name": marketcow_symbol,
             "market": market,
-            "exchange": exchange,
+            "exchange": instrument.mic,
             "currency": "CNY" if market == "CN" else "HKD" if market == "HK" else "USD",
             "price": price,
             "previous_close": previous_close,
             "change": change,
             "change_pct": change / previous_close * 100 if change is not None and previous_close else None,
             "session": session,
+            "trade_status": normalize_trade_status(
+                getattr(quote, "trade_status", None)
+            ),
+            "tradable": (
+                normalize_trade_status(getattr(quote, "trade_status", None))
+                == "active"
+            ),
             "quote_at": observed.isoformat(timespec="seconds"),
             "price_adjustment": "raw",
             "quality_status": "single_source_unverified",
@@ -295,4 +305,36 @@ class LongPortQuoteProvider:
             "source": self.name,
             "source_url": LONGPORT_QUOTE_URL,
             "quality_status": "single_source_unverified",
+        }
+
+    def fetch_spread_state(self, symbol: str) -> dict[str, Any]:
+        """Pull depth plus provider-timestamped security/session state."""
+        quote = self.fetch_quote(symbol)
+        try:
+            spread = self.fetch_spread(symbol)
+        except LongPortError as exc:
+            if "two-sided depth" not in str(exc):
+                raise
+            marketcow_symbol, market, _long_symbol = normalize_longport_symbol(
+                symbol
+            )
+            spread = {
+                "symbol": marketcow_symbol, "market": market,
+                "best_bid": None, "best_ask": None,
+                "spread": None, "spread_bps": None,
+                "bid_volume": 0, "ask_volume": 0,
+                "bids": [], "asks": [],
+                "observed_at": datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                ),
+                "source": self.name, "source_url": LONGPORT_QUOTE_URL,
+                "quality_status": "depth_unavailable",
+            }
+        return {
+            **spread,
+            "quote_at": quote["quote_at"],
+            "session": quote["session"],
+            "trade_status": quote["trade_status"],
+            "tradable": quote["tradable"],
+            "state_source": "LongPort Quote",
         }

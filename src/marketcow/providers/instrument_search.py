@@ -8,9 +8,6 @@ from urllib.parse import urlencode
 
 import requests
 
-from .yahoo_quote import normalize_yahoo_symbol
-
-
 EASTMONEY_SEARCH_URL = "https://searchapi.eastmoney.com/api/suggest/get"
 EASTMONEY_TOKEN = os.getenv("EASTMONEY_SEARCH_TOKEN", "")
 
@@ -59,13 +56,13 @@ class InstrumentSearchProvider:
         classify = str(row.get("Classify") or "")
         name = str(row.get("Name") or code).strip()
         if classify in ("AStock", "Fund") and code.isdigit() and len(code) == 6:
-            suffix = ".SH" if code.startswith(("5", "6", "9")) else ".BJ" if code.startswith(("4", "8")) else ".SZ"
-            symbol, market, currency = code + suffix, "CN", "CNY"
+            mic = "XSHG" if code.startswith(("5", "6", "9")) else "XBSE" if code.startswith(("4", "8")) else "XSHE"
+            symbol, market, currency = f"{code}.{mic}", "CN", "CNY"
         elif classify == "HK" and code.isdigit() and int(code) <= 9999:
-            symbol, _ = normalize_yahoo_symbol(code + ".HK")
-            market, currency = "HK", "HKD"
+            symbol, market, currency = f"{int(code)}.XHKG", "HK", "HKD"
         elif classify == "UsStock" and str(row.get("TypeUS") or "") in ("1", "3"):
-            symbol, market, currency = code.replace(".", "-"), "US", "USD"
+            # Search responses do not carry a reliable MIC. Do not guess a US venue.
+            return None
         else:
             return None
         return {

@@ -14,6 +14,10 @@ def _decimal(value: Any) -> str:
     return format(number, "f")
 
 
+def _optional_decimal(value: Any) -> Optional[str]:
+    return None if value is None else _decimal(value)
+
+
 def _iso_millis(value: Any) -> str:
     return datetime.fromtimestamp(
         int(value) / 1000, timezone.utc
@@ -76,6 +80,9 @@ class HyperliquidRealtimeProvider:
             delay = min(10.0, delay * 2)
 
     def _on_open(self, _app: Any) -> None:
+        if self._stop.is_set():
+            _app.close()
+            return
         self._connected.set()
         with self._lock:
             subscriptions = [
@@ -87,9 +94,12 @@ class HyperliquidRealtimeProvider:
             self._send("subscribe", kind, coin)
 
     def _send(self, method: str, kind: str, coin: str) -> None:
-        if self._app is None:
+        app = self._app
+        if app is None:
+            if self._stop.is_set():
+                return
             raise RuntimeError("Hyperliquid WebSocket is not connected")
-        self._app.send(json.dumps({
+        app.send(json.dumps({
             "method": method,
             "subscription": {"type": kind, "coin": coin},
         }, separators=(",", ":")))
@@ -99,10 +109,14 @@ class HyperliquidRealtimeProvider:
             self._connect()
             wants_bbo = bool({"quote", "order_book"} & data_types)
             wants_trades = bool({"trade", "bar"} & data_types)
+            wants_context = "asset_context" in data_types
             for instrument, coin in mappings.items():
                 self._mapping[coin.upper()] = instrument
                 self._provider_symbol_by_instrument[instrument] = coin
-                for kind, wanted in (("bbo", wants_bbo), ("trades", wants_trades)):
+                for kind, wanted in (
+                    ("l2Book", wants_bbo), ("trades", wants_trades),
+                    ("activeAssetCtx", wants_context),
+                ):
                     if not wanted:
                         continue
                     key = (coin, kind)
@@ -115,7 +129,11 @@ class HyperliquidRealtimeProvider:
             normalized = {
                 (
                     instrument,
-                    "trades" if kind in {"trade", "bar"} else "bbo",
+                    (
+                        "trades" if kind in {"trade", "bar"}
+                        else "activeAssetCtx" if kind == "asset_context"
+                        else "l2Book"
+                    ),
                 )
                 for instrument, kind in filters
             }
@@ -136,33 +154,50 @@ class HyperliquidRealtimeProvider:
     def _on_message(self, _app: Any, raw: str) -> None:
         message = json.loads(raw)
         channel, data = message.get("channel"), message.get("data")
-        if channel == "bbo" and isinstance(data, dict):
-            self._on_bbo(data)
+        if channel in {"bbo", "l2Book"} and isinstance(data, dict):
+            self._on_book(data)
         elif channel == "trades" and isinstance(data, list):
             for trade in data:
                 self._on_trade(trade)
+        elif channel == "activeAssetCtx" and isinstance(data, dict):
+            self._on_context(data)
 
-    def _on_bbo(self, data: dict[str, Any]) -> None:
+    def _on_book(self, data: dict[str, Any]) -> None:
         instrument = self._mapping.get(str(data.get("coin")).upper())
         if instrument is None:
             return
-        levels = data.get("bbo") or [None, None]
-        bid, ask = levels[0], levels[1]
-        bids = [] if not bid else [{
-            "price": _decimal(bid["px"]), "size": _decimal(bid["sz"]),
-            "order_id": "0",
-        }]
-        asks = [] if not ask else [{
-            "price": _decimal(ask["px"]), "size": _decimal(ask["sz"]),
-            "order_id": "0",
-        }]
+        levels = data.get("levels")
+        if levels is None:
+            bbo = data.get("bbo") or [None, None]
+            levels = [
+                [] if not bbo[0] else [bbo[0]],
+                [] if not bbo[1] else [bbo[1]],
+            ]
+        def normalize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [{
+                "price": _decimal(row["px"]), "size": _decimal(row["sz"]),
+                "order_id": "0",
+                "order_count": (
+                    int(row["n"]) if row.get("n") is not None else None
+                ),
+            } for row in rows[:20]]
+        bids, asks = normalize(levels[0]), normalize(levels[1])
+        bid, ask = (
+            levels[0][0] if levels[0] else None,
+            levels[1][0] if levels[1] else None,
+        )
         ts_event = _iso_millis(data["time"])
         self._sink({
             "event_type": "order_book_snapshot", "instrument_id": instrument,
             "source": "hyperliquid", "ts_event": ts_event,
             "payload": {
-                "book_type": "L1_MBP", "depth": 1, "baseline_sequence": 0,
-                "bids": bids, "asks": asks,
+                "book_type": "L2_MBP" if max(len(bids), len(asks)) > 1 else "L1_MBP",
+                "depth": next(
+                    value for value in (1, 5, 10, 20)
+                    if max(len(bids), len(asks)) <= value
+                ),
+                "baseline_sequence": 0,
+                "bids": bids, "asks": asks, "ts_event_source": "provider",
             },
         })
         if bid and ask:
@@ -177,6 +212,38 @@ class HyperliquidRealtimeProvider:
                     "ts_event_source": "provider",
                 },
             })
+
+    def _on_context(self, data: dict[str, Any]) -> None:
+        instrument = self._mapping.get(str(data.get("coin")).upper())
+        if instrument is None:
+            return
+        context = data.get("ctx") if isinstance(data.get("ctx"), dict) else data
+        timestamp = data.get("time") or context.get("time")
+        ts_event = (
+            _iso_millis(timestamp)
+            if timestamp is not None
+            else datetime.now(timezone.utc).isoformat()
+        )
+        external = context.get("externalPerpPx")
+        oracle = context.get("oraclePx")
+        self._sink({
+            "event_type": "asset_context", "instrument_id": instrument,
+            "source": "hyperliquid", "ts_event": ts_event,
+            "payload": {
+                "mark_price": _optional_decimal(context.get("markPx")),
+                "oracle_price": _optional_decimal(oracle),
+                "external_oracle_price": _optional_decimal(external),
+                "mid_price": _optional_decimal(context.get("midPx")),
+                "funding_rate": _optional_decimal(context.get("funding")),
+                "open_interest": _optional_decimal(context.get("openInterest")),
+                "premium": _optional_decimal(context.get("premium")),
+                "market_status": "active",
+                "oracle_status": (
+                    "external_live" if external is not None
+                    else "internal_only" if oracle is not None else "unavailable"
+                ),
+            },
+        })
 
     def _on_trade(self, trade: dict[str, Any]) -> None:
         instrument = self._mapping.get(str(trade.get("coin")).upper())
@@ -229,7 +296,9 @@ class RoutingRealtimeProvider:
 
     @staticmethod
     def _is_hyperliquid(instrument: str) -> bool:
-        return instrument.endswith(".HYPL")
+        return instrument.endswith(".HYPL") or bool(
+            __import__("re").fullmatch(r".+-PERP\.[A-Z0-9]{3}H", instrument)
+        )
 
     def subscribe(self, mappings: dict[str, str], data_types: set[str]) -> None:
         hyperliquid = {

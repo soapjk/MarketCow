@@ -22,12 +22,59 @@ from marketcow.repositories import ControlPlaneRepository
 
 class PostgresDomainInventoryTest(unittest.TestCase):
     def test_bg003_inventory_is_explicit_and_complete(self):
-        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 21)
-        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 21)
+        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 22)
+        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 22)
         self.assertEqual(
             POSTGRES_TRANSACTION_DOMAINS[-2:],
             ("runtime_config_version", "migration_checkpoint"),
         )
+
+    def test_history_worker_lease_migration_is_backward_compatible(self):
+        version, description, statement = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 15
+        )
+
+        self.assertEqual(version, 15)
+        self.assertEqual(description, "history job worker leases")
+        for column in (
+            "owner_id", "lease_token", "lease_expires_at", "heartbeat_at",
+            "takeover_count",
+        ):
+            self.assertGreaterEqual(statement.count(f"IF NOT EXISTS {column}"), 2)
+        self.assertIn("history_fetch_job_recovery_idx", statement)
+        self.assertIn("history_fetch_item_recovery_idx", statement)
+        self.assertIn("WHERE status IN ('queued', 'running')", statement)
+
+    def test_history_shard_checkpoint_migration_has_recovery_constraints(self):
+        version, description, statement = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 16
+        )
+
+        self.assertEqual(version, 16)
+        self.assertEqual(description, "history fetch shard checkpoints")
+        self.assertIn("CREATE TABLE IF NOT EXISTS history_fetch_shard", statement)
+        self.assertIn("UNIQUE (job_id, item_id, shard_index)", statement)
+        self.assertIn("CHECK (range_start < range_end)", statement)
+        self.assertIn("history_fetch_shard_recovery_idx", statement)
+
+    def test_history_ingestion_identity_migration_is_indexed(self):
+        version, description, statement = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 17
+        )
+
+        self.assertEqual(version, 17)
+        self.assertEqual(description, "history shard ingestion identities")
+        self.assertIn("ADD COLUMN IF NOT EXISTS ingestion_id TEXT", statement)
+        self.assertIn("history_fetch_shard_ingestion_idx", statement)
+
+    def test_history_canonical_queue_migration_is_durable(self):
+        version, description, statement = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 18
+        )
+
+        self.assertEqual(description, "history canonical verification queue")
+        self.assertIn("CREATE TABLE IF NOT EXISTS history_canonical_check", statement)
+        self.assertIn("history_canonical_check_pending_idx", statement)
 
 
 @unittest.skipUnless(
@@ -63,6 +110,66 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         self.assertEqual(sorted(created for _, created in results), [False, True])
         winning_job_id = results[0][0]["job_id"]
         self.assertEqual(len(self.repository.list_history_items(winning_job_id)), 1)
+
+    def test_history_item_claim_is_atomic_and_fenced_by_token(self):
+        suffix = uuid.uuid4().hex
+        job_id, item_id = "lease-job-" + suffix, "lease-item-" + suffix
+        now = "2030-01-01T00:00:00+00:00"
+        job = {
+            "job_id": job_id, "idempotency_key": "lease-key-" + suffix,
+            "status": "queued", "request_json": {"symbols": ["AAPL"]},
+            "created_at": now, "started_at": None, "updated_at": now,
+            "finished_at": None, "error_json": None,
+        }
+        item = {
+            "job_id": job_id, "item_id": item_id, "symbol": "AAPL",
+            "status": "queued", "provider": "yahoo", "source": None,
+            "attempt": 0, "rows_fetched": 0, "rows_persisted": 0,
+            "canonical_status": "pending", "error_code": None,
+            "error_message": None, "started_at": None, "updated_at": now,
+            "finished_at": None,
+        }
+        self.repository.get_or_create_history_job(job, [item])
+
+        def claim(owner):
+            return self.repository.claim_history_item(
+                job_id, item_id, owner, "token-" + owner, now,
+                "2030-01-01T00:01:00+00:00",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            claimed = list(executor.map(claim, ("one", "two")))
+        self.assertEqual(sum(row is not None for row in claimed), 1)
+        winner = next(row for row in claimed if row is not None)
+        winner_owner = winner["owner_id"]
+        winner_token = winner["lease_token"]
+        loser_owner = "two" if winner_owner == "one" else "one"
+
+        self.assertIsNone(self.repository.renew_history_item_lease(
+            job_id, item_id, loser_owner, "token-" + loser_owner,
+            "2030-01-01T00:00:10+00:00", "2030-01-01T00:02:00+00:00",
+        ))
+        renewed = self.repository.renew_history_item_lease(
+            job_id, item_id, winner_owner, winner_token,
+            "2030-01-01T00:00:10+00:00", "2030-01-01T00:02:00+00:00",
+        )
+        self.assertEqual(renewed["owner_id"], winner_owner)
+
+        terminal = {
+            **item, "status": "succeeded", "attempt": 1,
+            "rows_fetched": 2, "rows_persisted": 2,
+            "canonical_status": "completed",
+            "updated_at": "2030-01-01T00:00:20+00:00",
+            "finished_at": "2030-01-01T00:00:20+00:00",
+        }
+        self.assertIsNone(self.repository.finish_claimed_history_item(
+            terminal, loser_owner, "token-" + loser_owner
+        ))
+        finished = self.repository.finish_claimed_history_item(
+            terminal, winner_owner, winner_token
+        )
+        self.assertEqual(finished["status"], "succeeded")
+        self.assertIsNone(finished["lease_token"])
 
     def test_backup_component_extracts_real_postgres_schema(self):
         component = BackupComponent.postgresql(
@@ -129,7 +236,10 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
             versions = connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
-        self.assertEqual([row["version"] for row in versions], [1, 2, 3, 4, 5])
+        self.assertEqual(
+            [row["version"] for row in versions],
+            [version for version, _description, _statement in POSTGRES_MIGRATIONS],
+        )
 
         run = ["run-1", "fixture", "running", None, "2026-07-20T00:00:00+00:00", None, 0, None]
         self.repository.save_run(run)
@@ -255,10 +365,77 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
                     "SELECT table_name FROM information_schema.tables WHERE table_schema=%s",
                     (schema,),
                 ).fetchall()}
-            self.assertEqual(versions, [1, 2, 3, 4, 5])
+            self.assertEqual(
+                versions,
+                [version for version, _description, _statement in POSTGRES_MIGRATIONS],
+            )
             self.assertTrue(set(POSTGRES_TRANSACTION_DOMAINS).issubset(tables))
             upgraded.close()
         finally:
+            with psycopg.connect(self.dsn, autocommit=True) as connection:
+                    connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+    def test_upgrade_from_migration_fourteen_preserves_queued_history_job(self):
+        schema = "marketcow_history_upgrade_" + uuid.uuid4().hex[:8] + "_test"
+        database = None
+        try:
+            with psycopg.connect(self.dsn, autocommit=True) as connection:
+                connection.execute(f'CREATE SCHEMA "{schema}"')
+                connection.execute(f'SET search_path TO "{schema}", public')
+                connection.execute("""
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY, description TEXT NOT NULL,
+                        applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                for version, description, statement in POSTGRES_MIGRATIONS[:14]:
+                    connection.execute(statement)
+                    connection.execute(
+                        "INSERT INTO schema_migrations(version, description) "
+                        "VALUES (%s, %s)",
+                        (version, description),
+                    )
+                connection.execute(
+                    "INSERT INTO history_fetch_job "
+                    "(job_id,idempotency_key,status,request_json,created_at,updated_at) "
+                    "VALUES ('upgrade-job','upgrade-key','queued','{}',now(),now())"
+                )
+                connection.execute(
+                    "INSERT INTO history_fetch_item "
+                    "(job_id,item_id,symbol,status,provider,updated_at) "
+                    "VALUES ('upgrade-job','upgrade-item','AAPL','queued','yahoo',now())"
+                )
+
+            database = PostgresDatabase(self.dsn, schema, min_size=1, max_size=2)
+            database.open()
+            database.migrate()
+            with database.connection() as connection:
+                job = connection.execute(
+                    "SELECT status, owner_id, takeover_count "
+                    "FROM history_fetch_job WHERE job_id='upgrade-job'"
+                ).fetchone()
+                item = connection.execute(
+                    "SELECT status, owner_id, takeover_count "
+                    "FROM history_fetch_item WHERE item_id='upgrade-item'"
+                ).fetchone()
+                versions = [
+                    row["version"] for row in connection.execute(
+                        "SELECT version FROM schema_migrations ORDER BY version"
+                    ).fetchall()
+                ]
+            self.assertEqual(job, {
+                "status": "queued", "owner_id": None, "takeover_count": 0,
+            })
+            self.assertEqual(item, {
+                "status": "queued", "owner_id": None, "takeover_count": 0,
+            })
+            self.assertEqual(
+                versions,
+                [version for version, _description, _statement in POSTGRES_MIGRATIONS],
+            )
+        finally:
+            if database is not None:
+                database.close()
             with psycopg.connect(self.dsn, autocommit=True) as connection:
                 connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
@@ -350,7 +527,7 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
 
     def test_fundamental_history_and_strict_point_in_time_queries(self):
         base = {
-            "instrument_id": "CN.XSHG.600298", "symbol": "600298", "exchange": "XSHG",
+            "instrument_id": "600298.XSHG", "symbol": "600298", "exchange": "XSHG",
             "name": "Fixture", "is_active": True, "report_period": "20260331",
             "published_at": "2026-04-30", "industry": "Food", "roe_weighted": 8.5,
             "pe_dynamic": 20.0, "source": "fixture", "observed_at": "2026-05-01",
@@ -373,7 +550,7 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
 
     def test_financial_statement_jsonb_round_trip_and_as_of(self):
         row = {
-            "instrument_id": "CN.XSHG.600298", "symbol": "600298",
+            "instrument_id": "600298.XSHG", "symbol": "600298",
             "statement": "income", "report_date": "2026-03-31",
             "published_at": "2026-04-30", "source": "fixture",
             "payload": {"revenue": 123.0}, "fetched_at": "2026-05-01",

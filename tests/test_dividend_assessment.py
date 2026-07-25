@@ -168,7 +168,7 @@ class DividendAssessmentTest(unittest.TestCase):
             client = TestClient(create_app(settings, Service()))
             single = client.get("/v1/dividends/AAPL?fiscal_year=2025").json()
             batch = client.post("/v1/dividends/query", json={
-                "symbols": ["AAPL"], "fiscal_year": 2025,
+                "symbols": ["AAPL.XNAS"], "fiscal_year": 2025,
             }).json()["items"][0]["data"]
 
         self.assertEqual(single["assessment"], batch["assessment"])

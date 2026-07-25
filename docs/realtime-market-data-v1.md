@@ -12,9 +12,11 @@ The first client frame is normally a `subscribe`:
   "type": "subscribe",
   "request_id": "sub-1",
   "instruments": ["AAPL.XNAS"],
-  "data_types": ["quote", "trade", "bar", "order_book"],
+  "data_types": [
+    "quote", "trade", "bar", "order_book", "asset_context", "market_state"
+  ],
   "bar_types": ["1-MINUTE"],
-  "book_depth": 1
+  "book_depth": 20
 }
 ```
 
@@ -73,6 +75,19 @@ source. LongPort Depth has no upstream event timestamp, so Quote uses MarketCow 
 time, sets `payload.ts_event_source=marketcow_observation`, and is marked degraded rather
 than pretending that the timestamp was provider-assigned. Quote/trade financial values
 remain decimal strings.
+
+An order-book subscription also subscribes to LongPort `Quote`. Depth has no provider
+event timestamp, so its snapshot keeps `ts_event_source=marketcow_observation` and records
+the provider depth sequence when available. Quote publishes a separate `market_state`
+event with provider timestamp/sequence, normalized trade status (`active`, `halted`,
+`volatility_halt`, `opening`, `delisted`, `unknown`) and session (`regular`,
+`pre_market`, `post_market`, `overnight`, `closed`, `unknown`). Consumers must evaluate
+book freshness and market-state freshness independently.
+
+Hyperliquid and HIP-3 instruments use `l2Book` and may publish `L2_MBP` snapshots up to
+20 levels. The `asset_context` stream carries mark/oracle/external-oracle prices, funding,
+open interest and market/oracle status separately from the executable book. A consumer
+must not substitute mark or oracle prices for bid/ask execution prices.
 
 ## One-minute bar rules
 

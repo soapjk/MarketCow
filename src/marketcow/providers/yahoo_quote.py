@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -10,6 +9,7 @@ from urllib.parse import urlencode
 
 import requests
 
+from ..instruments import canonical_instrument
 
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 ALLOWED_RANGES = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"}
@@ -17,25 +17,10 @@ ALLOWED_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "
 
 
 def normalize_yahoo_symbol(value: str) -> Tuple[str, str]:
-    text = str(value or "").strip().upper()
-    if not text:
-        raise ValueError("symbol is required")
-    if re.fullmatch(r"(?:CNY|HKD)=X", text):
-        return text, "FX"
-    if text.endswith(".HK"):
-        digits = re.sub(r"\D", "", text[:-3]).lstrip("0") or "0"
-        if len(digits) > 5:
-            raise ValueError("invalid Hong Kong symbol")
-        return (digits.zfill(4) if len(digits) <= 4 else digits) + ".HK", "HK"
-    if text.isdigit():
-        if len(text) > 5:
-            raise ValueError("six-digit A-share symbols use /v1/fundamentals; append .HK for Hong Kong equities")
-        digits = text.lstrip("0") or "0"
-        return (digits.zfill(4) if len(digits) <= 4 else digits) + ".HK", "HK"
-    text = text.replace(".", "-")
-    if not re.fullmatch(r"[A-Z][A-Z0-9-]{0,14}", text):
-        raise ValueError("unsupported US/HK symbol format")
-    return text, "US"
+    instrument = canonical_instrument(value)
+    if instrument.market not in {"CN", "HK", "US"}:
+        raise ValueError("Yahoo quotes support CN, HK and US instruments")
+    return instrument.provider_symbol("provider:yahoo"), instrument.market
 
 
 def _float(value: Any) -> Optional[float]:
@@ -125,6 +110,7 @@ class YahooQuoteProvider:
         return results[0]
 
     def fetch_quote(self, value: str) -> Dict[str, Any]:
+        instrument = canonical_instrument(value)
         symbol, market = normalize_yahoo_symbol(value)
         params = {
             "range": "1d", "interval": "5m", "includePrePost": "true",
@@ -154,8 +140,9 @@ class YahooQuoteProvider:
         change_pct = change / previous_close * 100 if change is not None and previous_close else None
         exchange = str(meta.get("exchangeName") or meta.get("fullExchangeName") or "")
         return {
-            "instrument_id": ("FX.YAHOO." + symbol) if market == "FX" else ("HK.XHKG." + symbol.split(".")[0]) if market == "HK" else "US.{0}.{1}".format(exchange or "UNKNOWN", symbol),
-            "symbol": symbol,
+            "instrument_id": instrument.instrument_id,
+            "symbol": instrument.instrument_id,
+            "provider_symbol": symbol,
             "name": meta.get("shortName") or meta.get("longName") or symbol,
             "market": market,
             "exchange": exchange,
@@ -184,7 +171,6 @@ class YahooQuoteProvider:
         interval: str = "1d",
         adjustment: str = "adjusted",
     ) -> Dict[str, Any]:
-        symbol, market = normalize_yahoo_symbol(value)
         if range_ not in ALLOWED_RANGES:
             raise ValueError("unsupported range")
         if interval not in ALLOWED_INTERVALS:
@@ -195,6 +181,38 @@ class YahooQuoteProvider:
             "range": range_, "interval": interval, "includePrePost": "false",
             "events": "div,splits", "includeAdjustedClose": "true",
         }
+        return self._fetch_history_params(
+            value, params, range_, interval, adjustment
+        )
+
+    def fetch_history_window(
+        self, value: str, start: datetime, end: datetime,
+        interval: str, adjustment: str,
+    ) -> Dict[str, Any]:
+        if start.tzinfo is None or end.tzinfo is None or start >= end:
+            raise ValueError("history window must be ordered and timezone-aware")
+        if interval not in ALLOWED_INTERVALS:
+            raise ValueError("unsupported interval")
+        if adjustment not in ("adjusted", "raw"):
+            raise ValueError("adjustment must be adjusted or raw")
+        params = {
+            "period1": int(start.timestamp()), "period2": int(end.timestamp()),
+            "interval": interval, "includePrePost": "false",
+            "events": "div,splits", "includeAdjustedClose": "true",
+        }
+        return self._fetch_history_params(
+            value, params,
+            f"{start.astimezone(timezone.utc).isoformat()}/"
+            f"{end.astimezone(timezone.utc).isoformat()}",
+            interval, adjustment,
+        )
+
+    def _fetch_history_params(
+        self, value: str, params: Dict[str, Any], range_label: str,
+        interval: str, adjustment: str,
+    ) -> Dict[str, Any]:
+        instrument = canonical_instrument(value)
+        symbol, market = normalize_yahoo_symbol(value)
         payload, source_url = self._fetch_chart(symbol, params)
         result = self._result(payload)
         meta = result.get("meta") or {}
@@ -227,13 +245,14 @@ class YahooQuoteProvider:
                 "volume": _float(volumes[index]) if index < len(volumes) else None,
             })
         return {
-            "instrument_id": ("FX.YAHOO." + symbol) if market == "FX" else ("HK.XHKG." + symbol.split(".")[0]) if market == "HK" else "US.{0}.{1}".format(meta.get("exchangeName") or "UNKNOWN", symbol),
-            "symbol": symbol,
+            "instrument_id": instrument.instrument_id,
+            "symbol": instrument.instrument_id,
+            "provider_symbol": symbol,
             "name": meta.get("shortName") or meta.get("longName") or symbol,
             "market": market,
             "exchange": meta.get("exchangeName") or meta.get("fullExchangeName"),
             "currency": meta.get("currency") or ("HKD" if market == "HK" else "USD"),
-            "range": range_,
+            "range": range_label,
             "interval": interval,
             "adjustment": adjustment,
             "quality_status": "single_source_unverified",

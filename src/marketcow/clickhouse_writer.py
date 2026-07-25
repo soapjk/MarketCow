@@ -48,6 +48,11 @@ def normalize_bar(dataset: str, row: Dict[str, Any]) -> Dict[str, Any]:
         if dataset == "raw" and column in {"content_rank", "content_version"}:
             continue
         value = row.get(column)
+        if dataset == "raw" and column == "ingestion_id" and value is None:
+            # Ingestion identity is required for recoverable history shards, but
+            # legacy/realtime raw writes remain valid and use ClickHouse's empty
+            # default rather than inventing a cross-request identity.
+            value = ""
         if value is None and column not in OPTIONAL_COLUMNS:
             raise ValueError(f"{dataset} bar requires {column}")
         if value is not None and column in DATETIME_COLUMNS:

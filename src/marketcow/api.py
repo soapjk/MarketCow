@@ -16,13 +16,13 @@ from .config import Settings
 from .dividends import normalize_dividend_symbol
 from .market_bar_cursor import decode_cursor, encode_cursor, load_or_create_secret
 from .normalize import normalize_as_of, normalize_report_period
-from .providers.yahoo_quote import normalize_yahoo_symbol
-from .providers.hyperliquid import hyperliquid_instrument
-from .providers.eastmoney_realtime import normalize_a_symbol
 from .service import FundamentalService
 from .telemetry import sanitize_text, telemetry_call
 from .health import HealthEvaluator
 from .history_jobs import HistoryJobManager
+from .history_reconciliation import HistoryReconciler
+from .history_consistency import HistoryConsistencyAuditor
+from .instruments import canonical_instrument
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
 from .market_data_contracts import (
     CanonicalBarPage,
@@ -49,14 +49,7 @@ from .providers.longport_quote import LongPortError
 
 
 def normalize_quote_symbol(value: str) -> str:
-    if str(value).strip().upper().endswith(".HYPL"):
-        instrument_id, _provider_symbol, _kind = hyperliquid_instrument(value)
-        return instrument_id
-    try:
-        return normalize_a_symbol(value)
-    except ValueError:
-        normalized, _market = normalize_yahoo_symbol(value)
-        return normalized
+    return canonical_instrument(value).instrument_id
 
 
 class TushareRequest(BaseModel):
@@ -71,6 +64,30 @@ class TushareRealtimeRequest(BaseModel):
 class ProviderPolicy(BaseModel):
     provider: Optional[str] = None
     allow_fallback: bool = False
+
+
+class CrossMarketPairRequest(BaseModel):
+    derivative_instrument_id: str
+    underlying_instrument_id: str
+
+
+class CrossMarketQuery(BaseModel):
+    pairs: list[CrossMarketPairRequest] = Field(min_length=1, max_length=50)
+    book_depth: int = Field(ge=1, le=20)
+    max_age_ms: int = Field(ge=10, le=60_000)
+    max_skew_ms: int = Field(ge=0, le=10_000)
+
+    @model_validator(mode="after")
+    def supported_depth_and_unique_pairs(self):
+        if self.book_depth not in {1, 5, 10, 20}:
+            raise ValueError("book_depth must be 1, 5, 10 or 20")
+        identities = [
+            (pair.derivative_instrument_id, pair.underlying_instrument_id)
+            for pair in self.pairs
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("cross-market pairs must be unique")
+        return self
 
 
 class QuoteQuery(ProviderPolicy):
@@ -97,12 +114,17 @@ class HistoryJobRequest(BaseModel):
     max_concurrency: int = Field(ge=1, le=16)
     max_attempts: int = Field(ge=1, le=10)
     retry_backoff_seconds: float = Field(ge=0, le=60)
+    retry_max_backoff_seconds: float = Field(ge=0, le=600)
+    retry_jitter_seconds: float = Field(ge=0, le=60)
+    retry_budget_seconds: float = Field(ge=0, le=86400)
     canonical_wait_seconds: float = Field(ge=0, le=60)
     idempotency_key: str = Field(min_length=8, max_length=200)
 
     @model_validator(mode="after")
     def validate_symbols_and_provider(self):
-        normalized = [symbol.strip().upper() for symbol in self.symbols]
+        normalized = [
+            canonical_instrument(symbol).instrument_id for symbol in self.symbols
+        ]
         if any(not symbol for symbol in normalized):
             raise ValueError("symbols must not contain empty values")
         if len(set(normalized)) != len(normalized):
@@ -112,7 +134,19 @@ class HistoryJobRequest(BaseModel):
             self.provider = "yahoo"
         if self.provider not in {"yahoo", "tushare", "hyperliquid"}:
             raise ValueError("unsupported history provider")
+        for symbol in normalized:
+            instrument = canonical_instrument(symbol)
+            if self.provider == "tushare":
+                instrument.provider_symbol("provider:tushare")
+            elif self.provider == "yahoo":
+                instrument.provider_symbol("provider:yahoo")
+            elif instrument.mic != "HYPL":
+                raise ValueError("Hyperliquid history requires a HYPL instrument")
         return self
+
+
+class HistoryReconcileRequest(BaseModel):
+    dry_run: bool
 
 
 class DividendAnnouncementInput(BaseModel):
@@ -161,13 +195,44 @@ def create_app(
     if history_repository is not None and all(hasattr(history_repository, name) for name in (
         "get_or_create_history_job", "upsert_history_job", "upsert_history_item",
         "get_history_job",
-        "list_history_jobs", "list_history_items",
+        "list_history_jobs", "list_recoverable_history_jobs", "list_history_items",
+        "claim_history_item", "renew_history_item_lease",
+        "finish_claimed_history_item", "release_history_item_lease",
+        "upsert_history_shard", "list_history_shards",
+        "upsert_history_canonical_check",
+        "list_pending_history_canonical_checks",
+        "list_history_canonical_checks",
     )):
         history_manager = HistoryJobManager(
             service, history_repository,
             max_workers=getattr(settings, "history_job_max_workers", 4),
+            lease_seconds=getattr(settings, "history_job_lease_seconds", 30),
         )
     app.state.history_job_manager = history_manager
+    history_reconciler = None
+    history_consistency_auditor = None
+    market_bar_repository = getattr(service, "market_bar_repository", None)
+    artifact_store = getattr(service, "artifact_store", None)
+    if history_repository is not None and market_bar_repository is not None:
+        if all(hasattr(history_repository, name) for name in (
+            "reconcile_history_shard", "reconcile_history_item",
+            "list_history_shards", "list_history_items", "get_history_job",
+        )) and hasattr(market_bar_repository, "get_raw_ingestion_receipt"):
+            history_reconciler = HistoryReconciler(
+                history_repository, market_bar_repository,
+                getattr(service, "telemetry", None),
+            )
+        if (
+            artifact_store is not None
+            and hasattr(history_repository, "list_all_history_shards")
+            and hasattr(market_bar_repository, "list_raw_ingestion_receipts")
+            and hasattr(artifact_store, "list_artifacts")
+        ):
+            history_consistency_auditor = HistoryConsistencyAuditor(
+                history_repository, market_bar_repository, artifact_store
+            )
+    app.state.history_reconciler = history_reconciler
+    app.state.history_consistency_auditor = history_consistency_auditor
     clock = now_provider or (lambda: datetime.now(timezone.utc))
     longport_realtime = LongPortRealtimeProvider(
         settings.longport_app_key, settings.longport_app_secret,
@@ -527,6 +592,62 @@ def create_app(
                 "namespace": namespace, "external_symbol": external_symbol,
             })
         return instrument_record(row)
+
+    @app.get("/v1/instrument-relationships")
+    def instrument_relationship(
+        derivative_instrument_id: str, underlying_instrument_id: str,
+    ):
+        try:
+            return service.get_instrument_relationship(
+                derivative_instrument_id, underlying_instrument_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail={
+                "code": "instrument_relationship_unavailable",
+                "message": str(exc),
+            }) from exc
+
+    @app.post("/v1/cross-market/snapshots/query")
+    def cross_market_snapshots(request: CrossMarketQuery):
+        def load(pair: CrossMarketPairRequest) -> Dict[str, Any]:
+            try:
+                data = service.get_cross_market_snapshot(
+                    pair.derivative_instrument_id,
+                    pair.underlying_instrument_id,
+                    depth=request.book_depth,
+                    max_age_ms=request.max_age_ms,
+                    max_skew_ms=request.max_skew_ms,
+                )
+                return {
+                    "derivative_instrument_id": pair.derivative_instrument_id,
+                    "underlying_instrument_id": pair.underlying_instrument_id,
+                    "status": "available", "data": data, "error": None,
+                }
+            except ValueError as exc:
+                return {
+                    "derivative_instrument_id": pair.derivative_instrument_id,
+                    "underlying_instrument_id": pair.underlying_instrument_id,
+                    "status": "unavailable", "data": None,
+                    "error": {"code": "invalid_pair", "message": str(exc)},
+                }
+            except Exception as exc:
+                return {
+                    "derivative_instrument_id": pair.derivative_instrument_id,
+                    "underlying_instrument_id": pair.underlying_instrument_id,
+                    "status": "error", "data": None,
+                    "error": {
+                        "code": "provider_unavailable",
+                        "message": sanitize_text(exc),
+                    },
+                }
+
+        with ThreadPoolExecutor(max_workers=min(8, len(request.pairs))) as executor:
+            futures = [executor.submit(load, pair) for pair in request.pairs]
+            items = [future.result() for future in futures]
+        return {
+            "schema_version": "cross-market-query-v1",
+            "count": len(items), "items": items,
+        }
 
     @app.get("/v1/canonical-bars/{instrument_id}")
     def canonical_bars_v1(
@@ -1645,6 +1766,36 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/v1/admin/history-jobs/{job_id}/reconcile")
+    def reconcile_history_job(job_id: str, request: HistoryReconcileRequest):
+        if history_reconciler is None:
+            raise HTTPException(
+                status_code=503, detail="history reconciler unavailable"
+            )
+        try:
+            return history_reconciler.reconcile(
+                job_id, dry_run=request.dry_run
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail="history job not found"
+            ) from exc
+
+    @app.get("/v1/admin/history-consistency")
+    def audit_history_consistency(
+        limit: int = Query(10000, ge=1, le=100000),
+    ):
+        if history_consistency_auditor is None:
+            raise HTTPException(
+                status_code=503,
+                detail="history consistency auditor unavailable",
+            )
+        return history_consistency_auditor.audit(limit)
+
+    @app.get("/v1/admin/history-health")
+    def history_health():
+        return require_history_manager().health_snapshot()
+
     @app.get("/v1/admin/history-jobs-ui", response_class=HTMLResponse)
     def history_jobs_ui():
         return """<!doctype html><html><head><meta charset="utf-8">
@@ -1652,23 +1803,49 @@ def create_app(
 body{font:14px system-ui;margin:24px;background:#f6f7f9;color:#17202a}
 table{border-collapse:collapse;width:100%;background:white;margin:12px 0}
 th,td{padding:8px;border:1px solid #dfe3e8;text-align:left}
-progress{width:180px} pre{white-space:pre-wrap}</style></head><body>
-<h1>History fetch jobs</h1><div id="jobs">Loading…</div><script>
+progress{width:180px} pre{white-space:pre-wrap}
+button.cancel{margin-left:12px;padding:6px 10px;border:1px solid #b42318;
+border-radius:4px;background:#fff;color:#b42318;cursor:pointer}
+button.cancel:disabled{cursor:wait;opacity:.55}
+#notice{min-height:20px;color:#344054}</style></head><body>
+<h1>History fetch jobs</h1><div id="notice" role="status" aria-live="polite"></div>
+<div id="jobs">Loading…</div><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;',
  '>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const cancelable=s=>s==='queued'||s==='running';
+async function cancelJob(button){
+ const id=button.dataset.job;
+ if(!confirm(`Cancel history job ${id}? Completed data will be kept.`))return;
+ button.disabled=true;document.getElementById('notice').textContent=`Canceling ${id}…`;
+ try{const r=await fetch(`/v1/admin/history-jobs/${encodeURIComponent(id)}/cancel`,
+  {method:'POST'});
+  const d=await r.json();if(!r.ok)throw new Error(d.detail||`HTTP ${r.status}`);
+  document.getElementById('notice').textContent=`Cancel requested for ${id}.`;
+  await load();
+ }catch(e){document.getElementById('notice').textContent=
+  `Could not cancel ${id}: ${e.message}`;button.disabled=false}
+}
 async function load(){const r=await fetch('/v1/admin/history-jobs?limit=50');
 const d=await r.json();document.getElementById('jobs').innerHTML=d.items.map(j=>
-`<section><h2>${esc(j.job_id)} — ${esc(j.status)}</h2>
+`<section><h2>${esc(j.job_id)} — ${esc(j.status)}
+${cancelable(j.status)?`<button class="cancel" data-job="${esc(j.job_id)}"
+type="button">Cancel job</button>`:''}</h2>
 <progress max="100" value="${j.progress_percent}"></progress> ${j.progress_percent}%
 <p>${j.completed_symbols}/${j.total_symbols}; fetched ${j.rows_fetched};
 persisted ${j.rows_persisted}; updated ${esc(j.updated_at)}</p><table><tr>
 <th>Symbol</th><th>Status</th><th>Provider/source</th><th>Attempt</th>
-<th>Rows</th><th>Canonical</th><th>Error</th></tr>${j.items.map(i=>`<tr>
+<th>Rows</th><th>Canonical</th><th>Owner / lease</th><th>Heartbeat</th>
+<th>Takeovers</th><th>Error</th></tr>${j.items.map(i=>`<tr>
 <td>${esc(i.symbol)}</td><td>${esc(i.status)}</td>
 <td>${esc(i.provider)}/${esc(i.source)}</td><td>${i.attempt}</td>
 <td>${i.rows_fetched}/${i.rows_persisted}</td><td>${esc(i.canonical_status)}</td>
+<td>${esc(i.owner_id)} / ${esc(i.lease_active?'active':i.lease_expires_at)}</td>
+<td>${esc(i.heartbeat_at)}</td><td>${esc(i.takeover_count)}</td>
 <td>${esc(i.error_code)} ${esc(i.error_message)}</td></tr>`).join('')}</table></section>`
-).join('')||'No jobs'} load();setInterval(load,2000);</script></body></html>"""
+).join('')||'No jobs'}
+document.getElementById('jobs').addEventListener('click',e=>{
+ const button=e.target.closest('button.cancel');if(button)cancelJob(button)});
+load();setInterval(load,2000);</script></body></html>"""
 
     @app.get("/v1/admin/artifacts")
     def artifacts(dataset: str = "", limit: int = Query(100, ge=1, le=1000)):

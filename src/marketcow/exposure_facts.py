@@ -5,8 +5,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
-from .providers.eastmoney_realtime import normalize_a_symbol
-from .providers.yahoo_quote import normalize_yahoo_symbol
+from .instruments import canonical_instrument
 
 
 CONTRACT_VERSION = "marketcow.exposure-facts.v1"
@@ -23,14 +22,10 @@ def _utc(value: Any) -> datetime:
 
 
 def normalize_exposure_symbol(value: str) -> tuple[str, str]:
-    try:
-        symbol = normalize_a_symbol(value)
-        return symbol, "CN"
-    except ValueError:
-        symbol, market = normalize_yahoo_symbol(value)
-        if market not in {"HK", "US"}:
-            raise ValueError("exposure facts support CN, HK and US securities")
-        return symbol, market
+    instrument = canonical_instrument(value)
+    if instrument.market not in {"CN", "HK", "US"}:
+        raise ValueError("exposure facts support CN, HK and US securities")
+    return instrument.instrument_id, instrument.market
 
 
 class ExposureFactSource(Protocol):

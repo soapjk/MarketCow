@@ -29,7 +29,7 @@ DIVIDEND_DATE_FIELDS = ("record_date", "ex_date", "payment_date")
 
 
 def normalize_dividend_symbol(value: str) -> str:
-    return canonical_instrument(value).symbol
+    return canonical_instrument(value).instrument_id
 
 
 def _iso_date(value: Any, field: str, required: bool = False) -> str | None:
@@ -57,7 +57,7 @@ def normalize_dividend_announcement(
     payload: Dict[str, Any], ingested_at: str
 ) -> Dict[str, Any]:
     instrument = canonical_instrument(payload.get("symbol", ""))
-    symbol = instrument.symbol
+    symbol = instrument.instrument_id
     try:
         fiscal_year = int(payload.get("fiscal_year"))
     except (TypeError, ValueError) as exc:
@@ -134,7 +134,7 @@ def normalize_dividend_announcement(
         "symbol": symbol,
         "instrument_id": instrument.instrument_id,
         "market": instrument.market,
-        "exchange": instrument.exchange,
+        "exchange": instrument.mic,
         "fiscal_year": fiscal_year,
         "amount_per_share": amount,
         "currency": currency,

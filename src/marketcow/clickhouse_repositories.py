@@ -14,6 +14,7 @@ import clickhouse_connect
 
 from .bar_version import raw_content_rank, raw_content_version
 from .canonical_selection import canonical_page_payload, with_effective_time
+from .migration_policy import validate_migration_history
 
 
 CLICKHOUSE_MIGRATIONS = [
@@ -116,6 +117,14 @@ CLICKHOUSE_MIGRATIONS = [
             ) ENGINE = ReplacingMergeTree(content_version)
             ORDER BY symbol
             """,
+        ],
+    ),
+    (
+        6,
+        "raw history ingestion identity",
+        [
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "ingestion_id String DEFAULT '' AFTER raw_artifact_id",
         ],
     ),
 ]
@@ -235,9 +244,13 @@ class ClickHouseDatabase:
             "version UInt32, description String, applied_at DateTime64(3, 'UTC') DEFAULT now64(3)"
             ") ENGINE = MergeTree ORDER BY version"
         )
-        applied = {row[0] for row in client.query(
-            "SELECT version FROM schema_migrations"
-        ).result_rows}
+        applied = validate_migration_history(
+            client.query(
+                "SELECT version, description FROM schema_migrations"
+            ).result_rows,
+            CLICKHOUSE_MIGRATIONS,
+            "ClickHouse",
+        )
         for version, description, statements in CLICKHOUSE_MIGRATIONS:
             if version in applied:
                 continue
@@ -294,8 +307,8 @@ class ClickHouseMarketBarRepository:
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
         "low", "close", "raw_close", "adjustment_factor", "volume", "amount",
         "source", "source_sequence",
-        "observed_at", "ingested_at", "raw_artifact_id", "content_rank",
-        "content_version",
+        "observed_at", "ingested_at", "raw_artifact_id", "ingestion_id",
+        "content_rank", "content_version",
     ]
     CANONICAL_COLUMNS = [
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
@@ -313,8 +326,12 @@ class ClickHouseMarketBarRepository:
         self.database = database
 
     @staticmethod
-    def _range_time(value: str, name: str) -> datetime:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    def _range_time(value: Any, name: str) -> datetime:
+        parsed = (
+            value
+            if isinstance(value, datetime)
+            else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        )
         if parsed.tzinfo is None:
             raise ValueError(f"{name} must include a timezone")
         return parsed.astimezone(timezone.utc)
@@ -468,6 +485,7 @@ class ClickHouseMarketBarRepository:
                 "source_sequence": str(bar.get("source_sequence") or bar.get("timestamp")),
                 "observed_at": observed_at, "ingested_at": ingested_at,
                 "raw_artifact_id": provenance.get("raw_artifact_id"),
+                "ingestion_id": str(provenance.get("ingestion_id") or ""),
             })
         return normalized
 
@@ -476,9 +494,63 @@ class ClickHouseMarketBarRepository:
         ingested_at: str, bars: List[Dict[str, Any]],
         provenance: Optional[Dict[str, Any]] = None,
     ) -> int:
-        return self.insert_raw_bars(self.prepare_raw_bars(
-            symbol, interval, adjustment, source, ingested_at, bars, provenance
-        ))
+        provenance = provenance or {}
+        return self.insert_raw_bars(
+            self.prepare_raw_bars(
+                symbol, interval, adjustment, source, ingested_at, bars,
+                provenance,
+            ),
+            batch_id=str(provenance.get("ingestion_id") or ""),
+        )
+
+    def get_raw_ingestion_receipt(
+        self, ingestion_id: str
+    ) -> Optional[Dict[str, Any]]:
+        normalized = str(ingestion_id).strip()
+        if not normalized:
+            raise ValueError("ingestion_id is required")
+        result = self._query(
+            """
+            SELECT count(), min(toUnixTimestamp64Milli(bar_time)),
+                   max(toUnixTimestamp64Milli(bar_time)),
+                   argMax(raw_artifact_id, content_version)
+            FROM market_bar_raw FINAL
+            WHERE ingestion_id={ingestion_id:String}
+            """,
+            {"ingestion_id": normalized},
+        )
+        row = result.result_rows[0]
+        count = int(row[0] or 0)
+        if count == 0:
+            return None
+        return {
+            "ingestion_id": normalized, "row_count": count,
+            "first_bar_at_ms": int(row[1]), "last_bar_at_ms": int(row[2]),
+            "raw_artifact_id": row[3],
+        }
+
+    def list_raw_ingestion_receipts(
+        self, limit: int = 10000
+    ) -> List[Dict[str, Any]]:
+        if not 1 <= int(limit) <= 100000:
+            raise ValueError("limit must be between 1 and 100000")
+        result = self._query(
+            """
+            SELECT ingestion_id,count(),
+                   min(toUnixTimestamp64Milli(bar_time)),
+                   max(toUnixTimestamp64Milli(bar_time)),
+                   argMax(raw_artifact_id,content_version)
+            FROM market_bar_raw FINAL
+            WHERE ingestion_id <> ''
+            GROUP BY ingestion_id ORDER BY ingestion_id LIMIT {limit:UInt32}
+            """,
+            {"limit": int(limit)},
+        )
+        return [{
+            "ingestion_id": str(row[0]), "row_count": int(row[1]),
+            "first_bar_at_ms": int(row[2]), "last_bar_at_ms": int(row[3]),
+            "raw_artifact_id": row[4],
+        } for row in result.result_rows]
 
     # Direct MarketBarRepository contract. The canonical-prefixed methods remain as
     # compatibility entry points for pre-blue/green offline tooling.

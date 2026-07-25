@@ -23,6 +23,7 @@ POSTGRES_TRANSACTION_DOMAINS = (
     "dividend_announcement",
     "dividend_refresh_state",
     "instrument_master",
+    "instrument_relationship",
     "runtime_config_version",
     "migration_checkpoint",
 )
@@ -497,6 +498,147 @@ POSTGRES_MIGRATIONS = [
                 CHECK (size_precision BETWEEN 0 AND 18),
             ADD CONSTRAINT instrument_master_size_increment_check
                 CHECK (size_increment > 0);
+        """,
+    ),
+    (
+        14,
+        "HIP-3 derivatives and instrument relationships",
+        """
+        ALTER TABLE instrument_master
+            DROP CONSTRAINT IF EXISTS instrument_master_instrument_type_check,
+            DROP CONSTRAINT IF EXISTS instrument_master_asset_class_check;
+        ALTER TABLE instrument_master
+            ADD CONSTRAINT instrument_master_instrument_type_check
+                CHECK (instrument_type IN (
+                    'equity', 'crypto_spot', 'crypto_perpetual',
+                    'equity_perpetual', 'index_perpetual', 'hip3_perpetual'
+                )),
+            ADD CONSTRAINT instrument_master_asset_class_check
+                CHECK (asset_class IN (
+                    'equity', 'crypto', 'equity_derivative', 'index_derivative',
+                    'other_derivative'
+                ));
+        CREATE TABLE IF NOT EXISTS instrument_relationship (
+            relationship_id TEXT PRIMARY KEY,
+            schema_version TEXT NOT NULL,
+            relationship_type TEXT NOT NULL,
+            derivative_instrument_id TEXT NOT NULL
+                REFERENCES instrument_master(instrument_id),
+            underlying_instrument_id TEXT NOT NULL
+                REFERENCES instrument_master(instrument_id),
+            quantity_multiplier NUMERIC NOT NULL CHECK (quantity_multiplier > 0),
+            price_multiplier NUMERIC NOT NULL CHECK (price_multiplier > 0),
+            currency TEXT NOT NULL,
+            hedge_quality TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source_json JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            UNIQUE (derivative_instrument_id, underlying_instrument_id)
+        );
+        """,
+    ),
+    (
+        15,
+        "history job worker leases",
+        """
+        ALTER TABLE history_fetch_job
+            ADD COLUMN IF NOT EXISTS owner_id TEXT,
+            ADD COLUMN IF NOT EXISTS lease_token TEXT,
+            ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS takeover_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE history_fetch_item
+            ADD COLUMN IF NOT EXISTS owner_id TEXT,
+            ADD COLUMN IF NOT EXISTS lease_token TEXT,
+            ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS takeover_count INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS history_fetch_job_recovery_idx
+            ON history_fetch_job (status, lease_expires_at, created_at)
+            WHERE status IN ('queued', 'running', 'cancel_requested');
+        CREATE INDEX IF NOT EXISTS history_fetch_item_recovery_idx
+            ON history_fetch_item (status, lease_expires_at, job_id)
+            WHERE status IN ('queued', 'running');
+        """,
+    ),
+    (
+        16,
+        "history fetch shard checkpoints",
+        """
+        CREATE TABLE IF NOT EXISTS history_fetch_shard (
+            job_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            shard_key TEXT NOT NULL,
+            shard_index INTEGER NOT NULL CHECK (shard_index >= 0),
+            range_start TIMESTAMPTZ NOT NULL,
+            range_end TIMESTAMPTZ NOT NULL,
+            status TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            rows_fetched BIGINT NOT NULL DEFAULT 0,
+            rows_persisted BIGINT NOT NULL DEFAULT 0,
+            cursor_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            write_receipt_json JSONB,
+            error_code TEXT,
+            error_message TEXT,
+            owner_id TEXT,
+            lease_token TEXT,
+            lease_expires_at TIMESTAMPTZ,
+            heartbeat_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ,
+            PRIMARY KEY (job_id, item_id, shard_key),
+            UNIQUE (job_id, item_id, shard_index),
+            FOREIGN KEY (job_id, item_id)
+                REFERENCES history_fetch_item(job_id, item_id) ON DELETE CASCADE,
+            CHECK (range_start < range_end)
+        );
+        CREATE INDEX IF NOT EXISTS history_fetch_shard_recovery_idx
+            ON history_fetch_shard (status, lease_expires_at, job_id, item_id)
+            WHERE status IN ('queued', 'running', 'failed');
+        """,
+    ),
+    (
+        17,
+        "history shard ingestion identities",
+        """
+        ALTER TABLE history_fetch_shard
+            ADD COLUMN IF NOT EXISTS ingestion_id TEXT;
+        CREATE INDEX IF NOT EXISTS history_fetch_shard_ingestion_idx
+            ON history_fetch_shard (ingestion_id)
+            WHERE ingestion_id IS NOT NULL;
+        """,
+    ),
+    (
+        18,
+        "history canonical verification queue",
+        """
+        CREATE TABLE IF NOT EXISTS history_canonical_check (
+            check_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            shard_key TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            interval TEXT NOT NULL,
+            adjustment TEXT NOT NULL,
+            range_start TIMESTAMPTZ NOT NULL,
+            range_end TIMESTAMPTZ NOT NULL,
+            expected_rows BIGINT NOT NULL CHECK (expected_rows >= 0),
+            status TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            error_code TEXT,
+            error_message TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ,
+            UNIQUE (job_id, item_id, shard_key),
+            FOREIGN KEY (job_id, item_id, shard_key)
+                REFERENCES history_fetch_shard(job_id, item_id, shard_key)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS history_canonical_check_pending_idx
+            ON history_canonical_check (status, updated_at)
+            WHERE status IN ('pending', 'retry');
         """,
     ),
 ]

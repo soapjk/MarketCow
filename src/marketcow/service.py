@@ -7,6 +7,7 @@ import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -26,10 +27,12 @@ from .providers.baostock_provider import BaoStockProvider, optional_float
 from .providers.eastmoney import EastmoneySpotProvider
 from .providers.tdx_financial import TdxFinancialProvider
 from .providers.yahoo_quote import YahooQuoteProvider
-from .providers.yahoo_quote import normalize_yahoo_symbol
-from .providers.hyperliquid import HyperliquidProvider, hyperliquid_instrument
+from .providers.hyperliquid import HyperliquidProvider
+from .cross_market import (
+    cross_market_snapshot, exact_relationship, load_cross_market_inputs,
+)
 from .providers.instrument_search import InstrumentSearchProvider
-from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider, normalize_a_symbol
+from .providers.eastmoney_realtime import EastmoneyRealtimeQuoteProvider
 from .providers.sina_realtime import SinaRealtimeQuoteProvider
 from .providers.calendar import CalendarProvider
 from .providers.tushare_provider import TushareProvider
@@ -62,6 +65,7 @@ from .market_data_contracts import (
 from .provider_routing import (
     MARKET_BAR_HISTORY,
     REALTIME_QUOTE,
+    ProviderNotSupported,
     ProviderUnavailable,
     select_providers,
 )
@@ -266,7 +270,8 @@ class FundamentalService:
             self.repository_database.close()
 
     def _persist_tushare_response(
-        self, api_name: str, params: Dict[str, Any], fields: str, result: Dict[str, Any]
+        self, api_name: str, params: Dict[str, Any], fields: str,
+        result: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         result = json_safe(result)
         ingested_at = utc_now()
@@ -280,7 +285,10 @@ class FundamentalService:
             "data.fields + data.items",
             ingested_at,
             ingested_at,
-            {"api_name": api_name, "params": params, "fields": fields, "row_count": len(rows)},
+            {
+                "api_name": api_name, "params": params, "fields": fields,
+                "row_count": len(rows), **(metadata or {}),
+            },
         )
         self.metadata_repository.save_tushare_response({
             "request_id": uuid.uuid4().hex, "api_name": api_name, "params": params,
@@ -318,28 +326,65 @@ class FundamentalService:
             raise ValueError("unsupported range")
         end = datetime.now().astimezone()
         start = end - timedelta(days=range_days[range_])
+        return self.refresh_tushare_minute_history_window(
+            symbol, start, end, interval, adjustment, range_label=range_
+        )
+
+    def refresh_tushare_minute_history_window(
+        self, symbol: str, start: datetime, end: datetime, interval: str,
+        adjustment: str, range_label: str = "window",
+        ingestion_id: str | None = None,
+    ) -> Dict[str, Any]:
+        if adjustment != "raw":
+            raise ValueError("Tushare minute bars currently require adjustment=raw")
+        frequencies = {
+            "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+            "60m": "60min", "1h": "60min",
+        }
+        if interval not in frequencies:
+            raise ValueError("unsupported Tushare minute interval")
+        if start.tzinfo is None or end.tzinfo is None or start >= end:
+            raise ValueError("history window must be ordered and timezone-aware")
+        if range_label == "window":
+            range_label = (
+                f"{start.astimezone(timezone.utc).isoformat()}/"
+                f"{end.astimezone(timezone.utc).isoformat()}"
+            )
+        instrument = canonical_instrument(symbol)
+        if instrument.market != "CN":
+            raise ValueError("Tushare minute history requires a CN instrument")
+        provider_symbol = instrument.provider_symbol("provider:tushare")
         params = {
-            "ts_code": symbol, "freq": frequencies[interval],
+            "ts_code": provider_symbol, "freq": frequencies[interval],
             "start_date": start.strftime("%Y-%m-%d %H:%M:%S"),
             "end_date": end.strftime("%Y-%m-%d %H:%M:%S"),
         }
         result = self.tushare_provider.call("stk_mins", params, "")
-        artifact = self._persist_tushare_response("stk_mins", params, "", result)
+        artifact = self._persist_tushare_response(
+            "stk_mins", params, "", result,
+            {"ingestion_id": ingestion_id} if ingestion_id else None,
+        )
         bars = self.tushare_provider.minute_bars(result)
         ingested_at = utc_now()
         count = self.market_bar_repository.upsert_price_bars(
-            symbol, interval, "raw", self.tushare_provider.name, ingested_at, bars,
+            instrument.instrument_id, interval, "raw",
+            self.tushare_provider.name, ingested_at, bars,
             {"source_url": self.tushare_provider.base_url + "/", "observed_at": ingested_at,
              "raw_response_locator": "data.items", "raw_path": artifact["storage_path"],
-             "raw_artifact_id": artifact["artifact_id"]},
+             "raw_artifact_id": artifact["artifact_id"],
+             "ingestion_id": ingestion_id},
         )
         self.metadata_repository.record_provider_health(self.tushare_provider.name, True, ingested_at)
         return {
-            "symbol": symbol, "range": range_, "interval": interval, "adjustment": "raw",
+            "symbol": instrument.instrument_id,
+            "provider_symbol": provider_symbol, "range": range_label,
+            "interval": interval, "adjustment": "raw",
             "source": self.tushare_provider.name, "source_url": self.tushare_provider.base_url + "/",
             "raw_response_locator": "data.items", "bars": bars, "count": count,
             "observed_at": ingested_at, "ingested_at": ingested_at,
-            "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"],
+            "raw_path": artifact["storage_path"],
+            "raw_artifact_id": artifact["artifact_id"],
+            "ingestion_id": ingestion_id,
         }
 
     def search_instruments(self, query: str, limit: int = 12) -> List[Dict[str, Any]]:
@@ -421,7 +466,7 @@ class FundamentalService:
             normalize_dividend_symbol(value)
             for value in getattr(settings, "dividend_etf_symbols", ())
         }
-        if instrument.symbol in configured:
+        if instrument.instrument_id in configured:
             return "etf"
         if instrument.market == "CN" and instrument.symbol[:2] in {
             "15", "16", "50", "51", "52", "56", "58",
@@ -502,7 +547,7 @@ class FundamentalService:
         self, provider: Any, symbol: str, fiscal_year: int
     ) -> Dict[str, Any]:
         instrument = canonical_instrument(symbol)
-        announcements = provider.fetch(instrument.symbol, fiscal_year)
+        announcements = provider.fetch(instrument.instrument_id, fiscal_year)
         query_sources = sorted({
             str(row.get("source_name") or "").strip()
             for row in announcements if row.get("source_name")
@@ -521,7 +566,7 @@ class FundamentalService:
             artifact = self._register_file_artifact(
                 path, "dividend_announcement", announcement["source_name"],
                 announcement["source_url"], "document", utc_now(),
-                {"symbol": instrument.symbol, "fiscal_year": fiscal_year},
+                {"symbol": instrument.instrument_id, "fiscal_year": fiscal_year},
             )
             announcement["raw_artifact_id"] = artifact["artifact_id"]
         result = (
@@ -554,10 +599,10 @@ class FundamentalService:
                 "automatic official refresh is not yet available for this market"
             )
         attempted_at = utc_now()
-        prior_state = self._dividend_state(instrument.symbol, fiscal_year)
+        prior_state = self._dividend_state(instrument.instrument_id, fiscal_year)
         source = self._dividend_provider_name(provider)
         self.fundamental_repository.upsert_dividend_refresh_state({
-            "symbol": instrument.symbol, "fiscal_year": fiscal_year,
+            "symbol": instrument.instrument_id, "fiscal_year": fiscal_year,
             "status": "refreshing", "last_attempt_at": attempted_at,
             "last_success_at": (
                 prior_state.get("last_success_at") if prior_state else None
@@ -569,14 +614,14 @@ class FundamentalService:
         })
         try:
             ingestion = self._fetch_and_ingest_dividends(
-                provider, instrument.symbol, fiscal_year
+                provider, instrument.instrument_id, fiscal_year
             )
             source = str(ingestion.get("query_source") or source)
             succeeded_at = utc_now()
-            refreshed_data = self._read_dividends(instrument.symbol, fiscal_year)
+            refreshed_data = self._read_dividends(instrument.instrument_id, fiscal_year)
             count = int(refreshed_data.get("announced_count") or 0)
             state = {
-                "symbol": instrument.symbol, "fiscal_year": fiscal_year,
+                "symbol": instrument.instrument_id, "fiscal_year": fiscal_year,
                 "status": "success_data" if count else "success_empty",
                 "last_attempt_at": attempted_at,
                 "last_success_at": succeeded_at, "last_error": "",
@@ -594,7 +639,7 @@ class FundamentalService:
         except Exception as exc:
             failed_at = utc_now()
             self.fundamental_repository.upsert_dividend_refresh_state({
-                "symbol": instrument.symbol, "fiscal_year": fiscal_year,
+                "symbol": instrument.instrument_id, "fiscal_year": fiscal_year,
                 "status": self._dividend_failure_status(exc),
                 "last_attempt_at": attempted_at,
                 "last_success_at": (
@@ -731,7 +776,7 @@ class FundamentalService:
         instrument = canonical_instrument(symbol)
         if instrument.market != "CN":
             raise ValueError("third-party dividend discovery currently supports A shares")
-        ts_code = instrument.symbol
+        ts_code = instrument.provider_symbol("provider:tushare")
         result = self.tushare_provider.call("dividend", {"ts_code": ts_code}, "")
         announcements = []
         for row in self.tushare_provider.rows(result):
@@ -744,7 +789,7 @@ class FundamentalService:
                 continue
             pay_date = str(row.get("pay_date") or "")
             announcements.append({
-                "symbol": instrument.symbol, "fiscal_year": fiscal_year,
+                "symbol": instrument.instrument_id, "fiscal_year": fiscal_year,
                 "amount_per_share": str(amount), "currency": "CNY",
                 "announcement_date": (
                     f"{announced[:4]}-{announced[4:6]}-{announced[6:]}"
@@ -772,7 +817,10 @@ class FundamentalService:
         ingestion = self.ingest_dividend_announcements(announcements) if announcements else {
             "status": "success", "count": 0, "ingested_at": utc_now()
         }
-        return {**ingestion, "data": self.get_dividends(instrument.symbol, fiscal_year)}
+        return {
+            **ingestion,
+            "data": self.get_dividends(instrument.instrument_id, fiscal_year),
+        }
 
     def _start_run(self, job_name: str, report_period: str = "") -> tuple[str, str]:
         run_id, started_at = uuid.uuid4().hex, utc_now()
@@ -818,30 +866,43 @@ class FundamentalService:
         self.artifact_store.save_artifact(manifest)
         return manifest
 
-    def _save_quote_raw(self, symbol: str, dataset: str, payload: Dict[str, Any], ingested_at: str, source: str, source_url: str, locator: str) -> Dict[str, Any]:
+    def _save_quote_raw(
+        self, symbol: str, dataset: str, payload: Dict[str, Any],
+        ingested_at: str, source: str, source_url: str, locator: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         safe_symbol = "".join(ch for ch in symbol if ch.isalnum() or ch in ("-", "."))
         folder = self.settings.raw_path / "quotes" / safe_symbol
-        return self._write_artifact(folder, "quote_" + dataset, payload, source, source_url, locator, ingested_at, ingested_at, {"symbol": symbol})
+        return self._write_artifact(
+            folder, "quote_" + dataset, payload, source, source_url, locator,
+            ingested_at, ingested_at, {"symbol": symbol, **(metadata or {})},
+        )
 
     @staticmethod
     def _quote_market(symbol: str) -> tuple[str, str]:
-        if str(symbol).strip().upper().endswith(".HYPL"):
-            instrument_id, _provider_symbol, _kind = hyperliquid_instrument(symbol)
-            return "CRYPTO", instrument_id
-        try:
-            return "CN", normalize_a_symbol(symbol)
-        except ValueError:
-            normalized, market = normalize_yahoo_symbol(symbol)
-            return market, normalized
+        instrument = canonical_instrument(symbol)
+        return instrument.market, instrument.instrument_id
 
     def _quote_provider(self, name: str) -> Any:
         return self.provider_registry.get(name)
 
     def _fetch_realtime_quote(self, provider_name: str, symbol: str) -> Dict[str, Any]:
         provider = self._quote_provider(provider_name)
+        instrument = canonical_instrument(symbol)
         if provider_name != "tushare":
-            return provider.fetch_quote(symbol)
-        rows = json_safe(provider.realtime_quote(symbol))
+            provider_input = (
+                instrument.provider_symbol(f"provider:{provider_name}")
+                if provider_name in {"eastmoney", "sina"}
+                else instrument.instrument_id
+            )
+            row = provider.fetch_quote(provider_input)
+            row["provider_symbol"] = row.get("symbol") or provider_input
+            row["instrument_id"] = instrument.instrument_id
+            row["symbol"] = instrument.instrument_id
+            row["exchange"] = instrument.mic
+            return row
+        provider_symbol = instrument.provider_symbol("provider:tushare")
+        rows = json_safe(provider.realtime_quote(provider_symbol))
         if not rows:
             raise RuntimeError("Tushare returned no realtime quote")
         item = rows[0]
@@ -849,7 +910,7 @@ class FundamentalService:
         if price is None:
             raise RuntimeError("Tushare returned no usable price")
         previous_close = _number(item.get("PRE_CLOSE"))
-        code = symbol.split(".")[0]
+        code = instrument.symbol
         date_value, time_value = item.get("DATE"), item.get("TIME")
         quote_at = None
         if date_value and time_value:
@@ -860,9 +921,11 @@ class FundamentalService:
             except ValueError:
                 pass
         return {
-            "instrument_id": instrument_id(code), "symbol": symbol,
+            "instrument_id": instrument.instrument_id,
+            "symbol": instrument.instrument_id,
+            "provider_symbol": provider_symbol,
             "name": item.get("NAME") or code, "market": "CN",
-            "exchange": exchange_for_symbol(code), "currency": "CNY",
+            "exchange": instrument.mic, "currency": "CNY",
             "price": price, "previous_close": previous_close,
             "change": None if previous_close is None else price - previous_close,
             "change_pct": None if not previous_close else (price / previous_close - 1) * 100,
@@ -1056,11 +1119,60 @@ class FundamentalService:
 
         return self.longport_quote_provider.fetch_spread(symbol)
 
+    def get_instrument_relationship(
+        self, derivative_instrument_id: str, underlying_instrument_id: str,
+    ) -> Dict[str, Any]:
+        relationship_id = (
+            f"{derivative_instrument_id}~{underlying_instrument_id}"
+        )
+        getter = getattr(
+            self.metadata_repository, "get_instrument_relationship", None
+        )
+        if getter is not None:
+            saved = getter(relationship_id)
+            if saved is not None:
+                result = dict(saved)
+                for field in ("quantity_multiplier", "price_multiplier"):
+                    result[field] = format(Decimal(str(result[field])), "f")
+                result.pop("updated_at", None)
+                return result
+        derivative = self.metadata_repository.get_instrument(
+            derivative_instrument_id
+        )
+        underlying = self.metadata_repository.get_instrument(
+            underlying_instrument_id
+        )
+        if derivative is None or underlying is None:
+            raise ValueError("relationship instrument is unavailable")
+        return exact_relationship(derivative, underlying)
+
+    def get_cross_market_snapshot(
+        self, derivative_instrument_id: str, underlying_instrument_id: str,
+        *, depth: int, max_age_ms: int, max_skew_ms: int,
+    ) -> Dict[str, Any]:
+        relationship = self.get_instrument_relationship(
+            derivative_instrument_id, underlying_instrument_id
+        )
+        underlying = self.metadata_repository.get_instrument(
+            underlying_instrument_id
+        )
+        if underlying is None:
+            raise ValueError("underlying instrument is unavailable")
+        derivative_book, underlying_book, context = load_cross_market_inputs(
+            self.hyperliquid_provider, self.longport_quote_provider,
+            derivative_instrument_id, underlying["symbol"], depth,
+        )
+        return cross_market_snapshot(
+            relationship, derivative_book, underlying_book, context,
+            max_age_ms=max_age_ms, max_skew_ms=max_skew_ms,
+        )
+
     def refresh_quote_history(
         self, symbol: str, range_: str, interval: str, adjustment: str,
         provider: str | None = None, allow_fallback: bool = False,
     ) -> Dict[str, Any]:
-        market, normalized = self._quote_market(symbol)
+        instrument = canonical_instrument(symbol)
+        market, normalized = instrument.market, instrument.instrument_id
         priority = tuple(
             {"yahoo_chart": "yahoo"}.get(item, item)
             for item in self.settings.clickhouse_source_priority
@@ -1109,7 +1221,9 @@ class FundamentalService:
             )
         run_id, started_at = self._start_run("refresh_quote_history", symbol)
         try:
-            result = self.quote_provider.fetch_history(normalized, range_, interval, adjustment)
+            result = self.quote_provider.fetch_history(
+                instrument.instrument_id, range_, interval, adjustment,
+            )
         except Exception as exc:
             provider = getattr(self.quote_provider, "name", self.quote_provider.__class__.__name__)
             self.metadata_repository.record_provider_health(provider, False, utc_now(), str(exc))
@@ -1119,18 +1233,105 @@ class FundamentalService:
             result, range_, interval, adjustment, run_id, started_at, symbol
         )
 
+    def refresh_quote_history_window(
+        self, symbol: str, start: datetime, end: datetime, interval: str,
+        adjustment: str, provider: str, allow_fallback: bool = False,
+        ingestion_id: str | None = None,
+    ) -> Dict[str, Any]:
+        if start.tzinfo is None or end.tzinfo is None or start >= end:
+            raise ValueError("history window must be ordered and timezone-aware")
+        instrument = canonical_instrument(symbol)
+        market, normalized = instrument.market, instrument.instrument_id
+        priority = tuple(
+            {"yahoo_chart": "yahoo"}.get(item, item)
+            for item in self.settings.clickhouse_source_priority
+        )
+        names = select_providers(
+            MARKET_BAR_HISTORY, market, provider, priority,
+            allow_fallback=allow_fallback,
+        )
+        errors: list[str] = []
+        range_label = (
+            f"{start.astimezone(timezone.utc).isoformat()}/"
+            f"{end.astimezone(timezone.utc).isoformat()}"
+        )
+        for name in names:
+            run_id, started_at = self._start_run(
+                "refresh_quote_history_window", symbol
+            )
+            try:
+                if name == "tushare":
+                    if not self.tushare_provider.configured:
+                        raise ProviderUnavailable(
+                            "tushare provider is not configured",
+                            provider=name, capability=MARKET_BAR_HISTORY,
+                            market=market,
+                        )
+                    return self.refresh_tushare_minute_history_window(
+                        normalized, start, end, interval, adjustment,
+                        range_label=range_label, ingestion_id=ingestion_id,
+                    )
+                if name == "hyperliquid":
+                    result = self.hyperliquid_provider.fetch_history_window(
+                        normalized, start, end, interval, adjustment
+                    )
+                elif name == "yahoo":
+                    result = self.quote_provider.fetch_history_window(
+                        instrument.instrument_id, start, end, interval, adjustment
+                    )
+                else:
+                    raise ProviderNotSupported(
+                        f"provider {name!r} has no history window adapter",
+                        provider=name, capability=MARKET_BAR_HISTORY,
+                        market=market,
+                    )
+                return self._persist_history_result(
+                    result, range_label, interval, adjustment,
+                    run_id, started_at, symbol, ingestion_id=ingestion_id,
+                )
+            except Exception as exc:
+                self._finish_run(
+                    run_id, "refresh_quote_history_window", started_at,
+                    symbol, 0, str(exc),
+                )
+                errors.append(f"{name}: {exc}")
+                if not allow_fallback:
+                    raise
+        raise ProviderUnavailable(
+            "; ".join(errors) or "no history window provider available",
+            provider=provider, capability=MARKET_BAR_HISTORY, market=market,
+        )
+
     def _persist_history_result(
         self, result: Dict[str, Any], range_: str, interval: str,
         adjustment: str, run_id: str, started_at: str, requested_symbol: str,
+        ingestion_id: str | None = None,
     ) -> Dict[str, Any]:
         raw_payload = result.pop("_raw_payload")
         ingested_at = utc_now()
-        artifact = self._save_quote_raw(result["symbol"], "history-{0}-{1}-{2}".format(range_, interval, adjustment), raw_payload, ingested_at, result["source"], result["source_url"], result["raw_response_locator"])
+        result["provider_symbol"] = result.get("provider_symbol") or result["symbol"]
+        result["symbol"] = canonical_instrument(requested_symbol).instrument_id
+        artifact = self._save_quote_raw(
+            result["symbol"],
+            "history-{0}-{1}-{2}".format(range_, interval, adjustment),
+            raw_payload, ingested_at, result["source"], result["source_url"],
+            result["raw_response_locator"],
+            {"ingestion_id": ingestion_id} if ingestion_id else None,
+        )
         count = self.market_bar_repository.upsert_price_bars(
             result["symbol"], interval, adjustment, result["source"], ingested_at, result["bars"],
-            {**result, "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"], "observed_at": ingested_at},
+            {
+                **result, "raw_path": artifact["storage_path"],
+                "raw_artifact_id": artifact["artifact_id"],
+                "observed_at": ingested_at, "ingestion_id": ingestion_id,
+            },
         )
-        result.update({"count": count, "observed_at": ingested_at, "ingested_at": ingested_at, "raw_path": artifact["storage_path"], "raw_artifact_id": artifact["artifact_id"]})
+        result.update({
+            "count": count, "observed_at": ingested_at,
+            "ingested_at": ingested_at, "raw_path": artifact["storage_path"],
+            "raw_artifact_id": artifact["artifact_id"],
+            "ingestion_id": ingestion_id,
+        })
         self.metadata_repository.record_provider_health(result["source"], True, ingested_at)
         self._finish_run(
             run_id, "refresh_quote_history", started_at, requested_symbol, count
@@ -1156,8 +1357,32 @@ class FundamentalService:
             }
             self.metadata_repository.upsert_instrument(row)
             saved.append(row)
+        relationship_count = 0
+        upsert_relationship = getattr(
+            self.metadata_repository, "upsert_instrument_relationship", None
+        )
+        if upsert_relationship is not None:
+            for derivative in saved:
+                if derivative["instrument_type"] != "equity_perpetual":
+                    continue
+                ticker = derivative["symbol"].removesuffix("-PERP")
+                underlying = None
+                for mic in ("XNAS", "XNYS", "ARCX"):
+                    underlying = self.metadata_repository.get_instrument(
+                        f"{ticker}.{mic}"
+                    )
+                    if underlying is not None:
+                        break
+                if underlying is None:
+                    continue
+                relationship = exact_relationship(derivative, underlying)
+                upsert_relationship({
+                    **relationship, "updated_at": observed_at,
+                })
+                relationship_count += 1
         return {
             "provider": "hyperliquid", "count": len(saved),
+            "relationship_count": relationship_count,
             "observed_at": observed_at,
         }
 

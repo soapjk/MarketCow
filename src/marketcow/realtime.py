@@ -44,6 +44,36 @@ def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _longport_trade_status(value: Any) -> str:
+    raw = str(getattr(value, "name", value) or "").lower().replace("_", "")
+    if raw in {"normal", "0"} or raw.endswith(".normal"):
+        return "active"
+    if any(token in raw for token in ("delisted", "expired")):
+        return "delisted"
+    if "fuse" in raw:
+        return "volatility_halt"
+    if any(token in raw for token in ("tobeopened", "preparelist")):
+        return "opening"
+    if any(token in raw for token in ("halt", "suspend")):
+        return "halted"
+    return "unknown"
+
+
+def _longport_session(value: Any) -> str:
+    raw = str(getattr(value, "name", value) or "").lower().replace("_", "")
+    if "overnight" in raw:
+        return "overnight"
+    if "pre" in raw:
+        return "pre_market"
+    if "post" in raw:
+        return "post_market"
+    if raw in {"normal", "normaltrade", "regular", "trading", "0"}:
+        return "regular"
+    if raw in {"closed", "close"}:
+        return "closed"
+    return "unknown"
+
+
 def _event_kind(data_type: str) -> str:
     return "order_book_snapshot" if data_type == "order_book" else data_type
 
@@ -58,7 +88,12 @@ def _provider_capabilities(
     return {
         (
             instrument,
-            "quote" if kind in {"quote", "order_book_snapshot"} else "trade",
+            (
+                "quote" if kind in {"quote", "order_book_snapshot"}
+                or kind == "market_state"
+                else "asset_context" if kind == "asset_context"
+                else "trade"
+            ),
         )
         for instrument, kind in filters
     }
@@ -290,7 +325,7 @@ class RealtimeHub:
                 raise ValueError(f"unknown instrument: {instrument_id}")
             provider_symbols = row.get("provider_symbols", {})
             provider_name = (
-                "hyperliquid" if instrument_id.endswith(".HYPL") else "longport"
+                "hyperliquid" if "hyperliquid" in provider_symbols else "longport"
             )
             symbol = provider_symbols.get(provider_name)
             if not symbol:
@@ -589,6 +624,7 @@ class LongPortRealtimeProvider:
                 )
                 context = QuoteContext(config)
         context.set_on_depth(self._on_depth)
+        context.set_on_quote(self._on_quote)
         context.set_on_trades(self._on_trades)
         return context
 
@@ -615,7 +651,9 @@ class LongPortRealtimeProvider:
                 try:
                     with _direct_connection_environment():
                         if new_depth:
-                            context.subscribe(sorted(new_depth), [SubType.Depth])
+                            context.subscribe(
+                                sorted(new_depth), [SubType.Quote, SubType.Depth]
+                            )
                             subscribed_depth = True
                         if new_trade:
                             context.subscribe(sorted(new_trade), [SubType.Trade])
@@ -623,7 +661,9 @@ class LongPortRealtimeProvider:
                     if subscribed_depth:
                         try:
                             with _direct_connection_environment():
-                                context.unsubscribe(sorted(new_depth), [SubType.Depth])
+                                context.unsubscribe(
+                                    sorted(new_depth), [SubType.Quote, SubType.Depth]
+                                )
                         except Exception:
                             pass
                     raise
@@ -671,7 +711,9 @@ class LongPortRealtimeProvider:
             try:
                 with _direct_connection_environment():
                     if self._context is not None and unsubscribe_depth:
-                        self._context.unsubscribe(sorted(unsubscribe_depth), [SubType.Depth])
+                        self._context.unsubscribe(
+                            sorted(unsubscribe_depth), [SubType.Quote, SubType.Depth]
+                        )
                         unsubscribed_depth = True
                     if self._context is not None and unsubscribe_trade:
                         self._context.unsubscribe(sorted(unsubscribe_trade), [SubType.Trade])
@@ -680,7 +722,8 @@ class LongPortRealtimeProvider:
                     try:
                         with _direct_connection_environment():
                             self._context.subscribe(
-                                sorted(unsubscribe_depth), [SubType.Depth]
+                                sorted(unsubscribe_depth),
+                                [SubType.Quote, SubType.Depth],
                             )
                     except Exception:
                         pass
@@ -733,6 +776,8 @@ class LongPortRealtimeProvider:
             "payload": {
                 "book_type": "L1_MBP", "depth": 1, "baseline_sequence": 0,
                 "bids": book_bids, "asks": book_asks,
+                "ts_event_source": "marketcow_observation",
+                "provider_sequence": getattr(push, "sequence", None),
             },
         })
         if not bids or not asks:
@@ -750,6 +795,33 @@ class LongPortRealtimeProvider:
                 "bid_size": _decimal(bids[0].volume),
                 "ask_size": _decimal(asks[0].volume),
                 "ts_event_source": "marketcow_observation",
+            },
+        })
+
+    def _on_quote(self, *args: Any) -> None:
+        symbol, push = self._callback(args)
+        instrument = self._mapping.get(symbol)
+        if instrument is None:
+            return
+        event_time = _timestamp(getattr(push, "timestamp", None))
+        if event_time is None:
+            self._status("degraded", "quote_timestamp_unavailable")
+            return
+        trade_status = _longport_trade_status(
+            getattr(push, "trade_status", None)
+        )
+        session = _longport_session(getattr(push, "trade_session", None))
+        tradable = trade_status == "active" and session not in {
+            "closed", "unknown",
+        }
+        self._sink({
+            "event_type": "market_state", "instrument_id": instrument,
+            "source": "longport", "ts_event": _iso(event_time),
+            "payload": {
+                "trade_status": trade_status, "session": session,
+                "tradable": tradable,
+                "provider_sequence": getattr(push, "sequence", None),
+                "ts_event_source": "provider",
             },
         })
 

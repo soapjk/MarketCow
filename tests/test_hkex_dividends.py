@@ -13,7 +13,7 @@ class HkexDividendParserTest(unittest.TestCase):
             "Dividend declared HKD 4.50 per share "
             "Ex-dividend date 15 May 2026 Record date 18 May 2026 "
             "Payment date 01 June 2026",
-            "00700.HK", "https://www1.hkexnews.hk/a.pdf", "a.pdf",
+            "700.XHKG", "https://www1.hkexnews.hk/a.pdf", "a.pdf",
         )
         self.assertEqual(rows[0]["amount_per_share"], "4.50")
         self.assertEqual(rows[0]["fiscal_year"], 2025)
@@ -24,7 +24,7 @@ class HkexDividendParserTest(unittest.TestCase):
 
     def test_missing_payment_date_is_not_confirmed(self):
         self.assertEqual(parse_hkex_dividend_form(
-            "Dividend declared HKD 4.50 per share", "00700.HK",
+            "Dividend declared HKD 4.50 per share", "700.XHKG",
             "https://www1.hkexnews.hk/a.pdf", "a.pdf",
         ), [])
 

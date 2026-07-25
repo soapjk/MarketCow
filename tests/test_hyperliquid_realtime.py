@@ -64,21 +64,21 @@ class HyperliquidRealtimeTest(unittest.TestCase):
         events = []
         provider.set_sink(events.append)
         provider.subscribe(
-            {"BTC-PERP.HYPL": "BTC"}, {"quote", "trade"}
+            {"BTC-PERP.HYPL": "BTC"}, {"quote", "trade", "asset_context"}
         )
         subscribed = {
             value["subscription"]["type"] for value in apps[0].sent
             if value["method"] == "subscribe"
         }
-        self.assertEqual(subscribed, {"bbo", "trades"})
+        self.assertEqual(subscribed, {"l2Book", "trades", "activeAssetCtx"})
 
         provider._on_message(None, json.dumps({
-            "channel": "bbo",
+            "channel": "l2Book",
             "data": {
                 "coin": "BTC", "time": 1_700_000_000_000,
-                "bbo": [
-                    {"px": "64999.5", "sz": "1.2", "n": 2},
-                    {"px": "65000.5", "sz": "0.8", "n": 1},
+                "levels": [
+                    [{"px": "64999.5", "sz": "1.2", "n": 2}],
+                    [{"px": "65000.5", "sz": "0.8", "n": 1}],
                 ],
             },
         }))
@@ -89,29 +89,41 @@ class HyperliquidRealtimeTest(unittest.TestCase):
                 "px": "65000", "sz": "0.1", "side": "B", "tid": 42,
             }],
         }))
+        provider._on_message(None, json.dumps({
+            "channel": "activeAssetCtx",
+            "data": {
+                "coin": "BTC", "time": 1_700_000_000_002,
+                "ctx": {
+                    "markPx": "65001", "oraclePx": "65000",
+                    "funding": "0.00001", "openInterest": "100",
+                },
+            },
+        }))
         self.assertEqual(
             [event["event_type"] for event in events],
-            ["order_book_snapshot", "quote", "trade"],
+            ["order_book_snapshot", "quote", "trade", "asset_context"],
         )
         self.assertEqual(events[1]["payload"]["bid_price"], "64999.5")
+        self.assertEqual(events[0]["payload"]["bids"][0]["order_count"], 2)
         self.assertEqual(events[2]["payload"]["aggressor_side"], "BUYER")
+        self.assertEqual(events[3]["payload"]["oracle_status"], "internal_only")
         provider.close()
 
     def test_routing_preserves_longport_and_hyperliquid(self):
         longport, hyperliquid = FakeVenue(), FakeVenue()
         router = RoutingRealtimeProvider(longport, hyperliquid)
         router.subscribe({
-            "US.XNAS.AAPL": "AAPL.US",
+            "AAPL.XNAS": "AAPL.US",
             "BTC-PERP.HYPL": "BTC",
         }, {"quote"})
         self.assertEqual(
-            longport.subscribed[0][0], {"US.XNAS.AAPL": "AAPL.US"}
+            longport.subscribed[0][0], {"AAPL.XNAS": "AAPL.US"}
         )
         self.assertEqual(
             hyperliquid.subscribed[0][0], {"BTC-PERP.HYPL": "BTC"}
         )
         router.unsubscribe({
-            ("US.XNAS.AAPL", "quote"), ("BTC-PERP.HYPL", "quote"),
+            ("AAPL.XNAS", "quote"), ("BTC-PERP.HYPL", "quote"),
         })
         self.assertEqual(
             hyperliquid.unsubscribed[0], {("BTC-PERP.HYPL", "quote")}

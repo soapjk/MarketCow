@@ -89,7 +89,7 @@ class ServiceRoutingTest(unittest.TestCase):
             pg.query_fundamentals.return_value = [{"symbol": "000001"}]
             pg.list_artifacts.return_value = [{"artifact_id": "artifact-1"}]
             direct = MagicMock()
-            direct.get_latest_quotes.return_value = [{"symbol": "AAPL", "close": 1.0}]
+            direct.get_latest_quotes.return_value = [{"symbol": "AAPL.XNAS", "close": 1.0}]
             direct.get_price_bars.return_value = []
             writer = MagicMock()
             resources = SimpleNamespace(
@@ -114,13 +114,13 @@ class ServiceRoutingTest(unittest.TestCase):
                 self.assertEqual(client.get(
                     "/v1/admin/artifacts?limit=1"
                 ).json()["items"][0]["artifact_id"], "artifact-1")
-                quote = client.get("/v1/quotes?symbols=AAPL&refresh=false")
+                quote = client.get("/v1/quotes?symbols=AAPL.XNAS&refresh=false")
                 self.assertEqual(quote.status_code, 200)
-                self.assertEqual(quote.json()["items"][0]["symbol"], "AAPL")
-                exposure = client.get("/v1/exposure-facts/AAPL")
+                self.assertEqual(quote.json()["items"][0]["symbol"], "AAPL.XNAS")
+                exposure = client.get("/v1/exposure-facts/AAPL.XNAS")
                 self.assertEqual(exposure.status_code, 200)
                 self.assertEqual(exposure.json()["schema"], "marketcow.exposure-facts.v1")
-                self.assertEqual(exposure.json()["symbol"], "AAPL")
+                self.assertEqual(exposure.json()["symbol"], "AAPL.XNAS")
                 health = client.get("/v1/health")
                 self.assertEqual(
                     health.json()["database"],
@@ -129,7 +129,7 @@ class ServiceRoutingTest(unittest.TestCase):
                 service.quote_provider = SimpleNamespace(
                     name="fixture", base_url="local://fixture",
                     fetch_history=lambda *_args: {
-                        "symbol": "AAPL", "source": "fixture",
+                        "symbol": "AAPL.XNAS", "source": "fixture",
                         "source_url": "local://fixture",
                         "raw_response_locator": "payload", "_raw_payload": {"ok": True},
                         "bars": [{
@@ -139,13 +139,13 @@ class ServiceRoutingTest(unittest.TestCase):
                         }],
                     },
                 )
-                direct.prepare_raw_bars.return_value = [{"symbol": "AAPL"}]
+                direct.prepare_raw_bars.return_value = [{"symbol": "AAPL.XNAS"}]
                 writer.write.return_value = {
                     "status": "success", "acknowledged": True,
                     "verified": True, "written": 1,
                 }
                 success = client.get(
-                    "/v1/quotes/AAPL/history?refresh=true&interval=1d&adjustment=raw"
+                    "/v1/quotes/AAPL.XNAS/history?refresh=true&interval=1d&adjustment=raw"
                 )
                 self.assertEqual(success.status_code, 200)
                 writer.write.return_value = {
@@ -154,7 +154,7 @@ class ServiceRoutingTest(unittest.TestCase):
                 }
                 direct.get_price_bars.return_value = []
                 pending = client.get(
-                    "/v1/quotes/AAPL/history?refresh=true&interval=1d&adjustment=raw"
+                    "/v1/quotes/AAPL.XNAS/history?refresh=true&interval=1d&adjustment=raw"
                 )
                 self.assertEqual(pending.status_code, 502)
                 self.assertIn("durable_pending", pending.json()["detail"])
@@ -163,7 +163,7 @@ class ServiceRoutingTest(unittest.TestCase):
                     "terminal": True,
                 })
                 terminal = client.get(
-                    "/v1/quotes/AAPL/history?refresh=true&interval=1d&adjustment=raw"
+                    "/v1/quotes/AAPL.XNAS/history?refresh=true&interval=1d&adjustment=raw"
                 )
                 self.assertEqual(terminal.status_code, 502)
                 self.assertLessEqual(len(terminal.json()["detail"]), 1000)
@@ -202,7 +202,7 @@ from fastapi.testclient import TestClient
 import marketcow.api as api
 with TestClient(api.create_app()) as client:
  assert client.get('/v1/economic-indicators').status_code == 200
- assert client.get('/v1/quotes?symbols=AAPL&refresh=false').status_code == 200
+ assert client.get('/v1/quotes?symbols=AAPL.XNAS&refresh=false').status_code == 200
  assert client.get('/v1/health').json()['database']=='postgresql://marketcow_test+clickhouse://marketcow_test'
 assert 'duckdb' not in sys.modules
 assert 'marketcow.storage' not in sys.modules
@@ -238,7 +238,7 @@ class ServiceIntegrationTest(unittest.TestCase):
             service = FundamentalService(settings)
             resources = service.online_resources
             service.market_bar_repository.upsert_price_bars(
-                "AAPL", "1d", "raw", "fixture", "2026-07-21T00:00:01Z",
+                "AAPL.XNAS", "1d", "raw", "fixture", "2026-07-21T00:00:01Z",
                 [{
                     "bar_at": "2026-07-20T00:00:00Z", "open": 10.0,
                     "high": 12.0, "low": 9.0, "close": 11.0,
@@ -247,12 +247,12 @@ class ServiceIntegrationTest(unittest.TestCase):
                 {"market": "US", "observed_at": "2026-07-20T00:00:00Z"},
             )
             rebuilt = resources.canonical_builder.rebuild(
-                "AAPL", "1d", "raw", "2026-07-20T00:00:00Z",
+                "AAPL.XNAS", "1d", "raw", "2026-07-20T00:00:00Z",
                 "2026-07-20T00:00:00Z", 10,
             )
             self.assertEqual(rebuilt["status"], "ok")
             resources.market_bars.upsert_quote({
-                "symbol": "AAPL", "source": "fixture", "close": 11.0,
+                "symbol": "AAPL.XNAS", "source": "fixture", "close": 11.0,
                 "observed_at": "2026-07-20T00:00:00Z",
                 "ingested_at": "2026-07-21T00:00:01Z",
             })
@@ -286,15 +286,15 @@ class ServiceIntegrationTest(unittest.TestCase):
                 )
                 self.assertNotIn("duckdb", health.text.lower())
                 self.assertEqual(client.get(
-                    "/v1/quotes?symbols=AAPL&refresh=false"
+                    "/v1/quotes?symbols=AAPL.XNAS&refresh=false"
                 ).json()["items"][0]["close"], 11.0)
                 history = client.get(
-                    "/v1/quotes/AAPL/history?refresh=false&interval=1d&adjustment=raw"
+                    "/v1/quotes/AAPL.XNAS/history?refresh=false&interval=1d&adjustment=raw"
                 )
                 self.assertEqual(history.status_code, 200)
                 self.assertEqual(history.json()["bars"][0]["close"], 11.0)
                 raw = client.get(
-                    "/v1/quotes/AAPL/raw-history?interval=1d&adjustment=raw&"
+                    "/v1/quotes/AAPL.XNAS/raw-history?interval=1d&adjustment=raw&"
                     "start=2026-07-20T00:00:00Z&end=2026-07-20T00:00:00Z"
                 )
                 self.assertEqual(raw.status_code, 200)

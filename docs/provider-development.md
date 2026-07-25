@@ -34,7 +34,7 @@ class ExampleQuoteProvider:
     def fetch_quote(self, symbol: str) -> dict[str, Any]:
         payload = self._bounded_request(symbol)  # 必须有总超时、限流和响应大小边界
         return {
-            "instrument_id": "US.XNAS." + symbol,
+            "instrument_id": symbol + ".XNAS",
             "symbol": symbol,
             "market": "US",
             "exchange": "XNAS",

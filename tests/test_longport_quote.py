@@ -77,14 +77,14 @@ class LongPortQuoteProviderTest(unittest.TestCase):
                     os.environ[name] = value
 
     def test_symbol_mapping_covers_current_market_contract(self):
-        self.assertEqual(normalize_longport_symbol("600519.SH"), (
-            "600519.SH", "CN", "600519.SH",
+        self.assertEqual(normalize_longport_symbol("600519.XSHG"), (
+            "600519.XSHG", "CN", "600519.SH",
         ))
-        self.assertEqual(normalize_longport_symbol("0700.HK"), (
-            "0700.HK", "HK", "700.HK",
+        self.assertEqual(normalize_longport_symbol("700.XHKG"), (
+            "700.XHKG", "HK", "700.HK",
         ))
-        self.assertEqual(normalize_longport_symbol("BRK.B"), (
-            "BRK-B", "US", "BRK.B.US",
+        self.assertEqual(normalize_longport_symbol("BRK-B.XNYS"), (
+            "BRK-B.XNYS", "US", "BRK.B.US",
         ))
         with self.assertRaises(ValueError):
             normalize_longport_symbol("CNY=X")
@@ -94,9 +94,9 @@ class LongPortQuoteProviderTest(unittest.TestCase):
         provider = LongPortQuoteProvider(
             "key", "secret", "token", context_factory=lambda: context,
         )
-        result = provider.fetch_quotes(["AAPL", "0700.HK"])
+        result = provider.fetch_quotes(["AAPL.XNAS", "700.XHKG"])
         self.assertEqual(context.calls, [["AAPL.US", "700.HK"]])
-        self.assertEqual([row["symbol"] for row in result], ["AAPL", "0700.HK"])
+        self.assertEqual([row["symbol"] for row in result], ["AAPL.XNAS", "700.XHKG"])
         self.assertEqual([row["price"] for row in result], [101.25, 321.4])
         for row in result:
             validate_realtime_quote(row)
@@ -110,7 +110,7 @@ class LongPortQuoteProviderTest(unittest.TestCase):
         provider = LongPortQuoteProvider(
             "key", "secret", "token", context_factory=lambda: context,
         )
-        result = provider.fetch_quote("AAPL")
+        result = provider.fetch_quote("AAPL.XNAS")
         self.assertEqual(result["price"], 103.5)
         self.assertEqual(result["session"], "post_market")
 
@@ -125,7 +125,7 @@ class LongPortQuoteProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: context,
         )
 
-        result = provider.fetch_quote("0700.HK")
+        result = provider.fetch_quote("700.XHKG")
 
         self.assertEqual(result["quote_at"], "2026-07-23T02:50:21+00:00")
         self.assertEqual(result["market"], "HK")
@@ -147,7 +147,7 @@ class LongPortQuoteProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: context,
         )
 
-        result = provider.fetch_quote("AAPL")
+        result = provider.fetch_quote("AAPL.XNAS")
 
         self.assertEqual(result["quote_at"], "2026-07-22T23:59:59+00:00")
         self.assertEqual(result["session"], "post_market")
@@ -166,20 +166,20 @@ class LongPortQuoteProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: context,
         )
 
-        result = provider.fetch_quote("0700.HK")
+        result = provider.fetch_quote("700.XHKG")
 
         self.assertEqual(result["quote_at"], "2026-07-23T02:50:21+00:00")
 
     def test_missing_credentials_and_sdk_errors_are_bounded_and_redacted(self):
         with self.assertRaisesRegex(LongPortError, "credentials are not configured"):
-            LongPortQuoteProvider("", "", "").fetch_quote("AAPL")
+            LongPortQuoteProvider("", "", "").fetch_quote("AAPL.XNAS")
         secret = "do-not-leak"
         provider = LongPortQuoteProvider(
             "key", secret, "token",
             context_factory=lambda: FakeContext(error=RuntimeError(secret)),
         )
         with self.assertRaises(LongPortError) as raised:
-            provider.fetch_quote("AAPL")
+            provider.fetch_quote("AAPL.XNAS")
         self.assertNotIn(secret, str(raised.exception))
 
     def test_incomplete_batch_fails_closed_and_close_is_idempotent(self):
@@ -188,7 +188,7 @@ class LongPortQuoteProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: context,
         )
         with self.assertRaisesRegex(LongPortError, "incomplete"):
-            provider.fetch_quotes(["AAPL", "MSFT"])
+            provider.fetch_quotes(["AAPL.XNAS", "MSFT.XNAS"])
         provider.close()
         provider.close()
         self.assertTrue(context.closed)
@@ -209,7 +209,7 @@ class LongPortQuoteProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: context,
         )
 
-        result = provider.fetch_spread("AAPL")
+        result = provider.fetch_spread("AAPL.XNAS")
 
         self.assertEqual(context.calls, ["AAPL.US"])
         self.assertEqual(result["best_bid"], 101.0)
@@ -228,7 +228,7 @@ class LongPortQuoteProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: FakeContext(one_sided),
         )
         with self.assertRaisesRegex(LongPortError, "two-sided"):
-            provider.fetch_spread("AAPL")
+            provider.fetch_spread("AAPL.XNAS")
 
         secret = "depth-secret"
         provider = LongPortQuoteProvider(
@@ -236,8 +236,39 @@ class LongPortQuoteProviderTest(unittest.TestCase):
             context_factory=lambda: FakeContext(error=RuntimeError(secret)),
         )
         with self.assertRaises(LongPortError) as raised:
-            provider.fetch_spread("AAPL")
+            provider.fetch_spread("AAPL.XNAS")
         self.assertNotIn(secret, str(raised.exception))
+
+    def test_spread_state_uses_provider_quote_time_and_trade_status(self):
+        depth = SimpleNamespace(
+            asks=[SimpleNamespace(
+                position=1, price=Decimal("101.10"), volume=200, order_num=1
+            )],
+            bids=[SimpleNamespace(
+                position=1, price=Decimal("101.00"), volume=400, order_num=3
+            )],
+        )
+
+        class Context:
+            def depth(self, _symbol):
+                return depth
+
+            def quote(self, _symbols):
+                return [quote(
+                    "AAPL.US",
+                    timestamp=datetime(
+                        2026, 7, 24, 14, 30, tzinfo=timezone.utc
+                    ),
+                )]
+
+        provider = LongPortQuoteProvider(
+            "key", "secret", "token", context_factory=Context
+        )
+        result = provider.fetch_spread_state("AAPL.XNAS")
+        self.assertEqual(result["trade_status"], "active")
+        self.assertEqual(result["session"], "regular")
+        self.assertTrue(result["tradable"])
+        self.assertEqual(result["quote_at"], "2026-07-24T14:30:00+00:00")
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
         provider.base_url = "https://example.invalid"
         provider.call.return_value = {"payload": "fixture"}
         provider.rows.return_value = [{
-            "ts_code": "600519.SH",
+            "ts_code": "600519.XSHG",
             "end_date": "20251231",
             "ann_date": "20260403",
             "cash_div_tax": "27.6",
@@ -28,7 +28,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
             "div_proc": "实施",
         }]
 
-        rows = TushareDividendProvider(provider).fetch("600519.SH", 2026)
+        rows = TushareDividendProvider(provider).fetch("600519.XSHG", 2026)
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["fiscal_year"], 2026)
@@ -45,7 +45,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
         provider.base_url = "https://example.invalid"
         provider.call.return_value = {"payload": "fixture"}
         provider.rows.return_value = [{
-            "ts_code": "159583.SZ",
+            "ts_code": "159583.XSHE",
             "ann_date": "20251016",
             "imp_anndate": "20251016",
             "base_date": "20251020",
@@ -57,7 +57,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
             "div_proc": "实施",
         }]
 
-        rows = TushareDividendProvider(provider).fetch("159583.SZ", 2025)
+        rows = TushareDividendProvider(provider).fetch("159583.XSHE", 2025)
 
         self.assertEqual(rows[0]["amount_per_share"], "0.015")
         self.assertEqual(rows[0]["record_date"], "2025-10-20")
@@ -80,11 +80,11 @@ class StructuredDividendProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: context
         )
 
-        rows = provider.fetch("0700.HK", 2026)
+        rows = provider.fetch("700.XHKG", 2026)
 
         context.dividend.assert_called_once_with("700.HK")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["symbol"], "00700.HK")
+        self.assertEqual(rows[0]["symbol"], "700.XHKG")
         self.assertEqual(rows[0]["amount_per_share"], "5.3")
         self.assertEqual(rows[0]["expected_payment_date"], "2026-06-01")
         self.assertEqual(rows[0]["record_date"], "2026-05-18")
@@ -108,7 +108,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: context
         )
 
-        rows = provider.fetch("600519.SH", 2026)
+        rows = provider.fetch("600519.XSHG", 2026)
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["amount_per_share"], "28.02423")
@@ -130,7 +130,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
             "key", "secret", "token", context_factory=lambda: context
         )
 
-        rows = provider.fetch("SOXX", 2025)
+        rows = provider.fetch("SOXX.XNAS", 2025)
 
         context.dividend.assert_called_once_with("SOXX.US")
         self.assertEqual(rows[0]["record_date"], "2025-03-20")
@@ -154,7 +154,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "parse produced no usable events"):
-            provider.fetch("SOXX", 2025)
+            provider.fetch("SOXX.XNAS", 2025)
 
     def test_longport_retries_rate_limit_under_global_request_lock(self):
         item = SimpleNamespace(
@@ -176,7 +176,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
             min_interval_seconds=0, max_attempts=2,
         )
 
-        rows = provider.fetch("MCD", 2025)
+        rows = provider.fetch("MCD.XNYS", 2025)
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(context.dividend.call_count, 2)
@@ -186,11 +186,11 @@ class StructuredDividendProviderTest(unittest.TestCase):
         longport = SimpleNamespace(fetch=Mock(return_value=[{"source": "longport"}]))
 
         rows = CnStructuredDividendProvider(tushare, longport).fetch(
-            "600519.SH", 2026
+            "600519.XSHG", 2026
         )
 
         self.assertEqual(rows, [{"source": "longport"}])
-        longport.fetch.assert_called_once_with("600519.SH", 2026)
+        longport.fetch.assert_called_once_with("600519.XSHG", 2026)
 
     def test_us_provider_prefers_longport_and_falls_back_to_sec(self):
         longport = SimpleNamespace(
@@ -198,11 +198,11 @@ class StructuredDividendProviderTest(unittest.TestCase):
         )
         sec = SimpleNamespace(fetch=Mock(return_value=[{"source": "sec"}]))
 
-        rows = UsStructuredDividendProvider(longport, sec).fetch("MCD", 2025)
+        rows = UsStructuredDividendProvider(longport, sec).fetch("MCD.XNYS", 2025)
 
         self.assertEqual(rows, [{"source": "sec"}])
-        longport.fetch.assert_called_once_with("MCD", 2025)
-        sec.fetch.assert_called_once_with("MCD", 2025)
+        longport.fetch.assert_called_once_with("MCD.XNYS", 2025)
+        sec.fetch.assert_called_once_with("MCD.XNYS", 2025)
 
     def test_us_provider_does_not_hide_primary_failure_as_sec_empty(self):
         error = RuntimeError("429002 api request is limited")
@@ -212,7 +212,7 @@ class StructuredDividendProviderTest(unittest.TestCase):
         sec = SimpleNamespace(fetch=Mock(return_value=[]))
 
         with self.assertRaisesRegex(RuntimeError, "429002"):
-            UsStructuredDividendProvider(longport, sec).fetch("MCD", 2025)
+            UsStructuredDividendProvider(longport, sec).fetch("MCD.XNYS", 2025)
 
 
 if __name__ == "__main__":

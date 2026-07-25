@@ -73,6 +73,7 @@ class _FailingClient:
 class _InsertClient:
     def __init__(self):
         self.rows = []
+        self.insert_calls = []
 
     def query(self, _statement, **_kwargs):
         if not self.rows:
@@ -85,6 +86,7 @@ class _InsertClient:
         })()
 
     def insert(self, _table, rows, **_kwargs):
+        self.insert_calls.append((_table, rows, _kwargs))
         self.rows.extend(rows)
 
 
@@ -98,6 +100,78 @@ class _InsertDatabase:
 
 
 class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
+    def test_range_time_accepts_database_datetime_values(self):
+        point = datetime(2026, 7, 25, 7, 21, 24, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            ClickHouseMarketBarRepository._range_time(point, "start"),
+            point,
+        )
+
+    def test_history_ingestion_identity_is_clickhouse_deduplication_token(self):
+        database = _InsertDatabase()
+        repository = ClickHouseMarketBarRepository(database)
+        provenance = {
+            "market": "US", "observed_at": "2026-01-01T00:00:00+00:00",
+            "raw_artifact_id": "artifact",
+            "ingestion_id": "stable-history-ingestion",
+        }
+        bars = [{
+            "bar_at": "2026-01-01T00:00:00+00:00",
+            "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+        }]
+
+        repository.upsert_price_bars(
+            "AAPL", "1d", "raw", "yahoo",
+            "2026-01-02T00:00:00+00:00", bars, provenance,
+        )
+
+        settings = database.client.insert_calls[0][2]["settings"]
+        self.assertEqual(
+            settings["insert_deduplication_token"],
+            "stable-history-ingestion",
+        )
+        ingestion_index = repository.RAW_COLUMNS.index("ingestion_id")
+        self.assertEqual(
+            database.client.insert_calls[0][1][0][ingestion_index],
+            "stable-history-ingestion",
+        )
+
+    def test_raw_ingestion_receipt_is_read_by_stable_identity(self):
+        class Result:
+            result_rows = [[2, 1000, 2000, "artifact-a"]]
+
+        repository = object.__new__(ClickHouseMarketBarRepository)
+        calls = []
+        repository._query = lambda statement, parameters: (
+            calls.append((statement, parameters)) or Result()
+        )
+
+        receipt = repository.get_raw_ingestion_receipt("ingestion-a")
+
+        self.assertEqual(receipt["row_count"], 2)
+        self.assertEqual(receipt["first_bar_at_ms"], 1000)
+        self.assertEqual(receipt["raw_artifact_id"], "artifact-a")
+        self.assertEqual(calls[0][1], {"ingestion_id": "ingestion-a"})
+
+        Result.result_rows = [[0, None, None, None]]
+        self.assertIsNone(repository.get_raw_ingestion_receipt("missing"))
+
+    def test_lists_raw_ingestion_receipts_for_consistency_audit(self):
+        class Result:
+            result_rows = [["a", 2, 1000, 2000, "artifact-a"]]
+
+        repository = object.__new__(ClickHouseMarketBarRepository)
+        repository._query = lambda *_args, **_kwargs: Result()
+
+        rows = repository.list_raw_ingestion_receipts(10)
+
+        self.assertEqual(rows, [{
+            "ingestion_id": "a", "row_count": 2,
+            "first_bar_at_ms": 1000, "last_bar_at_ms": 2000,
+            "raw_artifact_id": "artifact-a",
+        }])
+
     def test_canonical_json_normalizes_bytes_decimal_and_datetime(self):
         timestamp = datetime(2026, 7, 23, 1, 2, 3, 456000, timezone.utc)
         normalized = canonical_json_value([

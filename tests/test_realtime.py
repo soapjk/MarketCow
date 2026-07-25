@@ -404,6 +404,9 @@ class LongPortRealtimeProviderTest(unittest.TestCase):
             def set_on_depth(self, callback):
                 self.depth_callback = callback
 
+            def set_on_quote(self, callback):
+                self.quote_callback = callback
+
             def set_on_trades(self, callback):
                 self.trade_callback = callback
 
@@ -437,6 +440,9 @@ class LongPortRealtimeProviderTest(unittest.TestCase):
             def set_on_depth(self, callback):
                 self.depth_callback = callback
 
+            def set_on_quote(self, callback):
+                self.quote_callback = callback
+
             def set_on_trades(self, callback):
                 self.trade_callback = callback
 
@@ -462,7 +468,15 @@ class LongPortRealtimeProviderTest(unittest.TestCase):
         level = lambda price, volume: SimpleNamespace(price=price, volume=volume)
         context.depth_callback(
             "AAPL.US", SimpleNamespace(
-                bids=[level("100", 2)], asks=[level("101", 3)]
+                bids=[level("100", 2)], asks=[level("101", 3)], sequence=10,
+            )
+        )
+        context.quote_callback(
+            "AAPL.US", SimpleNamespace(
+                timestamp=datetime(2026, 7, 23, 1, 0, tzinfo=timezone.utc),
+                trade_status=SimpleNamespace(name="Normal"),
+                trade_session=SimpleNamespace(name="Normal"),
+                sequence=11,
             )
         )
         context.trade_callback(
@@ -473,14 +487,17 @@ class LongPortRealtimeProviderTest(unittest.TestCase):
         )
         self.assertEqual(
             [event["event_type"] for event in events],
-            ["order_book_snapshot", "quote", "trade"],
+            ["order_book_snapshot", "quote", "market_state", "trade"],
         )
         self.assertEqual(events[0]["payload"]["bids"][0]["order_id"], "0")
+        self.assertEqual(events[0]["payload"]["provider_sequence"], 10)
         self.assertEqual(events[1]["payload"]["bid_size"], "2")
         self.assertEqual(events[1]["payload"]["ts_event_source"], "marketcow_observation")
         self.assertTrue(events[1]["quality"]["degraded"])
-        self.assertEqual(events[2]["payload"]["aggressor_side"], "BUYER")
-        self.assertTrue(events[2]["payload"]["trade_id"].startswith("longport:"))
+        self.assertTrue(events[2]["payload"]["tradable"])
+        self.assertEqual(events[2]["payload"]["session"], "regular")
+        self.assertEqual(events[3]["payload"]["aggressor_side"], "BUYER")
+        self.assertTrue(events[3]["payload"]["trade_id"].startswith("longport:"))
         provider.subscribe({"AAPL.XNAS": "AAPL.US"}, {"quote"})
         self.assertEqual(len(context.subscriptions), 2)
         provider.unsubscribe({("AAPL.XNAS", "quote")})
@@ -514,6 +531,9 @@ class LongPortRealtimeProviderTest(unittest.TestCase):
 
             def set_on_depth(self, callback):
                 self.depth_callback = callback
+
+            def set_on_quote(self, callback):
+                self.quote_callback = callback
 
             def set_on_trades(self, callback):
                 self.trade_callback = callback
