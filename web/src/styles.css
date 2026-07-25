@@ -172,7 +172,9 @@ td code { color: var(--cyan); }
 label { color: var(--muted); font-size: 11px; }
 label input, label select, .search-bar input { width: 100%; margin-top: 6px; padding: 10px 11px; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 3px; outline: none; }
 label input:focus, label select:focus, .search-bar input:focus { border-color: var(--accent); }
+label input[type="date"] { color-scheme: dark; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+.field-hint { color: var(--muted); font-size: 10px; line-height: 1.5; }
 .primary-action { width: calc(100% - 32px); margin-top: 16px; padding: 11px; color: #07111f; background: var(--accent); border: 0; font-weight: 800; }
 .primary-action:disabled { opacity: .6; cursor: wait; }
 .inline-error { padding: 10px 14px; color: #ff8d8d; background: #ff71710c; }

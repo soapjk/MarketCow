@@ -1112,6 +1112,42 @@ class HistoryJobApiTest(unittest.TestCase):
         self.assertEqual(normalized.json()["job"]["request_json"]["provider"], "yahoo")
         self.assertEqual(normalized.json()["job"]["items"][0]["symbol"], "AAPL.XNAS")
 
+    def test_explicit_date_range_is_validated_and_frozen(self):
+        created = self.client.post(
+            "/v1/admin/history-jobs",
+            json=request(
+                symbols=["AAPL.XNAS"],
+                range="custom",
+                range_start="2026-06-01T00:00:00Z",
+                range_end="2026-06-30T23:59:59Z",
+                idempotency_key="history-explicit-window",
+            ),
+        )
+        missing_end = self.client.post(
+            "/v1/admin/history-jobs",
+            json=request(
+                range="custom",
+                range_start="2026-06-01T00:00:00Z",
+                idempotency_key="history-missing-window-end",
+            ),
+        )
+        reversed_range = self.client.post(
+            "/v1/admin/history-jobs",
+            json=request(
+                range="custom",
+                range_start="2026-07-01T00:00:00Z",
+                range_end="2026-06-01T00:00:00Z",
+                idempotency_key="history-reversed-window",
+            ),
+        )
+        self.assertEqual(created.status_code, 202)
+        frozen = created.json()["job"]["request_json"]
+        self.assertEqual(frozen["range"], "custom")
+        self.assertEqual(frozen["range_start"], "2026-06-01T00:00:00+00:00")
+        self.assertEqual(frozen["range_end"], "2026-06-30T23:59:59+00:00")
+        self.assertEqual(missing_end.status_code, 422)
+        self.assertEqual(reversed_range.status_code, 422)
+
     def test_reconcile_and_consistency_admin_endpoints(self):
         now = "2026-07-25T00:00:00+00:00"
         repository = self.service.metadata_repository

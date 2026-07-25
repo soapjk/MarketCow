@@ -119,6 +119,8 @@ class HistoryJobRequest(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=100)
     provider: str = Field(min_length=1)
     range: str = Field(min_length=1)
+    range_start: Optional[datetime] = None
+    range_end: Optional[datetime] = None
     interval: str = Field(min_length=1)
     adjustment: str = Field(pattern="^(adjusted|raw)$")
     allow_fallback: bool
@@ -133,6 +135,18 @@ class HistoryJobRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_symbols_and_provider(self):
+        if (self.range_start is None) != (self.range_end is None):
+            raise ValueError("range_start and range_end must be provided together")
+        if self.range_start is not None and self.range_end is not None:
+            if (
+                self.range_start.tzinfo is None
+                or self.range_end.tzinfo is None
+                or self.range_start >= self.range_end
+            ):
+                raise ValueError(
+                    "history date range must be ordered and timezone-aware"
+                )
+            self.range = "custom"
         normalized = [
             canonical_instrument(symbol).instrument_id for symbol in self.symbols
         ]
