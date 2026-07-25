@@ -9,6 +9,10 @@ from .csv_import import CsvImportRequest, ParsedCsvBar, iter_csv_bars
 from .csv_import_manifest import CsvImportManifest
 
 
+class CsvImportCanceled(RuntimeError):
+    pass
+
+
 def instrument_ingestion_id(shard_ingestion_id: str, instrument_id: str) -> str:
     return hashlib.sha256(
         f"{shard_ingestion_id}|{instrument_id}".encode()
@@ -30,6 +34,7 @@ class CsvShardImporter:
         *,
         raw_artifact_id: str,
         ingested_at: str,
+        should_cancel: Any = None,
     ) -> dict[str, Any]:
         row_start = int(shard["row_start"])
         row_end = int(shard["row_end"])
@@ -38,6 +43,12 @@ class CsvShardImporter:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         rows_read = 0
         for row_index, parsed in enumerate(iter_csv_bars(stream, request)):
+            if (
+                should_cancel is not None
+                and row_index % 1000 == 0
+                and should_cancel()
+            ):
+                raise CsvImportCanceled("CSV import cancellation requested")
             if row_index < row_start:
                 continue
             if row_index >= row_end:
@@ -89,6 +100,7 @@ class CsvShardImporter:
         *,
         raw_artifact_id: str,
         ingested_at: str,
+        should_cancel: Any = None,
     ) -> dict[str, Any]:
         with storage_path.open(
             "r", encoding=request.profile.encoding, newline=""
@@ -97,4 +109,5 @@ class CsvShardImporter:
                 stream, request, manifest, shard,
                 raw_artifact_id=raw_artifact_id,
                 ingested_at=ingested_at,
+                should_cancel=should_cancel,
             )

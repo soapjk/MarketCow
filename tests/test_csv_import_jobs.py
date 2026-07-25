@@ -6,6 +6,7 @@ import time
 import unittest
 
 from marketcow.csv_import_jobs import CsvImportJobManager
+from marketcow.csv_import_ingestion import CsvImportCanceled
 
 
 class MemoryRepository:
@@ -189,6 +190,33 @@ class CsvImportJobManagerTest(unittest.TestCase):
             wait_for(second, job["job_id"], "succeeded")
         finally:
             second.close()
+
+    def test_cancel_requested_transitions_running_job_to_canceled(self):
+        repository = MemoryRepository()
+        started = threading.Event()
+        release = threading.Event()
+
+        def importer(_job, _shard):
+            started.set()
+            release.wait(1)
+            raise CsvImportCanceled("requested")
+
+        manager = CsvImportJobManager(repository, importer, max_workers=1)
+        try:
+            job, _ = create(manager, "cancel-key")
+            self.assertTrue(started.wait(1))
+            self.assertEqual(
+                manager.cancel(job["job_id"])["status"], "cancel_requested"
+            )
+            release.set()
+            completed = wait_for(manager, job["job_id"], "canceled")
+            self.assertTrue(all(
+                row["status"] in {"succeeded", "canceled"}
+                for row in completed["shards"]
+            ))
+        finally:
+            release.set()
+            manager.close()
 
 
 if __name__ == "__main__":

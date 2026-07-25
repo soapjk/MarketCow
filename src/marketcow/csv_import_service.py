@@ -130,6 +130,11 @@ class CsvImportService:
             ingested_at=datetime.now(timezone.utc).isoformat(
                 timespec="microseconds"
             ),
+            should_cancel=lambda: (
+                self.metadata_repository.get_csv_import_job(job["job_id"])[
+                    "status"
+                ] == "cancel_requested"
+            ),
         )
 
     def _finalize_job(self, job: dict[str, Any]) -> dict[str, Any]:

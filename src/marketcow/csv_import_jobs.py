@@ -174,14 +174,21 @@ class CsvImportJobManager:
             }, self.owner_id, token)
         except Exception as exc:
             finished = _now()
+            canceled = type(exc).__name__ == "CsvImportCanceled"
             max_attempts = int(job["request_json"].get("max_attempts", 3))
-            status = "retry" if int(claimed["attempt"]) < max_attempts else "failed"
+            status = (
+                "canceled" if canceled
+                else "retry" if int(claimed["attempt"]) < max_attempts
+                else "failed"
+            )
             self.repository.finish_claimed_csv_import_shard({
                 **claimed, "status": status, "rows_read": 0,
                 "rows_written": 0, "write_receipt_json": None,
-                "error_code": type(exc).__name__.lower(),
+                "error_code": None if canceled else type(exc).__name__.lower(),
                 "error_message": str(exc)[:500], "updated_at": finished,
-                "finished_at": finished if status == "failed" else None,
+                "finished_at": (
+                    finished if status in {"failed", "canceled"} else None
+                ),
             }, self.owner_id, token)
         finally:
             stop.set()

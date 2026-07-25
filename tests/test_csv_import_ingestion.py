@@ -9,6 +9,7 @@ from marketcow.csv_import import (
     InstrumentMapping,
 )
 from marketcow.csv_import_ingestion import (
+    CsvImportCanceled,
     CsvShardImporter,
     instrument_ingestion_id,
 )
@@ -96,6 +97,21 @@ class CsvShardImporterTest(unittest.TestCase):
                 {"row_start": 0, "row_end": 2, "ingestion_id": "shard"},
                 raw_artifact_id="artifact",
                 ingested_at="2026-01-02T00:00:00Z",
+            )
+
+    def test_running_shard_checks_cooperative_cancellation(self):
+        request, manifest = declarations()
+        with self.assertRaises(CsvImportCanceled):
+            CsvShardImporter(Bars()).import_shard(
+                io.StringIO(
+                    "symbol,time,open,high,low,close,volume\n"
+                    "AAPL.US,2026-01-01T14:30:00Z,1,2,0.5,1.5,10\n"
+                ),
+                request, manifest,
+                {"row_start": 0, "row_end": 1, "ingestion_id": "shard"},
+                raw_artifact_id="artifact",
+                ingested_at="2026-01-02T00:00:00Z",
+                should_cancel=lambda: True,
             )
 
 
