@@ -22,12 +22,14 @@ class CsvImportJobManager:
         self,
         repository: Any,
         import_shard: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
+        finalize_job: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         *,
         max_workers: int = 2,
         lease_seconds: float = 30,
     ):
         self.repository = repository
         self.import_shard = import_shard
+        self.finalize_job = finalize_job
         self.max_workers = max(1, min(int(max_workers), 16))
         self.lease_seconds = max(1.0, float(lease_seconds))
         self.owner_id = uuid.uuid4().hex
@@ -61,7 +63,8 @@ class CsvImportJobManager:
             "request_json": dict(request_json), "storage_path": storage_path,
             "raw_artifact_id": raw_artifact_id, "rows_total": rows_total,
             "rows_read": 0, "rows_written": 0, "error_code": None,
-            "error_message": None, "created_at": now, "started_at": None,
+            "error_message": None, "quality_report_json": None,
+            "created_at": now, "started_at": None,
             "updated_at": now, "finished_at": None,
         }
         durable_shards = [{
@@ -209,8 +212,25 @@ class CsvImportJobManager:
         rows_read = sum(int(row["rows_read"]) for row in shards)
         rows_written = sum(int(row["rows_written"]) for row in shards)
         statuses = {str(row["status"]) for row in shards}
+        quality_report = None
         if statuses <= {"succeeded"}:
-            status, code = "succeeded", None
+            candidate = {
+                **job, "status": "succeeded", "rows_read": rows_read,
+                "rows_written": rows_written, "shards": shards,
+            }
+            try:
+                quality_report = (
+                    self.finalize_job(candidate)
+                    if self.finalize_job is not None else None
+                )
+                if quality_report is not None and quality_report.get(
+                    "status"
+                ) != "passed":
+                    raise RuntimeError("CSV import quality gate failed")
+                status, code = "succeeded", None
+            except Exception as exc:
+                status, code = "failed", "csv_import_quality_failed"
+                job = {**job, "error_message": str(exc)[:500]}
         elif job["status"] == "cancel_requested" and not statuses.intersection(
             {"queued", "running", "retry"}
         ):
@@ -223,7 +243,8 @@ class CsvImportJobManager:
         self.repository.update_csv_import_job({
             **job, "status": status, "rows_read": rows_read,
             "rows_written": rows_written, "error_code": code,
-            "error_message": None, "updated_at": now,
+            "error_message": job.get("error_message"), "updated_at": now,
+            "quality_report_json": quality_report,
             "finished_at": now if status in TERMINAL_CSV_IMPORT_JOBS else None,
         })
 

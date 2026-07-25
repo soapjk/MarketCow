@@ -688,6 +688,7 @@ POSTGRES_MIGRATIONS = [
             rows_written BIGINT NOT NULL DEFAULT 0 CHECK (rows_written >= 0),
             error_code TEXT,
             error_message TEXT,
+            quality_report_json JSONB,
             created_at TIMESTAMPTZ NOT NULL,
             started_at TIMESTAMPTZ,
             updated_at TIMESTAMPTZ NOT NULL,

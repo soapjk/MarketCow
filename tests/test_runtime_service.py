@@ -81,6 +81,28 @@ class AuthoritativeMarketBarAdapterTest(unittest.TestCase):
 
 
 class ServiceRoutingTest(unittest.TestCase):
+    def test_authoritative_raw_write_enqueues_verified_rows_for_canonical(self):
+        direct = MagicMock()
+        direct.prepare_raw_bars.return_value = [{"symbol": "AAPL.XNAS"}]
+        writer = MagicMock()
+        writer.write.return_value = {
+            "acknowledged": True, "verified": True, "written": 1,
+        }
+        scheduler = MagicMock()
+        repository = AuthoritativeMarketBarRepository(
+            direct, writer, background_scheduler=scheduler
+        )
+
+        count = repository.upsert_price_bars(
+            "AAPL.XNAS", "1m", "raw", "vendor",
+            "2026-07-25T00:00:00Z", [{"bar_at": "2026-07-24T14:30:00Z"}],
+        )
+
+        self.assertEqual(count, 1)
+        scheduler.enqueue_committed_rows.assert_called_once_with([
+            {"symbol": "AAPL.XNAS"}
+        ])
+
     def test_service_and_api_route_pg_ch_and_close_factory_once(self):
         with tempfile.TemporaryDirectory(suffix="-test") as folder:
             root = Path(folder)

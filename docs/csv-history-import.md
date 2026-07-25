@@ -51,3 +51,88 @@ dry-run 以流式方式读取文件，不写业务数据库。它输出：
 
 正式导入将在此契约之上增加 Manifest、分片 checkpoint、稳定
 `ingestion_id`、ClickHouse receipt 对账、canonical 构建和质量门禁。
+
+## CLI
+
+声明文件使用与 API 相同的版本化结构：
+
+```json
+{
+  "contract_version": "marketcow.csv-bars.v1",
+  "source": "purchased_vendor",
+  "interval": "1m",
+  "adjustment": "raw",
+  "profile": {
+    "name": "purchased-vendor-us",
+    "version": "1",
+    "columns": {
+      "symbol": "ticker",
+      "timestamp": "datetime",
+      "open": "open",
+      "high": "high",
+      "low": "low",
+      "close": "close",
+      "volume": "volume"
+    },
+    "timezone_name": "America/New_York",
+    "timestamp_format": "%Y-%m-%d %H:%M:%S",
+    "encoding": "utf-8-sig",
+    "delimiter": ",",
+    "fixed_external_symbol": null
+  },
+  "instruments": {
+    "namespace": "provider:purchased_vendor",
+    "symbols": {
+      "AAPL.US": "AAPL.XNAS",
+      "IBM.US": "IBM.XNYS"
+    }
+  }
+}
+```
+
+先执行无写入检查：
+
+```bash
+marketcow --profile production import-bars \
+  --file /allowed/imports/vendor-us-1m.csv \
+  --config /allowed/imports/vendor-us-profile.json \
+  --dry-run
+```
+
+正式任务必须提供幂等键；CLI 会等待任务进入终态并返回质量报告：
+
+```bash
+marketcow --profile production import-bars \
+  --file /allowed/imports/vendor-us-1m.csv \
+  --config /allowed/imports/vendor-us-profile.json \
+  --idempotency-key vendor-us-1m-20260725 \
+  --chunk-rows 100000 \
+  --max-attempts 3
+```
+
+CSV 与声明文件都必须位于 `MARKETCOW_ALLOWED_ROOT` 下。原始 CSV 会以内容哈希
+命名，原子复制到 MarketCow storage；同一 Manifest 重复提交不会产生第二份文件。
+
+## 管理 API 与页面
+
+- `POST /v1/admin/csv-imports/dry-run`
+- `POST /v1/admin/csv-imports`
+- `GET /v1/admin/csv-imports`
+- `GET /v1/admin/csv-imports/{job_id}`
+- `POST /v1/admin/csv-imports/{job_id}/cancel`
+- `GET /v1/admin/csv-imports-ui`
+
+管理页面每两秒刷新任务状态，显示 raw/canonical 质量门禁结果，并允许取消尚未
+进入终态的任务。页面只提交服务器允许目录内的路径，不接受任意远程 URL。
+
+## 恢复和质量门禁
+
+导入任务及分片保存在 PostgreSQL。worker 使用租约、心跳和 fencing token；
+服务重启会接管 queued/running 任务，失败分片在有界次数内重试。每个分片内的
+Instrument 使用独立稳定 `ingestion_id`，因此重复执行由 ClickHouse raw
+`ReplacingMergeTree` 和 ingestion receipt 幂等化。
+
+raw 写入完成后，任务同步触发受影响范围的 canonical rebuild。质量门禁按
+ingestion receipt 的精确 raw key 与 canonical 表连接，只有每一条导入 raw bar
+都有 canonical 对应项且 artifact/行数一致时，任务才进入 `succeeded`；否则任务
+进入 `failed` 并保存 `marketcow.csv-import-quality.v1` 报告。

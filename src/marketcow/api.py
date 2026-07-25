@@ -26,6 +26,12 @@ from .health import HealthEvaluator
 from .history_jobs import HistoryJobManager
 from .history_reconciliation import HistoryReconciler
 from .history_consistency import HistoryConsistencyAuditor
+from .csv_import import (
+    CsvImportRequest as CsvImportDeclaration,
+    CsvSchemaProfile,
+    InstrumentMapping,
+)
+from .csv_import_service import CsvImportService, create_csv_import_service
 from .instruments import canonical_instrument
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
 from .market_data_contracts import (
@@ -219,6 +225,55 @@ class DividendQuery(BaseModel):
     fiscal_year: int = Field(ge=1991, le=2100)
 
 
+class CsvSchemaProfileInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    version: str = Field(min_length=1, max_length=50)
+    columns: Dict[str, str]
+    timezone_name: str = Field(min_length=1, max_length=100)
+    timestamp_format: str = Field(default="iso8601", min_length=1, max_length=100)
+    encoding: str = Field(default="utf-8-sig", min_length=1, max_length=50)
+    delimiter: str = Field(default=",", min_length=1, max_length=1)
+    fixed_external_symbol: Optional[str] = None
+
+
+class CsvInstrumentMappingInput(BaseModel):
+    namespace: str = Field(min_length=3, max_length=100)
+    symbols: Dict[str, str] = Field(min_length=1)
+
+
+class CsvImportDeclarationInput(BaseModel):
+    source: str = Field(min_length=1, max_length=100)
+    interval: str = Field(min_length=1, max_length=10)
+    adjustment: str = Field(pattern="^(raw|adjusted)$")
+    profile: CsvSchemaProfileInput
+    instruments: CsvInstrumentMappingInput
+
+    def declaration(self) -> CsvImportDeclaration:
+        return CsvImportDeclaration(
+            source=self.source,
+            interval=self.interval,
+            adjustment=self.adjustment,
+            profile=CsvSchemaProfile(**self.profile.model_dump()),
+            instruments=InstrumentMapping(
+                self.instruments.namespace, self.instruments.symbols
+            ),
+        )
+
+
+class CsvImportDryRunInput(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    declaration: CsvImportDeclarationInput
+    max_error_samples: int = Field(default=100, ge=0, le=1000)
+
+
+class CsvImportCreateInput(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    declaration: CsvImportDeclarationInput
+    idempotency_key: str = Field(min_length=8, max_length=200)
+    chunk_rows: int = Field(default=100000, ge=1000, le=1000000)
+    max_attempts: int = Field(default=3, ge=1, le=10)
+
+
 def create_app(
     settings: Optional[Settings] = None,
     service: Optional[FundamentalService] = None,
@@ -299,6 +354,27 @@ def create_app(
             )
     app.state.history_reconciler = history_reconciler
     app.state.history_consistency_auditor = history_consistency_auditor
+    csv_import_service = None
+    if (
+        history_repository is not None
+        and market_bar_repository is not None
+        and artifact_store is not None
+        and all(hasattr(history_repository, name) for name in (
+            "get_or_create_csv_import_job", "get_csv_import_job",
+            "list_csv_import_jobs", "list_recoverable_csv_import_jobs",
+            "list_csv_import_shards", "claim_csv_import_shard",
+            "renew_csv_import_shard_lease",
+            "finish_claimed_csv_import_shard", "update_csv_import_job",
+            "request_cancel_csv_import_job",
+            "cancel_unclaimed_csv_import_shards",
+        ))
+        and all(hasattr(market_bar_repository, name) for name in (
+            "upsert_price_bars", "get_raw_ingestion_receipt",
+            "get_canonical_ingestion_coverage",
+        ))
+    ):
+        csv_import_service = create_csv_import_service(settings, service)
+    app.state.csv_import_service = csv_import_service
     clock = now_provider or (lambda: datetime.now(timezone.utc))
     longport_realtime = LongPortRealtimeProvider(
         settings.longport_app_key, settings.longport_app_secret,
@@ -356,6 +432,8 @@ def create_app(
         finally:
             if history_manager is not None:
                 history_manager.close()
+            if csv_import_service is not None:
+                csv_import_service.close()
             service.close()
 
     app.add_event_handler("shutdown", shutdown)
@@ -1995,6 +2073,64 @@ def create_app(
     def jobs(limit: int = Query(20, ge=1, le=200)):
         return {"items": service.metadata_repository.latest_runs(limit)}
 
+    def require_csv_import_service() -> CsvImportService:
+        value = app.state.csv_import_service
+        if value is None:
+            raise HTTPException(
+                status_code=503, detail="CSV import service unavailable"
+            )
+        return value
+
+    @app.post("/v1/admin/csv-imports/dry-run")
+    def dry_run_csv_import(request: CsvImportDryRunInput):
+        try:
+            return require_csv_import_service().dry_run(
+                request.path, request.declaration.declaration(),
+                max_error_samples=request.max_error_samples,
+            )
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/admin/csv-imports")
+    def create_csv_import(request: CsvImportCreateInput):
+        try:
+            job, created = require_csv_import_service().create_import(
+                request.path, request.declaration.declaration(),
+                idempotency_key=request.idempotency_key,
+                chunk_rows=request.chunk_rows,
+                max_attempts=request.max_attempts,
+            )
+            return {"created": created, "job": job}
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/admin/csv-imports")
+    def list_csv_imports(limit: int = Query(50, ge=1, le=500)):
+        rows = require_csv_import_service().list(limit)
+        return {"count": len(rows), "items": rows}
+
+    @app.get("/v1/admin/csv-imports/{job_id}")
+    def get_csv_import(job_id: str):
+        job = require_csv_import_service().get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="CSV import job not found")
+        return job
+
+    @app.post("/v1/admin/csv-imports/{job_id}/cancel")
+    def cancel_csv_import(job_id: str):
+        job = require_csv_import_service().cancel(job_id)
+        if job is None:
+            current = require_csv_import_service().get(job_id)
+            if current is None:
+                raise HTTPException(
+                    status_code=404, detail="CSV import job not found"
+                )
+            raise HTTPException(
+                status_code=409,
+                detail=f"CSV import job is already {current['status']}",
+            )
+        return job
+
     def require_history_manager() -> HistoryJobManager:
         if history_manager is None:
             raise HTTPException(status_code=503, detail="history job store unavailable")
@@ -2185,6 +2321,69 @@ persisted ${j.rows_persisted}; updated ${esc(j.updated_at)}</p><table><tr>
 document.getElementById('jobs').addEventListener('click',e=>{
  const button=e.target.closest('button.cancel');if(button)cancelJob(button)});
 load();setInterval(load,2000);</script></body></html>"""
+
+    @app.get("/v1/admin/csv-imports-ui", response_class=HTMLResponse)
+    def csv_imports_ui():
+        return """<!doctype html><html><head><meta charset="utf-8">
+<title>MarketCow CSV Imports</title><style>
+body{font:14px system-ui;margin:24px;background:#f6f7f9;color:#17202a}
+form,section{background:white;padding:16px;margin:12px 0;border:1px solid #dfe3e8}
+label{display:block;margin:8px 0}input,select,textarea{width:100%;max-width:900px}
+textarea{height:90px;font-family:monospace}button{margin:8px 8px 8px 0;padding:7px 12px}
+table{border-collapse:collapse;width:100%}th,td{padding:7px;border:1px solid #ddd}
+pre{white-space:pre-wrap;max-height:360px;overflow:auto}.danger{color:#b42318}</style>
+</head><body><h1>CSV history imports</h1>
+<p>Only server-local files under MARKETCOW_ALLOWED_ROOT are accepted. Run dry-run first.</p>
+<form id="form"><label>CSV path<input id="path" required></label>
+<label>Source<input id="source" value="purchased_vendor" required></label>
+<label>Namespace<input id="namespace" value="provider:purchased_vendor" required></label>
+<label>Instrument mappings (provider symbol → SYMBOL.MIC)
+<textarea id="mappings">{"AAPL.US":"AAPL.XNAS"}</textarea></label>
+<label>Columns (canonical → CSV column)
+<textarea id="columns">{"symbol":"symbol","timestamp":"timestamp","open":"open","high":"high","low":"low","close":"close","volume":"volume"}</textarea></label>
+<label>Timezone<input id="timezone" value="America/New_York"></label>
+<label>Timestamp format<input id="timestampFormat" value="iso8601"></label>
+<label>Interval<select id="interval"><option>1m</option><option>5m</option>
+<option>15m</option><option>1h</option><option>1d</option></select></label>
+<label>Adjustment<select id="adjustment"><option>raw</option>
+<option>adjusted</option></select></label>
+<label>Idempotency key<input id="key" value="csv-import-"></label>
+<button type="button" id="dry">Dry-run</button>
+<button type="button" id="start">Start import</button></form>
+<pre id="result" role="status"></pre><section><h2>Jobs</h2><div id="jobs"></div></section>
+<script>
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,
+c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function payload(){return{path:$('path').value,declaration:{
+source:$('source').value,interval:$('interval').value,
+adjustment:$('adjustment').value,profile:{name:$('source').value,version:'1',
+columns:JSON.parse($('columns').value),timezone_name:$('timezone').value,
+timestamp_format:$('timestampFormat').value,encoding:'utf-8-sig',delimiter:','},
+instruments:{namespace:$('namespace').value,
+symbols:JSON.parse($('mappings').value)}}}}
+async function call(url,body){const r=await fetch(url,{method:'POST',
+headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+const d=await r.json();if(!r.ok)throw new Error(JSON.stringify(d.detail));return d}
+$('dry').onclick=async()=>{try{$('result').textContent=JSON.stringify(
+await call('/v1/admin/csv-imports/dry-run',payload()),null,2)}
+catch(e){$('result').textContent=e.message}}
+$('start').onclick=async()=>{if(!confirm('Start durable CSV import?'))return;
+try{const p=payload();p.idempotency_key=$('key').value;p.chunk_rows=100000;
+p.max_attempts=3;$('result').textContent=JSON.stringify(
+await call('/v1/admin/csv-imports',p),null,2);await load()}
+catch(e){$('result').textContent=e.message}}
+async function cancelJob(id){if(!confirm(`Cancel CSV import ${id}?`))return;
+try{await call(`/v1/admin/csv-imports/${encodeURIComponent(id)}/cancel`,{});await load()}
+catch(e){$('result').textContent=e.message}}
+async function load(){const r=await fetch('/v1/admin/csv-imports?limit=50');
+const d=await r.json();$('jobs').innerHTML=`<table><tr><th>Job</th><th>Status</th>
+<th>Rows read/written</th><th>Quality</th><th>Updated</th><th></th></tr>`+
+d.items.map(j=>`<tr><td>${esc(j.job_id)}</td><td>${esc(j.status)}</td>
+<td>${j.rows_read}/${j.rows_written}</td>
+<td>${esc(j.quality_report_json?.status||'pending')}</td><td>${esc(j.updated_at)}</td>
+<td>${['queued','running','cancel_requested'].includes(j.status)?
+`<button onclick="cancelJob('${esc(j.job_id)}')">Cancel</button>`:''}</td></tr>`).join('')
++'</table>'}load();setInterval(load,2000)</script></body></html>"""
 
     @app.get("/v1/admin/artifacts")
     def artifacts(dataset: str = "", limit: int = Query(100, ge=1, le=1000)):

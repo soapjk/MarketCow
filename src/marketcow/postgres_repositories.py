@@ -885,9 +885,9 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 INSERT INTO csv_import_job
                     (job_id,idempotency_key,manifest_id,status,request_json,
                      storage_path,raw_artifact_id,rows_total,rows_read,
-                     rows_written,error_code,error_message,created_at,started_at,
-                     updated_at,finished_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     rows_written,error_code,error_message,quality_report_json,
+                     created_at,started_at,updated_at,finished_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (idempotency_key) DO NOTHING
                 RETURNING *
                 """,
@@ -897,7 +897,10 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                     job["storage_path"], job["raw_artifact_id"],
                     job["rows_total"], job.get("rows_read", 0),
                     job.get("rows_written", 0), job.get("error_code"),
-                    job.get("error_message"), job["created_at"],
+                    job.get("error_message"),
+                    Jsonb(job["quality_report_json"])
+                    if job.get("quality_report_json") is not None else None,
+                    job["created_at"],
                     job.get("started_at"), job["updated_at"],
                     job.get("finished_at"),
                 ),
@@ -1058,14 +1061,17 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 """
                 UPDATE csv_import_job SET
                     status=%s,rows_read=%s,rows_written=%s,error_code=%s,
-                    error_message=%s,started_at=COALESCE(started_at,%s),
-                    updated_at=%s,finished_at=%s
+                    error_message=%s,quality_report_json=%s,
+                    started_at=COALESCE(started_at,%s),updated_at=%s,
+                    finished_at=%s
                 WHERE job_id=%s
                 RETURNING *
                 """,
                 (
                     row["status"], row["rows_read"], row["rows_written"],
                     row.get("error_code"), row.get("error_message"),
+                    Jsonb(row["quality_report_json"])
+                    if row.get("quality_report_json") is not None else None,
                     row.get("started_at"), row["updated_at"],
                     row.get("finished_at"), row["job_id"],
                 ),

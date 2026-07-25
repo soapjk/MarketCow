@@ -40,4 +40,6 @@ class AuthoritativeMarketBarRepository:
             raise AuthoritativeWriteError(
                 f"ClickHouse authoritative write did not complete ({status})"
             )
+        if self.background_scheduler is not None:
+            self.background_scheduler.enqueue_committed_rows(rows)
         return int(result.get("written", len(rows)))

@@ -130,6 +130,15 @@ class CsvImportContractTest(unittest.TestCase):
                 request(),
             ))
 
+    def test_declaration_round_trip_is_versioned_and_lossless(self):
+        original = request()
+        restored = CsvImportRequest.from_dict(original.as_dict())
+        self.assertEqual(restored.as_dict(), original.as_dict())
+        broken = original.as_dict()
+        broken["contract_version"] = "future"
+        with self.assertRaisesRegex(CsvImportContractError, "contract version"):
+            CsvImportRequest.from_dict(broken)
+
 
 if __name__ == "__main__":
     unittest.main()

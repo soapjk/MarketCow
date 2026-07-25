@@ -5,6 +5,8 @@ import ipaddress
 import json
 import os
 import sys
+import time
+from pathlib import Path
 from typing import Any, Sequence
 
 import uvicorn
@@ -86,7 +88,53 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
         "--scopes", default="history:read,history:write",
         help="comma-separated capability scopes",
     )
+    csv_import = commands.add_parser("import-bars")
+    csv_import.add_argument("--file", required=True)
+    csv_import.add_argument(
+        "--config", required=True,
+        help="JSON file containing the versioned CSV import declaration",
+    )
+    csv_import.add_argument("--dry-run", action="store_true")
+    csv_import.add_argument("--idempotency-key", default="")
+    csv_import.add_argument("--chunk-rows", type=int, default=100000)
+    csv_import.add_argument("--max-attempts", type=int, default=3)
     return parser
+
+
+def import_csv_bars(settings: Settings, args: Any) -> dict[str, Any]:
+    from .csv_import import CsvImportRequest
+    from .csv_import_service import create_csv_import_service
+    from .service import FundamentalService
+
+    config_path = Path(args.config).expanduser().resolve(strict=True)
+    if not config_path.is_relative_to(settings.allowed_root.resolve()):
+        raise ValueError("CSV import config is outside MARKETCOW_ALLOWED_ROOT")
+    declaration = CsvImportRequest.from_dict(json.loads(
+        config_path.read_text(encoding="utf-8")
+    ))
+    service = FundamentalService(settings)
+    imports = create_csv_import_service(settings, service)
+    try:
+        if args.dry_run:
+            return imports.dry_run(args.file, declaration)
+        key = args.idempotency_key.strip()
+        if not key:
+            raise ValueError("--idempotency-key is required without --dry-run")
+        job, created = imports.create_import(
+            args.file, declaration, idempotency_key=key,
+            chunk_rows=args.chunk_rows, max_attempts=args.max_attempts,
+        )
+        job_id = str(job["job_id"])
+        while True:
+            current = imports.get(job_id)
+            if current is None:
+                raise RuntimeError("CSV import job disappeared")
+            if current["status"] in {"succeeded", "failed", "canceled"}:
+                return {"created": created, "job": current}
+            time.sleep(0.2)
+    finally:
+        imports.close()
+        service.close()
 
 
 def operate_spool(settings: Settings, action: str, limit: int = 100,
@@ -171,6 +219,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
             return 0 if result.get("status") == "ok" else 2
+        if args.command == "import-bars":
+            result = import_csv_bars(settings, args)
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            status = result.get("status") or (result.get("job") or {}).get("status")
+            return 0 if status in {"valid", "succeeded"} else 2
         if not is_loopback_host(args.host) and os.getenv(
             "MARKETCOW_ALLOW_NON_LOOPBACK", ""
         ).lower() not in {"1", "true", "yes"}:

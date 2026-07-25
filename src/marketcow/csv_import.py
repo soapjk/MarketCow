@@ -157,6 +157,49 @@ class CsvImportRequest:
             raise CsvImportContractError("adjustment must be raw or adjusted")
         object.__setattr__(self, "source", source)
 
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "contract_version": CSV_IMPORT_CONTRACT_VERSION,
+            "source": self.source,
+            "interval": self.interval,
+            "adjustment": self.adjustment,
+            "profile": {
+                "name": self.profile.name,
+                "version": self.profile.version,
+                "columns": dict(self.profile.columns),
+                "timezone_name": self.profile.timezone_name,
+                "timestamp_format": self.profile.timestamp_format,
+                "encoding": self.profile.encoding,
+                "delimiter": self.profile.delimiter,
+                "fixed_external_symbol": self.profile.fixed_external_symbol,
+            },
+            "instruments": {
+                "namespace": self.instruments.namespace,
+                "symbols": dict(self.instruments.canonical_mappings),
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CsvImportRequest":
+        if value.get("contract_version") != CSV_IMPORT_CONTRACT_VERSION:
+            raise CsvImportContractError("unsupported CSV import contract version")
+        profile = value.get("profile")
+        instruments = value.get("instruments")
+        if not isinstance(profile, Mapping) or not isinstance(instruments, Mapping):
+            raise CsvImportContractError(
+                "CSV import profile and instruments are required"
+            )
+        return cls(
+            source=str(value.get("source") or ""),
+            interval=str(value.get("interval") or ""),
+            adjustment=str(value.get("adjustment") or ""),
+            profile=CsvSchemaProfile(**dict(profile)),
+            instruments=InstrumentMapping(
+                str(instruments.get("namespace") or ""),
+                dict(instruments.get("symbols") or {}),
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class ParsedCsvBar:

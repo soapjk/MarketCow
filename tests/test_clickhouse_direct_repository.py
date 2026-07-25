@@ -207,6 +207,26 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
             "raw_artifact_id": "artifact-a",
         }])
 
+    def test_canonical_ingestion_coverage_joins_exact_raw_keys(self):
+        class Result:
+            result_rows = [[3, 3, 1000, 3000]]
+
+        calls = []
+        repository = object.__new__(ClickHouseMarketBarRepository)
+        repository._query = lambda statement, parameters: (
+            calls.append((statement, parameters)) or Result()
+        )
+
+        result = repository.get_canonical_ingestion_coverage(["b", "a", "a"])
+
+        self.assertEqual(result, {
+            "ingestion_ids": ["a", "b"], "raw_rows": 3,
+            "canonical_rows": 3, "first_bar_at_ms": 1000,
+            "last_bar_at_ms": 3000,
+        })
+        self.assertIn("SELECT DISTINCT symbol,interval,adjustment,bar_time", calls[0][0])
+        self.assertEqual(calls[0][1], {"ingestion_ids": ["a", "b"]})
+
     def test_canonical_json_normalizes_bytes_decimal_and_datetime(self):
         timestamp = datetime(2026, 7, 23, 1, 2, 3, 456000, timezone.utc)
         normalized = canonical_json_value([

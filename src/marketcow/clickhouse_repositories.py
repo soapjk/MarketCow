@@ -642,6 +642,42 @@ class ClickHouseMarketBarRepository:
             "raw_artifact_id": row[4],
         } for row in result.result_rows]
 
+    def get_canonical_ingestion_coverage(
+        self, ingestion_ids: Sequence[str]
+    ) -> Dict[str, Any]:
+        normalized = sorted({
+            str(value).strip() for value in ingestion_ids if str(value).strip()
+        })
+        if not normalized:
+            raise ValueError("ingestion_ids must not be empty")
+        if len(normalized) > 10000:
+            raise ValueError("ingestion_ids must contain at most 10000 values")
+        result = self._query(
+            """
+            SELECT count() AS raw_rows,
+                   countIf(c.symbol != '') AS canonical_rows,
+                   min(toUnixTimestamp64Milli(r.bar_time)) AS first_bar_at_ms,
+                   max(toUnixTimestamp64Milli(r.bar_time)) AS last_bar_at_ms
+            FROM (
+                SELECT DISTINCT symbol,interval,adjustment,bar_time
+                FROM market_bar_raw FINAL
+                WHERE ingestion_id IN {ingestion_ids:Array(String)}
+            ) r
+            LEFT JOIN market_bar_canonical FINAL c
+              ON c.symbol=r.symbol AND c.interval=r.interval
+             AND c.adjustment=r.adjustment AND c.bar_time=r.bar_time
+            """,
+            {"ingestion_ids": normalized},
+        )
+        row = result.result_rows[0]
+        return {
+            "ingestion_ids": normalized,
+            "raw_rows": int(row[0] or 0),
+            "canonical_rows": int(row[1] or 0),
+            "first_bar_at_ms": None if row[2] is None else int(row[2]),
+            "last_bar_at_ms": None if row[3] is None else int(row[3]),
+        }
+
     # Direct MarketBarRepository contract. The canonical-prefixed methods remain as
     # compatibility entry points for pre-blue/green offline tooling.
     def get_price_bars(
