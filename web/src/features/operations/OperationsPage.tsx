@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../lib/api";
 import { useIdentity } from "../auth/authContext";
@@ -13,10 +13,15 @@ type HistoryJob = {
   total_symbols?: number; rows_persisted?: number; updated_at: string;
 };
 type JobPage = { items: HistoryJob[]; page: { total: number } };
+type Instrument = {
+  instrument_id?: string; symbol: string; name?: string; market?: string;
+  exchange?: string; source?: string;
+};
+type SearchResult = { count: number; items: Instrument[] };
 
 type JobProvider = "yahoo" | "tushare" | "hyperliquid";
 type JobForm = {
-  symbols: string; provider: JobProvider; startDate: string; endDate: string;
+  symbols: Instrument[]; provider: JobProvider; startDate: string; endDate: string;
   interval: string; adjustment: string; allow_fallback: boolean;
   max_concurrency: number; max_attempts: number; retry_backoff_seconds: number;
   retry_max_backoff_seconds: number; retry_jitter_seconds: number;
@@ -39,6 +44,11 @@ const providerIntervals: Record<JobProvider, { value: string; label: string }[]>
     ["30m", "30 分钟"], ["1h", "1 小时"], ["1d", "日线"],
   ].map(([value, label]) => ({ value, label })),
 };
+const providerMarkets: Record<JobProvider, Set<string>> = {
+  yahoo: new Set(["CN", "HK", "US"]),
+  tushare: new Set(["CN"]),
+  hyperliquid: new Set(["CRYPTO"]),
+};
 
 function inputDate(value: Date) {
   const year = value.getFullYear();
@@ -52,7 +62,7 @@ function createDefaultJob(): JobForm {
   const start = new Date(end);
   start.setDate(start.getDate() - 30);
   return {
-  symbols: "AAPL,MSFT", provider: "yahoo",
+  symbols: [], provider: "yahoo",
   startDate: inputDate(start), endDate: inputDate(end), interval: "1d",
   adjustment: "raw", allow_fallback: false, max_concurrency: 2, max_attempts: 3,
   retry_backoff_seconds: 0.5, retry_max_backoff_seconds: 30,
@@ -67,7 +77,24 @@ export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | 
   const client = useQueryClient();
   const tab = initialTab;
   const [form, setForm] = useState<JobForm>(createDefaultJob);
+  const [instrumentInput, setInstrumentInput] = useState("");
+  const [instrumentQuery, setInstrumentQuery] = useState("");
   const dateError = !form.startDate || !form.endDate || form.startDate > form.endDate;
+  useEffect(() => {
+    const value = instrumentInput.trim();
+    const timer = window.setTimeout(() => setInstrumentQuery(value), 250);
+    return () => window.clearTimeout(timer);
+  }, [instrumentInput]);
+  const instrumentSearch = useQuery({
+    queryKey: ["job-instrument-search", instrumentQuery],
+    queryFn: () => api.request<SearchResult>(
+      `/v1/instruments/search?q=${encodeURIComponent(instrumentQuery)}&limit=12`,
+    ),
+    enabled: Boolean(instrumentQuery),
+  });
+  const compatibleSearchItems = (instrumentSearch.data?.items ?? []).filter(
+    (item) => providerMarkets[form.provider].has(item.market ?? ""),
+  );
   const providers = useQuery({
     queryKey: ["admin-providers"],
     queryFn: () => api.request<ProviderPage>("/v1/admin/providers?limit=100"),
@@ -88,7 +115,7 @@ export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | 
         range: "custom",
         range_start: `${startDate}T00:00:00.000Z`,
         range_end: `${endDate}T23:59:59.999Z`,
-        symbols: form.symbols.split(",").map((item) => item.trim().toUpperCase()).filter(Boolean),
+        symbols: form.symbols.map((item) => item.instrument_id ?? item.symbol),
         idempotency_key: `admin-${crypto.randomUUID()}`,
         };
       })()),
@@ -102,8 +129,27 @@ export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | 
   });
   function submit(event: FormEvent) {
     event.preventDefault();
-    if (dateError) return;
+    if (dateError || form.symbols.length === 0) return;
     createJob.mutate();
+  }
+  function selectInstrument(instrument: Instrument) {
+    const id = instrument.instrument_id ?? instrument.symbol;
+    if (!form.symbols.some(
+      (item) => (item.instrument_id ?? item.symbol) === id,
+    )) {
+      setForm({ ...form, symbols: [...form.symbols, instrument] });
+    }
+    setInstrumentInput("");
+    setInstrumentQuery("");
+  }
+  function removeInstrument(instrument: Instrument) {
+    const id = instrument.instrument_id ?? instrument.symbol;
+    setForm({
+      ...form,
+      symbols: form.symbols.filter(
+        (item) => (item.instrument_id ?? item.symbol) !== id,
+      ),
+    });
   }
   function selectProvider(provider: JobProvider) {
     const intervals = providerIntervals[provider];
@@ -114,6 +160,9 @@ export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | 
       provider,
       interval,
       adjustment: provider === "yahoo" ? form.adjustment : "raw",
+      symbols: form.symbols.filter(
+        (item) => providerMarkets[provider].has(item.market ?? ""),
+      ),
     });
   }
   function runCommand(jobId: string, action: "cancel" | "retry-failed") {
@@ -130,7 +179,27 @@ export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | 
         <div className="split-layout">
           <form className="data-card operation-form" onSubmit={submit} aria-disabled={!canOperate}>
             <header><div><p className="eyebrow">NEW BATCH</p><h3>创建历史任务</h3></div></header>
-            <label>标的（逗号分隔）<input value={form.symbols} onChange={(e) => setForm({ ...form, symbols: e.target.value })} required /></label>
+            <div className="instrument-picker">
+              <label>搜索并添加标的<input aria-label="搜索并添加标的" placeholder="输入名称、简称或代码" value={instrumentInput} onChange={(e) => setInstrumentInput(e.target.value)} autoComplete="off" /></label>
+              {instrumentQuery && <div className="instrument-suggestions" role="listbox" aria-label="标的搜索结果">
+                {instrumentSearch.isPending ? <p>搜索中…</p>
+                  : instrumentSearch.isError ? <p className="inline-error">{instrumentSearch.error.message}</p>
+                  : compatibleSearchItems.length === 0 ? <p>没有适用于 {form.provider} 的搜索结果。</p>
+                  : compatibleSearchItems.map((item) => {
+                    const id = item.instrument_id ?? item.symbol;
+                    return <button type="button" role="option" key={`${item.source}-${id}`} onClick={() => selectInstrument(item)}>
+                      <span><strong>{item.name || "未命名标的"}</strong><small>{id}</small></span>
+                      <small>{item.market || item.exchange || "—"}</small>
+                    </button>;
+                  })}
+              </div>}
+              <div className="selected-instruments" aria-label="已选标的">
+                {form.symbols.length === 0 ? <p>尚未选择标的。</p> : form.symbols.map((item) => {
+                  const id = item.instrument_id ?? item.symbol;
+                  return <span key={id}><strong>{item.name || id}</strong><code>{id}</code><button type="button" aria-label={`移除 ${id}`} onClick={() => removeInstrument(item)}>×</button></span>;
+                })}
+              </div>
+            </div>
             <div className="form-grid">
               <label>Provider<select value={form.provider} onChange={(e) => selectProvider(e.target.value as JobProvider)}><option>yahoo</option><option>tushare</option><option>hyperliquid</option></select></label>
               <label>周期<select value={form.interval} onChange={(e) => setForm({ ...form, interval: e.target.value })}>{providerIntervals[form.provider].map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
@@ -140,7 +209,7 @@ export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | 
             </div>
             <p className="field-hint">日期按 UTC 自然日提交；结束日期包含当天。周期选项会根据 Provider 自动收窄。</p>
             {dateError && <p className="inline-error">结束日期不能早于开始日期。</p>}
-            <button className="primary-action" type="submit" disabled={!canOperate || createJob.isPending || dateError}>{createJob.isPending ? "提交中…" : canOperate ? "创建任务" : "Viewer 无操作权限"}</button>
+            <button className="primary-action" type="submit" disabled={!canOperate || createJob.isPending || dateError || form.symbols.length === 0}>{createJob.isPending ? "提交中…" : canOperate ? "创建任务" : "Viewer 无操作权限"}</button>
             {createJob.isError && <p className="inline-error">{createJob.error.message}</p>}
           </form>
           <article className="data-card">

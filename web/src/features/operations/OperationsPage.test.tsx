@@ -12,8 +12,11 @@ test("submits an explicit date range and provider-specific interval", async () =
         job_id: "job-1", created: true, job: { job_id: "job-1" },
       }), { status: 202, headers: { "Content-Type": "application/json" } });
     }
-    const body = String(url).includes("/providers")
-      ? { items: [], page: { total: 0 } }
+    const body = String(url).includes("/instruments/search")
+      ? { count: 1, items: [{
+        symbol: "600519.XSHG", name: "贵州茅台", market: "CN",
+        exchange: "上海证券交易所", source: "eastmoney_suggest",
+      }] }
       : { items: [], page: { total: 0 } };
     return new Response(JSON.stringify(body), {
       status: 200, headers: { "Content-Type": "application/json" },
@@ -36,6 +39,14 @@ test("submits an explicit date range and provider-specific interval", async () =
   const interval = screen.getByLabelText("周期");
   fireEvent.change(provider, { target: { value: "tushare" } });
   expect(screen.queryByRole("option", { name: "日线" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "创建任务" })).toBeDisabled();
+  fireEvent.change(screen.getByLabelText("搜索并添加标的"), {
+    target: { value: "茅台" },
+  });
+  fireEvent.click(await screen.findByRole("option", {
+    name: /贵州茅台 600519\.XSHG CN/,
+  }));
+  expect(screen.getByText("600519.XSHG")).toBeInTheDocument();
   fireEvent.change(interval, { target: { value: "5m" } });
   fireEvent.change(screen.getByLabelText("开始日期"), {
     target: { value: "2026-06-01" },
@@ -48,6 +59,7 @@ test("submits an explicit date range and provider-specific interval", async () =
   await waitFor(() => expect(submitted).toBeDefined());
   expect(submitted).toMatchObject({
     provider: "tushare",
+    symbols: ["600519.XSHG"],
     range: "custom",
     range_start: "2026-06-01T00:00:00.000Z",
     range_end: "2026-06-30T23:59:59.999Z",
