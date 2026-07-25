@@ -114,6 +114,29 @@ nav a.active { color: var(--text); background: var(--accent-soft); border-color:
 .page-state { min-height: 300px; display: grid; place-content: center; gap: 12px; color: var(--muted); text-align: center; border: 1px solid var(--line); background: var(--surface); }
 .page-state button { justify-self: center; padding: 8px 14px; color: #07111f; background: var(--accent); border: 0; }
 .error-state strong { color: #ff8d8d; }
+.live-controls { display: flex; align-items: center; gap: 8px; }
+.live-controls button { padding: 8px 13px; color: #07111f; background: var(--accent); border: 1px solid var(--accent); border-radius: 4px; font-weight: 700; }
+.live-controls button.secondary { color: var(--text); background: transparent; border-color: var(--line); }
+.connection-state { padding: 6px 9px; color: var(--muted); border: 1px solid var(--line); border-radius: 30px; font: 10px ui-monospace, monospace; text-transform: uppercase; }
+.state-open { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.state-retrying, .state-connecting { color: #f5b942; }
+.live-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+.live-stats > div { padding: 16px; border: 1px solid var(--line); background: var(--surface); }
+.live-stats span, .live-stats strong { display: block; }
+.live-stats span { color: var(--muted); font: 10px ui-monospace, monospace; text-transform: uppercase; }
+.live-stats strong { margin-top: 8px; font-size: 24px; }
+.chart-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+.chart-card { min-width: 0; min-height: 360px; border: 1px solid var(--line); background: var(--surface); }
+.chart-card > header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.chart-card h3 { margin: 0; font-size: 14px; }
+.chart-card header span { color: var(--muted); font: 10px ui-monospace, monospace; text-transform: uppercase; }
+.echart { width: 100%; height: 310px; }
+.error-feed { max-height: 360px; overflow: auto; }
+.error-row { display: grid; grid-template-columns: 72px 40px minmax(0, 1fr); gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); font-size: 11px; }
+.error-row span { color: var(--muted); }
+.error-row strong { color: #ff8d8d; }
+.error-row code { overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.empty-copy { padding: 30px; color: var(--muted); text-align: center; }
 
 @media (max-width: 800px) {
   .app-shell { grid-template-columns: 1fr; }
@@ -123,6 +146,8 @@ nav a.active { color: var(--text); background: var(--accent-soft); border-color:
   .topbar, .content { padding-left: 18px; padding-right: 18px; }
   .skeleton-grid { grid-template-columns: 1fr; }
   .page-intro, .grafana-card > header { align-items: start; flex-direction: column; }
+  .live-stats { grid-template-columns: 1fr 1fr; }
+  .chart-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 520px) {

@@ -27,6 +27,7 @@ class RequestMetricsTest(unittest.TestCase):
         self.assertIn('status_family="2xx"} 1', rendered)
         self.assertIn('le="0.1"} 1', rendered)
         self.assertIn('marketcow_http_requests_in_flight{method="GET"} 0', rendered)
+        self.assertEqual(self.metrics.in_flight_total(), 0)
 
     def test_unbounded_methods_routes_and_statuses_are_normalized(self):
         for index in range(MAX_ROUTE_SERIES + 2):

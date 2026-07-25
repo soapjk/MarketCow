@@ -137,6 +137,10 @@ class RequestMetrics:
         ])
         return "\n".join(lines) + "\n"
 
+    def in_flight_total(self) -> int:
+        with self._lock:
+            return sum(self._in_flight.values())
+
 
 class RequestMetricsMiddleware:
     def __init__(
@@ -179,6 +183,7 @@ class RequestMetricsMiddleware:
                         "duration_ms": round(
                             max(0.0, self.metrics.clock() - started) * 1000, 3
                         ),
+                        "in_flight": self.metrics.in_flight_total(),
                         "exception": exception,
                     })
                 except Exception:

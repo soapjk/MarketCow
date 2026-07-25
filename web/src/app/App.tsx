@@ -1,7 +1,14 @@
-import { Component, type ErrorInfo, type ReactNode, useEffect, useState } from "react";
+import {
+  Component, Suspense, lazy, type ErrorInfo, type ReactNode, useEffect, useState,
+} from "react";
 import { AppShell } from "./AppShell";
 import { PlaceholderPage } from "../components/PlaceholderPage";
 import { DashboardsPage } from "../features/dashboards/DashboardsPage";
+
+const LiveMonitorPage = lazy(async () => {
+  const module = await import("../features/live/LiveMonitorPage");
+  return { default: module.LiveMonitorPage };
+});
 
 type ErrorBoundaryState = { error: Error | null };
 
@@ -52,7 +59,13 @@ export function App() {
   return (
     <ErrorBoundary>
       <AppShell path={path}>
-        {kind === "dashboards" ? <DashboardsPage /> : <PlaceholderPage kind={kind} />}
+        {kind === "dashboards" ? <DashboardsPage />
+          : kind === "live" ? (
+            <Suspense fallback={<section className="page-state">正在加载实时图表引擎…</section>}>
+              <LiveMonitorPage />
+            </Suspense>
+          )
+          : <PlaceholderPage kind={kind} />}
       </AppShell>
     </ErrorBoundary>
   );
