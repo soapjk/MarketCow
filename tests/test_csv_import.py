@@ -90,6 +90,31 @@ class CsvImportContractTest(unittest.TestCase):
         with self.assertRaisesRegex(CsvRowError, "OHLC"):
             list(iter_csv_bars(io.StringIO(invalid), request()))
 
+    def test_naive_dst_transition_times_must_be_unambiguous(self):
+        import io
+
+        for local_time, error_code in (
+            ("2026-11-01 01:30:00", "timestamp_ambiguous"),
+            ("2026-03-08 02:30:00", "timestamp_nonexistent"),
+        ):
+            body = (
+                "ticker,datetime,o,h,l,c,v\n"
+                f"AAPL.US,{local_time},100,101,99,100.5,10\n"
+            )
+            with self.assertRaises(CsvRowError) as raised:
+                list(iter_csv_bars(io.StringIO(body), request()))
+            self.assertEqual(raised.exception.code, error_code)
+
+        offset_profile = profile(timestamp_format="iso8601")
+        body = (
+            "ticker,datetime,o,h,l,c,v\n"
+            "AAPL.US,2026-11-01T01:30:00-04:00,100,101,99,100.5,10\n"
+        )
+        rows = list(iter_csv_bars(
+            io.StringIO(body), request(profile=offset_profile)
+        ))
+        self.assertEqual(rows[0].bar["bar_at"], "2026-11-01T05:30:00+00:00")
+
     def test_dry_run_is_non_writing_exact_and_bounds_error_samples(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "bars.csv"

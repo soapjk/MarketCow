@@ -138,6 +138,27 @@ class CsvImportServiceTest(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_empty_csv_is_not_accepted_as_a_successful_import(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "empty.csv"
+            source.write_text(
+                "symbol,time,open,high,low,close,volume\n",
+                encoding="utf-8",
+            )
+            service = CsvImportService(
+                allowed_root=root, storage_root=root / "storage",
+                metadata_repository=MemoryRepository(),
+                market_bar_repository=Bars(), artifact_store=Artifacts(),
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "no valid bars"):
+                    service.create_import(
+                        source, declaration(), idempotency_key="empty"
+                    )
+            finally:
+                service.close()
+
 
 if __name__ == "__main__":
     unittest.main()

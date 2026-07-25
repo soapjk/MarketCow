@@ -240,7 +240,26 @@ def _timestamp(raw: Any, profile: CsvSchemaProfile) -> datetime:
             f"timestamp does not match {profile.timestamp_format}",
         ) from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=ZoneInfo(profile.timezone_name))
+        zone = ZoneInfo(profile.timezone_name)
+        fold_zero = parsed.replace(tzinfo=zone, fold=0)
+        fold_one = parsed.replace(tzinfo=zone, fold=1)
+        round_trip = (
+            fold_zero.astimezone(timezone.utc)
+            .astimezone(zone)
+            .replace(tzinfo=None)
+        )
+        if round_trip != parsed:
+            raise CsvRowError(
+                "timestamp_nonexistent",
+                "naive timestamp does not exist in the configured timezone",
+            )
+        if fold_zero.utcoffset() != fold_one.utcoffset():
+            raise CsvRowError(
+                "timestamp_ambiguous",
+                "naive timestamp is ambiguous in the configured timezone; "
+                "include an explicit UTC offset",
+            )
+        parsed = fold_zero
     return parsed.astimezone(timezone.utc)
 
 

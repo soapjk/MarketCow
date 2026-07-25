@@ -75,6 +75,8 @@ class CsvImportService:
         report = dry_run_csv(source, request)
         if report["status"] != "valid":
             raise ValueError("CSV dry-run must pass before import")
+        if int(report["rows_valid"]) == 0:
+            raise ValueError("CSV contains no valid bars")
         manifest = CsvImportManifest.create(source, request)
         archived = archive_csv(source, self.storage_root, manifest)
         now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
