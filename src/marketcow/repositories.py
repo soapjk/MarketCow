@@ -121,6 +121,7 @@ class MarketBarRepository(Protocol):
     def get_price_bars(
         self, symbol: str, interval: str, adjustment: str, limit: int
     ) -> List[Dict[str, Any]]: ...
+    def get_symbol_coverage(self, symbol: str) -> List[Dict[str, Any]]: ...
     def get_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
         start: str, end: str, limit: int,

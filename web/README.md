@@ -25,3 +25,16 @@ Hash routes are intentional: a static local deployment can reload any page witho
 requiring a server-side history fallback. The application uses TanStack Query for
 request caching and provides a bounded-retry SSE client foundation. The realtime
 protocol itself is implemented by MCHR-49.
+
+## Pages
+
+- **Overview** refreshes the versioned control-plane summary every ten seconds.
+- **Dashboards** renders server-registered, read-only Grafana frames.
+- **Data** searches instruments and queries raw/canonical ClickHouse coverage.
+- **Operations** manages durable history jobs and displays Provider health.
+- **Live** consumes the bounded SSE stream and renders ECharts panels.
+- **Settings** displays sanitized append-only administration audit events.
+
+State-changing task actions show a confirmation, remain disabled while pending, and
+surface the server result. Authorization is enforced by the API; page visibility is
+not treated as a security boundary.

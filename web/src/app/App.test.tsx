@@ -8,5 +8,5 @@ test("renders the administration shell and overview route", async () => {
   render(<QueryClientProvider client={client}><App /></QueryClientProvider>);
   expect(await screen.findByRole("heading", { name: "总览", level: 1 })).toBeInTheDocument();
   expect(screen.getByRole("navigation", { name: "主导航" })).toBeInTheDocument();
-  expect(screen.getByText("统一运行视图")).toBeInTheDocument();
+  expect(screen.getByText("正在汇总系统状态…")).toBeInTheDocument();
 });

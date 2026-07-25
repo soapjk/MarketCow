@@ -641,6 +641,27 @@ def create_app(
             })
         return instrument_record(row)
 
+    @app.get("/v1/admin/instruments/{symbol}/coverage")
+    def admin_instrument_coverage(symbol: str):
+        try:
+            normalized = normalize_quote_symbol(symbol)
+            rows = service.market_bar_repository.get_symbol_coverage(normalized)
+            return {
+                "schema": "marketcow.instrument-coverage.v1",
+                "symbol": normalized,
+                "items": rows,
+                "summary": {
+                    "layers": sorted({row["layer"] for row in rows}),
+                    "intervals": sorted({row["interval"] for row in rows}),
+                    "rows": sum(int(row["row_count"]) for row in rows),
+                    "sources": sorted({
+                        source for row in rows for source in row["sources"]
+                    }),
+                },
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/v1/instruments:resolve")
     def resolve_instrument(namespace: str, external_symbol: str):
         row = service.metadata_repository.find_instrument_by_mapping(

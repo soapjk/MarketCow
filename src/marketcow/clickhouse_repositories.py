@@ -621,6 +621,39 @@ class ClickHouseMarketBarRepository:
         rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
         return self._map_canonical_rows(reversed(rows))
 
+    def get_symbol_coverage(self, symbol: str) -> List[Dict[str, Any]]:
+        result = self._query(
+            """
+            SELECT layer, interval, adjustment, min(bar_time) AS first_bar,
+                   max(bar_time) AS last_bar, count() AS row_count,
+                   groupUniqArray(source) AS sources
+            FROM (
+                SELECT 'raw' AS layer, interval, adjustment, bar_time, source
+                FROM market_bar_raw FINAL WHERE symbol={symbol:String}
+                UNION ALL
+                SELECT 'canonical' AS layer, interval, adjustment, bar_time,
+                       selected_source AS source
+                FROM market_bar_canonical FINAL WHERE symbol={symbol:String}
+            )
+            GROUP BY layer, interval, adjustment
+            ORDER BY layer, interval, adjustment
+            """,
+            parameters={"symbol": symbol},
+        )
+        rows = []
+        for raw in result.result_rows:
+            row = dict(zip(result.column_names, raw))
+            rows.append({
+                "layer": str(row["layer"]),
+                "interval": str(row["interval"]),
+                "adjustment": str(row["adjustment"]),
+                "first_bar": self._iso(row["first_bar"]),
+                "last_bar": self._iso(row["last_bar"]),
+                "row_count": int(row["row_count"]),
+                "sources": sorted(str(source) for source in row["sources"]),
+            })
+        return rows
+
     def _map_canonical_rows(self, rows: Any) -> List[Dict[str, Any]]:
         mapped = []
         for raw_row in rows:

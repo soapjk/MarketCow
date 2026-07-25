@@ -4,6 +4,10 @@ import {
 import { AppShell } from "./AppShell";
 import { PlaceholderPage } from "../components/PlaceholderPage";
 import { DashboardsPage } from "../features/dashboards/DashboardsPage";
+import { OverviewPage } from "../features/overview/OverviewPage";
+import { OperationsPage } from "../features/operations/OperationsPage";
+import { DataExplorerPage } from "../features/data/DataExplorerPage";
+import { SettingsPage } from "../features/settings/SettingsPage";
 
 const LiveMonitorPage = lazy(async () => {
   const module = await import("../features/live/LiveMonitorPage");
@@ -59,12 +63,15 @@ export function App() {
   return (
     <ErrorBoundary>
       <AppShell path={path}>
-        {kind === "dashboards" ? <DashboardsPage />
+        {kind === "overview" ? <OverviewPage />
+          : kind === "dashboards" ? <DashboardsPage />
+          : kind === "data" ? <DataExplorerPage />
+          : kind === "operations" ? <OperationsPage />
           : kind === "live" ? (
             <Suspense fallback={<section className="page-state">正在加载实时图表引擎…</section>}>
               <LiveMonitorPage />
             </Suspense>
-          )
+          ) : kind === "settings" ? <SettingsPage />
           : <PlaceholderPage kind={kind} />}
       </AppShell>
     </ErrorBoundary>

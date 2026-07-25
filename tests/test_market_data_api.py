@@ -76,6 +76,14 @@ class Bars:
             self.revision = "snapshot-during-read"
         return selected[:page_size], len(selected) > page_size
 
+    def get_symbol_coverage(self, symbol):
+        return [{
+            "layer": "canonical", "interval": "1d", "adjustment": "raw",
+            "first_bar": "2026-01-01T00:00:00+00:00",
+            "last_bar": "2026-07-25T00:00:00+00:00",
+            "row_count": 100, "sources": ["longport"],
+        }]
+
 
 class Service:
     def __init__(self):
@@ -165,6 +173,12 @@ class MarketDataApiTest(unittest.TestCase):
         self.assertEqual(metrics.status_code, 200)
         self.assertIn("marketcow_http_requests_total", metrics.text)
         self.assertIn('route="/v1/admin/overview"', metrics.text)
+
+        coverage = self.client.get("/v1/admin/instruments/AAPL/coverage")
+        self.assertEqual(coverage.status_code, 200)
+        self.assertEqual(coverage.json()["schema"], "marketcow.instrument-coverage.v1")
+        self.assertEqual(coverage.json()["summary"]["rows"], 100)
+        self.assertEqual(coverage.json()["summary"]["sources"], ["longport"])
 
     def test_crypto_canonical_storage_uses_venue_qualified_symbol(self):
         crypto = {
