@@ -65,6 +65,11 @@ class ExampleQuoteProvider:
 - 显式指定 provider 时，若市场或能力不支持，返回 `provider_not_supported`，默认不得静默换源。
 - 未指定 provider 时，只在声明支持该能力与市场的 provider 中按配置优先级选择。
 - provider 私有字段只能放在原始 Artifact；公开响应和 ClickHouse 行情字段保持统一。
+- 历史 K 线不得输出语义不明的 `adjusted`。股票类数据必须声明 `raw`、`qfq` 或
+  `hfq`，并分别提供 `corporate_action_factor` 与
+  `applied_adjustment_multiplier`；不存在公司行动语义的资产使用
+  `factor_applicability=not_applicable`，不能伪造值为 `1` 的公司行动因子。
+- Provider 无法证明旧复权序列具体属于 qfq 或 hfq 时必须拒绝或隔离，不能猜测。
 
 新增能力时先定义统一业务契约，再扩展 `CapabilityDeclaration` 和公开 API；不要以 provider 名称创建
 新的公开路由。

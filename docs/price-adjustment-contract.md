@@ -70,3 +70,14 @@ uv run python scripts/backfill_adjustment_contract.py \
 
 旧 `adjusted`、找不到日因子的股票 K 线和来源语义无法证明的数据只进入 quarantine
 报告，不会猜测或覆盖。
+
+## 2026-07-25 生产验收记录
+
+- ClickHouse migration 8 已应用，raw/canonical 表均包含八个显式复权字段。
+- Tushare 历史任务 `6587295140e240bb8f26b2ea61cd127c` 成功补取贵州茅台两个
+  交易日的 60 分钟 K 线与日因子，写入 10 根 K 线。
+- 安全回填批次 `adjustment-backfill-7f6b7a932854b798c8a83e93` 写入 731 条
+  可证明记录；raw 层最终为 `applicable=20`、`not_applicable=721`。
+- 64 条旧 Yahoo raw 记录因历史下载时没有保存可证明的因子来源，保持隔离，没有猜测。
+- 已修复分组完成 canonical rebuild：贵州茅台两个标识分组各 5 条，
+  BTC 永续 713 条；生产健康检查为 ready。

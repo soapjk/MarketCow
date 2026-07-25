@@ -107,7 +107,16 @@ window-start range. Bars are strictly ascending without duplicate positions, and
   historical and realtime bars.
 - Supported intervals are `1-MINUTE`, `5-MINUTE`, `15-MINUTE`, `30-MINUTE`, `1-HOUR`,
   and `1-DAY`; arbitrary interval strings are rejected.
-- `raw` means unadjusted provider observations; `adjusted` is a distinct stored series.
+- `adjustment` is explicit: `raw`, `qfq`, or `hfq`. The ambiguous legacy value
+  `adjusted` is rejected by new market-data and history-job requests.
+- `raw` means unadjusted provider observations. For assets with corporate actions,
+  a raw row still carries `corporate_action_factor`; its
+  `applied_adjustment_multiplier` is `1`.
+- `qfq` and `hfq` are distinct stored series. MarketCow does not synthesize either
+  one during a canonical read.
+- Every historical response declares `adjustment_contract_version=1` and may include
+  factor applicability, cumulative factor, applied multiplier, reference date/factor,
+  source, artifact, and as-of evidence on each bar.
 - Historical canonical bars are never synthesized for empty periods.
 - One canonical row has one selected source; a row cannot mix providers.
 - Revisions change canonical content identity and invalidate prior snapshot cursors.
@@ -121,7 +130,11 @@ Realtime lifecycle, recovery and bar rules are defined in
 GET /v1/instruments/AAPL.XNAS
 GET /v1/instruments:resolve?namespace=provider:longport&external_symbol=AAPL.US
 GET /v1/canonical-bars/AAPL.XNAS?start=2026-07-01T00:00:00Z&end=2026-07-22T23:59:59Z&interval=1-DAY&adjustment=raw&page_size=1000
+GET /v1/canonical-bars/AAPL.XNAS?start=2026-07-01T00:00:00Z&end=2026-07-22T23:59:59Z&interval=1-DAY&adjustment=qfq&page_size=1000
 ```
+
+The second request returns qfq rows only when that exact series exists. It never
+relabels raw or legacy `adjusted` data.
 
 Base URL for local production is configured by the consumer; MarketCow does not prescribe
 an implicit endpoint. The current local convention is HTTP `http://127.0.0.1:8790`.
