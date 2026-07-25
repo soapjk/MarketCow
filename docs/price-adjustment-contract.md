@@ -46,3 +46,27 @@ hfq: P = P_raw × F_t,           applied_adjustment_multiplier = F_t
 同一个字段表达。所有因子和乘数通过十进制字符串进入契约，避免 JSON 浮点数先行损失
 精度。
 
+## 旧数据审计与回填
+
+默认命令只生成计划，不写数据：
+
+```bash
+uv run python scripts/backfill_adjustment_contract.py \
+  --profile production --limit 10000
+```
+
+生产写入需要同时提供两个显式参数：
+
+```bash
+uv run python scripts/backfill_adjustment_contract.py \
+  --profile production --limit 10000 --apply \
+  --confirm APPLY_ADJUSTMENT_BACKFILL
+```
+
+工具只自动处理两类可以证明语义的数据：
+
+- Tushare `raw` K 线与同标的、同来源、同上海交易日的日因子精确匹配；
+- 不存在公司行动语义的 CRYPTO `raw` K 线标记为 `not_applicable`。
+
+旧 `adjusted`、找不到日因子的股票 K 线和来源语义无法证明的数据只进入 quarantine
+报告，不会猜测或覆盖。
