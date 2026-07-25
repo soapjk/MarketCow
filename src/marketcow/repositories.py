@@ -91,6 +91,10 @@ class MetadataRepository(Protocol):
         self, job_id: str, item_id: str, owner_id: str, lease_token: str,
         now: str,
     ) -> Optional[Dict[str, Any]]: ...
+    def append_admin_audit(self, row: Dict[str, Any]) -> Dict[str, Any]: ...
+    def list_admin_audit(
+        self, limit: int = 50, offset: int = 0, action: str = "", outcome: str = ""
+    ) -> List[Dict[str, Any]]: ...
 
 
 @runtime_checkable
@@ -162,6 +166,7 @@ class MarketBarRepository(Protocol):
     def get_price_bars(
         self, symbol: str, interval: str, adjustment: str, limit: int
     ) -> List[Dict[str, Any]]: ...
+    def get_symbol_coverage(self, symbol: str) -> List[Dict[str, Any]]: ...
     def get_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
         start: str, end: str, limit: int,

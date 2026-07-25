@@ -90,6 +90,16 @@ class Settings:
     hyperliquid_base_url: str = "https://api.hyperliquid.xyz"
     hyperliquid_timeout_seconds: float = 3.0
     hyperliquid_request_budget_seconds: float = 10.0
+    dashboard_registry_json: str = ""
+    admin_auth_required: bool = False
+    admin_tokens_json: str = ""
+    admin_session_seconds: int = 28800
+    admin_cookie_secure: bool = False
+    admin_frontend_enabled: bool = True
+    admin_grafana_enabled: bool = True
+    admin_commands_enabled: bool = True
+    admin_live_enabled: bool = True
+    admin_live_max_connections: int = 100
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -244,6 +254,22 @@ class Settings:
             )),
             hyperliquid_request_budget_seconds=float(os.getenv(
                 "MARKETCOW_HYPERLIQUID_REQUEST_BUDGET_SECONDS", "10"
+            )),
+            dashboard_registry_json=os.getenv("MARKETCOW_DASHBOARD_REGISTRY_JSON", ""),
+            admin_auth_required=_bool_env(
+                "MARKETCOW_ADMIN_AUTH_REQUIRED", profile == "production"
+            ),
+            admin_tokens_json=os.getenv("MARKETCOW_ADMIN_TOKENS_JSON", ""),
+            admin_session_seconds=int(os.getenv(
+                "MARKETCOW_ADMIN_SESSION_SECONDS", "28800"
+            )),
+            admin_cookie_secure=_bool_env("MARKETCOW_ADMIN_COOKIE_SECURE", False),
+            admin_frontend_enabled=_bool_env("MARKETCOW_ADMIN_FRONTEND_ENABLED", True),
+            admin_grafana_enabled=_bool_env("MARKETCOW_ADMIN_GRAFANA_ENABLED", True),
+            admin_commands_enabled=_bool_env("MARKETCOW_ADMIN_COMMANDS_ENABLED", True),
+            admin_live_enabled=_bool_env("MARKETCOW_ADMIN_LIVE_ENABLED", True),
+            admin_live_max_connections=int(os.getenv(
+                "MARKETCOW_ADMIN_LIVE_MAX_CONNECTIONS", "100"
             )),
         )
 

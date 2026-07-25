@@ -4,12 +4,17 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Body, FastAPI, Header, HTTPException, Query, Request, WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel, Field, ValidationError, model_validator
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.staticfiles import StaticFiles
 
 from . import __version__
 from .config import Settings
@@ -46,6 +51,13 @@ from .hyperliquid_realtime import (
     RoutingRealtimeProvider,
 )
 from .providers.longport_quote import LongPortError
+from .dashboard_registry import load_dashboard_registry, registry_document
+from .admin_control import AdminAuditService
+from .http_metrics import RequestMetrics, RequestMetricsMiddleware
+from .admin_events import ALLOWED_EVENT_TYPES, AdminEventHub, encode_sse
+from .admin_auth import (
+    CSRF_COOKIE, SESSION_COOKIE, AdminAuth, AdminSecurityMiddleware,
+)
 
 
 def normalize_quote_symbol(value: str) -> str:
@@ -189,6 +201,31 @@ def create_app(
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
+    admin_auth = AdminAuth(
+        settings.admin_auth_required,
+        settings.admin_tokens_json,
+        settings.admin_session_seconds,
+    )
+    app.add_middleware(
+        AdminSecurityMiddleware,
+        auth=admin_auth,
+        commands_enabled=settings.admin_commands_enabled,
+    )
+    app.state.admin_auth = admin_auth
+    admin_events = AdminEventHub(
+        replay_capacity=min(settings.realtime_replay_capacity, 100000),
+        subscriber_capacity=min(settings.realtime_queue_capacity, 10000),
+        heartbeat_seconds=max(1.0, settings.realtime_heartbeat_seconds),
+        max_subscribers=settings.admin_live_max_connections,
+    )
+    request_metrics = RequestMetrics()
+    app.add_middleware(
+        RequestMetricsMiddleware,
+        metrics=request_metrics,
+        event_sink=admin_events.request_completed,
+    )
+    app.state.request_metrics = request_metrics
+    app.state.admin_events = admin_events
     app.state.service = service
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None
@@ -276,6 +313,13 @@ def create_app(
         clock=clock, persist_bar=persist_realtime_bar,
     )
     app.state.realtime_hub = hub
+    app.state.dashboard_registry = load_dashboard_registry(settings.dashboard_registry_json)
+    admin_audit = AdminAuditService(metadata_repository)
+    app.state.admin_audit = admin_audit
+
+    def authenticated_actor(request: Request) -> str:
+        identity = request.scope.get("admin_identity")
+        return getattr(identity, "actor", "local-development")
 
     async def shutdown() -> None:
         try:
@@ -462,6 +506,177 @@ def create_app(
             "storage_health": storage_health(),
         }
 
+    @app.post("/v1/auth/session")
+    def create_admin_session(token: str = Body(embed=True, min_length=1, max_length=500)):
+        try:
+            session_id, identity = admin_auth.login(token)
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=401, detail={"code": "invalid_credentials"}
+            ) from exc
+        response = JSONResponse({
+            "authenticated": True, "actor": identity.actor, "role": identity.role,
+        })
+        response.set_cookie(
+            SESSION_COOKIE, session_id, max_age=settings.admin_session_seconds,
+            httponly=True, secure=settings.admin_cookie_secure,
+            samesite="strict", path="/",
+        )
+        response.set_cookie(
+            CSRF_COOKIE, identity.csrf, max_age=settings.admin_session_seconds,
+            httponly=False, secure=settings.admin_cookie_secure,
+            samesite="strict", path="/",
+        )
+        return response
+
+    @app.get("/v1/auth/session")
+    def get_admin_session(request: Request):
+        identity = admin_auth.authenticate(request.headers, request.cookies)
+        if identity is None:
+            raise HTTPException(
+                status_code=401, detail={"code": "authentication_required"}
+            )
+        return {
+            "authenticated": True, "actor": identity.actor, "role": identity.role,
+        }
+
+    @app.delete("/v1/auth/session")
+    def delete_admin_session(request: Request):
+        identity = admin_auth.authenticate(request.headers, request.cookies)
+        if identity is not None and not admin_auth.csrf_valid(identity, request.headers):
+            raise HTTPException(status_code=403, detail={"code": "csrf_validation_failed"})
+        admin_auth.logout(request.cookies.get(SESSION_COOKIE, ""))
+        response = Response(status_code=204)
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        response.delete_cookie(CSRF_COOKIE, path="/")
+        return response
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics():
+        return Response(
+            request_metrics.render(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    @app.get("/v1/admin/events")
+    async def admin_event_stream(
+        types: str = Query("request.summary", max_length=300),
+        after_sequence: int = Query(0, ge=0),
+        last_event_id: str = Header("", alias="Last-Event-ID", max_length=30),
+    ):
+        if not settings.admin_live_enabled:
+            raise HTTPException(
+                status_code=503, detail={"code": "admin_live_disabled"}
+            )
+        if admin_events.subscriber_count >= admin_events.max_subscribers:
+            raise HTTPException(
+                status_code=503, detail={"code": "admin_live_connection_limit"}
+            )
+        if last_event_id:
+            try:
+                after_sequence = max(after_sequence, int(last_event_id))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail="Last-Event-ID must be an integer"
+                ) from exc
+        selected = tuple(item.strip() for item in types.split(",") if item.strip())
+        subscribable = ALLOWED_EVENT_TYPES - {"stream.heartbeat", "stream.gap"}
+        if not selected or not set(selected) <= subscribable:
+            raise HTTPException(
+                status_code=400, detail="admin event subscription is invalid"
+            )
+
+        async def events():
+            yield b"retry: 1000\n\n"
+            async for event in admin_events.stream(after_sequence, selected):
+                yield encode_sse(event)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.get("/v1/admin/dashboards")
+    def admin_dashboards():
+        values = app.state.dashboard_registry if settings.admin_grafana_enabled else ()
+        return registry_document(values)
+
+    @app.get("/v1/admin/capabilities")
+    def admin_capabilities():
+        return {
+            "schema": "marketcow.admin-capabilities.v1",
+            "features": {
+                "frontend": settings.admin_frontend_enabled,
+                "grafana": settings.admin_grafana_enabled,
+                "commands": settings.admin_commands_enabled,
+                "live": settings.admin_live_enabled,
+            },
+        }
+
+    @app.get("/v1/admin/overview")
+    def admin_overview():
+        providers = (
+            service.metadata_repository.provider_health()
+            if getattr(service, "metadata_repository", None) is not None
+            else []
+        )
+        jobs = history_manager.list(10) if history_manager is not None else []
+        return {
+            "schema": "marketcow.admin-overview.v1",
+            "generated_at": clock().astimezone(timezone.utc).isoformat(),
+            "service": {
+                "status": "ok", "version": __version__, "profile": settings.profile,
+            },
+            "storage": storage_health(),
+            "providers": {
+                "total": len(providers),
+                "healthy": sum(str(item.get("status", "")).lower() == "ok" for item in providers),
+                "items": providers[:20],
+            },
+            "history_jobs": {"items": jobs},
+        }
+
+    @app.get("/v1/admin/providers")
+    def admin_providers(
+        status: str = Query("", pattern="^(|ok|error)$"),
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=10000),
+    ):
+        rows = list(service.metadata_repository.provider_health())
+        normalized = []
+        for row in rows:
+            item = dict(row)
+            item["status"] = str(item.get("status", "")).lower()
+            item["configured"] = None
+            item.pop("credentials", None)
+            normalized.append(item)
+        if status:
+            normalized = [item for item in normalized if item["status"] == status]
+        page = normalized[offset:offset + limit]
+        return {
+            "schema": "marketcow.admin-providers.v1",
+            "items": page,
+            "page": {
+                "limit": limit, "offset": offset, "returned": len(page),
+                "total": len(normalized),
+            },
+        }
+
+    @app.get("/v1/admin/audit")
+    def admin_audit_events(
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=10000),
+        action: str = Query("", max_length=120),
+        outcome: str = Query("", pattern="^(|accepted|succeeded|rejected|failed)$"),
+    ):
+        return admin_audit.list(
+            limit=limit, offset=offset, action=action, outcome=outcome
+        )
+
     @app.get("/v1/readiness")
     def readiness():
         result = storage_health()
@@ -580,6 +795,27 @@ def create_app(
                 "code": "instrument_not_found", "instrument_id": instrument_id,
             })
         return instrument_record(row)
+
+    @app.get("/v1/admin/instruments/{symbol}/coverage")
+    def admin_instrument_coverage(symbol: str):
+        try:
+            normalized = normalize_quote_symbol(symbol)
+            rows = service.market_bar_repository.get_symbol_coverage(normalized)
+            return {
+                "schema": "marketcow.instrument-coverage.v1",
+                "symbol": normalized,
+                "items": rows,
+                "summary": {
+                    "layers": sorted({row["layer"] for row in rows}),
+                    "intervals": sorted({row["interval"] for row in rows}),
+                    "rows": sum(int(row["row_count"]) for row in rows),
+                    "sources": sorted({
+                        source for row in rows for source in row["sources"]
+                    }),
+                },
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/v1/instruments:resolve")
     def resolve_instrument(namespace: str, external_symbol: str):
@@ -1731,17 +1967,54 @@ def create_app(
         return history_manager
 
     @app.post("/v1/admin/history-jobs")
-    def create_history_job(request: HistoryJobRequest):
+    def create_history_job(
+        request: HistoryJobRequest,
+        http_request: Request,
+        x_request_id: str = Header("", max_length=120),
+    ):
         payload = request.model_dump()
-        job, created = require_history_manager().create(payload)
+        actor = authenticated_actor(http_request)
+        try:
+            job, created = require_history_manager().create(payload)
+        except Exception as exc:
+            admin_audit.append(
+                actor=actor, action="history_job.create",
+                target=request.idempotency_key, outcome="failed",
+                parameters={"symbols": request.symbols, "provider": request.provider},
+                request_id=x_request_id, detail=str(exc),
+            )
+            raise
+        admin_audit.append(
+            actor=actor, action="history_job.create",
+            target=job["job_id"], outcome="accepted" if created else "succeeded",
+            parameters={
+                "symbols": request.symbols, "provider": request.provider,
+                "idempotency_key": request.idempotency_key,
+            },
+            request_id=x_request_id, detail="created" if created else "idempotent replay",
+        )
         return JSONResponse(
             status_code=202,
             content={"job_id": job["job_id"], "created": created, "job": job},
         )
 
     @app.get("/v1/admin/history-jobs")
-    def list_history_jobs(limit: int = Query(50, ge=1, le=200)):
-        return {"items": require_history_manager().list(limit)}
+    def list_history_jobs(
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=10000),
+        status: str = Query("", max_length=40),
+    ):
+        values = require_history_manager().list(200)
+        if status:
+            values = [item for item in values if item.get("status") == status]
+        page = values[offset:offset + limit]
+        return {
+            "items": page,
+            "page": {
+                "limit": limit, "offset": offset, "returned": len(page),
+                "total": len(values),
+            },
+        }
 
     @app.get("/v1/admin/history-jobs/{job_id}")
     def get_history_job(job_id: str):
@@ -1751,20 +2024,52 @@ def create_app(
             raise HTTPException(status_code=404, detail="history job not found") from exc
 
     @app.post("/v1/admin/history-jobs/{job_id}/cancel")
-    def cancel_history_job(job_id: str):
+    def cancel_history_job(
+        job_id: str,
+        request: Request,
+        x_request_id: str = Header("", max_length=120),
+    ):
+        actor = authenticated_actor(request)
         try:
-            return require_history_manager().cancel(job_id)
+            result = require_history_manager().cancel(job_id)
         except KeyError as exc:
+            admin_audit.append(
+                actor=actor, action="history_job.cancel", target=job_id,
+                outcome="rejected", request_id=x_request_id, detail="not found",
+            )
             raise HTTPException(status_code=404, detail="history job not found") from exc
+        admin_audit.append(
+            actor=actor, action="history_job.cancel", target=job_id,
+            outcome="succeeded", request_id=x_request_id,
+        )
+        return result
 
     @app.post("/v1/admin/history-jobs/{job_id}/retry-failed")
-    def retry_history_job(job_id: str):
+    def retry_history_job(
+        job_id: str,
+        request: Request,
+        x_request_id: str = Header("", max_length=120),
+    ):
+        actor = authenticated_actor(request)
         try:
-            return require_history_manager().retry_failed(job_id)
+            result = require_history_manager().retry_failed(job_id)
         except KeyError as exc:
+            admin_audit.append(
+                actor=actor, action="history_job.retry_failed", target=job_id,
+                outcome="rejected", request_id=x_request_id, detail="not found",
+            )
             raise HTTPException(status_code=404, detail="history job not found") from exc
         except ValueError as exc:
+            admin_audit.append(
+                actor=actor, action="history_job.retry_failed", target=job_id,
+                outcome="rejected", request_id=x_request_id, detail=str(exc),
+            )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        admin_audit.append(
+            actor=actor, action="history_job.retry_failed", target=job_id,
+            outcome="succeeded", request_id=x_request_id,
+        )
+        return result
 
     @app.post("/v1/admin/history-jobs/{job_id}/reconcile")
     def reconcile_history_job(job_id: str, request: HistoryReconcileRequest):
@@ -1946,5 +2251,13 @@ load();setInterval(load,2000);</script></body></html>"""
             as_of=normalized_as_of,
         )
         return {"count": len(rows), "limit": limit, "offset": offset, "as_of": normalized_as_of or None, "point_in_time": bool(normalized_as_of), "items": rows}
+
+    admin_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if settings.admin_frontend_enabled and (admin_dist / "index.html").is_file():
+        app.mount(
+            "/admin",
+            StaticFiles(directory=admin_dist, html=True),
+            name="admin-frontend",
+        )
 
     return app

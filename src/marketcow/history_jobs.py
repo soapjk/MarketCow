@@ -296,7 +296,6 @@ class HistoryJobManager:
         for job in map(_clean, jobs):
             job_id = str(job["job_id"])
             items = list(map(_clean, self.repository.list_history_items(job_id)))
-            request = dict(job["request_json"])
             redispatch = False
             for raw in items:
                 item = dict(raw)

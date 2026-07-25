@@ -7,6 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DASHBOARD = ROOT / "ops/grafana/dashboards/marketcow-data-inventory.json"
+API_DASHBOARD = ROOT / "ops/grafana/dashboards/marketcow-api-observability.json"
 
 
 class GrafanaDashboardTest(unittest.TestCase):
@@ -59,7 +60,21 @@ class GrafanaDashboardTest(unittest.TestCase):
             {item["name"] for item in self.dashboard["templating"]["list"]},
         )
 
+    def test_api_dashboard_uses_bounded_prometheus_metrics(self) -> None:
+        dashboard = json.loads(API_DASHBOARD.read_text())
+        self.assertEqual(dashboard["uid"], "marketcow-api-observability")
+        self.assertEqual(dashboard["refresh"], "5s")
+        titles = {panel["title"] for panel in dashboard["panels"]}
+        self.assertEqual(
+            titles,
+            {"Request rate", "Error ratio", "Request latency", "In-flight requests"},
+        )
+        for panel in dashboard["panels"]:
+            self.assertEqual(panel["datasource"]["uid"], "marketcow-prometheus")
+            for target in panel["targets"]:
+                self.assertIn("marketcow_http_", target["expr"])
+                self.assertNotIn("user_id", target["expr"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
