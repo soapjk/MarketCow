@@ -9,8 +9,7 @@ from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import (
-    Body, FastAPI, Header, HTTPException, Query, Request, WebSocket,
-    WebSocketDisconnect,
+    FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect,
 )
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -161,6 +160,20 @@ class HistoryReconcileRequest(BaseModel):
     dry_run: bool
 
 
+class AdminSessionRequest(BaseModel):
+    token: str = Field(default="", max_length=500)
+    username: str = Field(default="", max_length=64)
+    password: str = Field(default="", max_length=128)
+
+    @model_validator(mode="after")
+    def valid_login_method(self):
+        has_token = bool(self.token)
+        has_credentials = bool(self.username and self.password)
+        if has_token == has_credentials:
+            raise ValueError("provide either token or username and password")
+        return self
+
+
 class DividendAnnouncementInput(BaseModel):
     symbol: str
     fiscal_year: int = Field(ge=1990, le=2100)
@@ -205,6 +218,7 @@ def create_app(
         settings.admin_auth_required,
         settings.admin_tokens_json,
         settings.admin_session_seconds,
+        users_json=settings.admin_users_json,
     )
     app.add_middleware(
         AdminSecurityMiddleware,
@@ -507,9 +521,14 @@ def create_app(
         }
 
     @app.post("/v1/auth/session")
-    def create_admin_session(token: str = Body(embed=True, min_length=1, max_length=500)):
+    def create_admin_session(credentials: AdminSessionRequest):
         try:
-            session_id, identity = admin_auth.login(token)
+            if credentials.token:
+                session_id, identity = admin_auth.login(credentials.token)
+            else:
+                session_id, identity = admin_auth.login_credentials(
+                    credentials.username, credentials.password
+                )
         except PermissionError as exc:
             raise HTTPException(
                 status_code=401, detail={"code": "invalid_credentials"}

@@ -1,21 +1,34 @@
 # MarketCow administration security
 
 Administration authentication is enabled by default for the production profile.
-Configure one or more long local bootstrap tokens:
+Browser users authenticate with a username and password. Store only a scrypt hash:
 
 ```dotenv
 MARKETCOW_ADMIN_AUTH_REQUIRED=true
+MARKETCOW_ADMIN_USERS_JSON={"admin":{"role":"admin","password_hash":"scrypt$..."}}
+MARKETCOW_ADMIN_SESSION_SECONDS=2592000
+```
+
+Generate a password hash locally:
+
+```bash
+uv run python -c 'from marketcow.admin_auth import hash_admin_password; import getpass; print(hash_admin_password(getpass.getpass()))'
+```
+
+Long bootstrap tokens remain available for API automation:
+
+```dotenv
 MARKETCOW_ADMIN_TOKENS_JSON={"long-viewer-token":"viewer","long-operator-token":"operator","long-admin-token":"admin"}
 ```
 
-Keep this value in the uncommitted profile environment file. Tokens must contain at
-least 16 characters. Production startup fails when authentication is required but
-no token is configured.
+Keep these values in the uncommitted profile environment file. Passwords must contain
+8 to 128 characters; tokens must contain at least 16 characters. Production startup
+fails when authentication is required but neither a user nor token is configured.
 
 ## Session flow
 
-1. `POST /v1/auth/session` accepts a bootstrap token once.
-2. The server creates a random, bounded, eight-hour session.
+1. `POST /v1/auth/session` accepts username/password or a bootstrap token.
+2. The server creates a random, bounded session, configurable up to 30 days.
 3. The session ID is stored in an HttpOnly, SameSite=Strict cookie.
 4. A separate SameSite=Strict CSRF cookie must match `X-CSRF-Token` on mutations.
 5. `DELETE /v1/auth/session` removes the server session and both cookies.

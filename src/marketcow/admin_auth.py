@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import json
+import re
 import secrets
 import threading
 import time
@@ -16,6 +19,10 @@ SESSION_COOKIE = "marketcow_admin_session"
 CSRF_COOKIE = "marketcow_csrf"
 ROLES = {"viewer": 1, "operator": 2, "admin": 3}
 MAX_SESSIONS = 128
+_USERNAME = re.compile(r"^[A-Za-z0-9_.-]{3,64}$")
+_SCRYPT_N = 16384
+_SCRYPT_R = 8
+_SCRYPT_P = 1
 
 
 @dataclass(frozen=True)
@@ -30,6 +37,12 @@ class Identity:
 class _Session:
     identity: Identity
     expires_at: float
+
+
+@dataclass(frozen=True)
+class AdminUser:
+    role: str
+    password_hash: str
 
 
 def load_admin_tokens(raw: str) -> dict[str, str]:
@@ -53,19 +66,107 @@ def load_admin_tokens(raw: str) -> dict[str, str]:
     return result
 
 
+def hash_admin_password(password: str, salt: bytes | None = None) -> str:
+    if not 8 <= len(password) <= 128:
+        raise ValueError("admin password length is invalid")
+    salt = salt or secrets.token_bytes(16)
+    if len(salt) != 16:
+        raise ValueError("admin password salt is invalid")
+    digest = hashlib.scrypt(
+        password.encode(),
+        salt=salt,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=32,
+    )
+    encoded_salt = base64.urlsafe_b64encode(salt).decode().rstrip("=")
+    encoded_digest = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return (
+        f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}"
+        f"${encoded_salt}${encoded_digest}"
+    )
+
+
+def _decode_password_hash(encoded: str) -> tuple[bytes, bytes] | None:
+    try:
+        algorithm, n, r, p, encoded_salt, encoded_digest = encoded.split("$")
+        if (
+            algorithm != "scrypt"
+            or (int(n), int(r), int(p)) != (_SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
+        ):
+            return None
+        salt = base64.urlsafe_b64decode(encoded_salt + "==")
+        expected = base64.urlsafe_b64decode(encoded_digest + "==")
+        if len(salt) != 16 or len(expected) != 32:
+            return None
+        return salt, expected
+    except (ValueError, TypeError):
+        return None
+
+
+def verify_admin_password(password: str, encoded: str) -> bool:
+    decoded = _decode_password_hash(encoded)
+    if decoded is None:
+        return False
+    salt, expected = decoded
+    try:
+        actual = hashlib.scrypt(
+            password.encode(),
+            salt=salt,
+            n=_SCRYPT_N,
+            r=_SCRYPT_R,
+            p=_SCRYPT_P,
+            dklen=32,
+        )
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def load_admin_users(raw: str) -> dict[str, AdminUser]:
+    if not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("admin users must be valid JSON") from exc
+    if not isinstance(value, Mapping) or not 1 <= len(value) <= 20:
+        raise ValueError("admin users must be an object with 1 to 20 entries")
+    result = {}
+    for username, declaration in value.items():
+        username = str(username).strip()
+        if not _USERNAME.fullmatch(username) or not isinstance(declaration, Mapping):
+            raise ValueError("admin user declaration is invalid")
+        role = str(declaration.get("role", "")).strip().lower()
+        password_hash = str(declaration.get("password_hash", "")).strip()
+        if role not in ROLES or _decode_password_hash(password_hash) is None:
+            raise ValueError("admin user credentials are invalid")
+        result[username] = AdminUser(role=role, password_hash=password_hash)
+    return result
+
+
+_DUMMY_PASSWORD_HASH = hash_admin_password(
+    "marketcow-invalid-login", salt=b"\0" * 16
+)
+
+
 class AdminAuth:
     """Local bearer/bootstrap token auth with bounded HttpOnly sessions."""
 
     def __init__(
         self, required: bool, tokens_json: str = "", session_seconds: int = 28800,
-        clock: Any = None,
+        clock: Any = None, users_json: str = "",
     ) -> None:
-        if not 300 <= session_seconds <= 86400:
+        if not 300 <= session_seconds <= 2592000:
             raise ValueError("admin session duration is invalid")
         self.required = bool(required)
         self.tokens = load_admin_tokens(tokens_json)
-        if self.required and not self.tokens:
-            raise ValueError("admin authentication requires at least one token")
+        self.users = load_admin_users(users_json)
+        if self.required and not (self.tokens or self.users):
+            raise ValueError(
+                "admin authentication requires at least one token or user"
+            )
         self.session_seconds = session_seconds
         self.clock = clock or time.time
         self._sessions: OrderedDict[str, _Session] = OrderedDict()
@@ -78,10 +179,22 @@ class AdminAuth:
                 role = candidate_role
         if role is None:
             raise PermissionError("invalid administration token")
+        return self._create_session(f"local-{role}", role)
+
+    def login_credentials(self, username: str, password: str) -> tuple[str, Identity]:
+        normalized = username.strip()
+        user = self.users.get(normalized)
+        password_hash = user.password_hash if user else _DUMMY_PASSWORD_HASH
+        valid = verify_admin_password(password, password_hash)
+        if user is None or not valid:
+            raise PermissionError("invalid administration credentials")
+        return self._create_session(normalized, user.role)
+
+    def _create_session(self, actor: str, role: str) -> tuple[str, Identity]:
         session_id = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(24)
         identity = Identity(
-            actor=f"local-{role}", role=role, csrf=csrf, cookie_session=True
+            actor=actor, role=role, csrf=csrf, cookie_session=True
         )
         with self._lock:
             self._expire()

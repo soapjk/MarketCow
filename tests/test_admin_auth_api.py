@@ -8,6 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from marketcow.api import create_app
+from marketcow.admin_auth import hash_admin_password
 from marketcow.config import Settings
 from tests.test_market_data_api import Service
 
@@ -29,6 +30,13 @@ class AdminAuthApiTest(unittest.TestCase):
             admin_tokens_json=(
                 '{"viewer-token-123456789":"viewer",'
                 '"operator-token-123456":"operator"}'
+            ),
+            admin_users_json=(
+                '{"admin":{"role":"admin","password_hash":"'
+                + hash_admin_password(
+                    "correct horse battery staple", salt=b"0123456789abcdef"
+                )
+                + '"}}'
             ),
         )
 
@@ -94,6 +102,21 @@ class AdminAuthApiTest(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 503)
             self.assertEqual(response.json()["detail"]["code"], "admin_commands_disabled")
+
+    def test_username_and_password_login(self):
+        with TestClient(create_app(self.settings, Service())) as client:
+            login = client.post("/v1/auth/session", json={
+                "username": "admin",
+                "password": "correct horse battery staple",
+            })
+            self.assertEqual(login.status_code, 200)
+            self.assertEqual(login.json()["actor"], "admin")
+            self.assertEqual(login.json()["role"], "admin")
+            rejected = TestClient(create_app(self.settings, Service())).post(
+                "/v1/auth/session",
+                json={"username": "admin", "password": "wrong password"},
+            )
+            self.assertEqual(rejected.status_code, 401)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@ from __future__ import annotations
 import unittest
 
 from marketcow.admin_auth import (
-    AdminAuth, AdminSecurityMiddleware, Identity, load_admin_tokens,
+    AdminAuth, AdminSecurityMiddleware, Identity, hash_admin_password,
+    load_admin_tokens, load_admin_users, verify_admin_password,
 )
 
 
@@ -53,6 +54,35 @@ class AdminAuthTest(unittest.TestCase):
         auth = AdminAuth(True, '{"valid-token-123456":"admin"}')
         with self.assertRaises(PermissionError):
             auth.login("wrong-token-123456")
+
+    def test_password_users_are_hashed_and_create_named_sessions(self):
+        password_hash = hash_admin_password(
+            "correct horse battery staple", salt=b"0123456789abcdef"
+        )
+        users_json = (
+            '{"admin":{"role":"admin","password_hash":"' + password_hash + '"}}'
+        )
+        auth = AdminAuth(True, users_json=users_json)
+        session_id, identity = auth.login_credentials(
+            "admin", "correct horse battery staple"
+        )
+        self.assertEqual(identity.actor, "admin")
+        self.assertEqual(identity.role, "admin")
+        self.assertEqual(
+            auth.authenticate({}, {"marketcow_admin_session": session_id}), identity
+        )
+        self.assertTrue(verify_admin_password(
+            "correct horse battery staple", password_hash
+        ))
+        self.assertFalse(verify_admin_password("wrong password", password_hash))
+        with self.assertRaises(PermissionError):
+            auth.login_credentials("admin", "wrong password")
+        with self.assertRaises(PermissionError):
+            auth.login_credentials("missing", "correct horse battery staple")
+        with self.assertRaisesRegex(ValueError, "credentials"):
+            load_admin_users(
+                '{"admin":{"role":"admin","password_hash":"not-a-hash"}}'
+            )
 
     def test_command_feature_flag_is_explicit(self):
         middleware = AdminSecurityMiddleware(

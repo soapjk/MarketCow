@@ -5,7 +5,8 @@ import { AuthContext, type Identity } from "./authContext";
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const client = useQueryClient();
-  const [token, setToken] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const session = useQuery({
     queryKey: ["admin-session"],
     queryFn: () => api.request<Identity>("/v1/auth/session"),
@@ -13,7 +14,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   });
   const login = useMutation({
     mutationFn: () => api.request<Identity>("/v1/auth/session", {
-      method: "POST", body: JSON.stringify({ token }),
+      method: "POST", body: JSON.stringify({ username, password }),
     }),
     onSuccess: (identity) => client.setQueryData(["admin-session"], identity),
   });
@@ -42,8 +43,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
           <div className="brand-mark">M</div>
           <p className="eyebrow">LOCAL ADMINISTRATION</p>
           <h1>进入 MarketCow Control</h1>
-          <p>输入本机配置的 Viewer、Operator 或 Admin bootstrap token。</p>
-          <label>访问令牌<input autoFocus type="password" autoComplete="current-password" value={token} onChange={(event) => setToken(event.target.value)} required /></label>
+          <p>使用本机配置的管理账户登录。程序调用仍可使用 bootstrap token。</p>
+          <label>用户名<input autoFocus type="text" autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
+          <label>密码<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
           <button type="submit" disabled={login.isPending}>{login.isPending ? "验证中…" : "登录"}</button>
           {login.isError && <p className="inline-error">{login.error.message}</p>}
         </form>
