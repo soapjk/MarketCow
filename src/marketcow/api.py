@@ -46,6 +46,7 @@ from .hyperliquid_realtime import (
     RoutingRealtimeProvider,
 )
 from .providers.longport_quote import LongPortError
+from .dashboard_registry import load_dashboard_registry, registry_document
 
 
 def normalize_quote_symbol(value: str) -> str:
@@ -211,6 +212,7 @@ def create_app(
         clock=clock, persist_bar=persist_realtime_bar,
     )
     app.state.realtime_hub = hub
+    app.state.dashboard_registry = load_dashboard_registry(settings.dashboard_registry_json)
 
     async def shutdown() -> None:
         try:
@@ -396,6 +398,10 @@ def create_app(
             "metadata_backend": "postgresql",
             "storage_health": storage_health(),
         }
+
+    @app.get("/v1/admin/dashboards")
+    def admin_dashboards():
+        return registry_document(app.state.dashboard_registry)
 
     @app.get("/v1/readiness")
     def readiness():

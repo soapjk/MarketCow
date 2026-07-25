@@ -171,6 +171,8 @@ def _configure_launch_agent(plist_path: Path, provisioning_root: Path) -> None:
     data = plistlib.loads(plist_path.read_bytes())
     env = data.setdefault("EnvironmentVariables", {})
     env["GF_PATHS_PROVISIONING"] = str(provisioning_root)
+    env["GF_SECURITY_ALLOW_EMBEDDING"] = "true"
+    env["GF_SECURITY_COOKIE_SAMESITE"] = "lax"
     temporary = plist_path.with_suffix(".plist.tmp")
     temporary.write_bytes(plistlib.dumps(data, sort_keys=False))
     os.replace(temporary, plist_path)

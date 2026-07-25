@@ -53,3 +53,23 @@ The dashboard is one part of the broader visualization and administration design
 The accepted boundary between Grafana, native administration pages, aggregate
 metrics, and sub-second streaming panels is documented in
 [`visualization/architecture-baseline.md`](visualization/architecture-baseline.md).
+
+## Administration frontend embedding
+
+The administration frontend reads its dashboard list from
+`GET /v1/admin/dashboards`. MarketCow's inventory dashboard is registered by
+default. Additional local dashboards are configured with
+`MARKETCOW_DASHBOARD_REGISTRY_JSON`; entries contain a stable key, project, display
+name, Grafana dashboard UID and slug, and optional panel, theme, variables, and sort
+order. The server validates identifiers and returns only a Grafana-relative path.
+
+The local provisioning command enables iframe rendering and keeps the Grafana login
+cookie at `SameSite=Lax`. Grafana remains independently authenticated. The frontend
+uses `VITE_GRAFANA_BASE_URL` (default `http://127.0.0.1:3001`) and offers a direct
+Grafana link if the iframe does not load.
+
+Example additional dashboard:
+
+```dotenv
+MARKETCOW_DASHBOARD_REGISTRY_JSON=[{"key":"api-traffic","project":"API Service","name":"API access","dashboard_uid":"api-traffic","slug":"api-traffic","sort_order":20}]
+```

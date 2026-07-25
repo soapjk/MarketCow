@@ -16,10 +16,10 @@ export type ApiClientOptions = {
 
 export function createApiClient(options: ApiClientOptions = {}) {
   const baseUrl = (options.baseUrl ?? import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl = options.fetchImpl;
 
   async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const response = await fetchImpl(`${baseUrl}${path}`, {
+    const response = await (fetchImpl ?? fetch)(`${baseUrl}${path}`, {
       ...init,
       headers: {
         Accept: "application/json",

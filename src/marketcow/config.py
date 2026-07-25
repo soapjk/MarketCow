@@ -89,6 +89,7 @@ class Settings:
     hyperliquid_base_url: str = "https://api.hyperliquid.xyz"
     hyperliquid_timeout_seconds: float = 3.0
     hyperliquid_request_budget_seconds: float = 10.0
+    dashboard_registry_json: str = ""
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -241,6 +242,7 @@ class Settings:
             hyperliquid_request_budget_seconds=float(os.getenv(
                 "MARKETCOW_HYPERLIQUID_REQUEST_BUDGET_SECONDS", "10"
             )),
+            dashboard_registry_json=os.getenv("MARKETCOW_DASHBOARD_REGISTRY_JSON", ""),
         )
 
     def validate_runtime_isolation(self) -> None:

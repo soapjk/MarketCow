@@ -1,6 +1,7 @@
 import { Component, type ErrorInfo, type ReactNode, useEffect, useState } from "react";
 import { AppShell } from "./AppShell";
 import { PlaceholderPage } from "../components/PlaceholderPage";
+import { DashboardsPage } from "../features/dashboards/DashboardsPage";
 
 type ErrorBoundaryState = { error: Error | null };
 
@@ -51,7 +52,7 @@ export function App() {
   return (
     <ErrorBoundary>
       <AppShell path={path}>
-        <PlaceholderPage kind={kind} />
+        {kind === "dashboards" ? <DashboardsPage /> : <PlaceholderPage kind={kind} />}
       </AppShell>
     </ErrorBoundary>
   );
