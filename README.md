@@ -66,3 +66,19 @@ git diff --check
 ```
 
 更完整的架构边界见 [当前运行架构](docs/architecture/current-runtime.md)。
+
+## 管理后台
+
+可视化与管理后台位于 `web/`，使用 React、TypeScript 和 Vite。开发时分别启动
+MarketCow API 与前端：
+
+```bash
+uv run marketcow --profile development start --host 127.0.0.1 --port 8792
+cd web
+npm install
+npm run dev
+```
+
+前端默认监听 `http://127.0.0.1:4173`，并将 `/v1` 代理到本地 API。详细的
+Grafana、聚合指标和实时面板边界见
+[可视化架构基线](docs/visualization/architecture-baseline.md)。

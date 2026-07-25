@@ -10,6 +10,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+node_modules/
 *.whl
 .pytest_cache/
 .ruff_cache/
