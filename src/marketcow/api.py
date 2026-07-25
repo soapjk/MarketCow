@@ -32,6 +32,7 @@ from .csv_import import (
     InstrumentMapping,
 )
 from .csv_import_service import CsvImportService, create_csv_import_service
+from .csv_import_jobs import _safe_error_message
 from .instruments import canonical_instrument
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
 from .market_data_contracts import (
@@ -2119,10 +2120,22 @@ def create_app(
         return value
 
     def public_csv_import_job(job: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        public = {
             key: value for key, value in job.items()
             if key not in {"storage_path", "request_json"}
         }
+        if public.get("error_message"):
+            public["error_message"] = _safe_error_message(
+                public["error_message"]
+            )
+        public["shards"] = [{
+            **shard,
+            "error_message": (
+                _safe_error_message(shard["error_message"])
+                if shard.get("error_message") else shard.get("error_message")
+            ),
+        } for shard in public.get("shards") or ()]
+        return public
 
     @app.post("/v1/admin/csv-imports/dry-run")
     def dry_run_csv_import(request: CsvImportDryRunInput):

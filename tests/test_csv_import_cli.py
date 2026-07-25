@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from marketcow.__main__ import build_parser
+from marketcow.__main__ import (
+    _public_csv_job,
+    _write_csv_import_evidence,
+    build_parser,
+)
 from marketcow.config import Settings
 
 
@@ -27,6 +31,23 @@ class CsvImportCliTest(unittest.TestCase):
         self.assertTrue(args.dry_run)
         self.assertEqual(args.chunk_rows, 100000)
         self.assertEqual(args.max_attempts, 3)
+        self.assertEqual(args.evidence_output, "")
+
+    def test_smoke_evidence_is_redacted_and_create_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "evidence.json"
+            payload = _public_csv_job({
+                "job_id": "job", "status": "succeeded",
+                "storage_path": "/secret/purchased.csv",
+                "request_json": {"path": "/secret/purchased.csv"},
+                "quality_report_json": {"status": "passed"},
+            })
+            _write_csv_import_evidence(str(target), payload)
+            body = target.read_text(encoding="utf-8")
+            self.assertNotIn("/secret", body)
+            self.assertIn('"status": "succeeded"', body)
+            with self.assertRaises(FileExistsError):
+                _write_csv_import_evidence(str(target), payload)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -98,7 +99,39 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     csv_import.add_argument("--idempotency-key", default="")
     csv_import.add_argument("--chunk-rows", type=int, default=100000)
     csv_import.add_argument("--max-attempts", type=int, default=3)
+    csv_import.add_argument(
+        "--evidence-output", default="",
+        help=(
+            "create a redacted JSON smoke-test evidence file; "
+            "the file must not already exist"
+        ),
+    )
     return parser
+
+
+def _write_csv_import_evidence(
+    output: str, payload: dict[str, Any]
+) -> None:
+    if not output:
+        return
+    target = Path(output).expanduser().resolve()
+    if not target.parent.is_dir():
+        raise ValueError("CSV import evidence parent directory does not exist")
+    encoded = json.dumps(
+        payload, ensure_ascii=False, indent=2, sort_keys=True, default=str
+    )
+    with target.open("x", encoding="utf-8") as stream:
+        stream.write(encoded)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _public_csv_job(job: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value for key, value in job.items()
+        if key not in {"storage_path", "request_json"}
+    }
 
 
 def import_csv_bars(settings: Settings, args: Any) -> dict[str, Any]:
@@ -107,7 +140,8 @@ def import_csv_bars(settings: Settings, args: Any) -> dict[str, Any]:
     from .service import FundamentalService
 
     config_path = Path(args.config).expanduser().resolve(strict=True)
-    if not config_path.is_relative_to(settings.allowed_root.resolve()):
+    allowed_root = (settings.allowed_root or settings.storage_root).resolve()
+    if not config_path.is_relative_to(allowed_root):
         raise ValueError("CSV import config is outside MARKETCOW_ALLOWED_ROOT")
     declaration = CsvImportRequest.from_dict(json.loads(
         config_path.read_text(encoding="utf-8")
@@ -116,7 +150,30 @@ def import_csv_bars(settings: Settings, args: Any) -> dict[str, Any]:
     imports = create_csv_import_service(settings, service)
     try:
         if args.dry_run:
-            return imports.dry_run(args.file, declaration)
+            report = imports.dry_run(args.file, declaration)
+            evidence = {
+                "schema": "marketcow.csv-import-smoke-evidence.v1",
+                "generated_at": datetime.now(timezone.utc).isoformat(
+                    timespec="microseconds"
+                ),
+                "mode": "dry-run",
+                "contract_version": report["contract_version"],
+                "file": report["file"],
+                "source": report["source"],
+                "profile": report["profile"],
+                "namespace": report["namespace"],
+                "interval": report["interval"],
+                "adjustment": report["adjustment"],
+                "validation": {
+                    key: value for key, value in report.items()
+                    if key not in {
+                        "file", "source", "profile", "namespace",
+                        "interval", "adjustment",
+                    }
+                },
+            }
+            _write_csv_import_evidence(args.evidence_output, evidence)
+            return report
         key = args.idempotency_key.strip()
         if not key:
             raise ValueError("--idempotency-key is required without --dry-run")
@@ -130,7 +187,23 @@ def import_csv_bars(settings: Settings, args: Any) -> dict[str, Any]:
             if current is None:
                 raise RuntimeError("CSV import job disappeared")
             if current["status"] in {"succeeded", "failed", "canceled"}:
-                return {"created": created, "job": current}
+                request_json = dict(current.get("request_json") or {})
+                evidence = {
+                    "schema": "marketcow.csv-import-smoke-evidence.v1",
+                    "generated_at": datetime.now(timezone.utc).isoformat(
+                        timespec="microseconds"
+                    ),
+                    "mode": "formal-import",
+                    "created": created,
+                    "file": (
+                        request_json.get("dry_run_report", {}).get("file")
+                    ),
+                    "manifest": request_json.get("manifest"),
+                    "job": _public_csv_job(current),
+                    "quality_report": current.get("quality_report_json"),
+                }
+                _write_csv_import_evidence(args.evidence_output, evidence)
+                return {"created": created, "job": _public_csv_job(current)}
             time.sleep(0.2)
     finally:
         imports.close()

@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 
-from marketcow.csv_import_jobs import CsvImportJobManager
+from marketcow.csv_import_jobs import CsvImportJobManager, _safe_error_message
 from marketcow.csv_import_ingestion import CsvImportCanceled
 
 
@@ -144,6 +144,13 @@ def create(manager, key="import-key"):
 
 
 class CsvImportJobManagerTest(unittest.TestCase):
+    def test_persisted_errors_redact_absolute_paths(self):
+        message = _safe_error_message(
+            "failed reading /srv/private/vendor/bars.csv at row 2"
+        )
+        self.assertNotIn("/srv/private", message)
+        self.assertIn("<redacted-path>", message)
+
     def test_job_is_idempotent_and_aggregates_durable_shards(self):
         repository = MemoryRepository()
         manager = CsvImportJobManager(

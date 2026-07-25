@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,10 +10,15 @@ from typing import Any, Callable
 
 TERMINAL_CSV_IMPORT_JOBS = {"succeeded", "failed", "canceled"}
 TERMINAL_CSV_IMPORT_SHARDS = {"succeeded", "failed", "canceled"}
+_ABSOLUTE_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s\"']+")
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _safe_error_message(value: Any) -> str:
+    return _ABSOLUTE_PATH.sub("<redacted-path>", str(value))[:500]
 
 
 class CsvImportJobManager:
@@ -202,7 +208,7 @@ class CsvImportJobManager:
                 **claimed, "status": status, "rows_read": 0,
                 "rows_written": 0, "write_receipt_json": None,
                 "error_code": None if canceled else type(exc).__name__.lower(),
-                "error_message": str(exc)[:500], "updated_at": finished,
+                "error_message": _safe_error_message(exc), "updated_at": finished,
                 "finished_at": (
                     finished if status in {"failed", "canceled"} else None
                 ),
@@ -254,7 +260,7 @@ class CsvImportJobManager:
                 status, code = "succeeded", None
             except Exception as exc:
                 status, code = "failed", "csv_import_quality_failed"
-                job = {**job, "error_message": str(exc)[:500]}
+                job = {**job, "error_message": _safe_error_message(exc)}
         elif job["status"] == "cancel_requested" and not statuses.intersection(
             {"queued", "running", "retry"}
         ):

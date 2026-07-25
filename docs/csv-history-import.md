@@ -135,6 +135,20 @@ marketcow --profile production import-bars \
   --max-attempts 3
 ```
 
+生产前真实样本 smoke test 应额外输出脱敏证据文件：
+
+```bash
+marketcow --profile production import-bars \
+  --file /allowed/imports/vendor-authorized-sample.csv \
+  --config /allowed/imports/vendor-us-profile.json \
+  --idempotency-key smoke-vendor-us-20260725 \
+  --evidence-output /allowed/evidence/vendor-us-smoke-20260725.json
+```
+
+证据文件使用 `marketcow.csv-import-smoke-evidence.v1`，包含输入文件哈希和大小、
+Manifest、终态、分片 receipt 与质量报告，但不包含 CSV 内容、原始配置、服务器
+归档路径或购买数据路径。目标文件必须不存在，避免覆盖既有审计证据。
+
 CSV 与声明文件都必须位于 `MARKETCOW_ALLOWED_ROOT` 下。原始 CSV 会以内容哈希
 命名，原子复制到 MarketCow storage；同一 Manifest 重复提交不会产生第二份文件。
 未配置 allowed root 时仅允许 storage root。文件大小默认上限为 100 GiB，可用
