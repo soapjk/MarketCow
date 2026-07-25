@@ -24,11 +24,30 @@ class AdjustmentBackfillService:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat()
 
+    @staticmethod
+    def _utc_iso(value: Any) -> str:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+    @staticmethod
+    def _factor_symbol(symbol: str) -> str:
+        suffixes = {
+            ".SH": ".XSHG", ".SZ": ".XSHE", ".BJ": ".XBSE",
+        }
+        for suffix, mic in suffixes.items():
+            if symbol.endswith(suffix):
+                return symbol[:-len(suffix)] + mic
+        return symbol
+
     def plan(self, limit: int = 10000) -> Dict[str, Any]:
         candidates = self.repository.list_adjustment_contract_candidates(limit)
         repaired: List[Dict[str, Any]] = []
         quarantined: List[Dict[str, Any]] = []
-        factor_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+        factor_cache: Dict[tuple[str, str, str], Dict[str, Any]] = {}
         for row in candidates:
             identity = {
                 "symbol": str(row["symbol"]), "interval": str(row["interval"]),
@@ -52,10 +71,14 @@ class AdjustmentBackfillService:
                 )
             elif "tushare" in str(row["source"]):
                 trade_date = self._trade_date(row)
-                key = (str(row["symbol"]), trade_date)
+                key = (
+                    self._factor_symbol(str(row["symbol"])),
+                    trade_date,
+                    str(row["source"]),
+                )
                 if key not in factor_cache:
                     factors = self.repository.get_adjustment_factors(
-                        key[0], trade_date, trade_date, str(row["source"])
+                        key[0], trade_date, trade_date, key[2]
                     )
                     factor_cache[key] = factors[0] if factors else {}
                 factor = factor_cache[key]
@@ -87,10 +110,10 @@ class AdjustmentBackfillService:
                 ),
             })
         digest = hashlib.sha256(
-            repr(sorted(
+            ("adjustment-backfill-v2:" + repr(sorted(
                 (row["symbol"], row["interval"], str(row["bar_time"]), row["source"])
                 for row in repaired
-            )).encode()
+            ))).encode()
         ).hexdigest()[:24]
         return {
             "schema": "marketcow.adjustment-backfill-plan.v1",
@@ -108,7 +131,14 @@ class AdjustmentBackfillService:
         rows = []
         for row in plan["rows"]:
             rows.append({
-                **row, "ingested_at": now,
+                **row,
+                "bar_time": self._utc_iso(row["bar_time"]),
+                "ingested_at": now,
+                "observed_at": self._utc_iso(row["observed_at"]),
+                "factor_as_of": (
+                    None if row.get("factor_as_of") is None
+                    else self._utc_iso(row["factor_as_of"])
+                ),
                 "ingestion_id": plan["batch_id"],
             })
             rows[-1].pop("content_rank", None)
@@ -119,4 +149,3 @@ class AdjustmentBackfillService:
         return {
             **plan, "rows": [], "applied": True, "written": written,
         }
-

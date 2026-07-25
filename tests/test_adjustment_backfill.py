@@ -10,11 +10,13 @@ class FakeRepository:
         self.candidates = candidates
         self.factors = factors or []
         self.inserted = []
+        self.factor_calls = []
 
     def list_adjustment_contract_candidates(self, limit):
         return self.candidates[:limit]
 
     def get_adjustment_factors(self, *_args):
+        self.factor_calls.append(_args)
         return self.factors
 
     def insert_raw_bars(self, rows, batch_id=""):
@@ -27,6 +29,7 @@ def row(**updates):
         "symbol": "600519.XSHG", "market": "CN", "interval": "1m",
         "adjustment": "raw", "bar_time": "2026-07-24T01:35:00Z",
         "source": "tushare_via_stockai888", "adjustment_factor": 1,
+        "observed_at": "2026-07-24T01:35:01Z",
         "content_rank": "old", "content_version": 1,
     }
     value.update(updates)
@@ -57,6 +60,9 @@ class AdjustmentBackfillTest(unittest.TestCase):
             "legacy_adjusted_is_ambiguous",
         )
         self.assertEqual(repository.inserted, [])
+        self.assertEqual(
+            repository.factor_calls[0][0], "600519.XSHG"
+        )
 
     def test_apply_replaces_content_identity_and_is_batch_scoped(self):
         repository = FakeRepository(
@@ -76,6 +82,10 @@ class AdjustmentBackfillTest(unittest.TestCase):
         self.assertNotIn("content_rank", repository.inserted[0])
         self.assertEqual(
             repository.inserted[0]["ingestion_id"], result["batch_id"]
+        )
+        self.assertEqual(
+            repository.inserted[0]["bar_time"],
+            "2026-07-24T01:35:00.000+00:00",
         )
 
     def test_crypto_is_not_applicable_and_unknown_sources_are_quarantined(self):

@@ -655,7 +655,16 @@ class ClickHouseMarketBarRepository:
                 **({"source": source} if source else {}),
             },
         )
-        return [dict(zip(result.column_names, row)) for row in result.result_rows]
+        rows = [dict(zip(result.column_names, row)) for row in result.result_rows]
+        return [{
+            **row,
+            "trade_date": str(row["trade_date"]),
+            "adjustment_factor": format(
+                Decimal(str(row["adjustment_factor"])), "f"
+            ),
+            "observed_at": self._iso(row["observed_at"]),
+            "ingested_at": self._iso(row["ingested_at"]),
+        } for row in rows]
 
     def get_raw_ingestion_receipt(
         self, ingestion_id: str
