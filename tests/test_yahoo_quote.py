@@ -49,7 +49,7 @@ class YahooQuoteProviderTest(unittest.TestCase):
         self.assertEqual(quote["session"], "post_market")
         self.assertEqual(quote["price_adjustment"], "raw")
 
-    def test_history_defaults_to_adjusted_ohlc(self):
+    def test_legacy_adjusted_input_emits_explicit_qfq_contract(self):
         provider = YahooQuoteProvider()
         with patch.object(provider, "_fetch_chart", return_value=(PAYLOAD, "https://example/0700.HK")):
             history = provider.fetch_history("700.XHKG", "1y", "1d", "adjusted")
@@ -57,6 +57,32 @@ class YahooQuoteProviderTest(unittest.TestCase):
         self.assertEqual(history["bars"][0]["close"], 242.5)
         self.assertEqual(history["bars"][0]["open"], 240.0)
         self.assertEqual(history["bars"][0]["adjustment_factor"], 0.5)
+        self.assertEqual(history["adjustment"], "qfq")
+        self.assertEqual(
+            history["bars"][0]["corporate_action_factor"], "0.5"
+        )
+        self.assertEqual(
+            history["bars"][0]["applied_adjustment_multiplier"], "0.5"
+        )
+        self.assertEqual(history["bars"][0]["reference_factor"], "1")
+
+    def test_raw_history_keeps_real_factor_without_applying_it(self):
+        provider = YahooQuoteProvider()
+        with patch.object(
+            provider, "_fetch_chart",
+            return_value=(PAYLOAD, "https://example/0700.HK"),
+        ):
+            history = provider.fetch_history("700.XHKG", "1y", "1d", "raw")
+
+        self.assertEqual(history["adjustment"], "raw")
+        self.assertEqual(history["bars"][0]["close"], 485.0)
+        self.assertEqual(
+            history["bars"][0]["corporate_action_factor"], "0.5"
+        )
+        self.assertEqual(
+            history["bars"][0]["applied_adjustment_multiplier"], "1.0"
+        )
+        self.assertIsNone(history["bars"][0]["adjustment_reference_date"])
 
     def test_history_window_uses_explicit_period_boundaries(self):
         provider = YahooQuoteProvider()

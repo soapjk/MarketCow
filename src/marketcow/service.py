@@ -1389,6 +1389,21 @@ class FundamentalService:
             result["raw_response_locator"],
             {"ingestion_id": ingestion_id} if ingestion_id else None,
         )
+        for bar in result["bars"]:
+            applicability = bar.get("factor_applicability")
+            if applicability == "applicable":
+                bar["factor_artifact_id"] = artifact["artifact_id"]
+                bar["factor_as_of"] = ingested_at
+            if applicability in {"applicable", "not_applicable"}:
+                contract = PriceAdjustmentContract.model_validate({
+                    key: bar.get(key) for key in (
+                        "factor_applicability", "corporate_action_factor",
+                        "applied_adjustment_multiplier",
+                        "adjustment_reference_date", "reference_factor",
+                        "factor_source", "factor_artifact_id", "factor_as_of",
+                    )
+                } | {"adjustment": adjustment})
+                bar.update(contract.model_dump())
         count = self.market_bar_repository.upsert_price_bars(
             result["symbol"], interval, adjustment, result["source"], ingested_at, result["bars"],
             {

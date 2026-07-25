@@ -4,8 +4,10 @@ import json
 import subprocess
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -169,14 +171,14 @@ class YahooQuoteProvider:
         value: str,
         range_: str = "1y",
         interval: str = "1d",
-        adjustment: str = "adjusted",
+        adjustment: str = "qfq",
     ) -> Dict[str, Any]:
         if range_ not in ALLOWED_RANGES:
             raise ValueError("unsupported range")
         if interval not in ALLOWED_INTERVALS:
             raise ValueError("unsupported interval")
-        if adjustment not in ("adjusted", "raw"):
-            raise ValueError("adjustment must be adjusted or raw")
+        if adjustment not in ("adjusted", "qfq", "raw"):
+            raise ValueError("Yahoo adjustment must be raw or qfq")
         params = {
             "range": range_, "interval": interval, "includePrePost": "false",
             "events": "div,splits", "includeAdjustedClose": "true",
@@ -193,8 +195,8 @@ class YahooQuoteProvider:
             raise ValueError("history window must be ordered and timezone-aware")
         if interval not in ALLOWED_INTERVALS:
             raise ValueError("unsupported interval")
-        if adjustment not in ("adjusted", "raw"):
-            raise ValueError("adjustment must be adjusted or raw")
+        if adjustment not in ("adjusted", "qfq", "raw"):
+            raise ValueError("Yahoo adjustment must be raw or qfq")
         params = {
             "period1": int(start.timestamp()), "period2": int(end.timestamp()),
             "interval": interval, "includePrePost": "false",
@@ -216,20 +218,35 @@ class YahooQuoteProvider:
         payload, source_url = self._fetch_chart(symbol, params)
         result = self._result(payload)
         meta = result.get("meta") or {}
+        # Yahoo's adjusted close is a back-adjusted series. Keep accepting the
+        # old provider-specific spelling at this boundary, but never emit it.
+        adjustment = "qfq" if adjustment == "adjusted" else adjustment
         timestamps = result.get("timestamp") or []
         indicators = result.get("indicators") or {}
         quote = (indicators.get("quote") or [{}])[0]
         adjusted_close = (indicators.get("adjclose") or [{}])[0].get("adjclose") or []
+        exchange_zone = ZoneInfo(meta.get("exchangeTimezoneName") or "UTC")
+        reference_date = (
+            datetime.fromtimestamp(int(timestamps[-1]), exchange_zone).date().isoformat()
+            if timestamps else None
+        )
         bars: List[Dict[str, Any]] = []
         for index, timestamp in enumerate(timestamps):
             raw_close = _float((quote.get("close") or [])[index]) if index < len(quote.get("close") or []) else None
             adj_close = _float(adjusted_close[index]) if index < len(adjusted_close) else None
-            factor = adj_close / raw_close if adjustment == "adjusted" and adj_close is not None and raw_close else 1.0
+            factor = adj_close / raw_close if adj_close is not None and raw_close else None
+            if raw_close is not None and factor is None:
+                raise ValueError(
+                    "Yahoo history is missing an adjustment factor for a price bar"
+                )
+            applied_multiplier = factor if adjustment == "qfq" and factor else 1.0
             def value_for(field: str) -> Optional[float]:
                 values = quote.get(field) or []
                 number = _float(values[index]) if index < len(values) else None
-                return number * factor if number is not None else None
-            close = adj_close if adjustment == "adjusted" and adj_close is not None else raw_close
+                return (
+                    number * applied_multiplier if number is not None else None
+                )
+            close = adj_close if adjustment == "qfq" and adj_close is not None else raw_close
             if close is None:
                 continue
             volumes = quote.get("volume") or []
@@ -241,7 +258,19 @@ class YahooQuoteProvider:
                 "low": value_for("low"),
                 "close": close,
                 "raw_close": raw_close,
-                "adjustment_factor": factor,
+                "adjustment_factor": applied_multiplier,
+                "factor_applicability": "applicable",
+                "corporate_action_factor": (
+                    None if factor is None else format(Decimal(str(factor)), "f")
+                ),
+                "applied_adjustment_multiplier": format(
+                    Decimal(str(applied_multiplier)), "f"
+                ),
+                "adjustment_reference_date": (
+                    reference_date if adjustment == "qfq" else None
+                ),
+                "reference_factor": "1" if adjustment == "qfq" else None,
+                "factor_source": self.name,
                 "volume": _float(volumes[index]) if index < len(volumes) else None,
             })
         return {
