@@ -93,8 +93,17 @@ curl -X POST http://127.0.0.1:8790/v1/admin/history-jobs \
   `10y`、`ytd`、`max`
 - `adjustment`：仅 `raw`
 
-当前 Tushare 任务链路不支持 A 股日线，也不支持前复权或后复权。不要为 A 股
-Tushare 请求启用 fallback；Yahoo adapter 不接受 MarketCow 的规范 A 股代码。
+每个 Tushare 分片除了分钟 K 线，还会默认调用 `adj_factor`，保存原始响应证据，并将
+`trade_date + adjustment_factor` 日频序列写入 ClickHouse
+`market_adjustment_factor`。因子与分片使用相同的 `ingestion_id`；只要分钟 K 线中
+某个交易日缺少对应因子，该分片就会失败，而不会留下一个表面成功但无法复权的数据集。
+
+这不改变 `adjustment=raw` 的含义：K 线价格仍按上游原始值保存，下载阶段不自动生成
+前复权或后复权价格。后续计算必须使用已保存的因子序列，并显式选择基准日。复权因子是
+公司行动作用于价格的累计结果，不是分红、送转、拆股或合股事件明细。
+
+当前 Tushare 任务链路不支持 A 股日线，也不直接生成前复权或后复权 K 线。不要为
+A 股 Tushare 请求启用 fallback；Yahoo adapter 不接受 MarketCow 的规范 A 股代码。
 
 创建接口返回 HTTP 202。保存响应中的 `job_id`，然后查看该任务：
 

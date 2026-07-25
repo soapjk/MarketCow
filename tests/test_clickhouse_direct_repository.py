@@ -137,6 +137,41 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
             "stable-history-ingestion",
         )
 
+    def test_adjustment_factor_preserves_precision_and_ingestion_identity(self):
+        database = _InsertDatabase()
+        repository = ClickHouseMarketBarRepository(database)
+
+        count = repository.upsert_adjustment_factors(
+            "600519.XSHG", "tushare",
+            "2026-07-25T01:02:03+00:00",
+            [{
+                "trade_date": "2026-07-24",
+                "adjustment_factor": "12.345678901234567890",
+            }],
+            {
+                "raw_artifact_id": "factor-artifact",
+                "ingestion_id": "history-shard-a",
+            },
+        )
+
+        self.assertEqual(count, 1)
+        table, rows, kwargs = database.client.insert_calls[0]
+        self.assertEqual(table, "market_adjustment_factor")
+        factor_index = repository.ADJUSTMENT_FACTOR_COLUMNS.index(
+            "adjustment_factor"
+        )
+        ingestion_index = repository.ADJUSTMENT_FACTOR_COLUMNS.index(
+            "ingestion_id"
+        )
+        self.assertEqual(
+            rows[0][factor_index], Decimal("12.345678901234567890")
+        )
+        self.assertEqual(rows[0][ingestion_index], "history-shard-a")
+        self.assertEqual(
+            kwargs["settings"]["insert_deduplication_token"],
+            "history-shard-a",
+        )
+
     def test_raw_ingestion_receipt_is_read_by_stable_identity(self):
         class Result:
             result_rows = [[2, 1000, 2000, "artifact-a"]]

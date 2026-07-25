@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
@@ -90,6 +91,40 @@ class TushareProvider:
                 "amount": row.get("amount"), "source_payload": row,
             })
         return sorted(bars, key=lambda bar: bar["timestamp"])
+
+    @staticmethod
+    def adjustment_factors(
+        result: Dict[str, Any], expected_ts_code: str = ""
+    ) -> list[Dict[str, Any]]:
+        factors: Dict[str, Dict[str, Any]] = {}
+        for row in TushareProvider.rows(result):
+            ts_code = str(row.get("ts_code") or "").strip()
+            if expected_ts_code and ts_code != expected_ts_code:
+                raise TushareError(
+                    f"adj_factor returned unexpected ts_code {ts_code or '<empty>'}"
+                )
+            raw_date = str(row.get("trade_date") or "").strip()
+            if len(raw_date) != 8 or not raw_date.isdigit():
+                raise TushareError("adj_factor returned an invalid trade_date")
+            try:
+                trade_date = datetime.strptime(raw_date, "%Y%m%d").date().isoformat()
+                factor = Decimal(str(row.get("adj_factor")))
+            except (ValueError, InvalidOperation) as error:
+                raise TushareError("adj_factor returned an invalid factor row") from error
+            if not factor.is_finite() or factor <= 0:
+                raise TushareError("adj_factor must be finite and greater than zero")
+            normalized = {
+                "trade_date": trade_date,
+                "adjustment_factor": format(factor, "f"),
+                "source_payload": row,
+            }
+            existing = factors.get(trade_date)
+            if existing and existing["adjustment_factor"] != normalized["adjustment_factor"]:
+                raise TushareError(
+                    f"adj_factor returned conflicting values for {trade_date}"
+                )
+            factors[trade_date] = normalized
+        return [factors[key] for key in sorted(factors)]
 
     def realtime_quote(self, ts_code: str) -> list[Dict[str, Any]]:
         if not ts_code.strip():

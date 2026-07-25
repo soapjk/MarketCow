@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -366,6 +367,46 @@ class FundamentalService:
         )
         bars = self.tushare_provider.minute_bars(result)
         ingested_at = utc_now()
+        shanghai = ZoneInfo("Asia/Shanghai")
+        factor_start = start.astimezone(shanghai).date()
+        factor_end = (end - timedelta(microseconds=1)).astimezone(shanghai).date()
+        factor_params = {
+            "ts_code": provider_symbol,
+            "start_date": factor_start.strftime("%Y%m%d"),
+            "end_date": factor_end.strftime("%Y%m%d"),
+        }
+        factor_fields = "ts_code,trade_date,adj_factor"
+        factor_result = self.tushare_provider.call(
+            "adj_factor", factor_params, factor_fields
+        )
+        factor_artifact = self._persist_tushare_response(
+            "adj_factor", factor_params, factor_fields, factor_result,
+            {"ingestion_id": ingestion_id, "instrument_id": instrument.instrument_id},
+        )
+        factors = self.tushare_provider.adjustment_factors(
+            factor_result, provider_symbol
+        )
+        expected_dates = {
+            datetime.fromisoformat(str(bar["bar_at"]).replace("Z", "+00:00"))
+            .astimezone(shanghai).date().isoformat()
+            for bar in bars
+        }
+        factor_dates = {factor["trade_date"] for factor in factors}
+        missing_dates = sorted(expected_dates - factor_dates)
+        if missing_dates:
+            preview = ",".join(missing_dates[:3])
+            raise ValueError(
+                f"Tushare adj_factor is missing {len(missing_dates)} bar dates: {preview}"
+            )
+        factor_count = self.market_bar_repository.upsert_adjustment_factors(
+            instrument.instrument_id, self.tushare_provider.name, ingested_at,
+            factors,
+            {
+                "observed_at": ingested_at,
+                "raw_artifact_id": factor_artifact["artifact_id"],
+                "ingestion_id": ingestion_id,
+            },
+        )
         count = self.market_bar_repository.upsert_price_bars(
             instrument.instrument_id, interval, "raw",
             self.tushare_provider.name, ingested_at, bars,
@@ -385,6 +426,10 @@ class FundamentalService:
             "raw_path": artifact["storage_path"],
             "raw_artifact_id": artifact["artifact_id"],
             "ingestion_id": ingestion_id,
+            "adjustment_factors": factors,
+            "adjustment_factor_count": factor_count,
+            "adjustment_factor_raw_path": factor_artifact["storage_path"],
+            "adjustment_factor_raw_artifact_id": factor_artifact["artifact_id"],
         }
 
     def search_instruments(self, query: str, limit: int = 12) -> List[Dict[str, Any]]:

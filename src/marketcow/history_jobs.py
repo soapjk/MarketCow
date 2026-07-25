@@ -616,6 +616,12 @@ class HistoryJobManager:
                             "ingestion_id": shard.get("ingestion_id"),
                             "source": result.get("source"),
                             "raw_artifact_id": result.get("raw_artifact_id"),
+                            "adjustment_factor_count": result.get(
+                                "adjustment_factor_count"
+                            ),
+                            "adjustment_factor_raw_artifact_id": result.get(
+                                "adjustment_factor_raw_artifact_id"
+                            ),
                             "observed_at": result.get("observed_at"),
                             "canonical_status": canonical,
                         },

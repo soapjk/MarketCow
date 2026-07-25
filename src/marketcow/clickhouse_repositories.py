@@ -127,6 +127,22 @@ CLICKHOUSE_MIGRATIONS = [
             "ingestion_id String DEFAULT '' AFTER raw_artifact_id",
         ],
     ),
+    (
+        7,
+        "daily market adjustment factors",
+        [
+            """
+            CREATE TABLE IF NOT EXISTS market_adjustment_factor (
+                symbol String, trade_date Date, adjustment_factor Decimal128(18),
+                source LowCardinality(String), observed_at DateTime64(3, 'UTC'),
+                ingested_at DateTime64(3, 'UTC'), raw_artifact_id Nullable(String),
+                ingestion_id String, content_rank String, content_version UInt256
+            ) ENGINE = ReplacingMergeTree(content_version)
+            PARTITION BY toYYYYMM(trade_date)
+            ORDER BY (symbol, source, trade_date)
+            """,
+        ],
+    ),
 ]
 
 
@@ -321,6 +337,11 @@ class ClickHouseMarketBarRepository:
         "symbol", "payload_json", "observed_at", "ingested_at", "source",
         "content_rank", "content_version",
     ]
+    ADJUSTMENT_FACTOR_COLUMNS = [
+        "symbol", "trade_date", "adjustment_factor", "source", "observed_at",
+        "ingested_at", "raw_artifact_id", "ingestion_id", "content_rank",
+        "content_version",
+    ]
 
     def __init__(self, database: ClickHouseDatabase) -> None:
         self.database = database
@@ -371,7 +392,15 @@ class ClickHouseMarketBarRepository:
             return 0
         date_columns = {"bar_time", "observed_at", "ingested_at", "updated_at"}
         values = [[
-            self._datetime(row.get(column)) if column in date_columns else row.get(column)
+            (
+                self._datetime(row.get(column))
+                if column in date_columns
+                else (
+                    date.fromisoformat(str(row.get(column)))
+                    if column == "trade_date" and not isinstance(row.get(column), date)
+                    else row.get(column)
+                )
+            )
             for column in columns
         ] for row in rows]
         settings = {"insert_deduplication_token": batch_id} if batch_id else None
@@ -502,6 +531,67 @@ class ClickHouseMarketBarRepository:
             ),
             batch_id=str(provenance.get("ingestion_id") or ""),
         )
+
+    def upsert_adjustment_factors(
+        self, symbol: str, source: str, ingested_at: str,
+        factors: List[Dict[str, Any]],
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        provenance = provenance or {}
+        normalized = []
+        for factor in factors:
+            trade_date = date.fromisoformat(str(factor["trade_date"])).isoformat()
+            value = Decimal(str(factor["adjustment_factor"]))
+            if not value.is_finite() or value <= 0:
+                raise ValueError("adjustment_factor must be finite and greater than zero")
+            rank_payload = json.dumps(
+                {
+                    "symbol": symbol, "trade_date": trade_date,
+                    "adjustment_factor": format(value, "f"), "source": source,
+                    "raw_artifact_id": provenance.get("raw_artifact_id"),
+                },
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            content_rank = hashlib.sha256(
+                rank_payload.encode("utf-8")
+            ).hexdigest()[:52]
+            normalized.append({
+                "symbol": symbol, "trade_date": trade_date,
+                "adjustment_factor": value, "source": source,
+                "observed_at": provenance.get("observed_at") or ingested_at,
+                "ingested_at": ingested_at,
+                "raw_artifact_id": provenance.get("raw_artifact_id"),
+                "ingestion_id": str(provenance.get("ingestion_id") or ""),
+                "content_rank": content_rank,
+                "content_version": raw_content_version(ingested_at, content_rank),
+            })
+        return self._insert(
+            "market_adjustment_factor", self.ADJUSTMENT_FACTOR_COLUMNS, normalized,
+            str(provenance.get("ingestion_id") or ""),
+        )
+
+    def get_adjustment_factors(
+        self, symbol: str, start_date: str, end_date: str, source: str = "",
+    ) -> List[Dict[str, Any]]:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+        if start > end:
+            raise ValueError("adjustment factor date range must be ordered")
+        source_filter = " AND source={source:String}" if source else ""
+        result = self._query(
+            "SELECT symbol,trade_date,adjustment_factor,source,observed_at,"
+            "ingested_at,raw_artifact_id,ingestion_id "
+            "FROM market_adjustment_factor FINAL "
+            "WHERE symbol={symbol:String} AND trade_date>={start:Date} "
+            "AND trade_date<={end:Date}"
+            f"{source_filter} "
+            "ORDER BY trade_date,source",
+            {
+                "symbol": symbol, "start": start, "end": end,
+                **({"source": source} if source else {}),
+            },
+        )
+        return [dict(zip(result.column_names, row)) for row in result.result_rows]
 
     def get_raw_ingestion_receipt(
         self, ingestion_id: str

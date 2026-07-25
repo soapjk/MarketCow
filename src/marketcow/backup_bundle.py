@@ -199,14 +199,24 @@ class BackupComponent:
 
     @classmethod
     def clickhouse(cls, database: Any, captured_at: str):
-        allowed = {"schema_migrations", "market_bar_raw", "market_bar_canonical"}
+        allowed = {
+            "schema_migrations", "market_bar_raw", "market_bar_canonical",
+            "market_adjustment_factor",
+        }
         tables = sorted(
             str(row[0]) for row in database.client.query("SHOW TABLES").result_rows
             if str(row[0]) in allowed
         )
         payload = {}
         for table in tables:
-            final = " FINAL" if table in {"market_bar_raw", "market_bar_canonical"} else ""
+            final = (
+                " FINAL"
+                if table in {
+                    "market_bar_raw", "market_bar_canonical",
+                    "market_adjustment_factor",
+                }
+                else ""
+            )
             result = database.client.query(f"SELECT * FROM {table}{final}")
             payload[table] = {
                 "columns": list(result.column_names),

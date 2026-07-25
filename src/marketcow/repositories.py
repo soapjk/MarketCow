@@ -163,6 +163,14 @@ class MarketBarRepository(Protocol):
         ingested_at: str, bars: List[Dict[str, Any]],
         provenance: Optional[Dict[str, Any]] = None,
     ) -> int: ...
+    def upsert_adjustment_factors(
+        self, symbol: str, source: str, ingested_at: str,
+        factors: List[Dict[str, Any]],
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> int: ...
+    def get_adjustment_factors(
+        self, symbol: str, start_date: str, end_date: str, source: str = ""
+    ) -> List[Dict[str, Any]]: ...
     def get_price_bars(
         self, symbol: str, interval: str, adjustment: str, limit: int
     ) -> List[Dict[str, Any]]: ...

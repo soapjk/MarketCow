@@ -50,6 +50,43 @@ class TushareProviderTest(unittest.TestCase):
         self.assertEqual(bars[0]["source_payload"]["ts_code"], "600000.SH")
         self.assertEqual(bars[0]["bar_at"], "2026-07-17T01:35:00+00:00")
 
+    def test_adjustment_factors_are_validated_sorted_and_deduplicated(self):
+        result = {
+            "code": 0,
+            "data": {
+                "fields": ["ts_code", "trade_date", "adj_factor"],
+                "items": [
+                    ["600519.SH", "20260718", 12.3456],
+                    ["600519.SH", "20260717", 12.3],
+                    ["600519.SH", "20260717", 12.3],
+                ],
+            },
+        }
+
+        factors = TushareProvider.adjustment_factors(result, "600519.SH")
+
+        self.assertEqual(
+            [item["trade_date"] for item in factors],
+            ["2026-07-17", "2026-07-18"],
+        )
+        self.assertEqual(factors[0]["adjustment_factor"], "12.3")
+
+    def test_adjustment_factors_reject_wrong_symbol_and_invalid_value(self):
+        with self.assertRaisesRegex(TushareError, "unexpected ts_code"):
+            TushareProvider.adjustment_factors({
+                "data": {
+                    "fields": ["ts_code", "trade_date", "adj_factor"],
+                    "items": [["000001.SZ", "20260717", 1]],
+                }
+            }, "600519.SH")
+        with self.assertRaisesRegex(TushareError, "greater than zero"):
+            TushareProvider.adjustment_factors({
+                "data": {
+                    "fields": ["ts_code", "trade_date", "adj_factor"],
+                    "items": [["600519.SH", "20260717", 0]],
+                }
+            }, "600519.SH")
+
     @patch("time.sleep")
     def test_rate_limit_is_enforced(self, sleep):
         provider, _ = self.provider_with({"code": 0, "data": {"fields": [], "items": []}}, 0.5)
