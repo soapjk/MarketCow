@@ -68,6 +68,22 @@ class AdminEventHubTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(heartbeat["type"], "stream.heartbeat")
         self.assertEqual(heartbeat["payload"]["watermark"], 0)
 
+    async def test_connection_count_is_bounded(self):
+        hub = AdminEventHub(
+            replay_capacity=2, subscriber_capacity=1,
+            heartbeat_seconds=1, max_subscribers=1,
+        )
+        first = hub.stream(0, ("request.summary",))
+        pending = asyncio.create_task(anext(first))
+        await asyncio.sleep(0)
+        second = hub.stream(0, ("request.summary",))
+        with self.assertRaisesRegex(RuntimeError, "connection limit"):
+            await anext(second)
+        await second.aclose()
+        await hub.publish("request.summary", {"ok": True})
+        await pending
+        await first.aclose()
+
 
 if __name__ == "__main__":
     unittest.main()

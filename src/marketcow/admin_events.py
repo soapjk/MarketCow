@@ -62,7 +62,7 @@ class AdminEventHub:
 
     def __init__(
         self, replay_capacity: int = 1024, subscriber_capacity: int = 128,
-        heartbeat_seconds: float = 15.0,
+        heartbeat_seconds: float = 15.0, max_subscribers: int = 100,
     ) -> None:
         if not 1 <= replay_capacity <= 100000:
             raise ValueError("admin event replay capacity is invalid")
@@ -70,9 +70,12 @@ class AdminEventHub:
             raise ValueError("admin event subscriber capacity is invalid")
         if not 1 <= heartbeat_seconds <= 60:
             raise ValueError("admin event heartbeat is invalid")
+        if not 1 <= max_subscribers <= 10000:
+            raise ValueError("admin event subscriber limit is invalid")
         self.replay_capacity = replay_capacity
         self.subscriber_capacity = subscriber_capacity
         self.heartbeat_seconds = heartbeat_seconds
+        self.max_subscribers = max_subscribers
         self._replay: deque[dict[str, Any]] = deque(maxlen=replay_capacity)
         self._subscribers: set[_Subscriber] = set()
         self._sequence = 0
@@ -130,6 +133,8 @@ class AdminEventHub:
         )
         initial: list[dict[str, Any]] = []
         async with self._lock:
+            if len(self._subscribers) >= self.max_subscribers:
+                raise RuntimeError("admin event connection limit reached")
             oldest = self._replay[0]["sequence"] if self._replay else self._sequence + 1
             if after_sequence and after_sequence < oldest - 1:
                 initial.append(self._event(
@@ -167,6 +172,10 @@ class AdminEventHub:
         finally:
             async with self._lock:
                 self._subscribers.discard(subscriber)
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subscribers)
 
 
 def encode_sse(event: Mapping[str, Any]) -> bytes:

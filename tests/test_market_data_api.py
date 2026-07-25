@@ -152,6 +152,9 @@ class MarketDataApiTest(unittest.TestCase):
         dashboards = self.client.get("/v1/admin/dashboards")
         self.assertEqual(dashboards.status_code, 200)
         self.assertEqual(dashboards.json()["schema"], "marketcow.dashboard-registry.v1")
+        capabilities = self.client.get("/v1/admin/capabilities").json()
+        self.assertEqual(capabilities["schema"], "marketcow.admin-capabilities.v1")
+        self.assertTrue(all(capabilities["features"].values()))
 
         overview = self.client.get("/v1/admin/overview")
         self.assertEqual(overview.status_code, 200)

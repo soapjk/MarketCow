@@ -4,6 +4,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
@@ -13,6 +14,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.staticfiles import StaticFiles
 
 from . import __version__
 from .config import Settings
@@ -170,12 +172,17 @@ def create_app(
         settings.admin_tokens_json,
         settings.admin_session_seconds,
     )
-    app.add_middleware(AdminSecurityMiddleware, auth=admin_auth)
+    app.add_middleware(
+        AdminSecurityMiddleware,
+        auth=admin_auth,
+        commands_enabled=settings.admin_commands_enabled,
+    )
     app.state.admin_auth = admin_auth
     admin_events = AdminEventHub(
         replay_capacity=min(settings.realtime_replay_capacity, 100000),
         subscriber_capacity=min(settings.realtime_queue_capacity, 10000),
-        heartbeat_seconds=settings.realtime_heartbeat_seconds,
+        heartbeat_seconds=max(1.0, settings.realtime_heartbeat_seconds),
+        max_subscribers=settings.admin_live_max_connections,
     )
     request_metrics = RequestMetrics()
     app.add_middleware(
@@ -492,6 +499,14 @@ def create_app(
         after_sequence: int = Query(0, ge=0),
         last_event_id: str = Header("", alias="Last-Event-ID", max_length=30),
     ):
+        if not settings.admin_live_enabled:
+            raise HTTPException(
+                status_code=503, detail={"code": "admin_live_disabled"}
+            )
+        if admin_events.subscriber_count >= admin_events.max_subscribers:
+            raise HTTPException(
+                status_code=503, detail={"code": "admin_live_connection_limit"}
+            )
         if last_event_id:
             try:
                 after_sequence = max(after_sequence, int(last_event_id))
@@ -522,7 +537,20 @@ def create_app(
 
     @app.get("/v1/admin/dashboards")
     def admin_dashboards():
-        return registry_document(app.state.dashboard_registry)
+        values = app.state.dashboard_registry if settings.admin_grafana_enabled else ()
+        return registry_document(values)
+
+    @app.get("/v1/admin/capabilities")
+    def admin_capabilities():
+        return {
+            "schema": "marketcow.admin-capabilities.v1",
+            "features": {
+                "frontend": settings.admin_frontend_enabled,
+                "grafana": settings.admin_grafana_enabled,
+                "commands": settings.admin_commands_enabled,
+                "live": settings.admin_live_enabled,
+            },
+        }
 
     @app.get("/v1/admin/overview")
     def admin_overview():
@@ -2046,5 +2074,13 @@ persisted ${j.rows_persisted}; updated ${esc(j.updated_at)}</p><table><tr>
             as_of=normalized_as_of,
         )
         return {"count": len(rows), "limit": limit, "offset": offset, "as_of": normalized_as_of or None, "point_in_time": bool(normalized_as_of), "items": rows}
+
+    admin_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+    if settings.admin_frontend_enabled and (admin_dist / "index.html").is_file():
+        app.mount(
+            "/admin",
+            StaticFiles(directory=admin_dist, html=True),
+            name="admin-frontend",
+        )
 
     return app

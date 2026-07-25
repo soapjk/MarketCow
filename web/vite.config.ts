@@ -2,7 +2,12 @@ import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
+  base: "/admin/",
   plugins: [react()],
+  build: {
+    // ECharts is isolated in the lazy-loaded live-monitor route.
+    chunkSizeWarningLimit: 650,
+  },
   server: {
     port: 4173,
     strictPort: true,

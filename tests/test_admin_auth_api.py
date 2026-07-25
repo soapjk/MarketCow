@@ -85,6 +85,16 @@ class AdminAuthApiTest(unittest.TestCase):
                                 if isinstance(response.json().get("detail"), dict)
                                 else "", "csrf_validation_failed")
 
+    def test_command_feature_flag_fails_closed(self):
+        settings = replace(self.settings, admin_commands_enabled=False)
+        with TestClient(create_app(settings, Service())) as client:
+            response = client.post(
+                "/v1/admin/history-jobs/example/cancel",
+                headers={"Authorization": "Bearer operator-token-123456"},
+            )
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()["detail"]["code"], "admin_commands_disabled")
+
 
 if __name__ == "__main__":
     unittest.main()

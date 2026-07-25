@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 
-from marketcow.admin_auth import AdminAuth, Identity, load_admin_tokens
+from marketcow.admin_auth import (
+    AdminAuth, AdminSecurityMiddleware, Identity, load_admin_tokens,
+)
 
 
 class Clock:
@@ -51,6 +53,12 @@ class AdminAuthTest(unittest.TestCase):
         auth = AdminAuth(True, '{"valid-token-123456":"admin"}')
         with self.assertRaises(PermissionError):
             auth.login("wrong-token-123456")
+
+    def test_command_feature_flag_is_explicit(self):
+        middleware = AdminSecurityMiddleware(
+            object(), AdminAuth(False), commands_enabled=False
+        )
+        self.assertFalse(middleware.commands_enabled)
 
 
 if __name__ == "__main__":

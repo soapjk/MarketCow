@@ -82,3 +82,6 @@ npm run dev
 前端默认监听 `http://127.0.0.1:4173`，并将 `/v1` 代理到本地 API。详细的
 Grafana、聚合指标和实时面板边界见
 [可视化架构基线](docs/visualization/architecture-baseline.md)。
+
+完整验证、分阶段启用、故障降级和回退方法见
+[可视化运维手册](docs/visualization/operations-runbook.md)。

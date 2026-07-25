@@ -94,6 +94,11 @@ class Settings:
     admin_tokens_json: str = ""
     admin_session_seconds: int = 28800
     admin_cookie_secure: bool = False
+    admin_frontend_enabled: bool = True
+    admin_grafana_enabled: bool = True
+    admin_commands_enabled: bool = True
+    admin_live_enabled: bool = True
+    admin_live_max_connections: int = 100
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -255,6 +260,13 @@ class Settings:
                 "MARKETCOW_ADMIN_SESSION_SECONDS", "28800"
             )),
             admin_cookie_secure=_bool_env("MARKETCOW_ADMIN_COOKIE_SECURE", False),
+            admin_frontend_enabled=_bool_env("MARKETCOW_ADMIN_FRONTEND_ENABLED", True),
+            admin_grafana_enabled=_bool_env("MARKETCOW_ADMIN_GRAFANA_ENABLED", True),
+            admin_commands_enabled=_bool_env("MARKETCOW_ADMIN_COMMANDS_ENABLED", True),
+            admin_live_enabled=_bool_env("MARKETCOW_ADMIN_LIVE_ENABLED", True),
+            admin_live_max_connections=int(os.getenv(
+                "MARKETCOW_ADMIN_LIVE_MAX_CONNECTIONS", "100"
+            )),
         )
 
     def validate_runtime_isolation(self) -> None:

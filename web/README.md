@@ -7,9 +7,9 @@ npm install
 npm run dev
 ```
 
-The Vite server listens on `127.0.0.1:4173` and proxies `/v1` to the development
-MarketCow API at `127.0.0.1:8792`. Set `VITE_API_BASE_URL` only when the API is
-served from another origin.
+The Vite server listens on `127.0.0.1:4173`; open `/admin/#/overview`. It proxies
+`/v1` to the development MarketCow API at `127.0.0.1:8792`. Set
+`VITE_API_BASE_URL` only when the API is served from another origin.
 
 ## Verification
 
@@ -18,7 +18,7 @@ npm run typecheck
 npm test
 npm run build
 npm run lint
-npm audit --omit=dev
+npm audit
 ```
 
 Hash routes are intentional: a static local deployment can reload any page without

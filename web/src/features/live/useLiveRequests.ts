@@ -13,7 +13,6 @@ export function useLiveRequests(paused: boolean) {
 
   useEffect(() => {
     if (paused) {
-      setState("idle");
       return;
     }
     const stream = new ReconnectingEventStream<AdminEvent<RequestSummaryPayload>>({
@@ -38,7 +37,7 @@ export function useLiveRequests(paused: boolean) {
   }, [paused]);
 
   return {
-    state,
+    state: paused ? "idle" : state,
     snapshot,
     clear: () => {
       pending.current.length = 0;

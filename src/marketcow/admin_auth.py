@@ -141,9 +141,12 @@ class AdminAuth:
 
 
 class AdminSecurityMiddleware:
-    def __init__(self, app: Any, auth: AdminAuth) -> None:
+    def __init__(
+        self, app: Any, auth: AdminAuth, commands_enabled: bool = True
+    ) -> None:
         self.app = app
         self.auth = auth
+        self.commands_enabled = commands_enabled
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -166,6 +169,13 @@ class AdminSecurityMiddleware:
                 )(scope, receive, send)
                 return
             required_role = "viewer" if scope.get("method") in {"GET", "HEAD"} else "operator"
+            if required_role == "operator" and not self.commands_enabled:
+                await JSONResponse(
+                    {"detail": {"code": "admin_commands_disabled"}},
+                    status_code=503,
+                    headers=_security_headers(),
+                )(scope, receive, send)
+                return
             if not self.auth.permits(identity, required_role):
                 await JSONResponse(
                     {"detail": {"code": "insufficient_role", "required": required_role}},
