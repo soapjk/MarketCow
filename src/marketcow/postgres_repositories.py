@@ -498,6 +498,46 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 (job_id,),
             ).fetchall())
 
+    def append_admin_audit(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                INSERT INTO admin_audit_event
+                    (audit_id,schema_version,occurred_at,actor,action,target,outcome,
+                     request_id,parameters_json,detail)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING *
+                """,
+                (
+                    row["audit_id"], row["schema_version"], row["occurred_at"],
+                    row["actor"], row["action"], row["target"], row["outcome"],
+                    row.get("request_id", ""), Jsonb(row.get("parameters_json", {})),
+                    row.get("detail", ""),
+                ),
+            ).fetchone()
+
+    def list_admin_audit(
+        self, limit: int = 50, offset: int = 0, action: str = "", outcome: str = ""
+    ) -> List[Dict[str, Any]]:
+        clauses = []
+        parameters: list[Any] = []
+        if action:
+            clauses.append("action = %s")
+            parameters.append(action)
+        if outcome:
+            clauses.append("outcome = %s")
+            parameters.append(outcome)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        parameters.extend((limit, offset))
+        with self.database.connection() as connection:
+            return list(connection.execute(
+                f"""
+                SELECT * FROM admin_audit_event{where}
+                ORDER BY occurred_at DESC, audit_id DESC LIMIT %s OFFSET %s
+                """,
+                tuple(parameters),
+            ).fetchall())
+
     def find_instrument_by_mapping(
         self, namespace: str, external_symbol: str
     ) -> Optional[Dict[str, Any]]:

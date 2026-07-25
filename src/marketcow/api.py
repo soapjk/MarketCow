@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, Callable, Dict, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from starlette.responses import HTMLResponse, JSONResponse
 
@@ -47,6 +47,7 @@ from .hyperliquid_realtime import (
 )
 from .providers.longport_quote import LongPortError
 from .dashboard_registry import load_dashboard_registry, registry_document
+from .admin_control import AdminAuditService
 
 
 def normalize_quote_symbol(value: str) -> str:
@@ -213,6 +214,8 @@ def create_app(
     )
     app.state.realtime_hub = hub
     app.state.dashboard_registry = load_dashboard_registry(settings.dashboard_registry_json)
+    admin_audit = AdminAuditService(metadata_repository)
+    app.state.admin_audit = admin_audit
 
     async def shutdown() -> None:
         try:
@@ -402,6 +405,66 @@ def create_app(
     @app.get("/v1/admin/dashboards")
     def admin_dashboards():
         return registry_document(app.state.dashboard_registry)
+
+    @app.get("/v1/admin/overview")
+    def admin_overview():
+        providers = (
+            service.metadata_repository.provider_health()
+            if getattr(service, "metadata_repository", None) is not None
+            else []
+        )
+        jobs = history_manager.list(10) if history_manager is not None else []
+        return {
+            "schema": "marketcow.admin-overview.v1",
+            "generated_at": clock().astimezone(timezone.utc).isoformat(),
+            "service": {
+                "status": "ok", "version": __version__, "profile": settings.profile,
+            },
+            "storage": storage_health(),
+            "providers": {
+                "total": len(providers),
+                "healthy": sum(str(item.get("status", "")).lower() == "ok" for item in providers),
+                "items": providers[:20],
+            },
+            "history_jobs": {"items": jobs},
+        }
+
+    @app.get("/v1/admin/providers")
+    def admin_providers(
+        status: str = Query("", pattern="^(|ok|error)$"),
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=10000),
+    ):
+        rows = list(service.metadata_repository.provider_health())
+        normalized = []
+        for row in rows:
+            item = dict(row)
+            item["status"] = str(item.get("status", "")).lower()
+            item["configured"] = None
+            item.pop("credentials", None)
+            normalized.append(item)
+        if status:
+            normalized = [item for item in normalized if item["status"] == status]
+        page = normalized[offset:offset + limit]
+        return {
+            "schema": "marketcow.admin-providers.v1",
+            "items": page,
+            "page": {
+                "limit": limit, "offset": offset, "returned": len(page),
+                "total": len(normalized),
+            },
+        }
+
+    @app.get("/v1/admin/audit")
+    def admin_audit_events(
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=10000),
+        action: str = Query("", max_length=120),
+        outcome: str = Query("", pattern="^(|accepted|succeeded|rejected|failed)$"),
+    ):
+        return admin_audit.list(
+            limit=limit, offset=offset, action=action, outcome=outcome
+        )
 
     @app.get("/v1/readiness")
     def readiness():
@@ -1616,17 +1679,53 @@ def create_app(
         return history_manager
 
     @app.post("/v1/admin/history-jobs")
-    def create_history_job(request: HistoryJobRequest):
+    def create_history_job(
+        request: HistoryJobRequest,
+        x_request_id: str = Header("", max_length=120),
+        x_admin_actor: str = Header("local", max_length=120),
+    ):
         payload = request.model_dump()
-        job, created = require_history_manager().create(payload)
+        try:
+            job, created = require_history_manager().create(payload)
+        except Exception as exc:
+            admin_audit.append(
+                actor=x_admin_actor, action="history_job.create",
+                target=request.idempotency_key, outcome="failed",
+                parameters={"symbols": request.symbols, "provider": request.provider},
+                request_id=x_request_id, detail=str(exc),
+            )
+            raise
+        admin_audit.append(
+            actor=x_admin_actor, action="history_job.create",
+            target=job["job_id"], outcome="accepted" if created else "succeeded",
+            parameters={
+                "symbols": request.symbols, "provider": request.provider,
+                "idempotency_key": request.idempotency_key,
+            },
+            request_id=x_request_id, detail="created" if created else "idempotent replay",
+        )
         return JSONResponse(
             status_code=202,
             content={"job_id": job["job_id"], "created": created, "job": job},
         )
 
     @app.get("/v1/admin/history-jobs")
-    def list_history_jobs(limit: int = Query(50, ge=1, le=200)):
-        return {"items": require_history_manager().list(limit)}
+    def list_history_jobs(
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0, le=10000),
+        status: str = Query("", max_length=40),
+    ):
+        values = require_history_manager().list(200)
+        if status:
+            values = [item for item in values if item.get("status") == status]
+        page = values[offset:offset + limit]
+        return {
+            "items": page,
+            "page": {
+                "limit": limit, "offset": offset, "returned": len(page),
+                "total": len(values),
+            },
+        }
 
     @app.get("/v1/admin/history-jobs/{job_id}")
     def get_history_job(job_id: str):
@@ -1636,20 +1735,50 @@ def create_app(
             raise HTTPException(status_code=404, detail="history job not found") from exc
 
     @app.post("/v1/admin/history-jobs/{job_id}/cancel")
-    def cancel_history_job(job_id: str):
+    def cancel_history_job(
+        job_id: str,
+        x_request_id: str = Header("", max_length=120),
+        x_admin_actor: str = Header("local", max_length=120),
+    ):
         try:
-            return require_history_manager().cancel(job_id)
+            result = require_history_manager().cancel(job_id)
         except KeyError as exc:
+            admin_audit.append(
+                actor=x_admin_actor, action="history_job.cancel", target=job_id,
+                outcome="rejected", request_id=x_request_id, detail="not found",
+            )
             raise HTTPException(status_code=404, detail="history job not found") from exc
+        admin_audit.append(
+            actor=x_admin_actor, action="history_job.cancel", target=job_id,
+            outcome="succeeded", request_id=x_request_id,
+        )
+        return result
 
     @app.post("/v1/admin/history-jobs/{job_id}/retry-failed")
-    def retry_history_job(job_id: str):
+    def retry_history_job(
+        job_id: str,
+        x_request_id: str = Header("", max_length=120),
+        x_admin_actor: str = Header("local", max_length=120),
+    ):
         try:
-            return require_history_manager().retry_failed(job_id)
+            result = require_history_manager().retry_failed(job_id)
         except KeyError as exc:
+            admin_audit.append(
+                actor=x_admin_actor, action="history_job.retry_failed", target=job_id,
+                outcome="rejected", request_id=x_request_id, detail="not found",
+            )
             raise HTTPException(status_code=404, detail="history job not found") from exc
         except ValueError as exc:
+            admin_audit.append(
+                actor=x_admin_actor, action="history_job.retry_failed", target=job_id,
+                outcome="rejected", request_id=x_request_id, detail=str(exc),
+            )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        admin_audit.append(
+            actor=x_admin_actor, action="history_job.retry_failed", target=job_id,
+            outcome="succeeded", request_id=x_request_id,
+        )
+        return result
 
     @app.get("/v1/admin/history-jobs-ui", response_class=HTMLResponse)
     def history_jobs_ui():

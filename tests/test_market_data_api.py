@@ -29,6 +29,14 @@ class Metadata:
                 return row
         return None
 
+    def provider_health(self):
+        return [{
+            "provider": "longport", "status": "ok",
+            "last_attempt_at": "2026-07-25T00:00:00Z",
+            "last_success_at": "2026-07-25T00:00:00Z",
+            "last_error": "", "consecutive_failures": 0,
+        }]
+
 
 class Bars:
     def __init__(self):
@@ -131,6 +139,27 @@ class MarketDataApiTest(unittest.TestCase):
         )
         InstrumentRecord.model_validate(resolved.json())
         self.assertEqual(resolved.json()["instrument_id"], "AAPL.XNAS")
+
+    def test_administration_read_models_are_versioned_and_paginated(self):
+        dashboards = self.client.get("/v1/admin/dashboards")
+        self.assertEqual(dashboards.status_code, 200)
+        self.assertEqual(dashboards.json()["schema"], "marketcow.dashboard-registry.v1")
+
+        overview = self.client.get("/v1/admin/overview")
+        self.assertEqual(overview.status_code, 200)
+        self.assertEqual(overview.json()["schema"], "marketcow.admin-overview.v1")
+        self.assertEqual(overview.json()["providers"]["healthy"], 1)
+
+        providers = self.client.get(
+            "/v1/admin/providers", params={"limit": 1, "offset": 0, "status": "ok"}
+        )
+        self.assertEqual(providers.status_code, 200)
+        self.assertEqual(providers.json()["page"]["total"], 1)
+        self.assertNotIn("credentials", providers.json()["items"][0])
+
+        audit = self.client.get("/v1/admin/audit")
+        self.assertEqual(audit.status_code, 200)
+        self.assertEqual(audit.json()["schema"], "marketcow.admin-audit.v1")
 
     def test_crypto_canonical_storage_uses_venue_qualified_symbol(self):
         crypto = {

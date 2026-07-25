@@ -23,6 +23,7 @@ POSTGRES_TRANSACTION_DOMAINS = (
     "dividend_announcement",
     "dividend_refresh_state",
     "instrument_master",
+    "admin_audit_event",
     "runtime_config_version",
     "migration_checkpoint",
 )
@@ -497,6 +498,33 @@ POSTGRES_MIGRATIONS = [
                 CHECK (size_precision BETWEEN 0 AND 18),
             ADD CONSTRAINT instrument_master_size_increment_check
                 CHECK (size_increment > 0);
+        """,
+    ),
+    (
+        14,
+        "append-only administration audit events",
+        """
+        CREATE TABLE IF NOT EXISTS admin_audit_event (
+            audit_id TEXT PRIMARY KEY,
+            schema_version TEXT NOT NULL CHECK (
+                schema_version = 'marketcow.admin-audit.v1'
+            ),
+            occurred_at TIMESTAMPTZ NOT NULL,
+            actor TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK (
+                outcome IN ('accepted', 'succeeded', 'rejected', 'failed')
+            ),
+            request_id TEXT NOT NULL DEFAULT '',
+            parameters_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+            detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS admin_audit_event_occurred_idx
+            ON admin_audit_event (occurred_at DESC, audit_id DESC);
+        CREATE INDEX IF NOT EXISTS admin_audit_event_action_idx
+            ON admin_audit_event (action, occurred_at DESC);
+        REVOKE UPDATE, DELETE, TRUNCATE ON admin_audit_event FROM PUBLIC;
         """,
     ),
 ]
