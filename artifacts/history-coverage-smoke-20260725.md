@@ -47,3 +47,23 @@ the implemented exact-date supplementation after the widened range query.
   as `upstream_coverage_unproven`; it must not be reported as successful.
 - Exact-date factor supplementation is required for the configured compatible
   endpoint.
+
+## Production-profile local runtime smoke
+
+After loading commit `736935f` into the loopback-only launchd service, a
+controlled one-day job was created for
+`[2026-07-24T00:00:00Z, 2026-07-25T00:00:00Z)`:
+
+- Job ID: `65323b7255b0410b8c586cd54dc843a1`
+- Status: `succeeded`
+- Shards: 1/1 completed; 0 split events; 0 unproven shards
+- Raw rows: 241 fetched and 241 persisted
+- Coverage: `provisionally_complete`, with XSHG session `2026-07-24`
+  observed, 241 unique rows, no missing/incomplete session and no error reason
+- Adjustment factor rows: 1; factor Artifact present
+- Canonical: 1 completed, 0 pending, 0 failed
+- Runtime health after restart: PostgreSQL, ClickHouse, WAL and canonical
+  scheduler healthy; WAL pending/failed/quarantine all zero
+
+The service and validation were local only. No remote push or deployment was
+performed.

@@ -704,6 +704,11 @@ class HistoryJobManager:
                             "adjustment_factor_raw_artifact_id": result.get(
                                 "adjustment_factor_raw_artifact_id"
                             ),
+                            "adjustment_factor_supplement_artifact_ids": (
+                                result.get(
+                                    "adjustment_factor_supplement_artifact_ids"
+                                ) or []
+                            ),
                             "observed_at": result.get("observed_at"),
                             "canonical_status": canonical,
                             "coverage": coverage,
