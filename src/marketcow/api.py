@@ -116,7 +116,7 @@ class MarketBarQuery(ProviderPolicy):
     symbols: list[str] = Field(min_length=1, max_length=20)
     range: str = "1y"
     interval: str = "1d"
-    adjustment: str = Field(default="adjusted", pattern="^(adjusted|raw)$")
+    adjustment: str = Field(default="qfq", pattern="^(raw|qfq|hfq)$")
     refresh: bool = True
     limit: int = Field(default=500, ge=1, le=5000)
 
@@ -128,7 +128,7 @@ class HistoryJobRequest(BaseModel):
     range_start: Optional[datetime] = None
     range_end: Optional[datetime] = None
     interval: str = Field(min_length=1)
-    adjustment: str = Field(pattern="^(adjusted|raw)$")
+    adjustment: str = Field(pattern="^(raw|qfq|hfq)$")
     allow_fallback: bool
     max_concurrency: int = Field(ge=1, le=16)
     max_attempts: int = Field(ge=1, le=10)
@@ -1003,7 +1003,7 @@ def create_app(
         start: str,
         end: str,
         interval: str,
-        adjustment: str = Query(pattern="^(raw|adjusted)$"),
+        adjustment: str = Query(pattern="^(raw|qfq|hfq)$"),
         page_size: int = Query(ge=1, le=5000),
         cursor: Optional[str] = None,
     ):
@@ -1074,6 +1074,20 @@ def create_app(
                     low=format(Decimal(str(row["low"])), "f"),
                     close=format(Decimal(str(row["close"])), "f"),
                     volume=format(Decimal(str(row["volume"])), "f"),
+                    factor_applicability=(
+                        row.get("factor_applicability") or None
+                    ),
+                    corporate_action_factor=row.get("corporate_action_factor"),
+                    applied_adjustment_multiplier=row.get(
+                        "applied_adjustment_multiplier"
+                    ),
+                    adjustment_reference_date=row.get(
+                        "adjustment_reference_date"
+                    ),
+                    reference_factor=row.get("reference_factor"),
+                    factor_source=row.get("factor_source"),
+                    factor_artifact_id=row.get("factor_artifact_id"),
+                    factor_as_of=row.get("factor_as_of"),
                     selected_source=(
                         row.get("selected_source") or row.get("source")
                     ),
@@ -1431,7 +1445,7 @@ def create_app(
         symbol: str,
         range_: str = Query("1y", alias="range"),
         interval: str = "1d",
-        adjustment: str = Query("adjusted", pattern="^(adjusted|raw)$"),
+        adjustment: str = Query("qfq", pattern="^(raw|qfq|hfq)$"),
         refresh: bool = True,
         limit: int = Query(500, ge=1, le=5000),
         start: Optional[str] = None,
@@ -1579,15 +1593,15 @@ def create_app(
     def quote_cross_section(
         bar_at: str,
         interval: str = "1d",
-        adjustment: str = "adjusted",
+        adjustment: str = "qfq",
         limit: int = 500,
         symbols: Optional[str] = None,
         page_size: Optional[int] = Query(None, ge=1, le=5000),
         cursor: Optional[str] = None,
     ):
         try:
-            if adjustment not in {"adjusted", "raw"}:
-                raise ValueError("adjustment must be adjusted or raw")
+            if adjustment not in {"raw", "qfq", "hfq"}:
+                raise ValueError("adjustment must be raw, qfq or hfq")
             if not 1 <= limit <= 5000:
                 raise ValueError("cross-section limit must be between 1 and 5000")
             if cursor is not None and page_size is None:
@@ -1663,13 +1677,13 @@ def create_app(
         bar_ats: str,
         symbols: str,
         interval: str = "1d",
-        adjustment: str = "adjusted",
+        adjustment: str = "qfq",
         page_size: int = Query(500, ge=1, le=5000),
         cursor: Optional[str] = None,
     ):
         try:
-            if adjustment not in {"adjusted", "raw"}:
-                raise ValueError("adjustment must be adjusted or raw")
+            if adjustment not in {"raw", "qfq", "hfq"}:
+                raise ValueError("adjustment must be raw, qfq or hfq")
             normalized_points = set()
             for value in (item.strip() for item in bar_ats.split(",")):
                 if not value:
@@ -1741,14 +1755,14 @@ def create_app(
         as_of: str,
         symbols: str,
         interval: str = "1d",
-        adjustment: str = "adjusted",
+        adjustment: str = "qfq",
         max_lookback_seconds: int = Query(86400, ge=1, le=31_536_000),
         page_size: int = Query(500, ge=1, le=1000),
         cursor: Optional[str] = None,
     ):
         try:
-            if adjustment not in {"adjusted", "raw"}:
-                raise ValueError("adjustment must be adjusted or raw")
+            if adjustment not in {"raw", "qfq", "hfq"}:
+                raise ValueError("adjustment must be raw, qfq or hfq")
             point = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
             if point.tzinfo is None:
                 raise ValueError("as_of must include a timezone")
@@ -1810,12 +1824,12 @@ def create_app(
         symbol: str,
         as_of: str,
         interval: str = "1d",
-        adjustment: str = "adjusted",
+        adjustment: str = "qfq",
         max_lookback_seconds: int = Query(86400, ge=1, le=31_536_000),
     ):
         try:
-            if adjustment not in {"adjusted", "raw"}:
-                raise ValueError("adjustment must be adjusted or raw")
+            if adjustment not in {"raw", "qfq", "hfq"}:
+                raise ValueError("adjustment must be raw, qfq or hfq")
             normalized = normalize_quote_symbol(symbol)
             point = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
             if point.tzinfo is None:
@@ -1856,8 +1870,8 @@ def create_app(
         cursor: Optional[str] = None,
     ):
         try:
-            if adjustment not in {"adjusted", "raw"}:
-                raise ValueError("adjustment must be adjusted or raw")
+            if adjustment not in {"raw", "qfq", "hfq"}:
+                raise ValueError("adjustment must be raw, qfq or hfq")
             if not 1 <= limit <= 5000:
                 raise ValueError("raw history limit must be between 1 and 5000")
             if cursor is not None and page_size is None:
