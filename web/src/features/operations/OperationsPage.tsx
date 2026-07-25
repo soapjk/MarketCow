@@ -8,9 +8,25 @@ type Provider = {
   last_error?: string; consecutive_failures: number; configured: boolean | null;
 };
 type ProviderPage = { items: Provider[]; page: { total: number } };
+type HistoryShard = {
+  shard_key: string; status: string; range_start: string; range_end: string;
+  rows_fetched: number; rows_persisted: number; error_code?: string;
+  cursor_json?: {
+    parent_shard_key?: string; split_reason?: string[];
+    child_shard_keys?: string[];
+    coverage?: { status?: string; reasons?: string[]; missing_session_dates?: string[] };
+  };
+  write_receipt_json?: {
+    coverage?: { status?: string; reasons?: string[]; missing_session_dates?: string[] };
+  };
+};
+type HistoryItem = { item_id: string; symbol: string; shards?: HistoryShard[] };
 type HistoryJob = {
   job_id: string; status: string; progress_percent?: number; provider?: string;
   total_symbols?: number; rows_persisted?: number; updated_at: string;
+  total_shards?: number; completed_shards?: number; superseded_shards?: number;
+  coverage_split_events?: number; coverage_unproven_shards?: number;
+  items?: HistoryItem[];
 };
 type JobPage = { items: HistoryJob[]; page: { total: number } };
 type Instrument = {
@@ -217,12 +233,29 @@ export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | 
             {jobs.isError ? <p className="inline-error">{jobs.error.message}</p> : (
               <div className="job-list">{jobs.data?.items.map((job) => (
                 <div className="job-row" key={job.job_id}>
-                  <div><code>{job.job_id.slice(0, 12)}</code><span>{job.provider ?? "—"} · {job.total_symbols ?? 0} symbols · {job.rows_persisted ?? 0} rows</span></div>
+                  <div><code>{job.job_id.slice(0, 12)}</code><span>{job.provider ?? "—"} · {job.total_symbols ?? 0} symbols · {job.rows_persisted ?? 0} rows</span>
+                    <small>{job.completed_shards ?? 0}/{job.total_shards ?? 0} 分片 · 动态拆分 {job.coverage_split_events ?? 0} 次 · 覆盖未证明 {job.coverage_unproven_shards ?? 0}</small>
+                  </div>
                   <div className="job-progress"><span className={`status-pill status-${job.status}`}>{job.status}</span><progress max="100" value={job.progress_percent ?? 0} /></div>
                   <div className="row-actions">
                     {canOperate && !["succeeded", "failed", "canceled", "partially_failed"].includes(job.status) && <button onClick={() => runCommand(job.job_id, "cancel")}>取消</button>}
                     {canOperate && ["failed", "partially_failed"].includes(job.status) && <button onClick={() => runCommand(job.job_id, "retry-failed")}>重试</button>}
                   </div>
+                  <details>
+                    <summary>分片与覆盖证据</summary>
+                    <div className="table-wrap"><table><thead><tr><th>标的</th><th>分片</th><th>状态</th><th>范围</th><th>行数</th><th>覆盖/拆分</th></tr></thead><tbody>
+                      {job.items?.flatMap((item) => (item.shards ?? []).map((shard) => {
+                        const coverage = shard.write_receipt_json?.coverage ?? shard.cursor_json?.coverage;
+                        const reasons = coverage?.reasons ?? shard.cursor_json?.split_reason ?? [];
+                        return <tr key={`${item.item_id}-${shard.shard_key}`}>
+                          <td>{item.symbol}</td><td><code>{shard.shard_key.slice(0, 10)}</code></td>
+                          <td><span className={`status-pill status-${shard.status}`}>{shard.status}</span></td>
+                          <td>{new Date(shard.range_start).toLocaleDateString()} → {new Date(shard.range_end).toLocaleDateString()}</td>
+                          <td>{shard.rows_fetched}/{shard.rows_persisted}</td>
+                          <td>{coverage?.status ?? "—"} {reasons.join(", ")}{shard.error_code ? ` · ${shard.error_code}` : ""}</td>
+                        </tr>;
+                      }))}</tbody></table></div>
+                  </details>
                 </div>
               ))}</div>
             )}

@@ -71,6 +71,7 @@ from .provider_routing import (
     select_providers,
 )
 from .price_adjustment import PriceAdjustmentContract
+from .history_coverage import assess_history_response
 from .exposure_facts import ExposureFactsService, RepositoryExposureFactSource
 
 
@@ -369,12 +370,83 @@ class FundamentalService:
         bars = self.tushare_provider.minute_bars(result)
         ingested_at = utc_now()
         shanghai = ZoneInfo("Asia/Shanghai")
+        preliminary_coverage = assess_history_response(
+            "tushare", interval, bars, start, end,
+            instrument_id=instrument.instrument_id,
+        )
+        coverage_exempt_dates: list[str] = []
+        coverage_evidence_artifact_id = None
+        missing_sessions = list(
+            preliminary_coverage.get("missing_session_dates") or []
+        )
+        if missing_sessions:
+            suspension_params = {
+                "ts_code": provider_symbol,
+                "start_date": missing_sessions[0].replace("-", ""),
+                "end_date": (
+                    datetime.fromisoformat(missing_sessions[-1]).date()
+                    + timedelta(days=1)
+                ).strftime("%Y%m%d"),
+            }
+            suspension_fields = "ts_code,trade_date,suspend_type"
+            suspension_result = self.tushare_provider.call(
+                "suspend_d", suspension_params, suspension_fields
+            )
+            suspension_artifact = self._persist_tushare_response(
+                "suspend_d", suspension_params, suspension_fields,
+                suspension_result,
+                {
+                    "ingestion_id": ingestion_id,
+                    "instrument_id": instrument.instrument_id,
+                    "coverage_evidence": True,
+                },
+            )
+            coverage_evidence_artifact_id = suspension_artifact["artifact_id"]
+            missing_set = set(missing_sessions)
+            coverage_exempt_dates = sorted({
+                datetime.strptime(
+                    str(row.get("trade_date")), "%Y%m%d"
+                ).date().isoformat()
+                for row in self.tushare_provider.rows(suspension_result)
+                if str(row.get("trade_date") or "").isdigit()
+                and len(str(row.get("trade_date"))) == 8
+                and datetime.strptime(
+                    str(row.get("trade_date")), "%Y%m%d"
+                ).date().isoformat() in missing_set
+            })
+        final_prewrite_coverage = assess_history_response(
+            "tushare", interval, bars, start, end, coverage_exempt_dates,
+            instrument.instrument_id,
+        )
+        if final_prewrite_coverage["status"] == "split_required":
+            self.metadata_repository.record_provider_health(
+                self.tushare_provider.name, True, ingested_at
+            )
+            return {
+                "status": "split_required",
+                "source": self.tushare_provider.name,
+                "range": range_label, "interval": interval,
+                "adjustment": adjustment, "bars": bars, "count": 0,
+                "observed_at": ingested_at,
+                "raw_path": artifact["storage_path"],
+                "raw_artifact_id": artifact["artifact_id"],
+                "ingestion_id": ingestion_id,
+                "coverage_exempt_dates": coverage_exempt_dates,
+                "coverage_evidence_artifact_id": (
+                    coverage_evidence_artifact_id
+                ),
+                "coverage": final_prewrite_coverage,
+            }
         factor_start = start.astimezone(shanghai).date()
         factor_end = (end - timedelta(microseconds=1)).astimezone(shanghai).date()
         factor_params = {
             "ts_code": provider_symbol,
             "start_date": factor_start.strftime("%Y%m%d"),
-            "end_date": factor_end.strftime("%Y%m%d"),
+            # The configured Tushare-compatible endpoint treats end_date as
+            # exclusive for multi-day adj_factor queries, although the
+            # upstream contract describes a date range. Widen the provider
+            # request while keeping MarketCow's internal window unchanged.
+            "end_date": (factor_end + timedelta(days=1)).strftime("%Y%m%d"),
         }
         factor_fields = "ts_code,trade_date,adj_factor"
         factor_result = self.tushare_provider.call(
@@ -387,12 +459,46 @@ class FundamentalService:
         factors = self.tushare_provider.adjustment_factors(
             factor_result, provider_symbol
         )
+        factor_artifacts_by_date = {
+            factor["trade_date"]: factor_artifact["artifact_id"]
+            for factor in factors
+        }
         expected_dates = {
             datetime.fromisoformat(str(bar["bar_at"]).replace("Z", "+00:00"))
             .astimezone(shanghai).date().isoformat()
             for bar in bars
         }
         factor_dates = {factor["trade_date"] for factor in factors}
+        missing_dates = sorted(expected_dates - factor_dates)
+        supplement_artifact_ids = []
+        for missing_date in missing_dates:
+            exact_params = {
+                "ts_code": provider_symbol,
+                "trade_date": missing_date.replace("-", ""),
+            }
+            exact_result = self.tushare_provider.call(
+                "adj_factor", exact_params, factor_fields
+            )
+            exact_artifact = self._persist_tushare_response(
+                "adj_factor", exact_params, factor_fields, exact_result,
+                {
+                    "ingestion_id": ingestion_id,
+                    "instrument_id": instrument.instrument_id,
+                    "supplement_for_trade_date": missing_date,
+                },
+            )
+            exact_factors = self.tushare_provider.adjustment_factors(
+                exact_result, provider_symbol
+            )
+            for factor in exact_factors:
+                if factor["trade_date"] == missing_date:
+                    factors.append(factor)
+                    factor_dates.add(missing_date)
+                    factor_artifacts_by_date[missing_date] = exact_artifact[
+                        "artifact_id"
+                    ]
+                    supplement_artifact_ids.append(exact_artifact["artifact_id"])
+                    break
         missing_dates = sorted(expected_dates - factor_dates)
         if missing_dates:
             preview = ",".join(missing_dates[:3])
@@ -419,7 +525,7 @@ class FundamentalService:
                 "adjustment_reference_date": None,
                 "reference_factor": None,
                 "factor_source": self.tushare_provider.name,
-                "factor_artifact_id": factor_artifact["artifact_id"],
+                "factor_artifact_id": factor_artifacts_by_date[trade_date],
                 "factor_as_of": ingested_at,
             })
             bar["adjustment_factor"] = factor
@@ -456,6 +562,9 @@ class FundamentalService:
             "adjustment_factor_count": factor_count,
             "adjustment_factor_raw_path": factor_artifact["storage_path"],
             "adjustment_factor_raw_artifact_id": factor_artifact["artifact_id"],
+            "adjustment_factor_supplement_artifact_ids": supplement_artifact_ids,
+            "coverage_exempt_dates": coverage_exempt_dates,
+            "coverage_evidence_artifact_id": coverage_evidence_artifact_id,
         }
 
     def search_instruments(self, query: str, limit: int = 12) -> List[Dict[str, Any]]:

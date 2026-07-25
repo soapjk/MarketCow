@@ -2,9 +2,28 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 
+import exchange_calendars
+
+from .history_capabilities import provider_history_capability
+
+
+@lru_cache(maxsize=8)
+def _exchange_calendar(name: str):
+    return exchange_calendars.get_calendar(name)
+
+
+def _is_session(name: str, value: datetime) -> bool:
+    local_zone = ZoneInfo({
+        "XSHG": "Asia/Shanghai",
+        "XHKG": "Asia/Hong_Kong",
+    }.get(name, "America/New_York"))
+    session_date = value.astimezone(local_zone).date().isoformat()
+    return bool(_exchange_calendar(name).is_session(session_date))
 
 RANGE_DAYS = {
     "1d": 1,
@@ -93,6 +112,43 @@ def shard_span(request: Dict[str, Any]) -> timedelta:
     raise ValueError("unsupported history provider")
 
 
+def _budgeted_span(
+    cursor: datetime, end: datetime, request: Dict[str, Any]
+) -> tuple[datetime, int]:
+    capability = provider_history_capability(
+        str(request["provider"]), str(request["interval"])
+    )
+    if capability.provider == "hyperliquid":
+        shard_end = min(end, cursor + shard_span(request))
+        seconds = max(0.0, (shard_end - cursor).total_seconds())
+        expected = int(
+            seconds / max(1, INTERVAL_SECONDS[str(request["interval"])])
+        )
+        return shard_end, expected
+    if capability.provider == "yahoo":
+        shard_end = min(end, cursor + shard_span(request))
+        days = max(1, int((shard_end - cursor).total_seconds() / 86400) + 1)
+        return shard_end, days * capability.rows_per_trading_day
+
+    # Tushare A-share minute data is planned using a conservative weekday
+    # envelope. Exchange holidays only reduce the observed row count.
+    budget_days = max(
+        1, capability.planning_row_budget // capability.rows_per_trading_day
+    )
+    candidate = cursor
+    weekdays = 0
+    while candidate < end:
+        candidate = min(end, candidate + timedelta(days=1))
+        observed = candidate - timedelta(microseconds=1)
+        if capability.calendar_name and _is_session(
+            capability.calendar_name, observed
+        ):
+            weekdays += 1
+        if weekdays >= budget_days:
+            break
+    return candidate, weekdays * capability.rows_per_trading_day
+
+
 def plan_history_shards(request: Dict[str, Any]) -> list[Dict[str, Any]]:
     start = _utc(datetime.fromisoformat(
         str(request["range_start"]).replace("Z", "+00:00")
@@ -100,11 +156,13 @@ def plan_history_shards(request: Dict[str, Any]) -> list[Dict[str, Any]]:
     end = _utc(datetime.fromisoformat(
         str(request["range_end"]).replace("Z", "+00:00")
     ))
-    span = shard_span(request)
+    capability = provider_history_capability(
+        str(request["provider"]), str(request["interval"])
+    )
     shards = []
     cursor = start
     while cursor < end:
-        shard_end = min(end, cursor + span)
+        shard_end, expected_max_rows = _budgeted_span(cursor, end, request)
         identity_payload = {
             "provider": request["provider"],
             "interval": request["interval"],
@@ -120,6 +178,12 @@ def plan_history_shards(request: Dict[str, Any]) -> list[Dict[str, Any]]:
             "shard_key": identity[:24],
             "range_start": identity_payload["start"],
             "range_end": identity_payload["end"],
+            "expected_max_rows": expected_max_rows,
+            "planning_row_budget": capability.planning_row_budget,
+            "maximum_rows_per_request": capability.maximum_rows_per_request,
+            "capability_schema_version": capability.schema_version,
+            "limit_confidence": capability.limit_confidence,
+            "capability_source": capability.capability_source,
         })
         cursor = shard_end
     return shards

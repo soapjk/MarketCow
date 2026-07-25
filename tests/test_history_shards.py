@@ -9,6 +9,7 @@ from marketcow.history_shards import (
     history_ingestion_identity,
     plan_history_shards,
 )
+from marketcow.history_capabilities import provider_history_capability
 
 
 class HistoryShardPlanningTest(unittest.TestCase):
@@ -59,8 +60,40 @@ class HistoryShardPlanningTest(unittest.TestCase):
         })
 
         self.assertEqual(len(yahoo), 7)
-        self.assertEqual(len(tushare), 12)
+        self.assertEqual(len(tushare), 5)
         self.assertEqual(len(hyperliquid), 3)
+        self.assertTrue(all(
+            shard["expected_max_rows"] <= 3000 for shard in tushare
+        ))
+
+    def test_tushare_one_minute_plan_stays_inside_row_budget(self):
+        shards = plan_history_shards({
+            "range": "custom", "adjustment": "raw",
+            "range_start": "2026-06-01T00:00:00+00:00",
+            "range_end": "2026-08-01T00:00:00+00:00",
+            "provider": "tushare", "interval": "1m",
+        })
+        capability = provider_history_capability("tushare", "1m")
+        self.assertGreater(len(shards), 1)
+        self.assertTrue(all(
+            shard["expected_max_rows"] <= capability.planning_row_budget
+            for shard in shards
+        ))
+        self.assertTrue(all(
+            shard["maximum_rows_per_request"]
+            == capability.maximum_rows_per_request
+            for shard in shards
+        ))
+
+    def test_tushare_budget_uses_exchange_holidays_not_weekdays(self):
+        shards = plan_history_shards({
+            "range": "custom", "adjustment": "raw",
+            "range_start": "2026-10-01T00:00:00+00:00",
+            "range_end": "2026-10-10T00:00:00+00:00",
+            "provider": "tushare", "interval": "1m",
+        })
+        self.assertEqual(len(shards), 1)
+        self.assertEqual(shards[0]["expected_max_rows"], 2 * 242)
 
     def test_naive_or_reversed_boundaries_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "timezone-aware"):

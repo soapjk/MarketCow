@@ -31,7 +31,7 @@ class HistoryReconciler:
         repaired_keys = set()
         for raw in shards:
             shard = dict(raw)
-            if shard["status"] in {"succeeded", "canceled"}:
+            if shard["status"] in {"succeeded", "canceled", "superseded"}:
                 continue
             ingestion_id = str(shard.get("ingestion_id") or "")
             if not ingestion_id:
@@ -88,20 +88,24 @@ class HistoryReconciler:
             for raw_item in items:
                 item = dict(raw_item)
                 owned = by_item.get(str(item["item_id"]), [])
-                if not owned or any(
-                    shard["status"] != "succeeded" for shard in owned
+                leaves = [
+                    shard for shard in owned
+                    if shard["status"] != "superseded"
+                ]
+                if not leaves or any(
+                    shard["status"] != "succeeded" for shard in leaves
                 ):
                     continue
-                rows = sum(int(shard["rows_persisted"]) for shard in owned)
+                rows = sum(int(shard["rows_persisted"]) for shard in leaves)
                 sources = [
                     dict(shard.get("write_receipt_json") or {}).get("source")
-                    for shard in owned
+                    for shard in leaves
                 ]
                 item.update({
                     "status": "succeeded",
                     "source": next((value for value in sources if value), None),
                     "rows_fetched": sum(
-                        int(shard["rows_fetched"]) for shard in owned
+                        int(shard["rows_fetched"]) for shard in leaves
                     ),
                     "rows_persisted": rows,
                     "canonical_status": "pending",

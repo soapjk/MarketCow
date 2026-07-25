@@ -15,6 +15,7 @@ import requests
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.history_jobs import HistoryJobManager, _error_policy, _retry_delay
+from marketcow.history_shards import _exchange_calendar
 from marketcow.provider_routing import ProviderNotSupported
 from marketcow.telemetry import Telemetry
 
@@ -117,7 +118,9 @@ class MemoryJobs:
             self._check_open()
             key = (row["job_id"], row["item_id"], row["shard_key"])
             current = self.shards.get(key)
-            if current is None or current["status"] in {"succeeded", "canceled"}:
+            if current is None or current["status"] in {
+                "succeeded", "canceled", "superseded"
+            }:
                 return None
             if (
                 current["status"] == "running"
@@ -866,6 +869,154 @@ class HistoryJobManagerTest(unittest.TestCase):
         self.assertEqual(windows.count(windows[0]), 1)
         self.assertEqual(windows.count(windows[1]), 1)
         self.assertEqual(windows.count(windows[2]), 2)
+        manager.close()
+
+    def test_suspected_truncation_is_persistently_split_and_reconciled(self):
+        service = JobService()
+        manager = HistoryJobManager(
+            service, service.metadata_repository, max_workers=1
+        )
+        calls = []
+
+        def fetch_window(
+            symbol, start, end, interval, adjustment, provider, allow_fallback,
+            ingestion_id=None,
+        ):
+            calls.append((start, end, ingestion_id))
+            if (end - start) > timedelta(days=2):
+                count = 3000
+                step = (end - start) / count
+                bars = [
+                    {"bar_at": (start + step * index).isoformat()}
+                    for index in range(count)
+                ]
+            else:
+                calendar = _exchange_calendar("XSHG")
+                sessions = calendar.sessions_in_range(
+                    start.date().isoformat(),
+                    (end - timedelta(microseconds=1)).date().isoformat(),
+                )
+                bars = [
+                    {
+                        "bar_at": (
+                            calendar.session_open(session).to_pydatetime()
+                            + timedelta(minutes=index)
+                        ).isoformat()
+                    }
+                    for session in sessions
+                    for index in range(242)
+                ]
+                count = len(bars)
+            return {
+                "source": provider,
+                "bars": bars,
+                "count": count,
+            }
+
+        service.refresh_quote_history_window = fetch_window
+        job, _ = manager.create(request(
+            symbols=["600519.XSHG"], provider="tushare", interval="1m",
+            range="custom",
+            range_start="2026-07-20T00:00:00+00:00",
+            range_end="2026-07-24T00:00:00+00:00",
+            max_attempts=3,
+        ))
+        detail = terminal(manager, job["job_id"])
+        shards = detail["items"][0]["shards"]
+
+        self.assertEqual(detail["status"], "succeeded")
+        self.assertEqual([value["status"] for value in shards].count(
+            "superseded"
+        ), 1)
+        leaves = [value for value in shards if value["status"] == "succeeded"]
+        self.assertEqual(len(leaves), 2)
+        self.assertEqual(detail["rows_fetched"], 4 * 242)
+        self.assertEqual(detail["rows_persisted"], 4 * 242)
+        self.assertEqual(detail["completed_shards"], detail["total_shards"])
+        self.assertEqual(len({value["ingestion_id"] for value in leaves}), 2)
+        self.assertTrue(all(
+            value["cursor_json"].get("parent_shard_key") for value in leaves
+        ))
+        self.assertEqual(len(calls), 3)
+        manager.close()
+
+        repository = service.metadata_repository
+        restarted_leaf = leaves[0]
+        original_ingestion_id = restarted_leaf["ingestion_id"]
+        with repository.lock:
+            stored_job = repository.jobs[job["job_id"]]
+            stored_job.update({"status": "running", "finished_at": None})
+            stored_item = repository.items[(
+                job["job_id"], detail["items"][0]["item_id"]
+            )]
+            stored_item.update({
+                "status": "running", "owner_id": "dead-worker",
+                "lease_token": "dead-token",
+                "lease_expires_at": "2000-01-01T00:00:00+00:00",
+                "finished_at": None,
+            })
+            stored_leaf = repository.shards[(
+                job["job_id"], detail["items"][0]["item_id"],
+                restarted_leaf["shard_key"],
+            )]
+            stored_leaf.update({
+                "status": "queued", "rows_fetched": 0,
+                "rows_persisted": 0, "finished_at": None,
+            })
+        restarted_service = JobService(repository)
+        restarted_service.refresh_quote_history_window = fetch_window
+        restarted = HistoryJobManager(
+            restarted_service, repository, max_workers=1
+        )
+        recovered = terminal(restarted, job["job_id"])
+        recovered_leaf = next(
+            value for value in recovered["items"][0]["shards"]
+            if value["shard_key"] == restarted_leaf["shard_key"]
+        )
+
+        self.assertEqual(recovered["status"], "succeeded")
+        self.assertEqual(recovered_leaf["ingestion_id"], original_ingestion_id)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(recovered["superseded_shards"], 1)
+        restarted.close()
+
+    def test_unproven_minimum_shard_fails_closed(self):
+        service = JobService()
+        manager = HistoryJobManager(
+            service, service.metadata_repository, max_workers=1
+        )
+
+        def saturated(
+            _symbol, start, _end, _interval, _adjustment, provider,
+            allow_fallback, ingestion_id=None,
+        ):
+            return {
+                "source": provider,
+                "bars": [
+                    {"bar_at": (start + timedelta(seconds=index)).isoformat()}
+                    for index in range(3000)
+                ],
+                "count": 3000,
+            }
+
+        service.refresh_quote_history_window = saturated
+        job, _ = manager.create(request(
+            symbols=["600519.XSHG"], provider="tushare", interval="1m",
+            range="custom",
+            range_start="2026-07-20T00:00:00+00:00",
+            range_end="2026-07-21T00:00:00+00:00",
+        ))
+        detail = terminal(manager, job["job_id"])
+
+        self.assertEqual(detail["status"], "failed")
+        self.assertEqual(
+            detail["items"][0]["error_code"],
+            "upstream_coverage_unproven",
+        )
+        self.assertEqual(
+            detail["items"][0]["shards"][0]["error_code"],
+            "upstream_coverage_unproven",
+        )
         manager.close()
 
     def test_cancel_finishes_current_shard_and_cancels_all_remaining_shards(self):

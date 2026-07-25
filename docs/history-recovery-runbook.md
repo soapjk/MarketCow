@@ -72,6 +72,19 @@
 - failed 表示复核预算耗尽；先检查 canonical scheduler/ClickHouse，再处理。
 - 不应为了清除 pending 直接把 item 改成 completed。
 
+### coverage split 或 upstream_coverage_unproven
+
+- `superseded` 是动态拆分后的正常终态，不要重试父分片。
+- 在子分片 `cursor_json.parent_shard_key` 与父分片
+  `cursor_json.child_shard_keys` 之间核对关系。
+- `coverage_split_events` 增加表示服务检测到可能截断并自动缩小查询范围，不等于失败。
+- `upstream_coverage_unproven` 表示已经达到最小拆分单位，仍存在行数上限、重复、
+  乱序或越界记录；不得人工改成成功。保存 Artifact 后调查供应商，再用新的任务验证。
+- consistency audit 对这种只归档、未写 bars 的叶片报告
+  `coverage_unproven_artifact`，建议调查供应商，不能按普通
+  `market_bars_missing` 执行 replay。
+- 重启后 queued 子分片会继续执行；`superseded` 父分片必须保持不可执行。
+
 ## 3. 取消
 
 调用 `POST /v1/admin/history-jobs/{job_id}/cancel`。queued shard 立即取消；已进入

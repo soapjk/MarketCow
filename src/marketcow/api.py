@@ -2406,7 +2406,9 @@ ${cancelable(j.status)?`<button class="cancel" data-job="${esc(j.job_id)}"
 type="button">Cancel job</button>`:''}</h2>
 <progress max="100" value="${j.progress_percent}"></progress> ${j.progress_percent}%
 <p>${j.completed_symbols}/${j.total_symbols}; fetched ${j.rows_fetched};
-persisted ${j.rows_persisted}; updated ${esc(j.updated_at)}</p><table><tr>
+persisted ${j.rows_persisted}; shards ${j.completed_shards}/${j.total_shards};
+splits ${j.coverage_split_events}; unproven ${j.coverage_unproven_shards};
+updated ${esc(j.updated_at)}</p><table><tr>
 <th>Symbol</th><th>Status</th><th>Provider/source</th><th>Attempt</th>
 <th>Rows</th><th>Canonical</th><th>Owner / lease</th><th>Heartbeat</th>
 <th>Takeovers</th><th>Error</th></tr>${j.items.map(i=>`<tr>

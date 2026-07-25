@@ -18,12 +18,18 @@ from .history_shards import (
     history_ingestion_identity,
     plan_history_shards,
 )
+from .history_coverage import (
+    HistoryCoverageUnproven,
+    assess_history_response,
+    split_history_shard,
+)
 from .history_canonical import HistoryCanonicalVerifier
 from .telemetry import sanitize_text, telemetry_call
 
 
 TERMINAL_JOB = {"succeeded", "partially_failed", "failed", "canceled"}
 TERMINAL_ITEM = {"succeeded", "failed", "canceled"}
+TERMINAL_SHARD = TERMINAL_ITEM | {"superseded"}
 HISTORY_HEALTH_THRESHOLDS = {
     "queued_degraded": 100,
     "expired_lease_degraded": 1,
@@ -80,6 +86,8 @@ def _error_policy(exc: BaseException) -> tuple[str, bool]:
         return exc.code, False
     if isinstance(exc, ProviderRoutingError):
         return exc.code, False
+    if isinstance(exc, HistoryCoverageUnproven):
+        return "upstream_coverage_unproven", False
     if isinstance(exc, ValueError):
         return "invalid_history_request", False
     message = str(exc).lower()
@@ -349,7 +357,16 @@ class HistoryJobManager:
                         symbol, request, planned
                     ),
                     "status": "queued", "attempt": 0, "rows_fetched": 0,
-                    "rows_persisted": 0, "cursor_json": {},
+                    "rows_persisted": 0, "cursor_json": {
+                        "planning": {
+                            key: planned[key] for key in (
+                                "expected_max_rows", "planning_row_budget",
+                                "maximum_rows_per_request",
+                                "capability_schema_version",
+                                "limit_confidence", "capability_source",
+                            ) if key in planned
+                        }
+                    },
                     "write_receipt_json": None, "error_code": None,
                     "error_message": None, "owner_id": None,
                     "lease_token": None, "lease_expires_at": None,
@@ -550,8 +567,13 @@ class HistoryJobManager:
         total_persisted = 0
         canonical_statuses = []
         source = item.get("source")
+        next_shard_index = max(
+            (int(value["shard_index"]) for value in shards), default=-1
+        ) + 1
         for raw in shards:
             shard = dict(raw)
+            if shard["status"] == "superseded":
+                continue
             if shard["status"] == "succeeded":
                 total_fetched += int(shard["rows_fetched"])
                 total_persisted += int(shard["rows_persisted"])
@@ -601,6 +623,65 @@ class HistoryJobManager:
                     )
                     fetched = len(result.get("bars") or [])
                     persisted = int(result.get("count") or 0)
+                    coverage = assess_history_response(
+                        str(request["provider"]), str(request["interval"]),
+                        result.get("bars") or [],
+                        start, end,
+                        result.get("coverage_exempt_dates") or [],
+                        str(item["symbol"]),
+                    )
+                    if coverage["status"] == "split_required":
+                        children = split_history_shard(
+                            shard, str(item["symbol"]), request,
+                            next_shard_index,
+                        )
+                        if not children:
+                            raise HistoryCoverageUnproven(
+                                "upstream coverage cannot be proven at the "
+                                "minimum shard size"
+                            )
+                        now = _now()
+                        created_children = []
+                        for child in children:
+                            child_row = {
+                                **child, "job_id": job_id,
+                                "item_id": item["item_id"], "status": "queued",
+                                "attempt": 0, "rows_fetched": 0,
+                                "rows_persisted": 0,
+                                "cursor_json": {
+                                    "parent_shard_key": shard["shard_key"],
+                                    "split_reason": coverage["reasons"],
+                                },
+                                "write_receipt_json": None,
+                                "error_code": None, "error_message": None,
+                                "owner_id": None, "lease_token": None,
+                                "lease_expires_at": None, "heartbeat_at": None,
+                                "created_at": now, "updated_at": now,
+                                "finished_at": None,
+                            }
+                            saved_child = self.repository.upsert_history_shard(
+                                child_row
+                            )
+                            created_children.append(dict(_clean(saved_child)))
+                        shard.update({
+                            "status": "superseded", "rows_fetched": 0,
+                            "rows_persisted": 0,
+                            "cursor_json": {
+                                **dict(shard.get("cursor_json") or {}),
+                                "coverage": coverage,
+                                "child_shard_keys": [
+                                    child["shard_key"] for child in children
+                                ],
+                            },
+                            "write_receipt_json": None, "owner_id": None,
+                            "lease_token": None, "lease_expires_at": None,
+                            "heartbeat_at": None, "updated_at": now,
+                            "finished_at": now,
+                        })
+                        self.repository.upsert_history_shard(shard)
+                        shards.extend(created_children)
+                        next_shard_index += len(created_children)
+                        break
                     canonical = self._canonical_status(
                         item["symbol"],
                         {**request, "canonical_wait_seconds": 0},
@@ -610,6 +691,7 @@ class HistoryJobManager:
                         "status": "succeeded", "rows_fetched": fetched,
                         "rows_persisted": persisted,
                         "cursor_json": {
+                            **dict(shard.get("cursor_json") or {}),
                             "confirmed_through": shard["range_end"]
                         },
                         "write_receipt_json": {
@@ -624,6 +706,10 @@ class HistoryJobManager:
                             ),
                             "observed_at": result.get("observed_at"),
                             "canonical_status": canonical,
+                            "coverage": coverage,
+                            "coverage_evidence_artifact_id": result.get(
+                                "coverage_evidence_artifact_id"
+                            ),
                         },
                         "owner_id": None, "lease_token": None,
                         "lease_expires_at": None, "heartbeat_at": None,
@@ -816,7 +902,7 @@ class HistoryJobManager:
         for raw in map(
             _clean, self.repository.list_history_shards(job_id, item_id)
         ):
-            if raw["status"] in TERMINAL_ITEM:
+            if raw["status"] in TERMINAL_SHARD:
                 continue
             shard = dict(raw)
             shard.update({
@@ -967,7 +1053,18 @@ class HistoryJobManager:
             ),
             "total_shards": len(shards),
             "completed_shards": sum(
-                shard["status"] in TERMINAL_ITEM for shard in shards
+                shard["status"] in TERMINAL_SHARD for shard in shards
+            ),
+            "superseded_shards": sum(
+                shard["status"] == "superseded" for shard in shards
+            ),
+            "coverage_split_events": sum(
+                bool((shard.get("cursor_json") or {}).get("child_shard_keys"))
+                for shard in shards
+            ),
+            "coverage_unproven_shards": sum(
+                shard.get("error_code") == "upstream_coverage_unproven"
+                for shard in shards
             ),
         }
         for state in ("queued", "running", "succeeded", "failed", "canceled"):

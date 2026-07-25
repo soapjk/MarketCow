@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from marketcow.service import FundamentalService
+from marketcow.providers.tushare_provider import TushareProvider
 
 
 class TushareHistoryWindowTest(unittest.TestCase):
@@ -48,7 +49,7 @@ class TushareHistoryWindowTest(unittest.TestCase):
             {
                 "ts_code": "600519.SH",
                 "start_date": "20260101",
-                "end_date": "20260102",
+                "end_date": "20260103",
             },
             "ts_code,trade_date,adj_factor",
         ))
@@ -72,8 +73,12 @@ class TushareHistoryWindowTest(unittest.TestCase):
                 else {"data": {"fields": [], "items": []}}
             ),
             minute_bars=lambda _result: [{
-                "bar_at": "2026-01-02T01:35:00+00:00", "close": 10
-            }],
+                "bar_at": (
+                    datetime(2026, 1, 2, 1, 35, tzinfo=timezone.utc)
+                    + timedelta(minutes=5 * index)
+                ).isoformat(),
+                "close": 10,
+            } for index in range(50)],
             adjustment_factors=lambda _result, _symbol: [],
         )
         service = SimpleNamespace(
@@ -120,11 +125,13 @@ class TushareHistoryWindowTest(unittest.TestCase):
                 }
             ),
             minute_bars=lambda _result: [{
-                "bar_at": "2026-01-02T01:35:00+00:00",
-                "close": 10,
-                "raw_close": 10,
+                "bar_at": (
+                    datetime(2026, 1, 2, 1, 35, tzinfo=timezone.utc)
+                    + timedelta(minutes=5 * index)
+                ).isoformat(),
+                "close": 10, "raw_close": 10,
                 "adjustment_factor": None,
-            }],
+            } for index in range(50)],
             adjustment_factors=lambda _result, _symbol: [{
                 "trade_date": "2026-01-02",
                 "adjustment_factor": "12.3456",
@@ -170,6 +177,77 @@ class TushareHistoryWindowTest(unittest.TestCase):
             result["bars"][0]["factor_artifact_id"], "artifact-adj_factor"
         )
         self.assertEqual(saved_bars[0]["adjustment_factor"], "12.3456")
+
+    def test_missing_range_factor_is_supplemented_by_exact_trade_date(self):
+        calls = []
+
+        def call(api, params, _fields):
+            calls.append((api, dict(params)))
+            if api == "stk_mins":
+                return {"data": {"fields": [], "items": []}}
+            if api == "adj_factor" and params.get("trade_date"):
+                return {
+                    "data": {
+                        "fields": ["ts_code", "trade_date", "adj_factor"],
+                        "items": [["600519.SH", "20260102", 12.3456]],
+                    }
+                }
+            return {"data": {"fields": [], "items": []}}
+
+        provider = SimpleNamespace(
+            name="tushare_fixture", base_url="https://example.test",
+            call=call,
+            minute_bars=lambda _result: [{
+                "bar_at": (
+                    datetime(2026, 1, 2, 1, 35, tzinfo=timezone.utc)
+                    + timedelta(minutes=5 * index)
+                ).isoformat(),
+                "close": 10, "raw_close": 10,
+                "adjustment_factor": None,
+            } for index in range(50)],
+            adjustment_factors=TushareProvider.adjustment_factors,
+            rows=TushareProvider.rows,
+        )
+        artifacts = []
+        service = SimpleNamespace(
+            tushare_provider=provider,
+            _persist_tushare_response=lambda api, _params, _fields, _result,
+            metadata=None: (
+                artifacts.append((api, metadata or {}))
+                or {
+                    "storage_path": f"/tmp/{api}-{len(artifacts)}",
+                    "artifact_id": f"artifact-{api}-{len(artifacts)}",
+                }
+            ),
+            market_bar_repository=SimpleNamespace(
+                upsert_price_bars=lambda *_args: 1,
+                upsert_adjustment_factors=lambda *_args: 1,
+            ),
+            metadata_repository=SimpleNamespace(
+                record_provider_health=lambda *_args: None
+            ),
+        )
+
+        result = FundamentalService.refresh_tushare_minute_history_window(
+            service, "600519.XSHG",
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            "5m", "raw",
+        )
+
+        self.assertIn(
+            ("adj_factor", {
+                "ts_code": "600519.SH", "trade_date": "20260102"
+            }),
+            calls,
+        )
+        self.assertEqual(
+            len(result["adjustment_factor_supplement_artifact_ids"]), 1
+        )
+        self.assertEqual(
+            result["bars"][0]["factor_artifact_id"],
+            result["adjustment_factor_supplement_artifact_ids"][0],
+        )
 
 
 if __name__ == "__main__":

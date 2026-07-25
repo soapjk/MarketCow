@@ -693,7 +693,7 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                     lease_expires_at=NULL,heartbeat_at=NULL,updated_at=%s,
                     finished_at=%s
                 WHERE job_id=%s AND item_id=%s AND shard_key=%s
-                  AND status NOT IN ('succeeded','canceled')
+                  AND status NOT IN ('succeeded','canceled','superseded')
                   AND (
                     status <> 'running'
                     OR lease_expires_at IS NULL

@@ -34,7 +34,12 @@ class HistoryConsistencyAuditor:
         )
         shards_by_ingestion = {
             str(row.get("ingestion_id")): dict(row)
-            for row in shards if row.get("ingestion_id")
+            for row in shards
+            if row.get("ingestion_id") and row.get("status") != "superseded"
+        }
+        superseded_ingestions = {
+            str(row.get("ingestion_id")) for row in shards
+            if row.get("ingestion_id") and row.get("status") == "superseded"
         }
         artifacts_by_ingestion: dict[str, list[Dict[str, Any]]] = {}
         for row in artifacts:
@@ -52,6 +57,19 @@ class HistoryConsistencyAuditor:
             has_bars = ingestion_id in receipts_by_ingestion
             if has_artifact and has_bars:
                 continue
+            if (
+                shard.get("error_code") == "upstream_coverage_unproven"
+                and has_artifact and not has_bars
+            ):
+                findings.append({
+                    "kind": "coverage_unproven_artifact",
+                    "recommended_action": "investigate_provider_coverage",
+                    "ingestion_id": ingestion_id,
+                    "job_id": shard["job_id"],
+                    "item_id": shard["item_id"],
+                    "shard_key": shard["shard_key"],
+                })
+                continue
             if not has_artifact and has_bars:
                 kind, action = "raw_artifact_missing", "refetch_or_restore_artifact"
             elif has_artifact and not has_bars:
@@ -64,7 +82,10 @@ class HistoryConsistencyAuditor:
                 "item_id": shard["item_id"], "shard_key": shard["shard_key"],
             })
         for ingestion_id, rows in artifacts_by_ingestion.items():
-            if ingestion_id not in shards_by_ingestion:
+            if (
+                ingestion_id not in shards_by_ingestion
+                and ingestion_id not in superseded_ingestions
+            ):
                 findings.append({
                     "kind": "orphan_artifact",
                     "recommended_action": "quarantine_artifact",
@@ -72,7 +93,10 @@ class HistoryConsistencyAuditor:
                     "artifact_ids": [row.get("artifact_id") for row in rows],
                 })
         for ingestion_id, receipt in receipts_by_ingestion.items():
-            if ingestion_id not in shards_by_ingestion:
+            if (
+                ingestion_id not in shards_by_ingestion
+                and ingestion_id not in superseded_ingestions
+            ):
                 findings.append({
                     "kind": "orphan_market_bars",
                     "recommended_action": "quarantine_ingestion",
@@ -89,7 +113,7 @@ class HistoryConsistencyAuditor:
                 for kind in {
                     "raw_artifact_missing", "market_bars_missing",
                     "ingestion_missing", "orphan_artifact",
-                    "orphan_market_bars",
+                    "orphan_market_bars", "coverage_unproven_artifact",
                 }
             },
             "scanned": {

@@ -100,6 +100,11 @@ curl -X POST http://127.0.0.1:8790/v1/admin/history-jobs \
 同一个真实因子也会写入每根原始 K 线的 `adjustment_factor` 字段，方便下游逐行计算；
 独立因子表使用 `Decimal128(18)` 保存高精度值，并承担来源追踪和按日复用。
 
+当前配置的 Tushare 兼容代理对多日 `adj_factor` 查询采用排他的 `end_date`。适配器
+因此把供应商查询结束日期向后扩一天，但 MarketCow 内部任务范围仍保持 `[start,end)`
+不变。范围结果若仍缺少某个有 K 线的交易日，服务会再以 `trade_date=YYYYMMDD`
+逐日精确补查并分别保存 Artifact；精确补查仍缺失才会失败。不得用相邻日期因子猜测。
+
 这不改变 `adjustment=raw` 的含义：K 线价格仍按上游原始值保存，下载阶段不自动生成
 前复权或后复权价格。后续计算必须使用已保存的因子序列，并显式选择基准日。复权因子是
 公司行动作用于价格的累计结果，不是分红、送转、拆股或合股事件明细。
@@ -165,6 +170,23 @@ launchctl kickstart -k gui/$(id -u)/com.marketcow.production
 新建任务使用 `history_job_schema_version=2`，在创建时冻结绝对范围并原子写入 shard
 checkpoints。升级前已经持久化且没有 shard 记录的任务继续走旧版整段 range adapter；
 系统不会在部署时猜测并补写分片边界。旧任务完成后，所有新任务都使用 v2 分片流程。
+
+分片大小不再只由固定自然日跨度决定。版本化 Provider capability 为每个
+provider/interval 记录单次行数上限、保守规划预算、每交易日最大行数和最小拆分单位。
+Tushare 计划器按工作日最大行数累计，单片不得超过当前 3,000 行规划预算。响应达到
+规划预算、达到供应商上限、出现重复/乱序时间戳或记录越出分片边界时，原分片进入
+`superseded`，并在 PostgreSQL 中持久化两个确定性子分片。服务崩溃后会跳过
+superseded 父片并继续 queued/running 叶子分片；子片具有独立稳定 ingestion ID。
+
+如果已经拆到 Provider 的最小单位仍无法证明覆盖，任务以
+`upstream_coverage_unproven` 失败，绝不把“返回行数等于写入行数”当作完整性证明。
+详情响应提供 `total_shards`、`completed_shards`、`superseded_shards`、
+`coverage_split_events` 和 `coverage_unproven_shards`；每个父/子关系及拆分原因保存在
+shard 的 `cursor_json`，每个成功叶片的覆盖检查保存在 `write_receipt_json.coverage`。
+覆盖检查使用 `exchange-calendars` 的 XSHG/XNYS 真实交易日，而不是工作日近似；完整
+交易日的分钟行数低于该周期保守下限也会触发拆分。Tushare 缺失交易日会查询
+`suspend_d` 并留存 Artifact，只有上游明确给出停牌记录的日期才能作为 coverage
+exemption。疑似截断的 Tushare 父片只归档原始响应，不写入 bars 或复权因子。
 
 取消会立即取消 queued item。已经进入 provider/持久化原子步骤的 item 会完成该步骤，
 随后转为 canceled，不再开始下一次重试。`retry-failed` 只重置 failed item。
