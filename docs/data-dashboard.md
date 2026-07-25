@@ -49,3 +49,7 @@ future iteration.
 All queries are read-only. The dashboard never calls providers, refreshes quotes or
 changes MarketCow data.
 
+The dashboard is one part of the broader visualization and administration design.
+The accepted boundary between Grafana, native administration pages, aggregate
+metrics, and sub-second streaming panels is documented in
+[`visualization/architecture-baseline.md`](visualization/architecture-baseline.md).
