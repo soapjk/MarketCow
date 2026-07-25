@@ -20,11 +20,11 @@ const defaultJob = {
   retry_backoff_seconds: 0.5, canonical_wait_seconds: 5,
 };
 
-export function OperationsPage() {
+export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | "providers" }) {
   const identity = useIdentity();
   const canOperate = identity?.role === "operator" || identity?.role === "admin";
   const client = useQueryClient();
-  const [tab, setTab] = useState<"jobs" | "providers">("jobs");
+  const tab = initialTab;
   const [form, setForm] = useState(defaultJob);
   const providers = useQuery({
     queryKey: ["admin-providers"],
@@ -60,9 +60,12 @@ export function OperationsPage() {
     const label = action === "cancel" ? "取消" : "重试失败项";
     if (window.confirm(`确认${label}任务 ${jobId.slice(0, 12)}？`)) command.mutate({ jobId, action });
   }
+  function selectTab(next: "jobs" | "providers") {
+    window.location.hash = next === "providers" ? "#/operations/providers" : "#/operations";
+  }
   return (
     <section>
-      <div className="page-intro"><div><p className="eyebrow">OPERATIONS / AUDITED</p><h2>任务与服务</h2></div><div className="tab-switch"><button className={tab === "jobs" ? "active" : ""} onClick={() => setTab("jobs")}>历史任务</button><button className={tab === "providers" ? "active" : ""} onClick={() => setTab("providers")}>Provider</button></div></div>
+      <div className="page-intro"><div><p className="eyebrow">OPERATIONS / AUDITED</p><h2>任务与服务</h2></div><div className="tab-switch"><button className={tab === "jobs" ? "active" : ""} onClick={() => selectTab("jobs")}>历史任务</button><button className={tab === "providers" ? "active" : ""} onClick={() => selectTab("providers")}>Provider</button></div></div>
       {tab === "jobs" ? (
         <div className="split-layout">
           <form className="data-card operation-form" onSubmit={submit} aria-disabled={!canOperate}>

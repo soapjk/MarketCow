@@ -13,5 +13,7 @@ test("renders the control-plane overview", async () => {
   render(<QueryClientProvider client={client}><OverviewPage /></QueryClientProvider>);
   expect(await screen.findByText("1/2")).toBeInTheDocument();
   expect(screen.getByText("READY")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "查看 Provider 状态，1 个正常，共 2 个" }))
+    .toHaveAttribute("href", "#/operations/providers");
   vi.unstubAllGlobals();
 });

@@ -54,19 +54,20 @@ export function App() {
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
-  const route = path.slice(1);
+  const [route, subroute] = path.slice(1).split("/");
   const kind = route === "overview" || route === "dashboards" || route === "data"
     || route === "operations" || route === "live" || route === "settings"
     ? route
     : "not-found";
+  const shellPath = kind === "not-found" ? path : `/${kind}`;
 
   return (
     <ErrorBoundary>
-      <AppShell path={path}>
+      <AppShell path={shellPath}>
         {kind === "overview" ? <OverviewPage />
           : kind === "dashboards" ? <DashboardsPage />
           : kind === "data" ? <DataExplorerPage />
-          : kind === "operations" ? <OperationsPage />
+          : kind === "operations" ? <OperationsPage initialTab={subroute === "providers" ? "providers" : "jobs"} />
           : kind === "live" ? (
             <Suspense fallback={<section className="page-state">正在加载实时图表引擎…</section>}>
               <LiveMonitorPage />

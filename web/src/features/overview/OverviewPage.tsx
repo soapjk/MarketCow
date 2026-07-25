@@ -29,7 +29,15 @@ export function OverviewPage() {
       <div className="overview-grid">
         <article className="summary-card accent-card"><span>API</span><strong>{data.service.status}</strong><small>v{data.service.version} / {data.service.profile}</small></article>
         <article className="summary-card"><span>存储就绪</span><strong>{storageReady ? "READY" : "DEGRADED"}</strong><small>PostgreSQL + ClickHouse</small></article>
-        <article className="summary-card"><span>Provider 健康</span><strong>{data.providers.healthy}/{data.providers.total}</strong><small>最近持久化状态</small></article>
+        <a
+          className="summary-card summary-card-link"
+          href="#/operations/providers"
+          aria-label={`查看 Provider 状态，${data.providers.healthy} 个正常，共 ${data.providers.total} 个`}
+        >
+          <span>Provider 健康</span>
+          <strong>{data.providers.healthy}/{data.providers.total}</strong>
+          <small>查看 Provider 状态 →</small>
+        </a>
         <article className="summary-card"><span>近期任务</span><strong>{data.history_jobs.items.length}</strong><small>最多显示 10 项</small></article>
       </div>
       <article className="data-card">
