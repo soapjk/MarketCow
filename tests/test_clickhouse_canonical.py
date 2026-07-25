@@ -64,6 +64,28 @@ class CanonicalMarketBarBuilderTest(unittest.TestCase):
             self.assertEqual(different[0]["quality_status"],
                              "multi_source_ohlcva_difference")
 
+    def test_explicit_adjustment_contract_survives_canonical_selection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            builder = self.builder(FakeRepository(), folder)
+            source = {
+                **raw("tushare"),
+                "factor_applicability": "applicable",
+                "corporate_action_factor": "12.3456",
+                "applied_adjustment_multiplier": "1",
+                "adjustment_reference_date": None,
+                "reference_factor": None,
+                "factor_source": "tushare",
+                "factor_artifact_id": "factor-artifact",
+                "factor_as_of": "2026-07-20T01:00:03Z",
+            }
+
+            built, _, _ = builder.build_rows([source], [])
+
+            self.assertEqual(built[0]["corporate_action_factor"], "12.3456")
+            self.assertEqual(built[0]["applied_adjustment_multiplier"], "1")
+            self.assertEqual(built[0]["factor_source"], "tushare")
+            self.assertEqual(built[0]["factor_artifact_id"], "factor-artifact")
+
     def test_stable_tie_break_and_monotonic_content_version(self):
         with tempfile.TemporaryDirectory() as folder:
             builder = self.builder(FakeRepository(), folder)

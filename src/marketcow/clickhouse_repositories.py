@@ -143,6 +143,48 @@ CLICKHOUSE_MIGRATIONS = [
             """,
         ],
     ),
+    (
+        8,
+        "explicit price adjustment contract fields",
+        [
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "factor_applicability LowCardinality(String) DEFAULT '' AFTER adjustment_factor",
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "corporate_action_factor Nullable(Decimal128(18)) AFTER factor_applicability",
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "applied_adjustment_multiplier Nullable(Decimal128(18)) "
+            "AFTER corporate_action_factor",
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "adjustment_reference_date Nullable(Date) "
+            "AFTER applied_adjustment_multiplier",
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "reference_factor Nullable(Decimal128(18)) AFTER adjustment_reference_date",
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "factor_source Nullable(String) AFTER reference_factor",
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "factor_artifact_id Nullable(String) AFTER factor_source",
+            "ALTER TABLE market_bar_raw ADD COLUMN IF NOT EXISTS "
+            "factor_as_of Nullable(DateTime64(3, 'UTC')) AFTER factor_artifact_id",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "factor_applicability LowCardinality(String) DEFAULT '' AFTER adjustment_factor",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "corporate_action_factor Nullable(Decimal128(18)) AFTER factor_applicability",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "applied_adjustment_multiplier Nullable(Decimal128(18)) "
+            "AFTER corporate_action_factor",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "adjustment_reference_date Nullable(Date) "
+            "AFTER applied_adjustment_multiplier",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "reference_factor Nullable(Decimal128(18)) AFTER adjustment_reference_date",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "factor_source Nullable(String) AFTER reference_factor",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "factor_artifact_id Nullable(String) AFTER factor_source",
+            "ALTER TABLE market_bar_canonical ADD COLUMN IF NOT EXISTS "
+            "factor_as_of Nullable(DateTime64(3, 'UTC')) AFTER factor_artifact_id",
+        ],
+    ),
 ]
 
 
@@ -322,6 +364,9 @@ class ClickHouseMarketBarRepository:
     RAW_COLUMNS = [
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
         "low", "close", "raw_close", "adjustment_factor", "volume", "amount",
+        "factor_applicability", "corporate_action_factor",
+        "applied_adjustment_multiplier", "adjustment_reference_date",
+        "reference_factor", "factor_source", "factor_artifact_id", "factor_as_of",
         "source", "source_sequence",
         "observed_at", "ingested_at", "raw_artifact_id", "ingestion_id",
         "content_rank", "content_version",
@@ -329,6 +374,9 @@ class ClickHouseMarketBarRepository:
     CANONICAL_COLUMNS = [
         "symbol", "market", "interval", "adjustment", "bar_time", "open", "high",
         "low", "close", "raw_close", "adjustment_factor", "volume", "amount",
+        "factor_applicability", "corporate_action_factor",
+        "applied_adjustment_multiplier", "adjustment_reference_date",
+        "reference_factor", "factor_source", "factor_artifact_id", "factor_as_of",
         "selected_source", "source_count",
         "quality_status", "input_fingerprint", "version", "observed_at", "ingested_at",
         "raw_artifact_id", "updated_at",
@@ -390,14 +438,18 @@ class ClickHouseMarketBarRepository:
     ) -> int:
         if not rows:
             return 0
-        date_columns = {"bar_time", "observed_at", "ingested_at", "updated_at"}
+        date_columns = {
+            "bar_time", "observed_at", "ingested_at", "updated_at", "factor_as_of",
+        }
         values = [[
             (
                 self._datetime(row.get(column))
-                if column in date_columns
+                if column in date_columns and row.get(column) is not None
                 else (
                     date.fromisoformat(str(row.get(column)))
-                    if column == "trade_date" and not isinstance(row.get(column), date)
+                    if column in {"trade_date", "adjustment_reference_date"}
+                    and row.get(column) is not None
+                    and not isinstance(row.get(column), date)
                     else row.get(column)
                 )
             )
@@ -509,6 +561,18 @@ class ClickHouseMarketBarRepository:
                 "high": bar.get("high"), "low": bar.get("low"),
                 "close": bar.get("close"), "raw_close": bar.get("raw_close"),
                 "adjustment_factor": bar.get("adjustment_factor"),
+                "factor_applicability": bar.get("factor_applicability") or "",
+                "corporate_action_factor": bar.get("corporate_action_factor"),
+                "applied_adjustment_multiplier": bar.get(
+                    "applied_adjustment_multiplier"
+                ),
+                "adjustment_reference_date": bar.get(
+                    "adjustment_reference_date"
+                ),
+                "reference_factor": bar.get("reference_factor"),
+                "factor_source": bar.get("factor_source"),
+                "factor_artifact_id": bar.get("factor_artifact_id"),
+                "factor_as_of": bar.get("factor_as_of"),
                 "volume": bar.get("volume"), "amount": bar.get("amount"),
                 "source": source,
                 "source_sequence": str(bar.get("source_sequence") or bar.get("timestamp")),
@@ -807,7 +871,10 @@ class ClickHouseMarketBarRepository:
             raise ValueError("history limit must be between 1 and 5000")
         result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, selected_source, "
             "observed_at, ingested_at, "
             "raw_artifact_id, source_count, quality_status, version "
             "FROM market_bar_canonical FINAL WHERE symbol={symbol:String} "
@@ -870,6 +937,7 @@ class ClickHouseMarketBarRepository:
                               else float(row["raw_close"])),
                 "adjustment_factor": (None if row["adjustment_factor"] is None
                                       else float(row["adjustment_factor"])),
+                **self._map_adjustment_contract(row),
                 "volume": float(row["volume"]),
                 "amount": None if row["amount"] is None else float(row["amount"]),
                 "source": row["selected_source"],
@@ -887,6 +955,32 @@ class ClickHouseMarketBarRepository:
                 },
             })
         return mapped
+
+    def _map_adjustment_contract(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        def decimal_text(name: str) -> Optional[str]:
+            value = row.get(name)
+            if value is None:
+                return None
+            return format(Decimal(str(value)), "f")
+
+        reference_date = row.get("adjustment_reference_date")
+        factor_as_of = row.get("factor_as_of")
+        return {
+            "factor_applicability": str(row.get("factor_applicability") or ""),
+            "corporate_action_factor": decimal_text("corporate_action_factor"),
+            "applied_adjustment_multiplier": decimal_text(
+                "applied_adjustment_multiplier"
+            ),
+            "adjustment_reference_date": (
+                None if reference_date is None else str(reference_date)
+            ),
+            "reference_factor": decimal_text("reference_factor"),
+            "factor_source": row.get("factor_source"),
+            "factor_artifact_id": row.get("factor_artifact_id"),
+            "factor_as_of": (
+                None if factor_as_of is None else self._iso(factor_as_of)
+            ),
+        }
 
     def get_canonical_price_bars_range(
         self, symbol: str, interval: str, adjustment: str,
@@ -906,7 +1000,10 @@ class ClickHouseMarketBarRepository:
         end_at = datetime.fromtimestamp(int(end_at.timestamp()), timezone.utc)
         result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
             "version FROM market_bar_canonical FINAL WHERE symbol={symbol:String} "
             "AND interval={interval:String} AND adjustment={adjustment:String} "
@@ -940,7 +1037,10 @@ class ClickHouseMarketBarRepository:
             parameters["after"] = datetime.fromtimestamp(after, timezone.utc)
         result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
             "version FROM market_bar_canonical FINAL WHERE symbol={symbol:String} "
             "AND interval={interval:String} AND adjustment={adjustment:String} "
@@ -990,7 +1090,10 @@ class ClickHouseMarketBarRepository:
         result = self._query(
             "SELECT symbol, interval, adjustment, toUnixTimestamp(bar_time) AS timestamp, "
             "open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, source, source_sequence, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, source, source_sequence, "
             "toUnixTimestamp64Milli(observed_at) AS observed_millis, "
             "toUnixTimestamp64Milli(ingested_at) AS ingested_millis, raw_artifact_id, "
             "content_rank FROM (SELECT *, row_number() OVER (PARTITION BY symbol, "
@@ -1017,6 +1120,7 @@ class ClickHouseMarketBarRepository:
                 "raw_close": None if row["raw_close"] is None else float(row["raw_close"]),
                 "adjustment_factor": (None if row["adjustment_factor"] is None
                                       else float(row["adjustment_factor"])),
+                **self._map_adjustment_contract(row),
                 "volume": float(row["volume"]),
                 "amount": None if row["amount"] is None else float(row["amount"]),
                 "observed_at": datetime.fromtimestamp(
@@ -1068,7 +1172,11 @@ class ClickHouseMarketBarRepository:
             parameters["after_source"] = after[1]
         result = self._query(
             "SELECT symbol, interval, adjustment, toUnixTimestamp(bar_time) AS timestamp, "
-            "open, high, low, close, raw_close, adjustment_factor, volume, amount, source, "
+            "open, high, low, close, raw_close, adjustment_factor, "
+            "factor_applicability, corporate_action_factor, "
+            "applied_adjustment_multiplier, adjustment_reference_date, "
+            "reference_factor, factor_source, factor_artifact_id, factor_as_of, "
+            "volume, amount, source, "
             "source_sequence, toUnixTimestamp64Milli(observed_at) AS observed_millis, "
             "toUnixTimestamp64Milli(ingested_at) AS ingested_millis, raw_artifact_id, "
             "content_rank FROM (SELECT *, row_number() OVER (PARTITION BY symbol, "
@@ -1095,6 +1203,7 @@ class ClickHouseMarketBarRepository:
                 "raw_close": None if row["raw_close"] is None else float(row["raw_close"]),
                 "adjustment_factor": (None if row["adjustment_factor"] is None
                                       else float(row["adjustment_factor"])),
+                **self._map_adjustment_contract(row),
                 "volume": float(row["volume"]),
                 "amount": None if row["amount"] is None else float(row["amount"]),
                 "observed_at": datetime.fromtimestamp(
@@ -1134,7 +1243,10 @@ class ClickHouseMarketBarRepository:
             parameters["symbols"] = symbol_filter
         result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
             "version FROM market_bar_canonical FINAL WHERE interval={interval:String} "
             "AND adjustment={adjustment:String} AND bar_time={bar_at:DateTime64(3)}" +
@@ -1153,7 +1265,12 @@ class ClickHouseMarketBarRepository:
             """
             SELECT toUnixTimestamp64Milli(bar_time), toString(open), toString(high),
                    toString(low), toString(close), toString(raw_close),
-                   toString(adjustment_factor), toString(volume), toString(amount),
+                   toString(adjustment_factor), factor_applicability,
+                   toString(corporate_action_factor),
+                   toString(applied_adjustment_multiplier),
+                   toString(adjustment_reference_date), toString(reference_factor),
+                   factor_source, factor_artifact_id, toString(factor_as_of),
+                   toString(volume), toString(amount),
                    selected_source, source_count, quality_status, input_fingerprint,
                    toString(version), toUnixTimestamp64Milli(observed_at),
                    toUnixTimestamp64Milli(ingested_at), raw_artifact_id
@@ -1220,7 +1337,10 @@ class ClickHouseMarketBarRepository:
             parameters["after"] = after
         result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
             "version FROM market_bar_canonical FINAL WHERE interval={interval:String} "
             "AND adjustment={adjustment:String} AND bar_time={bar_at:DateTime64(3)}" +
@@ -1270,7 +1390,10 @@ class ClickHouseMarketBarRepository:
             parameters["after_symbol"] = after[1]
         result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
             "version FROM market_bar_canonical FINAL WHERE interval={interval:String} "
             "AND adjustment={adjustment:String} "
@@ -1301,7 +1424,10 @@ class ClickHouseMarketBarRepository:
         )
         result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
             "version FROM market_bar_canonical FINAL WHERE symbol={symbol:String} "
             "AND interval={interval:String} AND adjustment={adjustment:String} "
@@ -1342,7 +1468,10 @@ class ClickHouseMarketBarRepository:
             parameters["after"] = after
         result = self._query(
             "SELECT symbol, interval, adjustment, bar_time, open, high, low, close, "
-            "raw_close, adjustment_factor, volume, amount, selected_source, "
+            "raw_close, adjustment_factor, factor_applicability, "
+            "corporate_action_factor, applied_adjustment_multiplier, "
+            "adjustment_reference_date, reference_factor, factor_source, "
+            "factor_artifact_id, factor_as_of, volume, amount, selected_source, "
             "observed_at, ingested_at, raw_artifact_id, source_count, quality_status, "
             "version FROM (SELECT *, row_number() OVER (PARTITION BY symbol "
             "ORDER BY bar_time DESC) AS selected FROM market_bar_canonical FINAL "

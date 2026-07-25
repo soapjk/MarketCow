@@ -39,6 +39,25 @@ class FakeRepository:
 
 
 class ReliableClickHouseWriterTest(unittest.TestCase):
+    def test_wal_preserves_decimal_adjustment_contract_fields(self):
+        normalized = normalize_bar("raw", {
+            **raw_bar(),
+            "factor_applicability": "applicable",
+            "corporate_action_factor": "12.345600000000000000",
+            "applied_adjustment_multiplier": "1",
+            "factor_source": "tushare",
+            "factor_artifact_id": "factor-a",
+            "factor_as_of": "2026-07-20T01:31:02Z",
+        })
+
+        self.assertEqual(
+            normalized["corporate_action_factor"], "12.345600000000000000"
+        )
+        self.assertEqual(normalized["applied_adjustment_multiplier"], "1")
+        self.assertEqual(
+            normalized["factor_as_of"], "2026-07-20T01:31:02.000+00:00"
+        )
+
     def test_telemetry_failure_does_not_change_writer_result(self):
         class BrokenTelemetry:
             def clock(self):

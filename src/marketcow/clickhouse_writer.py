@@ -6,7 +6,8 @@ import json
 import os
 import shutil
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -20,13 +21,22 @@ DATASET_COLUMNS = {
     "raw": ClickHouseMarketBarRepository.RAW_COLUMNS,
     "canonical": ClickHouseMarketBarRepository.CANONICAL_COLUMNS,
 }
-DATETIME_COLUMNS = {"bar_time", "observed_at", "ingested_at", "updated_at"}
+DATETIME_COLUMNS = {
+    "bar_time", "observed_at", "ingested_at", "updated_at", "factor_as_of",
+}
 FLOAT_COLUMNS = {
     "open", "high", "low", "close", "raw_close", "adjustment_factor", "volume", "amount"
 }
+DECIMAL_COLUMNS = {
+    "corporate_action_factor", "applied_adjustment_multiplier", "reference_factor",
+}
+DATE_COLUMNS = {"adjustment_reference_date"}
 INTEGER_COLUMNS = {"source_count", "version"}
 OPTIONAL_COLUMNS = {
-    "amount", "raw_close", "adjustment_factor", "source_sequence", "raw_artifact_id"
+    "amount", "raw_close", "adjustment_factor", "source_sequence", "raw_artifact_id",
+    "factor_applicability", "corporate_action_factor",
+    "applied_adjustment_multiplier", "adjustment_reference_date",
+    "reference_factor", "factor_source", "factor_artifact_id", "factor_as_of",
 }
 
 
@@ -53,12 +63,18 @@ def normalize_bar(dataset: str, row: Dict[str, Any]) -> Dict[str, Any]:
             # legacy/realtime raw writes remain valid and use ClickHouse's empty
             # default rather than inventing a cross-request identity.
             value = ""
+        if column == "factor_applicability" and value is None:
+            value = ""
         if value is None and column not in OPTIONAL_COLUMNS:
             raise ValueError(f"{dataset} bar requires {column}")
         if value is not None and column in DATETIME_COLUMNS:
             value = _utc_iso(value)
         elif value is not None and column in FLOAT_COLUMNS:
             value = float(value)
+        elif value is not None and column in DECIMAL_COLUMNS:
+            value = format(Decimal(str(value)), "f")
+        elif value is not None and column in DATE_COLUMNS:
+            value = date.fromisoformat(str(value)).isoformat()
         elif value is not None and column in INTEGER_COLUMNS:
             value = int(value)
         normalized[column] = value

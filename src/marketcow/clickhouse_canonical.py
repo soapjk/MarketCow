@@ -17,7 +17,12 @@ from .canonical_selection import (
 
 
 VALUE_FIELDS = ("open", "high", "low", "close", "volume", "amount")
-CONTRACT_FIELDS = ("raw_close", "adjustment_factor")
+CONTRACT_FIELDS = (
+    "raw_close", "adjustment_factor", "factor_applicability",
+    "corporate_action_factor", "applied_adjustment_multiplier",
+    "adjustment_reference_date", "reference_factor", "factor_source",
+    "factor_artifact_id", "factor_as_of",
+)
 
 
 def _utc(value: Any) -> datetime:

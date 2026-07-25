@@ -9,12 +9,16 @@ from typing import Any, Dict
 
 RAW_CONTENT_FIELDS = (
     "open", "high", "low", "close", "raw_close", "adjustment_factor", "volume",
+    "corporate_action_factor", "applied_adjustment_multiplier",
+    "adjustment_reference_date", "reference_factor", "factor_applicability",
+    "factor_source", "factor_artifact_id", "factor_as_of",
     "amount", "source_sequence", "observed_at", "raw_artifact_id",
 )
-TIME_FIELDS = {"bar_time", "observed_at"}
+TIME_FIELDS = {"bar_time", "observed_at", "factor_as_of"}
 NUMBER_FIELDS = {
     "open", "high", "low", "close", "raw_close", "adjustment_factor",
-    "volume", "amount",
+    "corporate_action_factor", "applied_adjustment_multiplier",
+    "reference_factor", "volume", "amount",
 }
 
 
