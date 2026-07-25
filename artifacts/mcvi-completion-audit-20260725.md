@@ -34,7 +34,7 @@ Authoritative scope: Plane project `MCVI`, parent `MCVI-1`, stages 1–11.
 
 ## Stage 11 evidence
 
-- Full suite: `Ran 423 tests ... OK (skipped=19)`.
+- Full suite: `Ran 425 tests ... OK (skipped=19)`.
 - Static gate: `ruff check src tests` passed.
 - JSON contract parses successfully.
 - Fault tests cover invalid rows, duplicate file/archive, bounded-memory scale,
@@ -42,6 +42,8 @@ Authoritative scope: Plane project `MCVI`, parent `MCVI-1`, stages 1–11.
   partial writes, cancellation, canonical failure and retry.
 - Runbook: `docs/csv-import-recovery-runbook.md`.
 - Release checklist: `docs/csv-import-release-gate.md`.
+- CLI `--evidence-output` creates a create-only, fsync'd, path-redacted
+  `marketcow.csv-import-smoke-evidence.v1` artifact without CSV contents.
 
 ## Remaining external evidence
 
