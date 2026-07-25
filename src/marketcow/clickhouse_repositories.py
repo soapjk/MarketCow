@@ -750,7 +750,22 @@ class ClickHouseMarketBarRepository:
             SELECT count() AS raw_rows,
                    countIf(c.symbol != '') AS canonical_rows,
                    min(toUnixTimestamp64Milli(r.bar_time)) AS first_bar_at_ms,
-                   max(toUnixTimestamp64Milli(r.bar_time)) AS last_bar_at_ms
+                   max(toUnixTimestamp64Milli(r.bar_time)) AS last_bar_at_ms,
+                   countIf(
+                       c.symbol != '' AND (
+                           NOT isFinite(c.open) OR NOT isFinite(c.high)
+                           OR NOT isFinite(c.low) OR NOT isFinite(c.close)
+                           OR c.open <= 0 OR c.high <= 0 OR c.low <= 0
+                           OR c.close <= 0 OR c.volume < 0
+                           OR c.low > least(c.open,c.close)
+                           OR c.high < greatest(c.open,c.close)
+                           OR c.low > c.high
+                       )
+                   ) AS canonical_invalid_ohlc_rows,
+                   countIf(
+                       c.symbol != '' AND c.low > 0
+                       AND c.high / c.low >= 100
+                   ) AS canonical_abnormal_price_rows
             FROM (
                 SELECT DISTINCT symbol,interval,adjustment,bar_time
                 FROM market_bar_raw FINAL
@@ -769,7 +784,59 @@ class ClickHouseMarketBarRepository:
             "canonical_rows": int(row[1] or 0),
             "first_bar_at_ms": None if row[2] is None else int(row[2]),
             "last_bar_at_ms": None if row[3] is None else int(row[3]),
+            "canonical_invalid_ohlc_rows": (
+                int(row[4] or 0) if len(row) > 4 else 0
+            ),
+            "canonical_abnormal_price_rows": (
+                int(row[5] or 0) if len(row) > 5 else 0
+            ),
         }
+
+    def get_canonical_ingestion_quality(
+        self, ingestion_ids: Sequence[str]
+    ) -> List[Dict[str, Any]]:
+        normalized = sorted({
+            str(value).strip() for value in ingestion_ids if str(value).strip()
+        })
+        if not normalized or len(normalized) > 10000:
+            raise ValueError(
+                "ingestion_ids must contain between 1 and 10000 values"
+            )
+        result = self._query(
+            """
+            SELECT r.ingestion_id,
+                   count() AS raw_rows,
+                   countIf(c.symbol != '') AS canonical_rows,
+                   countIf(
+                       c.symbol != '' AND (
+                           NOT isFinite(c.open) OR NOT isFinite(c.high)
+                           OR NOT isFinite(c.low) OR NOT isFinite(c.close)
+                           OR c.open <= 0 OR c.high <= 0 OR c.low <= 0
+                           OR c.close <= 0 OR c.volume < 0
+                           OR c.low > least(c.open,c.close)
+                           OR c.high < greatest(c.open,c.close)
+                           OR c.low > c.high
+                       )
+                   ) AS canonical_invalid_ohlc_rows
+            FROM (
+                SELECT DISTINCT ingestion_id,symbol,interval,adjustment,bar_time
+                FROM market_bar_raw FINAL
+                WHERE ingestion_id IN {ingestion_ids:Array(String)}
+            ) r
+            LEFT JOIN market_bar_canonical FINAL c
+              ON c.symbol=r.symbol AND c.interval=r.interval
+             AND c.adjustment=r.adjustment AND c.bar_time=r.bar_time
+            GROUP BY r.ingestion_id
+            ORDER BY r.ingestion_id
+            """,
+            {"ingestion_ids": normalized},
+        )
+        return [{
+            "ingestion_id": str(row[0]),
+            "raw_rows": int(row[1] or 0),
+            "canonical_rows": int(row[2] or 0),
+            "canonical_invalid_ohlc_rows": int(row[3] or 0),
+        } for row in result.result_rows]
 
     # Direct MarketBarRepository contract. The canonical-prefixed methods remain as
     # compatibility entry points for pre-blue/green offline tooling.

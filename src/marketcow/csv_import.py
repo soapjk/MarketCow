@@ -5,8 +5,8 @@ import hashlib
 import sqlite3
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, time, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Iterator, Mapping, TextIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -25,6 +25,10 @@ SUPPORTED_INTERVALS = frozenset({
     "1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h",
     "1d", "5d", "1wk", "1mo", "3mo",
 })
+INTRADAY_INTERVAL_SECONDS = {
+    "1m": 60, "2m": 120, "5m": 300, "15m": 900, "30m": 1800,
+    "60m": 3600, "90m": 5400, "1h": 3600,
+}
 
 
 class CsvImportContractError(ValueError):
@@ -50,6 +54,15 @@ class CsvSchemaProfile:
     encoding: str = "utf-8-sig"
     delimiter: str = ","
     fixed_external_symbol: str | None = None
+    allow_extra_columns: bool = True
+    defaults: Mapping[str, str] = field(default_factory=dict)
+    price_multiplier: str = "1"
+    volume_multiplier: str = "1"
+    amount_multiplier: str = "1"
+    price_precision: int | None = None
+    volume_precision: int | None = None
+    amount_precision: int | None = None
+    trading_sessions: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         name = self.name.strip()
@@ -82,13 +95,54 @@ class CsvSchemaProfile:
             raise CsvImportContractError("profile source column names must not be empty")
         if len(set(normalized.values())) != len(normalized):
             raise CsvImportContractError("profile source columns must be unique")
+        defaults = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in self.defaults.items()
+        }
+        if set(defaults) - {"volume", "amount"}:
+            raise CsvImportContractError(
+                "profile defaults are only supported for volume and amount"
+            )
+        multipliers = {}
+        for field_name in (
+            "price_multiplier", "volume_multiplier", "amount_multiplier"
+        ):
+            try:
+                multiplier = Decimal(str(getattr(self, field_name)))
+            except InvalidOperation as exc:
+                raise CsvImportContractError(
+                    f"{field_name} must be a finite positive decimal"
+                ) from exc
+            if not multiplier.is_finite() or multiplier <= 0:
+                raise CsvImportContractError(
+                    f"{field_name} must be a finite positive decimal"
+                )
+            multipliers[field_name] = format(multiplier, "f")
+        for field_name in (
+            "price_precision", "volume_precision", "amount_precision"
+        ):
+            precision = getattr(self, field_name)
+            if precision is not None and (
+                not isinstance(precision, int) or precision < 0 or precision > 18
+            ):
+                raise CsvImportContractError(
+                    f"{field_name} must be an integer between 0 and 18"
+                )
         try:
-            ZoneInfo(self.timezone_name)
+            zone = ZoneInfo(self.timezone_name)
         except ZoneInfoNotFoundError as exc:
             raise CsvImportContractError("profile timezone is unknown") from exc
+        sessions = tuple(
+            _normalize_trading_session(value, zone)
+            for value in self.trading_sessions
+        )
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "version", version)
         object.__setattr__(self, "columns", normalized)
+        object.__setattr__(self, "defaults", defaults)
+        object.__setattr__(self, "trading_sessions", sessions)
+        for key, value in multipliers.items():
+            object.__setattr__(self, key, value)
 
     @property
     def identity(self) -> str:
@@ -146,6 +200,9 @@ class CsvImportRequest:
     adjustment: str
     profile: CsvSchemaProfile
     instruments: InstrumentMapping
+    created_by: str = "local-operator"
+    source_proof: str = "operator-declared"
+    retention_policy: str = "retain-until-explicit-deletion"
 
     def __post_init__(self) -> None:
         source = self.source.strip().lower()
@@ -155,6 +212,12 @@ class CsvImportRequest:
             raise CsvImportContractError("unsupported CSV bar interval")
         if self.adjustment not in {"raw", "adjusted"}:
             raise CsvImportContractError("adjustment must be raw or adjusted")
+        if not self.created_by.strip():
+            raise CsvImportContractError("created_by is required")
+        if not self.source_proof.strip():
+            raise CsvImportContractError("source_proof is required")
+        if not self.retention_policy.strip():
+            raise CsvImportContractError("retention_policy is required")
         object.__setattr__(self, "source", source)
 
     def as_dict(self) -> dict[str, Any]:
@@ -163,6 +226,9 @@ class CsvImportRequest:
             "source": self.source,
             "interval": self.interval,
             "adjustment": self.adjustment,
+            "created_by": self.created_by,
+            "source_proof": self.source_proof,
+            "retention_policy": self.retention_policy,
             "profile": {
                 "name": self.profile.name,
                 "version": self.profile.version,
@@ -172,6 +238,17 @@ class CsvImportRequest:
                 "encoding": self.profile.encoding,
                 "delimiter": self.profile.delimiter,
                 "fixed_external_symbol": self.profile.fixed_external_symbol,
+                "allow_extra_columns": self.profile.allow_extra_columns,
+                "defaults": dict(self.profile.defaults),
+                "price_multiplier": self.profile.price_multiplier,
+                "volume_multiplier": self.profile.volume_multiplier,
+                "amount_multiplier": self.profile.amount_multiplier,
+                "price_precision": self.profile.price_precision,
+                "volume_precision": self.profile.volume_precision,
+                "amount_precision": self.profile.amount_precision,
+                "trading_sessions": [
+                    dict(value) for value in self.profile.trading_sessions
+                ],
             },
             "instruments": {
                 "namespace": self.instruments.namespace,
@@ -181,6 +258,17 @@ class CsvImportRequest:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CsvImportRequest":
+        allowed = {
+            "contract_version", "source", "interval", "adjustment",
+            "created_by", "source_proof", "retention_policy",
+            "profile", "instruments",
+        }
+        unknown = set(value) - allowed
+        if unknown:
+            raise CsvImportContractError(
+                "CSV import declaration contains unknown fields: "
+                + ", ".join(sorted(unknown))
+            )
         if value.get("contract_version") != CSV_IMPORT_CONTRACT_VERSION:
             raise CsvImportContractError("unsupported CSV import contract version")
         profile = value.get("profile")
@@ -189,10 +277,31 @@ class CsvImportRequest:
             raise CsvImportContractError(
                 "CSV import profile and instruments are required"
             )
+        profile_allowed = {
+            field_name for field_name in CsvSchemaProfile.__dataclass_fields__
+        }
+        profile_unknown = set(profile) - profile_allowed
+        if profile_unknown:
+            raise CsvImportContractError(
+                "CSV profile contains unknown fields: "
+                + ", ".join(sorted(profile_unknown))
+            )
+        instrument_unknown = set(instruments) - {"namespace", "symbols"}
+        if instrument_unknown:
+            raise CsvImportContractError(
+                "CSV instrument mapping contains unknown fields: "
+                + ", ".join(sorted(instrument_unknown))
+            )
         return cls(
             source=str(value.get("source") or ""),
             interval=str(value.get("interval") or ""),
             adjustment=str(value.get("adjustment") or ""),
+            created_by=str(value.get("created_by") or "local-operator"),
+            source_proof=str(value.get("source_proof") or "operator-declared"),
+            retention_policy=str(
+                value.get("retention_policy")
+                or "retain-until-explicit-deletion"
+            ),
             profile=CsvSchemaProfile(**dict(profile)),
             instruments=InstrumentMapping(
                 str(instruments.get("namespace") or ""),
@@ -206,6 +315,35 @@ class ParsedCsvBar:
     line_number: int
     instrument_id: str
     bar: Mapping[str, Any]
+
+
+def _normalize_trading_session(
+    value: Mapping[str, Any], zone: ZoneInfo
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise CsvImportContractError("trading session must be an object")
+    try:
+        start = time.fromisoformat(str(value["start"]))
+        end = time.fromisoformat(str(value["end"]))
+        weekdays = tuple(sorted({int(day) for day in value["weekdays"]}))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CsvImportContractError(
+            "trading session requires start, end and weekdays"
+        ) from exc
+    if start.tzinfo is not None or end.tzinfo is not None or start >= end:
+        raise CsvImportContractError(
+            "trading session start/end must be increasing local times"
+        )
+    if not weekdays or any(day < 0 or day > 6 for day in weekdays):
+        raise CsvImportContractError(
+            "trading session weekdays must contain values from 0 through 6"
+        )
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "weekdays": list(weekdays),
+        "timezone": zone.key,
+    }
 
 
 def _decimal(raw: Any, field_name: str, *, required: bool) -> Decimal | None:
@@ -267,7 +405,42 @@ def _source_value(
     row: Mapping[str, Any], profile: CsvSchemaProfile, field_name: str
 ) -> Any:
     source_name = profile.columns.get(field_name)
-    return None if source_name is None else row.get(source_name)
+    value = None if source_name is None else row.get(source_name)
+    if (value is None or str(value).strip() == "") and field_name in profile.defaults:
+        return profile.defaults[field_name]
+    return value
+
+
+def _scaled(
+    value: Decimal | None, multiplier: str, precision: int | None
+) -> Decimal | None:
+    if value is None:
+        return None
+    scaled = value * Decimal(multiplier)
+    if precision is not None:
+        scaled = scaled.quantize(
+            Decimal(1).scaleb(-precision), rounding=ROUND_HALF_EVEN
+        )
+    return scaled
+
+
+def _validate_trading_session(
+    observed: datetime, profile: CsvSchemaProfile
+) -> None:
+    if not profile.trading_sessions:
+        return
+    local = observed.astimezone(ZoneInfo(profile.timezone_name))
+    local_time = local.timetz().replace(tzinfo=None)
+    if not any(
+        local.weekday() in session["weekdays"]
+        and time.fromisoformat(session["start"]) <= local_time
+        < time.fromisoformat(session["end"])
+        for session in profile.trading_sessions
+    ):
+        raise CsvRowError(
+            "outside_trading_session",
+            "timestamp is outside the configured trading sessions",
+        )
 
 
 def _parse_row(
@@ -281,8 +454,13 @@ def _parse_row(
     )
     instrument_id = request.instruments.resolve(str(external_symbol or ""))
     observed = _timestamp(_source_value(row, profile, "timestamp"), profile)
+    _validate_trading_session(observed, profile)
     prices = {
-        name: _decimal(_source_value(row, profile, name), name, required=True)
+        name: _scaled(
+            _decimal(_source_value(row, profile, name), name, required=True),
+            profile.price_multiplier,
+            profile.price_precision,
+        )
         for name in ("open", "high", "low", "close")
     }
     open_, high, low, close = (
@@ -296,11 +474,19 @@ def _parse_row(
             "ohlc_inconsistent",
             "OHLC must satisfy low <= open/close <= high",
         )
-    volume = _decimal(
-        _source_value(row, profile, "volume"), "volume", required=False
+    volume = _scaled(
+        _decimal(
+            _source_value(row, profile, "volume"), "volume", required=False
+        ),
+        profile.volume_multiplier,
+        profile.volume_precision,
     )
-    amount = _decimal(
-        _source_value(row, profile, "amount"), "amount", required=False
+    amount = _scaled(
+        _decimal(
+            _source_value(row, profile, "amount"), "amount", required=False
+        ),
+        profile.amount_multiplier,
+        profile.amount_precision,
     )
     if volume is not None and volume < 0:
         raise CsvRowError("volume_negative", "volume must not be negative")
@@ -344,6 +530,12 @@ def _validate_header(
         raise CsvImportContractError(
             "CSV is missing source columns: " + ", ".join(sorted(missing))
         )
+    unexpected = actual - expected
+    if unexpected and not profile.allow_extra_columns:
+        raise CsvImportContractError(
+            "CSV contains unexpected source columns: "
+            + ", ".join(sorted(unexpected))
+        )
 
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -366,10 +558,13 @@ def dry_run_csv(
     if max_error_samples < 0:
         raise ValueError("max_error_samples must not be negative")
     rows_total = rows_valid = rows_invalid = duplicate_rows = 0
+    abnormal_price_rows = 0
     errors: list[dict[str, Any]] = []
     instruments: dict[str, dict[str, Any]] = {}
     last_timestamp: dict[str, datetime] = {}
     unordered_rows = 0
+    gap_count = 0
+    gap_samples: list[dict[str, Any]] = []
     error_counts: dict[str, int] = {}
     with tempfile.TemporaryDirectory(prefix="marketcow-csv-dry-run-") as folder:
         database = sqlite3.connect(str(Path(folder) / "keys.sqlite3"))
@@ -420,6 +615,11 @@ def dry_run_csv(
                             })
                         continue
                     observed = datetime.fromisoformat(bar_at)
+                    if (
+                        float(parsed.bar["high"]) / float(parsed.bar["low"])
+                        >= 100
+                    ):
+                        abnormal_price_rows += 1
                     previous = last_timestamp.get(parsed.instrument_id)
                     if previous is not None and observed < previous:
                         unordered_rows += 1
@@ -431,6 +631,35 @@ def dry_run_csv(
                     summary["rows"] += 1
                     summary["first_bar_at"] = min(summary["first_bar_at"], bar_at)
                     summary["last_bar_at"] = max(summary["last_bar_at"], bar_at)
+            interval_seconds = INTRADAY_INTERVAL_SECONDS.get(request.interval)
+            if interval_seconds is not None:
+                previous_key: tuple[str, datetime] | None = None
+                for instrument_id, bar_at in database.execute(
+                    "SELECT instrument_id, bar_at FROM bar_key "
+                    "ORDER BY instrument_id, bar_at"
+                ):
+                    observed = datetime.fromisoformat(bar_at)
+                    if (
+                        previous_key is not None
+                        and previous_key[0] == instrument_id
+                        and observed.date() == previous_key[1].date()
+                        and (
+                            observed - previous_key[1]
+                        ).total_seconds() > interval_seconds
+                    ):
+                        gap_count += 1
+                        if len(gap_samples) < max_error_samples:
+                            gap_samples.append({
+                                "instrument_id": instrument_id,
+                                "after": previous_key[1].isoformat(),
+                                "before": observed.isoformat(),
+                                "missing_intervals": int(
+                                    (
+                                        observed - previous_key[1]
+                                    ).total_seconds() // interval_seconds
+                                ) - 1,
+                            })
+                    previous_key = (instrument_id, observed)
         finally:
             database.close()
     return {
@@ -452,6 +681,28 @@ def dry_run_csv(
         "rows_invalid": rows_invalid,
         "duplicate_rows": duplicate_rows,
         "unordered_rows": unordered_rows,
+        "gap_count": gap_count,
+        "abnormal_price_rows": abnormal_price_rows,
+        "gap_samples": gap_samples,
+        "warnings": (
+            [{
+                "code": "intraday_gaps_detected",
+                "count": gap_count,
+                "policy": "warning",
+            }] if gap_count else []
+        ) + (
+            [{
+                "code": "abnormal_intrabar_price_ratio",
+                "count": abnormal_price_rows,
+                "threshold": 100,
+                "policy": "warning",
+            }] if abnormal_price_rows else []
+        ) + (
+            [] if request.profile.trading_sessions else [{
+                "code": "trading_calendar_not_configured",
+                "policy": "warning",
+            }]
+        ),
         "error_counts": dict(sorted(error_counts.items())),
         "error_samples": errors,
         "errors_truncated": rows_invalid > len(errors),

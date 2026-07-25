@@ -87,7 +87,24 @@ class CsvImportJobManager:
         if job is None:
             return None
         shards = self.repository.list_csv_import_shards(job_id)
-        return {**job, "shards": shards}
+        rows_read = sum(int(row.get("rows_read") or 0) for row in shards)
+        rows_written = sum(int(row.get("rows_written") or 0) for row in shards)
+        completed = sum(
+            1 for row in shards if row["status"] in TERMINAL_CSV_IMPORT_SHARDS
+        )
+        return {
+            **job,
+            "rows_read": max(int(job.get("rows_read") or 0), rows_read),
+            "rows_written": max(int(job.get("rows_written") or 0), rows_written),
+            "completed_shards": completed,
+            "total_shards": len(shards),
+            "progress_percent": (
+                100 if not shards and job["status"] == "succeeded"
+                else round(100 * completed / len(shards), 2) if shards
+                else 0
+            ),
+            "shards": shards,
+        }
 
     def cancel(self, job_id: str) -> dict[str, Any] | None:
         return self.repository.request_cancel_csv_import_job(job_id, _now())

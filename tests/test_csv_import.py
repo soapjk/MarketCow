@@ -163,6 +163,76 @@ class CsvImportContractTest(unittest.TestCase):
         broken["contract_version"] = "future"
         with self.assertRaisesRegex(CsvImportContractError, "contract version"):
             CsvImportRequest.from_dict(broken)
+        unknown = original.as_dict()
+        unknown["guess_us_venue"] = True
+        with self.assertRaisesRegex(CsvImportContractError, "unknown fields"):
+            CsvImportRequest.from_dict(unknown)
+
+    def test_profile_scales_rounds_defaults_and_enforces_sessions(self):
+        import io
+
+        configured = profile(
+            defaults={"volume": "25"},
+            price_multiplier="0.01",
+            volume_multiplier="100",
+            price_precision=2,
+            volume_precision=0,
+            trading_sessions=({
+                "start": "09:30",
+                "end": "16:00",
+                "weekdays": [0, 1, 2, 3, 4],
+            },),
+        )
+        body = (
+            "ticker,datetime,o,h,l,c,v\n"
+            "AAPL.US,2026-07-24 09:30:00,10001,10100,9900,10055,\n"
+        )
+        row = list(iter_csv_bars(
+            io.StringIO(body), request(profile=configured)
+        ))[0]
+        self.assertEqual(row.bar["open"], 100.01)
+        self.assertEqual(row.bar["close"], 100.55)
+        self.assertEqual(row.bar["volume"], 2500.0)
+
+        outside = body.replace("09:30:00", "08:30:00")
+        with self.assertRaises(CsvRowError) as raised:
+            list(iter_csv_bars(
+                io.StringIO(outside), request(profile=configured)
+            ))
+        self.assertEqual(raised.exception.code, "outside_trading_session")
+
+    def test_profile_can_reject_unknown_source_columns_before_rows(self):
+        import io
+
+        strict = profile(allow_extra_columns=False)
+        with self.assertRaisesRegex(
+            CsvImportContractError, "unexpected source columns"
+        ):
+            list(iter_csv_bars(
+                io.StringIO(
+                    "ticker,datetime,o,h,l,c,v,vendor_magic\n"
+                    "AAPL.US,2026-01-02 09:30:00,1,2,1,2,3,x\n"
+                ),
+                request(profile=strict),
+            ))
+
+    def test_dry_run_reports_intraday_gaps_as_explicit_warnings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "gaps.csv"
+            path.write_text(
+                "ticker,datetime,o,h,l,c,v\n"
+                "AAPL.US,2026-07-24 09:30:00,1,2,1,2,3\n"
+                "AAPL.US,2026-07-24 09:32:00,1,2,1,2,3\n",
+                encoding="utf-8",
+            )
+            report = dry_run_csv(path, request())
+        self.assertEqual(report["status"], "valid")
+        self.assertEqual(report["gap_count"], 1)
+        self.assertEqual(report["gap_samples"][0]["missing_intervals"], 1)
+        self.assertIn(
+            "intraday_gaps_detected",
+            {warning["code"] for warning in report["warnings"]},
+        )
 
 
 if __name__ == "__main__":

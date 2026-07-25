@@ -23,14 +23,31 @@ class CsvImports:
         self.calls.append(("create", path, declaration, kwargs))
         return {"job_id": "job", "status": "queued"}, True
 
-    def list(self, limit):
-        return [{"job_id": "job", "status": "running"}]
+    def list(self, limit, manifest_id=""):
+        return [{
+            "job_id": "job", "status": "running",
+            "storage_path": "/secret/archive.csv",
+            "request_json": {"private": True},
+        }]
 
     def get(self, job_id):
         return {"job_id": job_id, "status": "running"}
 
     def cancel(self, job_id):
         return {"job_id": job_id, "status": "cancel_requested"}
+
+    def retry(self, job_id, **kwargs):
+        self.calls.append(("retry", job_id, kwargs))
+        return {"job_id": "retry", "status": "queued"}, True
+
+    def manifest(self, job_id):
+        return {"manifest_id": "manifest", "job_id": job_id}
+
+    def quality_report(self, job_id):
+        return {"job_id": job_id, "status": "passed"}
+
+    def errors(self, job_id):
+        return [{"shard_index": 1, "error_code": "write_failed"}]
 
 
 def declaration():
@@ -86,11 +103,38 @@ class CsvImportApiTest(unittest.TestCase):
         self.assertEqual(
             self.client.get("/v1/admin/csv-imports").json()["count"], 1
         )
+        self.assertNotIn(
+            "storage_path",
+            self.client.get("/v1/admin/csv-imports").json()["items"][0],
+        )
         self.assertEqual(
             self.client.get("/v1/admin/csv-imports/job").json()["job_id"], "job"
         )
         canceled = self.client.post("/v1/admin/csv-imports/job/cancel")
         self.assertEqual(canceled.json()["status"], "cancel_requested")
+        retried = self.client.post(
+            "/v1/admin/csv-imports/job/retry",
+            json={"idempotency_key": "vendor-retry-1"},
+        )
+        self.assertTrue(retried.json()["created"])
+        self.assertEqual(
+            self.client.get(
+                "/v1/admin/csv-imports/job/manifest"
+            ).json()["manifest_id"],
+            "manifest",
+        )
+        self.assertEqual(
+            self.client.get(
+                "/v1/admin/csv-imports/job/quality-report"
+            ).json()["status"],
+            "passed",
+        )
+        self.assertEqual(
+            self.client.get(
+                "/v1/admin/csv-imports/job/errors"
+            ).json()["count"],
+            1,
+        )
         self.assertEqual(self.imports.calls[0][0], "dry")
         self.assertEqual(self.imports.calls[1][0], "create")
 
@@ -100,6 +144,8 @@ class CsvImportApiTest(unittest.TestCase):
         self.assertIn("Dry-run", response.text)
         self.assertIn("Start import", response.text)
         self.assertIn("cancelJob", response.text)
+        self.assertIn("retryJob", response.text)
+        self.assertIn("Manifest", response.text)
         self.assertIn("setInterval(load,2000)", response.text)
 
     def test_us_mapping_is_not_inferred_by_api_model(self):

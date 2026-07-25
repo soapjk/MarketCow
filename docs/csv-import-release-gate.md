@@ -1,19 +1,27 @@
 # CSV 历史行情导入发布门禁
 
-- [ ] CSV 契约与 Profile 版本固定，未知字段和缺列测试通过。
-- [ ] 所有供应商 symbol 均有显式 namespace 映射；US MIC 不推断。
-- [ ] dry-run 对坏时间、NaN/Inf、OHLC、负 volume、重复和乱序有稳定报告。
-- [ ] 大文件流式测试证明内存有界，错误样本数量有上限。
-- [ ] 原始 CSV 哈希归档和 Manifest 去重测试通过。
-- [ ] job/shard 幂等创建、租约 fencing、心跳、有限重试和取消测试通过。
-- [ ] 服务崩溃后的过期 running shard 能接管。
-- [ ] 相同 ingestion ID 重放不产生重复 raw bars。
-- [ ] raw receipt 的行数和 artifact 与 Manifest 一致。
-- [ ] 每个导入 raw key 均存在 canonical key，质量失败不得进入 succeeded。
-- [ ] CLI dry-run/正式导入与管理 API 使用同一服务层。
-- [ ] 管理页面可 dry-run、启动、查看实时状态和取消。
-- [ ] 路径穿越及 allowed-root 外文件被拒绝。
-- [ ] 全量单元测试与 Ruff 通过。
+- [x] CSV 契约与 Profile 版本固定，未知字段和缺列测试通过。
+- [x] 所有供应商 symbol 均有显式 namespace 映射；US MIC 不推断。
+- [x] dry-run 对坏时间、DST、NaN/Inf、OHLC、负 volume、重复、乱序、缺口和交易时段有稳定报告。
+- [x] 大文件流式测试证明内存有界，错误样本数量有上限。
+- [x] 原始 CSV 哈希归档和 Manifest 去重测试通过。
+- [x] job/shard 幂等创建、租约 fencing、心跳、有限重试和取消测试通过。
+- [x] 服务崩溃后的过期 running shard 能接管。
+- [x] 相同 ingestion ID 重放不产生重复 raw bars。
+- [x] raw receipt 的行数和 artifact 与 Manifest 一致。
+- [x] 每个导入 raw key 均存在 canonical key，质量失败不得进入 succeeded。
+- [x] CLI dry-run/正式导入与管理 API 使用同一服务层。
+- [x] 管理页面可 dry-run、启动、查看实时状态、证据、取消和重试。
+- [x] 路径穿越、allowed-root 外文件和超出大小限制的文件被拒绝。
+- [x] 全量单元测试与 Ruff 通过。
 - [ ] 使用获授权的真实供应商样本完成生产前 smoke test。
 
 最后一项需要操作者提供获授权的数据文件；测试仓库不得提交购买数据。
+
+百万行门禁证据（2026-07-25，本地合成 1 分钟数据）：
+
+- 1,000,000 行全部有效，0 重复、0 乱序、0 缺口；
+- 49,000,026 bytes；
+- dry-run 6.523 秒；
+- `time -l` maximum resident set size 27,688,960 bytes，peak memory footprint
+  17,727,896 bytes。

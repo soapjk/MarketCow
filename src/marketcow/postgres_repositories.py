@@ -949,8 +949,16 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 "SELECT * FROM csv_import_job WHERE job_id=%s", (job_id,)
             ).fetchone()
 
-    def list_csv_import_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def list_csv_import_jobs(
+        self, limit: int = 50, manifest_id: str = ""
+    ) -> List[Dict[str, Any]]:
         with self.database.connection() as connection:
+            if manifest_id:
+                return list(connection.execute(
+                    "SELECT * FROM csv_import_job WHERE manifest_id=%s "
+                    "ORDER BY updated_at DESC LIMIT %s",
+                    (manifest_id, limit),
+                ).fetchall())
             return list(connection.execute(
                 "SELECT * FROM csv_import_job ORDER BY updated_at DESC LIMIT %s",
                 (limit,),
@@ -1065,6 +1073,7 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                     started_at=COALESCE(started_at,%s),updated_at=%s,
                     finished_at=%s
                 WHERE job_id=%s
+                  AND status NOT IN ('succeeded','failed','canceled')
                 RETURNING *
                 """,
                 (

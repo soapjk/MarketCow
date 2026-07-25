@@ -87,6 +87,7 @@ class Settings:
     dividend_zero_policy_evidence: tuple[dict[str, object], ...] = ()
     history_job_max_workers: int = 4
     history_job_lease_seconds: float = 30.0
+    csv_import_max_file_bytes: int = 107374182400
     hyperliquid_base_url: str = "https://api.hyperliquid.xyz"
     hyperliquid_timeout_seconds: float = 3.0
     hyperliquid_request_budget_seconds: float = 10.0
@@ -248,6 +249,9 @@ class Settings:
             history_job_lease_seconds=max(1.0, min(300.0, float(os.getenv(
                 "MARKETCOW_HISTORY_JOB_LEASE_SECONDS", "30"
             )))),
+            csv_import_max_file_bytes=max(1, int(os.getenv(
+                "MARKETCOW_CSV_IMPORT_MAX_FILE_BYTES", "107374182400"
+            ))),
             hyperliquid_base_url=os.getenv(
                 "MARKETCOW_HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"
             ).rstrip("/"),

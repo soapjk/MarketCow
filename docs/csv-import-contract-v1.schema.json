@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marketcow.local/contracts/csv-import-v1.schema.json",
+  "title": "MarketCow CSV bars import declaration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version", "source", "interval", "adjustment",
+    "profile", "instruments"
+  ],
+  "properties": {
+    "contract_version": {"const": "marketcow.csv-bars.v1"},
+    "source": {"type": "string", "minLength": 1},
+    "interval": {
+      "enum": [
+        "1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h",
+        "1d", "5d", "1wk", "1mo", "3mo"
+      ]
+    },
+    "adjustment": {"enum": ["raw", "adjusted"]},
+    "created_by": {"type": "string", "minLength": 1},
+    "source_proof": {"type": "string", "minLength": 1},
+    "retention_policy": {"type": "string", "minLength": 1},
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "columns", "timezone_name"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "columns": {
+          "type": "object",
+          "propertyNames": {
+            "enum": [
+              "symbol", "timestamp", "open", "high", "low", "close",
+              "volume", "amount"
+            ]
+          },
+          "additionalProperties": {"type": "string", "minLength": 1},
+          "required": ["timestamp", "open", "high", "low", "close"]
+        },
+        "timezone_name": {"type": "string", "minLength": 1},
+        "timestamp_format": {"type": "string", "default": "iso8601"},
+        "encoding": {"type": "string", "default": "utf-8-sig"},
+        "delimiter": {"type": "string", "minLength": 1, "maxLength": 1},
+        "fixed_external_symbol": {"type": ["string", "null"]},
+        "allow_extra_columns": {"type": "boolean", "default": true},
+        "defaults": {
+          "type": "object",
+          "propertyNames": {"enum": ["volume", "amount"]},
+          "additionalProperties": {"type": "string"}
+        },
+        "price_multiplier": {"type": "string", "default": "1"},
+        "volume_multiplier": {"type": "string", "default": "1"},
+        "amount_multiplier": {"type": "string", "default": "1"},
+        "price_precision": {"type": ["integer", "null"], "minimum": 0, "maximum": 18},
+        "volume_precision": {"type": ["integer", "null"], "minimum": 0, "maximum": 18},
+        "amount_precision": {"type": ["integer", "null"], "minimum": 0, "maximum": 18},
+        "trading_sessions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["start", "end", "weekdays"],
+            "properties": {
+              "start": {"type": "string", "format": "time"},
+              "end": {"type": "string", "format": "time"},
+              "weekdays": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {"type": "integer", "minimum": 0, "maximum": 6}
+              }
+            }
+          }
+        }
+      },
+      "anyOf": [
+        {"properties": {"columns": {"required": ["symbol"]}}},
+        {"required": ["fixed_external_symbol"]}
+      ]
+    },
+    "instruments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "symbols"],
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "pattern": "^(provider|broker):[^:]+$"
+        },
+        "symbols": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[^.]+\\.[A-Z0-9]{4}$"
+          }
+        }
+      }
+    }
+  }
+}

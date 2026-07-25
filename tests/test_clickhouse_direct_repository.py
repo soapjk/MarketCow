@@ -209,7 +209,7 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
 
     def test_canonical_ingestion_coverage_joins_exact_raw_keys(self):
         class Result:
-            result_rows = [[3, 3, 1000, 3000]]
+            result_rows = [[3, 3, 1000, 3000, 1, 2]]
 
         calls = []
         repository = object.__new__(ClickHouseMarketBarRepository)
@@ -223,9 +223,27 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
             "ingestion_ids": ["a", "b"], "raw_rows": 3,
             "canonical_rows": 3, "first_bar_at_ms": 1000,
             "last_bar_at_ms": 3000,
+            "canonical_invalid_ohlc_rows": 1,
+            "canonical_abnormal_price_rows": 2,
         })
         self.assertIn("SELECT DISTINCT symbol,interval,adjustment,bar_time", calls[0][0])
         self.assertEqual(calls[0][1], {"ingestion_ids": ["a", "b"]})
+
+    def test_canonical_ingestion_quality_is_grouped_for_shard_diagnostics(self):
+        class Result:
+            result_rows = [["a", 2, 1, 1], ["b", 1, 1, 0]]
+
+        calls = []
+        repository = object.__new__(ClickHouseMarketBarRepository)
+        repository._query = lambda statement, parameters: (
+            calls.append((statement, parameters)) or Result()
+        )
+        result = repository.get_canonical_ingestion_quality(["b", "a"])
+        self.assertEqual(result[0], {
+            "ingestion_id": "a", "raw_rows": 2, "canonical_rows": 1,
+            "canonical_invalid_ohlc_rows": 1,
+        })
+        self.assertIn("GROUP BY r.ingestion_id", calls[0][0])
 
     def test_canonical_json_normalizes_bytes_decimal_and_datetime(self):
         timestamp = datetime(2026, 7, 23, 1, 2, 3, 456000, timezone.utc)

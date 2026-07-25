@@ -24,8 +24,9 @@
 ## ClickHouse 或 WAL 暂不可用
 
 写入未同时满足 acknowledged/verified 时分片不会成功。系统在 `max_attempts`
-范围内重试；耗尽后任务失败。恢复存储后使用相同 idempotency key 读取原任务，
-不要复制 CSV 或更换映射来伪造新任务。
+范围内重试；耗尽后任务失败。恢复存储后调用
+`POST /v1/admin/csv-imports/{job_id}/retry` 并提供新的请求幂等键。重试任务复用
+原 Manifest、归档文件和稳定 ingestion ID；不要复制 CSV 或更换映射来伪造新任务。
 
 ## canonical 质量失败
 
@@ -36,6 +37,8 @@
 - `raw_artifact_mismatch`
 - `raw_coverage_mismatch`
 - `canonical_coverage_incomplete`
+- `manifest_row_count_mismatch`
+- `first_bar_at_mismatch` / `last_bar_at_mismatch`
 
 先修复 canonical scheduler/构建器，再使用原始 Manifest 和稳定 ingestion ID
 重新执行受影响范围。不得直接把 job 状态改为 succeeded。
@@ -45,3 +48,7 @@
 归档路径为 `storage/csv-imports/<hash-prefix>/<manifest-id>.csv`。文件名由 Manifest
 内容哈希决定，写入采用临时文件、fsync、哈希复核和原子 rename。不要修改归档
 文件；若哈希冲突，隔离文件并重新从供应商原件导入。
+
+默认保留策略禁止自动清理。需要清理时，先确认所有引用该 Manifest 的任务已进入
+终态，导出 Manifest 与质量报告，记录审批凭据，再删除归档；数据库中的审计记录和
+文件哈希必须继续保留。API 响应不会泄露上述服务器路径。

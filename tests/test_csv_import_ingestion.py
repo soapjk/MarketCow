@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import unittest
+from dataclasses import replace
 
 from marketcow.csv_import import (
     CsvImportRequest,
@@ -48,6 +49,10 @@ def declarations():
         adjustment="raw", instrument_mappings={
             "AAPL.US": "AAPL.XNAS", "IBM.US": "IBM.XNYS",
         },
+        first_bar_at=None, last_bar_at=None,
+        created_at="2026-01-01T00:00:00+00:00",
+        created_by="test", source_proof="fixture",
+        retention_policy="retain-until-explicit-deletion",
     )
     return request, manifest
 
@@ -113,6 +118,69 @@ class CsvShardImporterTest(unittest.TestCase):
                 ingested_at="2026-01-02T00:00:00Z",
                 should_cancel=lambda: True,
             )
+
+    def test_partial_multi_instrument_retry_reuses_stable_ingestion_ids(self):
+        class PartiallyFailingBars:
+            def __init__(self):
+                self.rows = {}
+                self.failed_once = False
+
+            def upsert_price_bars(self, *args):
+                ingestion_id = args[6]["ingestion_id"]
+                self.rows[ingestion_id] = list(args[5])
+                if args[0] == "IBM.XNYS" and not self.failed_once:
+                    self.failed_once = True
+                    raise ConnectionError("ClickHouse temporarily unavailable")
+                return len(args[5])
+
+        body = (
+            "symbol,time,open,high,low,close,volume\n"
+            "AAPL.US,2026-01-01T14:30:00Z,1,2,0.5,1.5,10\n"
+            "IBM.US,2026-01-01T14:30:00Z,3,4,2,3.5,20\n"
+        )
+        request, manifest = declarations()
+        bars = PartiallyFailingBars()
+        importer = CsvShardImporter(bars)
+        arguments = (
+            request,
+            manifest,
+            {"row_start": 0, "row_end": 2, "ingestion_id": "stable-shard"},
+        )
+        with self.assertRaises(ConnectionError):
+            importer.import_shard(
+                io.StringIO(body), *arguments,
+                raw_artifact_id="artifact",
+                ingested_at="2026-01-02T00:00:00Z",
+            )
+        result = importer.import_shard(
+            io.StringIO(body), *arguments,
+            raw_artifact_id="artifact",
+            ingested_at="2026-01-03T00:00:00Z",
+        )
+        self.assertEqual(result["rows_written"], 2)
+        self.assertEqual(len(bars.rows), 2)
+
+    def test_vendor_adjusted_bars_preserve_explicit_adjustment_semantics(self):
+        request, manifest = declarations()
+        request = replace(request, adjustment="adjusted")
+        manifest = replace(manifest, adjustment="adjusted")
+        bars = Bars()
+        CsvShardImporter(bars).import_shard(
+            io.StringIO(
+                "symbol,time,open,high,low,close,volume\n"
+                "AAPL.US,2020-08-31T13:30:00Z,125,130,123,129,1000\n"
+            ),
+            request,
+            manifest,
+            {"row_start": 0, "row_end": 1, "ingestion_id": "split-adjusted"},
+            raw_artifact_id="vendor-adjusted-artifact",
+            ingested_at="2026-01-02T00:00:00Z",
+        )
+        self.assertEqual(bars.calls[0][2], "adjusted")
+        self.assertEqual(
+            bars.calls[0][6]["raw_artifact_id"],
+            "vendor-adjusted-artifact",
+        )
 
 
 if __name__ == "__main__":

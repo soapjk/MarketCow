@@ -45,7 +45,8 @@ class CsvImportManifestTest(unittest.TestCase):
             first = CsvImportManifest.create(path, request())
             second = CsvImportManifest.create(path, request())
 
-        self.assertEqual(first, second)
+        self.assertEqual(first.manifest_id, second.manifest_id)
+        self.assertEqual(first.file_sha256, second.file_sha256)
         shards = plan_csv_shards(first, 2501, 1000)
         self.assertEqual(
             [(row["row_start"], row["row_end"]) for row in shards],
@@ -62,6 +63,31 @@ class CsvImportManifestTest(unittest.TestCase):
             path.write_text("two")
             second = CsvImportManifest.create(path, request())
         self.assertNotEqual(first.manifest_id, second.manifest_id)
+
+    def test_manifest_records_time_range_operator_proof_and_retention(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "vendor.csv"
+            path.write_text("bytes")
+            declaration = request()
+            manifest = CsvImportManifest.create(path, declaration, {
+                "instruments": {
+                    "AAPL.XNAS": {
+                        "first_bar_at": "2026-01-02T14:30:00+00:00",
+                        "last_bar_at": "2026-01-02T21:00:00+00:00",
+                    }
+                }
+            })
+        self.assertEqual(
+            manifest.first_bar_at, "2026-01-02T14:30:00+00:00"
+        )
+        self.assertEqual(
+            manifest.last_bar_at, "2026-01-02T21:00:00+00:00"
+        )
+        self.assertEqual(manifest.created_by, "local-operator")
+        self.assertEqual(manifest.source_proof, "operator-declared")
+        self.assertEqual(
+            manifest.retention_policy, "retain-until-explicit-deletion"
+        )
 
     def test_archive_is_atomic_hash_verified_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as folder:

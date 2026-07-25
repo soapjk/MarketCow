@@ -6,6 +6,7 @@ import os
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,11 +27,33 @@ class CsvImportManifest:
     interval: str
     adjustment: str
     instrument_mappings: Mapping[str, str]
+    first_bar_at: str | None
+    last_bar_at: str | None
+    created_at: str
+    created_by: str
+    source_proof: str
+    retention_policy: str
 
     @classmethod
-    def create(cls, path: Path, request: CsvImportRequest) -> "CsvImportManifest":
+    def create(
+        cls,
+        path: Path,
+        request: CsvImportRequest,
+        dry_run_report: Mapping[str, Any] | None = None,
+    ) -> "CsvImportManifest":
         resolved = path.resolve(strict=True)
         mappings = dict(sorted(request.instruments.canonical_mappings.items()))
+        summaries = list(
+            (dry_run_report or {}).get("instruments", {}).values()
+        )
+        first_bar_at = min(
+            (str(value["first_bar_at"]) for value in summaries),
+            default=None,
+        )
+        last_bar_at = max(
+            (str(value["last_bar_at"]) for value in summaries),
+            default=None,
+        )
         identity = {
             "contract_version": CSV_IMPORT_CONTRACT_VERSION,
             "file_sha256": file_sha256(resolved),
@@ -40,6 +63,10 @@ class CsvImportManifest:
             "interval": request.interval,
             "adjustment": request.adjustment,
             "instrument_mappings": mappings,
+            "first_bar_at": first_bar_at,
+            "last_bar_at": last_bar_at,
+            "source_proof": request.source_proof,
+            "retention_policy": request.retention_policy,
         }
         manifest_id = hashlib.sha256(json.dumps(
             identity, sort_keys=True, separators=(",", ":")
@@ -57,6 +84,14 @@ class CsvImportManifest:
             interval=request.interval,
             adjustment=request.adjustment,
             instrument_mappings=mappings,
+            first_bar_at=first_bar_at,
+            last_bar_at=last_bar_at,
+            created_at=datetime.now(timezone.utc).isoformat(
+                timespec="microseconds"
+            ),
+            created_by=request.created_by,
+            source_proof=request.source_proof,
+            retention_policy=request.retention_policy,
         )
 
     def as_dict(self) -> dict[str, Any]:

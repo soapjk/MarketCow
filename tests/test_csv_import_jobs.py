@@ -37,6 +37,20 @@ class MemoryRepository:
                 if row["status"] in {"queued", "running", "cancel_requested"}
             ]
 
+    def list_csv_import_jobs(self, limit=50, manifest_id=""):
+        with self.lock:
+            rows = sorted(
+                self.jobs.values(),
+                key=lambda row: row["updated_at"],
+                reverse=True,
+            )
+            if manifest_id:
+                rows = [
+                    row for row in rows
+                    if row["manifest_id"] == manifest_id
+                ]
+            return copy.deepcopy(rows[:limit])
+
     def list_csv_import_shards(self, job_id):
         with self.lock:
             return [
@@ -214,6 +228,35 @@ class CsvImportJobManagerTest(unittest.TestCase):
                 row["status"] in {"succeeded", "canceled"}
                 for row in completed["shards"]
             ))
+        finally:
+            release.set()
+            manager.close()
+
+    def test_progress_is_monotonic_and_visible_after_each_durable_shard(self):
+        repository = MemoryRepository()
+        second_started = threading.Event()
+        release = threading.Event()
+
+        def importer(_job, shard):
+            if shard["shard_index"] == 1:
+                second_started.set()
+                release.wait(1)
+            return {"rows_read": 1, "rows_written": 1, "receipts": []}
+
+        manager = CsvImportJobManager(repository, importer, max_workers=1)
+        try:
+            job, _ = create(manager, "progress-key")
+            self.assertTrue(second_started.wait(1))
+            current = manager.get(job["job_id"])
+            self.assertEqual(current["completed_shards"], 1)
+            self.assertEqual(current["progress_percent"], 50)
+            self.assertEqual(current["rows_written"], 1)
+            release.set()
+            completed = wait_for(manager, job["job_id"], "succeeded")
+            self.assertEqual(completed["progress_percent"], 100)
+            self.assertGreaterEqual(
+                completed["rows_written"], current["rows_written"]
+            )
         finally:
             release.set()
             manager.close()

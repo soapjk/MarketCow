@@ -16,6 +16,7 @@ class CsvImportQualityVerifier:
         receipt_rows = []
         failures = []
         ingestion_ids = []
+        ingestion_shards = {}
         expected_rows = 0
         for shard in shards:
             receipt = shard.get("write_receipt_json") or {}
@@ -53,6 +54,7 @@ class CsvImportQualityVerifier:
                         "ingestion_id": ingestion_id,
                     })
                 ingestion_ids.append(ingestion_id)
+                ingestion_shards[ingestion_id] = shard.get("shard_index")
                 expected_rows += expected
                 receipt_rows.append(durable)
         if not ingestion_ids and int(job.get("rows_written") or 0) > 0:
@@ -82,6 +84,93 @@ class CsvImportQualityVerifier:
                 "raw_rows": 0, "canonical_rows": 0,
                 "first_bar_at_ms": None, "last_bar_at_ms": None,
             }
+        manifest = dict(job.get("request_json", {}).get("manifest") or {})
+        dry_run = dict(job.get("request_json", {}).get("dry_run_report") or {})
+        if dry_run:
+            if int(dry_run.get("rows_valid") or 0) != expected_rows:
+                failures.append({
+                    "code": "manifest_row_count_mismatch",
+                    "manifest_rows": int(dry_run.get("rows_valid") or 0),
+                    "receipt_rows": expected_rows,
+                })
+            for metric in ("rows_invalid", "duplicate_rows"):
+                if int(dry_run.get(metric) or 0):
+                    failures.append({
+                        "code": f"preimport_{metric}_nonzero",
+                        "actual": int(dry_run[metric]),
+                    })
+        if (
+            coverage.get("first_bar_at_ms") is not None
+            and manifest.get("first_bar_at") is not None
+            and manifest.get("last_bar_at") is not None
+        ):
+            actual_first = _iso_from_milliseconds(coverage["first_bar_at_ms"])
+            actual_last = _iso_from_milliseconds(coverage["last_bar_at_ms"])
+            if actual_first != manifest.get("first_bar_at"):
+                failures.append({
+                    "code": "first_bar_at_mismatch",
+                    "expected": manifest.get("first_bar_at"),
+                    "actual": actual_first,
+                })
+            if actual_last != manifest.get("last_bar_at"):
+                failures.append({
+                    "code": "last_bar_at_mismatch",
+                    "expected": manifest.get("last_bar_at"),
+                    "actual": actual_last,
+                })
+        invalid_canonical = int(
+            coverage.get("canonical_invalid_ohlc_rows") or 0
+        )
+        if invalid_canonical:
+            failures.append({
+                "code": "canonical_ohlc_invalid",
+                "actual": invalid_canonical,
+            })
+        warnings = list(dry_run.get("warnings") or ())
+        abnormal_canonical = int(
+            coverage.get("canonical_abnormal_price_rows") or 0
+        )
+        if abnormal_canonical:
+            warnings.append({
+                "code": "canonical_abnormal_price_ratio",
+                "count": abnormal_canonical,
+                "threshold": 100,
+                "policy": "warning",
+            })
+        shard_diagnostics = []
+        if ingestion_ids and hasattr(
+            self.market_bar_repository, "get_canonical_ingestion_quality"
+        ):
+            shard_diagnostics = list(
+                self.market_bar_repository.get_canonical_ingestion_quality(
+                    ingestion_ids
+                )
+            )
+            found = {
+                str(value["ingestion_id"]) for value in shard_diagnostics
+            }
+            for ingestion_id in sorted(set(ingestion_ids) - found):
+                failures.append({
+                    "code": "ingestion_quality_missing",
+                    "ingestion_id": ingestion_id,
+                    "shard_index": ingestion_shards.get(ingestion_id),
+                })
+            for diagnostic in shard_diagnostics:
+                diagnostic["shard_index"] = ingestion_shards.get(
+                    str(diagnostic["ingestion_id"])
+                )
+                if int(diagnostic["canonical_rows"]) != int(
+                    diagnostic["raw_rows"]
+                ):
+                    failures.append({
+                        "code": "shard_canonical_coverage_incomplete",
+                        **diagnostic,
+                    })
+                if int(diagnostic["canonical_invalid_ohlc_rows"]):
+                    failures.append({
+                        "code": "shard_canonical_ohlc_invalid",
+                        **diagnostic,
+                    })
         return {
             "schema": "marketcow.csv-import-quality.v1",
             "job_id": job["job_id"],
@@ -89,6 +178,35 @@ class CsvImportQualityVerifier:
             "status": "passed" if not failures else "failed",
             "expected_rows": expected_rows,
             "raw_receipts": len(receipt_rows),
+            "shard_diagnostics": shard_diagnostics,
             "coverage": coverage,
+            "checks": {
+                "ohlc_and_finite_values": "preimport-validated",
+                "duplicate_keys": "exact-raw-to-canonical-key-coverage",
+                "time_range": "manifest-compared",
+                "intraday_gaps": int(dry_run.get("gap_count") or 0),
+                "abnormal_price_rows": int(
+                    dry_run.get("abnormal_price_rows") or 0
+                ),
+                "trading_calendar": (
+                    "profile-enforced"
+                    if (
+                        job.get("request_json", {})
+                        .get("request", {})
+                        .get("profile", {})
+                        .get("trading_sessions")
+                    )
+                    else "warning-not-configured"
+                ),
+            },
+            "warnings": warnings,
             "failures": failures,
         }
+
+
+def _iso_from_milliseconds(value: Any) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(
+        int(value) / 1000, timezone.utc
+    ).isoformat()

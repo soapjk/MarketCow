@@ -30,6 +30,7 @@ class CsvImportService:
         canonical_builder: Any = None,
         max_workers: int = 2,
         lease_seconds: float = 30,
+        max_file_bytes: int = 100 * 1024 * 1024 * 1024,
     ):
         self.allowed_root = allowed_root.resolve()
         self.storage_root = storage_root.resolve()
@@ -37,6 +38,7 @@ class CsvImportService:
         self.market_bar_repository = market_bar_repository
         self.artifact_store = artifact_store
         self.canonical_builder = canonical_builder
+        self.max_file_bytes = max_file_bytes
         self.shard_importer = CsvShardImporter(market_bar_repository)
         self.quality = CsvImportQualityVerifier(market_bar_repository)
         self.manager = CsvImportJobManager(
@@ -51,6 +53,8 @@ class CsvImportService:
             raise ValueError("CSV path is outside MARKETCOW_ALLOWED_ROOT")
         if not path.is_file():
             raise ValueError("CSV path must be a regular file")
+        if path.stat().st_size > self.max_file_bytes:
+            raise ValueError("CSV file exceeds the configured size limit")
         return path
 
     def dry_run(
@@ -77,7 +81,7 @@ class CsvImportService:
             raise ValueError("CSV dry-run must pass before import")
         if int(report["rows_valid"]) == 0:
             raise ValueError("CSV contains no valid bars")
-        manifest = CsvImportManifest.create(source, request)
+        manifest = CsvImportManifest.create(source, request, report)
         archived = archive_csv(source, self.storage_root, manifest)
         now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         artifact_id = "csv-" + manifest.manifest_id
@@ -100,6 +104,11 @@ class CsvImportService:
                 "interval": request.interval,
                 "adjustment": request.adjustment,
                 "instrument_mappings": dict(manifest.instrument_mappings),
+                "first_bar_at": manifest.first_bar_at,
+                "last_bar_at": manifest.last_bar_at,
+                "created_by": manifest.created_by,
+                "source_proof": manifest.source_proof,
+                "retention_policy": manifest.retention_policy,
             }, sort_keys=True),
         })
         shards = plan_csv_shards(
@@ -108,6 +117,7 @@ class CsvImportService:
         request_json = {
             "request": request.as_dict(),
             "manifest": manifest.as_dict(),
+            "dry_run_report": report,
             "max_attempts": max(1, min(int(max_attempts), 10)),
             "chunk_rows": int(chunk_rows),
         }
@@ -172,19 +182,70 @@ class CsvImportService:
     def get(self, job_id: str) -> dict[str, Any] | None:
         return self.manager.get(job_id)
 
-    def list(self, limit: int = 50) -> list[dict[str, Any]]:
-        return [
-            {
-                **job,
-                "shards": self.metadata_repository.list_csv_import_shards(
-                    job["job_id"]
-                ),
-            }
-            for job in self.metadata_repository.list_csv_import_jobs(limit)
-        ]
+    def list(
+        self, limit: int = 50, manifest_id: str = ""
+    ) -> list[dict[str, Any]]:
+        rows = []
+        for job in self.metadata_repository.list_csv_import_jobs(
+            limit, manifest_id
+        ):
+            current = self.manager.get(job["job_id"])
+            if current is not None:
+                rows.append(current)
+        return rows
 
     def cancel(self, job_id: str) -> dict[str, Any] | None:
         return self.manager.cancel(job_id)
+
+    def manifest(self, job_id: str) -> dict[str, Any] | None:
+        job = self.get(job_id)
+        if job is None:
+            return None
+        return dict(job["request_json"]["manifest"])
+
+    def quality_report(self, job_id: str) -> dict[str, Any] | None:
+        job = self.get(job_id)
+        if job is None:
+            return None
+        report = job.get("quality_report_json")
+        return None if report is None else dict(report)
+
+    def errors(self, job_id: str) -> list[dict[str, Any]] | None:
+        job = self.get(job_id)
+        if job is None:
+            return None
+        return [{
+            "shard_index": shard["shard_index"],
+            "status": shard["status"],
+            "attempt": shard["attempt"],
+            "error_code": shard.get("error_code"),
+            "error_message": shard.get("error_message"),
+        } for shard in job["shards"] if shard.get("error_code")]
+
+    def retry(
+        self, job_id: str, *, idempotency_key: str
+    ) -> tuple[dict[str, Any], bool]:
+        job = self.get(job_id)
+        if job is None:
+            raise ValueError("CSV import job not found")
+        if job["status"] not in {"failed", "canceled"}:
+            raise ValueError("only failed or canceled CSV imports can be retried")
+        request_json = dict(job["request_json"])
+        manifest = CsvImportManifest(**request_json["manifest"])
+        shards = plan_csv_shards(
+            manifest,
+            int(job["rows_total"]),
+            int(request_json["chunk_rows"]),
+        )
+        return self.manager.create(
+            idempotency_key=idempotency_key,
+            manifest_id=manifest.manifest_id,
+            request_json=request_json,
+            storage_path=job["storage_path"],
+            raw_artifact_id=job["raw_artifact_id"],
+            rows_total=int(job["rows_total"]),
+            shards=shards,
+        )
 
     def close(self) -> None:
         self.manager.close()
@@ -193,7 +254,7 @@ class CsvImportService:
 def create_csv_import_service(settings: Any, service: Any) -> CsvImportService:
     resources = getattr(service, "online_resources", None)
     return CsvImportService(
-        allowed_root=settings.allowed_root,
+        allowed_root=settings.allowed_root or settings.storage_root,
         storage_root=settings.storage_root,
         metadata_repository=service.metadata_repository,
         market_bar_repository=service.market_bar_repository,
@@ -203,4 +264,7 @@ def create_csv_import_service(settings: Any, service: Any) -> CsvImportService:
             16, max(1, getattr(settings, "history_job_max_workers", 4))
         ),
         lease_seconds=getattr(settings, "history_job_lease_seconds", 30),
+        max_file_bytes=getattr(
+            settings, "csv_import_max_file_bytes", 100 * 1024 * 1024 * 1024
+        ),
     )

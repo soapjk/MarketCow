@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from marketcow.csv_import import (
@@ -30,12 +31,16 @@ class Bars:
     def upsert_price_bars(
         self, symbol, interval, adjustment, source, ingested_at, bars, provenance
     ):
+        timestamps = [
+            int(datetime.fromisoformat(row["bar_at"]).timestamp() * 1000)
+            for row in bars
+        ]
         self.receipts[provenance["ingestion_id"]] = {
             "ingestion_id": provenance["ingestion_id"],
             "row_count": len(bars),
             "raw_artifact_id": provenance["raw_artifact_id"],
-            "first_bar_at_ms": 1000,
-            "last_bar_at_ms": 2000,
+            "first_bar_at_ms": min(timestamps),
+            "last_bar_at_ms": max(timestamps),
         }
         return len(bars)
 
@@ -47,8 +52,14 @@ class Bars:
         return {
             "raw_rows": count,
             "canonical_rows": count if self.canonical else 0,
-            "first_bar_at_ms": 1000,
-            "last_bar_at_ms": 2000,
+            "first_bar_at_ms": min(
+                self.receipts[value]["first_bar_at_ms"]
+                for value in ingestion_ids
+            ),
+            "last_bar_at_ms": max(
+                self.receipts[value]["last_bar_at_ms"]
+                for value in ingestion_ids
+            ),
         }
 
 
@@ -91,9 +102,10 @@ class CsvImportServiceTest(unittest.TestCase):
             bars = Bars()
             artifacts = Artifacts()
             builder = Builder(bars)
+            metadata = MemoryRepository()
             service = CsvImportService(
                 allowed_root=root, storage_root=root / "storage",
-                metadata_repository=MemoryRepository(),
+                metadata_repository=metadata,
                 market_bar_repository=bars, artifact_store=artifacts,
                 canonical_builder=builder,
             )
@@ -120,6 +132,22 @@ class CsvImportServiceTest(unittest.TestCase):
                 self.assertTrue(Path(
                     artifacts.rows[0]["storage_path"]
                 ).is_relative_to(root.resolve()))
+                self.assertEqual(
+                    service.manifest(job["job_id"])["manifest_id"],
+                    completed["manifest_id"],
+                )
+                self.assertEqual(
+                    service.quality_report(job["job_id"])["status"], "passed"
+                )
+                metadata.jobs[job["job_id"]]["status"] = "failed"
+                retried, created = service.retry(
+                    job["job_id"], idempotency_key="stable-retry"
+                )
+                self.assertTrue(created)
+                self.assertNotEqual(retried["job_id"], job["job_id"])
+                self.assertEqual(
+                    retried["manifest_id"], completed["manifest_id"]
+                )
             finally:
                 service.close()
 
@@ -156,6 +184,23 @@ class CsvImportServiceTest(unittest.TestCase):
                     service.create_import(
                         source, declaration(), idempotency_key="empty"
                     )
+            finally:
+                service.close()
+
+    def test_file_size_limit_is_enforced_before_parsing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "too-large.csv"
+            source.write_text("more than ten bytes", encoding="utf-8")
+            service = CsvImportService(
+                allowed_root=root, storage_root=root / "storage",
+                metadata_repository=MemoryRepository(),
+                market_bar_repository=Bars(), artifact_store=Artifacts(),
+                max_file_bytes=10,
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "size limit"):
+                    service.dry_run(source, declaration())
             finally:
                 service.close()
 

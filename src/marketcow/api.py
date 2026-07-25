@@ -234,6 +234,15 @@ class CsvSchemaProfileInput(BaseModel):
     encoding: str = Field(default="utf-8-sig", min_length=1, max_length=50)
     delimiter: str = Field(default=",", min_length=1, max_length=1)
     fixed_external_symbol: Optional[str] = None
+    allow_extra_columns: bool = True
+    defaults: Dict[str, str] = Field(default_factory=dict)
+    price_multiplier: str = "1"
+    volume_multiplier: str = "1"
+    amount_multiplier: str = "1"
+    price_precision: Optional[int] = Field(default=None, ge=0, le=18)
+    volume_precision: Optional[int] = Field(default=None, ge=0, le=18)
+    amount_precision: Optional[int] = Field(default=None, ge=0, le=18)
+    trading_sessions: list[Dict[str, Any]] = Field(default_factory=list)
 
 
 class CsvInstrumentMappingInput(BaseModel):
@@ -247,6 +256,13 @@ class CsvImportDeclarationInput(BaseModel):
     adjustment: str = Field(pattern="^(raw|adjusted)$")
     profile: CsvSchemaProfileInput
     instruments: CsvInstrumentMappingInput
+    created_by: str = Field(default="api-operator", min_length=1, max_length=200)
+    source_proof: str = Field(
+        default="operator-declared", min_length=1, max_length=1000
+    )
+    retention_policy: str = Field(
+        default="retain-until-explicit-deletion", min_length=1, max_length=200
+    )
 
     def declaration(self) -> CsvImportDeclaration:
         return CsvImportDeclaration(
@@ -257,6 +273,9 @@ class CsvImportDeclarationInput(BaseModel):
             instruments=InstrumentMapping(
                 self.instruments.namespace, self.instruments.symbols
             ),
+            created_by=self.created_by,
+            source_proof=self.source_proof,
+            retention_policy=self.retention_policy,
         )
 
 
@@ -272,6 +291,10 @@ class CsvImportCreateInput(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=200)
     chunk_rows: int = Field(default=100000, ge=1000, le=1000000)
     max_attempts: int = Field(default=3, ge=1, le=10)
+
+
+class CsvImportRetryInput(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=200)
 
 
 def create_app(
@@ -2095,6 +2118,12 @@ def create_app(
             )
         return value
 
+    def public_csv_import_job(job: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: value for key, value in job.items()
+            if key not in {"storage_path", "request_json"}
+        }
+
     @app.post("/v1/admin/csv-imports/dry-run")
     def dry_run_csv_import(request: CsvImportDryRunInput):
         try:
@@ -2114,13 +2143,19 @@ def create_app(
                 chunk_rows=request.chunk_rows,
                 max_attempts=request.max_attempts,
             )
-            return {"created": created, "job": job}
+            return {"created": created, "job": public_csv_import_job(job)}
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/v1/admin/csv-imports")
-    def list_csv_imports(limit: int = Query(50, ge=1, le=500)):
-        rows = require_csv_import_service().list(limit)
+    def list_csv_imports(
+        limit: int = Query(50, ge=1, le=500),
+        manifest_id: str = Query("", max_length=64),
+    ):
+        rows = [
+            public_csv_import_job(row)
+            for row in require_csv_import_service().list(limit, manifest_id)
+        ]
         return {"count": len(rows), "items": rows}
 
     @app.get("/v1/admin/csv-imports/{job_id}")
@@ -2128,7 +2163,7 @@ def create_app(
         job = require_csv_import_service().get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="CSV import job not found")
-        return job
+        return public_csv_import_job(job)
 
     @app.post("/v1/admin/csv-imports/{job_id}/cancel")
     def cancel_csv_import(job_id: str):
@@ -2143,7 +2178,44 @@ def create_app(
                 status_code=409,
                 detail=f"CSV import job is already {current['status']}",
             )
-        return job
+        return public_csv_import_job(job)
+
+    @app.post("/v1/admin/csv-imports/{job_id}/retry")
+    def retry_csv_import(job_id: str, request: CsvImportRetryInput):
+        try:
+            job, created = require_csv_import_service().retry(
+                job_id, idempotency_key=request.idempotency_key
+            )
+            return {"created": created, "job": public_csv_import_job(job)}
+        except ValueError as exc:
+            status = 404 if "not found" in str(exc) else 409
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    @app.get("/v1/admin/csv-imports/{job_id}/manifest")
+    def get_csv_import_manifest(job_id: str):
+        manifest = require_csv_import_service().manifest(job_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail="CSV import job not found")
+        return manifest
+
+    @app.get("/v1/admin/csv-imports/{job_id}/quality-report")
+    def get_csv_import_quality_report(job_id: str):
+        service_value = require_csv_import_service()
+        if service_value.get(job_id) is None:
+            raise HTTPException(status_code=404, detail="CSV import job not found")
+        report = service_value.quality_report(job_id)
+        if report is None:
+            raise HTTPException(
+                status_code=409, detail="CSV import quality report is not ready"
+            )
+        return report
+
+    @app.get("/v1/admin/csv-imports/{job_id}/errors")
+    def get_csv_import_errors(job_id: str):
+        errors = require_csv_import_service().errors(job_id)
+        if errors is None:
+            raise HTTPException(status_code=404, detail="CSV import job not found")
+        return {"count": len(errors), "items": errors}
 
     def require_history_manager() -> HistoryJobManager:
         if history_manager is None:
@@ -2389,14 +2461,26 @@ catch(e){$('result').textContent=e.message}}
 async function cancelJob(id){if(!confirm(`Cancel CSV import ${id}?`))return;
 try{await call(`/v1/admin/csv-imports/${encodeURIComponent(id)}/cancel`,{});await load()}
 catch(e){$('result').textContent=e.message}}
+async function retryJob(id){if(!confirm(`Retry CSV import ${id} using the same immutable manifest?`))return;
+try{const key=`retry-${id}-${Date.now()}`;$('result').textContent=JSON.stringify(
+await call(`/v1/admin/csv-imports/${encodeURIComponent(id)}/retry`,
+{idempotency_key:key}),null,2);await load()}
+catch(e){$('result').textContent=e.message}}
 async function load(){const r=await fetch('/v1/admin/csv-imports?limit=50');
 const d=await r.json();$('jobs').innerHTML=`<table><tr><th>Job</th><th>Status</th>
-<th>Rows read/written</th><th>Quality</th><th>Updated</th><th></th></tr>`+
+<th>Rows read/written</th><th>Quality</th><th>Updated</th><th>Evidence</th>
+<th>Action</th></tr>`+
 d.items.map(j=>`<tr><td>${esc(j.job_id)}</td><td>${esc(j.status)}</td>
-<td>${j.rows_read}/${j.rows_written}</td>
+<td><progress max="100" value="${j.progress_percent||0}"></progress>
+ ${j.progress_percent||0}% — ${j.rows_read}/${j.rows_written}</td>
 <td>${esc(j.quality_report_json?.status||'pending')}</td><td>${esc(j.updated_at)}</td>
+<td><a href="/v1/admin/csv-imports/${encodeURIComponent(j.job_id)}/manifest">Manifest</a>
+ ${j.quality_report_json?`<a href="/v1/admin/csv-imports/${encodeURIComponent(j.job_id)}/quality-report">Quality</a>`:''}
+ <a href="/v1/admin/csv-imports/${encodeURIComponent(j.job_id)}/errors">Errors</a></td>
 <td>${['queued','running','cancel_requested'].includes(j.status)?
-`<button onclick="cancelJob('${esc(j.job_id)}')">Cancel</button>`:''}</td></tr>`).join('')
+`<button onclick="cancelJob('${esc(j.job_id)}')">Cancel</button>`:
+['failed','canceled'].includes(j.status)?
+`<button onclick="retryJob('${esc(j.job_id)}')">Retry</button>`:''}</td></tr>`).join('')
 +'</table>'}load();setInterval(load,2000)</script></body></html>"""
 
     @app.get("/v1/admin/artifacts")

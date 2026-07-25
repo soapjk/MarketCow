@@ -726,4 +726,14 @@ POSTGRES_MIGRATIONS = [
             WHERE status IN ('queued', 'running', 'retry');
         """,
     ),
+    (
+        21,
+        "allow CSV retry jobs to reuse stable shard ingestion identities",
+        """
+        ALTER TABLE csv_import_shard
+            DROP CONSTRAINT IF EXISTS csv_import_shard_ingestion_id_key;
+        CREATE INDEX IF NOT EXISTS csv_import_shard_ingestion_idx
+            ON csv_import_shard (ingestion_id);
+        """,
+    ),
 ]

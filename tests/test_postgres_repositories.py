@@ -90,6 +90,14 @@ class PostgresDomainInventoryTest(unittest.TestCase):
         self.assertIn("lease_token TEXT", statement)
         self.assertIn("csv_import_job_recovery_idx", statement)
         self.assertIn("csv_import_shard_recovery_idx", statement)
+        retry = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 21
+        )
+        self.assertIn(
+            "DROP CONSTRAINT IF EXISTS csv_import_shard_ingestion_id_key",
+            retry[2],
+        )
+        self.assertIn("csv_import_shard_ingestion_idx", retry[2])
 
 
 @unittest.skipUnless(
