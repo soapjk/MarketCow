@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field, ValidationError, model_validator
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from . import __version__
 from .config import Settings
@@ -48,6 +48,7 @@ from .hyperliquid_realtime import (
 from .providers.longport_quote import LongPortError
 from .dashboard_registry import load_dashboard_registry, registry_document
 from .admin_control import AdminAuditService
+from .http_metrics import RequestMetrics, RequestMetricsMiddleware
 
 
 def normalize_quote_symbol(value: str) -> str:
@@ -157,6 +158,9 @@ def create_app(
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
+    request_metrics = RequestMetrics()
+    app.add_middleware(RequestMetricsMiddleware, metrics=request_metrics)
+    app.state.request_metrics = request_metrics
     app.state.service = service
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None
@@ -401,6 +405,13 @@ def create_app(
             "metadata_backend": "postgresql",
             "storage_health": storage_health(),
         }
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics():
+        return Response(
+            request_metrics.render(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     @app.get("/v1/admin/dashboards")
     def admin_dashboards():

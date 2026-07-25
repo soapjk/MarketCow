@@ -107,12 +107,12 @@ def _write_provisioning(
         (root / name).mkdir(parents=True, exist_ok=True)
     dashboard_files = root / "dashboard-files"
     dashboard_files.mkdir(parents=True, exist_ok=True)
-    source_dashboard = dashboard_path / "marketcow-data-inventory.json"
-    destination_dashboard = dashboard_files / source_dashboard.name
-    temporary_dashboard = destination_dashboard.with_suffix(".json.tmp")
-    shutil.copyfile(source_dashboard, temporary_dashboard)
-    os.chmod(temporary_dashboard, 0o644)
-    os.replace(temporary_dashboard, destination_dashboard)
+    for source_dashboard in sorted(dashboard_path.glob("*.json")):
+        destination_dashboard = dashboard_files / source_dashboard.name
+        temporary_dashboard = destination_dashboard.with_suffix(".json.tmp")
+        shutil.copyfile(source_dashboard, temporary_dashboard)
+        os.chmod(temporary_dashboard, 0o644)
+        os.replace(temporary_dashboard, destination_dashboard)
     datasource = f"""apiVersion: 1
 datasources:
   - name: MarketCow ClickHouse
@@ -143,6 +143,14 @@ datasources:
       searchPath: {pg_schema}
     secureJsonData:
       password: {pg_password}
+  - name: MarketCow Prometheus
+    uid: marketcow-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9090
+    jsonData:
+      httpMethod: POST
+      timeInterval: 5s
 """
     dashboard = f"""apiVersion: 1
 providers:

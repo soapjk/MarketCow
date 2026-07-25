@@ -161,6 +161,11 @@ class MarketDataApiTest(unittest.TestCase):
         self.assertEqual(audit.status_code, 200)
         self.assertEqual(audit.json()["schema"], "marketcow.admin-audit.v1")
 
+        metrics = self.client.get("/metrics")
+        self.assertEqual(metrics.status_code, 200)
+        self.assertIn("marketcow_http_requests_total", metrics.text)
+        self.assertIn('route="/v1/admin/overview"', metrics.text)
+
     def test_crypto_canonical_storage_uses_venue_qualified_symbol(self):
         crypto = {
             **self.instrument,

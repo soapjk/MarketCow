@@ -33,7 +33,7 @@ class DashboardRegistryTest(unittest.TestCase):
         }])
         document = registry_document(load_dashboard_registry(raw))
         self.assertEqual([item["key"] for item in document["items"]],
-                         ["api-errors", "marketcow-inventory"])
+                         ["api-errors", "marketcow-inventory", "marketcow-api-observability"])
         self.assertIn("/d-solo/api-traffic/api-traffic?", document["items"][0]["path"])
         self.assertIn("panelId=8", document["items"][0]["path"])
         self.assertIn("var-service=public+api", document["items"][0]["path"])

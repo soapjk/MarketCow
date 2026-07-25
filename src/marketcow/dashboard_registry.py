@@ -113,6 +113,15 @@ DEFAULT_DASHBOARDS = (
         slug="marketcow-data-inventory-quality",
         sort_order=10,
     ),
+    DashboardRegistration(
+        key="marketcow-api-observability",
+        project="MarketCow",
+        name="API 请求聚合监控",
+        description="Prometheus 请求速率、错误率、延迟分位数和在途请求。",
+        dashboard_uid="marketcow-api-observability",
+        slug="marketcow-api-observability",
+        sort_order=20,
+    ),
 )
 
 

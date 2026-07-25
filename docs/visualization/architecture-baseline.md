@@ -105,6 +105,9 @@ MarketCow Administration
 | Control-plane state | PostgreSQL through FastAPI | native administration UI | request/response |
 | Commands | authenticated FastAPI | native administration UI | request accepted promptly; progress asynchronous |
 
+The aggregate request implementation and local retention settings are documented in
+[`ops/prometheus/README.md`](../../ops/prometheus/README.md).
+
 Raw requests must not be synchronously inserted into a business SQL table merely
 to animate a chart. Monitoring is not a billing ledger; any future exact accounting
 requirement needs a separate durable event design.
@@ -205,4 +208,3 @@ MCHR-44 baseline
 
 Security is designed in every phase; MCHR-52 is the explicit adversarial review
 and closure task, not the first point at which authorization is considered.
-
