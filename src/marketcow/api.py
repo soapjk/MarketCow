@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field, ValidationError, model_validator
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from . import __version__
 from .config import Settings
@@ -49,6 +49,7 @@ from .providers.longport_quote import LongPortError
 from .dashboard_registry import load_dashboard_registry, registry_document
 from .admin_control import AdminAuditService
 from .http_metrics import RequestMetrics, RequestMetricsMiddleware
+from .admin_events import ALLOWED_EVENT_TYPES, AdminEventHub, encode_sse
 
 
 def normalize_quote_symbol(value: str) -> str:
@@ -158,9 +159,19 @@ def create_app(
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
+    admin_events = AdminEventHub(
+        replay_capacity=min(settings.realtime_replay_capacity, 100000),
+        subscriber_capacity=min(settings.realtime_queue_capacity, 10000),
+        heartbeat_seconds=settings.realtime_heartbeat_seconds,
+    )
     request_metrics = RequestMetrics()
-    app.add_middleware(RequestMetricsMiddleware, metrics=request_metrics)
+    app.add_middleware(
+        RequestMetricsMiddleware,
+        metrics=request_metrics,
+        event_sink=admin_events.request_completed,
+    )
     app.state.request_metrics = request_metrics
+    app.state.admin_events = admin_events
     app.state.service = service
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None
@@ -411,6 +422,40 @@ def create_app(
         return Response(
             request_metrics.render(),
             media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    @app.get("/v1/admin/events")
+    async def admin_event_stream(
+        types: str = Query("request.summary", max_length=300),
+        after_sequence: int = Query(0, ge=0),
+        last_event_id: str = Header("", alias="Last-Event-ID", max_length=30),
+    ):
+        if last_event_id:
+            try:
+                after_sequence = max(after_sequence, int(last_event_id))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail="Last-Event-ID must be an integer"
+                ) from exc
+        selected = tuple(item.strip() for item in types.split(",") if item.strip())
+        subscribable = ALLOWED_EVENT_TYPES - {"stream.heartbeat", "stream.gap"}
+        if not selected or not set(selected) <= subscribable:
+            raise HTTPException(
+                status_code=400, detail="admin event subscription is invalid"
+            )
+
+        async def events():
+            yield b"retry: 1000\n\n"
+            async for event in admin_events.stream(after_sequence, selected):
+                yield encode_sse(event)
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @app.get("/v1/admin/dashboards")

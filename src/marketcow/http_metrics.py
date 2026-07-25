@@ -139,9 +139,12 @@ class RequestMetrics:
 
 
 class RequestMetricsMiddleware:
-    def __init__(self, app: Any, metrics: RequestMetrics) -> None:
+    def __init__(
+        self, app: Any, metrics: RequestMetrics, event_sink: Any = None
+    ) -> None:
         self.app = app
         self.metrics = metrics
+        self.event_sink = event_sink
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http":
@@ -167,3 +170,16 @@ class RequestMetricsMiddleware:
             route_object = scope.get("route")
             route = getattr(route_object, "path", "unmatched")
             self.metrics.finish(method, route, status, started, exception)
+            if self.event_sink is not None and route != "/v1/admin/events":
+                try:
+                    await self.event_sink({
+                        "method": _method(method),
+                        "route": route,
+                        "status_family": _status_family(status),
+                        "duration_ms": round(
+                            max(0.0, self.metrics.clock() - started) * 1000, 3
+                        ),
+                        "exception": exception,
+                    })
+                except Exception:
+                    pass
