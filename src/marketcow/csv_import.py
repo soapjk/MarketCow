@@ -134,6 +134,10 @@ class InstrumentMapping:
                 f"no {self.namespace} mapping exists for {key or '<empty>'}",
             ) from exc
 
+    @property
+    def canonical_mappings(self) -> Mapping[str, str]:
+        return dict(self._normalized)
+
 
 @dataclass(frozen=True)
 class CsvImportRequest:
