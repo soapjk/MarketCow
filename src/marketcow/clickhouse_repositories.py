@@ -706,6 +706,35 @@ class ClickHouseMarketBarRepository:
             "raw_artifact_id": row[4],
         } for row in result.result_rows]
 
+    def list_adjustment_contract_candidates(
+        self, limit: int = 10000
+    ) -> List[Dict[str, Any]]:
+        if not 1 <= int(limit) <= 100000:
+            raise ValueError("limit must be between 1 and 100000")
+        result = self._query(
+            "SELECT * FROM market_bar_raw FINAL "
+            "WHERE factor_applicability='' OR adjustment='adjusted' "
+            "ORDER BY symbol,interval,adjustment,source,bar_time "
+            "LIMIT {limit:UInt32}",
+            {"limit": int(limit)},
+        )
+        return [
+            dict(zip(result.column_names, row)) for row in result.result_rows
+        ]
+
+    def adjustment_contract_audit(self) -> List[Dict[str, Any]]:
+        result = self._query(
+            "SELECT adjustment,factor_applicability,count() AS row_count "
+            "FROM market_bar_raw FINAL "
+            "GROUP BY adjustment,factor_applicability "
+            "ORDER BY adjustment,factor_applicability"
+        )
+        return [{
+            "adjustment": str(row[0]),
+            "factor_applicability": str(row[1]),
+            "row_count": int(row[2]),
+        } for row in result.result_rows]
+
     def get_canonical_ingestion_coverage(
         self, ingestion_ids: Sequence[str]
     ) -> Dict[str, Any]:
