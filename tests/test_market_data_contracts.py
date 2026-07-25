@@ -191,7 +191,7 @@ class MarketDataContractTest(unittest.TestCase):
             next_cursor=None, truncated=False, provenance={"layer": "canonical"},
         )
         bad_bar = bar.model_copy(update={
-            "interval": "5-MINUTE", "adjustment": "adjusted",
+            "interval": "5-MINUTE", "adjustment": "qfq",
             "window_start": "2026-07-23T03:00:00Z",
         })
         with self.assertRaises(ValidationError):

@@ -205,7 +205,7 @@ export function OperationsPage({ initialTab = "jobs" }: { initialTab?: "jobs" | 
               <label>周期<select value={form.interval} onChange={(e) => setForm({ ...form, interval: e.target.value })}>{providerIntervals[form.provider].map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select></label>
               <label>开始日期<input type="date" value={form.startDate} max={form.endDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} required /></label>
               <label>结束日期<input type="date" value={form.endDate} min={form.startDate} max={inputDate(new Date())} onChange={(e) => setForm({ ...form, endDate: e.target.value })} required /></label>
-              <label>复权<select value={form.adjustment} disabled={form.provider !== "yahoo"} onChange={(e) => setForm({ ...form, adjustment: e.target.value })}><option>raw</option><option>adjusted</option></select></label>
+              <label>复权<select value={form.adjustment} disabled={form.provider !== "yahoo"} onChange={(e) => setForm({ ...form, adjustment: e.target.value })}><option value="raw">原始数据 (raw)</option><option value="qfq">前复权 (qfq)</option></select></label>
             </div>
             <p className="field-hint">日期按 UTC 自然日提交；结束日期包含当天。周期选项会根据 Provider 自动收窄。</p>
             {dateError && <p className="inline-error">结束日期不能早于开始日期。</p>}

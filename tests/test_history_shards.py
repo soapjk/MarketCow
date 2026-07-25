@@ -36,7 +36,7 @@ class HistoryShardPlanningTest(unittest.TestCase):
         frozen = freeze_history_range(
             {
                 "provider": "yahoo", "range": "ytd", "interval": "1d",
-                "adjustment": "adjusted",
+                "adjustment": "qfq",
             },
             datetime(2026, 7, 25, 12, 30, tzinfo=timezone.utc),
         )

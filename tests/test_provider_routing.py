@@ -107,11 +107,11 @@ class ProviderRoutingTest(unittest.TestCase):
         client = TestClient(create_app(self.settings, service))
         response = client.post("/v1/market-bars/query", json={
             "symbols": ["AAPL.XNAS"], "range": "5d", "interval": "1d",
-            "adjustment": "adjusted", "refresh": True, "provider": "yahoo",
+            "adjustment": "qfq", "refresh": True, "provider": "yahoo",
         })
         self.assertEqual(response.status_code, 200)
         self.assertEqual(service.calls[0], (
-            "history", "AAPL.XNAS", "5d", "1d", "adjusted", "yahoo", False,
+            "history", "AAPL.XNAS", "5d", "1d", "qfq", "yahoo", False,
         ))
 
     def test_provider_specific_routes_are_not_public_schema(self):

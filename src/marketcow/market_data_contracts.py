@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Annotated, Any, Dict, Literal, Optional, Union
 
@@ -226,7 +226,7 @@ class OrderBookDeltaPayload(StrictModel):
 
 class BarPayload(StrictModel):
     interval: Interval
-    adjustment: Literal["raw", "adjusted"]
+    adjustment: Literal["raw", "qfq", "hfq"]
     price_type: Literal["LAST", "BID", "ASK", "MID"]
     aggregation_source: Literal["EXTERNAL"]
     session: Literal["regular", "pre_market", "post_market", "overnight", "unknown"] = (
@@ -476,12 +476,13 @@ STREAM_EVENT_ADAPTER = TypeAdapter(StreamEvent)
 
 
 class HistoricalManifest(ContractModel):
+    adjustment_contract_version: Literal[1] = 1
     dataset_id: str
     snapshot_id: str
     canonical_version: str
     instruments: list[str]
     interval: Interval
-    adjustment: Literal["raw", "adjusted"]
+    adjustment: Literal["raw", "qfq", "hfq"]
     start: str
     end: str
     end_inclusive: Literal[True] = True
@@ -503,7 +504,7 @@ class HistoricalManifest(ContractModel):
 class HistoricalBar(ContractModel):
     instrument_id: str = Field(pattern=INSTRUMENT_ID_PATTERN)
     interval: Interval
-    adjustment: Literal["raw", "adjusted"]
+    adjustment: Literal["raw", "qfq", "hfq"]
     price_type: Literal["LAST"]
     aggregation_source: Literal["EXTERNAL"]
     window_start: str
@@ -515,6 +516,14 @@ class HistoricalBar(ContractModel):
     low: DecimalString
     close: DecimalString
     volume: DecimalString
+    factor_applicability: Optional[Literal["applicable", "not_applicable"]] = None
+    corporate_action_factor: Optional[DecimalString] = None
+    applied_adjustment_multiplier: Optional[DecimalString] = None
+    adjustment_reference_date: Optional[str] = None
+    reference_factor: Optional[DecimalString] = None
+    factor_source: Optional[str] = None
+    factor_artifact_id: Optional[str] = None
+    factor_as_of: Optional[str] = None
     selected_source: str
     quality_status: str
     row_version: str
@@ -523,6 +532,18 @@ class HistoricalBar(ContractModel):
     @classmethod
     def timestamps(cls, value: str) -> str:
         return utc(value)
+
+    @field_validator("factor_as_of")
+    @classmethod
+    def optional_factor_timestamp(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else utc(value)
+
+    @field_validator("adjustment_reference_date")
+    @classmethod
+    def optional_reference_date(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            date.fromisoformat(value)
+        return value
 
     @model_validator(mode="after")
     def valid(self):
