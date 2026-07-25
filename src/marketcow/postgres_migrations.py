@@ -25,6 +25,8 @@ POSTGRES_TRANSACTION_DOMAINS = (
     "instrument_master",
     "instrument_relationship",
     "admin_audit_event",
+    "csv_import_job",
+    "csv_import_shard",
     "runtime_config_version",
     "migration_checkpoint",
 )
@@ -667,6 +669,60 @@ POSTGRES_MIGRATIONS = [
         CREATE INDEX IF NOT EXISTS admin_audit_event_action_idx
             ON admin_audit_event (action, occurred_at DESC);
         REVOKE UPDATE, DELETE, TRUNCATE ON admin_audit_event FROM PUBLIC;
+        """,
+    ),
+    (
+        20,
+        "recoverable CSV market bar imports",
+        """
+        CREATE TABLE IF NOT EXISTS csv_import_job (
+            job_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            manifest_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            request_json JSONB NOT NULL,
+            storage_path TEXT NOT NULL,
+            raw_artifact_id TEXT NOT NULL,
+            rows_total BIGINT NOT NULL CHECK (rows_total >= 0),
+            rows_read BIGINT NOT NULL DEFAULT 0 CHECK (rows_read >= 0),
+            rows_written BIGINT NOT NULL DEFAULT 0 CHECK (rows_written >= 0),
+            error_code TEXT,
+            error_message TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+            started_at TIMESTAMPTZ,
+            updated_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ
+        );
+        CREATE TABLE IF NOT EXISTS csv_import_shard (
+            job_id TEXT NOT NULL REFERENCES csv_import_job(job_id)
+                ON DELETE CASCADE,
+            shard_index INTEGER NOT NULL CHECK (shard_index >= 0),
+            row_start BIGINT NOT NULL CHECK (row_start >= 0),
+            row_end BIGINT NOT NULL CHECK (row_end > row_start),
+            ingestion_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+            rows_read BIGINT NOT NULL DEFAULT 0 CHECK (rows_read >= 0),
+            rows_written BIGINT NOT NULL DEFAULT 0 CHECK (rows_written >= 0),
+            write_receipt_json JSONB,
+            error_code TEXT,
+            error_message TEXT,
+            owner_id TEXT,
+            lease_token TEXT,
+            lease_expires_at TIMESTAMPTZ,
+            heartbeat_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            finished_at TIMESTAMPTZ,
+            PRIMARY KEY (job_id, shard_index),
+            UNIQUE (ingestion_id)
+        );
+        CREATE INDEX IF NOT EXISTS csv_import_job_recovery_idx
+            ON csv_import_job (status, created_at)
+            WHERE status IN ('queued', 'running', 'cancel_requested');
+        CREATE INDEX IF NOT EXISTS csv_import_shard_recovery_idx
+            ON csv_import_shard (status, lease_expires_at, job_id, shard_index)
+            WHERE status IN ('queued', 'running', 'retry');
         """,
     ),
 ]

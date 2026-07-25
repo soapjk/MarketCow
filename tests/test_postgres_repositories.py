@@ -22,13 +22,15 @@ from marketcow.repositories import ControlPlaneRepository
 
 class PostgresDomainInventoryTest(unittest.TestCase):
     def test_bg003_inventory_is_explicit_and_complete(self):
-        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 23)
-        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 23)
+        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 25)
+        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 25)
         self.assertIn("admin_audit_event", POSTGRES_TRANSACTION_DOMAINS)
         self.assertEqual(
             POSTGRES_TRANSACTION_DOMAINS[-2:],
             ("runtime_config_version", "migration_checkpoint"),
         )
+        self.assertIn("csv_import_job", POSTGRES_TRANSACTION_DOMAINS)
+        self.assertIn("csv_import_shard", POSTGRES_TRANSACTION_DOMAINS)
 
     def test_history_worker_lease_migration_is_backward_compatible(self):
         version, description, statement = next(
@@ -76,6 +78,18 @@ class PostgresDomainInventoryTest(unittest.TestCase):
         self.assertEqual(description, "history canonical verification queue")
         self.assertIn("CREATE TABLE IF NOT EXISTS history_canonical_check", statement)
         self.assertIn("history_canonical_check_pending_idx", statement)
+
+    def test_csv_import_migration_has_durable_jobs_shards_and_leases(self):
+        version, description, statement = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 20
+        )
+        self.assertEqual(description, "recoverable CSV market bar imports")
+        self.assertIn("CREATE TABLE IF NOT EXISTS csv_import_job", statement)
+        self.assertIn("CREATE TABLE IF NOT EXISTS csv_import_shard", statement)
+        self.assertIn("UNIQUE (ingestion_id)", statement)
+        self.assertIn("lease_token TEXT", statement)
+        self.assertIn("csv_import_job_recovery_idx", statement)
+        self.assertIn("csv_import_shard_recovery_idx", statement)
 
 
 @unittest.skipUnless(
