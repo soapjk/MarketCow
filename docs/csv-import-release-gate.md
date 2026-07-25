@@ -14,12 +14,12 @@
 - [x] 管理页面可 dry-run、启动、查看实时状态、证据、取消和重试。
 - [x] 路径穿越、allowed-root 外文件和超出大小限制的文件被拒绝。
 - [x] 全量单元测试与 Ruff 通过。
-- [ ] 使用获授权的真实供应商样本完成生产前 smoke test。
+- [x] 使用获授权的真实供应商样本完成生产前 smoke test。
 
-最后一项需要操作者提供获授权的数据文件；测试仓库不得提交购买数据。
-执行时使用 `import-bars --evidence-output <new-file>`；检查证据 schema、文件哈希、
-任务 `succeeded` 和质量报告 `passed`，仅提交脱敏证据摘要，不提交证据中可能存在的
-供应商文件名，除非数据许可明确允许。
+真实样本门禁于 2026-07-25 完成。执行使用
+`import-bars --evidence-output <new-file>`；脱敏摘要见
+`artifacts/mcvi-real-sample-smoke-summary-20260725.md`。购买数据和完整 create-only
+证据不提交到仓库。
 
 百万行门禁证据（2026-07-25，本地合成 1 分钟数据）：
 

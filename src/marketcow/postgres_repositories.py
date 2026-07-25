@@ -17,6 +17,20 @@ from .postgres_migrations import POSTGRES_MIGRATIONS
 from .domain_columns import FUNDAMENTAL_COLUMNS, TDX_COLUMNS
 
 
+def _csv_import_row(
+    row: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    return {
+        key: (
+            value.decode("utf-8")
+            if isinstance(value, bytes) else value
+        )
+        for key, value in row.items()
+    }
+
+
 class PostgresDatabase:
     """Development-only PostgreSQL connection and schema migration boundary."""
 
@@ -504,14 +518,14 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                             shard.get("finished_at"),
                         ),
                     )
-                return saved, True
+                return _csv_import_row(saved), True
             existing = connection.execute(
                 "SELECT * FROM history_fetch_job WHERE idempotency_key=%s",
                 (row["idempotency_key"],),
             ).fetchone()
             if existing is None:
                 raise RuntimeError("idempotent history job was not visible")
-            return existing, False
+            return _csv_import_row(existing), False
 
     def upsert_history_job(self, row: Dict[str, Any]) -> Dict[str, Any]:
         with self.database.connection() as connection:
@@ -934,62 +948,75 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                             shard["updated_at"], shard.get("finished_at"),
                         ),
                     )
-                return saved, True
+                decoded = _csv_import_row(saved)
+                assert decoded is not None
+                return decoded, True
             existing = connection.execute(
                 "SELECT * FROM csv_import_job WHERE idempotency_key=%s",
                 (job["idempotency_key"],),
             ).fetchone()
             if existing is None:
                 raise RuntimeError("idempotent CSV import job was not visible")
-            return existing, False
+            decoded = _csv_import_row(existing)
+            assert decoded is not None
+            return decoded, False
 
     def get_csv_import_job(self, job_id: str) -> Optional[Dict[str, Any]]:
         with self.database.connection() as connection:
-            return connection.execute(
+            return _csv_import_row(connection.execute(
                 "SELECT * FROM csv_import_job WHERE job_id=%s", (job_id,)
-            ).fetchone()
+            ).fetchone())
 
     def list_csv_import_jobs(
         self, limit: int = 50, manifest_id: str = ""
     ) -> List[Dict[str, Any]]:
         with self.database.connection() as connection:
             if manifest_id:
-                return list(connection.execute(
-                    "SELECT * FROM csv_import_job WHERE manifest_id=%s "
+                return [
+                    _csv_import_row(row) for row in connection.execute(
+                        "SELECT * FROM csv_import_job WHERE manifest_id=%s "
+                        "ORDER BY updated_at DESC LIMIT %s",
+                        (manifest_id, limit),
+                    ).fetchall()
+                ]
+            return [
+                _csv_import_row(row) for row in connection.execute(
+                    "SELECT * FROM csv_import_job "
                     "ORDER BY updated_at DESC LIMIT %s",
-                    (manifest_id, limit),
-                ).fetchall())
-            return list(connection.execute(
-                "SELECT * FROM csv_import_job ORDER BY updated_at DESC LIMIT %s",
-                (limit,),
-            ).fetchall())
+                    (limit,),
+                ).fetchall()
+            ]
 
     def list_recoverable_csv_import_jobs(self) -> List[Dict[str, Any]]:
         with self.database.connection() as connection:
-            return list(connection.execute(
-                """
-                SELECT * FROM csv_import_job
-                WHERE status IN ('queued','running','cancel_requested')
-                ORDER BY created_at,job_id
-                """
-            ).fetchall())
+            return [
+                _csv_import_row(row) for row in connection.execute(
+                    """
+                    SELECT * FROM csv_import_job
+                    WHERE status IN ('queued','running','cancel_requested')
+                    ORDER BY created_at,job_id
+                    """
+                ).fetchall()
+            ]
 
     def list_csv_import_shards(self, job_id: str) -> List[Dict[str, Any]]:
         with self.database.connection() as connection:
-            return list(connection.execute(
-                """
-                SELECT * FROM csv_import_shard
-                WHERE job_id=%s ORDER BY shard_index
-                """,
-                (job_id,),
-            ).fetchall())
+            return [
+                _csv_import_row(row) for row in connection.execute(
+                    """
+                    SELECT * FROM csv_import_shard
+                    WHERE job_id=%s ORDER BY shard_index
+                    """,
+                    (job_id,),
+                ).fetchall()
+            ]
 
     def claim_csv_import_shard(
         self, job_id: str, shard_index: int, owner_id: str,
         lease_token: str, now: str, lease_expires_at: str,
     ) -> Optional[Dict[str, Any]]:
         with self.database.connection() as connection:
-            return connection.execute(
+            return _csv_import_row(connection.execute(
                 """
                 UPDATE csv_import_shard SET
                     status='running',attempt=attempt+1,owner_id=%s,
@@ -1015,14 +1042,14 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                     owner_id, lease_token, lease_expires_at, now, now,
                     job_id, shard_index, now,
                 ),
-            ).fetchone()
+            ).fetchone())
 
     def renew_csv_import_shard_lease(
         self, job_id: str, shard_index: int, owner_id: str,
         lease_token: str, now: str, lease_expires_at: str,
     ) -> Optional[Dict[str, Any]]:
         with self.database.connection() as connection:
-            return connection.execute(
+            return _csv_import_row(connection.execute(
                 """
                 UPDATE csv_import_shard SET
                     heartbeat_at=%s,lease_expires_at=%s,updated_at=%s
@@ -1034,13 +1061,13 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                     now, lease_expires_at, now, job_id, shard_index,
                     owner_id, lease_token, now,
                 ),
-            ).fetchone()
+            ).fetchone())
 
     def finish_claimed_csv_import_shard(
         self, row: Dict[str, Any], owner_id: str, lease_token: str
     ) -> Optional[Dict[str, Any]]:
         with self.database.connection() as connection:
-            return connection.execute(
+            return _csv_import_row(connection.execute(
                 """
                 UPDATE csv_import_shard SET
                     status=%s,rows_read=%s,rows_written=%s,
@@ -1059,13 +1086,13 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                     row["updated_at"], row.get("finished_at"), row["job_id"],
                     row["shard_index"], owner_id, lease_token,
                 ),
-            ).fetchone()
+            ).fetchone())
 
     def update_csv_import_job(
         self, row: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         with self.database.connection() as connection:
-            return connection.execute(
+            return _csv_import_row(connection.execute(
                 """
                 UPDATE csv_import_job SET
                     status=%s,rows_read=%s,rows_written=%s,error_code=%s,
@@ -1084,20 +1111,20 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                     row.get("started_at"), row["updated_at"],
                     row.get("finished_at"), row["job_id"],
                 ),
-            ).fetchone()
+            ).fetchone())
 
     def request_cancel_csv_import_job(
         self, job_id: str, now: str
     ) -> Optional[Dict[str, Any]]:
         with self.database.connection() as connection:
-            return connection.execute(
+            return _csv_import_row(connection.execute(
                 """
                 UPDATE csv_import_job SET status='cancel_requested',updated_at=%s
                 WHERE job_id=%s AND status IN ('queued','running')
                 RETURNING *
                 """,
                 (now, job_id),
-            ).fetchone()
+            ).fetchone())
 
     def cancel_unclaimed_csv_import_shards(
         self, job_id: str, now: str

@@ -34,7 +34,7 @@ Authoritative scope: Plane project `MCVI`, parent `MCVI-1`, stages 1–11.
 
 ## Stage 11 evidence
 
-- Full suite: `Ran 425 tests ... OK (skipped=19)`.
+- Full suite: `Ran 428 tests ... OK (skipped=19)`.
 - Static gate: `ruff check src tests` passed.
 - JSON contract parses successfully.
 - Fault tests cover invalid rows, duplicate file/archive, bounded-memory scale,
@@ -45,13 +45,20 @@ Authoritative scope: Plane project `MCVI`, parent `MCVI-1`, stages 1–11.
 - CLI `--evidence-output` creates a create-only, fsync'd, path-redacted
   `marketcow.csv-import-smoke-evidence.v1` artifact without CSV contents.
 
-## Remaining external evidence
+## Authorized real-sample evidence
 
-Plane stage 11 explicitly requires a smoke test using an authorized real
-supplier sample. No CSV exists under the configured allowed root
-`/Volumes/T9/projects/marketcow` as of this audit. Completion therefore requires
-the operator to provide an authorized sample path plus its matching declaration.
-Purchased CSV contents must not be committed to the repository.
+Plane stage 11's real supplier sample gate passed on 2026-07-25:
 
-Plane state/comment synchronization is also pending explicit authorization for
+- 64,836 valid rows; 0 invalid, duplicate or unordered rows.
+- 3/3 durable shards and raw receipts.
+- Raw/canonical coverage: 64,836/64,836.
+- Canonical invalid OHLC and abnormal-price rows: 0.
+- Quality status: `passed`, failures: 0.
+- Stable ingestion IDs were reused during recovery without duplicate keys.
+
+The redacted evidence summary is
+`artifacts/mcvi-real-sample-smoke-summary-20260725.md`. Purchased CSV contents,
+paths and full evidence files remain untracked.
+
+Plane state/comment synchronization remains pending explicit authorization for
 that remote write.

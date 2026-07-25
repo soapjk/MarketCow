@@ -26,3 +26,4 @@ node_modules/
 *.sqlite3-wal
 *.duckdb
 *.parquet
+artifacts/mcvi-*-evidence.json

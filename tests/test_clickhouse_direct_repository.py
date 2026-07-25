@@ -227,6 +227,7 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
             "canonical_abnormal_price_rows": 2,
         })
         self.assertIn("SELECT DISTINCT symbol,interval,adjustment,bar_time", calls[0][0])
+        self.assertIn("market_bar_canonical AS c FINAL", calls[0][0])
         self.assertEqual(calls[0][1], {"ingestion_ids": ["a", "b"]})
 
     def test_canonical_ingestion_quality_is_grouped_for_shard_diagnostics(self):
@@ -244,6 +245,7 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
             "canonical_invalid_ohlc_rows": 1,
         })
         self.assertIn("GROUP BY r.ingestion_id", calls[0][0])
+        self.assertIn("market_bar_canonical AS c FINAL", calls[0][0])
 
     def test_canonical_json_normalizes_bytes_decimal_and_datetime(self):
         timestamp = datetime(2026, 7, 23, 1, 2, 3, 456000, timezone.utc)

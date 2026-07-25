@@ -780,7 +780,7 @@ class ClickHouseMarketBarRepository:
                 FROM market_bar_raw FINAL
                 WHERE ingestion_id IN {ingestion_ids:Array(String)}
             ) r
-            LEFT JOIN market_bar_canonical FINAL c
+            LEFT JOIN market_bar_canonical AS c FINAL
               ON c.symbol=r.symbol AND c.interval=r.interval
              AND c.adjustment=r.adjustment AND c.bar_time=r.bar_time
             """,
@@ -832,7 +832,7 @@ class ClickHouseMarketBarRepository:
                 FROM market_bar_raw FINAL
                 WHERE ingestion_id IN {ingestion_ids:Array(String)}
             ) r
-            LEFT JOIN market_bar_canonical FINAL c
+            LEFT JOIN market_bar_canonical AS c FINAL
               ON c.symbol=r.symbol AND c.interval=r.interval
              AND c.adjustment=r.adjustment AND c.bar_time=r.bar_time
             GROUP BY r.ingestion_id

@@ -3,11 +3,14 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from marketcow.__main__ import (
     _public_csv_job,
     _write_csv_import_evidence,
     build_parser,
+    import_csv_bars,
 )
 from marketcow.config import Settings
 
@@ -48,6 +51,63 @@ class CsvImportCliTest(unittest.TestCase):
             self.assertIn('"status": "succeeded"', body)
             with self.assertRaises(FileExistsError):
                 _write_csv_import_evidence(str(target), payload)
+
+    def test_cli_disables_background_scheduler_to_avoid_server_lease(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = root / "declaration.json"
+            config.write_text("""{
+              "contract_version":"marketcow.csv-bars.v1",
+              "source":"vendor","interval":"1m","adjustment":"raw",
+              "profile":{"name":"vendor","version":"1",
+                "columns":{"timestamp":"t","open":"o","high":"h",
+                  "low":"l","close":"c"},
+                "timezone_name":"UTC","fixed_external_symbol":"AAPL.US"},
+              "instruments":{"namespace":"provider:vendor",
+                "symbols":{"AAPL.US":"AAPL.XNAS"}}
+            }""", encoding="utf-8")
+            settings = Settings(
+                raw_path=root / "raw", storage_root=root,
+                allowed_root=root, postgres_dsn="postgresql://local",
+                clickhouse_password="secret",
+                clickhouse_background_canonical=True,
+            )
+            captured = {}
+
+            class Imports:
+                def dry_run(self, *_args):
+                    return {
+                        "contract_version": "marketcow.csv-bars.v1",
+                        "status": "valid", "file": {"name": "sample.csv"},
+                        "source": "vendor", "profile": "vendor@1",
+                        "namespace": "provider:vendor", "interval": "1m",
+                        "adjustment": "raw",
+                    }
+
+                def close(self):
+                    pass
+
+            class Service:
+                def __init__(self, value):
+                    captured["settings"] = value
+
+                def close(self):
+                    pass
+
+            with patch(
+                "marketcow.service.FundamentalService", Service
+            ), patch(
+                "marketcow.csv_import_service.create_csv_import_service",
+                return_value=Imports(),
+            ):
+                result = import_csv_bars(settings, SimpleNamespace(
+                    config=str(config), file=str(root / "sample.csv"),
+                    dry_run=True, evidence_output="",
+                ))
+        self.assertEqual(result["status"], "valid")
+        self.assertFalse(
+            captured["settings"].clickhouse_background_canonical
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,47 @@
+{
+  "contract_version": "marketcow.csv-bars.v1",
+  "source": "purchased_vendor_2025",
+  "interval": "1m",
+  "adjustment": "raw",
+  "created_by": "local-data-operator",
+  "source_proof": "operator-authorized-local-dataset-2025",
+  "retention_policy": "retain-until-explicit-deletion",
+  "profile": {
+    "name": "purchased-us-minute-bars",
+    "version": "2025.1",
+    "columns": {
+      "timestamp": "DateTime",
+      "open": "Open",
+      "high": "High",
+      "low": "Low",
+      "close": "Close",
+      "volume": "Volume"
+    },
+    "timezone_name": "America/New_York",
+    "timestamp_format": "%Y-%m-%d %H:%M:%S",
+    "encoding": "utf-8-sig",
+    "delimiter": ",",
+    "fixed_external_symbol": "AAPL.US",
+    "allow_extra_columns": false,
+    "defaults": {},
+    "price_multiplier": "1",
+    "volume_multiplier": "1",
+    "amount_multiplier": "1",
+    "price_precision": 4,
+    "volume_precision": 0,
+    "amount_precision": null,
+    "trading_sessions": [
+      {
+        "start": "04:00",
+        "end": "20:00",
+        "weekdays": [0, 1, 2, 3, 4]
+      }
+    ]
+  },
+  "instruments": {
+    "namespace": "provider:purchased_vendor_2025",
+    "symbols": {
+      "AAPL.US": "AAPL.XNAS"
+    }
+  }
+}

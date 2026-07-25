@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -146,8 +147,9 @@ def import_csv_bars(settings: Settings, args: Any) -> dict[str, Any]:
     declaration = CsvImportRequest.from_dict(json.loads(
         config_path.read_text(encoding="utf-8")
     ))
-    service = FundamentalService(settings)
-    imports = create_csv_import_service(settings, service)
+    cli_settings = replace(settings, clickhouse_background_canonical=False)
+    service = FundamentalService(cli_settings)
+    imports = create_csv_import_service(cli_settings, service)
     try:
         if args.dry_run:
             report = imports.dry_run(args.file, declaration)

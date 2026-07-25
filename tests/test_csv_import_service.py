@@ -68,10 +68,10 @@ class Builder:
         self.bars = bars
         self.calls = []
 
-    def rebuild(self, *args):
-        self.calls.append(args)
+    def rebuild(self, *args, **kwargs):
+        self.calls.append((*args, kwargs))
         self.bars.canonical = True
-        return {"status": "success"}
+        return {"status": "ok"}
 
 
 def declaration():
@@ -91,6 +91,39 @@ def declaration():
 
 
 class CsvImportServiceTest(unittest.TestCase):
+    def test_truncated_canonical_ranges_are_split_until_complete(self):
+        class SplittingBuilder:
+            def __init__(self):
+                self.calls = []
+
+            def rebuild(
+                self, _instrument, _interval, _adjustment,
+                start, end, limit,
+            ):
+                self.calls.append((start, end, limit))
+                span_ms = int((end - start).total_seconds() * 1000)
+                return {
+                    "status": "truncated" if span_ms > 1 else "ok"
+                }
+
+        with tempfile.TemporaryDirectory() as folder:
+            builder = SplittingBuilder()
+            service = CsvImportService(
+                allowed_root=Path(folder),
+                storage_root=Path(folder) / "storage",
+                metadata_repository=MemoryRepository(),
+                market_bar_repository=Bars(), artifact_store=Artifacts(),
+                canonical_builder=builder,
+            )
+            try:
+                service._rebuild_canonical_range(
+                    "AAPL.XNAS", "1m", "raw", 0, 3
+                )
+            finally:
+                service.close()
+        self.assertEqual(len(builder.calls), 3)
+        self.assertTrue(all(call[2] == 100000 for call in builder.calls))
+
     def test_one_service_drives_dry_run_archive_job_canonical_and_quality(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

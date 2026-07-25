@@ -152,7 +152,7 @@ class CsvImportService:
     def _finalize_job(self, job: dict[str, Any]) -> dict[str, Any]:
         request = CsvImportRequest.from_dict(job["request_json"]["request"])
         if self.canonical_builder is not None:
-            ranges: dict[str, tuple[int, int]] = {}
+            ranges: set[tuple[str, int, int]] = set()
             for shard in job["shards"]:
                 for receipt in (
                     shard.get("write_receipt_json") or {}
@@ -163,21 +163,55 @@ class CsvImportService:
                     if durable is None:
                         continue
                     instrument_id = str(receipt["instrument_id"])
-                    start, end = ranges.get(instrument_id, (
+                    ranges.add((
+                        instrument_id,
                         int(durable["first_bar_at_ms"]),
                         int(durable["last_bar_at_ms"]),
                     ))
-                    ranges[instrument_id] = (
-                        min(start, int(durable["first_bar_at_ms"])),
-                        max(end, int(durable["last_bar_at_ms"])),
-                    )
-            for instrument_id, (start_ms, end_ms) in sorted(ranges.items()):
-                self.canonical_builder.rebuild(
-                    instrument_id, request.interval, request.adjustment,
-                    datetime.fromtimestamp(start_ms / 1000, timezone.utc),
-                    datetime.fromtimestamp(end_ms / 1000, timezone.utc),
+            for instrument_id, start_ms, end_ms in sorted(ranges):
+                self._rebuild_canonical_range(
+                    instrument_id,
+                    request.interval,
+                    request.adjustment,
+                    start_ms,
+                    end_ms,
                 )
         return self.quality.verify(job)
+
+    def _rebuild_canonical_range(
+        self,
+        instrument_id: str,
+        interval: str,
+        adjustment: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> None:
+        result = self.canonical_builder.rebuild(
+            instrument_id,
+            interval,
+            adjustment,
+            datetime.fromtimestamp(start_ms / 1000, timezone.utc),
+            datetime.fromtimestamp(end_ms / 1000, timezone.utc),
+            limit=100000,
+        )
+        if result.get("status") == "ok":
+            return
+        if result.get("status") != "truncated":
+            raise RuntimeError(
+                "canonical rebuild failed: "
+                + str(result.get("status") or "unknown")
+            )
+        if start_ms >= end_ms:
+            raise RuntimeError(
+                "canonical rebuild cannot split a truncated millisecond"
+            )
+        midpoint = start_ms + (end_ms - start_ms) // 2
+        self._rebuild_canonical_range(
+            instrument_id, interval, adjustment, start_ms, midpoint
+        )
+        self._rebuild_canonical_range(
+            instrument_id, interval, adjustment, midpoint + 1, end_ms
+        )
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         return self.manager.get(job_id)

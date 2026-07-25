@@ -11,6 +11,7 @@ from marketcow.postgres_repositories import (
     PostgresDatabase,
     PostgresFundamentalRepository,
     PostgresMetadataRepository,
+    _csv_import_row,
 )
 from marketcow.backup_bundle import BackupComponent
 from marketcow.postgres_migrations import (
@@ -21,6 +22,15 @@ from marketcow.repositories import ControlPlaneRepository
 
 
 class PostgresDomainInventoryTest(unittest.TestCase):
+    def test_csv_repository_decodes_text_from_sql_ascii_clusters(self):
+        decoded = _csv_import_row({
+            "job_id": b"job", "status": b"queued",
+            "rows_total": 1, "request_json": {"source": "vendor"},
+        })
+        self.assertEqual(decoded["job_id"], "job")
+        self.assertEqual(decoded["status"], "queued")
+        self.assertEqual(decoded["request_json"], {"source": "vendor"})
+
     def test_bg003_inventory_is_explicit_and_complete(self):
         self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 25)
         self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 25)
