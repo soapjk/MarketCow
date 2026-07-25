@@ -159,6 +159,16 @@ class TushareHistoryWindowTest(unittest.TestCase):
         self.assertEqual(result["adjustment"], "raw")
         self.assertEqual(result["bars"][0]["raw_close"], 10)
         self.assertEqual(result["bars"][0]["adjustment_factor"], "12.3456")
+        self.assertEqual(
+            result["bars"][0]["corporate_action_factor"], "12.3456"
+        )
+        self.assertEqual(
+            result["bars"][0]["applied_adjustment_multiplier"], "1"
+        )
+        self.assertEqual(result["bars"][0]["factor_source"], "tushare_fixture")
+        self.assertEqual(
+            result["bars"][0]["factor_artifact_id"], "artifact-adj_factor"
+        )
         self.assertEqual(saved_bars[0]["adjustment_factor"], "12.3456")
 
 

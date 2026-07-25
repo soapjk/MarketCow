@@ -70,6 +70,7 @@ from .provider_routing import (
     ProviderUnavailable,
     select_providers,
 )
+from .price_adjustment import PriceAdjustmentContract
 from .exposure_facts import ExposureFactsService, RepositoryExposureFactSource
 
 
@@ -407,7 +408,22 @@ class FundamentalService:
                 datetime.fromisoformat(str(bar["bar_at"]).replace("Z", "+00:00"))
                 .astimezone(shanghai).date().isoformat()
             )
-            bar["adjustment_factor"] = factors_by_date[trade_date]
+            factor = factors_by_date[trade_date]
+            # Keep adjustment_factor during the compatibility window. New
+            # consumers must use the two explicit fields below.
+            contract = PriceAdjustmentContract.model_validate({
+                "adjustment": "raw",
+                "factor_applicability": "applicable",
+                "corporate_action_factor": factor,
+                "applied_adjustment_multiplier": "1",
+                "adjustment_reference_date": None,
+                "reference_factor": None,
+                "factor_source": self.tushare_provider.name,
+                "factor_artifact_id": factor_artifact["artifact_id"],
+                "factor_as_of": ingested_at,
+            })
+            bar["adjustment_factor"] = factor
+            bar.update(contract.model_dump())
         factor_count = self.market_bar_repository.upsert_adjustment_factors(
             instrument.instrument_id, self.tushare_provider.name, ingested_at,
             factors,
