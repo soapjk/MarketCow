@@ -104,6 +104,63 @@ class TushareHistoryWindowTest(unittest.TestCase):
                 "raw",
             )
 
+    def test_raw_tushare_bars_are_enriched_with_the_daily_factor(self):
+        saved_bars = []
+        provider = SimpleNamespace(
+            name="tushare_fixture",
+            base_url="https://example.test",
+            call=lambda api, _params, _fields: (
+                {"data": {"fields": [], "items": []}}
+                if api == "stk_mins"
+                else {
+                    "data": {
+                        "fields": ["ts_code", "trade_date", "adj_factor"],
+                        "items": [["600519.SH", "20260102", 12.3456]],
+                    }
+                }
+            ),
+            minute_bars=lambda _result: [{
+                "bar_at": "2026-01-02T01:35:00+00:00",
+                "close": 10,
+                "raw_close": 10,
+                "adjustment_factor": None,
+            }],
+            adjustment_factors=lambda _result, _symbol: [{
+                "trade_date": "2026-01-02",
+                "adjustment_factor": "12.3456",
+            }],
+        )
+        service = SimpleNamespace(
+            tushare_provider=provider,
+            _persist_tushare_response=lambda api, *_args: {
+                "storage_path": f"/tmp/{api}", "artifact_id": f"artifact-{api}"
+            },
+            market_bar_repository=SimpleNamespace(
+                upsert_price_bars=lambda _symbol, _interval, _adjustment,
+                _source, _ingested_at, bars, _provenance: (
+                    saved_bars.extend(bars) or len(bars)
+                ),
+                upsert_adjustment_factors=lambda *_args: 1,
+            ),
+            metadata_repository=SimpleNamespace(
+                record_provider_health=lambda *_args: None
+            ),
+        )
+
+        result = FundamentalService.refresh_tushare_minute_history_window(
+            service,
+            "600519.XSHG",
+            datetime(2026, 1, 2, tzinfo=timezone.utc),
+            datetime(2026, 1, 3, tzinfo=timezone.utc),
+            "5m",
+            "raw",
+        )
+
+        self.assertEqual(result["adjustment"], "raw")
+        self.assertEqual(result["bars"][0]["raw_close"], 10)
+        self.assertEqual(result["bars"][0]["adjustment_factor"], "12.3456")
+        self.assertEqual(saved_bars[0]["adjustment_factor"], "12.3456")
+
 
 if __name__ == "__main__":
     unittest.main()

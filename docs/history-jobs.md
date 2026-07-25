@@ -97,6 +97,8 @@ curl -X POST http://127.0.0.1:8790/v1/admin/history-jobs \
 `trade_date + adjustment_factor` 日频序列写入 ClickHouse
 `market_adjustment_factor`。因子与分片使用相同的 `ingestion_id`；只要分钟 K 线中
 某个交易日缺少对应因子，该分片就会失败，而不会留下一个表面成功但无法复权的数据集。
+同一个真实因子也会写入每根原始 K 线的 `adjustment_factor` 字段，方便下游逐行计算；
+独立因子表使用 `Decimal128(18)` 保存高精度值，并承担来源追踪和按日复用。
 
 这不改变 `adjustment=raw` 的含义：K 线价格仍按上游原始值保存，下载阶段不自动生成
 前复权或后复权价格。后续计算必须使用已保存的因子序列，并显式选择基准日。复权因子是

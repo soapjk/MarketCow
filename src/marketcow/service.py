@@ -398,6 +398,16 @@ class FundamentalService:
             raise ValueError(
                 f"Tushare adj_factor is missing {len(missing_dates)} bar dates: {preview}"
             )
+        factors_by_date = {
+            factor["trade_date"]: factor["adjustment_factor"]
+            for factor in factors
+        }
+        for bar in bars:
+            trade_date = (
+                datetime.fromisoformat(str(bar["bar_at"]).replace("Z", "+00:00"))
+                .astimezone(shanghai).date().isoformat()
+            )
+            bar["adjustment_factor"] = factors_by_date[trade_date]
         factor_count = self.market_bar_repository.upsert_adjustment_factors(
             instrument.instrument_id, self.tushare_provider.name, ingested_at,
             factors,

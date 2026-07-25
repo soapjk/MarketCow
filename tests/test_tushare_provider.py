@@ -49,6 +49,7 @@ class TushareProviderTest(unittest.TestCase):
         self.assertEqual(bars[0]["amount"], 12120)
         self.assertEqual(bars[0]["source_payload"]["ts_code"], "600000.SH")
         self.assertEqual(bars[0]["bar_at"], "2026-07-17T01:35:00+00:00")
+        self.assertIsNone(bars[0]["adjustment_factor"])
 
     def test_adjustment_factors_are_validated_sorted_and_deduplicated(self):
         result = {

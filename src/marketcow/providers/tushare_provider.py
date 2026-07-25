@@ -86,7 +86,7 @@ class TushareProvider:
                 "timestamp": int(utc_value.timestamp()),
                 "bar_at": utc_value.isoformat(timespec="seconds"),
                 "open": row.get("open"), "high": row.get("high"), "low": row.get("low"),
-                "close": close, "raw_close": close, "adjustment_factor": 1.0,
+                "close": close, "raw_close": close, "adjustment_factor": None,
                 "volume": row.get("vol") if row.get("vol") is not None else row.get("volume"),
                 "amount": row.get("amount"), "source_payload": row,
             })
