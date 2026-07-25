@@ -5,7 +5,8 @@
 重试、canonical 等待时间和幂等键。
 
 ```bash
-curl -X POST http://127.0.0.1:8790/v1/admin/history-jobs \
+curl -X POST "${MARKETCOW_API_URL:-http://127.0.0.1:8790}/v1/admin/history-jobs" \
+  -H "Authorization: Bearer $MARKETCOW_API_KEY" \
   -H 'content-type: application/json' -d '{
     "symbols":["AAPL.XNAS","MSFT.XNAS"],
     "provider":"yahoo",

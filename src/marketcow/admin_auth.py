@@ -20,6 +20,8 @@ CSRF_COOKIE = "marketcow_csrf"
 ROLES = {"viewer": 1, "operator": 2, "admin": 3}
 MAX_SESSIONS = 128
 _USERNAME = re.compile(r"^[A-Za-z0-9_.-]{3,64}$")
+_SERVICE_ACCOUNT_ID = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
+_SCOPE = re.compile(r"^[a-z][a-z0-9_-]{1,31}:(read|write)$")
 _SCRYPT_N = 16384
 _SCRYPT_R = 8
 _SCRYPT_P = 1
@@ -31,6 +33,7 @@ class Identity:
     role: str
     csrf: str = ""
     cookie_session: bool = False
+    scopes: frozenset[str] = frozenset({"*"})
 
 
 @dataclass
@@ -43,6 +46,14 @@ class _Session:
 class AdminUser:
     role: str
     password_hash: str
+
+
+@dataclass(frozen=True)
+class ServiceAccount:
+    role: str
+    key_hash: str
+    scopes: frozenset[str]
+    enabled: bool = True
 
 
 def load_admin_tokens(raw: str) -> dict[str, str]:
@@ -146,6 +157,67 @@ def load_admin_users(raw: str) -> dict[str, AdminUser]:
     return result
 
 
+def hash_service_api_key(api_key: str) -> str:
+    if not isinstance(api_key, str) or not api_key.startswith("mcsa."):
+        raise ValueError("service API key format is invalid")
+    parts = api_key.split(".", 2)
+    if (
+        len(parts) != 3
+        or not _SERVICE_ACCOUNT_ID.fullmatch(parts[1])
+        or len(parts[2]) < 32
+    ):
+        raise ValueError("service API key format is invalid")
+    return "sha256:" + hashlib.sha256(api_key.encode()).hexdigest()
+
+
+def generate_service_api_key(account_id: str) -> tuple[str, str]:
+    normalized = account_id.strip().lower()
+    if not _SERVICE_ACCOUNT_ID.fullmatch(normalized):
+        raise ValueError("service account id is invalid")
+    api_key = f"mcsa.{normalized}.{secrets.token_urlsafe(32)}"
+    return api_key, hash_service_api_key(api_key)
+
+
+def load_service_accounts(raw: str) -> dict[str, ServiceAccount]:
+    if not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("service accounts must be valid JSON") from exc
+    if not isinstance(value, Mapping) or not 1 <= len(value) <= 100:
+        raise ValueError("service accounts must be an object with 1 to 100 entries")
+    result = {}
+    for account_id, declaration in value.items():
+        account_id = str(account_id).strip().lower()
+        if (
+            not _SERVICE_ACCOUNT_ID.fullmatch(account_id)
+            or not isinstance(declaration, Mapping)
+        ):
+            raise ValueError("service account declaration is invalid")
+        role = str(declaration.get("role", "")).strip().lower()
+        key_hash = str(declaration.get("key_hash", "")).strip().lower()
+        scopes = declaration.get("scopes")
+        enabled = declaration.get("enabled", True)
+        if (
+            role not in ROLES
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", key_hash)
+            or not isinstance(scopes, list)
+            or not 1 <= len(scopes) <= 32
+            or not isinstance(enabled, bool)
+        ):
+            raise ValueError("service account credentials are invalid")
+        normalized_scopes = frozenset(str(scope).strip().lower() for scope in scopes)
+        if len(normalized_scopes) != len(scopes) or not all(
+            _SCOPE.fullmatch(scope) for scope in normalized_scopes
+        ):
+            raise ValueError("service account scopes are invalid")
+        result[account_id] = ServiceAccount(
+            role=role, key_hash=key_hash, scopes=normalized_scopes, enabled=enabled
+        )
+    return result
+
+
 _DUMMY_PASSWORD_HASH = hash_admin_password(
     "marketcow-invalid-login", salt=b"\0" * 16
 )
@@ -156,16 +228,17 @@ class AdminAuth:
 
     def __init__(
         self, required: bool, tokens_json: str = "", session_seconds: int = 28800,
-        clock: Any = None, users_json: str = "",
+        clock: Any = None, users_json: str = "", service_accounts_json: str = "",
     ) -> None:
         if not 300 <= session_seconds <= 2592000:
             raise ValueError("admin session duration is invalid")
         self.required = bool(required)
         self.tokens = load_admin_tokens(tokens_json)
         self.users = load_admin_users(users_json)
-        if self.required and not (self.tokens or self.users):
+        self.service_accounts = load_service_accounts(service_accounts_json)
+        if self.required and not (self.tokens or self.users or self.service_accounts):
             raise ValueError(
-                "admin authentication requires at least one token or user"
+                "admin authentication requires at least one token, user or service account"
             )
         self.session_seconds = session_seconds
         self.clock = clock or time.time
@@ -217,6 +290,9 @@ class AdminAuth:
         authorization = headers.get("authorization", "")
         if authorization.startswith("Bearer "):
             token = authorization[7:]
+            service_identity = self._authenticate_service_account(token)
+            if service_identity is not None:
+                return service_identity
             for candidate, role in self.tokens.items():
                 if hmac.compare_digest(token, candidate):
                     return Identity(actor=f"token-{role}", role=role)
@@ -232,6 +308,25 @@ class AdminAuth:
             self._sessions.move_to_end(session_id)
             return session.identity
 
+    def _authenticate_service_account(self, token: str) -> Identity | None:
+        parts = token.split(".", 2)
+        if len(parts) != 3 or parts[0] != "mcsa":
+            return None
+        account = self.service_accounts.get(parts[1])
+        if account is None or not account.enabled:
+            return None
+        try:
+            actual_hash = hash_service_api_key(token)
+        except ValueError:
+            return None
+        if not hmac.compare_digest(actual_hash, account.key_hash):
+            return None
+        return Identity(
+            actor=f"service:{parts[1]}",
+            role=account.role,
+            scopes=account.scopes,
+        )
+
     def _expire(self) -> None:
         now = self.clock()
         expired = [
@@ -244,6 +339,10 @@ class AdminAuth:
     @staticmethod
     def permits(identity: Identity, role: str) -> bool:
         return ROLES.get(identity.role, 0) >= ROLES[role]
+
+    @staticmethod
+    def permits_scope(identity: Identity, scope: str) -> bool:
+        return "*" in identity.scopes or scope in identity.scopes
 
     @staticmethod
     def csrf_valid(identity: Identity, headers: Mapping[str, str]) -> bool:
@@ -296,6 +395,17 @@ class AdminSecurityMiddleware:
                     headers=_security_headers(),
                 )(scope, receive, send)
                 return
+            required_scope = self._required_scope(path, scope.get("method", "GET"))
+            if not self.auth.permits_scope(identity, required_scope):
+                await JSONResponse(
+                    {"detail": {
+                        "code": "insufficient_scope",
+                        "required": required_scope,
+                    }},
+                    status_code=403,
+                    headers=_security_headers(),
+                )(scope, receive, send)
+                return
             if scope.get("method") not in {"GET", "HEAD", "OPTIONS"} and not self.auth.csrf_valid(
                 identity, headers
             ):
@@ -318,6 +428,12 @@ class AdminSecurityMiddleware:
             await send(message)
 
         await self.app(scope, receive, secure_send)
+
+    @staticmethod
+    def _required_scope(path: str, method: str) -> str:
+        namespace = "history" if path.startswith("/v1/admin/history-jobs") else "admin"
+        action = "read" if method in {"GET", "HEAD", "OPTIONS"} else "write"
+        return f"{namespace}:{action}"
 
 
 def _parse_cookies(value: str) -> dict[str, str]:

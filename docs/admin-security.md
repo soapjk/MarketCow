@@ -19,6 +19,37 @@ Long bootstrap tokens remain available for API automation:
 
 ```dotenv
 MARKETCOW_ADMIN_TOKENS_JSON={"long-viewer-token":"viewer","long-operator-token":"operator","long-admin-token":"admin"}
+
+## 服务间调用
+
+批量历史数据下载使用独立的 Service Account，不使用管理员用户名、密码、
+浏览器 Cookie，也不要求调用方位于 MarketCow 项目目录。
+
+生成一次性密钥和服务端声明：
+
+```bash
+marketcow service-account generate \
+  --id history-worker \
+  --role operator \
+  --scopes history:read,history:write
+```
+
+命令输出的 `api_key` 只交给调用服务保存。将
+`service_accounts_json` 对象配置为服务端的
+`MARKETCOW_SERVICE_ACCOUNTS_JSON`。服务端仅保存 API Key 的 SHA-256
+摘要。调用服务只需：
+
+```bash
+export MARKETCOW_API_URL=http://127.0.0.1:8790
+export MARKETCOW_API_KEY='mcsa.history-worker.<secret>'
+
+curl -fsS "$MARKETCOW_API_URL/v1/admin/history-jobs?limit=20" \
+  -H "Authorization: Bearer $MARKETCOW_API_KEY"
+```
+
+`history:read` 可查询任务，`history:write` 可创建、取消和重试任务。
+该密钥访问其他后台管理接口会返回 `403 insufficient_scope`。通过
+`enabled: false` 可以立即停用某个调用方；轮换时生成新密钥并更新摘要。
 ```
 
 Keep these values in the uncommitted profile environment file. Passwords must contain

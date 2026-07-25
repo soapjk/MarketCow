@@ -94,6 +94,7 @@ class Settings:
     admin_auth_required: bool = False
     admin_tokens_json: str = ""
     admin_users_json: str = ""
+    service_accounts_json: str = ""
     admin_session_seconds: int = 28800
     admin_cookie_secure: bool = False
     admin_frontend_enabled: bool = True
@@ -262,6 +263,7 @@ class Settings:
             ),
             admin_tokens_json=os.getenv("MARKETCOW_ADMIN_TOKENS_JSON", ""),
             admin_users_json=os.getenv("MARKETCOW_ADMIN_USERS_JSON", ""),
+            service_accounts_json=os.getenv("MARKETCOW_SERVICE_ACCOUNTS_JSON", ""),
             admin_session_seconds=int(os.getenv(
                 "MARKETCOW_ADMIN_SESSION_SECONDS", "28800"
             )),

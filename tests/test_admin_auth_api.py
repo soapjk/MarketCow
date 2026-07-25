@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from marketcow.api import create_app
-from marketcow.admin_auth import hash_admin_password
+from marketcow.admin_auth import generate_service_api_key, hash_admin_password
 from marketcow.config import Settings
 from tests.test_market_data_api import Service
 
@@ -37,6 +37,17 @@ class AdminAuthApiTest(unittest.TestCase):
                     "correct horse battery staple", salt=b"0123456789abcdef"
                 )
                 + '"}}'
+            ),
+        )
+        self.service_api_key, service_key_hash = generate_service_api_key(
+            "history-worker"
+        )
+        self.settings = replace(
+            self.settings,
+            service_accounts_json=(
+                '{"history-worker":{"role":"operator","key_hash":"'
+                + service_key_hash
+                + '","scopes":["history:read","history:write"],"enabled":true}}'
             ),
         )
 
@@ -117,6 +128,19 @@ class AdminAuthApiTest(unittest.TestCase):
                 json={"username": "admin", "password": "wrong password"},
             )
             self.assertEqual(rejected.status_code, 401)
+
+    def test_service_account_is_limited_to_history_job_routes(self):
+        headers = {"Authorization": f"Bearer {self.service_api_key}"}
+        with TestClient(create_app(self.settings, Service())) as client:
+            history = client.get("/v1/admin/history-jobs?limit=1", headers=headers)
+            self.assertNotEqual(history.status_code, 401)
+            self.assertNotEqual(history.status_code, 403)
+            unrelated = client.get("/v1/admin/dashboards", headers=headers)
+            self.assertEqual(unrelated.status_code, 403)
+            self.assertEqual(
+                unrelated.json()["detail"],
+                {"code": "insufficient_scope", "required": "admin:read"},
+            )
 
 
 if __name__ == "__main__":

@@ -219,6 +219,7 @@ def create_app(
         settings.admin_tokens_json,
         settings.admin_session_seconds,
         users_json=settings.admin_users_json,
+        service_accounts_json=settings.service_accounts_json,
     )
     app.add_middleware(
         AdminSecurityMiddleware,

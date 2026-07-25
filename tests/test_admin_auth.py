@@ -4,7 +4,8 @@ import unittest
 
 from marketcow.admin_auth import (
     AdminAuth, AdminSecurityMiddleware, Identity, hash_admin_password,
-    load_admin_tokens, load_admin_users, verify_admin_password,
+    generate_service_api_key, hash_service_api_key, load_admin_tokens,
+    load_admin_users, load_service_accounts, verify_admin_password,
 )
 
 
@@ -89,6 +90,41 @@ class AdminAuthTest(unittest.TestCase):
             object(), AdminAuth(False), commands_enabled=False
         )
         self.assertFalse(middleware.commands_enabled)
+
+    def test_service_accounts_use_hashed_keys_and_scoped_identities(self):
+        api_key, key_hash = generate_service_api_key("history-worker")
+        self.assertTrue(api_key.startswith("mcsa.history-worker."))
+        self.assertEqual(hash_service_api_key(api_key), key_hash)
+        declaration = (
+            '{"history-worker":{"role":"operator","key_hash":"' + key_hash
+            + '","scopes":["history:read","history:write"],"enabled":true}}'
+        )
+        accounts = load_service_accounts(declaration)
+        self.assertNotIn(api_key, declaration)
+        self.assertEqual(accounts["history-worker"].key_hash, key_hash)
+        auth = AdminAuth(True, service_accounts_json=declaration)
+        identity = auth.authenticate(
+            {"authorization": f"Bearer {api_key}"}, {}
+        )
+        self.assertEqual(identity.actor, "service:history-worker")
+        self.assertTrue(auth.permits_scope(identity, "history:write"))
+        self.assertFalse(auth.permits_scope(identity, "admin:read"))
+        self.assertIsNone(auth.authenticate(
+            {"authorization": "Bearer mcsa.history-worker.invalid-secret-value"}, {}
+        ))
+
+    def test_disabled_and_invalid_service_accounts_fail_closed(self):
+        api_key, key_hash = generate_service_api_key("history-worker")
+        declaration = (
+            '{"history-worker":{"role":"operator","key_hash":"' + key_hash
+            + '","scopes":["history:read"],"enabled":false}}'
+        )
+        auth = AdminAuth(True, service_accounts_json=declaration)
+        self.assertIsNone(auth.authenticate(
+            {"authorization": f"Bearer {api_key}"}, {}
+        ))
+        with self.assertRaisesRegex(ValueError, "scopes"):
+            load_service_accounts(declaration.replace("history:read", "unknown"))
 
 
 if __name__ == "__main__":

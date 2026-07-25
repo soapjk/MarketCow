@@ -75,6 +75,17 @@ def build_parser(settings: Settings) -> argparse.ArgumentParser:
     cleanup = actions.add_parser("cleanup-replayed")
     cleanup.add_argument("--retention-seconds", type=int, required=True)
     cleanup.add_argument("--limit", type=int, default=100)
+    service_account = commands.add_parser("service-account")
+    service_actions = service_account.add_subparsers(
+        dest="service_account_action", required=True
+    )
+    generate = service_actions.add_parser("generate")
+    generate.add_argument("--id", required=True)
+    generate.add_argument("--role", choices=("viewer", "operator"), default="operator")
+    generate.add_argument(
+        "--scopes", default="history:read,history:write",
+        help="comma-separated capability scopes",
+    )
     return parser
 
 
@@ -125,6 +136,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     settings = Settings.from_env(profile)
     args = build_parser(settings).parse_args(arguments)
     try:
+        if args.command == "service-account":
+            from .admin_auth import generate_service_api_key, load_service_accounts
+
+            api_key, key_hash = generate_service_api_key(args.id)
+            scopes = [scope.strip().lower() for scope in args.scopes.split(",") if scope.strip()]
+            declaration = {
+                args.id.strip().lower(): {
+                    "role": args.role,
+                    "key_hash": key_hash,
+                    "scopes": scopes,
+                    "enabled": True,
+                }
+            }
+            load_service_accounts(json.dumps(declaration))
+            print(json.dumps({
+                "api_key": api_key,
+                "service_accounts_json": declaration,
+                "warning": "The API key is shown once. Store it in the calling service.",
+            }, ensure_ascii=False, indent=2))
+            return 0
         settings.validate_preflight()
         if args.command == "init":
             print(json.dumps(initialize(settings), ensure_ascii=False, indent=2))
