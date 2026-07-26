@@ -85,3 +85,16 @@ Grafana、聚合指标和实时面板边界见
 
 完整验证、分阶段启用、故障降级和回退方法见
 [可视化运维手册](docs/visualization/operations-runbook.md)。
+
+## MCP
+
+MarketCow 服务启动时会默认在同一端口提供只读 MCP 入口。Agent 可通过它搜索标的、
+读取缓存报价、历史 K 线、基本面、财务报表、分红及敞口事实：
+
+```bash
+uv run marketcow --profile development start --host 127.0.0.1 --port 8792
+# MCP endpoint: http://127.0.0.1:8792/mcp
+```
+
+MCP 不直连数据库，也不开放刷新、导入或管理写操作。客户端配置、工具清单和分析时的
+数据契约注意事项见 [MCP Server 文档](docs/mcp-server.md)。

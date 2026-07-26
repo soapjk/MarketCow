@@ -122,6 +122,20 @@ class PostgresDomainInventoryTest(unittest.TestCase):
             statement,
         )
 
+    def test_csv_v2_migration_is_a_hard_cutover(self):
+        version, description, statement = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 23
+        )
+
+        self.assertEqual(
+            description,
+            "hard migrate CSV import declarations to explicit adjustment v2",
+        )
+        self.assertIn("marketcow.csv-bars.v2", statement)
+        self.assertIn("NOT IN ('raw', 'qfq', 'hfq')", statement)
+        self.assertIn("csv_import_job_contract_v2_check", statement)
+        self.assertIn("VALIDATE CONSTRAINT", statement)
+
 
 @unittest.skipUnless(
     os.getenv("MARKETCOW_TEST_POSTGRES_DSN"),

@@ -49,10 +49,10 @@ class YahooQuoteProviderTest(unittest.TestCase):
         self.assertEqual(quote["session"], "post_market")
         self.assertEqual(quote["price_adjustment"], "raw")
 
-    def test_legacy_adjusted_input_emits_explicit_qfq_contract(self):
+    def test_qfq_history_emits_explicit_adjustment_contract(self):
         provider = YahooQuoteProvider()
         with patch.object(provider, "_fetch_chart", return_value=(PAYLOAD, "https://example/0700.HK")):
-            history = provider.fetch_history("700.XHKG", "1y", "1d", "adjusted")
+            history = provider.fetch_history("700.XHKG", "1y", "1d", "qfq")
         self.assertEqual(history["instrument_id"], "700.XHKG")
         self.assertEqual(history["bars"][0]["close"], 242.5)
         self.assertEqual(history["bars"][0]["open"], 240.0)

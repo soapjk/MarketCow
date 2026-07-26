@@ -10,7 +10,6 @@ from .market_data_contracts import DecimalString, number, utc
 
 
 PriceAdjustment = Literal["raw", "qfq", "hfq"]
-LegacyPriceAdjustment = Literal["raw", "qfq", "hfq", "adjusted"]
 FactorApplicability = Literal["applicable", "not_applicable"]
 
 
@@ -95,17 +94,3 @@ class PriceAdjustmentContract(BaseModel):
             if multiplier != factor:
                 raise ValueError("hfq multiplier must equal corporate_action_factor")
         return self
-
-
-def normalize_legacy_adjustment(
-    value: LegacyPriceAdjustment, *, adjusted_means: Optional[Literal["qfq", "hfq"]] = None
-) -> PriceAdjustment:
-    """Map legacy input only when its historical meaning is explicitly proven."""
-
-    if value != "adjusted":
-        return value
-    if adjusted_means is None:
-        raise ValueError(
-            "legacy adjustment='adjusted' is ambiguous; qfq or hfq must be explicit"
-        )
-    return adjusted_means

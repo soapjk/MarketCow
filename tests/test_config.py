@@ -37,6 +37,22 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(settings.profile, "test")
             self.assertEqual(settings.postgres_schema, "marketcow_test")
             self.assertEqual(settings.clickhouse_database, "marketcow_test")
+            self.assertTrue(settings.mcp_enabled)
+
+    def test_mcp_is_enabled_by_default_and_can_be_disabled(self):
+        with tempfile.TemporaryDirectory(suffix="-test") as folder:
+            root = Path(folder)
+            env = {
+                "MARKETCOW_PROFILE": "test", "MARKETCOW_HOME": str(root),
+                "MARKETCOW_ALLOWED_ROOT": str(root.parent),
+                "MARKETCOW_POSTGRES_DSN":
+                    "postgresql://user:password@127.0.0.1/marketcow_test",
+                "MARKETCOW_CLICKHOUSE_PASSWORD": "secret",
+                "MARKETCOW_MCP_ENABLED": "false",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                settings = Settings.from_env()
+            self.assertFalse(settings.mcp_enabled)
 
     def test_old_profile_and_missing_database_credentials_fail(self):
         with patch.dict(os.environ, {"MARKETCOW_PROFILE": "v2-test"}, clear=True):

@@ -57,7 +57,7 @@ class CsvImportCliTest(unittest.TestCase):
             root = Path(folder)
             config = root / "declaration.json"
             config.write_text("""{
-              "contract_version":"marketcow.csv-bars.v1",
+              "contract_version":"marketcow.csv-bars.v2",
               "source":"vendor","interval":"1m","adjustment":"raw",
               "profile":{"name":"vendor","version":"1",
                 "columns":{"timestamp":"t","open":"o","high":"h",
@@ -77,7 +77,7 @@ class CsvImportCliTest(unittest.TestCase):
             class Imports:
                 def dry_run(self, *_args):
                     return {
-                        "contract_version": "marketcow.csv-bars.v1",
+                        "contract_version": "marketcow.csv-bars.v2",
                         "status": "valid", "file": {"name": "sample.csv"},
                         "source": "vendor", "profile": "vendor@1",
                         "namespace": "provider:vendor", "interval": "1m",

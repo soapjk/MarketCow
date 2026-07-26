@@ -159,8 +159,18 @@ class CsvImportContractTest(unittest.TestCase):
         original = request()
         restored = CsvImportRequest.from_dict(original.as_dict())
         self.assertEqual(restored.as_dict(), original.as_dict())
+        self.assertEqual(
+            request(adjustment="qfq").as_dict()["adjustment"], "qfq"
+        )
+        self.assertEqual(
+            request(adjustment="hfq").as_dict()["adjustment"], "hfq"
+        )
+        with self.assertRaisesRegex(
+            CsvImportContractError, "raw, qfq or hfq"
+        ):
+            request(adjustment="adjusted")
         broken = original.as_dict()
-        broken["contract_version"] = "future"
+        broken["contract_version"] = "marketcow.csv-bars.v1"
         with self.assertRaisesRegex(CsvImportContractError, "contract version"):
             CsvImportRequest.from_dict(broken)
         unknown = original.as_dict()

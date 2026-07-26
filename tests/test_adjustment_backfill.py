@@ -37,9 +37,9 @@ def row(**updates):
 
 
 class AdjustmentBackfillTest(unittest.TestCase):
-    def test_repairs_tushare_raw_and_keeps_ambiguous_adjusted_quarantined(self):
+    def test_repairs_tushare_raw_and_rejects_non_raw_candidates(self):
         repository = FakeRepository(
-            [row(), row(adjustment="adjusted")],
+            [row(), row(adjustment="qfq")],
             [{
                 "adjustment_factor": "12.3",
                 "source": "tushare_via_stockai888",
@@ -57,7 +57,7 @@ class AdjustmentBackfillTest(unittest.TestCase):
         )
         self.assertEqual(
             plan["quarantine"][0]["reason"],
-            "legacy_adjusted_is_ambiguous",
+            "unsupported_adjustment_value",
         )
         self.assertEqual(repository.inserted, [])
         self.assertEqual(

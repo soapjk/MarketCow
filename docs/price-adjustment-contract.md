@@ -6,8 +6,8 @@ MarketCow 新写入的规范 K 线只允许三种 `adjustment`：
 - `qfq`：OHLC 是以前复权基准计算的价格。
 - `hfq`：OHLC 是以后复权公式计算的价格。
 
-旧值 `adjusted` 只允许出现在兼容读取或迁移入口。只有在调用方能够证明它具体表示
-`qfq` 或 `hfq` 时才能迁移；服务不得猜测。
+CSV v1 历史声明已经一次性迁移到 v2。所有运行时入口只接受上述三个明确值，
+不存在旧值兼容分支。
 
 ## 字段
 
@@ -68,8 +68,8 @@ uv run python scripts/backfill_adjustment_contract.py \
 - Tushare `raw` K 线与同标的、同来源、同上海交易日的日因子精确匹配；
 - 不存在公司行动语义的 CRYPTO `raw` K 线标记为 `not_applicable`。
 
-旧 `adjusted`、找不到日因子的股票 K 线和来源语义无法证明的数据只进入 quarantine
-报告，不会猜测或覆盖。
+找不到日因子的股票 K 线和来源语义无法证明的数据只进入 quarantine 报告，不会
+猜测或覆盖。
 
 ## 2026-07-25 生产验收记录
 

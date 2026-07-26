@@ -212,10 +212,12 @@ def _infer_adjustment(
     normalized_header = {_normalized(value): value for value in header}
     if "adj" in selected.split("_") or "adjusted" in selected.split("_"):
         return {
-            "value": "adjusted", "confidence": "high", "score": 1.0,
+            "value": None, "confidence": "none", "score": 0.0,
             "evidence": [
                 f"The selected close column {selected_close_column!r} "
-                "is explicitly named as adjusted."
+                "is explicitly named as adjusted, but the column name cannot "
+                "distinguish qfq from hfq.",
+                "Select qfq or hfq from the vendor's documented methodology.",
             ],
         }
     adjusted_columns = [

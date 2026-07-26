@@ -62,6 +62,9 @@ test("uploads, preflights and creates an import with an explicit MIC", async () 
     </QueryClientProvider>,
   );
 
+  expect(screen.getByLabelText("复权状态")).toHaveTextContent("前复权");
+  expect(screen.getByLabelText("复权状态")).toHaveTextContent("后复权");
+  expect(screen.getByLabelText("复权状态")).not.toHaveTextContent("adjusted");
   fireEvent.change(screen.getByLabelText("MIC"), { target: { value: "XNYS" } });
   expect(screen.getByText("AAPL.XNYS")).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText(/选择 CSV 文件/), {

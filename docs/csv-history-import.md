@@ -1,8 +1,8 @@
 # CSV 历史 K 线导入契约
 
-状态：MCVI 基础契约，版本 `marketcow.csv-bars.v1`。
+状态：MCVI 明确复权契约，版本 `marketcow.csv-bars.v2`。
 
-机器可读契约见 `docs/csv-import-contract-v1.schema.json`；运行时由
+机器可读契约见 `docs/csv-import-contract-v2.schema.json`；运行时由
 `CsvImportRequest`、`CsvSchemaProfile` 和 `InstrumentMapping` 执行同一组约束。
 
 ## 身份与来源边界
@@ -18,9 +18,10 @@ IBM.US  -> IBM.XNYS
 美股 `.US` 后缀和裸 ticker 都不能决定交易场所。缺少映射、MIC 冲突或未知 MIC
 时整行失败，不推断 XNAS/XNYS。
 
-`adjustment=raw` 表示供应商原始价格；`adjustment=adjusted` 表示供应商已经完成
-拆股/分红复权的价格。两者使用不同的存储键和 Manifest 身份，不允许在同一声明中
-混合。CSV 导入不会猜测或自行生成供应商未提供的复权因子。
+`adjustment=raw` 表示供应商原始价格，`qfq` 表示前复权，`hfq` 表示后复权。
+三者使用不同的存储键和 Manifest 身份，不允许在同一声明中混合。CSV 导入不会
+根据 `Adjusted Close` 等模糊列名猜测前复权或后复权；操作员必须依据供应商说明
+明确选择。
 
 ## Profile
 
@@ -69,7 +70,7 @@ dry-run 以流式方式读取文件，不写业务数据库。它输出：
 
 ```json
 {
-  "contract_version": "marketcow.csv-bars.v1",
+  "contract_version": "marketcow.csv-bars.v2",
   "source": "purchased_vendor",
   "interval": "1m",
   "adjustment": "raw",

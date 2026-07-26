@@ -51,8 +51,9 @@ class CsvImportInferenceTest(unittest.TestCase):
             "DateTime,Adjusted Close\n2025-01-02 09:30:00,99\n",
             columns={"timestamp": "DateTime", "close": "Adjusted Close"},
         )
-        self.assertEqual(adjusted["adjustment"]["value"], "adjusted")
-        self.assertEqual(adjusted["adjustment"]["confidence"], "high")
+        self.assertIsNone(adjusted["adjustment"]["value"])
+        self.assertEqual(adjusted["adjustment"]["confidence"], "none")
+        self.assertIn("qfq from hfq", adjusted["adjustment"]["evidence"][0])
 
         ambiguous = self.infer(
             "DateTime,Close\n2025-01-02 09:30:00,100\n"

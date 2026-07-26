@@ -722,7 +722,7 @@ class ClickHouseMarketBarRepository:
             raise ValueError("limit must be between 1 and 100000")
         result = self._query(
             "SELECT * FROM market_bar_raw FINAL "
-            "WHERE factor_applicability='' OR adjustment='adjusted' "
+            "WHERE factor_applicability='' "
             "ORDER BY symbol,interval,adjustment,source,bar_time "
             "LIMIT {limit:UInt32}",
             {"limit": int(limit)},

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://marketcow.local/contracts/csv-import-v1.schema.json",
-  "title": "MarketCow CSV bars import declaration",
+  "$id": "https://marketcow.local/contracts/csv-import-v2.schema.json",
+  "title": "MarketCow CSV bars import declaration v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -9,7 +9,7 @@
     "profile", "instruments"
   ],
   "properties": {
-    "contract_version": {"const": "marketcow.csv-bars.v1"},
+    "contract_version": {"const": "marketcow.csv-bars.v2"},
     "source": {"type": "string", "minLength": 1},
     "interval": {
       "enum": [
@@ -17,7 +17,7 @@
         "1d", "5d", "1wk", "1mo", "3mo"
       ]
     },
-    "adjustment": {"enum": ["raw", "adjusted"]},
+    "adjustment": {"enum": ["raw", "qfq", "hfq"]},
     "created_by": {"type": "string", "minLength": 1},
     "source_proof": {"type": "string", "minLength": 1},
     "retention_policy": {"type": "string", "minLength": 1},

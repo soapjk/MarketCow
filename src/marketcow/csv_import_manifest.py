@@ -34,6 +34,12 @@ class CsvImportManifest:
     source_proof: str
     retention_policy: str
 
+    def __post_init__(self) -> None:
+        if self.contract_version != CSV_IMPORT_CONTRACT_VERSION:
+            raise ValueError("CSV manifest contract version is not supported")
+        if self.adjustment not in {"raw", "qfq", "hfq"}:
+            raise ValueError("CSV manifest adjustment must be raw, qfq or hfq")
+
     @classmethod
     def create(
         cls,

@@ -109,8 +109,7 @@ window-start range. Bars are strictly ascending without duplicate positions, and
   historical and realtime bars.
 - Supported intervals are `1-MINUTE`, `5-MINUTE`, `15-MINUTE`, `30-MINUTE`, `1-HOUR`,
   and `1-DAY`; arbitrary interval strings are rejected.
-- `adjustment` is explicit: `raw`, `qfq`, or `hfq`. The ambiguous legacy value
-  `adjusted` is rejected by new market-data and history-job requests.
+- `adjustment` is explicit: `raw`, `qfq`, or `hfq`. Every other value is rejected.
 - `raw` means unadjusted provider observations. For assets with corporate actions,
   a raw row still carries `corporate_action_factor`; its
   `applied_adjustment_multiplier` is `1`.
@@ -136,7 +135,7 @@ GET /v1/canonical-bars/AAPL.XNAS?start=2026-07-01T00:00:00Z&end=2026-07-22T23:59
 ```
 
 The second request returns qfq rows only when that exact series exists. It never
-relabels raw or legacy `adjusted` data.
+relabels raw data.
 
 Base URL for local production is configured by the consumer; MarketCow does not prescribe
 an implicit endpoint. The current local convention is HTTP `http://127.0.0.1:8790`.

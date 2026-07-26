@@ -39,7 +39,7 @@ type SemanticInference = {
     alternatives: { value: string; score: number }[];
   };
   adjustment: {
-    value: "raw" | "adjusted" | null;
+    value: "raw" | "qfq" | "hfq" | null;
     confidence: "high" | "medium" | "low" | "none";
     score: number;
     evidence: string[];
@@ -415,7 +415,8 @@ export function CsvImportsPage() {
             <label>复权状态
               <select value={adjustment} onChange={(event) => setAdjustment(event.target.value)}>
                 <option value="raw">raw — 未复权</option>
-                <option value="adjusted">adjusted — 已复权</option>
+                <option value="qfq">qfq — 前复权</option>
+                <option value="hfq">hfq — 后复权</option>
               </select>
             </label>
             <label>CSV 时区

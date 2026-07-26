@@ -22,7 +22,7 @@ Required query parameters:
   both ends for stored bar `window_start`.
 - `interval`: exactly one of `1-MINUTE`, `5-MINUTE`, `15-MINUTE`,
   `30-MINUTE`, `1-HOUR`, `1-DAY`.
-- `adjustment`: exactly `raw` or `adjusted`.
+- `adjustment`: exactly `raw`, `qfq`, or `hfq`.
 - `page_size`: integer `1..5000`.
 - `cursor`: optional opaque cursor returned by the previous page.
 
@@ -153,7 +153,7 @@ All create fields are required:
   `30-MINUTE -> 30m`, `1-HOUR -> 1h`, `1-DAY -> 1d`. Do not use `60m` for a
   Tradude `1-HOUR` dataset because canonical reads map `1-HOUR` to storage
   interval `1h`.
-- `adjustment`: explicit `raw` or `adjusted`.
+- `adjustment`: explicit `raw`, `qfq`, or `hfq`.
 - `allow_fallback`: explicit boolean. Use `false` for a deterministic certified
   workflow unless fallback provenance is expressly accepted.
 - `max_concurrency`: `1..16`; `max_attempts`: `1..10`.
@@ -170,7 +170,7 @@ Provider constraints used by the current job/shard path:
 - `tushare`: CN instruments; `1m`, `5m`, `15m`, `30m`, `60m`, `1h`; `raw`
   only. Tradude should use `1h`, not `60m`.
 - `yahoo`: CN/HK/US instruments; `1m`, `2m`, `5m`, `15m`, `30m`, `60m`,
-  `90m`, `1h`, `1d`, `5d`, `1wk`, `1mo`, `3mo`; `raw` or `adjusted`.
+  `90m`, `1h`, `1d`, `5d`, `1wk`, `1mo`, `3mo`; `raw` or `qfq`.
 - `hyperliquid`: `.HYPL` instruments; the current shard planner supports `1m`,
   `5m`, `15m`, `30m`, `1h`, `1d`; `raw` only.
 
@@ -378,4 +378,3 @@ if not bars:
   `/Volumes/T9/projects/trade/tradude/backtest/data/marketcow_client.py`.
 - Tradude repair flow:
   `/Volumes/T9/projects/trade/tradude/backtest/data/manager.py`.
-

@@ -177,7 +177,7 @@ class YahooQuoteProvider:
             raise ValueError("unsupported range")
         if interval not in ALLOWED_INTERVALS:
             raise ValueError("unsupported interval")
-        if adjustment not in ("adjusted", "qfq", "raw"):
+        if adjustment not in ("qfq", "raw"):
             raise ValueError("Yahoo adjustment must be raw or qfq")
         params = {
             "range": range_, "interval": interval, "includePrePost": "false",
@@ -195,7 +195,7 @@ class YahooQuoteProvider:
             raise ValueError("history window must be ordered and timezone-aware")
         if interval not in ALLOWED_INTERVALS:
             raise ValueError("unsupported interval")
-        if adjustment not in ("adjusted", "qfq", "raw"):
+        if adjustment not in ("qfq", "raw"):
             raise ValueError("Yahoo adjustment must be raw or qfq")
         params = {
             "period1": int(start.timestamp()), "period2": int(end.timestamp()),
@@ -218,9 +218,6 @@ class YahooQuoteProvider:
         payload, source_url = self._fetch_chart(symbol, params)
         result = self._result(payload)
         meta = result.get("meta") or {}
-        # Yahoo's adjusted close is a back-adjusted series. Keep accepting the
-        # old provider-specific spelling at this boundary, but never emit it.
-        adjustment = "qfq" if adjustment == "adjusted" else adjustment
         timestamps = result.get("timestamp") or []
         indicators = result.get("indicators") or {}
         quote = (indicators.get("quote") or [{}])[0]

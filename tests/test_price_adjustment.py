@@ -4,10 +4,7 @@ import unittest
 
 from pydantic import ValidationError
 
-from marketcow.price_adjustment import (
-    PriceAdjustmentContract,
-    normalize_legacy_adjustment,
-)
+from marketcow.price_adjustment import PriceAdjustmentContract
 
 
 FACTOR_PROVENANCE = {
@@ -83,15 +80,6 @@ class PriceAdjustmentContractTest(unittest.TestCase):
                 "applied_adjustment_multiplier": "1",
             })
 
-    def test_legacy_adjusted_is_never_guessed(self):
-        self.assertEqual(normalize_legacy_adjustment("raw"), "raw")
-        self.assertEqual(
-            normalize_legacy_adjustment("adjusted", adjusted_means="qfq"),
-            "qfq",
-        )
-        with self.assertRaisesRegex(ValueError, "ambiguous"):
-            normalize_legacy_adjustment("adjusted")
-
     def test_generic_adjusted_is_not_a_canonical_value(self):
         with self.assertRaises(ValidationError):
             PriceAdjustmentContract.model_validate({
@@ -103,4 +91,3 @@ class PriceAdjustmentContractTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

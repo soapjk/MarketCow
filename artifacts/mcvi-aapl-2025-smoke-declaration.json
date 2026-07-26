@@ -1,5 +1,5 @@
 {
-  "contract_version": "marketcow.csv-bars.v1",
+  "contract_version": "marketcow.csv-bars.v2",
   "source": "purchased_vendor_2025",
   "interval": "1m",
   "adjustment": "raw",

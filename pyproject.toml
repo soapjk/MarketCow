@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-keywords = ["market-data", "financial-data", "china-market", "fastapi", "postgresql", "clickhouse"]
+keywords = ["market-data", "financial-data", "china-market", "fastapi", "mcp", "postgresql", "clickhouse"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Framework :: FastAPI",
@@ -46,6 +46,7 @@ dev = [
 
 [project.scripts]
 marketcow = "marketcow.__main__:main"
+marketcow-mcp = "marketcow.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/soapjk/MarketCow"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from marketcow.csv_import import (
@@ -54,6 +55,10 @@ class CsvImportManifestTest(unittest.TestCase):
         )
         self.assertEqual(shards, plan_csv_shards(second, 2501, 1000))
         self.assertEqual(len({row["ingestion_id"] for row in shards}), 3)
+        with self.assertRaisesRegex(ValueError, "version"):
+            replace(first, contract_version="marketcow.csv-bars.v1")
+        with self.assertRaisesRegex(ValueError, "adjustment"):
+            replace(first, adjustment="adjusted")
 
     def test_file_content_or_mapping_changes_manifest_identity(self):
         with tempfile.TemporaryDirectory() as folder:

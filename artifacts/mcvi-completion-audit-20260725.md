@@ -4,7 +4,7 @@ Authoritative scope: Plane project `MCVI`, parent `MCVI-1`, stages 1–11.
 
 ## Verified stages
 
-1. CSV contract — `docs/csv-import-contract-v1.schema.json`,
+1. CSV contract — `docs/csv-import-contract-v2.schema.json`,
    `CsvImportRequest`, valid/invalid contract tests, strict unknown-field policy.
 2. Schema Profile — versioned columns, encoding, delimiter, timezone, units,
    precision, defaults, sessions and reusable US supplier example.
@@ -38,7 +38,7 @@ Authoritative scope: Plane project `MCVI`, parent `MCVI-1`, stages 1–11.
 - Static gate: `ruff check src tests` passed.
 - JSON contract parses successfully.
 - Fault tests cover invalid rows, duplicate file/archive, bounded-memory scale,
-  DST, adjusted/split semantics, process takeover, ClickHouse/WAL failure,
+  DST, explicit qfq/hfq semantics, process takeover, ClickHouse/WAL failure,
   partial writes, cancellation, canonical failure and retry.
 - Runbook: `docs/csv-import-recovery-runbook.md`.
 - Release checklist: `docs/csv-import-release-gate.md`.
@@ -62,3 +62,7 @@ paths and full evidence files remain untracked.
 
 Plane state/comment synchronization remains pending explicit authorization for
 that remote write.
+
+The declaration and contract references in this local evidence set were migrated
+in place to the hard-cutover CSV v2 contract. Runtime v1 compatibility was not
+retained.

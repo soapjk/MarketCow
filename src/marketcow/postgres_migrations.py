@@ -758,4 +758,76 @@ POSTGRES_MIGRATIONS = [
                 ));
         """,
     ),
+    (
+        23,
+        "hard migrate CSV import declarations to explicit adjustment v2",
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM csv_import_job
+                WHERE request_json #>> '{request,contract_version}'
+                      = 'marketcow.csv-bars.v1'
+                  AND COALESCE(
+                      request_json #>> '{request,adjustment}', ''
+                  ) NOT IN ('raw', 'qfq', 'hfq')
+            ) THEN
+                RAISE EXCEPTION
+                    'CSV v1 contains a non-explicit adjustment and cannot be migrated';
+            END IF;
+        END $$;
+
+        UPDATE csv_import_job
+        SET request_json = jsonb_set(
+                jsonb_set(
+                    jsonb_set(
+                        jsonb_set(
+                            request_json,
+                            '{request,contract_version}',
+                            '"marketcow.csv-bars.v2"'::jsonb
+                        ),
+                        '{manifest,contract_version}',
+                        '"marketcow.csv-bars.v2"'::jsonb
+                    ),
+                    '{dry_run_report,contract_version}',
+                    '"marketcow.csv-bars.v2"'::jsonb
+                ),
+                '{contract_migration}',
+                jsonb_build_object(
+                    'from', 'marketcow.csv-bars.v1',
+                    'to', 'marketcow.csv-bars.v2',
+                    'migrated_at', CURRENT_TIMESTAMP
+                )
+            )
+        WHERE request_json #>> '{request,contract_version}'
+              = 'marketcow.csv-bars.v1';
+
+        UPDATE raw_artifact_manifest
+        SET metadata_json = jsonb_set(
+            metadata_json,
+            '{contract_version}',
+            '"marketcow.csv-bars.v2"'::jsonb
+        )
+        WHERE dataset = 'csv_history_bars'
+          AND metadata_json ->> 'contract_version'
+              = 'marketcow.csv-bars.v1';
+
+        ALTER TABLE csv_import_job
+            ADD CONSTRAINT csv_import_job_contract_v2_check
+            CHECK (
+                request_json #>> '{request,contract_version}'
+                    = 'marketcow.csv-bars.v2'
+                AND request_json #>> '{manifest,contract_version}'
+                    = 'marketcow.csv-bars.v2'
+                AND request_json #>> '{dry_run_report,contract_version}'
+                    = 'marketcow.csv-bars.v2'
+                AND request_json #>> '{request,adjustment}'
+                    IN ('raw', 'qfq', 'hfq')
+                AND request_json #>> '{manifest,adjustment}'
+                    IN ('raw', 'qfq', 'hfq')
+            ) NOT VALID;
+        ALTER TABLE csv_import_job
+            VALIDATE CONSTRAINT csv_import_job_contract_v2_check;
+        """,
+    ),
 ]

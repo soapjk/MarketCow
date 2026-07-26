@@ -103,6 +103,7 @@ class Settings:
     admin_commands_enabled: bool = True
     admin_live_enabled: bool = True
     admin_live_max_connections: int = 100
+    mcp_enabled: bool = True
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -279,6 +280,7 @@ class Settings:
             admin_live_max_connections=int(os.getenv(
                 "MARKETCOW_ADMIN_LIVE_MAX_CONNECTIONS", "100"
             )),
+            mcp_enabled=_bool_env("MARKETCOW_MCP_ENABLED", True),
         )
 
     def validate_runtime_isolation(self) -> None:

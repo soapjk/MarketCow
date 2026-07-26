@@ -42,7 +42,7 @@ def declarations():
         }),
     )
     manifest = CsvImportManifest(
-        manifest_id="a" * 64, contract_version="marketcow.csv-bars.v1",
+        manifest_id="a" * 64, contract_version="marketcow.csv-bars.v2",
         file_name="bars.csv", file_sha256="b" * 64, byte_size=1,
         source="vendor", namespace="provider:vendor",
         profile_name="vendor", profile_version="1", interval="1m",
@@ -160,10 +160,10 @@ class CsvShardImporterTest(unittest.TestCase):
         self.assertEqual(result["rows_written"], 2)
         self.assertEqual(len(bars.rows), 2)
 
-    def test_vendor_adjusted_bars_preserve_explicit_adjustment_semantics(self):
+    def test_vendor_qfq_bars_preserve_explicit_adjustment_semantics(self):
         request, manifest = declarations()
-        request = replace(request, adjustment="adjusted")
-        manifest = replace(manifest, adjustment="adjusted")
+        request = replace(request, adjustment="qfq")
+        manifest = replace(manifest, adjustment="qfq")
         bars = Bars()
         CsvShardImporter(bars).import_shard(
             io.StringIO(
@@ -172,14 +172,14 @@ class CsvShardImporterTest(unittest.TestCase):
             ),
             request,
             manifest,
-            {"row_start": 0, "row_end": 1, "ingestion_id": "split-adjusted"},
-            raw_artifact_id="vendor-adjusted-artifact",
+            {"row_start": 0, "row_end": 1, "ingestion_id": "split-qfq"},
+            raw_artifact_id="vendor-qfq-artifact",
             ingested_at="2026-01-02T00:00:00Z",
         )
-        self.assertEqual(bars.calls[0][2], "adjusted")
+        self.assertEqual(bars.calls[0][2], "qfq")
         self.assertEqual(
             bars.calls[0][6]["raw_artifact_id"],
-            "vendor-adjusted-artifact",
+            "vendor-qfq-artifact",
         )
 
 

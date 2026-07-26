@@ -70,6 +70,14 @@ from .admin_events import ALLOWED_EVENT_TYPES, AdminEventHub, encode_sse
 from .admin_auth import (
     CSRF_COOKIE, SESSION_COOKIE, AdminAuth, AdminSecurityMiddleware,
 )
+from .mcp_server import (
+    SUPPORTED_PROTOCOL_VERSIONS,
+    MarketCowClient,
+    McpServer,
+)
+
+
+MCP_MAX_REQUEST_BYTES = 1024 * 1024
 
 
 def normalize_quote_symbol(value: str) -> str:
@@ -260,7 +268,7 @@ class CsvInstrumentMappingInput(BaseModel):
 class CsvImportDeclarationInput(BaseModel):
     source: str = Field(min_length=1, max_length=100)
     interval: str = Field(min_length=1, max_length=10)
-    adjustment: str = Field(pattern="^(raw|adjusted)$")
+    adjustment: str = Field(pattern="^(raw|qfq|hfq)$")
     profile: CsvSchemaProfileInput
     instruments: CsvInstrumentMappingInput
     created_by: str = Field(default="api-operator", min_length=1, max_length=200)
@@ -329,6 +337,7 @@ def create_app(
     service: Optional[FundamentalService] = None,
     now_provider: Optional[Callable[[], datetime]] = None,
     realtime_hub: Optional[RealtimeHub] = None,
+    mcp_server: Optional[McpServer] = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
@@ -471,6 +480,24 @@ def create_app(
     app.state.dashboard_registry = load_dashboard_registry(settings.dashboard_registry_json)
     admin_audit = AdminAuditService(metadata_repository)
     app.state.admin_audit = admin_audit
+    owned_mcp_client = None
+    if settings.mcp_enabled:
+        if mcp_server is None:
+            runtime_host = os.environ.get("MARKETCOW_RUNTIME_HOST", settings.host)
+            if runtime_host in {"0.0.0.0", "::"}:
+                runtime_host = "127.0.0.1"
+            if ":" in runtime_host and not runtime_host.startswith("["):
+                runtime_host = f"[{runtime_host}]"
+            runtime_port = int(os.environ.get(
+                "MARKETCOW_RUNTIME_PORT", str(settings.port)
+            ))
+            owned_mcp_client = MarketCowClient(
+                base_url=f"http://{runtime_host}:{runtime_port}"
+            )
+            mcp_server = McpServer(owned_mcp_client)
+        app.state.mcp_server = mcp_server
+    else:
+        app.state.mcp_server = None
 
     def authenticated_actor(request: Request) -> str:
         identity = request.scope.get("admin_identity")
@@ -484,6 +511,8 @@ def create_app(
                 history_manager.close()
             if csv_import_service is not None:
                 csv_import_service.close()
+            if owned_mcp_client is not None:
+                owned_mcp_client.close()
             service.close()
 
     app.add_event_handler("shutdown", shutdown)
@@ -585,6 +614,52 @@ def create_app(
             f"clickhouse://{sanitize_text(settings.clickhouse_database)}"
         )
 
+    if settings.mcp_enabled:
+        @app.post("/mcp", include_in_schema=False)
+        async def mcp_endpoint(request: Request):
+            if request.headers.get("origin"):
+                return JSONResponse(
+                    {"error": "browser origins are not accepted by the MCP endpoint"},
+                    status_code=403,
+                )
+            content_type = request.headers.get("content-type", "").split(";", 1)[0]
+            if content_type.lower() != "application/json":
+                return JSONResponse(
+                    {"error": "Content-Type must be application/json"},
+                    status_code=415,
+                )
+            content_length = request.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > MCP_MAX_REQUEST_BYTES:
+                        return JSONResponse(
+                            {"error": "MCP request exceeds 1 MiB"},
+                            status_code=413,
+                        )
+                except ValueError:
+                    return JSONResponse(
+                        {"error": "invalid Content-Length"},
+                        status_code=400,
+                    )
+            protocol = request.headers.get("mcp-protocol-version")
+            if protocol and protocol not in SUPPORTED_PROTOCOL_VERSIONS:
+                return JSONResponse(
+                    {"error": "unsupported MCP protocol version"},
+                    status_code=400,
+                )
+            body = await request.body()
+            if len(body) > MCP_MAX_REQUEST_BYTES:
+                return JSONResponse(
+                    {"error": "MCP request exceeds 1 MiB"},
+                    status_code=413,
+                )
+            result = await asyncio.to_thread(
+                app.state.mcp_server.handle_json, body
+            )
+            if result is None:
+                return Response(status_code=202)
+            return JSONResponse(result)
+
     def cache_metadata(
         bars: list[Dict[str, Any]], fallback_ingested_at: Any = None,
         reason: str = "",
@@ -660,6 +735,10 @@ def create_app(
             "profile": settings.profile,
             "database": database_identifier(),
             "metadata_backend": "postgresql",
+            "mcp": {
+                "enabled": settings.mcp_enabled,
+                "endpoint": "/mcp" if settings.mcp_enabled else None,
+            },
             "storage_health": storage_health(),
         }
 
@@ -2591,7 +2670,7 @@ pre{white-space:pre-wrap;max-height:360px;overflow:auto}.danger{color:#b42318}</
 <label>Interval<select id="interval"><option>1m</option><option>5m</option>
 <option>15m</option><option>1h</option><option>1d</option></select></label>
 <label>Adjustment<select id="adjustment"><option>raw</option>
-<option>adjusted</option></select></label>
+<option>qfq</option><option>hfq</option></select></label>
 <label>Idempotency key<input id="key" value="csv-import-"></label>
 <button type="button" id="dry">Dry-run</button>
 <button type="button" id="start">Start import</button></form>

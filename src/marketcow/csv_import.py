@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .instruments import canonical_instrument
 
 
-CSV_IMPORT_CONTRACT_VERSION = "marketcow.csv-bars.v1"
+CSV_IMPORT_CONTRACT_VERSION = "marketcow.csv-bars.v2"
 CANONICAL_FIELDS = frozenset({
     "symbol", "timestamp", "open", "high", "low", "close", "volume", "amount",
 })
@@ -210,8 +210,8 @@ class CsvImportRequest:
             raise CsvImportContractError("source is required")
         if self.interval not in SUPPORTED_INTERVALS:
             raise CsvImportContractError("unsupported CSV bar interval")
-        if self.adjustment not in {"raw", "adjusted"}:
-            raise CsvImportContractError("adjustment must be raw or adjusted")
+        if self.adjustment not in {"raw", "qfq", "hfq"}:
+            raise CsvImportContractError("adjustment must be raw, qfq or hfq")
         if not self.created_by.strip():
             raise CsvImportContractError("created_by is required")
         if not self.source_proof.strip():

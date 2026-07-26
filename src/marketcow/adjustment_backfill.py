@@ -9,7 +9,7 @@ from .price_adjustment import PriceAdjustmentContract
 
 
 class AdjustmentBackfillService:
-    """Conservative legacy-row repair. Ambiguous adjusted data is never guessed."""
+    """Conservative repair for rows already using the explicit adjustment contract."""
 
     def __init__(self, repository: Any) -> None:
         self.repository = repository
@@ -54,11 +54,6 @@ class AdjustmentBackfillService:
                 "adjustment": str(row["adjustment"]),
                 "bar_time": str(row["bar_time"]), "source": str(row["source"]),
             }
-            if row["adjustment"] == "adjusted":
-                quarantined.append({
-                    **identity, "reason": "legacy_adjusted_is_ambiguous",
-                })
-                continue
             if row["adjustment"] != "raw":
                 quarantined.append({
                     **identity, "reason": "unsupported_adjustment_value",

@@ -304,6 +304,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ).lower() not in {"1", "true", "yes"}:
             raise ValueError("refusing non-loopback host without explicit override")
         os.environ["MARKETCOW_PROFILE"] = settings.profile
+        os.environ["MARKETCOW_RUNTIME_HOST"] = args.host
+        os.environ["MARKETCOW_RUNTIME_PORT"] = str(args.port)
         uvicorn.run("marketcow.api:create_app", host=args.host, port=args.port, factory=True)
         return 0
     except Exception as exc:
