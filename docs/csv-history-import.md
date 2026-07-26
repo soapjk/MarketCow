@@ -157,6 +157,8 @@ CSV 与声明文件都必须位于 `MARKETCOW_ALLOWED_ROOT` 下。原始 CSV 会
 ## 管理 API 与页面
 
 - `POST /v1/admin/csv-imports/dry-run`
+- `POST /v1/admin/csv-imports/upload?filename=<name.csv>`
+- `POST /v1/admin/csv-imports/infer`
 - `POST /v1/admin/csv-imports`
 - `GET /v1/admin/csv-imports`
 - `GET /v1/admin/csv-imports/{job_id}`
@@ -166,6 +168,35 @@ CSV 与声明文件都必须位于 `MARKETCOW_ALLOWED_ROOT` 下。原始 CSV 会
 - `GET /v1/admin/csv-imports/{job_id}/quality-report`
 - `GET /v1/admin/csv-imports/{job_id}/errors`
 - `GET /v1/admin/csv-imports-ui`
+
+React 管理控制台的 `#/csv-imports` 页面支持直接从浏览器选择 CSV 文件。
+上传请求使用流式 `application/octet-stream` 或 `text/csv` 请求体，受
+`MARKETCOW_CSV_IMPORT_MAX_FILE_BYTES` 限制；服务端只返回不可猜测的
+`upload_id`、文件大小和 SHA-256，不向浏览器暴露本地暂存路径。页面要求操作者
+显式选择 MIC，并将供应商代码映射为唯一的 `SYMBOL.MIC`。美股不会根据 ticker
+自动推断 XNAS、XNYS 或 ARCX。
+
+上传响应同时返回检测到的表头和分隔符。管理页面会忽略大小写并按常见别名自动
+匹配时间、OHLC 和成交量列，例如 `DateTime`、`Open`、`Volume`；操作者可以在
+预检前通过下拉框修正每一项映射。映射或其他声明发生变化后，原预检结果立即失效，
+必须重新预检才能开始正式导入。
+
+`infer` 对源时区和复权语义给出建议值、分数、置信度及证据，不把推断冒充为
+事实。时区推断会比较所选 MIC 的交易时段模型、UTC 和常见区域时区，并对带显式
+offset 的时间戳优先采用其自身证据。实现使用确定性的蓄水池抽样，扫描文件但只
+保留至多 20,000 个时间点。
+
+复权推断遵循保守规则：选择 `Adjusted Close` 等显式列，或文件同时提供 Close
+和独立调整列时，可以给出高置信度；只有普通 OHLCV、没有供应商元数据或公司行动
+对照时，只给出低置信度 `raw` 建议，并明确要求人工确认。管理页面会自动预填建议，
+但保留人工覆盖；列映射或 MIC 改变会重新推断，手工修改时区或复权状态后则使用
+操作者选择并要求重新预检。任一语义结果为低置信度或无法判断时，管理页面要求
+操作者显式确认后才开放正式导入按钮。
+
+上传文件会先写入 `storage/csv-import-uploads` 的原子暂存文件。预检和正式导入
+均以 `upload_id` 引用该文件；创建正式任务成功后删除暂存副本，长期留存由原有
+内容寻址归档和 Manifest 负责。旧的服务器本地 `path` 调用仍可用于 CLI 和自动化，
+但 API 请求必须在 `path` 与 `upload_id` 中且仅选择一个。
 
 管理页面每两秒刷新分片进度，显示 Manifest、错误和 raw/canonical 质量报告，
 并允许取消或用同一不可变 Manifest 重试。启动、取消、重试均要求浏览器确认。

@@ -18,6 +18,7 @@ _MIC_MARKET = {
     "XHKG": "HK",
     "XNAS": "US",
     "XNYS": "US",
+    "ARCX": "US",
     "HYPL": "CRYPTO",
 }
 _CN_MIC_SUFFIX = {

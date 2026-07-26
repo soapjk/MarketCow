@@ -5,9 +5,10 @@ const navigation = [
   ["overview", "总览", "01"],
   ["dashboards", "数据看板", "02"],
   ["data", "数据浏览", "03"],
-  ["operations", "任务与服务", "04"],
-  ["live", "实时监控", "05"],
-  ["settings", "管理设置", "06"],
+  ["csv-imports", "CSV 导入", "04"],
+  ["operations", "任务与服务", "05"],
+  ["live", "实时监控", "06"],
+  ["settings", "管理设置", "07"],
 ] as const;
 
 const titles = Object.fromEntries(navigation.map(([path, title]) => [`/${path}`, title]));

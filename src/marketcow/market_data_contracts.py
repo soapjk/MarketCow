@@ -45,12 +45,12 @@ class ContractModel(StrictModel):
 class InstrumentContract(ContractModel):
     instrument_id: str = Field(pattern=INSTRUMENT_ID_PATTERN)
     instrument_type: Literal[
-        "equity", "crypto_spot", "crypto_perpetual", "equity_perpetual",
-        "index_perpetual", "hip3_perpetual",
+        "equity", "convertible_bond", "crypto_spot", "crypto_perpetual",
+        "equity_perpetual", "index_perpetual", "hip3_perpetual",
     ]
     asset_class: Literal[
-        "equity", "crypto", "equity_derivative", "index_derivative",
-        "other_derivative",
+        "equity", "fixed_income", "crypto", "equity_derivative",
+        "index_derivative", "other_derivative",
     ]
     symbol: str = Field(min_length=1, max_length=32)
     market: Literal["US", "HK", "CN", "CRYPTO"]

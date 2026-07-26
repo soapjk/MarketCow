@@ -27,3 +27,4 @@ node_modules/
 *.duckdb
 *.parquet
 artifacts/mcvi-*-evidence.json
+AGENTS.md

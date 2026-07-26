@@ -7,6 +7,7 @@ import { DashboardsPage } from "../features/dashboards/DashboardsPage";
 import { OverviewPage } from "../features/overview/OverviewPage";
 import { OperationsPage } from "../features/operations/OperationsPage";
 import { DataExplorerPage } from "../features/data/DataExplorerPage";
+import { CsvImportsPage } from "../features/csv-imports/CsvImportsPage";
 import { SettingsPage } from "../features/settings/SettingsPage";
 
 const LiveMonitorPage = lazy(async () => {
@@ -56,7 +57,8 @@ export function App() {
 
   const [route, subroute] = path.slice(1).split("/");
   const kind = route === "overview" || route === "dashboards" || route === "data"
-    || route === "operations" || route === "live" || route === "settings"
+    || route === "csv-imports" || route === "operations" || route === "live"
+    || route === "settings"
     ? route
     : "not-found";
   const shellPath = kind === "not-found" ? path : `/${kind}`;
@@ -67,6 +69,7 @@ export function App() {
         {kind === "overview" ? <OverviewPage />
           : kind === "dashboards" ? <DashboardsPage />
           : kind === "data" ? <DataExplorerPage />
+          : kind === "csv-imports" ? <CsvImportsPage />
           : kind === "operations" ? <OperationsPage initialTab={subroute === "providers" ? "providers" : "jobs"} />
           : kind === "live" ? (
             <Suspense fallback={<section className="page-state">正在加载实时图表引擎…</section>}>

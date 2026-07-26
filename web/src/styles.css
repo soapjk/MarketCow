@@ -198,6 +198,50 @@ label input[type="date"] { color-scheme: dark; }
 progress { width: 100%; height: 4px; accent-color: var(--accent); }
 .row-actions button { padding: 6px 9px; color: var(--text); background: transparent; border: 1px solid var(--line); }
 .error-cell { max-width: 300px; overflow: hidden; color: #ff8d8d; text-overflow: ellipsis; }
+.csv-import-layout { display: grid; grid-template-columns: minmax(520px, 1.5fr) minmax(300px, .7fr); gap: 12px; align-items: start; }
+.csv-upload-form { padding-bottom: 18px; }
+.csv-upload-form > .form-grid, .csv-upload-form > .field-hint { margin-left: 16px; margin-right: 16px; }
+.file-drop {
+  min-height: 120px; margin: 16px; padding: 24px; display: grid; place-content: center; gap: 7px;
+  text-align: center; border: 1px dashed var(--line); background: var(--bg); cursor: pointer;
+}
+.file-drop:hover, .file-drop.has-file { border-color: var(--accent); background: var(--accent-soft); }
+.file-drop input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.file-drop strong { color: var(--text); font-size: 14px; }
+.file-drop span { color: var(--muted); font-size: 10px; }
+.identity-preview { margin: 16px; padding: 14px; display: grid; gap: 4px; border-left: 3px solid var(--accent); background: var(--accent-soft); }
+.identity-preview span, .identity-preview small { color: var(--muted); font: 9px ui-monospace, monospace; text-transform: uppercase; }
+.identity-preview strong { color: var(--accent); font: 21px ui-monospace, monospace; }
+.subsection-header { margin-top: 20px; border-top: 1px solid var(--line); }
+.semantic-inference { margin: 16px; border: 1px solid var(--line); background: var(--bg); }
+.semantic-inference > header { min-height: 62px; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
+.semantic-inference h3 { margin: 3px 0 0; font-size: 14px; }
+.semantic-inference header > span { color: var(--muted); font-size: 10px; }
+.inference-grid { display: grid; grid-template-columns: 1fr 1fr; }
+.inference-grid article { padding: 14px; border-right: 1px solid var(--line); }
+.inference-grid article:last-child { border-right: 0; }
+.inference-grid article > div { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; }
+.inference-grid article span { color: var(--muted); font: 9px ui-monospace, monospace; text-transform: uppercase; }
+.inference-grid article strong { font-size: 16px; }
+.confidence { grid-column: 2; grid-row: 1 / span 2; padding: 4px 7px; border: 1px solid var(--line); border-radius: 20px; font: normal 9px ui-monospace, monospace; text-transform: uppercase; }
+.confidence-high { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+.confidence-medium { color: #f5b942; border-color: #f5b94266; }
+.confidence-low, .confidence-none { color: #ff8d8d; border-color: #ff717155; }
+.inference-grid ul { margin: 12px 0 0; padding-left: 16px; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.semantic-inference > p { margin: 0; padding: 10px 14px; color: var(--muted); border-top: 1px solid var(--line); font-size: 10px; line-height: 1.5; }
+.semantic-inference .semantic-confirmation { margin: 0; padding: 11px 14px; display: flex; align-items: center; gap: 9px; color: var(--text); border-top: 1px solid var(--line); font-size: 10px; }
+.semantic-confirmation input { width: auto; margin: 0; accent-color: var(--accent); }
+.csv-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px; }
+.csv-actions .primary-action { width: auto; margin: 0; }
+.secondary-action { padding: 11px; color: var(--text); background: transparent; border: 1px solid var(--line); font-weight: 700; }
+.secondary-action:disabled { opacity: .45; cursor: not-allowed; }
+.receipt-grid { margin: 0; }
+.receipt-grid div { padding: 13px 16px; border-bottom: 1px solid var(--line); }
+.receipt-grid dt { color: var(--muted); font: 9px ui-monospace, monospace; text-transform: uppercase; }
+.receipt-grid dd { margin: 5px 0 0; overflow: hidden; font-size: 12px; text-overflow: ellipsis; }
+.csv-job-card { margin-top: 12px; }
+.csv-progress { min-width: 140px; }
+.csv-progress progress { width: 90px; margin-right: 8px; }
 .search-bar { display: flex; margin-bottom: 12px; }
 .search-bar input { margin: 0; border-radius: 3px 0 0 3px; }
 .search-bar button { width: 110px; color: #07111f; background: var(--accent); border: 0; font-weight: 800; }
@@ -232,7 +276,9 @@ progress { width: 100%; height: 4px; accent-color: var(--accent); }
   .live-stats { grid-template-columns: 1fr 1fr; }
   .chart-grid { grid-template-columns: 1fr; }
   .overview-grid { grid-template-columns: 1fr 1fr; }
-  .split-layout, .explorer-grid { grid-template-columns: 1fr; }
+  .split-layout, .explorer-grid, .csv-import-layout { grid-template-columns: 1fr; }
+  .inference-grid { grid-template-columns: 1fr; }
+  .inference-grid article { border-right: 0; border-bottom: 1px solid var(--line); }
 }
 
 @media (max-width: 520px) {

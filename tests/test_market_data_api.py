@@ -148,6 +148,35 @@ class MarketDataApiTest(unittest.TestCase):
         InstrumentRecord.model_validate(resolved.json())
         self.assertEqual(resolved.json()["instrument_id"], "AAPL.XNAS")
 
+    def test_convertible_bond_registration_uses_fixed_income_asset_class(self):
+        convertible_bond = {
+            **self.instrument,
+            "instrument_id": "118074.XSHG",
+            "symbol": "118074",
+            "instrument_type": "convertible_bond",
+            "asset_class": "fixed_income",
+            "market": "CN",
+            "mic": "XSHG",
+            "currency": "CNY",
+            "price_precision": 3,
+            "tick_size": "0.001",
+            "lot_size": "10",
+            "provider_symbols": {
+                "tushare": "118074.SH",
+                "eastmoney": "118074.SH",
+            },
+            "broker_symbols": {},
+        }
+
+        response = self.client.put(
+            "/v1/admin/instruments/118074.XSHG",
+            json=convertible_bond,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["instrument_type"], "convertible_bond")
+        self.assertEqual(response.json()["asset_class"], "fixed_income")
+
     def test_administration_read_models_are_versioned_and_paginated(self):
         dashboards = self.client.get("/v1/admin/dashboards")
         self.assertEqual(dashboards.status_code, 200)

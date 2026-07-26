@@ -48,6 +48,10 @@ class CanonicalInstrumentTest(unittest.TestCase):
             resolved.provider_symbol("broker:longport"),
             "AAPL.US",
         )
+        self.assertEqual(
+            canonical_instrument("SPY.ARCX").instrument_id,
+            "SPY.ARCX",
+        )
 
     def test_legacy_internal_formats_are_rejected(self):
         for value in (

@@ -36,6 +36,31 @@ def instrument(**updates):
 
 
 class MarketDataContractTest(unittest.TestCase):
+    def test_convertible_bond_is_a_supported_instrument_type(self):
+        value = InstrumentContract.model_validate(instrument(
+            instrument_id="118074.XSHG",
+            symbol="118074",
+            instrument_type="convertible_bond",
+            asset_class="fixed_income",
+            market="CN",
+            mic="XSHG",
+            currency="CNY",
+            price_precision=3,
+            size_precision=0,
+            tick_size="0.001",
+            size_increment="1",
+            lot_size="10",
+            provider_symbols={
+                "tushare": "118074.SH",
+                "eastmoney": "118074.SH",
+            },
+            broker_symbols={},
+        ))
+
+        validate_instrument_identity(value)
+        self.assertEqual(value.instrument_type, "convertible_bond")
+        self.assertEqual(value.asset_class, "fixed_income")
+
     def test_instrument_has_no_implicit_critical_defaults(self):
         for field in (
             "mic", "currency", "price_precision", "size_precision",

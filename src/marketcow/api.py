@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import hashlib
+import os
+import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -33,6 +38,7 @@ from .csv_import import (
 )
 from .csv_import_service import CsvImportService, create_csv_import_service
 from .csv_import_jobs import _safe_error_message
+from .csv_import_inference import infer_csv_semantics
 from .instruments import canonical_instrument
 from .provider_routing import ProviderNotSupported, ProviderRoutingError
 from .market_data_contracts import (
@@ -280,18 +286,38 @@ class CsvImportDeclarationInput(BaseModel):
         )
 
 
-class CsvImportDryRunInput(BaseModel):
-    path: str = Field(min_length=1, max_length=4096)
+class CsvImportSourceInput(BaseModel):
+    path: Optional[str] = Field(default=None, min_length=1, max_length=4096)
+    upload_id: Optional[str] = Field(
+        default=None, pattern=r"^[0-9a-f]{32}$"
+    )
+
+    @model_validator(mode="after")
+    def one_csv_source(self):
+        if bool(self.path) == bool(self.upload_id):
+            raise ValueError("provide exactly one of path or upload_id")
+        return self
+
+
+class CsvImportDryRunInput(CsvImportSourceInput):
     declaration: CsvImportDeclarationInput
     max_error_samples: int = Field(default=100, ge=0, le=1000)
 
 
-class CsvImportCreateInput(BaseModel):
-    path: str = Field(min_length=1, max_length=4096)
+class CsvImportCreateInput(CsvImportSourceInput):
     declaration: CsvImportDeclarationInput
     idempotency_key: str = Field(min_length=8, max_length=200)
     chunk_rows: int = Field(default=100000, ge=1000, le=1000000)
     max_attempts: int = Field(default=3, ge=1, le=10)
+
+
+class CsvImportInferenceInput(BaseModel):
+    upload_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    instrument_id: str = Field(min_length=6, max_length=40)
+    columns: Dict[str, str]
+    timestamp_format: str = Field(default="iso8601", min_length=1, max_length=100)
+    encoding: str = Field(default="utf-8-sig", min_length=1, max_length=50)
+    delimiter: str = Field(default=",", min_length=1, max_length=1)
 
 
 class CsvImportRetryInput(BaseModel):
@@ -2137,25 +2163,143 @@ def create_app(
         } for shard in public.get("shards") or ()]
         return public
 
+    csv_upload_root = settings.storage_root / "csv-import-uploads"
+
+    def csv_upload_path(upload_id: str) -> Path:
+        if re.fullmatch(r"[0-9a-f]{32}", upload_id) is None:
+            raise HTTPException(status_code=400, detail="invalid CSV upload id")
+        path = csv_upload_root / f"{upload_id}.csv"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="CSV upload not found")
+        return path
+
+    def csv_input_path(request: CsvImportSourceInput) -> Path | str:
+        if request.upload_id:
+            return csv_upload_path(request.upload_id)
+        return request.path or ""
+
+    def inspect_uploaded_csv(path: Path) -> tuple[list[str], str]:
+        with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
+            sample = stream.read(65536)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        header = next(csv.reader(sample.splitlines(), dialect), [])
+        return [value.strip() for value in header], dialect.delimiter
+
+    @app.post("/v1/admin/csv-imports/upload", status_code=201)
+    async def upload_csv_import(
+        request: Request,
+        filename: str = Query(..., min_length=1, max_length=255),
+    ):
+        safe_name = Path(filename).name
+        if (
+            safe_name != filename
+            or not safe_name.lower().endswith(".csv")
+            or any(ord(character) < 32 for character in safe_name)
+        ):
+            raise HTTPException(
+                status_code=400, detail="filename must be a plain .csv filename"
+            )
+        content_type = request.headers.get(
+            "content-type", ""
+        ).split(";", 1)[0].lower()
+        if content_type not in {
+            "text/csv", "application/csv", "application/octet-stream",
+        }:
+            raise HTTPException(
+                status_code=415, detail="CSV upload content type is unsupported"
+            )
+        declared_size = request.headers.get("content-length")
+        if declared_size:
+            try:
+                if int(declared_size) > settings.csv_import_max_file_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="CSV file exceeds the configured size limit",
+                    )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail="invalid Content-Length"
+                ) from exc
+
+        upload_id = uuid.uuid4().hex
+        csv_upload_root.mkdir(parents=True, exist_ok=True)
+        destination = csv_upload_root / f"{upload_id}.csv"
+        partial = csv_upload_root / f".{upload_id}.part"
+        digest = hashlib.sha256()
+        byte_size = 0
+        try:
+            with partial.open("xb") as stream:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    byte_size += len(chunk)
+                    if byte_size > settings.csv_import_max_file_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="CSV file exceeds the configured size limit",
+                        )
+                    digest.update(chunk)
+                    stream.write(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if byte_size == 0:
+                raise HTTPException(
+                    status_code=400, detail="CSV file must not be empty"
+                )
+            os.replace(partial, destination)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+        columns, delimiter = inspect_uploaded_csv(destination)
+        return {
+            "upload_id": upload_id,
+            "filename": safe_name,
+            "byte_size": byte_size,
+            "sha256": digest.hexdigest(),
+            "columns": columns,
+            "delimiter": delimiter,
+        }
+
     @app.post("/v1/admin/csv-imports/dry-run")
     def dry_run_csv_import(request: CsvImportDryRunInput):
         try:
             return require_csv_import_service().dry_run(
-                request.path, request.declaration.declaration(),
+                csv_input_path(request), request.declaration.declaration(),
                 max_error_samples=request.max_error_samples,
+            )
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/admin/csv-imports/infer")
+    def infer_csv_import(request: CsvImportInferenceInput):
+        try:
+            instrument = canonical_instrument(request.instrument_id)
+            return infer_csv_semantics(
+                csv_upload_path(request.upload_id),
+                mic=instrument.mic,
+                columns=request.columns,
+                timestamp_format=request.timestamp_format,
+                encoding=request.encoding,
+                delimiter=request.delimiter,
             )
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/v1/admin/csv-imports")
     def create_csv_import(request: CsvImportCreateInput):
+        path = csv_input_path(request)
         try:
             job, created = require_csv_import_service().create_import(
-                request.path, request.declaration.declaration(),
+                path, request.declaration.declaration(),
                 idempotency_key=request.idempotency_key,
                 chunk_rows=request.chunk_rows,
                 max_attempts=request.max_attempts,
             )
+            if request.upload_id:
+                Path(path).unlink(missing_ok=True)
             return {"created": created, "job": public_csv_import_job(job)}
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

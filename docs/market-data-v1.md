@@ -22,9 +22,11 @@ are resolved only at an explicit namespace boundary. A US mapping must
 also supply its MIC; a bare ticker or `.US` suffix is not enough to
 choose `XNAS` or `XNYS`.
 
-Contract v1 supports `instrument_type=equity` and `asset_class=equity` only. This is
-deliberately explicit: `size_precision` is fixed at `0` and `size_increment` at `"1"` to
-match Nautilus `Equity`. `ts_event` is the authoritative effective time of the instrument
+The instrument contract supports equities, convertible bonds, crypto spot/perpetuals,
+and the documented derivative instrument types. A convertible bond uses
+`instrument_type=convertible_bond` and `asset_class=fixed_income`; for example,
+`118074.XSHG`. Precision, tick size, size increment, and lot size remain explicit
+per instrument. `ts_event` is the authoritative effective time of the instrument
 definition; `ts_init` is when MarketCow initialized that definition, and
 `ts_event <= ts_init`.
 

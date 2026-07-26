@@ -79,6 +79,7 @@ class CsvImportApiTest(unittest.TestCase):
             postgres_schema="test", clickhouse_database="test",
             clickhouse_spool_path=root / "spool",
         )
+        self.settings = settings
         self.app = create_app(settings, StubService())
         self.imports = CsvImports()
         self.app.state.csv_import_service = self.imports
@@ -137,6 +138,84 @@ class CsvImportApiTest(unittest.TestCase):
         )
         self.assertEqual(self.imports.calls[0][0], "dry")
         self.assertEqual(self.imports.calls[1][0], "create")
+
+    def test_browser_upload_can_be_preflighted_and_imported_without_exposing_path(self):
+        uploaded = self.client.post(
+            "/v1/admin/csv-imports/upload?filename=AAPL.csv",
+            content=b"symbol,time,open,high,low,close\nAAPL.US,2025-01-02,1,2,1,2\n",
+            headers={"content-type": "text/csv"},
+        )
+        self.assertEqual(uploaded.status_code, 201)
+        upload = uploaded.json()
+        self.assertRegex(upload["upload_id"], r"^[0-9a-f]{32}$")
+        self.assertNotIn("path", upload)
+        self.assertEqual(upload["filename"], "AAPL.csv")
+        self.assertEqual(upload["byte_size"], 59)
+        self.assertEqual(
+            upload["columns"],
+            ["symbol", "time", "open", "high", "low", "close"],
+        )
+        self.assertEqual(upload["delimiter"], ",")
+
+        inferred = self.client.post("/v1/admin/csv-imports/infer", json={
+            "upload_id": upload["upload_id"],
+            "instrument_id": "AAPL.XNAS",
+            "columns": {"timestamp": "time", "close": "close"},
+        })
+        self.assertEqual(inferred.status_code, 200)
+        self.assertEqual(
+            inferred.json()["schema"], "marketcow.csv-import-inference.v1"
+        )
+        self.assertEqual(
+            inferred.json()["adjustment"]["confidence"], "low"
+        )
+
+        dry = self.client.post("/v1/admin/csv-imports/dry-run", json={
+            "upload_id": upload["upload_id"],
+            "declaration": declaration(),
+        })
+        self.assertEqual(dry.status_code, 200)
+        uploaded_path = Path(self.imports.calls[-1][1])
+        self.assertTrue(uploaded_path.is_file())
+        self.assertTrue(uploaded_path.is_relative_to(
+            self.settings.storage_root
+        ))
+
+        created = self.client.post("/v1/admin/csv-imports", json={
+            "upload_id": upload["upload_id"],
+            "declaration": declaration(),
+            "idempotency_key": "uploaded-import-1",
+        })
+        self.assertEqual(created.status_code, 200)
+        self.assertFalse(uploaded_path.exists())
+
+    def test_browser_upload_rejects_unsafe_names_and_oversized_content(self):
+        unsafe = self.client.post(
+            "/v1/admin/csv-imports/upload?filename=../bars.csv",
+            content=b"a,b\n1,2\n",
+            headers={"content-type": "text/csv"},
+        )
+        self.assertEqual(unsafe.status_code, 400)
+
+        object.__setattr__(self.settings, "csv_import_max_file_bytes", 4)
+        oversized = self.client.post(
+            "/v1/admin/csv-imports/upload?filename=bars.csv",
+            content=b"a,b\n1,2\n",
+            headers={"content-type": "text/csv"},
+        )
+        self.assertEqual(oversized.status_code, 413)
+
+    def test_csv_source_requires_exactly_one_path_or_upload_id(self):
+        missing = self.client.post("/v1/admin/csv-imports/dry-run", json={
+            "declaration": declaration(),
+        })
+        self.assertEqual(missing.status_code, 422)
+        both = self.client.post("/v1/admin/csv-imports/dry-run", json={
+            "path": "/allowed/vendor.csv",
+            "upload_id": "a" * 32,
+            "declaration": declaration(),
+        })
+        self.assertEqual(both.status_code, 422)
 
     def test_ui_contains_dry_run_progress_and_cancel_controls(self):
         response = self.client.get("/v1/admin/csv-imports-ui")

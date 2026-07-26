@@ -109,6 +109,19 @@ class PostgresDomainInventoryTest(unittest.TestCase):
         )
         self.assertIn("csv_import_shard_ingestion_idx", retry[2])
 
+    def test_convertible_bond_migration_extends_instrument_types(self):
+        version, description, statement = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 22
+        )
+
+        self.assertEqual(description, "convertible bond instruments")
+        self.assertIn("'convertible_bond'", statement)
+        self.assertIn("'fixed_income'", statement)
+        self.assertIn(
+            "DROP CONSTRAINT IF EXISTS instrument_master_instrument_type_check",
+            statement,
+        )
+
 
 @unittest.skipUnless(
     os.getenv("MARKETCOW_TEST_POSTGRES_DSN"),

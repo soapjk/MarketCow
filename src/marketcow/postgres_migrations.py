@@ -736,4 +736,26 @@ POSTGRES_MIGRATIONS = [
             ON csv_import_shard (ingestion_id);
         """,
     ),
+    (
+        22,
+        "convertible bond instruments",
+        """
+        ALTER TABLE instrument_master
+            DROP CONSTRAINT IF EXISTS instrument_master_instrument_type_check,
+            DROP CONSTRAINT IF EXISTS instrument_master_asset_class_check;
+        ALTER TABLE instrument_master
+            ADD CONSTRAINT instrument_master_instrument_type_check
+                CHECK (instrument_type IN (
+                    'equity', 'convertible_bond',
+                    'crypto_spot', 'crypto_perpetual',
+                    'equity_perpetual', 'index_perpetual', 'hip3_perpetual'
+                )),
+            ADD CONSTRAINT instrument_master_asset_class_check
+                CHECK (asset_class IN (
+                    'equity', 'fixed_income', 'crypto',
+                    'equity_derivative', 'index_derivative',
+                    'other_derivative'
+                ));
+        """,
+    ),
 ]
