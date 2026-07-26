@@ -185,6 +185,15 @@ worker 以最多每秒一次的频率保存受 lease token 保护的
 `verifying`、`canceling`、`completed`、`failed` 或 `canceled`。
 `heartbeat_at` 用于识别长时间没有 checkpoint 或 lease heartbeat 的导入。
 
+管理页面也支持直接选择文件夹。浏览器只提交文件夹中的 `.csv` 文件，并按
+`webkitRelativePath` 排序后逐个上传。第一个 CSV 的表头、分隔符、时区和复权
+语义作为整个批次的共享格式；其余文件仍分别执行 dry-run，任一文件的表头或
+分隔符不同都会被单独标记为失败。文件名去掉 `.csv` 后作为供应商代码，常见的
+`.US/.HK/.SH/.SZ/.BJ` 后缀会在生成 canonical symbol 时移除，再拼接页面选择的
+MIC。页面会在上传前展示全部映射并拒绝重复 Instrument ID。只有全部 CSV 通过
+当前共享声明的预检，才允许按相同顺序逐个创建导入任务。单个任务创建失败不会
+中断后续文件，页面会保留失败项供再次提交。
+
 上传响应同时返回检测到的表头和分隔符。管理页面会忽略大小写并按常见别名自动
 匹配时间、OHLC 和成交量列，例如 `DateTime`、`Open`、`Volume`；操作者可以在
 预检前通过下拉框修正每一项映射。映射或其他声明发生变化后，原预检结果立即失效，

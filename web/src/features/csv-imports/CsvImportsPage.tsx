@@ -63,6 +63,35 @@ type CsvJob = {
 
 type JobPage = { count: number; items: CsvJob[] };
 
+type Declaration = ReturnType<typeof declarationShape>;
+type BatchStage =
+  | "selected"
+  | "uploading"
+  | "preflighting"
+  | "valid"
+  | "invalid"
+  | "creating"
+  | "created"
+  | "failed";
+
+type BatchItem = {
+  key: string;
+  path: string;
+  file: File;
+  externalSymbol: string;
+  symbol: string;
+  stage: BatchStage;
+  receipt?: UploadReceipt;
+  report?: DryRunReport;
+  declaration?: Declaration;
+  jobId?: string;
+  error?: string;
+};
+
+type PreflightMutationResult =
+  | { mode: "single"; report: DryRunReport; declaration: string }
+  | { mode: "batch"; items: BatchItem[] };
+
 const micOptions = [
   ["XNAS", "NASDAQ"],
   ["XNYS", "New York Stock Exchange"],
@@ -141,6 +170,77 @@ function isStalled(job: CsvJob) {
   return Number.isFinite(updated) && Date.now() - updated > 60_000;
 }
 
+function declarationShape(
+  source: string,
+  interval: string,
+  adjustment: string,
+  columns: ColumnMapping,
+  timezone: string,
+  delimiter: string,
+  externalSymbol: string,
+  canonicalInstrumentId: string,
+  actor: string,
+) {
+  return {
+    source,
+    interval,
+    adjustment,
+    profile: {
+      name: source,
+      version: "1",
+      columns,
+      timezone_name: timezone,
+      timestamp_format: "iso8601",
+      encoding: "utf-8-sig",
+      delimiter,
+      fixed_external_symbol: externalSymbol,
+    },
+    instruments: {
+      namespace: `provider:${source}`,
+      symbols: { [externalSymbol]: canonicalInstrumentId },
+    },
+    created_by: actor,
+    source_proof: "operator-uploaded",
+  };
+}
+
+function filePath(file: File) {
+  return file.webkitRelativePath || file.name;
+}
+
+function fileIdentity(file: File) {
+  const externalSymbol = file.name.replace(/\.csv$/i, "").trim();
+  const symbol = externalSymbol
+    .replace(/\.(US|HK|SH|SZ|BJ)$/i, "")
+    .trim()
+    .toUpperCase();
+  return { externalSymbol, symbol };
+}
+
+function selectedCsvFiles(files: FileList | null): BatchItem[] {
+  return Array.from(files ?? [])
+    .filter((candidate) => candidate.name.toLowerCase().endsWith(".csv"))
+    .sort((left, right) => filePath(left).localeCompare(filePath(right)))
+    .map((candidate) => ({
+      key: filePath(candidate),
+      path: filePath(candidate),
+      file: candidate,
+      ...fileIdentity(candidate),
+      stage: "selected" as const,
+    }));
+}
+
+const batchStageLabels: Record<BatchStage, string> = {
+  selected: "等待",
+  uploading: "上传中",
+  preflighting: "预检中",
+  valid: "预检通过",
+  invalid: "预检失败",
+  creating: "创建任务中",
+  created: "任务已创建",
+  failed: "失败",
+};
+
 export function CsvImportsPage() {
   const identity = useIdentity();
   const canOperate = identity?.role === "operator" || identity?.role === "admin";
@@ -162,6 +262,7 @@ export function CsvImportsPage() {
   const [inferenceKey, setInferenceKey] = useState("");
   const [semanticsConfirmed, setSemanticsConfirmed] = useState(false);
   const [error, setError] = useState("");
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
 
   const jobs = useQuery({
     queryKey: ["csv-import-jobs"],
@@ -174,27 +275,28 @@ export function CsvImportsPage() {
     selectedDelimiter: string = delimiter,
     inferredTimezone: string = timezone,
     inferredAdjustment: string = adjustment,
-  ) => ({
+    selectedExternalSymbol: string = externalSymbol,
+    selectedSymbol: string = symbol,
+  ) => declarationShape(
     source,
     interval,
-    adjustment: inferredAdjustment,
-    profile: {
-      name: source,
-      version: "1",
-      columns,
-      timezone_name: inferredTimezone,
-      timestamp_format: "iso8601",
-      encoding: "utf-8-sig",
-      delimiter: selectedDelimiter,
-      fixed_external_symbol: externalSymbol,
-    },
-    instruments: {
-      namespace: `provider:${source}`,
-      symbols: { [externalSymbol]: `${symbol.trim().toUpperCase()}.${mic}` },
-    },
-    created_by: identity?.actor ?? "admin-ui",
-    source_proof: "operator-uploaded",
-  });
+    inferredAdjustment,
+    columns,
+    inferredTimezone,
+    selectedDelimiter,
+    selectedExternalSymbol,
+    `${selectedSymbol.trim().toUpperCase()}.${mic}`,
+    identity?.actor ?? "admin-ui",
+  );
+
+  const updateBatchItem = (
+    key: string,
+    patch: Partial<BatchItem>,
+  ) => {
+    setBatchItems((current) => current.map((item) => (
+      item.key === key ? { ...item, ...patch } : item
+    )));
+  };
 
   const ensureUpload = async () => {
     if (upload) {
@@ -220,45 +322,159 @@ export function CsvImportsPage() {
     };
   };
 
+  const inferSemantics = async (
+    receipt: UploadReceipt,
+    columns: ColumnMapping,
+    selectedDelimiter: string,
+    canonicalInstrumentId: string,
+  ) => {
+    const semanticKey = JSON.stringify({
+      upload_id: receipt.upload_id,
+      instrument_id: canonicalInstrumentId,
+      columns,
+      delimiter: selectedDelimiter,
+    });
+    let selectedTimezone = timezone;
+    let selectedAdjustment = adjustment;
+    if (!inference || inferenceKey !== semanticKey) {
+      const inferred = await api.request<SemanticInference>(
+        "/v1/admin/csv-imports/infer", {
+          method: "POST",
+          body: JSON.stringify({
+            upload_id: receipt.upload_id,
+            instrument_id: canonicalInstrumentId,
+            columns,
+            timestamp_format: "iso8601",
+            encoding: "utf-8-sig",
+            delimiter: selectedDelimiter,
+          }),
+        },
+      );
+      setInference(inferred);
+      setInferenceKey(semanticKey);
+      setSemanticsConfirmed(false);
+      if (inferred.timezone.value) {
+        selectedTimezone = inferred.timezone.value;
+        setTimezone(inferred.timezone.value);
+      }
+      if (inferred.adjustment.value) {
+        selectedAdjustment = inferred.adjustment.value;
+        setAdjustment(inferred.adjustment.value);
+      }
+    }
+    return { selectedTimezone, selectedAdjustment };
+  };
+
   const preflight = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (): Promise<PreflightMutationResult> => {
       setError("");
+      if (batchItems.length) {
+        const completed: BatchItem[] = [];
+        let sharedColumns: ColumnMapping | null = null;
+        let sharedSourceColumns: string[] | null = null;
+        let sharedDelimiter = delimiter;
+        let selectedTimezone = timezone;
+        let selectedAdjustment = adjustment;
+
+        for (const original of batchItems) {
+          let current: BatchItem = {
+            ...original,
+            stage: "uploading",
+            receipt: undefined,
+            report: undefined,
+            declaration: undefined,
+            jobId: undefined,
+            error: undefined,
+          };
+          updateBatchItem(current.key, current);
+          try {
+            const receipt = await api.request<UploadReceipt>(
+              `/v1/admin/csv-imports/upload?filename=${
+                encodeURIComponent(current.file.name)
+              }`,
+              {
+                method: "POST",
+                body: current.file,
+                headers: { "Content-Type": "application/octet-stream" },
+              },
+            );
+            if (sharedColumns === null) {
+              sharedSourceColumns = receipt.columns;
+              sharedColumns = detectColumnMapping(
+                receipt.columns, columnMapping
+              );
+              sharedDelimiter = receipt.delimiter;
+              setColumnMapping(sharedColumns);
+              setDelimiter(sharedDelimiter);
+              const inferred = await inferSemantics(
+                receipt,
+                sharedColumns,
+                sharedDelimiter,
+                `${current.symbol}.${mic}`,
+              );
+              selectedTimezone = inferred.selectedTimezone;
+              selectedAdjustment = inferred.selectedAdjustment;
+            } else if (
+              receipt.delimiter !== sharedDelimiter
+              || JSON.stringify(receipt.columns)
+                !== JSON.stringify(sharedSourceColumns)
+            ) {
+              throw new Error("文件表头或分隔符与文件夹中的第一个 CSV 不一致");
+            }
+            const declaration = buildDeclaration(
+              sharedColumns,
+              sharedDelimiter,
+              selectedTimezone,
+              selectedAdjustment,
+              current.externalSymbol,
+              current.symbol,
+            );
+            current = {
+              ...current,
+              stage: "preflighting",
+              receipt,
+              declaration,
+            };
+            updateBatchItem(current.key, current);
+            const report = await api.request<DryRunReport>(
+              "/v1/admin/csv-imports/dry-run", {
+                method: "POST",
+                body: JSON.stringify({
+                  upload_id: receipt.upload_id,
+                  declaration,
+                  max_error_samples: 100,
+                }),
+              },
+            );
+            current = {
+              ...current,
+              report,
+              stage: report.status === "valid" ? "valid" : "invalid",
+              error: report.status === "valid"
+                ? undefined
+                : "CSV 数据未通过预检",
+            };
+          } catch (value) {
+            current = {
+              ...current,
+              stage: "failed",
+              error: message(value),
+            };
+          }
+          completed.push(current);
+          updateBatchItem(current.key, current);
+        }
+        return { mode: "batch", items: completed };
+      }
+
       const uploaded = await ensureUpload();
       const canonicalInstrumentId = `${symbol.trim().toUpperCase()}.${mic}`;
-      const semanticKey = JSON.stringify({
-        upload_id: uploaded.receipt.upload_id,
-        instrument_id: canonicalInstrumentId,
-        columns: uploaded.columns,
-        delimiter: uploaded.delimiter,
-      });
-      let selectedTimezone = timezone;
-      let selectedAdjustment = adjustment;
-      if (!inference || inferenceKey !== semanticKey) {
-        const inferred = await api.request<SemanticInference>(
-          "/v1/admin/csv-imports/infer", {
-            method: "POST",
-            body: JSON.stringify({
-              upload_id: uploaded.receipt.upload_id,
-              instrument_id: canonicalInstrumentId,
-              columns: uploaded.columns,
-              timestamp_format: "iso8601",
-              encoding: "utf-8-sig",
-              delimiter: uploaded.delimiter,
-            }),
-          },
-        );
-        setInference(inferred);
-        setInferenceKey(semanticKey);
-        setSemanticsConfirmed(false);
-        if (inferred.timezone.value) {
-          selectedTimezone = inferred.timezone.value;
-          setTimezone(inferred.timezone.value);
-        }
-        if (inferred.adjustment.value) {
-          selectedAdjustment = inferred.adjustment.value;
-          setAdjustment(inferred.adjustment.value);
-        }
-      }
+      const { selectedTimezone, selectedAdjustment } = await inferSemantics(
+        uploaded.receipt,
+        uploaded.columns,
+        uploaded.delimiter,
+        canonicalInstrumentId,
+      );
       const selectedDeclaration = buildDeclaration(
         uploaded.columns, uploaded.delimiter,
         selectedTimezone, selectedAdjustment,
@@ -273,11 +489,16 @@ export function CsvImportsPage() {
         }),
       });
       return {
+        mode: "single",
         report,
         declaration: JSON.stringify(selectedDeclaration),
       };
     },
     onSuccess: (result) => {
+      if (result.mode === "batch") {
+        setBatchItems(result.items);
+        return;
+      }
       setDryRun(result.report);
       setValidatedDeclaration(result.declaration);
     },
@@ -286,6 +507,74 @@ export function CsvImportsPage() {
 
   const createImport = useMutation({
     mutationFn: async () => {
+      if (batchItems.length) {
+        if (
+          inference
+          && (
+            ["low", "none"].includes(inference.timezone.confidence)
+            || ["low", "none"].includes(inference.adjustment.confidence)
+          )
+          && !semanticsConfirmed
+        ) {
+          throw new Error("请先确认当前低置信度语义设置");
+        }
+        if (!batchItems.every((item) => (
+          item.receipt
+          && item.report?.status === "valid"
+          && item.declaration
+          && JSON.stringify(item.declaration) === JSON.stringify(
+            buildDeclaration(
+              columnMapping,
+              delimiter,
+              timezone,
+              adjustment,
+              item.externalSymbol,
+              item.symbol,
+            )
+          )
+        ))) {
+          throw new Error("文件夹中的所有 CSV 必须先通过当前共享格式的预检");
+        }
+        let failures = 0;
+        for (const item of batchItems) {
+          if (item.jobId) {
+            continue;
+          }
+          updateBatchItem(item.key, {
+            stage: "creating", error: undefined, jobId: undefined,
+          });
+          try {
+            const result = await api.request<{
+              created: boolean;
+              job: CsvJob;
+            }>("/v1/admin/csv-imports", {
+              method: "POST",
+              body: JSON.stringify({
+                upload_id: item.receipt?.upload_id,
+                declaration: item.declaration,
+                idempotency_key: `csv-upload-${item.receipt?.sha256}`,
+                chunk_rows: 100000,
+                max_attempts: 3,
+              }),
+            });
+            updateBatchItem(item.key, {
+              stage: "created",
+              jobId: result.job.job_id,
+            });
+          } catch (value) {
+            failures += 1;
+            updateBatchItem(item.key, {
+              stage: "failed",
+              error: message(value),
+            });
+          }
+        }
+        if (failures) {
+          setError(`${failures} 个 CSV 创建任务失败；其余文件已继续处理`);
+        }
+        return { mode: "batch" as const };
+      }
+
       if (
         !upload
         || dryRun?.status !== "valid"
@@ -313,9 +602,15 @@ export function CsvImportsPage() {
             max_attempts: 3,
           }),
         },
-      );
+      ).then((result) => ({ mode: "single" as const, result }));
     },
-    onSuccess: async () => {
+    onSuccess: async (result) => {
+      if (result.mode === "batch") {
+        await queryClient.invalidateQueries({
+          queryKey: ["csv-import-jobs"],
+        });
+        return;
+      }
       setFile(null);
       setUpload(null);
       setDryRun(null);
@@ -344,6 +639,7 @@ export function CsvImportsPage() {
 
   const chooseFile = (event: ChangeEvent<HTMLInputElement>) => {
     setFile(event.target.files?.[0] ?? null);
+    setBatchItems([]);
     setUpload(null);
     setDryRun(null);
     setValidatedDeclaration("");
@@ -355,12 +651,74 @@ export function CsvImportsPage() {
     setError("");
   };
 
+  const chooseFolder = (event: ChangeEvent<HTMLInputElement>) => {
+    const items = selectedCsvFiles(event.target.files);
+    setFile(null);
+    setBatchItems(items);
+    setUpload(null);
+    setDryRun(null);
+    setValidatedDeclaration("");
+    setInference(null);
+    setInferenceKey("");
+    setSemanticsConfirmed(false);
+    setColumnMapping(defaultColumns);
+    setDelimiter(",");
+    setError(items.length ? "" : "所选文件夹中没有 CSV 文件");
+  };
+
+  const folderMode = batchItems.length > 0;
   const canonicalId = `${symbol.trim().toUpperCase()}.${mic}`;
-  const validForm = Boolean(
-    file && source.trim() && externalSymbol.trim() && symbol.trim() && mic,
+  const batchCanonicalIds = batchItems.map(
+    (item) => `${item.symbol}.${mic}`
   );
-  const preflightMatches = dryRun?.status === "valid"
-    && validatedDeclaration === JSON.stringify(buildDeclaration());
+  const hasDuplicateBatchInstrument = (
+    new Set(batchCanonicalIds).size !== batchCanonicalIds.length
+  );
+  const validForm = Boolean(
+    source.trim()
+    && mic
+    && (
+      folderMode
+        ? batchItems.every((item) => (
+          item.externalSymbol.trim() && item.symbol.trim()
+        )) && !hasDuplicateBatchInstrument
+        : file && externalSymbol.trim() && symbol.trim()
+    ),
+  );
+  const batchDeclarationsMatch = folderMode && batchItems.every((item) => (
+    item.receipt
+    && item.report?.status === "valid"
+    && item.declaration
+    && JSON.stringify(item.declaration) === JSON.stringify(
+      buildDeclaration(
+        columnMapping,
+        delimiter,
+        timezone,
+        adjustment,
+        item.externalSymbol,
+        item.symbol,
+      )
+    )
+  ));
+  const batchHasImportCandidate = batchItems.some((item) => !item.jobId);
+  const batchPreflightMatches = (
+    batchDeclarationsMatch && batchHasImportCandidate
+  );
+  const preflightMatches = folderMode
+    ? batchPreflightMatches
+    : dryRun?.status === "valid"
+      && validatedDeclaration === JSON.stringify(buildDeclaration());
+  const schemaColumns = upload?.columns
+    ?? batchItems.find((item) => item.receipt)?.receipt?.columns;
+  const batchReportsPassed = folderMode && batchItems.every(
+    (item) => item.report?.status === "valid"
+  );
+  const batchHasFailure = folderMode && batchItems.some(
+    (item) => item.stage === "invalid" || item.stage === "failed"
+  );
+  const displayedPreflightStatus = folderMode
+    ? batchReportsPassed ? "valid" : batchHasFailure ? "invalid" : "pending"
+    : dryRun?.status ?? "pending";
   const requiresSemanticConfirmation = Boolean(
     inference && (
       ["low", "none"].includes(inference.timezone.confidence)
@@ -376,7 +734,7 @@ export function CsvImportsPage() {
           <h2>上传历史 K 线</h2>
         </div>
         <p>
-          文件先进入本地受控暂存区，通过预检后才会创建可恢复的分片导入任务。
+          文件或文件夹先进入本地受控暂存区，通过预检后才会创建可恢复的分片导入任务。
           MarketCow 内部标识始终使用 SYMBOL.MIC。
         </p>
       </section>
@@ -388,30 +746,66 @@ export function CsvImportsPage() {
             <span>CSV ONLY</span>
           </header>
 
-          <label className={`file-drop ${file ? "has-file" : ""}`}>
-            <input type="file" accept=".csv,text/csv" onChange={chooseFile} />
-            <strong>{file ? file.name : "选择 CSV 文件"}</strong>
-            <span>{file ? formatBytes(file.size) : "点击浏览本机文件；上传过程不会占用整文件内存"}</span>
-          </label>
+          <div className="csv-source-picker">
+            <label className={`file-drop ${file ? "has-file" : ""}`}>
+              <input
+                aria-label="选择单个 CSV 文件"
+                type="file"
+                accept=".csv,text/csv"
+                onChange={chooseFile}
+              />
+              <strong>{file ? file.name : "选择单个 CSV 文件"}</strong>
+              <span>
+                {file
+                  ? formatBytes(file.size)
+                  : "使用独立的标的代码和格式设置"}
+              </span>
+            </label>
+            <label className={`file-drop ${folderMode ? "has-file" : ""}`}>
+              <input
+                aria-label="选择 CSV 文件夹"
+                type="file"
+                accept=".csv,text/csv"
+                multiple
+                ref={(element) => {
+                  if (element) {
+                    element.setAttribute("webkitdirectory", "");
+                    element.setAttribute("directory", "");
+                  }
+                }}
+                onChange={chooseFolder}
+              />
+              <strong>
+                {folderMode
+                  ? `已选择 ${batchItems.length} 个 CSV`
+                  : "选择一个 CSV 文件夹"}
+              </strong>
+              <span>共享一次格式设置，按路径顺序逐个处理</span>
+            </label>
+          </div>
 
           <div className="form-grid csv-column-grid">
             <label>数据供应商
               <input value={source} onChange={(event) => setSource(event.target.value)} />
             </label>
-            <label>CSV 中的标的代码
-              <input
-                aria-label="CSV 中的标的代码"
-                value={externalSymbol}
-                onChange={(event) => setExternalSymbol(event.target.value)}
-              />
-            </label>
-            <label>标准 Symbol
-              <input
-                aria-label="标准 Symbol"
-                value={symbol}
-                onChange={(event) => setSymbol(event.target.value)}
-              />
-            </label>
+            {!folderMode ? (
+              <>
+                <label>CSV 中的标的代码
+                  <input
+                    aria-label="CSV 中的标的代码"
+                    value={externalSymbol}
+                    onChange={(event) => setExternalSymbol(event.target.value)}
+                  />
+                </label>
+                <label>标准 Symbol
+                  <input
+                    aria-label="标准 Symbol"
+                    value={symbol}
+                    onChange={(event) => setSymbol(event.target.value)}
+                  />
+                </label>
+              </>
+            ) : null}
             <label>MIC
               <select aria-label="MIC" value={mic} onChange={(event) => setMic(event.target.value)}>
                 {micOptions.map(([value, label]) => (
@@ -421,11 +815,28 @@ export function CsvImportsPage() {
             </label>
           </div>
 
-          <div className="identity-preview">
-            <span>统一 Instrument ID</span>
-            <strong>{canonicalId}</strong>
-            <small>{externalSymbol} → {canonicalId}</small>
-          </div>
+          {folderMode ? (
+            <div className="identity-preview batch-identity-preview">
+              <span>文件名映射预览</span>
+              {batchItems.slice(0, 6).map((item) => (
+                <small key={item.key}>
+                  {item.path} · {item.externalSymbol} → {item.symbol}.{mic}
+                </small>
+              ))}
+              {batchItems.length > 6 ? (
+                <small>另有 {batchItems.length - 6} 个 CSV…</small>
+              ) : null}
+              {hasDuplicateBatchInstrument ? (
+                <strong role="alert">文件名生成了重复 Instrument ID</strong>
+              ) : null}
+            </div>
+          ) : (
+            <div className="identity-preview">
+              <span>统一 Instrument ID</span>
+              <strong>{canonicalId}</strong>
+              <small>{externalSymbol} → {canonicalId}</small>
+            </div>
+          )}
 
           <header className="subsection-header">
             <div><p className="eyebrow">02 / SCHEMA</p><h3>CSV 格式</h3></div>
@@ -450,7 +861,7 @@ export function CsvImportsPage() {
             </label>
             {(Object.keys(columnMapping) as (keyof ColumnMapping)[]).map((field) => (
               <label key={field}>{field === "timestamp" ? "时间列" : `${field} 列`}
-                {upload?.columns.length ? (
+                {schemaColumns?.length ? (
                   <select
                     aria-label={`${field} 列`}
                     value={columnMapping[field]}
@@ -458,7 +869,7 @@ export function CsvImportsPage() {
                       ...columnMapping, [field]: event.target.value,
                     })}
                   >
-                    {upload.columns.map((column) => (
+                    {schemaColumns.map((column) => (
                       <option key={column} value={column}>{column}</option>
                     ))}
                   </select>
@@ -476,8 +887,9 @@ export function CsvImportsPage() {
           </div>
           <p className="field-hint">
             上传后会自动识别常见列名和大小写；如果供应商命名特殊，可在这里调整
-            时间、OHLC 和成交量映射。当前文件按单一标的导入，因此标的代码不必
-            作为 CSV 列存在。
+            时间、OHLC 和成交量映射。{folderMode
+              ? "文件夹模式会把第一个 CSV 的格式和语义设置应用到全部文件。"
+              : "当前文件按单一标的导入，因此标的代码不必作为 CSV 列存在。"}
           </p>
 
           {inference ? (
@@ -536,7 +948,9 @@ export function CsvImportsPage() {
               disabled={!canOperate || !validForm || preflight.isPending}
               onClick={() => preflight.mutate()}
             >
-              {preflight.isPending ? "上传并检查中…" : "上传并预检"}
+              {preflight.isPending
+                ? folderMode ? "正在依次检查…" : "上传并检查中…"
+                : folderMode ? "批量上传并预检" : "上传并预检"}
             </button>
             <button
               type="button"
@@ -547,7 +961,9 @@ export function CsvImportsPage() {
               }
               onClick={() => createImport.mutate()}
             >
-              {createImport.isPending ? "正在创建…" : "开始正式导入"}
+              {createImport.isPending
+                ? folderMode ? "正在依次创建…" : "正在创建…"
+                : folderMode ? "开始批量导入" : "开始正式导入"}
             </button>
           </div>
         </section>
@@ -555,11 +971,54 @@ export function CsvImportsPage() {
         <aside className="data-card csv-preflight">
           <header>
             <div><p className="eyebrow">PREFLIGHT</p><h3>预检结果</h3></div>
-            <span className={`status-pill status-${dryRun?.status ?? "pending"}`}>
-              {dryRun?.status ?? "等待"}
+            <span className={`status-pill status-${displayedPreflightStatus}`}>
+              {displayedPreflightStatus === "pending"
+                ? "等待"
+                : displayedPreflightStatus}
             </span>
           </header>
-          {upload ? (
+          {folderMode ? (
+            <div className="batch-preflight">
+              <p>
+                {batchItems.filter(
+                  (item) => item.report?.status === "valid"
+                ).length}
+                {" / "}
+                {batchItems.length} 通过
+              </p>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>CSV</th><th>映射</th><th>状态</th><th>有效行</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {batchItems.map((item) => (
+                      <tr key={item.key}>
+                        <td title={item.path}>{item.path}</td>
+                        <td>{item.symbol}.{mic}</td>
+                        <td>
+                          <span className={`batch-stage batch-stage-${item.stage}`}>
+                            {batchStageLabels[item.stage]}
+                          </span>
+                          {item.jobId ? (
+                            <small title={item.jobId}>
+                              {item.jobId.slice(0, 10)}
+                            </small>
+                          ) : null}
+                          {item.error ? (
+                            <small className="batch-item-error">{item.error}</small>
+                          ) : null}
+                        </td>
+                        <td>{formatRows(item.report?.rows_valid)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : upload ? (
             <dl className="receipt-grid">
               <div><dt>文件</dt><dd>{upload.filename}</dd></div>
               <div><dt>大小</dt><dd>{formatBytes(upload.byte_size)}</dd></div>
