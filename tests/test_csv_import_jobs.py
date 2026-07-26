@@ -86,6 +86,28 @@ class MemoryRepository:
             row.update({"heartbeat_at": now, "lease_expires_at": expires})
             return copy.deepcopy(row)
 
+    def checkpoint_csv_import_shard(
+        self, job_id, shard_index, owner_id, token,
+        rows_read, rows_written, now,
+    ):
+        with self.lock:
+            row = self.shards[(job_id, shard_index)]
+            if (
+                row.get("owner_id") != owner_id
+                or row.get("lease_token") != token
+                or row.get("status") != "running"
+            ):
+                return None
+            row.update({
+                "rows_read": max(int(row.get("rows_read") or 0), rows_read),
+                "rows_written": max(
+                    int(row.get("rows_written") or 0), rows_written
+                ),
+                "heartbeat_at": now,
+                "updated_at": now,
+            })
+            return copy.deepcopy(row)
+
     def finish_claimed_csv_import_shard(self, row, owner_id, token):
         with self.lock:
             current = self.shards[(row["job_id"], row["shard_index"])]
@@ -266,6 +288,115 @@ class CsvImportJobManagerTest(unittest.TestCase):
             )
         finally:
             release.set()
+            manager.close()
+
+    def test_progress_is_visible_inside_one_running_shard(self):
+        repository = MemoryRepository()
+        checkpointed = threading.Event()
+        release = threading.Event()
+
+        def importer(_job, _shard, progress):
+            progress(1, 1)
+            checkpointed.set()
+            release.wait(1)
+            progress(2, 2)
+            return {"rows_read": 2, "rows_written": 2, "receipts": []}
+
+        manager = CsvImportJobManager(repository, importer, max_workers=1)
+        try:
+            job, _ = manager.create(
+                idempotency_key="live-progress",
+                manifest_id="manifest",
+                request_json={"max_attempts": 1},
+                storage_path="/allowed/archive.csv",
+                raw_artifact_id="artifact",
+                rows_total=2,
+                shards=[{
+                    "shard_index": 0, "row_start": 0, "row_end": 2,
+                    "ingestion_id": "one-shard",
+                }],
+            )
+            self.assertTrue(checkpointed.wait(1))
+            current = manager.get(job["job_id"])
+            self.assertEqual(current["status"], "running")
+            self.assertEqual(current["phase"], "importing")
+            self.assertEqual(current["progress_percent"], 50)
+            self.assertEqual(current["rows_written"], 1)
+            release.set()
+            completed = wait_for(manager, job["job_id"], "succeeded")
+            self.assertEqual(completed["phase"], "completed")
+            self.assertEqual(completed["progress_percent"], 100)
+        finally:
+            release.set()
+            manager.close()
+
+    def test_completed_rows_are_capped_at_99_during_quality_verification(self):
+        repository = MemoryRepository()
+        verifying = threading.Event()
+        release = threading.Event()
+
+        def importer(_job, _shard, progress):
+            progress(1, 1)
+            return {"rows_read": 1, "rows_written": 1, "receipts": []}
+
+        def finalize(_job):
+            verifying.set()
+            release.wait(1)
+            return {"status": "passed"}
+
+        manager = CsvImportJobManager(
+            repository, importer, finalize_job=finalize, max_workers=1
+        )
+        try:
+            job, _ = manager.create(
+                idempotency_key="quality-progress",
+                manifest_id="manifest",
+                request_json={"max_attempts": 1},
+                storage_path="/allowed/archive.csv",
+                raw_artifact_id="artifact",
+                rows_total=1,
+                shards=[{
+                    "shard_index": 0, "row_start": 0, "row_end": 1,
+                    "ingestion_id": "quality-shard",
+                }],
+            )
+            self.assertTrue(verifying.wait(1))
+            current = manager.get(job["job_id"])
+            self.assertEqual(current["phase"], "verifying")
+            self.assertEqual(current["progress_percent"], 99)
+            release.set()
+            completed = wait_for(manager, job["job_id"], "succeeded")
+            self.assertEqual(completed["progress_percent"], 100)
+        finally:
+            release.set()
+            manager.close()
+
+    def test_failed_shard_keeps_its_last_durable_checkpoint(self):
+        repository = MemoryRepository()
+
+        def importer(_job, _shard, progress):
+            progress(1, 1)
+            raise ConnectionError("write failed after first durable batch")
+
+        manager = CsvImportJobManager(repository, importer, max_workers=1)
+        try:
+            job, _ = manager.create(
+                idempotency_key="failed-progress",
+                manifest_id="manifest",
+                request_json={"max_attempts": 1},
+                storage_path="/allowed/archive.csv",
+                raw_artifact_id="artifact",
+                rows_total=2,
+                shards=[{
+                    "shard_index": 0, "row_start": 0, "row_end": 2,
+                    "ingestion_id": "failed-shard",
+                }],
+            )
+            failed = wait_for(manager, job["job_id"], "failed")
+            self.assertEqual(failed["rows_read"], 1)
+            self.assertEqual(failed["rows_written"], 1)
+            self.assertEqual(failed["progress_percent"], 50)
+        finally:
             manager.close()
 
 

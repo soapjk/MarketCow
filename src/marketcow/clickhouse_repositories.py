@@ -593,7 +593,11 @@ class ClickHouseMarketBarRepository:
                 symbol, interval, adjustment, source, ingested_at, bars,
                 provenance,
             ),
-            batch_id=str(provenance.get("ingestion_id") or ""),
+            batch_id=str(
+                provenance.get("batch_id")
+                or provenance.get("ingestion_id")
+                or ""
+            ),
         )
 
     def upsert_adjustment_factors(

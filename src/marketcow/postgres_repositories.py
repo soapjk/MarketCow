@@ -1063,6 +1063,36 @@ class PostgresRepository(_PostgresControlPlaneRepository):
                 ),
             ).fetchone())
 
+    def checkpoint_csv_import_shard(
+        self,
+        job_id: str,
+        shard_index: int,
+        owner_id: str,
+        lease_token: str,
+        rows_read: int,
+        rows_written: int,
+        now: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.database.connection() as connection:
+            return _csv_import_row(connection.execute(
+                """
+                UPDATE csv_import_shard SET
+                    rows_read=GREATEST(rows_read,%s),
+                    rows_written=GREATEST(rows_written,%s),
+                    heartbeat_at=%s,updated_at=%s
+                WHERE job_id=%s AND shard_index=%s AND status='running'
+                  AND owner_id=%s AND lease_token=%s
+                  AND %s >= 0 AND %s >= 0 AND %s <= %s
+                  AND %s <= row_end-row_start
+                RETURNING *
+                """,
+                (
+                    rows_read, rows_written, now, now, job_id, shard_index,
+                    owner_id, lease_token, rows_read, rows_written,
+                    rows_written, rows_read, rows_read,
+                ),
+            ).fetchone())
+
     def finish_claimed_csv_import_shard(
         self, row: Dict[str, Any], owner_id: str, lease_token: str
     ) -> Optional[Dict[str, Any]]:

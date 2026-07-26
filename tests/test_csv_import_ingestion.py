@@ -13,6 +13,7 @@ from marketcow.csv_import_ingestion import (
     CsvImportCanceled,
     CsvShardImporter,
     instrument_ingestion_id,
+    microbatch_id,
 )
 from marketcow.csv_import_manifest import CsvImportManifest
 
@@ -89,6 +90,43 @@ class CsvShardImporterTest(unittest.TestCase):
         first = instrument_ingestion_id("shard", "AAPL.XNAS")
         self.assertEqual(first, instrument_ingestion_id("shard", "AAPL.XNAS"))
         self.assertNotEqual(first, instrument_ingestion_id("shard", "IBM.XNYS"))
+
+    def test_microbatches_report_durable_monotonic_progress(self):
+        body = (
+            "symbol,time,open,high,low,close,volume\n"
+            "AAPL.US,2026-01-01T14:30:00Z,1,2,0.5,1.5,10\n"
+            "IBM.US,2026-01-01T14:30:00Z,3,4,2,3.5,20\n"
+            "AAPL.US,2026-01-01T14:31:00Z,2,3,1,2.5,30\n"
+        )
+        request, manifest = declarations()
+        bars = Bars()
+        progress = []
+        result = CsvShardImporter(bars, batch_rows=2).import_shard(
+            io.StringIO(body), request, manifest,
+            {"row_start": 0, "row_end": 3, "ingestion_id": "shard"},
+            raw_artifact_id="artifact",
+            ingested_at="2026-01-02T00:00:00Z",
+            on_progress=lambda read, written: progress.append((read, written)),
+        )
+
+        self.assertEqual(progress, [(2, 2), (3, 3)])
+        self.assertEqual(result["rows_written"], 3)
+        self.assertEqual(
+            {item["instrument_id"]: item["rows"] for item in result["receipts"]},
+            {"AAPL.XNAS": 2, "IBM.XNYS": 1},
+        )
+        self.assertEqual(
+            bars.calls[0][6]["ingestion_id"],
+            bars.calls[2][6]["ingestion_id"],
+        )
+        self.assertNotEqual(
+            bars.calls[0][6]["batch_id"],
+            bars.calls[2][6]["batch_id"],
+        )
+        self.assertEqual(
+            microbatch_id("shard", 0, "AAPL.XNAS"),
+            bars.calls[0][6]["batch_id"],
+        )
 
     def test_truncated_shard_fails_instead_of_reporting_success(self):
         request, manifest = declarations()

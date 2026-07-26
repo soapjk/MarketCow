@@ -100,3 +100,41 @@ test("uploads, preflights and creates an import with an explicit MIC", async () 
   });
   vi.unstubAllGlobals();
 });
+
+test("shows durable row progress, phase and a stale heartbeat warning", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => (
+    new Response(JSON.stringify({
+      count: 1,
+      items: [{
+        job_id: "job-live-progress",
+        status: "running",
+        phase: "importing",
+        progress_percent: 50,
+        rows_total: 10_000,
+        rows_read: 5_000,
+        rows_written: 5_000,
+        heartbeat_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      }],
+    }), { status: 200, headers: { "Content-Type": "application/json" } })
+  )));
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <AuthContext.Provider value={{
+        authenticated: true, actor: "admin", role: "admin",
+        logout: () => undefined,
+      }}>
+        <CsvImportsPage />
+      </AuthContext.Provider>
+    </QueryClientProvider>,
+  );
+
+  expect(await screen.findByText("读取并写入")).toBeInTheDocument();
+  expect(screen.getByText("5,000 / 10,000")).toBeInTheDocument();
+  expect(screen.getByRole("progressbar")).toHaveValue(50);
+  expect(screen.getByRole("alert")).toHaveTextContent("处理可能停滞");
+  vi.unstubAllGlobals();
+});

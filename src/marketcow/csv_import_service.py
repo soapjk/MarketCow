@@ -132,7 +132,10 @@ class CsvImportService:
         )
 
     def _import_shard(
-        self, job: dict[str, Any], shard: dict[str, Any]
+        self,
+        job: dict[str, Any],
+        shard: dict[str, Any],
+        on_progress: Any = None,
     ) -> dict[str, Any]:
         request = CsvImportRequest.from_dict(job["request_json"]["request"])
         manifest = CsvImportManifest(**job["request_json"]["manifest"])
@@ -147,6 +150,7 @@ class CsvImportService:
                     "status"
                 ] == "cancel_requested"
             ),
+            on_progress=on_progress,
         )
 
     def _finalize_job(self, job: dict[str, Any]) -> dict[str, Any]:

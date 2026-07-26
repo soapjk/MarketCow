@@ -137,6 +137,33 @@ class ClickHouseDirectRepositoryPolicyTest(unittest.TestCase):
             "stable-history-ingestion",
         )
 
+    def test_csv_microbatch_token_deduplicates_without_splitting_receipts(self):
+        database = _InsertDatabase()
+        repository = ClickHouseMarketBarRepository(database)
+        provenance = {
+            "ingestion_id": "stable-shard-instrument",
+            "batch_id": "stable-microbatch",
+        }
+        repository.upsert_price_bars(
+            "AAPL", "1d", "raw", "vendor",
+            "2026-01-02T00:00:00+00:00",
+            [{
+                "bar_at": "2026-01-01T00:00:00+00:00",
+                "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1,
+            }],
+            provenance,
+        )
+
+        settings = database.client.insert_calls[0][2]["settings"]
+        self.assertEqual(
+            settings["insert_deduplication_token"], "stable-microbatch"
+        )
+        ingestion_index = repository.RAW_COLUMNS.index("ingestion_id")
+        self.assertEqual(
+            database.client.insert_calls[0][1][0][ingestion_index],
+            "stable-shard-instrument",
+        )
+
     def test_adjustment_factor_preserves_precision_and_ingestion_identity(self):
         database = _InsertDatabase()
         repository = ClickHouseMarketBarRepository(database)

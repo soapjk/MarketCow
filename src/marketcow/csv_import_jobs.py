@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import re
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -27,17 +29,37 @@ class CsvImportJobManager:
     def __init__(
         self,
         repository: Any,
-        import_shard: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]],
+        import_shard: Callable[..., dict[str, Any]],
         finalize_job: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         *,
         max_workers: int = 2,
         lease_seconds: float = 30,
+        progress_interval_seconds: float = 1,
     ):
         self.repository = repository
         self.import_shard = import_shard
+        try:
+            parameters = tuple(
+                inspect.signature(import_shard).parameters.values()
+            )
+        except (TypeError, ValueError):
+            parameters = ()
+        self._importer_accepts_progress = (
+            any(value.kind == inspect.Parameter.VAR_POSITIONAL for value in parameters)
+            or sum(
+                value.kind in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }
+                for value in parameters
+            ) >= 3
+        )
         self.finalize_job = finalize_job
         self.max_workers = max(1, min(int(max_workers), 16))
         self.lease_seconds = max(1.0, float(lease_seconds))
+        self.progress_interval_seconds = max(
+            0.1, float(progress_interval_seconds)
+        )
         self.owner_id = uuid.uuid4().hex
         self._executor = ThreadPoolExecutor(
             max_workers=self.max_workers, thread_name_prefix="csv-import"
@@ -98,17 +120,54 @@ class CsvImportJobManager:
         completed = sum(
             1 for row in shards if row["status"] in TERMINAL_CSV_IMPORT_SHARDS
         )
+        all_shards_succeeded = bool(shards) and all(
+            row["status"] == "succeeded" for row in shards
+        )
+        status = str(job["status"])
+        phase = (
+            "completed" if status == "succeeded"
+            else "failed" if status == "failed"
+            else "canceled" if status == "canceled"
+            else "canceling" if status == "cancel_requested"
+            else "verifying" if all_shards_succeeded
+            else "importing" if status == "running"
+            else "queued"
+        )
+        updated_at = max(
+            [str(job["updated_at"])]
+            + [str(row["updated_at"]) for row in shards if row.get("updated_at")]
+        )
+        heartbeat_at = max(
+            (
+                str(row["heartbeat_at"])
+                for row in shards if row.get("heartbeat_at")
+            ),
+            default=None,
+        )
+        if status == "succeeded":
+            progress_percent = 100
+        elif int(job.get("rows_total") or 0) > 0:
+            progress_percent = min(
+                99,
+                round(
+                    100
+                    * min(rows_written, int(job["rows_total"]))
+                    / int(job["rows_total"]),
+                    2,
+                ),
+            )
+        else:
+            progress_percent = 0
         return {
             **job,
             "rows_read": max(int(job.get("rows_read") or 0), rows_read),
             "rows_written": max(int(job.get("rows_written") or 0), rows_written),
             "completed_shards": completed,
             "total_shards": len(shards),
-            "progress_percent": (
-                100 if not shards and job["status"] == "succeeded"
-                else round(100 * completed / len(shards), 2) if shards
-                else 0
-            ),
+            "progress_percent": progress_percent,
+            "phase": phase,
+            "updated_at": updated_at,
+            "heartbeat_at": heartbeat_at,
             "shards": shards,
         }
 
@@ -185,7 +244,36 @@ class CsvImportJobManager:
         )
         heartbeat.start()
         try:
-            receipt = self.import_shard(job, claimed)
+            last_checkpoint_at = 0.0
+
+            def checkpoint(rows_read: int, rows_written: int) -> None:
+                nonlocal last_checkpoint_at
+                observed = time.monotonic()
+                shard_rows = int(claimed["row_end"]) - int(claimed["row_start"])
+                if (
+                    rows_read < shard_rows
+                    and observed - last_checkpoint_at
+                    < self.progress_interval_seconds
+                ):
+                    return
+                saved = self.repository.checkpoint_csv_import_shard(
+                    job_id,
+                    int(shard["shard_index"]),
+                    self.owner_id,
+                    token,
+                    int(rows_read),
+                    int(rows_written),
+                    _now(),
+                )
+                if saved is None:
+                    raise RuntimeError("CSV import shard lease was lost")
+                last_checkpoint_at = observed
+
+            receipt = (
+                self.import_shard(job, claimed, checkpoint)
+                if self._importer_accepts_progress
+                else self.import_shard(job, claimed)
+            )
             finished = _now()
             self.repository.finish_claimed_csv_import_shard({
                 **claimed, "status": "succeeded",
@@ -197,6 +285,13 @@ class CsvImportJobManager:
             }, self.owner_id, token)
         except Exception as exc:
             finished = _now()
+            current = next(
+                (
+                    row for row in self.repository.list_csv_import_shards(job_id)
+                    if int(row["shard_index"]) == int(shard["shard_index"])
+                ),
+                claimed,
+            )
             canceled = type(exc).__name__ == "CsvImportCanceled"
             max_attempts = int(job["request_json"].get("max_attempts", 3))
             status = (
@@ -205,8 +300,10 @@ class CsvImportJobManager:
                 else "failed"
             )
             self.repository.finish_claimed_csv_import_shard({
-                **claimed, "status": status, "rows_read": 0,
-                "rows_written": 0, "write_receipt_json": None,
+                **current, "status": status,
+                "rows_read": int(current.get("rows_read") or 0),
+                "rows_written": int(current.get("rows_written") or 0),
+                "write_receipt_json": None,
                 "error_code": None if canceled else type(exc).__name__.lower(),
                 "error_message": _safe_error_message(exc), "updated_at": finished,
                 "finished_at": (

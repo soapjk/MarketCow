@@ -142,6 +142,73 @@ class PostgresDomainInventoryTest(unittest.TestCase):
     "set MARKETCOW_TEST_POSTGRES_DSN to run PostgreSQL integration tests",
 )
 class PostgresRepositoryIntegrationTest(unittest.TestCase):
+    def test_csv_progress_checkpoint_is_monotonic_and_lease_fenced(self):
+        suffix = uuid.uuid4().hex
+        job_id = "csv-progress-" + suffix
+        now = "2026-07-26T00:00:00+00:00"
+        job = {
+            "job_id": job_id,
+            "idempotency_key": "csv-progress-key-" + suffix,
+            "manifest_id": "manifest-" + suffix,
+            "status": "queued",
+            "request_json": {"max_attempts": 1},
+            "storage_path": "/allowed/archive.csv",
+            "raw_artifact_id": "artifact-" + suffix,
+            "rows_total": 10,
+            "rows_read": 0,
+            "rows_written": 0,
+            "error_code": None,
+            "error_message": None,
+            "quality_report_json": None,
+            "created_at": now,
+            "started_at": None,
+            "updated_at": now,
+            "finished_at": None,
+        }
+        shard = {
+            "job_id": job_id,
+            "shard_index": 0,
+            "row_start": 0,
+            "row_end": 10,
+            "ingestion_id": "ingestion-" + suffix,
+            "status": "queued",
+            "attempt": 0,
+            "rows_read": 0,
+            "rows_written": 0,
+            "write_receipt_json": None,
+            "error_code": None,
+            "error_message": None,
+            "created_at": now,
+            "updated_at": now,
+            "finished_at": None,
+        }
+        self.repository.get_or_create_csv_import_job(job, [shard])
+        claimed = self.repository.claim_csv_import_shard(
+            job_id, 0, "owner", "token", now,
+            "2030-01-01T00:00:00+00:00",
+        )
+        self.assertIsNotNone(claimed)
+
+        checkpoint = self.repository.checkpoint_csv_import_shard(
+            job_id, 0, "owner", "token", 5, 5,
+            "2026-07-26T00:00:01+00:00",
+        )
+        self.assertEqual(checkpoint["rows_written"], 5)
+        self.assertIsNone(self.repository.checkpoint_csv_import_shard(
+            job_id, 0, "owner", "wrong-token", 6, 6,
+            "2026-07-26T00:00:02+00:00",
+        ))
+        monotonic = self.repository.checkpoint_csv_import_shard(
+            job_id, 0, "owner", "token", 3, 3,
+            "2026-07-26T00:00:03+00:00",
+        )
+        self.assertEqual(monotonic["rows_read"], 5)
+        self.assertEqual(monotonic["rows_written"], 5)
+        self.assertIsNone(self.repository.checkpoint_csv_import_shard(
+            job_id, 0, "owner", "token", 6, 7,
+            "2026-07-26T00:00:04+00:00",
+        ))
+
     def test_history_job_idempotency_is_atomic_under_concurrent_create(self):
         key = "history-atomic-" + uuid.uuid4().hex
         now = "2026-07-24T00:00:00+00:00"

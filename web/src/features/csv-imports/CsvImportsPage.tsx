@@ -53,6 +53,8 @@ type CsvJob = {
   rows_total?: number;
   rows_read?: number;
   rows_written?: number;
+  phase?: string;
+  heartbeat_at?: string | null;
   updated_at: string;
   quality_report_json?: { status?: string };
   error_code?: string;
@@ -113,6 +115,30 @@ function formatBytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function formatRows(value: number | undefined) {
+  return new Intl.NumberFormat("zh-CN").format(value ?? 0);
+}
+
+const phaseLabels: Record<string, string> = {
+  queued: "排队中",
+  importing: "读取并写入",
+  verifying: "质量检查中",
+  canceling: "正在取消",
+  completed: "已完成",
+  failed: "失败",
+  canceled: "已取消",
+};
+
+function phaseLabel(job: CsvJob) {
+  return phaseLabels[job.phase ?? ""] ?? job.status;
+}
+
+function isStalled(job: CsvJob) {
+  if (job.phase !== "importing") return false;
+  const updated = Date.parse(job.heartbeat_at ?? job.updated_at);
+  return Number.isFinite(updated) && Date.now() - updated > 60_000;
 }
 
 export function CsvImportsPage() {
@@ -565,10 +591,22 @@ export function CsvImportsPage() {
                   <td><code title={job.job_id}>{job.job_id.slice(0, 12)}</code></td>
                   <td><span className={`status-pill status-${job.status}`}>{job.status}</span></td>
                   <td className="csv-progress">
-                    <progress max="100" value={job.progress_percent ?? 0} />
-                    <span>{job.progress_percent ?? 0}%</span>
+                    <div>
+                      <progress
+                        aria-label={`${job.job_id} 导入进度`}
+                        max="100"
+                        value={job.progress_percent ?? 0}
+                      />
+                      <span>{job.progress_percent ?? 0}%</span>
+                    </div>
+                    <small>{phaseLabel(job)}</small>
+                    {isStalled(job) ? (
+                      <strong role="alert">处理可能停滞</strong>
+                    ) : null}
                   </td>
-                  <td>{job.rows_written ?? 0} / {job.rows_total ?? 0}</td>
+                  <td>
+                    {formatRows(job.rows_written)} / {formatRows(job.rows_total)}
+                  </td>
                   <td>{job.quality_report_json?.status ?? "pending"}</td>
                   <td>{job.updated_at}</td>
                   <td className="row-actions">

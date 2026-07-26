@@ -177,6 +177,14 @@ React 管理控制台的 `#/csv-imports` 页面支持直接从浏览器选择 CS
 显式选择 MIC，并将供应商代码映射为唯一的 `SYMBOL.MIC`。美股不会根据 ticker
 自动推断 XNAS、XNYS 或 ARCX。
 
+正式导入在每个 100,000 行分片内部按 5,000 行微批写入。微批成功持久化后，
+worker 以最多每秒一次的频率保存受 lease token 保护的
+`rows_read/rows_written` checkpoint。API 的 `progress_percent` 按全部分片
+已持久化的行数计算，而不是按完成分片数计算；质量检查完成前最高为 99%，只有
+任务进入 `succeeded` 才返回 100%。`phase` 取值为 `queued`、`importing`、
+`verifying`、`canceling`、`completed`、`failed` 或 `canceled`。
+`heartbeat_at` 用于识别长时间没有 checkpoint 或 lease heartbeat 的导入。
+
 上传响应同时返回检测到的表头和分隔符。管理页面会忽略大小写并按常见别名自动
 匹配时间、OHLC 和成交量列，例如 `DateTime`、`Open`、`Volume`；操作者可以在
 预检前通过下拉框修正每一项映射。映射或其他声明发生变化后，原预检结果立即失效，
