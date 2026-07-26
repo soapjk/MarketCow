@@ -1,6 +1,10 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError } from "../../lib/api";
+import {
+  api,
+  ApiError,
+  AUTHENTICATION_REQUIRED_EVENT,
+} from "../../lib/api";
 import { AuthContext, type Identity } from "./authContext";
 
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -11,7 +15,26 @@ export function AuthGate({ children }: { children: ReactNode }) {
     queryKey: ["admin-session"],
     queryFn: () => api.request<Identity>("/v1/auth/session"),
     retry: false,
+    refetchInterval: 60_000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
   });
+  useEffect(() => {
+    const revalidateSession = () => {
+      void client.resetQueries({
+        queryKey: ["admin-session"],
+        exact: true,
+      });
+    };
+    window.addEventListener(
+      AUTHENTICATION_REQUIRED_EVENT,
+      revalidateSession,
+    );
+    return () => window.removeEventListener(
+      AUTHENTICATION_REQUIRED_EVENT,
+      revalidateSession,
+    );
+  }, [client]);
   const login = useMutation({
     mutationFn: () => api.request<Identity>("/v1/auth/session", {
       method: "POST", body: JSON.stringify({ username, password }),

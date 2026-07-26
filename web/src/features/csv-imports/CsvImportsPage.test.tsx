@@ -229,6 +229,58 @@ test("preflights and imports every CSV in a folder with one shared format", asyn
   vi.unstubAllGlobals();
 });
 
+test("stops a folder batch after the first expired-session response", async () => {
+  const uploads: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (
+    input: RequestInfo | URL,
+  ) => {
+    const url = String(input);
+    if (url.includes("/upload")) {
+      uploads.push(url);
+      return new Response(JSON.stringify({
+        detail: { code: "authentication_required" },
+      }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ count: 0, items: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }));
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <AuthContext.Provider value={{
+        authenticated: true, actor: "admin", role: "admin",
+        logout: () => undefined,
+      }}>
+        <CsvImportsPage />
+      </AuthContext.Provider>
+    </QueryClientProvider>,
+  );
+  const files = ["AAPL.US.csv", "MSFT.US.csv", "NVDA.US.csv"].map(
+    (name) => new File(["csv"], name, { type: "text/csv" }),
+  );
+  files.forEach((file) => Object.defineProperty(file, "webkitRelativePath", {
+    value: `prices/${file.name}`,
+  }));
+
+  fireEvent.change(screen.getByLabelText("选择 CSV 文件夹"), {
+    target: { files },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "批量上传并预检" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "登录会话已失效，请重新登录",
+  );
+  expect(uploads).toHaveLength(1);
+  vi.unstubAllGlobals();
+});
+
 test("shows durable row progress, phase and a stale heartbeat warning", async () => {
   vi.stubGlobal("fetch", vi.fn(async () => (
     new Response(JSON.stringify({

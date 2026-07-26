@@ -1,6 +1,6 @@
 import { useState, type ChangeEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { useIdentity } from "../auth/authContext";
 
 type UploadReceipt = {
@@ -138,6 +138,10 @@ function detectColumnMapping(columns: string[], fallback: ColumnMapping) {
 
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function authenticationFailed(error: unknown) {
+  return error instanceof ApiError && error.status === 401;
 }
 
 function formatBytes(value: number) {
@@ -460,6 +464,10 @@ export function CsvImportsPage() {
               stage: "failed",
               error: message(value),
             };
+            updateBatchItem(current.key, current);
+            if (authenticationFailed(value)) {
+              throw value;
+            }
           }
           completed.push(current);
           updateBatchItem(current.key, current);
@@ -562,11 +570,14 @@ export function CsvImportsPage() {
               jobId: result.job.job_id,
             });
           } catch (value) {
-            failures += 1;
             updateBatchItem(item.key, {
               stage: "failed",
               error: message(value),
             });
+            if (authenticationFailed(value)) {
+              throw value;
+            }
+            failures += 1;
           }
         }
         if (failures) {
