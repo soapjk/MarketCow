@@ -40,6 +40,16 @@ class Builder:
         return {"status": "ok", "written": 1, "spooled": 0}
 
 
+class SplittingBuilder(Builder):
+    def rebuild(self, *args):
+        self.calls.append(args)
+        return (
+            {"status": "truncated", "spooled": 0}
+            if len(self.calls) == 1
+            else {"status": "ok", "written": 1, "spooled": 0}
+        )
+
+
 class RawRepository:
     def __init__(self, fail_calls=(), short_calls=()):
         self.calls = []
@@ -108,6 +118,41 @@ class BackgroundCanonicalSchedulerTest(unittest.TestCase):
         self.assertIsNone(create_canonical_scheduler(False, invalid="never evaluated"))
         self.assertFalse(absent.exists())
         self.assertEqual(before, {thread.name for thread in threading.enumerate()})
+
+    def test_truncated_range_splits_into_auditable_children(self):
+        builder = SplittingBuilder()
+        scheduler = self.scheduler(builder, start_paused=True)
+        group = {
+            "symbol": "AAPL.XNAS", "interval": "1m", "adjustment": "qfq",
+            "start": "2025-01-02T09:00:00Z",
+            "end": "2025-05-02T23:59:00.000+00:00",
+        }
+        self.spool._atomic_json(
+            scheduler.pending / f"{scheduler._task_id(group)}.json",
+            {"task_id": scheduler._task_id(group), **group, "attempts": 0,
+             "created_at_epoch": 1000, "next_attempt_epoch": 1000,
+             "last_error": ""},
+        )
+        scheduler._paused.clear()
+        scheduler.run_once()
+        children = scheduler._files(scheduler.pending, 10)
+        self.assertEqual(len(children), 2)
+        payloads = [self.spool.read(path, require_checksum=True) for path in children]
+        self.assertTrue(all(row["parent_task_id"] == scheduler._task_id(group)
+                            for row in payloads))
+        self.assertTrue(all(row["split_reason"] == "canonical_limit_truncated"
+                            for row in payloads))
+
+    def test_equivalent_timestamp_precision_has_one_task_id(self):
+        base = {"symbol": "AAPL.XNAS", "interval": "1m", "adjustment": "qfq"}
+        first = {**base, "start": "2025-01-02T09:00:00Z",
+                 "end": "2025-05-02T23:59:00Z"}
+        second = {**base, "start": "2025-01-02T09:00:00.000+00:00",
+                  "end": "2025-05-02T23:59:00.000+00:00"}
+        self.assertEqual(
+            BackgroundCanonicalScheduler._task_id(first),
+            BackgroundCanonicalScheduler._task_id(second),
+        )
 
     def test_sync_multichunk_commit_enqueues_one_exact_range_after_evidence(self):
         scheduler = self.scheduler(Builder(), start_paused=True)

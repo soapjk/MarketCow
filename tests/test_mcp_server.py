@@ -34,6 +34,34 @@ class McpServerTest(unittest.TestCase):
                 return httpx.Response(200, json={
                     "count": 1, "items": [{"symbol": "AAPL.XNAS", "last": "213.88"}],
                 })
+            if request.url.path == "/v1/tushare/cb_basic":
+                return httpx.Response(200, json={"data": {
+                    "fields": [
+                        "ts_code", "bond_short_name", "bond_full_name", "stk_code",
+                        "stk_short_name", "issue_price", "par", "first_conv_price",
+                        "conv_price", "newest_rating", "issue_size", "remain_size",
+                        "list_date",
+                    ],
+                    "items": [[
+                        "113052.SH", "兴业转债", "兴业银行可转换公司债券",
+                        "601166.SH", "兴业银行", 100, 100, 25.51, 23.51, "AAA",
+                        500, 499.5, "20210114",
+                    ]],
+                }})
+            if request.url.path == "/v1/tushare/cb_issue":
+                return httpx.Response(200, json={"data": {
+                    "fields": [
+                        "ts_code", "ann_date", "res_ann_date", "issue_price",
+                        "issue_size", "onl_date",
+                    ],
+                    "items": [["113052.SH", "20201223", "20210104", 100, 50_000_000_000,
+                               "20201228"]],
+                }})
+            if request.url.path == "/v1/tushare/stock_basic":
+                return httpx.Response(200, json={"data": {
+                    "fields": ["ts_code", "name", "fullname", "list_status"],
+                    "items": [["601166.SH", "兴业银行", "兴业银行股份有限公司", "L"]],
+                }})
             if request.url.path.startswith("/v1/fundamentals/"):
                 return httpx.Response(404, json={"detail": "fundamental data not found"})
             return httpx.Response(200, json={"status": "ok"})
@@ -73,6 +101,14 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("get_financial_statements", names)
         self.assertTrue(all(tool["annotations"]["readOnlyHint"] for tool in tools))
         self.assertTrue(all(not tool["annotations"]["destructiveHint"] for tool in tools))
+        open_world = {
+            tool["name"] for tool in tools if tool["annotations"]["openWorldHint"]
+        }
+        self.assertEqual(open_world, {
+            "search_convertible_bonds",
+            "get_convertible_bond",
+            "get_convertible_bond_market",
+        })
 
     def test_tool_call_returns_text_and_structured_content(self) -> None:
         response = self.request("tools/call", {
@@ -101,6 +137,22 @@ class McpServerTest(unittest.TestCase):
         self.assertFalse(body["refresh"])
         self.assertIsNone(body["provider"])
         self.assertFalse(body["allow_fallback"])
+
+    def test_convertible_bond_tool_loads_provider_catalog_not_bundled_rows(self) -> None:
+        response = self.request("tools/call", {
+            "name": "search_convertible_bonds",
+            "arguments": {"query": "113052.XSHG"},
+        })
+        content = response["result"]["structuredContent"]
+        self.assertEqual(content["catalog_size"], 1)
+        self.assertEqual(content["items"][0]["bond_id"], "113052.XSHG")
+        self.assertEqual(content["items"][0]["issuer"], "兴业银行股份有限公司")
+        paths = [request.url.path for request in self.requests]
+        self.assertEqual(paths, [
+            "/v1/tushare/cb_basic",
+            "/v1/tushare/cb_issue",
+            "/v1/tushare/stock_basic",
+        ])
 
     def test_invalid_tool_input_is_visible_to_agent(self) -> None:
         response = self.request("tools/call", {
@@ -210,7 +262,7 @@ class McpHttpEndpointTest(unittest.TestCase):
             health = client.get("/v1/health")
         self.assertEqual(initialized.status_code, 200)
         self.assertEqual(initialized.json()["result"]["protocolVersion"], "2025-11-25")
-        self.assertEqual(len(tools.json()["result"]["tools"]), 10)
+        self.assertEqual(len(tools.json()["result"]["tools"]), 13)
         self.assertEqual(health.json()["mcp"], {
             "enabled": True, "endpoint": "/mcp",
         })

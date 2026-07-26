@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
@@ -87,8 +88,48 @@ class BackgroundCanonicalScheduler:
 
     @staticmethod
     def _task_id(group: Dict[str, str]) -> str:
-        encoded = json.dumps(group, sort_keys=True, separators=(",", ":")).encode()
+        normalized = {
+            **group,
+            "start": BackgroundCanonicalScheduler._canonical_time(group["start"]),
+            "end": BackgroundCanonicalScheduler._canonical_time(group["end"]),
+        }
+        encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _canonical_time(value: Any) -> str:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("canonical scheduler timestamps must include a timezone")
+        return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+    def _split_truncated(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        start = datetime.fromisoformat(self._canonical_time(task["start"]))
+        end = datetime.fromisoformat(self._canonical_time(task["end"]))
+        if start >= end:
+            raise RuntimeError("truncated canonical task cannot be split further")
+        midpoint = start + (end - start) / 2
+        groups = [{
+            "symbol": task["symbol"], "interval": task["interval"],
+            "adjustment": task["adjustment"], "start": self._canonical_time(left),
+            "end": self._canonical_time(right),
+        } for left, right in ((start, midpoint), (midpoint, end))]
+        child_ids = []
+        now = float(self.clock())
+        for group in groups:
+            child_id = self._task_id(group)
+            child_ids.append(child_id)
+            destination = self.pending / f"{child_id}.json"
+            if not destination.exists():
+                self.spool._atomic_json(destination, {
+                    "task_id": child_id, **group, "attempts": 0,
+                    "created_at_epoch": now, "next_attempt_epoch": now,
+                    "last_error": "", "parent_task_id": task["task_id"],
+                    "split_reason": "canonical_limit_truncated",
+                })
+        return {"status": "split", "task_id": task["task_id"],
+                "child_task_ids": child_ids,
+                "reason": "canonical_limit_truncated"}
 
     @staticmethod
     def _files(folder: Path, limit: int) -> List[Path]:
@@ -164,8 +205,18 @@ class BackgroundCanonicalScheduler:
                 task["symbol"], task["interval"], task["adjustment"],
                 task["start"], task["end"], self.canonical_limit,
             )
+            if result.get("status") == "truncated":
+                split = self._split_truncated(task)
+                claimed.unlink(missing_ok=True)
+                with self._state_lock:
+                    self._last = split
+                self._wake.set()
+                return
             if result.get("status") != "ok" or result.get("spooled"):
-                raise RuntimeError("canonical rebuild did not complete")
+                raise RuntimeError(
+                    "canonical rebuild did not complete: "
+                    + json.dumps(result, sort_keys=True, default=str)[:800]
+                )
         except Exception as error:
             task["attempts"] = int(task.get("attempts", 0)) + 1
             task["last_error"] = sanitize_text(

@@ -26,6 +26,9 @@ The same process now serves MCP at `http://127.0.0.1:8792/mcp`. Configure an MCP
 }
 ```
 
+For a project-scoped setup that does not modify user-level or system-level MCP
+configuration, follow the [project installation guide](mcp-project-installation.md).
+
 The HTTP transport is sessionless and returns JSON responses directly. Requests with an
 `Origin` header are rejected to prevent browser-based DNS rebinding, and request bodies are
 limited to 1 MiB.
@@ -64,6 +67,9 @@ sent through a proxy.
 - `get_financial_statements`
 - `get_dividends`
 - `get_exposure_facts`
+- `search_convertible_bonds`
+- `get_convertible_bond`
+- `get_convertible_bond_market`
 
 Every tool is declared read-only and forces cached reads (`refresh=false`). Batch sizes and
 history page sizes are bounded to protect the agent context window. For reproducible
@@ -72,3 +78,6 @@ manifest, provenance, quality, and adjustment fields with the analysis.
 
 The server implements the MCP stdio lifecycle and tools protocol without adding another
 runtime dependency. This preserves MarketCow's tested `httpx` constraint.
+
+Convertible-bond field contracts, scorer mapping and missing-value semantics are
+documented in [Convertible-Bond MCP v1](mcp-convertible-bonds.md).

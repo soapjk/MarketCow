@@ -10,6 +10,12 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from . import __version__
+from .convertible_bonds import (
+    ConvertibleBondCatalog,
+    build_market_snapshot,
+    market_view,
+    records_from_tushare,
+)
 
 
 LATEST_PROTOCOL_VERSION = "2025-11-25"
@@ -69,6 +75,7 @@ class Tool:
     description: str
     input_schema: dict[str, Any]
     handler: Callable[[Mapping[str, Any]], dict[str, Any]]
+    open_world: bool = False
 
     def definition(self) -> dict[str, Any]:
         return {
@@ -79,7 +86,7 @@ class Tool:
                 "readOnlyHint": True,
                 "destructiveHint": False,
                 "idempotentHint": True,
-                "openWorldHint": False,
+                "openWorldHint": self.open_world,
             },
         }
 
@@ -207,6 +214,31 @@ def _symbols(arguments: Mapping[str, Any], maximum: int = 20) -> list[str]:
 
 
 def create_tools(client: MarketCowClient) -> dict[str, Tool]:
+    def tushare_rows(api_name: str, params: Mapping[str, Any] | None = None,
+                     fields: str = "") -> list[dict[str, Any]]:
+        payload = client.request(
+            "POST", f"/v1/tushare/{quote(api_name, safe='')}",
+            json_body={"params": dict(params or {}), "fields": fields},
+        )
+        data = payload.get("data") or {}
+        names = data.get("fields") or []
+        return [
+            dict(zip(names, values))
+            for values in (data.get("items") or [])
+        ]
+
+    def load_bond_catalog() -> tuple[dict[str, Any], ...]:
+        return records_from_tushare(
+            tushare_rows("cb_basic"),
+            tushare_rows("cb_issue"),
+            tushare_rows(
+                "stock_basic", {"list_status": "L"},
+                "ts_code,symbol,name,fullname,list_status",
+            ),
+        )
+
+    bond_catalog = ConvertibleBondCatalog(loader=load_bond_catalog)
+
     def service_health(_: Mapping[str, Any]) -> dict[str, Any]:
         return client.request("GET", "/v1/health")
 
@@ -308,6 +340,36 @@ def create_tools(client: MarketCowClient) -> dict[str, Tool]:
         symbol = _path_segment(arguments, "symbol")
         return client.request(
             "GET", f"/v1/exposure-facts/{symbol}", params={"refresh": False}
+        )
+
+    def search_convertible_bonds(arguments: Mapping[str, Any]) -> dict[str, Any]:
+        return bond_catalog.search(
+            _required_string(arguments, "query"),
+            _bounded_int(arguments, "limit", 12, 1, 30),
+        )
+
+    def get_convertible_bond(arguments: Mapping[str, Any]) -> dict[str, Any]:
+        return bond_catalog.get(
+            _required_string(arguments, "bond_id"),
+            _optional_string(arguments, "as_of"),
+        )
+
+    def get_convertible_bond_market(arguments: Mapping[str, Any]) -> dict[str, Any]:
+        record = bond_catalog.get(_required_string(arguments, "bond_id"))
+        if record.get("status") != "available":
+            return record
+        cb_daily = tushare_rows("cb_daily")
+        latest = max(
+            (str(row.get("trade_date") or "") for row in cb_daily),
+            default="",
+        )
+        if not latest:
+            return market_view(
+                record, {"trade_date": None, "observed_at": None, "items": {}}
+            )
+        stock_daily = tushare_rows("daily", {"trade_date": latest})
+        return market_view(
+            record, build_market_snapshot(bond_catalog, cb_daily, stock_daily)
         )
 
     common_symbol = _string(
@@ -431,6 +493,35 @@ def create_tools(client: MarketCowClient) -> dict[str, Tool]:
             "Get auditable issuer or fund exposure facts without inferred themes or factors.",
             _object_schema({"symbol": common_symbol}, ("symbol",)),
             get_exposure_facts,
+        ),
+        Tool(
+            "search_convertible_bonds",
+            "Search the broad Tushare-backed convertible-bond catalog by name, alias, bare code, exchange code, or canonical ID.",
+            _object_schema({
+                "query": _string("Convertible-bond name, alias, code, or canonical ID."),
+                "limit": _integer("Maximum matches.", 1, 30, 12),
+            }, ("query",)),
+            search_convertible_bonds,
+            open_world=True,
+        ),
+        Tool(
+            "get_convertible_bond",
+            "Get issuance terms, issuer mapping, credit/audit risk and subscription calendar with field-level provenance and missing semantics.",
+            _object_schema({
+                "bond_id": _string("Convertible-bond name, code, or canonical ID."),
+                "as_of": _string("Optional point-in-time ISO-8601 cutoff."),
+            }, ("bond_id",)),
+            get_convertible_bond,
+            open_world=True,
+        ),
+        Tool(
+            "get_convertible_bond_market",
+            "Get same-date bond and stock closes, conversion value, premium, issue size and broad-market comparable percentiles.",
+            _object_schema({
+                "bond_id": _string("Convertible-bond name, code, or canonical ID."),
+            }, ("bond_id",)),
+            get_convertible_bond_market,
+            open_world=True,
         ),
     ]
     return {tool.name: tool for tool in tools}
