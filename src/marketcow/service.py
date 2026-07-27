@@ -100,6 +100,19 @@ def _decode_database_value(value: Any) -> Any:
     return value
 
 
+def _instrument_contract_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {
+        key: _decode_database_value(row[key])
+        for key in InstrumentContract.model_fields
+    }
+    for field in ("tick_size", "size_increment", "lot_size"):
+        payload[field] = format(Decimal(str(payload[field])), "f")
+    for field in ("ts_event", "ts_init"):
+        if isinstance(payload[field], datetime):
+            payload[field] = payload[field].isoformat()
+    return payload
+
+
 def _number(value: Any) -> Optional[float]:
     value = json_safe(value)
     if value in (None, "", "-"):
@@ -1332,10 +1345,7 @@ class FundamentalService:
                             "broker_symbols": {},
                         }
                     else:
-                        payload = {
-                            key: existing[key]
-                            for key in InstrumentContract.model_fields
-                        }
+                        payload = _instrument_contract_payload(existing)
                         payload["provider_symbols"] = dict(
                             payload["provider_symbols"]
                         )
