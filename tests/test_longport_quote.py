@@ -45,6 +45,12 @@ class FakeContext:
             raise self.error
         return self.rows
 
+    def static_info(self, symbols):
+        self.calls.append(symbols)
+        if self.error:
+            raise self.error
+        return self.rows
+
     def depth(self, symbol):
         self.calls.append(symbol)
         if self.error:
@@ -100,6 +106,58 @@ class LongPortQuoteProviderTest(unittest.TestCase):
         self.assertEqual([row["price"] for row in result], [101.25, 321.4])
         for row in result:
             validate_realtime_quote(row)
+
+    def test_static_metadata_resolves_exchange_to_mic_without_guessing(self):
+        context = FakeContext([
+            SimpleNamespace(
+                symbol="BRK.B.US", exchange="NYSE", currency="USD", lot_size=1,
+                name_en="Berkshire Hathaway B", name_cn="",
+            ),
+            SimpleNamespace(
+                symbol="MU.US", exchange="NASD", currency="USD", lot_size=1,
+                name_en="Micron", name_cn="",
+            ),
+            SimpleNamespace(
+                symbol="DRAM.US", exchange="AMEX", currency="USD", lot_size=1,
+                name_en="Roundhill Memory ETF", name_cn="",
+            ),
+            SimpleNamespace(
+                symbol="SPY.US", exchange="ARCA", currency="USD", lot_size=1,
+                name_en="SPDR S&P 500 ETF", name_cn="",
+            ),
+        ])
+        provider = LongPortQuoteProvider(
+            "key", "secret", "token", context_factory=lambda: context,
+        )
+
+        result = provider.resolve_instruments([
+            "BRK.B.US", "MU.US", "DRAM.US", "SPY.US", "MISSING.US",
+        ])
+
+        self.assertEqual(context.calls, [[
+            "BRK.B.US", "MU.US", "DRAM.US", "SPY.US", "MISSING.US",
+        ]])
+        self.assertEqual(
+            [item.get("instrument_id") for item in result],
+            ["BRK-B.XNYS", "MU.XNAS", "DRAM.XASE", "SPY.ARCX", None],
+        )
+        self.assertEqual(result[-1]["error"]["code"], "not_found")
+
+    def test_unknown_or_conflicting_static_exchange_is_ambiguous(self):
+        context = FakeContext([
+            SimpleNamespace(
+                symbol="ODD.US", exchange="UNKNOWN", currency="USD", lot_size=1,
+                name_en="Odd", name_cn="",
+            ),
+        ])
+        provider = LongPortQuoteProvider(
+            "key", "secret", "token", context_factory=lambda: context,
+        )
+
+        result = provider.resolve_instruments(["ODD.US"])
+
+        self.assertEqual(result[0]["status"], "error")
+        self.assertEqual(result[0]["error"]["code"], "ambiguous")
 
     def test_latest_extended_session_quote_is_selected(self):
         post = SimpleNamespace(

@@ -100,6 +100,29 @@ class Service:
         self.search_calls.append((query, limit))
         return self.search_results.get(query, [])[:limit]
 
+    def resolve_instruments_batch(self, namespace, symbols):
+        items = [{
+            "namespace": namespace,
+            "external_symbol": symbol,
+            "status": "resolved",
+            "instrument_id": "MU.XNAS",
+            "symbol": "MU",
+            "mic": "XNAS",
+            "market": "US",
+            "currency": "USD",
+            "source": "longport.static_info",
+            "source_exchange": "NASD",
+            "observed_at": "2026-07-27T00:00:00Z",
+            "resolution": "upstream",
+        } for symbol in symbols]
+        return {
+            "namespace": namespace,
+            "count": len(items),
+            "resolved_count": len(items),
+            "error_count": 0,
+            "items": items,
+        }
+
 
 class MarketDataApiTest(unittest.TestCase):
     def setUp(self):
@@ -147,6 +170,33 @@ class MarketDataApiTest(unittest.TestCase):
         )
         InstrumentRecord.model_validate(resolved.json())
         self.assertEqual(resolved.json()["instrument_id"], "AAPL.XNAS")
+
+    def test_batch_instrument_resolution_is_public_and_machine_readable(self):
+        response = self.client.post("/v1/instruments:resolve/query", json={
+            "namespace": "provider:longport",
+            "symbols": ["MU.US"],
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["items"][0], {
+            "namespace": "provider:longport",
+            "external_symbol": "MU.US",
+            "status": "resolved",
+            "instrument_id": "MU.XNAS",
+            "symbol": "MU",
+            "mic": "XNAS",
+            "market": "US",
+            "currency": "USD",
+            "source": "longport.static_info",
+            "source_exchange": "NASD",
+            "observed_at": "2026-07-27T00:00:00Z",
+            "resolution": "upstream",
+            "error": None,
+        })
+        openapi = self.client.get("/openapi.json").json()
+        operation = openapi["paths"]["/v1/instruments:resolve/query"]["post"]
+        self.assertIn("InstrumentResolveBatchRequest", str(operation))
+        self.assertIn("InstrumentResolveBatchResponse", str(operation))
 
     def test_convertible_bond_registration_uses_fixed_income_asset_class(self):
         convertible_bond = {

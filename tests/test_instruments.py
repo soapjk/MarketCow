@@ -52,6 +52,10 @@ class CanonicalInstrumentTest(unittest.TestCase):
             canonical_instrument("SPY.ARCX").instrument_id,
             "SPY.ARCX",
         )
+        self.assertEqual(
+            canonical_instrument("DRAM.XASE").instrument_id,
+            "DRAM.XASE",
+        )
 
     def test_legacy_internal_formats_are_rejected(self):
         for value in (

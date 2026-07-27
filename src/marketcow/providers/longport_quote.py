@@ -13,6 +13,20 @@ from ..instruments import canonical_instrument
 
 LONGPORT_QUOTE_URL = "wss://openapi-quote.longbridge.com/v2"
 MAX_QUOTE_SYMBOLS = 500
+MAX_RESOLVE_SYMBOLS = 20
+LONGPORT_EXCHANGE_MICS = {
+    "SSE": "XSHG",
+    "SZSE": "XSHE",
+    "BSE": "XBSE",
+    "SEHK": "XHKG",
+    "NASD": "XNAS",
+    "NASDAQ": "XNAS",
+    "NYSE": "XNYS",
+    "ARCA": "ARCX",
+    "NYSE ARCA": "ARCX",
+    "AMEX": "XASE",
+    "NYSE AMERICAN": "XASE",
+}
 _PROXY_VARIABLES = (
     "http_proxy", "https_proxy", "all_proxy",
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
@@ -253,6 +267,105 @@ class LongPortQuoteProvider:
 
     def fetch_quote(self, symbol: str) -> dict[str, Any]:
         return self.fetch_quotes((symbol,))[0]
+
+    def resolve_instruments(
+        self, external_symbols: Iterable[str]
+    ) -> list[dict[str, Any]]:
+        """Resolve provider symbols using LongPort's authoritative static metadata."""
+
+        requested = tuple(
+            str(symbol or "").strip().upper().replace(" ", "")
+            for symbol in external_symbols
+        )
+        if not requested:
+            raise ValueError("at least one external symbol is required")
+        if len(requested) > MAX_RESOLVE_SYMBOLS:
+            raise ValueError("LongPort resolves at most 20 symbols per request")
+        if any(not symbol for symbol in requested):
+            raise ValueError("external symbols must not be empty")
+        try:
+            with self._lock:
+                with _direct_connection_environment():
+                    rows = self._quote_context().static_info(list(dict.fromkeys(requested)))
+        except LongPortError:
+            raise
+        except Exception as exc:
+            raise LongPortError("LongPort static instrument metadata request failed") from exc
+
+        by_symbol: dict[str, list[Any]] = {}
+        for row in rows:
+            provider_symbol = str(getattr(row, "symbol", "") or "").strip().upper()
+            if provider_symbol:
+                by_symbol.setdefault(provider_symbol, []).append(row)
+
+        results = []
+        for external_symbol in requested:
+            candidates = by_symbol.get(external_symbol, [])
+            if not candidates:
+                results.append({
+                    "external_symbol": external_symbol,
+                    "status": "error",
+                    "error": {
+                        "code": "not_found",
+                        "message": "LongPort returned no static metadata for the symbol",
+                    },
+                })
+                continue
+            resolved = []
+            unknown_exchanges = []
+            for row in candidates:
+                exchange = str(getattr(row, "exchange", "") or "").strip().upper()
+                mic = LONGPORT_EXCHANGE_MICS.get(exchange)
+                if mic is None:
+                    unknown_exchanges.append(exchange or "<empty>")
+                    continue
+                try:
+                    if external_symbol.endswith(".US"):
+                        provider_ticker = external_symbol[:-3]
+                        canonical_symbol = provider_ticker.replace(".", "-")
+                        instrument = canonical_instrument(f"{canonical_symbol}.{mic}")
+                    else:
+                        from ..instruments import external_instrument
+
+                        instrument = external_instrument(
+                            "provider:longport", external_symbol, mic=mic
+                        )
+                except ValueError:
+                    continue
+                resolved.append((instrument, row, exchange))
+            identities = {item[0].instrument_id for item in resolved}
+            if len(identities) != 1 or unknown_exchanges:
+                detail = (
+                    f"LongPort exchanges have no unique MIC mapping: "
+                    f"{', '.join(sorted(set(unknown_exchanges)))}"
+                    if unknown_exchanges
+                    else "LongPort returned multiple canonical instrument identities"
+                )
+                results.append({
+                    "external_symbol": external_symbol,
+                    "status": "error",
+                    "error": {"code": "ambiguous", "message": detail},
+                })
+                continue
+            instrument, row, exchange = resolved[0]
+            results.append({
+                "external_symbol": external_symbol,
+                "status": "resolved",
+                "instrument_id": instrument.instrument_id,
+                "symbol": instrument.symbol,
+                "mic": instrument.mic,
+                "market": instrument.market,
+                "currency": str(getattr(row, "currency", "") or "").upper(),
+                "lot_size": int(getattr(row, "lot_size", 1) or 1),
+                "name": (
+                    str(getattr(row, "name_en", "") or "")
+                    or str(getattr(row, "name_cn", "") or "")
+                    or instrument.symbol
+                ),
+                "source": "longport.static_info",
+                "source_exchange": exchange,
+            })
+        return results
 
     @staticmethod
     def _normalize_depth_levels(levels: Any) -> list[dict[str, Any]]:

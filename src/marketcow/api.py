@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import (
@@ -125,6 +125,49 @@ class CrossMarketQuery(BaseModel):
 class QuoteQuery(ProviderPolicy):
     symbols: list[str] = Field(min_length=1, max_length=20)
     refresh: bool = False
+
+
+class InstrumentResolveBatchRequest(BaseModel):
+    namespace: str = Field(
+        min_length=3, max_length=80,
+        pattern=r"^(?:provider|broker):[A-Za-z0-9_-]+$",
+    )
+    symbols: list[str] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def non_empty_symbols(self):
+        if any(not str(symbol or "").strip() for symbol in self.symbols):
+            raise ValueError("symbols must not contain empty values")
+        return self
+
+
+class InstrumentResolveError(BaseModel):
+    code: Literal["not_found", "ambiguous", "provider_unavailable"]
+    message: str
+
+
+class InstrumentResolveItem(BaseModel):
+    namespace: str
+    external_symbol: str
+    status: Literal["resolved", "error"]
+    instrument_id: Optional[str] = None
+    symbol: Optional[str] = None
+    mic: Optional[str] = None
+    market: Optional[str] = None
+    currency: Optional[str] = None
+    source: Optional[str] = None
+    source_exchange: Optional[str] = None
+    observed_at: Optional[str] = None
+    resolution: Optional[Literal["registry", "upstream"]] = None
+    error: Optional[InstrumentResolveError] = None
+
+
+class InstrumentResolveBatchResponse(BaseModel):
+    namespace: str
+    count: int
+    resolved_count: int
+    error_count: int
+    items: list[InstrumentResolveItem]
 
 
 class MarketBarQuery(ProviderPolicy):
@@ -1069,6 +1112,13 @@ def create_app(
                 "namespace": namespace, "external_symbol": external_symbol,
             })
         return instrument_record(row)
+
+    @app.post(
+        "/v1/instruments:resolve/query",
+        response_model=InstrumentResolveBatchResponse,
+    )
+    def resolve_instruments_query(request: InstrumentResolveBatchRequest):
+        return service.resolve_instruments_batch(request.namespace, request.symbols)
 
     @app.get("/v1/instrument-relationships")
     def instrument_relationship(
