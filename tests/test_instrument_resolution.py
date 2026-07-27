@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
+from decimal import Decimal
 
 from marketcow.service import FundamentalService
 
@@ -135,7 +137,14 @@ class InstrumentResolutionServiceTest(unittest.TestCase):
         row = self.metadata.rows["MU.XNAS"]
         row["instrument_id"] = b"MU.XNAS"
         row["currency"] = b"USD"
-        row["updated_at"] = b"2026-07-27T07:30:00+00:00"
+        row["tick_size"] = Decimal("0.01")
+        row["size_increment"] = Decimal("1")
+        row["lot_size"] = Decimal("1")
+        row["ts_event"] = datetime(2026, 7, 27, 7, 30, tzinfo=timezone.utc)
+        row["ts_init"] = datetime(2026, 7, 27, 7, 30, tzinfo=timezone.utc)
+        row["updated_at"] = datetime(
+            2026, 7, 27, 7, 30, tzinfo=timezone.utc
+        )
         row["provider_symbols"] = {b"longport": b"MU.US"}
         second = self.service.resolve_instruments_batch(
             "provider:longport", ["MU.US"]
@@ -144,6 +153,12 @@ class InstrumentResolutionServiceTest(unittest.TestCase):
         self.assertEqual(second["items"][0]["instrument_id"], "MU.XNAS")
         self.assertEqual(second["items"][0]["currency"], "USD")
         self.assertEqual(second["items"][0]["resolution"], "registry")
+
+        existing = self.service.resolve_instruments_batch(
+            "provider:longport", ["MICRON.US"]
+        )
+        self.assertEqual(existing["items"][0]["instrument_id"], "MU.XNAS")
+        self.assertEqual(existing["items"][0]["resolution"], "upstream")
 
 
 if __name__ == "__main__":
