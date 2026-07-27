@@ -28,6 +28,16 @@ class Metadata:
         self.health.append((provider, success, error))
 
 
+class ByteReturningMetadata(Metadata):
+    def upsert_instrument(self, row):
+        saved = super().upsert_instrument(row)
+        return {
+            **saved,
+            "instrument_id": saved["instrument_id"].encode(),
+            "currency": saved["currency"].encode(),
+        }
+
+
 class Provider:
     configured = True
 
@@ -112,6 +122,28 @@ class InstrumentResolutionServiceTest(unittest.TestCase):
             result["items"][0]["error"]["code"], "provider_unavailable"
         )
         self.assertEqual(self.provider.calls, [])
+
+    def test_postgres_byte_values_are_decoded_on_write_and_registry_hit(self):
+        self.metadata = ByteReturningMetadata()
+        self.service.metadata_repository = self.metadata
+
+        first = self.service.resolve_instruments_batch(
+            "provider:longport", ["MU.US"]
+        )
+        self.assertEqual(first["items"][0]["instrument_id"], "MU.XNAS")
+
+        row = self.metadata.rows["MU.XNAS"]
+        row["instrument_id"] = b"MU.XNAS"
+        row["currency"] = b"USD"
+        row["updated_at"] = b"2026-07-27T07:30:00+00:00"
+        row["provider_symbols"] = {b"longport": b"MU.US"}
+        second = self.service.resolve_instruments_batch(
+            "provider:longport", ["MU.US"]
+        )
+
+        self.assertEqual(second["items"][0]["instrument_id"], "MU.XNAS")
+        self.assertEqual(second["items"][0]["currency"], "USD")
+        self.assertEqual(second["items"][0]["resolution"], "registry")
 
 
 if __name__ == "__main__":

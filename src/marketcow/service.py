@@ -87,6 +87,19 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _decode_database_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, dict):
+        return {
+            _decode_database_value(key): _decode_database_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_decode_database_value(item) for item in value]
+    return value
+
+
 def _number(value: Any) -> Optional[float]:
     value = json_safe(value)
     if value in (None, "", "-"):
@@ -1213,7 +1226,8 @@ class FundamentalService:
             if row is None:
                 missing_positions.append(position)
                 continue
-            instrument = canonical_instrument(str(row["instrument_id"]))
+            row = _decode_database_value(row)
+            instrument = canonical_instrument(row["instrument_id"])
             items[position] = {
                 "namespace": normalized_namespace,
                 "external_symbol": external_symbol,
@@ -1294,6 +1308,7 @@ class FundamentalService:
                     existing = self.metadata_repository.get_instrument(
                         resolved["instrument_id"]
                     )
+                    existing = _decode_database_value(existing)
                     if existing is None:
                         payload = {
                             "schema_version": 1,
@@ -1335,6 +1350,7 @@ class FundamentalService:
                         "content_hash": canonical_hash(normalized),
                         "updated_at": observed_at,
                     })
+                    saved = _decode_database_value(saved)
                 except ValueError as exc:
                     items[position] = {
                         "namespace": normalized_namespace,
@@ -1354,7 +1370,7 @@ class FundamentalService:
                         },
                     }
                     continue
-                instrument = canonical_instrument(str(saved["instrument_id"]))
+                instrument = canonical_instrument(saved["instrument_id"])
                 items[position] = {
                     "namespace": normalized_namespace,
                     "external_symbol": normalized_symbols[position],
