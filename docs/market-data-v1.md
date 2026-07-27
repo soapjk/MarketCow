@@ -33,6 +33,90 @@ definition; `ts_init` is when MarketCow initialized that definition, and
 Mappings use explicit namespaces such as `provider:longport` and `broker:longport`.
 `(namespace, external_symbol)` is unique and a conflict returns `instrument_conflict`.
 
+### Dynamic provider symbol resolution
+
+`GET /v1/instruments:resolve` remains the read-only registered-mapping lookup.
+For a batch that may contain unregistered provider symbols, use:
+
+```http
+POST /v1/instruments:resolve/query
+Content-Type: application/json
+
+{
+  "namespace": "provider:longport",
+  "symbols": ["BRK.B.US", "MU.US", "DRAM.US"]
+}
+```
+
+The public batch endpoint accepts 1–20 symbols, preserves input order, and returns one
+result per input. It first checks the local `(namespace, external_symbol)` registry. A
+missing `provider:longport` mapping is resolved with LongPort `static_info`, whose
+`exchange` metadata is mapped explicitly to ISO MIC:
+
+- `NASD` / `NASDAQ` → `XNAS`
+- `NYSE` → `XNYS`
+- `ARCA` / `NYSE ARCA` → `ARCX`
+- `AMEX` / `NYSE AMERICAN` → `XASE`
+- `SSE` → `XSHG`, `SZSE` → `XSHE`, `BSE` → `XBSE`, `SEHK` → `XHKG`
+
+MarketCow never chooses a US MIC from a ticker pattern. An unknown exchange, or
+conflicting provider metadata that does not identify exactly one canonical instrument,
+returns `ambiguous`.
+
+Example response:
+
+```json
+{
+  "namespace": "provider:longport",
+  "count": 2,
+  "resolved_count": 1,
+  "error_count": 1,
+  "items": [
+    {
+      "namespace": "provider:longport",
+      "external_symbol": "MU.US",
+      "status": "resolved",
+      "instrument_id": "MU.XNAS",
+      "symbol": "MU",
+      "mic": "XNAS",
+      "market": "US",
+      "currency": "USD",
+      "source": "longport.static_info",
+      "source_exchange": "NASD",
+      "observed_at": "2026-07-27T00:00:00+00:00",
+      "resolution": "upstream",
+      "error": null
+    },
+    {
+      "namespace": "provider:longport",
+      "external_symbol": "MISSING.US",
+      "status": "error",
+      "instrument_id": null,
+      "error": {
+        "code": "not_found",
+        "message": "LongPort returned no static metadata for the symbol"
+      }
+    }
+  ]
+}
+```
+
+Successful upstream resolutions are idempotently written to `instrument_master` and
+`instrument_symbol_mapping`. A later
+`GET /v1/instruments:resolve?namespace=provider:longport&external_symbol=MU.US`
+therefore returns the registered InstrumentRecord without another provider call.
+`resolution=registry` identifies a cache hit; `resolution=upstream`,
+`source=longport.static_info`, `source_exchange`, and `observed_at` provide the
+resolution audit trail.
+
+Per-item error codes are:
+
+- `not_found`: the provider returned no metadata for that exact external symbol.
+- `ambiguous`: provider metadata did not select exactly one supported MIC, or conflicts
+  with an existing canonical registration.
+- `provider_unavailable`: credentials, upstream metadata access, the requested dynamic
+  namespace, or the local instrument registry is unavailable.
+
 ## Machine-readable schemas
 
 `GET /v1/schemas/{name}` serves JSON Schema for:

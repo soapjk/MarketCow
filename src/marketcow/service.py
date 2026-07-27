@@ -1196,6 +1196,189 @@ class FundamentalService:
             )
         return self._persist_quotes_async(rows, provider)
 
+    def resolve_instruments_batch(
+        self, namespace: str, external_symbols: list[str]
+    ) -> Dict[str, Any]:
+        normalized_namespace = str(namespace or "").strip().lower()
+        normalized_symbols = [
+            str(symbol or "").strip().upper().replace(" ", "")
+            for symbol in external_symbols
+        ]
+        items: list[Dict[str, Any] | None] = [None] * len(normalized_symbols)
+        missing_positions: list[int] = []
+        for position, external_symbol in enumerate(normalized_symbols):
+            row = self.metadata_repository.find_instrument_by_mapping(
+                normalized_namespace, external_symbol
+            )
+            if row is None:
+                missing_positions.append(position)
+                continue
+            instrument = canonical_instrument(str(row["instrument_id"]))
+            items[position] = {
+                "namespace": normalized_namespace,
+                "external_symbol": external_symbol,
+                "status": "resolved",
+                "instrument_id": instrument.instrument_id,
+                "symbol": instrument.symbol,
+                "mic": instrument.mic,
+                "market": instrument.market,
+                "currency": str(row.get("currency") or ""),
+                "source": "instrument_mapping_registry",
+                "source_exchange": None,
+                "observed_at": str(row.get("updated_at") or ""),
+                "resolution": "registry",
+            }
+
+        if missing_positions and normalized_namespace != "provider:longport":
+            for position in missing_positions:
+                items[position] = {
+                    "namespace": normalized_namespace,
+                    "external_symbol": normalized_symbols[position],
+                    "status": "error",
+                    "error": {
+                        "code": "provider_unavailable",
+                        "message": (
+                            "dynamic instrument resolution is unavailable for "
+                            f"{normalized_namespace}"
+                        ),
+                    },
+                }
+        elif missing_positions:
+            provider = self.longport_quote_provider
+            if not provider.configured:
+                provider_results = [{
+                    "external_symbol": normalized_symbols[position],
+                    "status": "error",
+                    "error": {
+                        "code": "provider_unavailable",
+                        "message": "LongPort credentials are not configured",
+                    },
+                } for position in missing_positions]
+            else:
+                try:
+                    provider_results = provider.resolve_instruments([
+                        normalized_symbols[position] for position in missing_positions
+                    ])
+                    record_health = getattr(
+                        self.metadata_repository, "record_provider_health", None
+                    )
+                    if callable(record_health):
+                        record_health("longport", True, utc_now())
+                except Exception as exc:
+                    record_health = getattr(
+                        self.metadata_repository, "record_provider_health", None
+                    )
+                    if callable(record_health):
+                        record_health("longport", False, utc_now(), str(exc))
+                    provider_results = [{
+                        "external_symbol": normalized_symbols[position],
+                        "status": "error",
+                        "error": {
+                            "code": "provider_unavailable",
+                            "message": str(exc),
+                        },
+                    } for position in missing_positions]
+
+            observed_at = utc_now()
+            provider_name = normalized_namespace.split(":", 1)[1]
+            for position, resolved in zip(missing_positions, provider_results):
+                if resolved["status"] == "error":
+                    items[position] = {
+                        "namespace": normalized_namespace,
+                        "external_symbol": normalized_symbols[position],
+                        "status": "error",
+                        "error": resolved["error"],
+                    }
+                    continue
+                try:
+                    existing = self.metadata_repository.get_instrument(
+                        resolved["instrument_id"]
+                    )
+                    if existing is None:
+                        payload = {
+                            "schema_version": 1,
+                            "instrument_id": resolved["instrument_id"],
+                            "instrument_type": "equity",
+                            "asset_class": "equity",
+                            "symbol": resolved["symbol"],
+                            "market": resolved["market"],
+                            "mic": resolved["mic"],
+                            "currency": resolved["currency"],
+                            "price_precision": 2,
+                            "size_precision": 0,
+                            "tick_size": "0.01",
+                            "size_increment": "1",
+                            "lot_size": str(resolved["lot_size"]),
+                            "ts_event": observed_at,
+                            "ts_init": observed_at,
+                            "provider_symbols": {
+                                provider_name: normalized_symbols[position]
+                            },
+                            "broker_symbols": {},
+                        }
+                    else:
+                        payload = {
+                            key: existing[key]
+                            for key in InstrumentContract.model_fields
+                        }
+                        payload["provider_symbols"] = dict(
+                            payload["provider_symbols"]
+                        )
+                        payload["provider_symbols"][provider_name] = (
+                            normalized_symbols[position]
+                        )
+                    contract = InstrumentContract.model_validate(payload)
+                    validate_instrument_identity(contract)
+                    normalized = contract.model_dump(mode="json")
+                    saved = self.metadata_repository.upsert_instrument({
+                        **normalized,
+                        "content_hash": canonical_hash(normalized),
+                        "updated_at": observed_at,
+                    })
+                except ValueError as exc:
+                    items[position] = {
+                        "namespace": normalized_namespace,
+                        "external_symbol": normalized_symbols[position],
+                        "status": "error",
+                        "error": {"code": "ambiguous", "message": str(exc)},
+                    }
+                    continue
+                except Exception:
+                    items[position] = {
+                        "namespace": normalized_namespace,
+                        "external_symbol": normalized_symbols[position],
+                        "status": "error",
+                        "error": {
+                            "code": "provider_unavailable",
+                            "message": "instrument registry write failed",
+                        },
+                    }
+                    continue
+                instrument = canonical_instrument(str(saved["instrument_id"]))
+                items[position] = {
+                    "namespace": normalized_namespace,
+                    "external_symbol": normalized_symbols[position],
+                    "status": "resolved",
+                    "instrument_id": instrument.instrument_id,
+                    "symbol": instrument.symbol,
+                    "mic": instrument.mic,
+                    "market": instrument.market,
+                    "currency": str(saved.get("currency") or resolved["currency"]),
+                    "source": resolved["source"],
+                    "source_exchange": resolved["source_exchange"],
+                    "observed_at": observed_at,
+                    "resolution": "upstream",
+                }
+
+        resolved_count = sum(item["status"] == "resolved" for item in items if item)
+        return {
+            "namespace": normalized_namespace,
+            "count": len(items),
+            "resolved_count": resolved_count,
+            "error_count": len(items) - resolved_count,
+            "items": items,
+        }
+
     def refresh_quote(
         self, symbol: str, provider: str | None = None, allow_fallback: bool = False,
         stale_max_seconds: float | None = None,
