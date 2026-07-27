@@ -2,6 +2,10 @@
 
 Status: Phase 0/Phase 1 frozen; Phase 2 local candidate. Schema version: `1`.
 
+The public FX contract and the complete Investrace provider-protocol migration audit
+are documented in
+[FX API and provider protocol migration](fx-and-provider-migration.md).
+
 ## Responsibility boundary
 
 MarketCow owns instrument identity, provider mappings, canonical history and market-data

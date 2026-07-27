@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.market_data_contracts import InstrumentRecord
+from marketcow.providers.yahoo_fx import FxRateError
 
 
 class Metadata:
@@ -92,6 +93,7 @@ class Service:
         self.online_resources = None
         self.search_results = {}
         self.search_calls = []
+        self.fx_error = None
 
     def close(self):
         pass
@@ -121,6 +123,28 @@ class Service:
             "resolved_count": len(items),
             "error_count": 0,
             "items": items,
+        }
+
+    def get_fx_rates(self, base, symbols, *, refresh=False):
+        if self.fx_error is not None:
+            raise self.fx_error
+        return {
+            "base": base,
+            "rates": {base: 1.0, "CNY": 7.2, "HKD": 7.8},
+            "source": "yahoo_chart",
+            "source_urls": {
+                "CNY": "https://example/CNY=X",
+                "HKD": "https://example/HKD=X",
+            },
+            "as_of": "2026-07-27T12:00:00+00:00",
+            "fetched_at": "2026-07-27T12:01:00+00:00",
+            "ingested_at": "2026-07-27T12:01:00+00:00",
+            "cached": not refresh,
+            "stale": False,
+            "cache_status": "hit" if not refresh else "refreshed",
+            "cache_ttl_seconds": 900,
+            "stale_max_seconds": 86400,
+            "errors": [],
         }
 
 
@@ -197,6 +221,54 @@ class MarketDataApiTest(unittest.TestCase):
         operation = openapi["paths"]["/v1/instruments:resolve/query"]["post"]
         self.assertIn("InstrumentResolveBatchRequest", str(operation))
         self.assertIn("InstrumentResolveBatchResponse", str(operation))
+
+    def test_fx_contract_is_public_compatible_and_machine_readable(self):
+        response = self.client.get(
+            "/v1/fx",
+            params={"base": "USD", "symbols": "CNY,HKD"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["base"], "USD")
+        self.assertEqual(response.json()["rates"], {
+            "USD": 1.0, "CNY": 7.2, "HKD": 7.8,
+        })
+        self.assertEqual(response.json()["source"], "yahoo_chart")
+        self.assertEqual(
+            response.json()["asOf"], "2026-07-27T12:00:00+00:00"
+        )
+        self.assertIn("fetchedAt", response.json())
+        self.assertIn("ingestedAt", response.json())
+        self.assertTrue(response.json()["cached"])
+        self.assertFalse(response.json()["stale"])
+        operation = self.client.get("/openapi.json").json()["paths"][
+            "/v1/fx"
+        ]["get"]
+        self.assertIn("FxResponse", str(operation))
+        self.assertIn("FxHttpErrorResponse", str(operation["responses"]["503"]))
+
+    def test_fx_validation_and_provider_errors_are_structured(self):
+        invalid = self.client.get(
+            "/v1/fx", params={"base": "EUR", "symbols": "CNY"}
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(invalid.json()["detail"]["code"], "invalid_currency")
+
+        self.service.fx_error = FxRateError(
+            "provider_unavailable", "offline", currency="CNY"
+        )
+        unavailable = self.client.get(
+            "/v1/fx", params={"base": "USD", "symbols": "CNY"}
+        )
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertEqual(
+            unavailable.json()["detail"],
+            {
+                "code": "provider_unavailable",
+                "currency": "CNY",
+                "message": "offline",
+            },
+        )
 
     def test_convertible_bond_registration_uses_fixed_income_asset_class(self):
         convertible_bond = {

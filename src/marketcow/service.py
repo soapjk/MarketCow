@@ -28,6 +28,7 @@ from .providers.baostock_provider import BaoStockProvider, optional_float
 from .providers.eastmoney import EastmoneySpotProvider
 from .providers.tdx_financial import TdxFinancialProvider
 from .providers.yahoo_quote import YahooQuoteProvider
+from .providers.yahoo_fx import YahooFxProvider
 from .providers.hyperliquid import HyperliquidProvider
 from .cross_market import (
     cross_market_snapshot, exact_relationship, load_cross_market_inputs,
@@ -168,6 +169,7 @@ class FundamentalService:
         baostock_provider: Optional[BaoStockProvider] = None,
         tdx_provider: Optional[TdxFinancialProvider] = None,
         quote_provider: Optional[YahooQuoteProvider] = None,
+        fx_provider: Optional[YahooFxProvider] = None,
         search_provider: Optional[InstrumentSearchProvider] = None,
         sina_quote_provider: Optional[SinaRealtimeQuoteProvider] = None,
         a_quote_provider: Optional[EastmoneyRealtimeQuoteProvider] = None,
@@ -220,6 +222,10 @@ class FundamentalService:
             settings.raw_path.parent / "tdx/financial"
         )
         self.quote_provider = quote_provider or YahooQuoteProvider()
+        self.fx_provider = fx_provider or YahooFxProvider(
+            cache_ttl_seconds=settings.fx_cache_ttl_seconds,
+            stale_max_seconds=settings.fx_stale_max_seconds,
+        )
         self.search_provider = search_provider or InstrumentSearchProvider()
         self.sina_quote_provider = sina_quote_provider or SinaRealtimeQuoteProvider()
         self.a_quote_provider = a_quote_provider or EastmoneyRealtimeQuoteProvider()
@@ -595,6 +601,11 @@ class FundamentalService:
 
     def search_instruments(self, query: str, limit: int = 12) -> List[Dict[str, Any]]:
         return self.search_provider.search(query, limit)
+
+    def get_fx_rates(
+        self, base: str, symbols: list[str], *, refresh: bool = False
+    ) -> Dict[str, Any]:
+        return self.fx_provider.get_rates(base, symbols, refresh=refresh)
 
     def ingest_dividend_announcements(
         self, announcements: List[Dict[str, Any]]

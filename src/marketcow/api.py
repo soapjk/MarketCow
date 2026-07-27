@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from fastapi import (
     FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect,
 )
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.staticfiles import StaticFiles
 
@@ -63,6 +63,7 @@ from .hyperliquid_realtime import (
     RoutingRealtimeProvider,
 )
 from .providers.longport_quote import LongPortError
+from .providers.yahoo_fx import FxRateError, SUPPORTED_FX_CURRENCIES
 from .dashboard_registry import load_dashboard_registry, registry_document
 from .admin_control import AdminAuditService
 from .http_metrics import RequestMetrics, RequestMetricsMiddleware
@@ -125,6 +126,44 @@ class CrossMarketQuery(BaseModel):
 class QuoteQuery(ProviderPolicy):
     symbols: list[str] = Field(min_length=1, max_length=20)
     refresh: bool = False
+
+
+class FxErrorItem(BaseModel):
+    currency: str
+    code: Literal["provider_unavailable", "no_data", "stale_data"]
+    message: str
+
+
+class FxHttpErrorDetail(BaseModel):
+    code: Literal[
+        "invalid_currency", "provider_unavailable", "no_data", "stale_data"
+    ]
+    currency: Optional[str] = None
+    message: str
+
+
+class FxHttpErrorResponse(BaseModel):
+    detail: FxHttpErrorDetail
+
+
+class FxResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    base: str
+    rates: Dict[str, float]
+    source: str
+    source_urls: Dict[str, str] = Field(alias="sourceUrls")
+    as_of: str = Field(alias="asOf")
+    fetched_at: str = Field(alias="fetchedAt")
+    ingested_at: str = Field(alias="ingestedAt")
+    cached: bool
+    stale: bool
+    cache_status: Literal["refreshed", "hit", "stale_if_error"] = Field(
+        alias="cacheStatus"
+    )
+    cache_ttl_seconds: float = Field(alias="cacheTtlSeconds")
+    stale_max_seconds: float = Field(alias="staleMaxSeconds")
+    errors: list[FxErrorItem]
 
 
 class InstrumentResolveBatchRequest(BaseModel):
@@ -1506,6 +1545,63 @@ def create_app(
         result = service.calendar_snapshot(start, end, limit)
         result.update({"from": start, "to": end, "past_events_excluded": True})
         return result
+
+    @app.get(
+        "/v1/fx",
+        response_model=FxResponse,
+        response_model_by_alias=True,
+        responses={
+            422: {"model": FxHttpErrorResponse},
+            503: {"model": FxHttpErrorResponse},
+        },
+        summary="Get auditable foreign-exchange rates",
+    )
+    def fx_rates(
+        base: str = Query(..., min_length=3, max_length=3),
+        symbols: str = Query(
+            ...,
+            min_length=3,
+            description="Comma-separated target currencies, for example CNY,HKD",
+        ),
+        refresh: bool = False,
+    ):
+        targets = [
+            item.strip().upper() for item in symbols.split(",") if item.strip()
+        ]
+        normalized_base = base.strip().upper()
+        if (
+            normalized_base not in SUPPORTED_FX_CURRENCIES
+            or not targets
+            or any(item not in SUPPORTED_FX_CURRENCIES for item in targets)
+            or len(targets) != len(set(targets))
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_currency",
+                    "message": (
+                        "base and unique symbols must use USD, CNY or HKD"
+                    ),
+                },
+            )
+        try:
+            return service.get_fx_rates(
+                normalized_base, targets, refresh=refresh
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "invalid_currency", "message": str(exc)},
+            ) from exc
+        except FxRateError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": exc.code,
+                    "currency": exc.currency,
+                    "message": str(exc),
+                },
+            ) from exc
 
     @app.post("/v1/admin/economic-calendar/refresh")
     def refresh_economic_calendar(

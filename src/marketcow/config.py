@@ -66,6 +66,8 @@ class Settings:
     longport_enable_overnight: bool = False
     quote_cache_ttl_seconds: float = 60.0
     quote_stale_max_seconds: float = 604800.0
+    fx_cache_ttl_seconds: float = 900.0
+    fx_stale_max_seconds: float = 86400.0
     quote_refresh_workers: int = 8
     quote_persistence_queue_size: int = 256
     quote_persistence_shutdown_seconds: float = 5.0
@@ -187,6 +189,8 @@ class Settings:
             ),
             quote_cache_ttl_seconds=float(os.getenv("MARKETCOW_QUOTE_CACHE_TTL_SECONDS", "60")),
             quote_stale_max_seconds=float(os.getenv("MARKETCOW_QUOTE_STALE_MAX_SECONDS", "604800")),
+            fx_cache_ttl_seconds=float(os.getenv("MARKETCOW_FX_CACHE_TTL_SECONDS", "900")),
+            fx_stale_max_seconds=float(os.getenv("MARKETCOW_FX_STALE_MAX_SECONDS", "86400")),
             quote_refresh_workers=int(os.getenv("MARKETCOW_QUOTE_REFRESH_WORKERS", "8")),
             quote_persistence_queue_size=int(os.getenv(
                 "MARKETCOW_QUOTE_PERSISTENCE_QUEUE_SIZE", "256"
