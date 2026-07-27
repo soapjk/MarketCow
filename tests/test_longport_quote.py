@@ -159,6 +159,38 @@ class LongPortQuoteProviderTest(unittest.TestCase):
         self.assertEqual(result[0]["status"], "error")
         self.assertEqual(result[0]["error"]["code"], "ambiguous")
 
+    def test_static_metadata_mixed_markets_preserve_request_order(self):
+        context = FakeContext([
+            SimpleNamespace(
+                symbol="600519.SH", exchange="SSE", currency="CNY", lot_size=100,
+                name_en="Kweichow Moutai", name_cn="贵州茅台",
+            ),
+            SimpleNamespace(
+                symbol="700.HK", exchange="SEHK", currency="HKD", lot_size=100,
+                name_en="Tencent", name_cn="腾讯控股",
+            ),
+            SimpleNamespace(
+                symbol="MU.US", exchange="NASD", currency="USD", lot_size=1,
+                name_en="Micron", name_cn="美光科技",
+            ),
+        ])
+        provider = LongPortQuoteProvider(
+            "key", "secret", "token", context_factory=lambda: context,
+        )
+
+        result = provider.resolve_instruments([
+            "MU.US", "600519.SH", "700.HK",
+        ])
+
+        self.assertEqual(
+            [item["instrument_id"] for item in result],
+            ["MU.XNAS", "600519.XSHG", "700.XHKG"],
+        )
+        self.assertEqual(
+            [item["source_exchange"] for item in result],
+            ["NASD", "SSE", "SEHK"],
+        )
+
     def test_latest_extended_session_quote_is_selected(self):
         post = SimpleNamespace(
             last_done=Decimal("103.5"),
