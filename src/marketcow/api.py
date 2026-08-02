@@ -17,7 +17,9 @@ from fastapi import (
     FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect,
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import (
+    FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse,
+)
 from starlette.staticfiles import StaticFiles
 
 from . import __version__
@@ -64,6 +66,8 @@ from .hyperliquid_realtime import (
 )
 from .providers.longport_quote import LongPortError
 from .providers.yahoo_fx import FxRateError, SUPPORTED_FX_CURRENCIES
+from .polymarket_history import PublishedPredictionMarketStore
+from .polymarket_contracts import PredictionMarketManifest
 from .dashboard_registry import load_dashboard_registry, registry_document
 from .admin_control import AdminAuditService
 from .http_metrics import RequestMetrics, RequestMetricsMiddleware
@@ -452,6 +456,10 @@ def create_app(
     app.state.request_metrics = request_metrics
     app.state.admin_events = admin_events
     app.state.service = service
+    polymarket_store = PublishedPredictionMarketStore(
+        settings.storage_root / "prediction-markets" / "polymarket"
+    )
+    app.state.polymarket_store = polymarket_store
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None
     if history_repository is not None and all(hasattr(history_repository, name) for name in (
@@ -1109,6 +1117,61 @@ def create_app(
             return {"count": len(items), "items": items}
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/prediction-markets/polymarket/datasets/{dataset_id}/manifest",
+        response_model=PredictionMarketManifest,
+        summary="Read a certified Polymarket dataset manifest",
+    )
+    def polymarket_certified_manifest(dataset_id: str):
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", dataset_id):
+            raise HTTPException(status_code=400, detail={
+                "code": "invalid_dataset_id",
+                "message": "dataset_id must be a safe stable identifier",
+            })
+        try:
+            return polymarket_store.manifest(dataset_id).model_dump(mode="json")
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail={
+                "code": "certified_dataset_not_found",
+                "dataset_id": dataset_id,
+            }) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "certified_dataset_integrity_failed",
+                "message": str(exc),
+            }) from exc
+
+    @app.get(
+        "/v1/prediction-markets/polymarket/datasets/{dataset_id}/parts/{table}",
+        response_class=FileResponse,
+        summary="Read one immutable certified Polymarket Parquet part",
+    )
+    def polymarket_certified_part(dataset_id: str, table: str):
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", dataset_id):
+            raise HTTPException(status_code=400, detail={
+                "code": "invalid_dataset_id",
+            })
+        if table not in {"catalog", "lifecycle", "books", "trades", "onchain"}:
+            raise HTTPException(status_code=400, detail={
+                "code": "invalid_dataset_table",
+            })
+        try:
+            path = polymarket_store.part(dataset_id, table)
+            return FileResponse(
+                path, media_type="application/vnd.apache.parquet",
+                filename=path.name,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail={
+                "code": "certified_dataset_part_not_found",
+                "dataset_id": dataset_id, "table": table,
+            }) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "certified_dataset_integrity_failed",
+                "message": str(exc),
+            }) from exc
 
     @app.get("/v1/instruments/{instrument_id}")
     def get_instrument(instrument_id: str):
