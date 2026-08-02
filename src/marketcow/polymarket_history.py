@@ -21,9 +21,13 @@ from .polymarket_contracts import (
     CoverageFacts,
     DatasetPart,
     GapEntry,
+    MarketBootstrap,
+    PredictionMarketBootstrap,
     PredictionMarketIdentity,
     PredictionMarketManifest,
+    ReplayContract,
     SourceRevision,
+    bootstrap_identity,
     canonical_json,
     content_sha256,
     decimal_text,
@@ -159,6 +163,28 @@ class PolymarketWebSocketRecorder:
             )
             event["bids"] = _levels(event.get("bids"), "bids")
             event["asks"] = _levels(event.get("asks"), "asks")
+            event["book_epoch"] = str(
+                event.get("book_epoch")
+                or content_sha256({
+                    "market_id": self.identity.market_id,
+                    "token_id": token_id,
+                    "first_snapshot": event["event_id"],
+                })
+            )
+            event["update_semantics"] = "absolute_size"
+            event["tick_version"] = str(
+                event.get("tick_version")
+                or content_sha256({"tick_size": event["tick_size"]})
+            )
+            state = {
+                "token_id": token_id,
+                "tick_size": event["tick_size"],
+                "bids": {item["price"]: item["size"] for item in event["bids"]},
+                "asks": {item["price"]: item["size"] for item in event["asks"]},
+            }
+            event["state_checksum"] = str(
+                event.get("state_checksum") or _state_hash(state)
+            )
         elif event_type == "price_change":
             changes = []
             raw_changes = event.get("changes") or [event]
@@ -369,7 +395,13 @@ PARQUET_SCHEMA = pa.schema([
     ("token_id", pa.string()),
     ("record_type", pa.string()),
     ("event_at", pa.timestamp("us", tz="UTC")),
+    ("received_at", pa.timestamp("us", tz="UTC")),
+    ("book_epoch", pa.string()),
     ("sequence", pa.int64()),
+    ("source_sequence", pa.int64()),
+    ("update_semantics", pa.string()),
+    ("tick_version", pa.string()),
+    ("state_checksum", pa.string()),
     ("price", pa.string()),
     ("size", pa.string()),
     ("transaction_hash", pa.string()),
@@ -402,8 +434,23 @@ class PredictionMarketMaterializer:
                 payload.get("exchange_ts") or payload.get("timestamp")
                 or payload.get("event_at") or payload.get("observed_at")
             ),
+            "received_at": _instant(
+                payload.get("received_ts") or payload.get("received_at")
+                or payload.get("exchange_ts") or payload.get("timestamp")
+                or payload.get("event_at") or payload.get("observed_at")
+            ),
+            "book_epoch": str(payload.get("book_epoch") or ""),
             "sequence": (
                 int(payload["sequence"]) if payload.get("sequence") is not None else None
+            ),
+            "source_sequence": (
+                int(payload["source_sequence"])
+                if payload.get("source_sequence") is not None else None
+            ),
+            "update_semantics": str(payload.get("update_semantics") or ""),
+            "tick_version": str(payload.get("tick_version") or ""),
+            "state_checksum": str(
+                payload.get("state_checksum") or payload.get("expected_state_hash") or ""
             ),
             "price": (
                 decimal_text(payload["price"], "price")
@@ -421,6 +468,12 @@ class PredictionMarketMaterializer:
 
     def _write_part(self, table_name: str, records: list[dict[str, Any]]) -> DatasetPart:
         rows = [self._parquet_row(record) for record in records]
+        if table_name == "books":
+            rows.sort(key=lambda row: (
+                row["event_at"], row["received_at"], row["book_epoch"],
+                row["sequence"] if row["sequence"] is not None else -1,
+                row["record_id"],
+            ))
         table = pa.Table.from_pylist(rows, schema=PARQUET_SCHEMA)
         staging = self.root / "staging"
         staging.mkdir(parents=True, exist_ok=True)
@@ -467,15 +520,57 @@ class PredictionMarketMaterializer:
         sources: list[SourceRevision],
         tables: dict[str, list[dict[str, Any]]],
         gaps: list[GapEntry],
+        *,
+        intended_use: str,
+        replay: ReplayContract,
+        bootstrap_markets: list[MarketBootstrap],
     ) -> PredictionMarketManifest:
-        if not identities or not sources:
-            raise ValueError("materialization requires identities and source revisions")
+        if not identities or not sources or not bootstrap_markets:
+            raise ValueError(
+                "materialization requires identities, sources, and typed bootstrap"
+            )
+        required_by_use = {
+            "nautilus_snapshot_replay": ["catalog", "lifecycle", "books", "trades"],
+            "nautilus_full_l2_replay": ["catalog", "lifecycle", "books", "trades"],
+            "official_onchain_reconciliation": [
+                "catalog", "lifecycle", "books", "trades", "onchain"
+            ],
+        }
+        required_parts = required_by_use.get(intended_use)
+        if required_parts is None:
+            raise ValueError("unsupported prediction-market intended use")
+        bootstrap_payload = {
+            "contract_version": CONTRACT_VERSION,
+            "schema_version": "marketcow.polymarket.bootstrap.v1",
+            "dataset_id": dataset_id,
+            "manifest_id": "0" * 64,
+            "bootstrap_id": "0" * 64,
+            "intended_use": intended_use,
+            "replay": replay.model_dump(mode="json"),
+            "markets": [item.model_dump(mode="json") for item in bootstrap_markets],
+        }
+        bootstrap_payload["bootstrap_id"] = bootstrap_identity(bootstrap_payload)
+        bootstrap = PredictionMarketBootstrap.model_validate(bootstrap_payload)
+        definition_path = (
+            self.root / "bootstrap-definitions" / f"{bootstrap.bootstrap_id}.json"
+        )
+        definition_body = canonical_json(bootstrap.model_dump(mode="json"))
+        if definition_path.exists() and definition_path.read_bytes() != definition_body:
+            raise RuntimeError("immutable bootstrap definition conflict")
+        if not definition_path.exists():
+            _atomic_write(definition_path, definition_body)
         parts = [
             self._write_part(name, records)
             for name, records in sorted(tables.items()) if records
         ]
         all_records = [record for records in tables.values() for record in records]
-        event_times = [self._parquet_row(record)["event_at"] for record in all_records]
+        coverage_records = [
+            record for table_name, records in tables.items()
+            if table_name != "catalog" for record in records
+        ]
+        event_times = [
+            self._parquet_row(record)["event_at"] for record in coverage_records
+        ]
         token_ids = {
             outcome.token_id for identity in identities for outcome in identity.outcomes
         }
@@ -492,6 +587,10 @@ class PredictionMarketMaterializer:
             "contract_version": CONTRACT_VERSION,
             "dataset_id": dataset_id,
             "revision": revision,
+            "intended_use": intended_use,
+            "replay": replay,
+            "bootstrap_id": bootstrap.bootstrap_id,
+            "required_parts": required_parts,
             "status": "draft",
             "created_at": self.now_provider().astimezone(timezone.utc).isoformat(),
             "identities": identities,
@@ -505,7 +604,8 @@ class PredictionMarketMaterializer:
         serialized = {
             key: [item.model_dump(mode="json") for item in value]
             if key in {"identities", "sources", "parts", "gap_ledger"}
-            else value.model_dump(mode="json") if key == "coverage" else value
+            else value.model_dump(mode="json")
+            if key in {"coverage", "replay"} else value
             for key, value in payload.items()
         }
         payload["manifest_id"] = manifest_identity(serialized)
@@ -536,6 +636,75 @@ class PredictionMarketCertifier:
         onchain_trades: list[dict[str, Any]],
     ) -> PredictionMarketManifest:
         checks: list[CertificationCheck] = []
+        definition_path = (
+            self.materializer.root / "bootstrap-definitions"
+            / f"{draft.bootstrap_id}.json"
+        )
+        bootstrap = None
+        bootstrap_error = None
+        try:
+            bootstrap = PredictionMarketBootstrap.model_validate_json(
+                definition_path.read_text(encoding="utf-8")
+            )
+            if bootstrap_identity(bootstrap.model_dump(mode="json")) != draft.bootstrap_id:
+                raise ValueError("bootstrap content identity mismatch")
+            if bootstrap.dataset_id != draft.dataset_id:
+                raise ValueError("bootstrap dataset identity mismatch")
+            if bootstrap.replay != draft.replay:
+                raise ValueError("bootstrap replay contract mismatch")
+            if {item.identity.market_id for item in bootstrap.markets} != {
+                item.market_id for item in draft.identities
+            }:
+                raise ValueError("bootstrap market coverage mismatch")
+        except (FileNotFoundError, ValueError) as exc:
+            bootstrap_error = str(exc)
+        checks.append(CertificationCheck(
+            name="typed_bootstrap_complete",
+            passed=bootstrap is not None and bootstrap_error is None,
+            details={"bootstrap_id": draft.bootstrap_id, "error": bootstrap_error},
+        ))
+        available_parts = {part.table for part in draft.parts}
+        missing_parts = sorted(set(draft.required_parts) - available_parts)
+        checks.append(CertificationCheck(
+            name="intended_use_required_parts",
+            passed=not missing_parts,
+            details={
+                "intended_use": draft.intended_use,
+                "required": draft.required_parts,
+                "missing": missing_parts,
+            },
+        ))
+        book_part = next((part for part in draft.parts if part.table == "books"), None)
+        replay_errors = []
+        if book_part is not None:
+            rows = pq.read_table(book_part.path).to_pylist()
+            previous = None
+            for row in rows:
+                if row["record_type"] not in {"snapshot", "book", "delta", "price_change"}:
+                    replay_errors.append("unsupported book record_type")
+                    continue
+                if draft.replay.mode == "snapshot_only" and row["record_type"] in {
+                    "delta", "price_change"
+                }:
+                    replay_errors.append("snapshot-only dataset contains a delta")
+                required = (
+                    "received_at", "book_epoch", "sequence", "update_semantics",
+                    "tick_version", "state_checksum",
+                )
+                if any(row.get(field) in {None, ""} for field in required):
+                    replay_errors.append(f"incomplete replay row:{row['record_id']}")
+                key = (
+                    row["event_at"], row["received_at"], row["book_epoch"],
+                    row["sequence"], row["record_id"],
+                )
+                if previous is not None and key < previous:
+                    replay_errors.append("books are not deterministically ordered")
+                previous = key
+        checks.append(CertificationCheck(
+            name="historical_book_replay_semantics",
+            passed=book_part is not None and not replay_errors,
+            details={"mode": draft.replay.mode, "errors": replay_errors[:20]},
+        ))
         expected_tokens = {
             outcome.token_id
             for identity in draft.identities for outcome in identity.outcomes
@@ -568,12 +737,19 @@ class PredictionMarketCertifier:
         official_keys = {self._trade_key(row) for row in official_trades}
         onchain_keys = {self._trade_key(row) for row in onchain_trades}
         missing_onchain = sorted(official_keys - onchain_keys)
+        reconciliation_required = (
+            draft.intended_use == "official_onchain_reconciliation"
+        )
         checks.append(CertificationCheck(
             name="official_onchain_trade_reconciliation",
-            passed=bool(official_keys) and not missing_onchain,
+            passed=(
+                bool(official_keys) and not missing_onchain
+                if reconciliation_required else bool(official_keys)
+            ),
             details={
                 "official": len(official_keys), "onchain": len(onchain_keys),
-                "missing_onchain": missing_onchain,
+                "missing_onchain": missing_onchain if reconciliation_required else [],
+                "reconciliation_required": reconciliation_required,
             },
         ))
         unresolved = [gap for gap in draft.gap_ledger if not gap.resolved]
@@ -598,9 +774,20 @@ class PredictionMarketCertifier:
                 "parts": payload["parts"],
                 "sources": payload["sources"],
                 "checks": payload["checks"],
+                "bootstrap_id": draft.bootstrap_id,
             })
         result = PredictionMarketManifest.model_validate(payload)
         self.materializer.write_manifest(result)
+        if passed and bootstrap is not None:
+            bound = bootstrap.model_copy(update={"manifest_id": result.manifest_id})
+            bootstrap_path = (
+                self.materializer.root / "bootstraps" / f"{result.manifest_id}.json"
+            )
+            bootstrap_body = canonical_json(bound.model_dump(mode="json"))
+            if bootstrap_path.exists() and bootstrap_path.read_bytes() != bootstrap_body:
+                raise RuntimeError("immutable certified bootstrap conflict")
+            if not bootstrap_path.exists():
+                _atomic_write(bootstrap_path, bootstrap_body)
         return result
 
 
@@ -619,6 +806,20 @@ class PublishedPredictionMarketStore:
         manifest_path = self.root / "manifests" / f"{manifest.manifest_id}.json"
         if not manifest_path.exists():
             raise FileNotFoundError("certified manifest is not materialized")
+        bootstrap_path = self.root / "bootstraps" / f"{manifest.manifest_id}.json"
+        if not bootstrap_path.exists():
+            raise FileNotFoundError("certified bootstrap is not materialized")
+        bootstrap = PredictionMarketBootstrap.model_validate_json(
+            bootstrap_path.read_text(encoding="utf-8")
+        )
+        if (
+            bootstrap.dataset_id != manifest.dataset_id
+            or bootstrap.manifest_id != manifest.manifest_id
+            or bootstrap.bootstrap_id != manifest.bootstrap_id
+            or bootstrap_identity(bootstrap.model_dump(mode="json"))
+            != manifest.bootstrap_id
+        ):
+            raise RuntimeError("certified bootstrap binding failed")
         for part in manifest.parts:
             path = Path(part.path).resolve()
             if not path.is_relative_to(self.root) or not path.exists():
@@ -662,6 +863,20 @@ class PublishedPredictionMarketStore:
         if hashlib.sha256(path.read_bytes()).hexdigest() != selected.sha256:
             raise RuntimeError("published part hash verification failed")
         return path
+
+    def bootstrap(self, dataset_id: str) -> PredictionMarketBootstrap:
+        manifest = self.manifest(dataset_id)
+        path = self.root / "bootstraps" / f"{manifest.manifest_id}.json"
+        bootstrap = PredictionMarketBootstrap.model_validate_json(path.read_text())
+        if (
+            bootstrap.dataset_id != dataset_id
+            or bootstrap.manifest_id != manifest.manifest_id
+            or bootstrap.bootstrap_id != manifest.bootstrap_id
+            or bootstrap_identity(bootstrap.model_dump(mode="json"))
+            != manifest.bootstrap_id
+        ):
+            raise RuntimeError("published bootstrap identity mismatch")
+        return bootstrap
 
 
 def table_records_from_recorder(

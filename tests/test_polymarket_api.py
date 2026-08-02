@@ -22,6 +22,7 @@ from marketcow.polymarket_history import (
     table_records_from_recorder,
 )
 from tests.test_market_data_api import Service
+from tests.test_polymarket_history import bootstrap_market, metadata_tables, replay
 
 
 NOW = datetime(2026, 8, 2, 9, 0, tzinfo=timezone.utc)
@@ -75,6 +76,7 @@ class PolymarketApiTest(unittest.TestCase):
         root = self.settings.storage_root / "prediction-markets" / "polymarket"
         materializer = PredictionMarketMaterializer(root, now_provider=lambda: NOW)
         tables = table_records_from_recorder(recorder)
+        tables.update(metadata_tables(identity))
         tables.update({"trades": official, "onchain": onchain})
         source = SourceRevision(
             source="polymarket_websocket", revision="r1",
@@ -83,12 +85,18 @@ class PolymarketApiTest(unittest.TestCase):
             raw_path=str(recorder.raw_path),
         )
         draft = materializer.materialize(
-            "tradude-sample", "r1", [identity], [source], tables, recorder.gaps
+            "tradude-sample", "r1", [identity], [source], tables, recorder.gaps,
+            intended_use="official_onchain_reconciliation", replay=replay(),
+            bootstrap_markets=[bootstrap_market(recorder.raw_path, identity)],
         )
         hidden = self.client.get(
             "/v1/prediction-markets/polymarket/datasets/tradude-sample/manifest"
         )
+        hidden_bootstrap = self.client.get(
+            "/v1/prediction-markets/polymarket/datasets/tradude-sample/bootstrap"
+        )
         self.assertEqual(hidden.status_code, 404)
+        self.assertEqual(hidden_bootstrap.status_code, 404)
         certified = PredictionMarketCertifier(materializer).certify(
             draft, book_states=recorder.states,
             official_trades=official, onchain_trades=onchain,
@@ -102,13 +110,24 @@ class PolymarketApiTest(unittest.TestCase):
             "/v1/prediction-markets/polymarket/datasets/tradude-sample/parts/books"
         )
         openapi = self.client.get("/openapi.json").json()
+        bootstrap = self.client.get(
+            "/v1/prediction-markets/polymarket/datasets/tradude-sample/bootstrap"
+        )
 
         self.assertEqual(manifest.status_code, 200)
         self.assertEqual(manifest.json()["status"], "certified")
         self.assertEqual(part.status_code, 200)
+        self.assertEqual(bootstrap.status_code, 200)
+        self.assertEqual(
+            bootstrap.json()["manifest_id"], manifest.json()["manifest_id"]
+        )
         self.assertEqual(part.headers["content-type"], "application/vnd.apache.parquet")
         self.assertIn(
             "/v1/prediction-markets/polymarket/datasets/{dataset_id}/manifest",
+            openapi["paths"],
+        )
+        self.assertIn(
+            "/v1/prediction-markets/polymarket/datasets/{dataset_id}/bootstrap",
             openapi["paths"],
         )
 

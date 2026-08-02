@@ -67,7 +67,10 @@ from .hyperliquid_realtime import (
 from .providers.longport_quote import LongPortError
 from .providers.yahoo_fx import FxRateError, SUPPORTED_FX_CURRENCIES
 from .polymarket_history import PublishedPredictionMarketStore
-from .polymarket_contracts import PredictionMarketManifest
+from .polymarket_contracts import (
+    PredictionMarketBootstrap,
+    PredictionMarketManifest,
+)
 from .dashboard_registry import load_dashboard_registry, registry_document
 from .admin_control import AdminAuditService
 from .http_metrics import RequestMetrics, RequestMetricsMiddleware
@@ -1135,6 +1138,30 @@ def create_app(
             raise HTTPException(status_code=404, detail={
                 "code": "certified_dataset_not_found",
                 "dataset_id": dataset_id,
+            }) from exc
+
+    @app.get(
+        "/v1/prediction-markets/polymarket/datasets/{dataset_id}/bootstrap",
+        response_model=PredictionMarketBootstrap,
+        summary="Read typed bootstrap for a certified Polymarket dataset",
+    )
+    def polymarket_certified_bootstrap(dataset_id: str):
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", dataset_id):
+            raise HTTPException(status_code=400, detail={
+                "code": "invalid_dataset_id",
+                "message": "dataset_id must be a safe stable identifier",
+            })
+        try:
+            return polymarket_store.bootstrap(dataset_id).model_dump(mode="json")
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail={
+                "code": "certified_dataset_bootstrap_not_found",
+                "dataset_id": dataset_id,
+            }) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "certified_dataset_integrity_failed",
+                "message": str(exc),
             }) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={

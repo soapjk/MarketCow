@@ -41,7 +41,7 @@ class SourceRevision(BaseModel):
     source: Literal[
         "polymarket_gamma", "polymarket_clob", "polymarket_data_api",
         "polymarket_subgraph", "polygon_logs", "polymarket_websocket",
-        "huggingface_fixed_revision",
+        "polymarket_docs", "polymarket_sdk", "huggingface_fixed_revision",
     ]
     revision: str = Field(min_length=1, max_length=200)
     source_url: str = Field(min_length=1, max_length=2000)
@@ -93,8 +93,8 @@ class MarketLifecycleRevision(BaseModel):
     resolution_source: str | None = None
     tick_size: str
     minimum_order_size: str
-    maker_fee_bps: str = "0"
-    taker_fee_bps: str = "0"
+    maker_fee_bps: str
+    taker_fee_bps: str
     source: SourceRevision
 
     @model_validator(mode="after")
@@ -134,6 +134,197 @@ class DatasetPart(BaseModel):
     end: datetime | None = None
 
 
+class ReplayContract(BaseModel):
+    schema_version: Literal["marketcow.polymarket.book-replay.v1"] = (
+        "marketcow.polymarket.book-replay.v1"
+    )
+    mode: Literal["snapshot_only", "snapshot_delta"]
+    ordering: list[Literal[
+        "exchange_at", "received_at", "book_epoch", "sequence", "record_id"
+    ]] = Field(min_length=5, max_length=5)
+    update_semantics: Literal["absolute_size"] = "absolute_size"
+    sequence_semantics: Literal["source", "deterministic_normalized"]
+    delta_supported: bool
+    cancellation_supported: bool
+    queue_position_supported: bool
+    depth: str = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def replay_claims_are_consistent(self):
+        if self.mode == "snapshot_only" and (
+            self.delta_supported or self.cancellation_supported
+            or self.queue_position_supported
+        ):
+            raise ValueError("snapshot-only replay cannot claim delta/cancel/queue semantics")
+        if self.mode == "snapshot_delta" and not self.delta_supported:
+            raise ValueError("snapshot-delta replay must support deltas")
+        if self.ordering != [
+            "exchange_at", "received_at", "book_epoch", "sequence", "record_id"
+        ]:
+            raise ValueError("book replay ordering must be deterministic and complete")
+        return self
+
+
+class RuleFact(BaseModel):
+    fact_id: str = Field(min_length=1, max_length=300)
+    rule_version: str = Field(min_length=1, max_length=100)
+    fact_type: Literal[
+        "binary_settlement", "standard_negative_risk", "settlement_currency",
+        "price_increment", "size_increment", "minimum_order_size",
+    ]
+    value: dict[str, Any]
+    provenance: SourceRevision
+    valid_from: datetime
+    valid_to: datetime | None = None
+
+    @model_validator(mode="after")
+    def valid_interval_is_ordered(self):
+        if self.valid_to is not None and self.valid_from >= self.valid_to:
+            raise ValueError("rule fact validity interval must be ordered")
+        return self
+
+
+class StructuralRelation(BaseModel):
+    relation_id: str = Field(min_length=1, max_length=300)
+    relation_version: str = Field(min_length=1, max_length=100)
+    relation_type: Literal["binary_complements", "standard_negative_risk"]
+    members: list[str] = Field(min_length=2)
+    convertible: bool
+    provenance: SourceRevision
+    valid_from: datetime
+    valid_to: datetime | None = None
+
+    @model_validator(mode="after")
+    def relation_is_explicit(self):
+        if len(set(self.members)) != len(self.members):
+            raise ValueError("structural relation members must be unique")
+        if self.relation_type == "binary_complements" and len(self.members) != 2:
+            raise ValueError("binary complement relation requires exactly two members")
+        if self.valid_to is not None and self.valid_from >= self.valid_to:
+            raise ValueError("structural relation validity interval must be ordered")
+        return self
+
+
+class FeeSchedule(BaseModel):
+    schedule_id: str = Field(min_length=1, max_length=300)
+    schedule_version: str = Field(min_length=1, max_length=100)
+    currency: str = Field(min_length=1, max_length=50)
+    maker_rate: str
+    taker_rate: str
+    formula: str = Field(min_length=1, max_length=500)
+    exponent: str
+    quantum: str
+    rounding_mode: str = Field(min_length=1, max_length=200)
+    effective_from: datetime
+    effective_to: datetime | None = None
+    provenance: list[SourceRevision] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def complete_schedule(self):
+        self.maker_rate = decimal_text(self.maker_rate, "maker_rate")
+        self.taker_rate = decimal_text(self.taker_rate, "taker_rate")
+        self.exponent = decimal_text(self.exponent, "fee_exponent")
+        self.quantum = decimal_text(self.quantum, "fee_quantum", allow_zero=False)
+        if self.effective_to is not None and self.effective_from >= self.effective_to:
+            raise ValueError("fee schedule interval must be ordered")
+        return self
+
+
+class MarketBootstrap(BaseModel):
+    identity: PredictionMarketIdentity
+    question: str = Field(min_length=1, max_length=2000)
+    title: str = Field(min_length=1, max_length=2000)
+    settlement_currency: str = Field(min_length=1, max_length=50)
+    activation_at: datetime
+    expiration_at: datetime
+    price_increment: str
+    size_increment: str
+    minimum_order_size: str
+    accepting_orders: bool
+    lifecycle_state: Literal["discovered", "active", "closed", "resolved", "invalid"]
+    resolution: str | None = None
+    external_ids: dict[str, str] = Field(default_factory=dict)
+    relations: list[StructuralRelation] = Field(min_length=1)
+    rule_facts: list[RuleFact] = Field(min_length=1)
+    fee_schedule: FeeSchedule
+
+    @model_validator(mode="after")
+    def nautilus_fields_are_complete(self):
+        self.price_increment = decimal_text(
+            self.price_increment, "price_increment", allow_zero=False
+        )
+        self.size_increment = decimal_text(
+            self.size_increment, "size_increment", allow_zero=False
+        )
+        self.minimum_order_size = decimal_text(
+            self.minimum_order_size, "minimum_order_size", allow_zero=False
+        )
+        if self.activation_at >= self.expiration_at:
+            raise ValueError("market activation must precede expiration")
+        if self.lifecycle_state == "resolved" and not self.resolution:
+            raise ValueError("resolved bootstrap markets require a resolution")
+        instruments = {item.instrument_id for item in self.identity.outcomes}
+        relation_types = {item.relation_type for item in self.relations}
+        if "binary_complements" not in relation_types:
+            raise ValueError("binary bootstrap requires an explicit complement relation")
+        if self.identity.neg_risk and "standard_negative_risk" not in relation_types:
+            raise ValueError("negative-risk identity requires an explicit relation")
+        if not self.identity.neg_risk and "standard_negative_risk" in relation_types:
+            raise ValueError("standard negative risk must come from source metadata")
+        for relation in self.relations:
+            if not set(relation.members) <= instruments:
+                raise ValueError("relation members must map to canonical instruments")
+        required_facts = {
+            "binary_settlement", "settlement_currency", "price_increment",
+            "size_increment", "minimum_order_size",
+        }
+        fact_types = {item.fact_type for item in self.rule_facts}
+        if not required_facts <= fact_types:
+            raise ValueError("typed bootstrap is missing required rule facts")
+        if self.fee_schedule.currency != self.settlement_currency:
+            raise ValueError("fee and settlement currencies must match")
+        return self
+
+
+class PredictionMarketBootstrap(BaseModel):
+    contract_version: Literal["marketcow.prediction_market.v1"] = CONTRACT_VERSION
+    schema_version: Literal["marketcow.polymarket.bootstrap.v1"] = (
+        "marketcow.polymarket.bootstrap.v1"
+    )
+    dataset_id: str = Field(min_length=1, max_length=300)
+    manifest_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bootstrap_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    intended_use: Literal[
+        "nautilus_snapshot_replay", "nautilus_full_l2_replay",
+        "official_onchain_reconciliation",
+    ]
+    replay: ReplayContract
+    markets: list[MarketBootstrap] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def bootstrap_is_reversible_and_bound(self):
+        market_ids = [item.identity.market_id for item in self.markets]
+        condition_ids = [item.identity.condition_id for item in self.markets]
+        instrument_ids = [
+            outcome.instrument_id
+            for market in self.markets for outcome in market.identity.outcomes
+        ]
+        if len(set(market_ids)) != len(market_ids):
+            raise ValueError("bootstrap market identities must be unique")
+        if len(set(condition_ids)) != len(condition_ids):
+            raise ValueError("bootstrap condition identities must be unique")
+        if len(set(instrument_ids)) != len(instrument_ids):
+            raise ValueError("bootstrap instrument identities must be unique")
+        return self
+
+
+def bootstrap_identity(payload: dict[str, Any]) -> str:
+    body = dict(payload)
+    body.pop("manifest_id", None)
+    body.pop("bootstrap_id", None)
+    return content_sha256(body)
+
+
 class CoverageFacts(BaseModel):
     market_count: int = Field(ge=0)
     token_count: int = Field(ge=0)
@@ -156,6 +347,15 @@ class PredictionMarketManifest(BaseModel):
     manifest_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     dataset_id: str = Field(min_length=1, max_length=300)
     revision: str = Field(min_length=1, max_length=200)
+    intended_use: Literal[
+        "nautilus_snapshot_replay", "nautilus_full_l2_replay",
+        "official_onchain_reconciliation",
+    ]
+    replay: ReplayContract
+    bootstrap_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    required_parts: list[Literal[
+        "catalog", "lifecycle", "books", "trades", "onchain"
+    ]] = Field(min_length=1)
     status: Literal["draft", "certified", "rejected"]
     created_at: datetime
     identities: list[PredictionMarketIdentity]

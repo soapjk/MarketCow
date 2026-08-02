@@ -6,11 +6,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pyarrow.parquet as pq
+from pydantic import ValidationError
 
 from marketcow.polymarket_contracts import (
+    FeeSchedule,
+    MarketBootstrap,
     OutcomeToken,
     PredictionMarketIdentity,
+    ReplayContract,
+    RuleFact,
     SourceRevision,
+    StructuralRelation,
 )
 from marketcow.polymarket_history import (
     PolymarketWebSocketRecorder,
@@ -55,7 +61,76 @@ def source(path):
     )
 
 
+def replay():
+    return ReplayContract(
+        mode="snapshot_only",
+        ordering=[
+            "exchange_at", "received_at", "book_epoch", "sequence", "record_id"
+        ],
+        sequence_semantics="source", delta_supported=False,
+        cancellation_supported=False, queue_position_supported=False,
+        depth="full source snapshot",
+    )
+
+
+def bootstrap_market(path="/tmp/source", market_identity=None):
+    evidence = source(path)
+    selected_identity = market_identity or identity()
+    instrument_ids = [item.instrument_id for item in selected_identity.outcomes]
+    return MarketBootstrap(
+        identity=selected_identity, question="Will X?", title="Will X?",
+        settlement_currency="USDC.e", activation_at=NOW,
+        expiration_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+        price_increment="0.01", size_increment="0.01",
+        minimum_order_size="5", accepting_orders=False,
+        lifecycle_state="resolved", resolution="Yes",
+        external_ids={"condition_id": "condition-1"},
+        relations=[StructuralRelation(
+            relation_id="binary-1", relation_version="1",
+            relation_type="binary_complements", members=instrument_ids,
+            convertible=True, provenance=evidence, valid_from=NOW,
+        )],
+        rule_facts=[RuleFact(
+            fact_id=f"rule-{index}", rule_version="1", fact_type=fact_type,
+            value=value, provenance=evidence, valid_from=NOW,
+        ) for index, (fact_type, value) in enumerate((
+            ("binary_settlement", {"winner_payout": "1", "loser_payout": "0"}),
+            ("settlement_currency", {"currency": "USDC.e"}),
+            ("price_increment", {"increment": "0.01"}),
+            ("size_increment", {"increment": "0.01"}),
+            ("minimum_order_size", {"size": "5"}),
+        ), start=1)],
+        fee_schedule=FeeSchedule(
+            schedule_id="fee-1", schedule_version="1", currency="USDC.e",
+            maker_rate="0", taker_rate="0.07",
+            formula="C * taker_rate * p * (1-p)", exponent="1",
+            quantum="0.00001", rounding_mode="half_up",
+            effective_from=NOW, provenance=[evidence],
+        ),
+    )
+
+
+def metadata_tables(market_identity=None):
+    selected = market_identity or identity()
+    base = {
+        "market_id": selected.market_id,
+        "condition_id": selected.condition_id,
+        "timestamp": NOW.isoformat(),
+        "source": "polymarket_gamma",
+    }
+    return {
+        "catalog": [{**base, "record_type": "catalog"}],
+        "lifecycle": [{**base, "record_type": "resolved"}],
+    }
+
+
 class PolymarketHistoryTest(unittest.TestCase):
+    def test_bootstrap_requires_explicit_fee_schedule(self):
+        payload = bootstrap_market().model_dump(mode="json")
+        payload.pop("fee_schedule")
+        with self.assertRaises(ValidationError):
+            MarketBootstrap.model_validate(payload)
+
     def test_append_replay_checkpoint_duplicate_gap_and_snapshot_recovery(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -134,12 +209,15 @@ class PolymarketHistoryTest(unittest.TestCase):
                 "source": "polygon_logs",
             }]
             tables = table_records_from_recorder(recorder)
+            tables.update(metadata_tables())
             tables["trades"] = official
             tables["onchain"] = onchain
             materializer = PredictionMarketMaterializer(root / "published", now_provider=lambda: NOW)
             draft = materializer.materialize(
                 "polymarket-binary-sample", "revision-1", [identity()],
                 [source(recorder.raw_path)], tables, recorder.gaps,
+                intended_use="official_onchain_reconciliation", replay=replay(),
+                bootstrap_markets=[bootstrap_market(recorder.raw_path)],
             )
 
             certified = PredictionMarketCertifier(materializer).certify(
@@ -160,6 +238,8 @@ class PolymarketHistoryTest(unittest.TestCase):
             second = materializer.materialize(
                 "another-dataset", "revision-1", [identity()],
                 [source(recorder.raw_path)], tables, recorder.gaps,
+                intended_use="official_onchain_reconciliation", replay=replay(),
+                bootstrap_markets=[bootstrap_market(recorder.raw_path)],
             )
             self.assertEqual(next(p for p in second.parts if p.table == "books").path,
                              str(book_path))
@@ -180,8 +260,11 @@ class PolymarketHistoryTest(unittest.TestCase):
             draft = materializer.materialize(
                 "rejected-sample", "revision-1", [identity()],
                 [source(recorder.raw_path)], {
-                    **table_records_from_recorder(recorder), "trades": official,
+                    **table_records_from_recorder(recorder), **metadata_tables(),
+                    "trades": official,
                 }, recorder.gaps,
+                intended_use="official_onchain_reconciliation", replay=replay(),
+                bootstrap_markets=[bootstrap_market(recorder.raw_path)],
             )
 
             rejected = PredictionMarketCertifier(materializer).certify(
@@ -193,6 +276,42 @@ class PolymarketHistoryTest(unittest.TestCase):
             self.assertFalse(next(
                 item for item in rejected.checks
                 if item.name == "official_onchain_trade_reconciliation"
+            ).passed)
+
+    def test_certification_rejects_missing_typed_bootstrap(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            recorder = PolymarketWebSocketRecorder(root / "recording", identity())
+            recorder.append(snapshot("yes", 1, "0.40", "0.42", "s1"))
+            recorder.append(snapshot("no", 1, "0.58", "0.60", "s2"))
+            trade = [{
+                "token_id": "yes", "price": "0.42", "size": "1",
+                "transaction_hash": "", "timestamp": NOW.isoformat(),
+                "record_type": "trade",
+            }]
+            materializer = PredictionMarketMaterializer(root / "published")
+            tables = {**table_records_from_recorder(recorder), **metadata_tables(),
+                      "trades": trade}
+            draft = materializer.materialize(
+                "missing-bootstrap", "r1", [identity()], [source(recorder.raw_path)],
+                tables, recorder.gaps, intended_use="nautilus_snapshot_replay",
+                replay=replay(), bootstrap_markets=[bootstrap_market(recorder.raw_path)],
+            )
+            definition = (
+                materializer.root / "bootstrap-definitions"
+                / f"{draft.bootstrap_id}.json"
+            )
+            definition.unlink()
+
+            rejected = PredictionMarketCertifier(materializer).certify(
+                draft, book_states=recorder.states,
+                official_trades=trade, onchain_trades=[],
+            )
+
+            self.assertEqual(rejected.status, "rejected")
+            self.assertFalse(next(
+                check for check in rejected.checks
+                if check.name == "typed_bootstrap_complete"
             ).passed)
 
 

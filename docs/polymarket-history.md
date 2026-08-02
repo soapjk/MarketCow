@@ -115,6 +115,7 @@ published pointer. The HTTP read boundary is:
 
 ```http
 GET /v1/prediction-markets/polymarket/datasets/{dataset_id}/manifest
+GET /v1/prediction-markets/polymarket/datasets/{dataset_id}/bootstrap
 GET /v1/prediction-markets/polymarket/datasets/{dataset_id}/parts/{table}
 ```
 
@@ -122,6 +123,21 @@ GET /v1/prediction-markets/polymarket/datasets/{dataset_id}/parts/{table}
 responses conform to the OpenAPI `PredictionMarketManifest` schema. Parts use media
 type `application/vnd.apache.parquet`. Each read re-verifies the part SHA-256 and
 refuses drafts, missing tables, path escape, or modified files.
+
+The bootstrap response is certified-only and is bound by both `dataset_id` and
+`manifest_id`. It carries typed, reversible event/market/condition/token/outcome/
+instrument identities plus the fields required to construct a Nautilus
+`BinaryOption`: title/question, USDC.e settlement currency, activation and
+expiration, price and size increments, minimum order size, lifecycle/resolution,
+structural relations, rule facts, and a complete versioned fee schedule. Missing
+fee or rule evidence makes the bootstrap invalid; a missing or mismatched bootstrap
+makes certification fail.
+
+Book rows expose `record_type`, `book_epoch`, deterministic `sequence`, optional
+`source_sequence`, absolute-size update semantics, exchange and receive timestamps,
+tick version, and state checksum. `replay.mode=snapshot_only` explicitly means no
+delta, cancellation, or queue-position semantics may be inferred. Consumers order
+rows by `(exchange_at, received_at, book_epoch, sequence, record_id)`.
 
 Example:
 
@@ -143,3 +159,26 @@ curl -fsS -o books.parquet \
 - A production dataset must meet the design document's sample gate (at least 20
   resolved binary markets and a complete lifecycle/24-hour window). The code does not
   waive this gate when no real pinned dataset configuration is supplied.
+
+## Pinned free Nautilus sample
+
+`scripts/materialize_polymarket_sample.py` builds the first local certified sample
+from `kinzikdza/polymarket-updown-microstructure` at immutable Hugging Face revision
+`eb4e9fc794c059dd9bef69c98eb4d34e70a5bd83` under CC BY 4.0. The three source
+Parquet SHA-256 values are pinned in `marketcow.polymarket_sample`; MarketCow refuses
+to read a mismatch. The builder also stores and hashes one official CLOB market
+response per condition and a local hash-pinned copy of the official fee contract.
+
+```bash
+uv run python scripts/materialize_polymarket_sample.py \
+  --source-root /path/to/pinned/source \
+  --store-root /path/to/immutable/store \
+  --dataset-id polymarket-updown-nautilus-sample-eb4e9fc
+```
+
+The upstream capture provides sampled books, not deltas. Source snapshots which are
+crossed or violate the declared tick are never repaired: immutable raw files remain
+the evidence, excluded counts enter a resolved gap ledger, and only valid snapshots
+are materialized for the declared snapshot-only replay. The sample has complete
+activation, expiration, and resolution facts for each included market; it does not
+claim a continuous 24-hour L2 window.
