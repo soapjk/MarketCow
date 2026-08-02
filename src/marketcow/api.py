@@ -1139,6 +1139,11 @@ def create_app(
                 "code": "certified_dataset_not_found",
                 "dataset_id": dataset_id,
             }) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "certified_dataset_integrity_failed",
+                "message": str(exc),
+            }) from exc
 
     @app.get(
         "/v1/prediction-markets/polymarket/datasets/{dataset_id}/bootstrap",
@@ -1157,11 +1162,6 @@ def create_app(
             raise HTTPException(status_code=404, detail={
                 "code": "certified_dataset_bootstrap_not_found",
                 "dataset_id": dataset_id,
-            }) from exc
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail={
-                "code": "certified_dataset_integrity_failed",
-                "message": str(exc),
             }) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail={

@@ -45,6 +45,10 @@ README_SHA256 = "f95504550f47e0d43023bfa8af9555e95e2b34745000bbd10bc67b6d5f8ffc1
 FEE_DOC_SHA256 = "8e246189f6ca85b8b8782e1d76a769cf98672a98c4c63d8bbe6150d659db8d7c"
 SDK_REVISION = "f3e1a05f868a1fd0c34ef85dfc45c6ce78f5bb69"
 SDK_ROUNDING_SHA256 = "0fd2d5020c1dd9b717788fc4f58d5a4ea28b790ad97170a7b4042b6e9864001f"
+FEE_MODULE_REVISION = "1a3c31c48275a9adceb039a05cfcf15aba4629bc"
+FEE_MODULE_EVIDENCE_SHA256 = (
+    "910a2918cbf71f43db2a3ce8ccc7711d86c1de92c56d628abef8bf34a8acd13e"
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -118,6 +122,7 @@ class FixedFreeSampleBuilder:
             "README.md": README_SHA256,
             "polymarket-fees.md": FEE_DOC_SHA256,
             "clob-v2-roundingConfig.ts": SDK_ROUNDING_SHA256,
+            "exchange-fee-module-FeeModule.sol": FEE_MODULE_EVIDENCE_SHA256,
         }.items():
             path = self.source_root / name
             if not path.exists() or _sha256_file(path) != expected:
@@ -155,6 +160,24 @@ class FixedFreeSampleBuilder:
             path=self.source_root / "clob-v2-roundingConfig.ts",
             observed_at=datetime.fromtimestamp(
                 (self.source_root / "clob-v2-roundingConfig.ts").stat().st_mtime,
+                timezone.utc,
+            ),
+            license_name="mit",
+        ))
+        sources.append(_source_revision(
+            source="polymarket_fee_module", revision=FEE_MODULE_REVISION,
+            source_url=(
+                "https://github.com/Polymarket/exchange-fee-module/blob/"
+                f"{FEE_MODULE_REVISION}/src/FeeModule.sol"
+            ),
+            path=(
+                self.source_root / "exchange-fee-module-FeeModule.sol"
+            ),
+            observed_at=datetime.fromtimestamp(
+                (
+                    self.source_root
+                    / "exchange-fee-module-FeeModule.sol"
+                ).stat().st_mtime,
                 timezone.utc,
             ),
             license_name="mit",
@@ -248,7 +271,7 @@ class FixedFreeSampleBuilder:
         self, slot: dict[str, Any], metadata: dict[str, Any],
         identity: PredictionMarketIdentity, dataset_source: SourceRevision,
         clob_source: SourceRevision, docs_source: SourceRevision,
-        sdk_source: SourceRevision,
+        sdk_source: SourceRevision, fee_module_source: SourceRevision,
     ) -> MarketBootstrap:
         winners = [item for item in metadata["tokens"] if item.get("winner") is True]
         if len(winners) != 1:
@@ -313,9 +336,14 @@ class FixedFreeSampleBuilder:
                 taker_rate=_decimal(slot["fee_rate"]),
                 formula="fee = C * taker_rate * p * (1 - p)", exponent="1",
                 quantum="0.00001",
-                rounding_mode="five_decimal_places; amounts below quantum round to zero",
+                # The public executable accepts an operator-chosen uint256 fee amount;
+                # it does not publish the decimal tie-breaking rule used upstream.
+                rounding_mode="UNSPECIFIED", tie_semantics="unspecified",
+                calculation_status="informational_only",
                 effective_from=activation, effective_to=expiration,
-                provenance=[dataset_source, docs_source, clob_source],
+                provenance=[
+                    dataset_source, docs_source, clob_source, fee_module_source
+                ],
             ),
         )
 
@@ -453,6 +481,10 @@ class FixedFreeSampleBuilder:
         sdk_source = next(
             source for source in fixed_sources if source.source == "polymarket_sdk"
         )
+        fee_module_source = next(
+            source for source in fixed_sources
+            if source.source == "polymarket_fee_module"
+        )
         slots = self._select_slots(market_count)
         identities = []
         bootstraps = []
@@ -467,7 +499,7 @@ class FixedFreeSampleBuilder:
             clob_sources.append(clob_source)
             bootstraps.append(self._bootstrap(
                 slot, metadata, identity, dataset_source, clob_source, docs_source,
-                sdk_source,
+                sdk_source, fee_module_source,
             ))
         by_condition = {item.condition_id: item for item in identities}
         books, book_states, gaps = self._book_records(

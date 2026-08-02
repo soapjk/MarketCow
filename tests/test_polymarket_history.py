@@ -17,6 +17,7 @@ from marketcow.polymarket_contracts import (
     RuleFact,
     SourceRevision,
     StructuralRelation,
+    quantize_fee_amount,
 )
 from marketcow.polymarket_history import (
     PolymarketWebSocketRecorder,
@@ -104,7 +105,9 @@ def bootstrap_market(path="/tmp/source", market_identity=None):
             schedule_id="fee-1", schedule_version="1", currency="USDC.e",
             maker_rate="0", taker_rate="0.07",
             formula="C * taker_rate * p * (1-p)", exponent="1",
-            quantum="0.00001", rounding_mode="half_up",
+            quantum="0.00001", rounding_mode="ROUND_HALF_UP",
+            tie_semantics="ties_away_from_zero",
+            calculation_status="executable_pnl",
             effective_from=NOW, provenance=[evidence],
         ),
     )
@@ -130,6 +133,38 @@ class PolymarketHistoryTest(unittest.TestCase):
         payload.pop("fee_schedule")
         with self.assertRaises(ValidationError):
             MarketBootstrap.model_validate(payload)
+
+    def test_fee_quantization_golden_boundaries(self):
+        schedule = bootstrap_market().fee_schedule.model_copy(update={
+            "rounding_mode": "ROUND_DOWN",
+            "tie_semantics": "toward_zero",
+            "calculation_status": "executable_pnl",
+        })
+        expected = {
+            "0.000005": "0.00000",  # exactly half a quantum
+            "0.000009": "0.00000",  # below one quantum
+            "0.00001": "0.00001",   # exactly one quantum
+            "1.75": "1.75000",      # C=100, rate=.07, p=.50
+            "0.0693": "0.06930",    # C=100, rate=.07, p=.01
+        }
+        for raw_amount, result in expected.items():
+            with self.subTest(raw_amount=raw_amount):
+                self.assertEqual(quantize_fee_amount(raw_amount, schedule), result)
+
+    def test_unspecified_fee_rounding_fails_closed(self):
+        schedule = bootstrap_market().fee_schedule.model_copy(update={
+            "rounding_mode": "UNSPECIFIED",
+            "tie_semantics": "unspecified",
+            "calculation_status": "informational_only",
+        })
+        for raw_amount in ("0.000005", "0.000009", "0.00001", "1.75", "0.0693"):
+            with self.subTest(raw_amount=raw_amount):
+                with self.assertRaisesRegex(ValueError, "not certified"):
+                    quantize_fee_amount(raw_amount, schedule)
+        invalid = schedule.model_dump(mode="json")
+        invalid["calculation_status"] = "executable_pnl"
+        with self.assertRaisesRegex(ValidationError, "deterministic fee rounding"):
+            FeeSchedule.model_validate(invalid)
 
     def test_append_replay_checkpoint_duplicate_gap_and_snapshot_recovery(self):
         with TemporaryDirectory() as folder:

@@ -133,6 +133,14 @@ structural relations, rule facts, and a complete versioned fee schedule. Missing
 fee or rule evidence makes the bootstrap invalid; a missing or mismatched bootstrap
 makes certification fail.
 
+Fee rounding is an enum, not prose. `ROUND_DOWN`, `ROUND_HALF_EVEN`, and
+`ROUND_HALF_UP` carry matching tie semantics and may be used for executable PnL;
+`UNSPECIFIED` must be paired with `calculation_status=informational_only` and makes
+fee calculation fail closed. The pinned free sample uses `UNSPECIFIED`: official
+fee documentation defines the five-decimal quantum, while the fixed-revision public
+FeeModule accepts an operator-selected integer fee and does not expose the
+operator's decimal tie-breaking implementation.
+
 Book rows expose `record_type`, `book_epoch`, deterministic `sequence`, optional
 `source_sequence`, absolute-size update semantics, exchange and receive timestamps,
 tick version, and state checksum. `replay.mode=snapshot_only` explicitly means no

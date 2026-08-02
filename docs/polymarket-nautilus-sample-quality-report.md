@@ -17,6 +17,12 @@
   `f3e1a05f868a1fd0c34ef85dfc45c6ce78f5bb69`, SHA-256
   `0fd2d5020c1dd9b717788fc4f58d5a4ea28b790ad97170a7b4042b6e9864001f`;
   its `size: 2` rule supplies the audited `0.01` size increment.
+- Official MIT-licensed `exchange-fee-module`, fixed at revision
+  `1a3c31c48275a9adceb039a05cfcf15aba4629bc`; the pinned executable excerpt
+  SHA-256 is
+  `910a2918cbf71f43db2a3ce8ccc7711d86c1de92c56d628abef8bf34a8acd13e`.
+  Its public `matchOrders` contract takes `takerFeeAmount` as an operator-chosen
+  `uint256`; it does not publish the operator's decimal tie-breaking algorithm.
 - Official CLOB market metadata is cached locally per condition and content-hashed.
 
 No PMData, Dome, PolymarketData, paid service, trial allowance, synthetic price,
@@ -25,8 +31,8 @@ interpolation, fabricated delta, cancellation, or queue event is used.
 ## Certified publication
 
 - Dataset ID: `polymarket-updown-nautilus-sample-eb4e9fc`
-- Manifest ID: `8581237cac6625cad8403dab249a5e5f8d699f1f59a8403dc85d782634825a25`
-- Bootstrap ID: `f5361a524e1df3dfd7316fe039ffdb96fdc3404c0596db3f0a9e1641ace72034`
+- Manifest ID: `6ccedcb80303601aa73a968e6226cea6cb3f3efe1563554008e17ef3c8ed61a8`
+- Bootstrap ID: `ab29cbbecf1297338b8ac50f10022de26f5f690dc171a221bcf4c046f24982f8`
 - Intended use: `nautilus_snapshot_replay`
 - Markets: 20 resolved binary markets
 - Tokens: 40, with reversible canonical instrument identities
@@ -38,7 +44,7 @@ interpolation, fabricated delta, cancellation, or queue event is used.
 - Replay: snapshot-only, deterministic normalized sequence, absolute sizes
 - Immutable parts:
   - books: `027ee7a1a61bbd9609db63c81e0c42d6ff9e243a49ebb236663cac960f0d4a21`
-  - catalog: `3bd89f28c6abdcb558127f1ad80f086de38aeddcfb2b8a5ce6ecdca19024b301`
+  - catalog: `2cdc903e14d1ed8bbebf4585614be993906870e43f348352c6c64168d65ec9b1`
   - lifecycle: `c75eb329782d9b408bd271be1976e4a45498343a63a109e45893d028e04d64cd`
   - trades: `3ac8f31a7877d00a0b38ff367b9e9d379c5375f33448e4b264027be7c5ab0d53`
 
@@ -58,3 +64,12 @@ then download the declared Parquet parts. It must reject mismatched `dataset_id`
 `manifest_id`, `bootstrap_id`, part SHA-256, row payload SHA-256, unsupported replay
 mode, or missing fee/rule facts. A copyable bootstrap, manifest, and minimal books
 Parquet fixture are delivered under the local Artifact fixture directory.
+
+The fee schedule is intentionally machine-readable as
+`rounding_mode=UNSPECIFIED`, `tie_semantics=unspecified`, and
+`calculation_status=informational_only`. The formula, rate, exponent, and quantum
+are source-backed, but this dataset is **not certified for executable PnL**.
+Consumers must fail closed instead of choosing `ROUND_DOWN`, `ROUND_HALF_EVEN`, or
+`ROUND_HALF_UP`. MarketCow's deterministic quantizer has golden boundary tests for
+supported modes and rejects the sample schedule at half-quantum, sub-quantum,
+exact-quantum, and representative 0.50/0.01 price-derived amounts.

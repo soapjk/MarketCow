@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -130,6 +131,47 @@ class PolymarketApiTest(unittest.TestCase):
             "/v1/prediction-markets/polymarket/datasets/{dataset_id}/bootstrap",
             openapi["paths"],
         )
+
+        manifest_path = root / "manifests" / f"{certified.manifest_id}.json"
+        original_manifest = manifest_path.read_bytes()
+        tampered_manifest = json.loads(original_manifest)
+        tampered_manifest["status"] = "draft"
+        manifest_path.write_text(json.dumps(tampered_manifest), encoding="utf-8")
+        response = self.client.get(
+            "/v1/prediction-markets/polymarket/datasets/tradude-sample/manifest"
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"]["code"], "certified_dataset_integrity_failed"
+        )
+        manifest_path.write_bytes(original_manifest)
+
+        bootstrap_path = root / "bootstraps" / f"{certified.manifest_id}.json"
+        original_bootstrap = bootstrap_path.read_bytes()
+        tampered_bootstrap = json.loads(original_bootstrap)
+        tampered_bootstrap["dataset_id"] = "tampered"
+        bootstrap_path.write_text(json.dumps(tampered_bootstrap), encoding="utf-8")
+        response = self.client.get(
+            "/v1/prediction-markets/polymarket/datasets/tradude-sample/bootstrap"
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"]["code"], "certified_dataset_integrity_failed"
+        )
+        bootstrap_path.write_bytes(original_bootstrap)
+
+        books_part = next(item for item in certified.parts if item.table == "books")
+        books_path = Path(books_part.path)
+        original_books = books_path.read_bytes()
+        books_path.write_bytes(original_books + b"tampered")
+        response = self.client.get(
+            "/v1/prediction-markets/polymarket/datasets/tradude-sample/parts/books"
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["detail"]["code"], "certified_dataset_integrity_failed"
+        )
+        books_path.write_bytes(original_books)
 
 
 if __name__ == "__main__":

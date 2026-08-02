@@ -841,11 +841,21 @@ class PublishedPredictionMarketStore:
         pointer = self._pointer(dataset_id)
         if not pointer.exists():
             raise FileNotFoundError("certified dataset is not published")
-        selected = json.loads(pointer.read_text(encoding="utf-8"))
+        try:
+            selected = json.loads(pointer.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("published dataset pointer is corrupt") from exc
         if selected.get("dataset_id") != dataset_id:
             raise RuntimeError("published dataset pointer identity mismatch")
         path = self.root / "manifests" / f"{selected['manifest_id']}.json"
-        manifest = PredictionMarketManifest.model_validate_json(path.read_text())
+        try:
+            manifest = PredictionMarketManifest.model_validate_json(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("published manifest is corrupt") from exc
+        if manifest.manifest_id != selected.get("manifest_id"):
+            raise RuntimeError("published manifest content identity mismatch")
+        if manifest_identity(manifest.model_dump(mode="json")) != manifest.manifest_id:
+            raise RuntimeError("published manifest content identity mismatch")
         if manifest.status != "certified":
             raise RuntimeError("published manifest is not certified")
         return manifest
@@ -867,7 +877,10 @@ class PublishedPredictionMarketStore:
     def bootstrap(self, dataset_id: str) -> PredictionMarketBootstrap:
         manifest = self.manifest(dataset_id)
         path = self.root / "bootstraps" / f"{manifest.manifest_id}.json"
-        bootstrap = PredictionMarketBootstrap.model_validate_json(path.read_text())
+        try:
+            bootstrap = PredictionMarketBootstrap.model_validate_json(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("published bootstrap is corrupt") from exc
         if (
             bootstrap.dataset_id != dataset_id
             or bootstrap.manifest_id != manifest.manifest_id

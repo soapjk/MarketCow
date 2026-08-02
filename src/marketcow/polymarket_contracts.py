@@ -4,7 +4,13 @@ import hashlib
 import json
 import re
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import (
+    ROUND_DOWN,
+    ROUND_HALF_EVEN,
+    ROUND_HALF_UP,
+    Decimal,
+    InvalidOperation,
+)
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -42,6 +48,7 @@ class SourceRevision(BaseModel):
         "polymarket_gamma", "polymarket_clob", "polymarket_data_api",
         "polymarket_subgraph", "polygon_logs", "polymarket_websocket",
         "polymarket_docs", "polymarket_sdk", "huggingface_fixed_revision",
+        "polymarket_fee_module",
     ]
     revision: str = Field(min_length=1, max_length=200)
     source_url: str = Field(min_length=1, max_length=2000)
@@ -214,7 +221,13 @@ class FeeSchedule(BaseModel):
     formula: str = Field(min_length=1, max_length=500)
     exponent: str
     quantum: str
-    rounding_mode: str = Field(min_length=1, max_length=200)
+    rounding_mode: Literal[
+        "ROUND_DOWN", "ROUND_HALF_EVEN", "ROUND_HALF_UP", "UNSPECIFIED"
+    ]
+    tie_semantics: Literal[
+        "toward_zero", "ties_to_even", "ties_away_from_zero", "unspecified"
+    ]
+    calculation_status: Literal["executable_pnl", "informational_only"]
     effective_from: datetime
     effective_to: datetime | None = None
     provenance: list[SourceRevision] = Field(min_length=1)
@@ -225,9 +238,37 @@ class FeeSchedule(BaseModel):
         self.taker_rate = decimal_text(self.taker_rate, "taker_rate")
         self.exponent = decimal_text(self.exponent, "fee_exponent")
         self.quantum = decimal_text(self.quantum, "fee_quantum", allow_zero=False)
+        expected_ties = {
+            "ROUND_DOWN": "toward_zero",
+            "ROUND_HALF_EVEN": "ties_to_even",
+            "ROUND_HALF_UP": "ties_away_from_zero",
+            "UNSPECIFIED": "unspecified",
+        }
+        if self.tie_semantics != expected_ties[self.rounding_mode]:
+            raise ValueError("fee rounding mode and tie semantics disagree")
+        if (
+            self.calculation_status == "executable_pnl"
+            and self.rounding_mode == "UNSPECIFIED"
+        ):
+            raise ValueError("executable PnL requires a deterministic fee rounding mode")
         if self.effective_to is not None and self.effective_from >= self.effective_to:
             raise ValueError("fee schedule interval must be ordered")
         return self
+
+
+def quantize_fee_amount(raw_amount: Any, schedule: FeeSchedule) -> str:
+    """Apply an explicitly certified fee quantum; ambiguous schedules fail closed."""
+    if schedule.rounding_mode == "UNSPECIFIED":
+        raise ValueError("fee rounding is not certified for executable PnL")
+    amount = Decimal(decimal_text(raw_amount, "fee_amount"))
+    quantum = Decimal(schedule.quantum)
+    rounding = {
+        "ROUND_DOWN": ROUND_DOWN,
+        "ROUND_HALF_EVEN": ROUND_HALF_EVEN,
+        "ROUND_HALF_UP": ROUND_HALF_UP,
+    }[schedule.rounding_mode]
+    units = (amount / quantum).quantize(Decimal("1"), rounding=rounding)
+    return format(units * quantum, "f")
 
 
 class MarketBootstrap(BaseModel):
