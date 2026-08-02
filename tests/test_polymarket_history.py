@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from marketcow.polymarket_contracts import (
     RuleFact,
     SourceRevision,
     StructuralRelation,
+    content_sha256,
     quantize_fee_amount,
 )
 from marketcow.polymarket_history import (
@@ -24,6 +26,7 @@ from marketcow.polymarket_history import (
     PredictionMarketCertifier,
     PredictionMarketMaterializer,
     PublishedPredictionMarketStore,
+    book_state_checksum,
     table_records_from_recorder,
 )
 
@@ -268,7 +271,31 @@ class PolymarketHistoryTest(unittest.TestCase):
             self.assertEqual(store.manifest(certified.dataset_id).manifest_id,
                              certified.manifest_id)
             book_path = store.part(certified.dataset_id, "books")
-            self.assertEqual(pq.read_table(book_path).num_rows, 2)
+            book_rows = pq.read_table(book_path).to_pylist()
+            self.assertEqual(len(book_rows), 2)
+            vendor_fields = {
+                "yes_ladder", "no_ladder", "yes_bid", "yes_ask",
+                "no_bid", "no_ask", "ts_ms", "condition_id",
+            }
+            for row in book_rows:
+                payload = json.loads(row["payload_json"])
+                self.assertEqual(
+                    payload["schema_version"], "marketcow.polymarket.book.v1"
+                )
+                self.assertEqual(payload["record_type"], "snapshot")
+                self.assertTrue(vendor_fields.isdisjoint(payload))
+                self.assertTrue(all(
+                    isinstance(level[field], str)
+                    for side in ("bids", "asks")
+                    for level in payload[side]
+                    for field in ("price", "size")
+                ))
+                self.assertEqual(book_state_checksum(payload), row["state_checksum"])
+                self.assertEqual(payload["state_checksum"], row["state_checksum"])
+                raw_payload = json.loads(row["raw_payload_json"])
+                self.assertEqual(
+                    content_sha256(raw_payload), row["raw_payload_sha256"]
+                )
             first_bytes = book_path.read_bytes()
             second = materializer.materialize(
                 "another-dataset", "revision-1", [identity()],
@@ -279,6 +306,45 @@ class PolymarketHistoryTest(unittest.TestCase):
             self.assertEqual(next(p for p in second.parts if p.table == "books").path,
                              str(book_path))
             self.assertEqual(book_path.read_bytes(), first_bytes)
+
+    def test_certification_rejects_float_in_canonical_book_payload(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            recorder = PolymarketWebSocketRecorder(root / "recording", identity())
+            recorder.append(snapshot("yes", 1, "0.40", "0.42", "s1"))
+            recorder.append(snapshot("no", 1, "0.58", "0.60", "s2"))
+            trades = [{
+                "record_type": "trade", "trade_id": "t1", "token_id": "yes",
+                "timestamp": "2026-08-02T08:01:00Z", "price": "0.42",
+                "size": "1", "transaction_hash": "0x1",
+                "source": "polymarket_data_api",
+            }]
+            tables = table_records_from_recorder(recorder)
+            tables["books"][0]["event"]["bids"][0]["price"] = 0.40
+            tables.update(metadata_tables())
+            tables["trades"] = trades
+            materializer = PredictionMarketMaterializer(
+                root / "published", now_provider=lambda: NOW
+            )
+            draft = materializer.materialize(
+                "float-canonical-payload", "revision-1", [identity()],
+                [source(recorder.raw_path)], tables, recorder.gaps,
+                intended_use="nautilus_snapshot_replay", replay=replay(),
+                bootstrap_markets=[bootstrap_market(recorder.raw_path)],
+            )
+
+            rejected = PredictionMarketCertifier(materializer).certify(
+                draft, book_states=recorder.states,
+                official_trades=trades, onchain_trades=[],
+            )
+
+            self.assertEqual(rejected.status, "rejected")
+            replay_check = next(
+                item for item in rejected.checks
+                if item.name == "historical_book_replay_semantics"
+            )
+            self.assertFalse(replay_check.passed)
+            self.assertIn("JSON float", " ".join(replay_check.details["errors"]))
 
     def test_certification_rejects_missing_onchain_trade(self):
         with TemporaryDirectory() as folder:

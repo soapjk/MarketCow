@@ -71,6 +71,77 @@ def _state_hash(state: dict[str, Any]) -> str:
     })
 
 
+def canonical_book_state(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the public, decimal-safe state used by the checksum contract."""
+    if payload.get("schema_version") != "marketcow.polymarket.book.v1":
+        raise ValueError("unsupported canonical book schema")
+    if payload.get("record_type") != "snapshot":
+        raise ValueError("canonical state reconstruction requires a snapshot")
+    bids = _levels(payload.get("bids"), "bids")
+    asks = _levels(payload.get("asks"), "asks")
+    state = {
+        "token_id": str(payload.get("token_id") or ""),
+        "tick_size": decimal_text(
+            payload.get("tick_size"), "tick_size", allow_zero=False
+        ),
+        "bids": {item["price"]: item["size"] for item in bids},
+        "asks": {item["price"]: item["size"] for item in asks},
+    }
+    if not state["token_id"]:
+        raise ValueError("canonical snapshot requires token_id")
+    if len(state["bids"]) != len(bids) or len(state["asks"]) != len(asks):
+        raise ValueError("canonical snapshot contains duplicate price levels")
+    _validate_book(state)
+    return state
+
+
+def book_state_checksum(payload: dict[str, Any]) -> str:
+    """SHA-256 of canonical JSON over token, tick, and sorted decimal levels."""
+    return _state_hash(canonical_book_state(payload))
+
+
+def _contains_float(value: Any) -> bool:
+    if isinstance(value, float):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_float(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_float(item) for item in value)
+    return False
+
+
+def _canonical_book_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    record_type = str(payload.get("type") or payload.get("record_type") or "")
+    if record_type not in {"book", "snapshot"}:
+        return payload
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "schema_version": "marketcow.polymarket.book.v1",
+        "record_id": str(payload.get("event_id") or content_sha256(payload)),
+        "record_type": "snapshot",
+        "snapshot_type": "full",
+        "token_id": str(payload.get("token_id") or payload.get("asset_id") or ""),
+        "book_epoch": str(payload.get("book_epoch") or ""),
+        "sequence": payload.get("sequence"),
+        "source_sequence": payload.get("source_sequence"),
+        "exchange_at": _instant(
+            payload.get("exchange_ts") or payload.get("event_at")
+        ).isoformat(),
+        "received_at": _instant(
+            payload.get("received_ts") or payload.get("received_at")
+            or payload.get("exchange_ts") or payload.get("event_at")
+        ).isoformat(),
+        "update_semantics": str(payload.get("update_semantics") or "absolute_size"),
+        "tick_version": str(payload.get("tick_version") or ""),
+        "tick_size": payload.get("tick_size"),
+        "bids": payload.get("bids") or [],
+        "asks": payload.get("asks") or [],
+        "state_checksum": str(
+            payload.get("state_checksum") or payload.get("expected_state_hash") or ""
+        ),
+    }
+
+
 def _validate_book(state: dict[str, Any]) -> None:
     tick = Decimal(state["tick_size"])
     if tick <= 0:
@@ -408,6 +479,8 @@ PARQUET_SCHEMA = pa.schema([
     ("source", pa.string()),
     ("payload_json", pa.string()),
     ("payload_sha256", pa.string()),
+    ("raw_payload_json", pa.string()),
+    ("raw_payload_sha256", pa.string()),
 ])
 
 
@@ -419,51 +492,63 @@ class PredictionMarketMaterializer:
     @staticmethod
     def _parquet_row(record: dict[str, Any]) -> dict[str, Any]:
         payload = record.get("event") or record
-        raw = record.get("raw_payload") or payload
+        normalized = _canonical_book_payload(payload)
+        public = normalized
+        raw = record.get("raw_payload")
         return {
             "contract_version": CONTRACT_VERSION,
             "record_id": str(
-                payload.get("event_id") or payload.get("trade_id")
-                or payload.get("transaction_hash") or content_sha256(payload)
+                public.get("record_id") or public.get("event_id")
+                or public.get("trade_id") or public.get("transaction_hash")
+                or content_sha256(public)
             ),
             "market_id": str(record.get("market_id") or payload.get("market_id") or ""),
             "condition_id": str(record.get("condition_id") or payload.get("condition_id") or ""),
-            "token_id": str(payload.get("token_id") or payload.get("asset_id") or ""),
-            "record_type": str(payload.get("type") or payload.get("record_type") or ""),
+            "token_id": str(public.get("token_id") or public.get("asset_id") or ""),
+            "record_type": str(
+                public.get("record_type") or public.get("type") or ""
+            ),
             "event_at": _instant(
-                payload.get("exchange_ts") or payload.get("timestamp")
-                or payload.get("event_at") or payload.get("observed_at")
+                public.get("exchange_at") or public.get("exchange_ts")
+                or public.get("timestamp") or public.get("event_at")
+                or public.get("observed_at")
             ),
             "received_at": _instant(
-                payload.get("received_ts") or payload.get("received_at")
-                or payload.get("exchange_ts") or payload.get("timestamp")
-                or payload.get("event_at") or payload.get("observed_at")
+                public.get("received_at") or public.get("received_ts")
+                or public.get("exchange_at") or public.get("exchange_ts")
+                or public.get("timestamp") or public.get("event_at")
+                or public.get("observed_at")
             ),
-            "book_epoch": str(payload.get("book_epoch") or ""),
+            "book_epoch": str(public.get("book_epoch") or ""),
             "sequence": (
-                int(payload["sequence"]) if payload.get("sequence") is not None else None
+                int(public["sequence"]) if public.get("sequence") is not None else None
             ),
             "source_sequence": (
-                int(payload["source_sequence"])
-                if payload.get("source_sequence") is not None else None
+                int(public["source_sequence"])
+                if public.get("source_sequence") is not None else None
             ),
-            "update_semantics": str(payload.get("update_semantics") or ""),
-            "tick_version": str(payload.get("tick_version") or ""),
+            "update_semantics": str(public.get("update_semantics") or ""),
+            "tick_version": str(public.get("tick_version") or ""),
             "state_checksum": str(
-                payload.get("state_checksum") or payload.get("expected_state_hash") or ""
+                public.get("state_checksum")
+                or public.get("expected_state_hash") or ""
             ),
             "price": (
-                decimal_text(payload["price"], "price")
-                if payload.get("price") is not None else None
+                decimal_text(public["price"], "price")
+                if public.get("price") is not None else None
             ),
             "size": (
-                decimal_text(payload["size"], "size")
-                if payload.get("size") is not None else None
+                decimal_text(public["size"], "size")
+                if public.get("size") is not None else None
             ),
-            "transaction_hash": str(payload.get("transaction_hash") or ""),
-            "source": str(record.get("source") or payload.get("source") or ""),
-            "payload_json": canonical_json(raw).decode("utf-8"),
-            "payload_sha256": content_sha256(raw),
+            "transaction_hash": str(public.get("transaction_hash") or ""),
+            "source": str(record.get("source") or public.get("source") or ""),
+            "payload_json": canonical_json(normalized).decode("utf-8"),
+            "payload_sha256": content_sha256(normalized),
+            "raw_payload_json": (
+                canonical_json(raw).decode("utf-8") if raw is not None else ""
+            ),
+            "raw_payload_sha256": content_sha256(raw) if raw is not None else "",
         }
 
     def _write_part(self, table_name: str, records: list[dict[str, Any]]) -> DatasetPart:
@@ -680,7 +765,7 @@ class PredictionMarketCertifier:
             rows = pq.read_table(book_part.path).to_pylist()
             previous = None
             for row in rows:
-                if row["record_type"] not in {"snapshot", "book", "delta", "price_change"}:
+                if row["record_type"] not in {"snapshot", "delta", "price_change"}:
                     replay_errors.append("unsupported book record_type")
                     continue
                 if draft.replay.mode == "snapshot_only" and row["record_type"] in {
@@ -693,6 +778,61 @@ class PredictionMarketCertifier:
                 )
                 if any(row.get(field) in {None, ""} for field in required):
                     replay_errors.append(f"incomplete replay row:{row['record_id']}")
+                try:
+                    payload = json.loads(row["payload_json"])
+                    if _contains_float(payload):
+                        raise ValueError(
+                            "canonical payload contains a JSON float; decimals must be strings"
+                        )
+                    required_payload = {
+                        "contract_version", "schema_version", "record_id",
+                        "record_type", "snapshot_type", "token_id", "book_epoch",
+                        "sequence", "source_sequence", "exchange_at", "received_at",
+                        "update_semantics", "tick_version", "tick_size", "bids",
+                        "asks", "state_checksum",
+                    }
+                    missing_payload = sorted(required_payload - set(payload))
+                    if missing_payload:
+                        raise ValueError(
+                            f"canonical payload missing fields:{missing_payload}"
+                        )
+                    if canonical_json(payload).decode("utf-8") != row["payload_json"]:
+                        raise ValueError("canonical payload JSON encoding mismatch")
+                    if content_sha256(payload) != row["payload_sha256"]:
+                        raise ValueError("canonical payload hash mismatch")
+                    observed_checksum = book_state_checksum(payload)
+                    if observed_checksum != payload["state_checksum"]:
+                        raise ValueError("canonical payload state checksum mismatch")
+                    if observed_checksum != row["state_checksum"]:
+                        raise ValueError("Parquet state checksum mismatch")
+                    if (
+                        payload["record_id"] != row["record_id"]
+                        or payload["token_id"] != row["token_id"]
+                        or payload["book_epoch"] != row["book_epoch"]
+                        or payload["sequence"] != row["sequence"]
+                        or payload["source_sequence"] != row["source_sequence"]
+                        or payload["record_type"] != row["record_type"]
+                        or payload["update_semantics"] != row["update_semantics"]
+                        or payload["tick_version"] != row["tick_version"]
+                        or _instant(payload["exchange_at"]) != row["event_at"]
+                        or _instant(payload["received_at"]) != row["received_at"]
+                    ):
+                        raise ValueError("canonical payload identity mismatch")
+                    raw_payload_json = row.get("raw_payload_json") or ""
+                    if not raw_payload_json or not row.get("raw_payload_sha256"):
+                        raise ValueError("book row is missing raw source evidence")
+                    raw_payload = json.loads(raw_payload_json)
+                    if (
+                        canonical_json(raw_payload).decode("utf-8")
+                        != raw_payload_json
+                    ):
+                        raise ValueError("raw source payload JSON encoding mismatch")
+                    if content_sha256(raw_payload) != row["raw_payload_sha256"]:
+                        raise ValueError("raw source payload hash mismatch")
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    replay_errors.append(
+                        f"invalid canonical replay row:{row['record_id']}:{exc}"
+                    )
                 key = (
                     row["event_at"], row["received_at"], row["book_epoch"],
                     row["sequence"], row["record_id"],

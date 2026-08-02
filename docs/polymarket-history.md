@@ -147,6 +147,33 @@ tick version, and state checksum. `replay.mode=snapshot_only` explicitly means n
 delta, cancellation, or queue-position semantics may be inferred. Consumers order
 rows by `(exchange_at, received_at, book_epoch, sequence, record_id)`.
 
+For book rows, `payload_json` is the provider-independent
+`marketcow.polymarket.book.v1` payload. A full snapshot contains `record_id`,
+`token_id`, `snapshot_type=full`, epoch and sequence fields, exchange/receive
+timestamps, tick version and tick size, absolute-size semantics, and `bids`/`asks`.
+Every level encodes `price` and `size` as JSON strings; a JSON float anywhere in the
+normalized payload makes certification fail. Provider input is retained separately
+as `raw_payload_json` plus `raw_payload_sha256`, and never replaces the public
+payload.
+
+The `state_checksum` algorithm is SHA-256 over UTF-8 canonical JSON (object keys
+sorted lexicographically, no insignificant whitespace) of exactly this object:
+
+```json
+{
+  "token_id": "...",
+  "tick_size": "0.01",
+  "bids": [{"price": "0.54", "size": "96.73"}],
+  "asks": [{"price": "0.5500", "size": "106.87"}]
+}
+```
+
+Bids are sorted by numeric price descending and asks ascending before hashing.
+Duplicate prices, non-string decimals, invalid ticks, crossed books, payload/hash
+mismatches, or top-level/payload identity mismatches fail certification. Consumers
+can use `marketcow.polymarket_history.book_state_checksum` as the reference
+implementation without parsing any provider-specific field.
+
 Example:
 
 ```sh

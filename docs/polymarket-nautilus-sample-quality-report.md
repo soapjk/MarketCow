@@ -31,7 +31,7 @@ interpolation, fabricated delta, cancellation, or queue event is used.
 ## Certified publication
 
 - Dataset ID: `polymarket-updown-nautilus-sample-eb4e9fc`
-- Manifest ID: `6ccedcb80303601aa73a968e6226cea6cb3f3efe1563554008e17ef3c8ed61a8`
+- Manifest ID: `8dcf3a9705b633ab727bd6597ed2dec2ff90653febe287966c50a35a63f39949`
 - Bootstrap ID: `ab29cbbecf1297338b8ac50f10022de26f5f690dc171a221bcf4c046f24982f8`
 - Intended use: `nautilus_snapshot_replay`
 - Markets: 20 resolved binary markets
@@ -43,10 +43,10 @@ interpolation, fabricated delta, cancellation, or queue event is used.
 - Lifecycle: activation, expiration, and resolution are complete for every market
 - Replay: snapshot-only, deterministic normalized sequence, absolute sizes
 - Immutable parts:
-  - books: `027ee7a1a61bbd9609db63c81e0c42d6ff9e243a49ebb236663cac960f0d4a21`
-  - catalog: `2cdc903e14d1ed8bbebf4585614be993906870e43f348352c6c64168d65ec9b1`
-  - lifecycle: `c75eb329782d9b408bd271be1976e4a45498343a63a109e45893d028e04d64cd`
-  - trades: `3ac8f31a7877d00a0b38ff367b9e9d379c5375f33448e4b264027be7c5ab0d53`
+  - books: `d2ac15b23fc3b49c10c8e726fd935263d8cc272f972578d9b6ca9021d0bd0c2e`
+  - catalog: `f662d44db48a95ed0549a3d28a3743e84d2381fed3ec305bbd9e23373a950c94`
+  - lifecycle: `b6a3baa4a7107de51e164ede1a02c300929eb7fb82613a8d17d3c77e2dbf5b96`
+  - trades: `accdf9e1e1a58f878360e9c5f2b15e67d24520659fd5e5be2dc916823f34b852`
 
 The source card warns that raw captures can be crossed. MarketCow keeps those raw
 rows in the immutable pinned input, records per-token exclusion counts in the gap
@@ -56,6 +56,13 @@ token to retain at least one valid, non-crossed, tick-aligned snapshot.
 The local generated manifest, bootstrap, part paths, hashes, and checks are recorded
 in the versioned delivery Artifact. Re-running against the same local inputs is
 local-first and yields the same content-addressed Parquet parts.
+
+The published books part uses only canonical token-scoped snapshot payloads with
+decimal-string levels. Vendor `yes_*`/`no_*` rows and their JSON numeric provenance
+remain separately available in `raw_payload_json` and are independently hashed.
+Certification parses all 1,158 public payloads, rejects JSON floats, verifies public
+and raw hashes, and reconstructs every `state_checksum` using the documented
+provider-neutral algorithm.
 
 ## Consumer contract
 
