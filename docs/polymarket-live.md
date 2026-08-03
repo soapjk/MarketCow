@@ -1,7 +1,7 @@
 # Polymarket free full-market live data
 
 Status: local candidate. Contract: `marketcow.prediction_market.v1` with live schema
-`marketcow.polymarket.live.v1`.
+`marketcow.polymarket.live.v2`.
 
 ## Source and trust boundary
 
@@ -41,9 +41,24 @@ HTTP 429/5xx with bounded `Retry-After`/exponential backoff.
 
 `GammaLiveNormalizer` publishes reversible event, market, condition, outcome token,
 and `POLY:{condition_id}:{token_id}` instrument identities. A content revision covers
-each metadata payload. Binary complement and standard negative-risk relations are
-explicit, versioned, and source-backed; all markets sharing a Gamma negative-risk ID
-receive the complete relation member set. New-market/resolution WebSocket events are
+each metadata payload. The breaking `live.v2` shape embeds a versioned
+`LiveInstrumentFacts` object with settlement currency, activation/expiration, price
+increment, size increment, minimum order size, lifecycle/accepting state, and the
+source revision for every fact. Current `pUSD` is tied to the official collateral
+documentation (modified 2026-04-17) and `0.01` size increment to the official CLOB SDK
+rounding config pinned at commit `b076b04d61135657e25dccc1bbd6866a96bd8c6e`;
+Gamma supplies the per-market time, tick, and minimum-size fields. A missing source
+field is published in `missing_fields`, never replaced by a business default, and
+causes `instrument_facts_incomplete`.
+
+Binary complement and standard negative-risk relations are explicit, versioned, and
+source-backed. A standard negative-risk relation's `members` is only the
+mutually-exclusive YES instrument set. `outcome_pairs` separately maps every explicit
+Gamma event-outcome label to its market/condition and YES/NO token/instrument pair.
+The consumer never parses a title, slug, or unconstrained outcome string. All markets
+sharing a Gamma negative-risk ID receive the complete pair set from one full keyset
+traversal. Missing labels, ambiguous YES/NO sides, or partial group expansion sets
+`negative_risk_relation_incomplete`. New-market/resolution WebSocket events are
 catalog invalidations: the collector refreshes Gamma and dynamically updates token
 subscriptions. It does not infer relations from title or slug.
 
@@ -51,11 +66,16 @@ Every complete Gamma traversal is stored as immutable canonical JSON under its
 SHA-256. The live catalog records the raw path/hash and refuses restart when either the
 canonical catalog revision or raw source evidence has been altered.
 
-Tick size, minimum order size, lifecycle, accepting-orders state, and the source fee
-form are retained: either explicit legacy maker/taker bps or current
-rate/exponent/rebate/taker-only fields. Officially unspecified fee rounding remains
-`UNSPECIFIED / informational_only`. Missing rule or fee facts are represented by
-completeness flags and make the Tradude market frame fail closed.
+The fee contract is a typed `LiveFeeSchedule`: schedule ID/version, currency,
+maker/taker rates, formula, exponent, quantum, rounding mode, tie semantics,
+calculation status, effective interval, and source provenance. MarketCow does not
+conflate current `pUSD` settlement collateral with the fee denomination: the official
+fee page states `USDC`, a zero maker rate, `C × feeRate × p × (1-p)`, and a
+`0.00001` quantum. A Gamma/CLOB per-token rate in bps is converted exactly by dividing
+by 10,000 and retains its source revision. Officially unspecified fee tie-breaking
+remains `UNSPECIFIED / unspecified / informational_only`; it is not zero and cannot be
+used for executable PnL. Missing per-market rate or schedule facts are named in
+`missing_fields` and cause `fee_schedule_incomplete`.
 
 ## Book semantics and recovery
 
@@ -110,12 +130,22 @@ GET /v1/prediction-markets/polymarket/live/gaps?unresolved_only=true
 GET /v1/prediction-markets/polymarket/live/public-data/{kind}
 ```
 
-Bootstrap contains the complete canonical catalog, catalog revision, active token list,
-current cursor, sequence semantics, and recovery contract. Snapshot contains one
-`MarketFrame` per requested market. Each frame includes both binary token books and all
-standard negative-risk relation token books. It is `fail_closed` when a member is
-missing, stale, skewed beyond the configured bound, affected by an unresolved gap, or
-has incomplete rules/fees.
+Bootstrap contains the complete canonical catalog, typed instrument/fee facts,
+relations/pairs, catalog revision, active token list, current cursor, sequence
+semantics, and recovery contract. Snapshot contains one `MarketFrame` per requested
+market. Every frame returns exactly the two books for its binary complete set. A
+standard negative-risk frame additionally returns every YES-member book and the exact
+pair metadata needed to verify its corresponding NO instrument. Frame revisions bind
+the instrument facts and fee schedule.
+
+Stable fail-closed reasons include `missing_outcome_book`,
+`instrument_facts_incomplete`, `fee_schedule_incomplete`, `unresolved_gap`,
+`token_frame_skew`, `stale_book`, `negative_risk_relation_incomplete`,
+`negative_risk_member_missing`, `negative_risk_frame_skew`,
+`negative_risk_member_stale`, and `negative_risk_member_gap`.
+Group-wide metadata failures additionally use `negative_risk_member_catalog_missing`,
+`negative_risk_member_instrument_facts_incomplete`, and
+`negative_risk_member_fee_schedule_incomplete`.
 
 Events are ordered by a process-independent monotonically increasing cursor and contain
 canonical and raw payloads plus separate hashes. A retained cursor resumes exactly;
@@ -195,3 +225,11 @@ PYTHONPATH=src .venv/bin/python scripts/capture_polymarket_public_data.py \
 - Durable tail/hash/cursor failure: HTTP 409; do not serve a partially replayed state.
 - Corrupt checkpoint/public fact file: explicit integrity error; never serve silently.
 - Missing/ambiguous fee or relation metadata: frame remains `fail_closed`.
+
+## Provider-neutral consumer fixture
+
+`tests/fixtures/polymarket-live-provider-neutral-v2.json` covers one ordinary binary
+market and one three-outcome standard negative-risk group across bootstrap, current
+snapshot, event resume, checkpoint, and expired-cursor recovery. It deliberately
+contains no Gamma/CLOB field names. Provider evidence remains available separately in
+the live event raw payload/hash fields.

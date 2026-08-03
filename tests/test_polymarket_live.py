@@ -52,9 +52,19 @@ def gamma_row(
         "orderPriceMinTickSize": "0.01",
         "orderMinSize": "1",
         "feesEnabled": True,
-        "fee_schedule": {"maker_fee_bps": "0", "taker_fee_bps": "20"},
+        "fee_schedule": {
+            "version": "gamma-test-fee-v1",
+            "currency": "USDC",
+            "maker_rate": "0",
+            "taker_rate": "0.02",
+            "formula": "fee = C * rate * p * (1 - p)",
+            "exponent": "1",
+            "quantum": "0.00001",
+            "effectiveFrom": "2026-08-01T00:00:00Z",
+        },
         "negRisk": neg_risk,
         "negRiskMarketID": "neg-group" if neg_risk else None,
+        "groupItemTitle": f"Outcome {market_id}" if neg_risk else None,
         "updatedAt": "2026-08-03T03:59:00Z",
         "events": [{"id": "event-1"}],
     }
@@ -141,9 +151,13 @@ class PolymarketLiveTest(unittest.TestCase):
             item for item in markets[0].relations
             if item.relation_type == "standard_negative_risk"
         )
-        self.assertEqual(len(relation.members), 4)
+        self.assertEqual(relation.members, sorted(["POLY:" + "0x" + "1" * 64 + ":a", "POLY:" + "0x" + "2" * 64 + ":c"]))
+        self.assertEqual(len(relation.outcome_pairs), 2)
+        self.assertEqual(
+            {item.no_token_id for item in relation.outcome_pairs}, {"b", "d"},
+        )
         self.assertTrue(markets[0].rules.rules_complete)
-        self.assertTrue(markets[0].rules.fee_complete)
+        self.assertTrue(markets[0].rules.fee_schedule.complete)
         changed = [dict(rows[0]), rows[1]]
         changed[0]["updatedAt"] = "2026-08-03T04:01:00Z"
         self.assertNotEqual(
@@ -152,15 +166,92 @@ class PolymarketLiveTest(unittest.TestCase):
         )
         current_fee = gamma_row("m3", "0x" + "3" * 64, ("e", "f"))
         current_fee["fee_schedule"] = {
-            "rate": "0.04", "exponent": "1", "rebateRate": "0.25",
-            "takerOnly": True,
+            **current_fee["fee_schedule"], "taker_rate": "0.04",
         }
         current_fee.pop("takerBaseFee", None)
         market = GammaLiveNormalizer.normalize([current_fee], NOW)[0]
-        self.assertTrue(market.rules.fee_complete)
-        self.assertEqual(market.rules.fee_rate, "0.04")
-        self.assertEqual(market.rules.fee_rounding_mode, "UNSPECIFIED")
-        self.assertEqual(market.rules.fee_calculation_status, "informational_only")
+        self.assertTrue(market.rules.fee_schedule.complete)
+        self.assertEqual(market.rules.fee_schedule.taker_rate, "0.04")
+        self.assertEqual(market.rules.fee_schedule.rounding_mode, "UNSPECIFIED")
+        self.assertEqual(
+            market.rules.fee_schedule.calculation_status, "informational_only",
+        )
+
+    def test_typed_nautilus_facts_have_explicit_source_revisions(self):
+        market = GammaLiveNormalizer.normalize([gamma_row()], NOW)[0]
+        instrument = market.rules.instrument
+        fee = market.rules.fee_schedule
+        self.assertTrue(instrument.complete)
+        self.assertEqual(instrument.settlement_currency, "pUSD")
+        self.assertEqual(instrument.price_increment, "0.01")
+        self.assertEqual(instrument.size_increment, "0.01")
+        self.assertEqual(instrument.minimum_order_size, "1")
+        self.assertEqual(instrument.activation_at, datetime(2026, 8, 1, tzinfo=timezone.utc))
+        self.assertEqual(instrument.expiration_at, datetime(2026, 9, 1, tzinfo=timezone.utc))
+        self.assertEqual(
+            {item.source for item in instrument.provenance},
+            {"polymarket_gamma", "polymarket_docs", "polymarket_sdk"},
+        )
+        provenance = {item.source: item for item in instrument.provenance}
+        self.assertEqual(
+            provenance["polymarket_docs"].source_url,
+            "https://docs.polymarket.com/concepts/pusd",
+        )
+        self.assertEqual(
+            provenance["polymarket_sdk"].revision,
+            "b076b04d61135657e25dccc1bbd6866a96bd8c6e",
+        )
+        self.assertTrue(fee.complete)
+        self.assertEqual(fee.currency, "USDC")
+        self.assertNotEqual(fee.currency, instrument.settlement_currency)
+        self.assertEqual(fee.quantum, "0.00001")
+        self.assertEqual(fee.rounding_mode, "UNSPECIFIED")
+        self.assertEqual(fee.tie_semantics, "unspecified")
+        self.assertEqual(fee.calculation_status, "informational_only")
+        mapping = {
+            outcome.instrument_id: (outcome.token_id, outcome.outcome)
+            for outcome in market.identity.outcomes
+        }
+        self.assertEqual(len(mapping), 2)
+        self.assertEqual({value[0] for value in mapping.values()}, {"yes-1", "no-1"})
+
+    def test_missing_source_facts_remain_explicit_and_fail_closed(self):
+        row = gamma_row()
+        row.pop("startDate")
+        row.pop("orderPriceMinTickSize")
+        row["fee_schedule"].pop("taker_rate")
+        market = GammaLiveNormalizer.normalize([row], NOW)[0]
+        self.assertEqual(
+            market.rules.instrument.missing_fields,
+            ["activation_at", "price_increment"],
+        )
+        self.assertEqual(
+            market.rules.fee_schedule.missing_fields, ["taker_rate"],
+        )
+        store = self.store([row])
+        store.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        store.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        frame = store.frame("m1", now=NOW)
+        self.assertEqual(frame.status, "fail_closed")
+        self.assertIn("instrument_facts_incomplete", frame.reason_codes)
+        self.assertIn("fee_schedule_incomplete", frame.reason_codes)
+
+    def test_legacy_gamma_bps_is_exactly_normalized_with_official_fee_facts(self):
+        row = gamma_row()
+        row["fee_schedule"] = {
+            "maker_fee_bps": "0", "taker_fee_bps": "20",
+        }
+        fee = GammaLiveNormalizer.normalize([row], NOW)[0].rules.fee_schedule
+        self.assertTrue(fee.complete)
+        self.assertEqual(fee.maker_rate, "0")
+        self.assertEqual(fee.taker_rate, "0.002")
+        self.assertEqual(fee.currency, "USDC")
+        self.assertEqual(fee.exponent, "1")
+        self.assertEqual(fee.quantum, "0.00001")
+        self.assertEqual(
+            {item.source for item in fee.provenance},
+            {"polymarket_gamma", "polymarket_docs"},
+        )
 
     def test_catalog_raw_revisions_are_immutable_and_verified_on_restart(self):
         rows = [gamma_row()]
@@ -245,6 +336,10 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(store.catalog["m1"].lifecycle_state, "resolved")
         self.assertEqual(store.catalog["m1"].resolution, "Yes")
         self.assertEqual(store.token_to_market, {})
+        self.assertTrue(all(
+            relation.valid_to is not None
+            for relation in store.catalog["m1"].relations
+        ))
         store.replace_catalog([], [])
         self.assertIn("m1", store.catalog)
         self.assertEqual(store.catalog["m1"].lifecycle_state, "resolved")
@@ -296,7 +391,129 @@ class PolymarketLiveTest(unittest.TestCase):
             store.apply_snapshot(snapshot(token, bid, ask), received_at=NOW)
         frame = store.frame("m1", now=NOW)
         self.assertEqual(frame.status, "ready")
-        self.assertEqual(len(frame.relation_tokens), 4)
+        self.assertEqual(len(frame.relation_tokens), 2)
+        self.assertEqual(
+            {item.yes_token_id for item in frame.relation_pairs}, {"a", "c"},
+        )
+
+    def test_three_outcome_negative_risk_relation_is_yes_only_and_reversible(self):
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),
+            gamma_row("m2", "0x" + "2" * 64, ("c", "d"), neg_risk=True),
+            gamma_row("m3", "0x" + "3" * 64, ("e", "f"), neg_risk=True),
+        ]
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        relation = next(
+            item for item in markets[0].relations
+            if item.relation_type == "standard_negative_risk"
+        )
+        self.assertTrue(relation.complete)
+        self.assertEqual(len(relation.members), 3)
+        self.assertEqual(
+            relation.members,
+            sorted(item.yes_instrument_id for item in relation.outcome_pairs),
+        )
+        self.assertEqual(
+            {item.yes_token_id for item in relation.outcome_pairs}, {"a", "c", "e"},
+        )
+        self.assertEqual(
+            {item.no_token_id for item in relation.outcome_pairs}, {"b", "d", "f"},
+        )
+        store = self.store(rows)
+        for token, bid, ask in (
+            ("a", "0.20", "0.22"), ("b", "0.78", "0.80"),
+            ("c", "0.30", "0.32"), ("d", "0.68", "0.70"),
+            ("e", "0.40", "0.42"), ("f", "0.58", "0.60"),
+        ):
+            store.apply_snapshot(snapshot(token, bid, ask), received_at=NOW)
+        frame = store.frame("m1", now=NOW)
+        self.assertEqual(frame.status, "ready")
+        self.assertEqual({item.token_id for item in frame.relation_tokens}, {"a", "c", "e"})
+        self.assertEqual(len(frame.relation_pairs), 3)
+
+    def test_ambiguous_negative_risk_pair_metadata_fails_closed(self):
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),
+            gamma_row("m2", "0x" + "2" * 64, ("c", "d"), neg_risk=True),
+            gamma_row("m3", "0x" + "3" * 64, ("e", "f"), neg_risk=True),
+        ]
+        rows[1].pop("groupItemTitle")
+        store = self.store(rows)
+        for token, bid, ask in (
+            ("a", "0.20", "0.22"), ("b", "0.78", "0.80"),
+            ("c", "0.30", "0.32"), ("d", "0.68", "0.70"),
+            ("e", "0.40", "0.42"), ("f", "0.58", "0.60"),
+        ):
+            store.apply_snapshot(snapshot(token, bid, ask), received_at=NOW)
+        frame = store.frame("m1", now=NOW)
+        self.assertEqual(frame.status, "fail_closed")
+        self.assertIn("negative_risk_relation_incomplete", frame.reason_codes)
+
+    def test_negative_risk_member_business_fact_gap_fails_whole_group_closed(self):
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),
+            gamma_row("m2", "0x" + "2" * 64, ("c", "d"), neg_risk=True),
+            gamma_row("m3", "0x" + "3" * 64, ("e", "f"), neg_risk=True),
+        ]
+        rows[1].pop("orderMinSize")
+        rows[2]["fee_schedule"].pop("taker_rate")
+        store = self.store(rows)
+        for token, bid, ask in (
+            ("a", "0.20", "0.22"), ("b", "0.78", "0.80"),
+            ("c", "0.30", "0.32"), ("d", "0.68", "0.70"),
+            ("e", "0.40", "0.42"), ("f", "0.58", "0.60"),
+        ):
+            store.apply_snapshot(snapshot(token, bid, ask), received_at=NOW)
+        frame = store.frame("m1", now=NOW)
+        self.assertEqual(frame.status, "fail_closed")
+        self.assertIn(
+            "negative_risk_member_instrument_facts_incomplete",
+            frame.reason_codes,
+        )
+        self.assertIn(
+            "negative_risk_member_fee_schedule_incomplete", frame.reason_codes,
+        )
+
+    def test_full_catalog_refresh_expands_negative_risk_group_and_subscriptions(self):
+        first = [
+            gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),
+            gamma_row("m2", "0x" + "2" * 64, ("c", "d"), neg_risk=True),
+        ]
+        store = self.store(first)
+        old_revision = store.catalog_revision
+        planner = SubscriptionPlanner()
+        planner.initial_messages(store.token_to_market)
+        expanded = [
+            *first,
+            gamma_row("m3", "0x" + "3" * 64, ("e", "f"), neg_risk=True),
+        ]
+        store.replace_catalog(GammaLiveNormalizer.normalize(expanded, NOW), expanded)
+        messages = planner.update_messages(store.token_to_market)
+        self.assertNotEqual(store.catalog_revision, old_revision)
+        self.assertEqual(messages[0]["operation"], "subscribe")
+        self.assertEqual(messages[0]["assets_ids"], ["e", "f"])
+        relation = next(
+            item for item in store.catalog["m1"].relations
+            if item.relation_type == "standard_negative_risk"
+        )
+        self.assertEqual(len(relation.outcome_pairs), 3)
+        expanded_relation_revision = relation.revision
+        store.apply_websocket({
+            "event_type": "market_resolved",
+            "market": "0x" + "3" * 64,
+            "winning_asset_id": "e",
+            "winning_outcome": "Yes",
+            "timestamp": "1785739201000",
+        }, received_at=NOW)
+        store.replace_catalog(GammaLiveNormalizer.normalize(first, NOW), first)
+        self.assertNotIn("e", store.token_to_market)
+        self.assertNotIn("f", store.token_to_market)
+        relation = next(
+            item for item in store.catalog["m1"].relations
+            if item.relation_type == "standard_negative_risk"
+        )
+        self.assertEqual(len(relation.outcome_pairs), 2)
+        self.assertNotEqual(relation.revision, expanded_relation_revision)
 
     def test_resume_cursor_expiry_and_long_stability_bound(self):
         store = self.store(capacity=10)
@@ -337,6 +554,34 @@ class PolymarketLiveTest(unittest.TestCase):
         ).lower()
         for prohibited in ("pmdata", "domeapi", "polymarketdata"):
             self.assertNotIn(prohibited, body)
+
+    def test_provider_neutral_consumer_fixture_covers_complete_resume_flow(self):
+        fixture = json.loads(Path(
+            "tests/fixtures/polymarket-live-provider-neutral-v2.json"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(fixture["schema_version"], "marketcow.polymarket.live.v2")
+        ordinary, negative = fixture["bootstrap"]["markets"]
+        self.assertEqual(len(ordinary["outcomes"]), 2)
+        self.assertEqual(ordinary["settlement_currency"], "pUSD")
+        self.assertEqual(ordinary["size_increment"], "0.01")
+        self.assertEqual(ordinary["fee_schedule"]["quantum"], "0.00001")
+        relation = negative["negative_risk_relation"]
+        self.assertEqual(len(relation["members"]), 3)
+        self.assertEqual(len(relation["outcome_pairs"]), 3)
+        self.assertEqual(
+            relation["members"],
+            sorted(item["yes_instrument_id"] for item in relation["outcome_pairs"]),
+        )
+        self.assertEqual(
+            fixture["snapshot"]["negative_risk_frame"]["pair_count"], 3,
+        )
+        self.assertEqual(fixture["events"]["request"]["after_cursor"], 9)
+        self.assertEqual(
+            fixture["checkpoint_resume"]["resume_request"]["after_cursor"], 11,
+        )
+        serialized = json.dumps(fixture, sort_keys=True).casefold()
+        for provider_field in ("clobtokenids", "negriskmarketid", "groupitemtitle"):
+            self.assertNotIn(provider_field, serialized)
 
     def test_public_data_decimal_profile_and_semantic_boundary(self):
         rows = [{
@@ -440,6 +685,13 @@ class PolymarketLiveTest(unittest.TestCase):
             ]
             self.assertIn("application/json", response_schema)
             self.assertTrue(response_schema["application/json"]["schema"])
+        schemas = openapi["components"]["schemas"]
+        self.assertIn("LiveInstrumentFacts", schemas)
+        self.assertIn("LiveFeeSchedule", schemas)
+        self.assertIn("LiveOutcomePair", schemas)
+        self.assertIn("relation_pairs", schemas["MarketFrame"]["properties"])
+        self.assertIn("instrument_revision", schemas["MarketFrame"]["properties"])
+        self.assertIn("fee_schedule_id", schemas["MarketFrame"]["properties"])
         facts_path.write_bytes(facts_path.read_bytes() + b" ")
         tampered = client.get(
             "/v1/prediction-markets/polymarket/live/public-data/trades"

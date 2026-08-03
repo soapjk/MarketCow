@@ -1,6 +1,6 @@
 # Polymarket live local-candidate quality report
 
-Date: 2026-08-03. Baseline: MarketCow `12fd4cd`.
+Date: 2026-08-03. Baseline: MarketCow `743fdd1`.
 
 ## Delivered scope
 
@@ -16,6 +16,8 @@ Date: 2026-08-03. Baseline: MarketCow `12fd4cd`.
 - Seven versioned, OpenAPI-discoverable Tradude read paths.
 - A single-writer/durable-tail reader boundary, so a running FastAPI process sees
   collector writes without restart.
+- Breaking `marketcow.polymarket.live.v2` Nautilus facts, complete typed fee schedules,
+  and YES-only standard negative-risk relations with reversible YES/NO pairs.
 
 ## Explicit limits
 
@@ -37,6 +39,11 @@ books that are absent or ambiguous stop frame readiness.
 | Dynamic subscriptions | deterministic shards and subscribe/unsubscribe diff |
 | Lifecycle | content revisions plus `new_market`/`market_resolved` catalog invalidation |
 | Binary/negative-risk | two-token frame plus all relation-member requirement |
+| Nautilus bootstrap | typed currency/time/price-size/minimum facts and reversible identity |
+| Typed fees | ID/version/currency/rates/formula/exponent/quantum/rounding/effective provenance |
+| Negative-risk solver | YES-only member set plus explicit YES/NO outcome pairs |
+| Missing business facts | named incomplete fields and stable fail-closed reason codes |
+| Consumer fixture | binary + three-outcome negative-risk bootstrap/snapshot/resume flow |
 | Recovery | disconnect gap, full `/books`, new epoch, checkpoint and post-checkpoint replay |
 | Cross-process visibility | API starts first; separate writer adds catalog/books; all live reads update |
 | Failed-event durability | checkpoint, invalid/missing/out-of-order event, restart remains fail closed |

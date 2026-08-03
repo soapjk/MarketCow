@@ -1234,7 +1234,7 @@ def create_app(
         _sync_polymarket_live()
         return {
             "contract_version": "marketcow.prediction_market.v1",
-            "schema_version": "marketcow.polymarket.live-bootstrap.v1",
+            "schema_version": "marketcow.polymarket.live-bootstrap.v2",
             "catalog_revision": polymarket_live.catalog_revision,
             "catalog_source": polymarket_live.catalog_source,
             "cursor": polymarket_live.cursor,
@@ -1273,7 +1273,7 @@ def create_app(
                 "market_id": str(exc.args[0]),
             }) from exc
         return {
-            "schema_version": "marketcow.polymarket.live-snapshot.v1",
+            "schema_version": "marketcow.polymarket.live-snapshot.v2",
             "catalog_revision": polymarket_live.catalog_revision,
             "cursor": polymarket_live.cursor,
             "count": len(frames),
@@ -1299,7 +1299,7 @@ def create_app(
             }) from exc
         next_cursor = items[-1].cursor if items else after_cursor
         return {
-            "schema_version": "marketcow.polymarket.live-events.v1",
+            "schema_version": "marketcow.polymarket.live-events.v2",
             "after_cursor": after_cursor,
             "next_cursor": next_cursor,
             "has_more": has_more,
@@ -1336,7 +1336,7 @@ def create_app(
             if not unresolved_only or not item.resolved
         ]
         return {
-            "schema_version": "marketcow.polymarket.live-gaps.v1",
+            "schema_version": "marketcow.polymarket.live-gaps.v2",
             "count": len(gaps),
             "items": [item.model_dump(mode="json") for item in gaps],
         }

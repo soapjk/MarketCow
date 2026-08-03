@@ -30,8 +30,17 @@ from .polymarket_history import _validate_book
 from .polymarket_sources import _atomic_write, utc_now
 
 
-LIVE_SCHEMA_VERSION = "marketcow.polymarket.live.v1"
+LIVE_SCHEMA_VERSION = "marketcow.polymarket.live.v2"
 PUBLIC_DATA_KINDS = frozenset({"trades", "activity", "positions", "holders"})
+SETTLEMENT_CURRENCY = "pUSD"
+SIZE_INCREMENT = "0.01"
+SETTLEMENT_SOURCE_URL = "https://docs.polymarket.com/concepts/pusd"
+FEE_SOURCE_URL = "https://docs.polymarket.com/trading/fees"
+SIZE_INCREMENT_SOURCE_URL = (
+    "https://github.com/Polymarket/py-clob-client/blob/"
+    "b076b04d61135657e25dccc1bbd6866a96bd8c6e/"
+    "py_clob_client/order_builder/constants.py"
+)
 
 
 def _instant(value: Any) -> datetime:
@@ -66,6 +75,11 @@ def _bool(value: Any) -> bool:
     return bool(value)
 
 
+def _bps_rate(value: Any, field: str) -> str:
+    bps = Decimal(decimal_text(value, field))
+    return format(bps / Decimal("10000"), "f")
+
+
 def _levels(value: Any, field: str) -> list[dict[str, str]]:
     levels = []
     for item in value or []:
@@ -91,49 +105,174 @@ def _state_checksum(token_id: str, tick_size: str, bids: dict[str, str], asks: d
     })
 
 
+class LiveFactProvenance(BaseModel):
+    source: Literal["polymarket_gamma", "polymarket_docs", "polymarket_sdk"]
+    revision: str
+    source_url: str
+    observed_at: datetime
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    field_paths: list[str] = Field(min_length=1)
+
+
+class LiveInstrumentFacts(BaseModel):
+    facts_version: Literal["marketcow.polymarket.live-instrument-facts.v1"] = (
+        "marketcow.polymarket.live-instrument-facts.v1"
+    )
+    revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    settlement_currency: str | None = None
+    activation_at: datetime | None = None
+    expiration_at: datetime | None = None
+    price_increment: str | None = None
+    size_increment: str | None = None
+    minimum_order_size: str | None = None
+    provenance: list[LiveFactProvenance] = Field(min_length=1)
+    missing_fields: list[str] = Field(default_factory=list)
+    complete: bool
+
+    @model_validator(mode="after")
+    def complete_nautilus_facts(self):
+        for field in ("price_increment", "size_increment", "minimum_order_size"):
+            value = getattr(self, field)
+            if value is not None:
+                setattr(self, field, decimal_text(value, field, allow_zero=False))
+        required = {
+            "settlement_currency": self.settlement_currency,
+            "activation_at": self.activation_at,
+            "expiration_at": self.expiration_at,
+            "price_increment": self.price_increment,
+            "size_increment": self.size_increment,
+            "minimum_order_size": self.minimum_order_size,
+        }
+        missing = sorted(name for name, value in required.items() if value is None)
+        if self.activation_at and self.expiration_at and self.activation_at >= self.expiration_at:
+            missing.append("activation_expiration_interval")
+        if sorted(set(self.missing_fields)) != sorted(set(missing)):
+            raise ValueError("instrument missing_fields must describe the typed facts")
+        if self.complete != (not missing):
+            raise ValueError("instrument completeness disagrees with typed facts")
+        return self
+
+
+class LiveFeeSchedule(BaseModel):
+    schedule_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schedule_version: str
+    currency: str | None = None
+    maker_rate: str | None = None
+    taker_rate: str | None = None
+    formula: str | None = None
+    exponent: str | None = None
+    quantum: str | None = None
+    rounding_mode: Literal[
+        "ROUND_DOWN", "ROUND_HALF_EVEN", "ROUND_HALF_UP", "UNSPECIFIED"
+    ] = "UNSPECIFIED"
+    tie_semantics: Literal[
+        "toward_zero", "ties_to_even", "ties_away_from_zero", "unspecified"
+    ] = "unspecified"
+    calculation_status: Literal["executable_pnl", "informational_only"] = (
+        "informational_only"
+    )
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
+    provenance: list[LiveFactProvenance] = Field(min_length=1)
+    missing_fields: list[str] = Field(default_factory=list)
+    complete: bool
+
+    @model_validator(mode="after")
+    def typed_schedule(self):
+        for field in ("maker_rate", "taker_rate", "exponent", "quantum"):
+            value = getattr(self, field)
+            if value is not None:
+                setattr(
+                    self, field,
+                    decimal_text(value, field, allow_zero=field != "quantum"),
+                )
+        expected_ties = {
+            "ROUND_DOWN": "toward_zero",
+            "ROUND_HALF_EVEN": "ties_to_even",
+            "ROUND_HALF_UP": "ties_away_from_zero",
+            "UNSPECIFIED": "unspecified",
+        }
+        if self.tie_semantics != expected_ties[self.rounding_mode]:
+            raise ValueError("fee rounding mode and tie semantics disagree")
+        if self.calculation_status == "executable_pnl" and self.rounding_mode == "UNSPECIFIED":
+            raise ValueError("executable PnL requires deterministic fee rounding")
+        required = {
+            "currency": self.currency,
+            "maker_rate": self.maker_rate,
+            "taker_rate": self.taker_rate,
+            "formula": self.formula,
+            "exponent": self.exponent,
+            "quantum": self.quantum,
+            "effective_from": self.effective_from,
+        }
+        missing = sorted(name for name, value in required.items() if value is None)
+        if self.effective_from and self.effective_to and self.effective_from >= self.effective_to:
+            missing.append("effective_interval")
+        if sorted(set(self.missing_fields)) != sorted(set(missing)):
+            raise ValueError("fee missing_fields must describe the typed schedule")
+        if self.complete != (not missing):
+            raise ValueError("fee completeness disagrees with typed schedule")
+        return self
+
+
 class LiveRuleSet(BaseModel):
-    tick_size: str
-    minimum_order_size: str
-    maker_fee_bps: str | None = None
-    taker_fee_bps: str | None = None
-    fee_rate: str | None = None
-    fee_exponent: str | None = None
-    fee_rebate_rate: str | None = None
-    fee_taker_only: bool | None = None
-    fee_rounding_mode: Literal["UNSPECIFIED"] = "UNSPECIFIED"
-    fee_calculation_status: Literal["informational_only"] = "informational_only"
-    fee_complete: bool
+    rule_version: str
+    instrument: LiveInstrumentFacts
+    fee_schedule: LiveFeeSchedule
     rules_complete: bool
 
     @model_validator(mode="after")
-    def decimals(self):
-        self.tick_size = decimal_text(self.tick_size, "tick_size", allow_zero=False)
-        self.minimum_order_size = decimal_text(
-            self.minimum_order_size, "minimum_order_size", allow_zero=False
-        )
-        if self.maker_fee_bps is not None:
-            self.maker_fee_bps = decimal_text(self.maker_fee_bps, "maker_fee_bps")
-        if self.taker_fee_bps is not None:
-            self.taker_fee_bps = decimal_text(self.taker_fee_bps, "taker_fee_bps")
-        if self.fee_rate is not None:
-            self.fee_rate = decimal_text(self.fee_rate, "fee_rate")
-        if self.fee_exponent is not None:
-            self.fee_exponent = decimal_text(self.fee_exponent, "fee_exponent")
-        if self.fee_rebate_rate is not None:
-            self.fee_rebate_rate = decimal_text(
-                self.fee_rebate_rate, "fee_rebate_rate"
-            )
+    def completeness(self):
+        if self.rules_complete != self.instrument.complete:
+            raise ValueError("rule completeness must match instrument facts")
         return self
+
+
+class LiveOutcomePair(BaseModel):
+    pair_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pair_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    event_id: str
+    market_id: str
+    condition_id: str
+    outcome_label: str
+    yes_token_id: str
+    yes_instrument_id: str
+    no_token_id: str
+    no_instrument_id: str
+    valid_from: datetime
+    valid_to: datetime | None = None
+    provenance: LiveFactProvenance
 
 
 class LiveRelation(BaseModel):
     relation_id: str
     relation_type: Literal["binary_complements", "standard_negative_risk"]
-    members: list[str] = Field(min_length=2)
+    members: list[str]
     convertible: bool
     revision: str
+    rule_version: str
     valid_from: datetime
+    valid_to: datetime | None = None
     source: Literal["polymarket_gamma"] = "polymarket_gamma"
+    provenance: LiveFactProvenance
+    outcome_pairs: list[LiveOutcomePair] = Field(default_factory=list)
+    missing_fields: list[str] = Field(default_factory=list)
+    complete: bool
+
+    @model_validator(mode="after")
+    def typed_members(self):
+        if len(set(self.members)) != len(self.members):
+            raise ValueError("relation members must be unique")
+        if self.relation_type == "binary_complements":
+            if len(self.members) != 2 or self.outcome_pairs:
+                raise ValueError("binary relation requires exactly two instruments")
+        else:
+            yes_members = [item.yes_instrument_id for item in self.outcome_pairs]
+            if self.members != sorted(set(yes_members)):
+                raise ValueError("negative-risk members must be the explicit YES set")
+            if self.complete != (len(self.outcome_pairs) >= 2 and not self.missing_fields):
+                raise ValueError("negative-risk relation completeness disagrees")
+        return self
 
 
 class LiveMarket(BaseModel):
@@ -161,6 +300,8 @@ class LiveMarket(BaseModel):
             item.relation_type == "standard_negative_risk" for item in self.relations
         ):
             raise ValueError("negative-risk market requires source-backed relation")
+        if self.lifecycle_state == "resolved" and not self.resolution:
+            raise ValueError("resolved live market requires a resolution")
         return self
 
 
@@ -183,7 +324,7 @@ class LiveBook(BaseModel):
 
 class LiveEventEnvelope(BaseModel):
     contract_version: Literal["marketcow.prediction_market.v1"] = CONTRACT_VERSION
-    schema_version: Literal["marketcow.polymarket.live.v1"] = LIVE_SCHEMA_VERSION
+    schema_version: Literal["marketcow.polymarket.live.v2"] = LIVE_SCHEMA_VERSION
     cursor: int = Field(ge=1)
     event_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     event_type: Literal[
@@ -214,8 +355,8 @@ def live_event_identity(event: LiveEventEnvelope) -> str:
 
 
 class LiveCheckpoint(BaseModel):
-    schema_version: Literal["marketcow.polymarket.live-checkpoint.v1"] = (
-        "marketcow.polymarket.live-checkpoint.v1"
+    schema_version: Literal["marketcow.polymarket.live-checkpoint.v2"] = (
+        "marketcow.polymarket.live-checkpoint.v2"
     )
     cursor: int = Field(ge=0)
     catalog_revision: str | None = None
@@ -235,6 +376,9 @@ class MarketFrame(BaseModel):
     tokens: list[LiveBook]
     relation_ids: list[str]
     relation_tokens: list[LiveBook]
+    relation_pairs: list[LiveOutcomePair]
+    instrument_revision: str
+    fee_schedule_id: str
 
 
 class LiveHealth(BaseModel):
@@ -253,8 +397,8 @@ class LiveHealth(BaseModel):
 
 class LiveBootstrapResponse(BaseModel):
     contract_version: Literal["marketcow.prediction_market.v1"] = CONTRACT_VERSION
-    schema_version: Literal["marketcow.polymarket.live-bootstrap.v1"] = (
-        "marketcow.polymarket.live-bootstrap.v1"
+    schema_version: Literal["marketcow.polymarket.live-bootstrap.v2"] = (
+        "marketcow.polymarket.live-bootstrap.v2"
     )
     catalog_revision: str | None
     catalog_source: dict[str, Any] | None
@@ -267,8 +411,8 @@ class LiveBootstrapResponse(BaseModel):
 
 
 class LiveSnapshotPage(BaseModel):
-    schema_version: Literal["marketcow.polymarket.live-snapshot.v1"] = (
-        "marketcow.polymarket.live-snapshot.v1"
+    schema_version: Literal["marketcow.polymarket.live-snapshot.v2"] = (
+        "marketcow.polymarket.live-snapshot.v2"
     )
     catalog_revision: str | None
     cursor: int = Field(ge=0)
@@ -277,8 +421,8 @@ class LiveSnapshotPage(BaseModel):
 
 
 class LiveEventPage(BaseModel):
-    schema_version: Literal["marketcow.polymarket.live-events.v1"] = (
-        "marketcow.polymarket.live-events.v1"
+    schema_version: Literal["marketcow.polymarket.live-events.v2"] = (
+        "marketcow.polymarket.live-events.v2"
     )
     after_cursor: int = Field(ge=0)
     next_cursor: int = Field(ge=0)
@@ -287,8 +431,8 @@ class LiveEventPage(BaseModel):
 
 
 class LiveGapPage(BaseModel):
-    schema_version: Literal["marketcow.polymarket.live-gaps.v1"] = (
-        "marketcow.polymarket.live-gaps.v1"
+    schema_version: Literal["marketcow.polymarket.live-gaps.v2"] = (
+        "marketcow.polymarket.live-gaps.v2"
     )
     count: int = Field(ge=0)
     items: list[GapEntry]
@@ -370,6 +514,17 @@ class GammaLiveNormalizer:
     """Provider boundary for live catalog metadata and explicit relations."""
 
     @staticmethod
+    def _provenance(
+        *, source: str, revision: str, source_url: str,
+        observed_at: datetime, payload: Any, field_paths: list[str],
+    ) -> LiveFactProvenance:
+        return LiveFactProvenance(
+            source=source, revision=revision, source_url=source_url,
+            observed_at=observed_at, payload_sha256=content_sha256(payload),
+            field_paths=field_paths,
+        )
+
+    @staticmethod
     def normalize(rows: list[dict[str, Any]], observed_at: datetime) -> list[LiveMarket]:
         result = []
         for row in rows:
@@ -407,47 +562,144 @@ class GammaLiveNormalizer:
                 "updated_at": row.get("updatedAt") or row.get("updated_at"),
                 "raw_payload_sha256": raw_hash,
             })
+            gamma_provenance = GammaLiveNormalizer._provenance(
+                source="polymarket_gamma", revision=revision,
+                source_url=GammaKeysetCatalog.endpoint, observed_at=observed_at,
+                payload=row, field_paths=[
+                    "conditionId", "clobTokenIds", "outcomes", "events",
+                    "negRisk", "negRiskMarketID",
+                ],
+            )
             relations = [LiveRelation(
                 relation_id=f"binary:{condition_id}",
                 relation_type="binary_complements",
                 members=instruments,
                 convertible=True,
                 revision=revision,
+                rule_version="gamma-binary-complements-v1",
                 valid_from=observed_at,
+                provenance=gamma_provenance,
+                complete=True,
             )]
             if neg_risk:
                 relations.append(LiveRelation(
                     relation_id=f"neg-risk:{neg_risk_id}",
                     relation_type="standard_negative_risk",
-                    members=instruments,
+                    members=[],
                     convertible=True,
                     revision=revision,
+                    rule_version="gamma-standard-negative-risk-v1",
                     valid_from=observed_at,
+                    provenance=gamma_provenance,
+                    missing_fields=["complete_outcome_pairs"],
+                    complete=False,
                 ))
+            start_at = _instant(row["startDate"]) if row.get("startDate") else None
+            end_at = _instant(row["endDate"]) if row.get("endDate") else None
             fee_schedule = row.get("fee_schedule") or row.get("feeSchedule") or {}
-            fee_enabled = row.get("feesEnabled")
-            maker = fee_schedule.get("maker_fee_bps") or fee_schedule.get("makerFeeBps")
-            taker = (
-                fee_schedule.get("taker_fee_bps") or fee_schedule.get("takerFeeBps")
-                or row.get("takerBaseFee") or row.get("taker_base_fee")
+            raw_taker_base_fee = (
+                row.get("takerBaseFee")
+                if row.get("takerBaseFee") is not None
+                else row.get("taker_base_fee")
             )
-            if fee_enabled is False:
-                maker = maker if maker is not None else "0"
-                taker = taker if taker is not None else "0"
-            fee_rate = fee_schedule.get("rate")
-            fee_exponent = fee_schedule.get("exponent")
-            fee_rebate_rate = fee_schedule.get("rebateRate") or fee_schedule.get("rebate_rate")
-            fee_taker_only = fee_schedule.get("takerOnly")
-            if fee_taker_only is None:
-                fee_taker_only = fee_schedule.get("taker_only")
+            fee_source_payload = {
+                "fee_schedule": fee_schedule,
+                "feesEnabled": row.get("feesEnabled"),
+                "takerBaseFee": raw_taker_base_fee,
+            }
+            maker_rate = fee_schedule.get("maker_rate") or fee_schedule.get("makerRate")
+            taker_rate = fee_schedule.get("taker_rate") or fee_schedule.get("takerRate")
+            if maker_rate is None:
+                maker_bps = fee_schedule.get("maker_fee_bps") or fee_schedule.get("makerFeeBps")
+                maker_rate = _bps_rate(maker_bps, "maker_fee_bps") if maker_bps is not None else "0"
+            if taker_rate is None:
+                taker_rate = fee_schedule.get("rate")
+            if taker_rate is None:
+                taker_bps = (
+                    fee_schedule.get("taker_fee_bps")
+                    or fee_schedule.get("takerFeeBps")
+                    or raw_taker_base_fee
+                )
+                if taker_bps is not None:
+                    taker_rate = _bps_rate(taker_bps, "taker_fee_bps")
+            if taker_rate is None and row.get("feesEnabled") is False:
+                taker_rate = "0"
+            fee_currency = fee_schedule.get("currency") or "USDC"
+            fee_formula = fee_schedule.get("formula") or "fee = C * feeRate * p * (1 - p)"
+            fee_exponent = fee_schedule.get("exponent") or "1"
+            fee_quantum = fee_schedule.get("quantum") or "0.00001"
+            fee_version = str(
+                fee_schedule.get("version") or fee_schedule.get("scheduleVersion")
+                or "gamma-plus-polymarket-fees-docs-v1"
+            )
+            effective_from = (
+                _instant(fee_schedule["effectiveFrom"])
+                if fee_schedule.get("effectiveFrom") else start_at
+            )
+            effective_to = (
+                _instant(fee_schedule["effectiveTo"])
+                if fee_schedule.get("effectiveTo") else None
+            )
             tick = row.get("orderPriceMinTickSize") or row.get("minimumTickSize") or row.get("tickSize")
             minimum = row.get("orderMinSize") or row.get("minimumOrderSize")
-            rules_complete = tick is not None and minimum is not None
-            fee_complete = (
-                maker is not None and taker is not None
-            ) or (
-                fee_rate is not None and fee_exponent is not None
-                and fee_taker_only is not None
+            docs_provenance = GammaLiveNormalizer._provenance(
+                source="polymarket_docs", revision="pusd-docs-2026-04-17",
+                source_url=SETTLEMENT_SOURCE_URL, observed_at=observed_at,
+                payload={"settlement_currency": SETTLEMENT_CURRENCY},
+                field_paths=["collateral_token", "settlement_currency"],
+            )
+            sdk_provenance = GammaLiveNormalizer._provenance(
+                source="polymarket_sdk",
+                revision="b076b04d61135657e25dccc1bbd6866a96bd8c6e",
+                source_url=SIZE_INCREMENT_SOURCE_URL, observed_at=observed_at,
+                payload={"size_increment": SIZE_INCREMENT},
+                field_paths=["ROUNDING_CONFIG.*.size"],
+            )
+            instrument_values = {
+                "settlement_currency": SETTLEMENT_CURRENCY,
+                "activation_at": start_at,
+                "expiration_at": end_at,
+                "price_increment": str(tick) if tick is not None else None,
+                "size_increment": SIZE_INCREMENT,
+                "minimum_order_size": str(minimum) if minimum is not None else None,
+            }
+            instrument_missing = sorted(
+                name for name, value in instrument_values.items() if value is None
+            )
+            instrument_revision = content_sha256({
+                "market_revision": revision,
+                "values": {
+                    key: value.isoformat() if isinstance(value, datetime) else value
+                    for key, value in instrument_values.items()
+                },
+                "protocol_revisions": [docs_provenance.revision, sdk_provenance.revision],
+            })
+            fee_values = {
+                "currency": str(fee_currency) if fee_currency is not None else None,
+                "maker_rate": str(maker_rate) if maker_rate is not None else None,
+                "taker_rate": str(taker_rate) if taker_rate is not None else None,
+                "formula": str(fee_formula) if fee_formula is not None else None,
+                "exponent": str(fee_exponent) if fee_exponent is not None else None,
+                "quantum": str(fee_quantum) if fee_quantum is not None else None,
+                "effective_from": effective_from,
+            }
+            fee_missing = sorted(name for name, value in fee_values.items() if value is None)
+            fee_provenance = GammaLiveNormalizer._provenance(
+                source="polymarket_gamma", revision=fee_version,
+                source_url=GammaKeysetCatalog.endpoint, observed_at=observed_at,
+                payload=fee_source_payload,
+                field_paths=["fee_schedule", "feesEnabled", "takerBaseFee"],
+            )
+            fee_docs_provenance = GammaLiveNormalizer._provenance(
+                source="polymarket_docs", revision="trading-fees-docs-v1",
+                source_url=FEE_SOURCE_URL, observed_at=observed_at,
+                payload={
+                    "currency": "USDC", "maker_rate": "0",
+                    "formula": "fee = C * feeRate * p * (1 - p)",
+                    "exponent": "1", "quantum": "0.00001",
+                    "rounding_mode": "UNSPECIFIED",
+                },
+                field_paths=["fee_structure", "fee_precision"],
             )
             closed = bool(row.get("closed"))
             resolution = row.get("resolution")
@@ -461,50 +713,112 @@ class GammaLiveNormalizer:
                 accepting_orders=bool(row.get("acceptingOrders", row.get("accepting_orders", False))),
                 lifecycle_state=lifecycle,
                 resolution=str(resolution) if resolution not in {None, ""} else None,
-                start_at=_instant(row["startDate"]) if row.get("startDate") else None,
-                end_at=_instant(row["endDate"]) if row.get("endDate") else None,
+                start_at=start_at,
+                end_at=end_at,
                 metadata_revision=revision,
                 observed_at=observed_at,
                 rules=LiveRuleSet(
-                    tick_size=str(tick or "1"), minimum_order_size=str(minimum or "1"),
-                    maker_fee_bps=(str(maker) if maker is not None else None),
-                    taker_fee_bps=(str(taker) if taker is not None else None),
-                    fee_rate=(str(fee_rate) if fee_rate is not None else None),
-                    fee_exponent=(str(fee_exponent) if fee_exponent is not None else None),
-                    fee_rebate_rate=(
-                        str(fee_rebate_rate) if fee_rebate_rate is not None else None
+                    rule_version="marketcow-polymarket-live-rules-v1",
+                    instrument=LiveInstrumentFacts(
+                        revision=instrument_revision, **instrument_values,
+                        provenance=[gamma_provenance, docs_provenance, sdk_provenance],
+                        missing_fields=instrument_missing, complete=not instrument_missing,
                     ),
-                    fee_taker_only=(
-                        _bool(fee_taker_only) if fee_taker_only is not None else None
+                    fee_schedule=LiveFeeSchedule(
+                        schedule_id=content_sha256({
+                            "market_id": market_id, "version": fee_version,
+                            "payload": fee_source_payload,
+                        }),
+                        schedule_version=fee_version,
+                        **fee_values,
+                        effective_to=effective_to,
+                        rounding_mode="UNSPECIFIED", tie_semantics="unspecified",
+                        calculation_status="informational_only",
+                        provenance=[fee_provenance, fee_docs_provenance],
+                        missing_fields=fee_missing,
+                        complete=not fee_missing,
                     ),
-                    fee_complete=fee_complete, rules_complete=rules_complete,
+                    rules_complete=not instrument_missing,
                 ),
                 relations=relations,
                 raw_payload_sha256=raw_hash,
             ))
-        neg_risk_groups: dict[str, list[str]] = defaultdict(list)
+        neg_risk_groups: dict[str, list[LiveMarket]] = defaultdict(list)
         for market in result:
             if market.identity.neg_risk and market.identity.neg_risk_market_id:
-                neg_risk_groups[market.identity.neg_risk_market_id].extend(
-                    outcome.instrument_id for outcome in market.identity.outcomes
-                )
+                neg_risk_groups[market.identity.neg_risk_market_id].append(market)
         for market in result:
             group_id = market.identity.neg_risk_market_id
             if not market.identity.neg_risk or not group_id:
                 continue
-            members = sorted(set(neg_risk_groups[group_id]))
+            group = neg_risk_groups[group_id]
+            pairs = []
+            for member_market in group:
+                by_label = {
+                    outcome.outcome.strip().casefold(): outcome
+                    for outcome in member_market.identity.outcomes
+                }
+                label = next((
+                    str(source.get("groupItemTitle") or source.get("group_item_title") or "")
+                    for source in rows
+                    if str(source.get("id") or "") == member_market.identity.market_id
+                ), "")
+                if set(by_label) != {"yes", "no"} or not label:
+                    continue
+                yes, no = by_label["yes"], by_label["no"]
+                pair_payload = {
+                    "event_id": member_market.identity.event_id,
+                    "market_id": member_market.identity.market_id,
+                    "condition_id": member_market.identity.condition_id,
+                    "outcome_label": label,
+                    "yes_token_id": yes.token_id,
+                    "yes_instrument_id": yes.instrument_id,
+                    "no_token_id": no.token_id,
+                    "no_instrument_id": no.instrument_id,
+                }
+                pair_revision = content_sha256({
+                    "pair": pair_payload,
+                    "market_revision": member_market.metadata_revision,
+                })
+                relation_provenance = next(
+                    item.provenance for item in member_market.relations
+                    if item.relation_type == "standard_negative_risk"
+                )
+                pairs.append(LiveOutcomePair(
+                    pair_id=content_sha256({
+                        "neg_risk_market_id": group_id,
+                        "condition_id": member_market.identity.condition_id,
+                    }),
+                    pair_revision=pair_revision, **pair_payload,
+                    valid_from=observed_at, provenance=relation_provenance,
+                ))
+            pairs.sort(key=lambda item: (item.outcome_label, item.market_id))
+            members = sorted({item.yes_instrument_id for item in pairs})
+            missing_fields = []
+            if len(pairs) != len(group):
+                missing_fields.append("complete_outcome_pairs")
+            if len(pairs) < 2:
+                missing_fields.append("mutually_exclusive_yes_member_set")
             relation = next(
                 item for item in market.relations
                 if item.relation_type == "standard_negative_risk"
             )
             relation.members = members
+            relation.outcome_pairs = pairs
+            relation.missing_fields = sorted(set(missing_fields))
+            relation.complete = not relation.missing_fields
             relation.revision = content_sha256({
                 "relation_id": relation.relation_id, "members": members,
+                "outcome_pairs": [item.model_dump(mode="json") for item in pairs],
                 "market_revisions": sorted(
                     item.metadata_revision for item in result
                     if item.identity.neg_risk_market_id == group_id
                 ),
             })
+            relation_index = market.relations.index(relation)
+            market.relations[relation_index] = LiveRelation.model_validate(
+                relation.model_dump(mode="json")
+            )
         return result
 
 
@@ -713,7 +1027,10 @@ class LiveStateStore:
     ) -> LiveEventEnvelope:
         token_id = str(raw.get("asset_id") or raw.get("token_id") or "")
         market = self._market_for_token(token_id)
-        tick = decimal_text(raw.get("tick_size") or market.rules.tick_size, "tick_size", allow_zero=False)
+        tick_value = raw.get("tick_size") or market.rules.instrument.price_increment
+        if tick_value is None:
+            raise ValueError("snapshot lacks source-backed price increment")
+        tick = decimal_text(tick_value, "tick_size", allow_zero=False)
         bids, asks = _levels(raw.get("bids"), "bids"), _levels(raw.get("asks"), "asks")
         state_bids = {item["price"]: item["size"] for item in bids}
         state_asks = {item["price"]: item["size"] for item in asks}
@@ -792,6 +1109,15 @@ class LiveStateStore:
                     "previous_revision": affected.metadata_revision,
                     "market_resolved_raw_sha256": raw_hash,
                 })
+                for relation in affected.relations:
+                    relation.valid_to = exchange
+                    relation.revision = content_sha256({
+                        "previous_revision": relation.revision,
+                        "valid_to": exchange.isoformat(),
+                        "market_resolved_raw_sha256": raw_hash,
+                    })
+                    for pair in relation.outcome_pairs:
+                        pair.valid_to = exchange
                 for outcome in affected.identity.outcomes:
                     self.token_to_market.pop(outcome.token_id, None)
                 canonical.update({
@@ -954,9 +1280,9 @@ class LiveStateStore:
         if len(books) != 2:
             reasons.append("missing_outcome_book")
         if not market.rules.rules_complete:
-            reasons.append("rules_incomplete")
-        if not market.rules.fee_complete:
-            reasons.append("fee_incomplete")
+            reasons.append("instrument_facts_incomplete")
+        if not market.rules.fee_schedule.complete:
+            reasons.append("fee_schedule_incomplete")
         if any(not gap.resolved and gap.token_id in {item.token_id for item in market.identity.outcomes} for gap in self.gaps):
             reasons.append("unresolved_gap")
         current = now or self.now_provider()
@@ -967,12 +1293,29 @@ class LiveStateStore:
             if any((current - item.received_at).total_seconds() * 1000 > self.stale_after_ms for item in books):
                 reasons.append("stale_book")
         relation_ids = [item.relation_id for item in market.relations]
-        relation_token_ids = {
-            instrument.rsplit(":", 1)[-1]
-            for relation in market.relations
+        negative_relations = [
+            relation for relation in market.relations
             if relation.relation_type == "standard_negative_risk"
-            for instrument in relation.members
-        }
+        ]
+        relation_pairs = [
+            pair for relation in negative_relations for pair in relation.outcome_pairs
+        ]
+        relation_token_ids = {pair.yes_token_id for pair in relation_pairs}
+        if any(not relation.complete for relation in negative_relations):
+            reasons.append("negative_risk_relation_incomplete")
+        pair_markets = [self.catalog.get(pair.market_id) for pair in relation_pairs]
+        if any(item is None for item in pair_markets):
+            reasons.append("negative_risk_member_catalog_missing")
+        if any(
+            item is not None and not item.rules.instrument.complete
+            for item in pair_markets
+        ):
+            reasons.append("negative_risk_member_instrument_facts_incomplete")
+        if any(
+            item is not None and not item.rules.fee_schedule.complete
+            for item in pair_markets
+        ):
+            reasons.append("negative_risk_member_fee_schedule_incomplete")
         relation_books = [
             self.books[token_id] for token_id in sorted(relation_token_ids)
             if token_id in self.books
@@ -1003,6 +1346,9 @@ class LiveStateStore:
             status="fail_closed" if reasons else "ready",
             reason_codes=sorted(set(reasons)), tokens=books,
             relation_ids=relation_ids, relation_tokens=relation_books,
+            relation_pairs=relation_pairs,
+            instrument_revision=market.rules.instrument.revision,
+            fee_schedule_id=market.rules.fee_schedule.schedule_id,
         )
 
     def checkpoint_payload(self) -> LiveCheckpoint:
