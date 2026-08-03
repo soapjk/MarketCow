@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -203,6 +204,13 @@ class LiveEventEnvelope(BaseModel):
     raw_payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     applied: bool
     fail_closed_reason: str | None = None
+    gaps: list[GapEntry] = Field(default_factory=list)
+
+
+def live_event_identity(event: LiveEventEnvelope) -> str:
+    payload = event.model_dump(mode="json")
+    payload.pop("event_id", None)
+    return content_sha256(payload)
 
 
 class LiveCheckpoint(BaseModel):
@@ -589,6 +597,12 @@ class LiveStateStore:
         self.cursor = 0
         self.catalog_revision: str | None = None
         self.catalog_source: dict[str, Any] | None = None
+        self._catalog_file_sha256: str | None = None
+        self._checkpoint_file_sha256: str | None = None
+        self._checkpoint_cursor = 0
+        self._event_offset = 0
+        self._last_log_cursor = 0
+        self._sync_lock = threading.RLock()
         self.recover()
 
     def _append(self, value: dict[str, Any]) -> None:
@@ -633,7 +647,9 @@ class LiveStateStore:
         }
         if not self.raw_catalog_path.exists():
             _atomic_write(self.raw_catalog_path, raw_body)
-        _atomic_write(self.catalog_path, canonical_json(payload))
+        catalog_body = canonical_json(payload)
+        _atomic_write(self.catalog_path, catalog_body)
+        self._catalog_file_sha256 = hashlib.sha256(catalog_body).hexdigest()
         changed = sorted(previous_tokens ^ set(self.token_to_market))
         self._emit(
             "catalog_revision", {"catalog_revision": revision, "changed_tokens": changed},
@@ -656,18 +672,15 @@ class LiveStateStore:
         exchange_at: datetime | None = None,
         received_at: datetime | None = None,
         reason: str | None = None,
+        gaps: list[GapEntry] | None = None,
     ) -> LiveEventEnvelope:
         received = received_at or self.now_provider()
         exchange = exchange_at or received
         self.cursor += 1
         raw_hash = content_sha256(raw_payload)
         canonical_hash = content_sha256(canonical_payload)
-        event_id = content_sha256({
-            "cursor": self.cursor, "event_type": event_type,
-            "raw_payload_sha256": raw_hash, "canonical_payload_sha256": canonical_hash,
-        })
         envelope = LiveEventEnvelope(
-            cursor=self.cursor, event_id=event_id, event_type=event_type,
+            cursor=self.cursor, event_id="0" * 64, event_type=event_type,
             market_id=market_id, condition_id=condition_id, token_id=token_id,
             book_epoch=book_epoch, sequence=sequence,
             exchange_at=exchange, received_at=received,
@@ -675,9 +688,13 @@ class LiveStateStore:
             canonical_payload_sha256=canonical_hash,
             raw_payload=raw_payload, raw_payload_sha256=raw_hash,
             applied=applied, fail_closed_reason=reason,
+            gaps=gaps or [],
         )
+        envelope.event_id = live_event_identity(envelope)
         self.events.append(envelope)
         self._append(envelope.model_dump(mode="json"))
+        self._event_offset = self.event_path.stat().st_size
+        self._last_log_cursor = envelope.cursor
         self.seen_raw_hashes.add(raw_hash)
         return envelope
 
@@ -736,10 +753,20 @@ class LiveStateStore:
         received = received_at or self.now_provider()
         exchange = _instant(raw.get("timestamp") or received)
         if raw_hash in self.seen_raw_hashes:
-            self.gaps.append(GapEntry(
+            gap = GapEntry(
                 code="duplicate", observed=raw_hash, event_at=exchange,
                 detected_at=received, resolved=True, resolution="ignored_idempotently",
-            ))
+            )
+            self.gaps.append(gap)
+            safe_type = event_type if event_type in {
+                "book", "price_change", "best_bid_ask", "last_trade_price",
+                "tick_size_change", "new_market", "market_resolved",
+            } else "price_change"
+            self._emit(
+                safe_type, {"ignored": "duplicate"}, raw, applied=False,
+                exchange_at=exchange, received_at=received,
+                reason="duplicate", gaps=[gap],
+            )
             return []
         if event_type == "book":
             return [self.apply_snapshot(raw, received_at=received)]
@@ -804,27 +831,30 @@ class LiveStateStore:
         market = self._market_for_token(token_id)
         previous = self.books.get(token_id)
         if previous is None:
-            self.gaps.append(GapEntry(
+            gap = GapEntry(
                 code="missing_snapshot", token_id=token_id,
                 observed=content_sha256(raw), event_at=exchange, detected_at=received,
-            ))
+            )
+            self.gaps.append(gap)
             return self._emit(
                 event_type, {"requires_snapshot_recovery": True}, raw, applied=False,
                 market_id=market.identity.market_id, condition_id=market.identity.condition_id,
                 token_id=token_id, exchange_at=exchange, received_at=received,
-                reason="missing_snapshot",
+                reason="missing_snapshot", gaps=[gap],
             )
         if exchange < previous.exchange_at:
-            self.gaps.append(GapEntry(
+            gap = GapEntry(
                 code="out_of_order", token_id=token_id,
                 expected=previous.exchange_at.isoformat(), observed=exchange.isoformat(),
                 event_at=exchange, detected_at=received,
-            ))
+            )
+            self.gaps.append(gap)
             return self._emit(
                 event_type, {"ignored": "out_of_order"}, raw, applied=False,
                 market_id=market.identity.market_id, condition_id=market.identity.condition_id,
                 token_id=token_id, book_epoch=previous.book_epoch, sequence=previous.sequence,
                 exchange_at=exchange, received_at=received, reason="out_of_order",
+                gaps=[gap],
             )
         book = previous.model_copy(deep=True)
         book.sequence += 1
@@ -857,15 +887,17 @@ class LiveStateStore:
         try:
             _validate_book({"tick_size": book.tick_size, "bids": bids, "asks": asks})
         except ValueError as exc:
-            self.gaps.append(GapEntry(
+            gap = GapEntry(
                 code="source_mismatch", token_id=token_id, observed=str(exc),
                 event_at=exchange, detected_at=received,
-            ))
+            )
+            self.gaps.append(gap)
             return self._emit(
                 event_type, {"requires_snapshot_recovery": True}, raw, applied=False,
                 market_id=market.identity.market_id, condition_id=market.identity.condition_id,
                 token_id=token_id, book_epoch=previous.book_epoch, sequence=previous.sequence,
                 exchange_at=exchange, received_at=received, reason="invalid_book_update",
+                gaps=[gap],
             )
         book.state_checksum = _state_checksum(token_id, book.tick_size, bids, asks)
         self.books[token_id] = book
@@ -879,12 +911,18 @@ class LiveStateStore:
     def mark_recovery_started(self, reason: str) -> str:
         recovery_id = content_sha256({"cursor": self.cursor, "reason": reason, "at": self.now_provider().isoformat()})
         now = self.now_provider()
+        gaps = []
         for token_id in self.token_to_market:
-            self.gaps.append(GapEntry(
+            gap = GapEntry(
                 code="coverage_gap", token_id=token_id, observed=recovery_id,
                 detected_at=now,
-            ))
-        self._emit("recovery_started", {"recovery_id": recovery_id, "reason": reason}, {}, applied=True)
+            )
+            self.gaps.append(gap)
+            gaps.append(gap)
+        self._emit(
+            "recovery_started", {"recovery_id": recovery_id, "reason": reason}, {},
+            applied=True, gaps=gaps,
+        )
         return recovery_id
 
     def recover_from_books(self, rows: list[dict[str, Any]], recovery_id: str) -> None:
@@ -903,6 +941,7 @@ class LiveStateStore:
                 gap.resolution = f"rest_books_snapshot:{recovery_id}"
         self._emit("recovery_completed", {
             "recovery_id": recovery_id, "recovered_token_count": len(recovered),
+            "recovered_token_ids": sorted(recovered),
         }, {}, applied=True)
         self.checkpoint()
 
@@ -979,70 +1018,250 @@ class LiveStateStore:
 
     def checkpoint(self) -> LiveCheckpoint:
         checkpoint = self.checkpoint_payload()
-        _atomic_write(self.checkpoint_path, canonical_json(checkpoint.model_dump(mode="json")))
+        body = canonical_json(checkpoint.model_dump(mode="json"))
+        _atomic_write(self.checkpoint_path, body)
+        self._checkpoint_file_sha256 = hashlib.sha256(body).hexdigest()
+        self._checkpoint_cursor = checkpoint.cursor
         return checkpoint
 
+    def _load_catalog(self, body: bytes) -> None:
+        payload = json.loads(body, parse_float=str, parse_int=str)
+        markets = [
+            LiveMarket.model_validate(item) for item in payload.get("markets") or []
+        ]
+        observed_revision = content_sha256([
+            market.model_dump(mode="json")
+            for market in sorted(markets, key=lambda item: item.identity.market_id)
+        ])
+        if observed_revision != payload.get("catalog_revision"):
+            raise RuntimeError("live catalog integrity failed")
+        catalog_source = payload.get("catalog_source")
+        raw_path = None
+        if catalog_source:
+            raw_path = Path(catalog_source["raw_path"]).resolve()
+            if not raw_path.is_relative_to(self.raw_catalog_root):
+                raise RuntimeError("live raw catalog escapes local evidence root")
+            if (
+                not raw_path.exists()
+                or hashlib.sha256(raw_path.read_bytes()).hexdigest()
+                != catalog_source.get("raw_payload_sha256")
+            ):
+                raise RuntimeError("live raw catalog integrity failed")
+        self.catalog = {item.identity.market_id: item for item in markets}
+        self.token_to_market = {
+            outcome.token_id: market.identity.market_id
+            for market in markets if market.active and not market.closed
+            for outcome in market.identity.outcomes
+        }
+        self.catalog_revision = payload.get("catalog_revision")
+        self.catalog_source = catalog_source
+        self.raw_catalog_path = raw_path
+        self._catalog_file_sha256 = hashlib.sha256(body).hexdigest()
+
+    @staticmethod
+    def _validate_checkpoint(body: bytes) -> LiveCheckpoint:
+        checkpoint = LiveCheckpoint.model_validate_json(body)
+        state = {
+            "cursor": checkpoint.cursor,
+            "catalog_revision": checkpoint.catalog_revision,
+            "books": {
+                key: value.model_dump(mode="json")
+                for key, value in sorted(checkpoint.books.items())
+            },
+            "unresolved_gaps": [
+                item.model_dump(mode="json") for item in checkpoint.unresolved_gaps
+            ],
+        }
+        if content_sha256(state) != checkpoint.state_sha256:
+            raise RuntimeError("live checkpoint integrity failed")
+        return checkpoint
+
+    @staticmethod
+    def _validate_event(event: LiveEventEnvelope, expected_cursor: int) -> None:
+        if event.cursor != expected_cursor:
+            raise RuntimeError(
+                f"live event cursor discontinuity: expected {expected_cursor}, "
+                f"observed {event.cursor}"
+            )
+        if content_sha256(event.canonical_payload) != event.canonical_payload_sha256:
+            raise RuntimeError("live event canonical payload hash mismatch")
+        if content_sha256(event.raw_payload) != event.raw_payload_sha256:
+            raise RuntimeError("live event raw payload hash mismatch")
+        if live_event_identity(event) != event.event_id:
+            raise RuntimeError("live event identity mismatch")
+
+    def _apply_replayed_event(self, event: LiveEventEnvelope) -> None:
+        existing_gaps = {
+            content_sha256(item.model_dump(mode="json")) for item in self.gaps
+        }
+        for gap in event.gaps:
+            identity = content_sha256(gap.model_dump(mode="json"))
+            if identity not in existing_gaps:
+                self.gaps.append(gap.model_copy(deep=True))
+                existing_gaps.add(identity)
+        if (
+            event.applied and event.token_id
+            and event.event_type in {
+                "book", "price_change", "best_bid_ask",
+                "last_trade_price", "tick_size_change",
+            }
+        ):
+            self.books[event.token_id] = LiveBook.model_validate(
+                event.canonical_payload
+            )
+        if event.event_type == "recovery_completed" and event.applied:
+            recovered = set(
+                event.canonical_payload.get("recovered_token_ids") or []
+            )
+            recovery_id = str(event.canonical_payload.get("recovery_id") or "")
+            for gap in self.gaps:
+                if not gap.resolved and gap.token_id in recovered:
+                    gap.resolved = True
+                    gap.resolution = f"rest_books_snapshot:{recovery_id}"
+        self.cursor = max(self.cursor, event.cursor)
+
+    def _read_all_events(self) -> tuple[list[LiveEventEnvelope], int]:
+        if not self.event_path.exists():
+            return [], 0
+        events = []
+        offset = 0
+        expected = 1
+        with self.event_path.open("rb") as stream:
+            while True:
+                start = stream.tell()
+                line = stream.readline()
+                if not line:
+                    offset = stream.tell()
+                    break
+                if not line.endswith(b"\n"):
+                    offset = start
+                    break
+                try:
+                    event = LiveEventEnvelope.model_validate_json(line)
+                except ValueError as exc:
+                    raise RuntimeError("live event log contains invalid JSON") from exc
+                self._validate_event(event, expected)
+                events.append(event)
+                expected += 1
+                offset = stream.tell()
+        return events, offset
+
+    def _rebuild_from_checkpoint(
+        self,
+        checkpoint: LiveCheckpoint | None,
+        events: list[LiveEventEnvelope],
+    ) -> None:
+        checkpoint_cursor = checkpoint.cursor if checkpoint else 0
+        if checkpoint_cursor and (
+            not events or events[-1].cursor < checkpoint_cursor
+        ):
+            raise RuntimeError("live checkpoint cursor exceeds verified event log")
+        self.books = {}
+        self.gaps = []
+        self.cursor = 0
+        self._checkpoint_cursor = checkpoint_cursor
+        self.events.clear()
+        self.seen_raw_hashes.clear()
+        for event in events:
+            self.events.append(event)
+            self.seen_raw_hashes.add(event.raw_payload_sha256)
+            if event.cursor <= checkpoint_cursor:
+                self._apply_replayed_event(event)
+        if checkpoint:
+            replayed_books = {
+                key: value.model_dump(mode="json")
+                for key, value in sorted(self.books.items())
+            }
+            checkpoint_books = {
+                key: value.model_dump(mode="json")
+                for key, value in sorted(checkpoint.books.items())
+            }
+            if replayed_books != checkpoint_books:
+                raise RuntimeError("live checkpoint books disagree with event replay")
+            replayed_unresolved = sorted(
+                content_sha256(item.model_dump(mode="json"))
+                for item in self.gaps if not item.resolved
+            )
+            checkpoint_unresolved = sorted(
+                content_sha256(item.model_dump(mode="json"))
+                for item in checkpoint.unresolved_gaps
+            )
+            if replayed_unresolved != checkpoint_unresolved:
+                raise RuntimeError("live checkpoint gaps disagree with event replay")
+            self.cursor = checkpoint_cursor
+        for event in events:
+            if event.cursor > checkpoint_cursor:
+                self._apply_replayed_event(event)
+        self._last_log_cursor = events[-1].cursor if events else 0
+
     def recover(self) -> None:
-        if self.catalog_path.exists():
-            payload = json.loads(self.catalog_path.read_text(encoding="utf-8"), parse_float=str, parse_int=str)
-            markets = [LiveMarket.model_validate(item) for item in payload.get("markets") or []]
-            observed_revision = content_sha256([
-                market.model_dump(mode="json")
-                for market in sorted(markets, key=lambda item: item.identity.market_id)
-            ])
-            if observed_revision != payload.get("catalog_revision"):
-                raise RuntimeError("live catalog integrity failed")
-            self.catalog = {item.identity.market_id: item for item in markets}
-            self.token_to_market = {
-                outcome.token_id: market.identity.market_id
-                for market in markets if market.active and not market.closed
-                for outcome in market.identity.outcomes
-            }
-            self.catalog_revision = payload.get("catalog_revision")
-            self.catalog_source = payload.get("catalog_source")
-            if self.catalog_source:
-                self.raw_catalog_path = Path(
-                    self.catalog_source["raw_path"]
-                ).resolve()
-                if not self.raw_catalog_path.is_relative_to(self.raw_catalog_root):
-                    raise RuntimeError("live raw catalog escapes local evidence root")
-                if (
-                    not self.raw_catalog_path.exists()
-                    or hashlib.sha256(self.raw_catalog_path.read_bytes()).hexdigest()
-                    != self.catalog_source.get("raw_payload_sha256")
-                ):
-                    raise RuntimeError("live raw catalog integrity failed")
-        if self.checkpoint_path.exists():
-            checkpoint = LiveCheckpoint.model_validate_json(self.checkpoint_path.read_text())
-            state = {
-                "cursor": checkpoint.cursor, "catalog_revision": checkpoint.catalog_revision,
-                "books": {key: value.model_dump(mode="json") for key, value in sorted(checkpoint.books.items())},
-                "unresolved_gaps": [item.model_dump(mode="json") for item in checkpoint.unresolved_gaps],
-            }
-            if content_sha256(state) != checkpoint.state_sha256:
-                raise RuntimeError("live checkpoint integrity failed")
-            self.cursor = checkpoint.cursor
-            self.books = checkpoint.books
-            self.gaps = checkpoint.unresolved_gaps
-        if self.event_path.exists():
-            checkpoint_cursor = self.cursor
-            for line in self.event_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                event = LiveEventEnvelope.model_validate_json(line)
-                self.seen_raw_hashes.add(event.raw_payload_sha256)
-                self.events.append(event)
-                if (
-                    event.cursor > checkpoint_cursor and event.applied
-                    and event.token_id and event.event_type in {
-                        "book", "price_change", "best_bid_ask",
-                        "last_trade_price", "tick_size_change",
-                    }
-                ):
-                    self.books[event.token_id] = LiveBook.model_validate(
-                        event.canonical_payload
-                    )
-                self.cursor = max(self.cursor, event.cursor)
+        with self._sync_lock:
+            if self.catalog_path.exists():
+                self._load_catalog(self.catalog_path.read_bytes())
+            checkpoint = None
+            if self.checkpoint_path.exists():
+                body = self.checkpoint_path.read_bytes()
+                checkpoint = self._validate_checkpoint(body)
+                self._checkpoint_file_sha256 = hashlib.sha256(body).hexdigest()
+            events, offset = self._read_all_events()
+            self._rebuild_from_checkpoint(checkpoint, events)
+            self._event_offset = offset
+
+    def sync(self) -> None:
+        """Tail a single writer's durable files into this read-side state."""
+        with self._sync_lock:
+            if self.catalog_path.exists():
+                body = self.catalog_path.read_bytes()
+                digest = hashlib.sha256(body).hexdigest()
+                if digest != self._catalog_file_sha256:
+                    self._load_catalog(body)
+
+            checkpoint_changed = False
+            checkpoint = None
+            if self.checkpoint_path.exists():
+                body = self.checkpoint_path.read_bytes()
+                digest = hashlib.sha256(body).hexdigest()
+                if digest != self._checkpoint_file_sha256:
+                    checkpoint = self._validate_checkpoint(body)
+                    self._checkpoint_file_sha256 = digest
+                    checkpoint_changed = True
+
+            if checkpoint_changed:
+                events, offset = self._read_all_events()
+                self._rebuild_from_checkpoint(checkpoint, events)
+                self._event_offset = offset
+                return
+
+            if not self.event_path.exists():
+                return
+            size = self.event_path.stat().st_size
+            if size < self._event_offset:
+                raise RuntimeError("live event log was truncated")
+            if size == self._event_offset:
+                return
+            with self.event_path.open("rb") as stream:
+                stream.seek(self._event_offset)
+                while True:
+                    start = stream.tell()
+                    line = stream.readline()
+                    if not line:
+                        self._event_offset = stream.tell()
+                        break
+                    if not line.endswith(b"\n"):
+                        self._event_offset = start
+                        break
+                    try:
+                        event = LiveEventEnvelope.model_validate_json(line)
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            "live event log contains invalid JSON"
+                        ) from exc
+                    self._validate_event(event, self._last_log_cursor + 1)
+                    self.events.append(event)
+                    self.seen_raw_hashes.add(event.raw_payload_sha256)
+                    self._apply_replayed_event(event)
+                    self._last_log_cursor = event.cursor
+                    self._event_offset = stream.tell()
 
     def events_after(self, cursor: int, limit: int) -> tuple[list[LiveEventEnvelope], bool]:
         if self.events and cursor < self.events[0].cursor - 1:

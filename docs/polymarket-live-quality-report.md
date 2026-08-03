@@ -14,6 +14,8 @@ Date: 2026-08-03. Baseline: MarketCow `12fd4cd`.
 - Public Data API trade/activity/position/holder normalization with profile and privacy
   semantics preserved.
 - Seven versioned, OpenAPI-discoverable Tradude read paths.
+- A single-writer/durable-tail reader boundary, so a running FastAPI process sees
+  collector writes without restart.
 
 ## Explicit limits
 
@@ -36,6 +38,9 @@ books that are absent or ambiguous stop frame readiness.
 | Lifecycle | content revisions plus `new_market`/`market_resolved` catalog invalidation |
 | Binary/negative-risk | two-token frame plus all relation-member requirement |
 | Recovery | disconnect gap, full `/books`, new epoch, checkpoint and post-checkpoint replay |
+| Cross-process visibility | API starts first; separate writer adds catalog/books; all live reads update |
+| Failed-event durability | checkpoint, invalid/missing/out-of-order event, restart remains fail closed |
+| Event integrity | continuous cursor plus full event identity and canonical/raw hash tamper rejection |
 | Book correctness | decimal, tick, checksum, duplicate, out-of-order, crossed update rejection |
 | Resume/retention | cursor pages, `has_more`, expired-cursor failure, bounded replay storage |
 | Long stability | repeated event application with bounded in-memory retention |

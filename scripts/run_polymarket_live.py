@@ -17,7 +17,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Capture free official Polymarket full-market live data locally"
     )
-    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--root", type=Path, required=True,
+        help=(
+            "Must equal the API storage_root/prediction-markets/polymarket-live "
+            "directory so FastAPI can durable-tail collector writes"
+        ),
+    )
     parser.add_argument("--catalog-only", action="store_true")
     parser.add_argument("--bootstrap-only", action="store_true")
     parser.add_argument("--shard-size", type=int, default=500)

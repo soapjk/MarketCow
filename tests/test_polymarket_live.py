@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from marketcow.api import create_app
 from marketcow.config import Settings
+from marketcow.polymarket_contracts import content_sha256
 from marketcow.polymarket_live import (
     ClobBooksClient,
     DataApiPublicClient,
@@ -448,6 +449,158 @@ class PolymarketLiveTest(unittest.TestCase):
             tampered.json()["detail"]["code"],
             "polymarket_public_data_integrity_failed",
         )
+
+    def test_running_api_durable_tails_collector_writes_after_startup(self):
+        settings = Settings(
+            raw_path=self.root / "raw", storage_root=self.root,
+            allowed_root=self.root.parent,
+            postgres_dsn="postgresql://u:p@127.0.0.1/test",
+            clickhouse_password="x", profile="test", port=8793,
+            postgres_schema="test", clickhouse_database="test",
+            clickhouse_spool_path=self.root / "spool",
+        )
+        app = create_app(settings, Service())
+        app.state.polymarket_live.now_provider = lambda: NOW
+        client = TestClient(app)
+        self.assertEqual(
+            client.get(
+                "/v1/prediction-markets/polymarket/live/health"
+            ).json()["book_token_count"],
+            0,
+        )
+
+        writer = LiveStateStore(
+            self.root / "prediction-markets" / "polymarket-live",
+            now_provider=lambda: NOW,
+        )
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+
+        bootstrap = client.get(
+            "/v1/prediction-markets/polymarket/live/bootstrap"
+        ).json()
+        frame = client.get(
+            "/v1/prediction-markets/polymarket/live/snapshot"
+        ).json()
+        events = client.get(
+            "/v1/prediction-markets/polymarket/live/events?after_cursor=0"
+        ).json()
+        health = client.get(
+            "/v1/prediction-markets/polymarket/live/health"
+        ).json()
+        self.assertEqual(len(bootstrap["markets"]), 1)
+        self.assertEqual(frame["items"][0]["status"], "ready")
+        self.assertEqual(len(frame["items"][0]["tokens"]), 2)
+        self.assertEqual(events["next_cursor"], writer.cursor)
+        self.assertEqual(health["book_token_count"], 2)
+        self.assertEqual(health["status"], "ready")
+
+    def test_post_checkpoint_invalid_gap_survives_restart_until_rest_recovery(self):
+        store = self.store()
+        store.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        store.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        store.checkpoint()
+        store.apply_websocket({
+            "event_type": "price_change", "timestamp": "1785739202000",
+            "price_changes": [{
+                "asset_id": "yes-1", "side": "BUY",
+                "price": "0.43", "size": "1",
+            }],
+        }, received_at=NOW)
+        self.assertEqual(store.frame("m1", now=NOW).status, "fail_closed")
+        self.assertEqual(sum(not item.resolved for item in store.gaps), 1)
+
+        restarted = LiveStateStore(
+            self.root / "live", now_provider=lambda: NOW
+        )
+        self.assertEqual(sum(not item.resolved for item in restarted.gaps), 1)
+        frame = restarted.frame("m1", now=NOW)
+        self.assertEqual(frame.status, "fail_closed")
+        self.assertIn("unresolved_gap", frame.reason_codes)
+
+        recovery_id = restarted.mark_recovery_started("integrity_recovery")
+        restarted.recover_from_books([
+            snapshot("yes-1", "0.39", "0.41", "1785739203000"),
+            snapshot("no-1", "0.59", "0.61", "1785739203000"),
+        ], recovery_id)
+        self.assertEqual(sum(not item.resolved for item in restarted.gaps), 0)
+        self.assertEqual(restarted.frame("m1", now=NOW).status, "ready")
+
+    def test_failed_event_types_are_durable_after_checkpoint(self):
+        cases = {
+            "missing_snapshot": {
+                "event_type": "last_trade_price", "asset_id": "yes-1",
+                "timestamp": "1785739201000", "price": "0.41", "size": "1",
+            },
+            "out_of_order": {
+                "event_type": "last_trade_price", "asset_id": "yes-1",
+                "timestamp": "1785739199000", "price": "0.41", "size": "1",
+            },
+        }
+        for name, event in cases.items():
+            with self.subTest(name=name), TemporaryDirectory() as folder:
+                root = Path(folder)
+                store = LiveStateStore(root, now_provider=lambda: NOW)
+                rows = [gamma_row()]
+                store.replace_catalog(
+                    GammaLiveNormalizer.normalize(rows, NOW), rows
+                )
+                if name == "out_of_order":
+                    store.apply_snapshot(
+                        snapshot("yes-1", "0.40", "0.42"), received_at=NOW
+                    )
+                store.checkpoint()
+                store.apply_websocket(event, received_at=NOW)
+                restarted = LiveStateStore(root, now_provider=lambda: NOW)
+                unresolved = [gap for gap in restarted.gaps if not gap.resolved]
+                self.assertEqual(len(unresolved), 1)
+                self.assertEqual(unresolved[0].code, name)
+
+    def test_recovery_rejects_tampered_event_identity_and_payload_hashes(self):
+        mutations = {
+            "canonical": lambda event: event["canonical_payload"].update(
+                {"tampered": True}
+            ),
+            "raw": lambda event: event["raw_payload"].update({"tampered": True}),
+            "event_id": lambda event: event.update({"event_id": "0" * 64}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), TemporaryDirectory() as folder:
+                root = Path(folder)
+                store = LiveStateStore(root, now_provider=lambda: NOW)
+                rows = [gamma_row()]
+                store.replace_catalog(
+                    GammaLiveNormalizer.normalize(rows, NOW), rows
+                )
+                lines = store.event_path.read_text(encoding="utf-8").splitlines()
+                event = json.loads(lines[0])
+                mutate(event)
+                lines[0] = json.dumps(event, separators=(",", ":"))
+                store.event_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "hash mismatch|identity mismatch"):
+                    LiveStateStore(root, now_provider=lambda: NOW)
+
+    def test_self_consistent_but_event_divergent_checkpoint_is_rejected(self):
+        store = self.store()
+        store.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        store.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        store.checkpoint()
+        payload = json.loads(store.checkpoint_path.read_text(encoding="utf-8"))
+        payload["books"]["yes-1"]["last_trade_price"] = "0.99"
+        state = {
+            "cursor": payload["cursor"],
+            "catalog_revision": payload["catalog_revision"],
+            "books": payload["books"],
+            "unresolved_gaps": payload["unresolved_gaps"],
+        }
+        payload["state_sha256"] = content_sha256(state)
+        store.checkpoint_path.write_text(
+            json.dumps(payload, separators=(",", ":")), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(RuntimeError, "books disagree"):
+            LiveStateStore(self.root / "live", now_provider=lambda: NOW)
 
 
 class FakeSocket:

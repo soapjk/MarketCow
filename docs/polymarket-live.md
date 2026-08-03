@@ -124,6 +124,29 @@ Checkpoint is content-addressed and restart recovery replays every complete cano
 book event after the checkpoint. Health reports catalog/token/book coverage, ready frame
 count, lag, gap count, and latest cursor.
 
+### Producer/consumer synchronization
+
+The collector is the single writer. The FastAPI process is a read-side durable tailer;
+both must use the exact same local root:
+
+```text
+<MarketCow storage_root>/prediction-markets/polymarket-live
+```
+
+Before every bootstrap, snapshot, events, checkpoint, health, or gaps response, FastAPI
+checks the atomic catalog/checkpoint identities and tails only complete newly fsynced
+JSONL records. A checkpoint change triggers deterministic rebuild from that checkpoint
+plus its verified successor events. Thus a collector that writes after FastAPI startup
+becomes visible without process restart, shared memory, or polling an upstream source.
+Multiple concurrent collector writers are not supported.
+
+Every event ID covers the entire envelope, including applied/failure semantics and gap
+facts. Recovery separately recomputes canonical and raw payload hashes, enforces a
+continuous cursor, and cross-checks checkpoint books/unresolved gaps against event-log
+replay. Invalid, missing-snapshot, out-of-order, duplicate, and recovery gaps therefore
+survive process restarts. A truncated, reordered, or hash/identity-tampered log produces
+`polymarket_live_integrity_failed` rather than a partially updated API view.
+
 ## Public wallet facts
 
 `DataApiPublicNormalizer` preserves wallet, condition, token, outcome, side, decimal
@@ -141,7 +164,7 @@ only the supplied local storage directory.
 
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/run_polymarket_live.py \
-  --root /absolute/local/path/prediction-markets/polymarket-live
+  --root '<MarketCow storage_root>/prediction-markets/polymarket-live'
 ```
 
 Use `--catalog-only` to validate discovery or `--bootstrap-only` to stop after complete
@@ -169,5 +192,6 @@ PYTHONPATH=src .venv/bin/python scripts/capture_polymarket_public_data.py \
 - WebSocket disconnect: record coverage gap and require a new epoch/full recovery.
 - Rate limit or transient upstream failure: bounded retry/backoff; never synthesize.
 - Cursor outside retention: HTTP 409 and full consumer resynchronization.
+- Durable tail/hash/cursor failure: HTTP 409; do not serve a partially replayed state.
 - Corrupt checkpoint/public fact file: explicit integrity error; never serve silently.
 - Missing/ambiguous fee or relation metadata: frame remains `fail_closed`.

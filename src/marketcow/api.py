@@ -1161,6 +1161,15 @@ def create_app(
                 "message": str(exc),
             }) from exc
 
+    def _sync_polymarket_live() -> None:
+        try:
+            polymarket_live.sync()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={
+                "code": "polymarket_live_integrity_failed",
+                "message": str(exc),
+            }) from exc
+
     @app.get(
         "/v1/prediction-markets/polymarket/datasets/{dataset_id}/bootstrap",
         response_model=PredictionMarketBootstrap,
@@ -1222,6 +1231,7 @@ def create_app(
         summary="Read the provider-neutral Polymarket live catalog and resume contract",
     )
     def polymarket_live_bootstrap():
+        _sync_polymarket_live()
         return {
             "contract_version": "marketcow.prediction_market.v1",
             "schema_version": "marketcow.polymarket.live-bootstrap.v1",
@@ -1253,6 +1263,7 @@ def create_app(
     def polymarket_live_snapshot(
         market_id: list[str] | None = Query(default=None),
     ):
+        _sync_polymarket_live()
         selected = market_id or sorted(set(polymarket_live.token_to_market.values()))
         try:
             frames = [polymarket_live.frame(item) for item in selected]
@@ -1277,6 +1288,7 @@ def create_app(
     def polymarket_live_events(
         after_cursor: int = Query(0, ge=0), limit: int = Query(1000, ge=1, le=10000),
     ):
+        _sync_polymarket_live()
         try:
             items, has_more = polymarket_live.events_after(after_cursor, limit)
         except RuntimeError as exc:
@@ -1300,6 +1312,7 @@ def create_app(
         summary="Read a content-addressed Polymarket live checkpoint",
     )
     def polymarket_live_checkpoint():
+        _sync_polymarket_live()
         return polymarket_live.checkpoint_payload().model_dump(mode="json")
 
     @app.get(
@@ -1308,6 +1321,7 @@ def create_app(
         summary="Read live source coverage, lag, and gap health",
     )
     def polymarket_live_health():
+        _sync_polymarket_live()
         return polymarket_live.health().model_dump(mode="json")
 
     @app.get(
@@ -1316,6 +1330,7 @@ def create_app(
         summary="Read the Polymarket live gap ledger",
     )
     def polymarket_live_gaps(unresolved_only: bool = True):
+        _sync_polymarket_live()
         gaps = [
             item for item in polymarket_live.gaps
             if not unresolved_only or not item.resolved
