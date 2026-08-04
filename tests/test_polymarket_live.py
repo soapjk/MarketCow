@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -127,12 +128,99 @@ class PolymarketLiveTest(unittest.TestCase):
         rows, evidence = GammaKeysetCatalog(
             requester=requester, sleeper=sleeps.append
         ).fetch_all()
+        self.addCleanup(rows.cleanup)
         self.assertEqual(len(rows), 2)
         self.assertEqual(evidence["pages"], 2)
         self.assertTrue(evidence["complete"])
         self.assertNotIn("offset", calls[-1][1])
         self.assertEqual(calls[-1][1]["after_cursor"], "cursor-2")
         self.assertEqual(sleeps, [0.0])
+        self.assertEqual(evidence["retry_count"], 1)
+
+    def test_gamma_keyset_traverses_beyond_1000_pages_until_terminal_cursor(self):
+        page_count = 1005
+        progress = []
+
+        def requester(_url, **kwargs):
+            cursor = kwargs["params"].get("after_cursor")
+            page = int(cursor.split("-")[-1]) + 1 if cursor else 1
+            payload = {
+                "markets": [
+                    {"id": f"m{page:04d}-{offset:03d}"}
+                    for offset in range(100)
+                ],
+            }
+            if page < page_count:
+                payload["next_cursor"] = f"cursor-{page}"
+            return Response(payload)
+
+        rows, evidence = GammaKeysetCatalog(
+            requester=requester, progress=progress.append,
+            progress_every_pages=250,
+        ).fetch_all()
+        self.addCleanup(rows.cleanup)
+        expected_market_count = page_count * 100
+        self.assertEqual(len(rows), expected_market_count)
+        self.assertEqual(sum(1 for _ in rows), expected_market_count)
+        self.assertEqual(evidence["pages"], page_count)
+        self.assertEqual(evidence["market_count"], expected_market_count)
+        self.assertTrue(evidence["complete"])
+        self.assertEqual(evidence["last_cursor"], "cursor-1004")
+        self.assertEqual([item["pages"] for item in progress[:-1]], [250, 500, 750, 1000])
+        self.assertTrue(progress[-1]["complete"])
+
+    def test_gamma_keyset_empty_nonterminal_page_and_repeated_page_fail(self):
+        with self.assertRaisesRegex(RuntimeError, "must be an object"):
+            GammaKeysetCatalog(
+                requester=lambda *_args, **_kwargs: Response([])
+            ).fetch_all()
+        with self.assertRaisesRegex(RuntimeError, "no progress"):
+            GammaKeysetCatalog(requester=lambda *_args, **_kwargs: Response({
+                "markets": [], "next_cursor": "cursor-1",
+            })).fetch_all()
+
+        responses = [
+            Response({"markets": [gamma_row()], "next_cursor": "cursor-1"}),
+            Response({"markets": [gamma_row()], "next_cursor": "cursor-2"}),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "repeated a page"):
+            GammaKeysetCatalog(
+                requester=lambda *_args, **_kwargs: responses.pop(0)
+            ).fetch_all()
+
+    def test_gamma_keyset_retries_are_per_page_and_session_is_reused(self):
+        class Session:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, _url, **kwargs):
+                self.calls += 1
+                page = 1 if "after_cursor" not in kwargs["params"] else 2
+                position = self.calls
+                if position in {1, 4}:
+                    return Response({}, 429, {"Retry-After": "0"})
+                if position in {2, 5}:
+                    return Response({}, 500, {"Retry-After": "0"})
+                return Response({
+                    "markets": [gamma_row(
+                        f"m{page}", f"0x{page:064x}",
+                        (f"yes-{page}", f"no-{page}"),
+                    )],
+                    **({"next_cursor": "cursor-1"} if page == 1 else {}),
+                })
+
+        session = Session()
+        sleeps = []
+        rows, evidence = GammaKeysetCatalog(
+            requester=session.get, sleeper=sleeps.append,
+        ).fetch_all()
+        self.addCleanup(rows.cleanup)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(session.calls, 6)
+        self.assertEqual(evidence["retry_count"], 4)
+        self.assertEqual(sleeps, [0.0, 0.0, 0.0, 0.0])
+        default_catalog = GammaKeysetCatalog()
+        self.assertIs(default_catalog.requester.__self__, default_catalog.session)
 
     def test_gamma_cursor_loop_fails_instead_of_publishing_partial_catalog(self):
         def requester(_url, **_kwargs):
@@ -140,6 +228,55 @@ class PolymarketLiveTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "cursor loop"):
             GammaKeysetCatalog(requester=requester).fetch_all()
+
+    def test_failed_large_refresh_preserves_atomic_catalog_across_restart(self):
+        store = self.store()
+        revision = store.catalog_revision
+        catalog_sha = content_sha256(json.loads(
+            store.catalog_path.read_text(encoding="utf-8")
+        ))
+        responses = [
+            Response({
+                "markets": [gamma_row(
+                    "m2", "0x" + "2" * 64, ("yes-2", "no-2"),
+                )],
+                "next_cursor": "cursor-1",
+            }),
+            Response({}, 500),
+        ]
+        collector = PolymarketLiveCollector(
+            store,
+            GammaKeysetCatalog(
+                requester=lambda *_args, **_kwargs: responses.pop(0),
+                max_retries_per_page=0,
+            ),
+            ClobBooksClient(requester=lambda *_args, **_kwargs: Response([])),
+        )
+        with self.assertRaises(RuntimeError):
+            collector.refresh_catalog()
+        self.assertEqual(store.catalog_revision, revision)
+        self.assertEqual(
+            content_sha256(json.loads(store.catalog_path.read_text(encoding="utf-8"))),
+            catalog_sha,
+        )
+        restarted = LiveStateStore(self.root / "live", now_provider=lambda: NOW)
+        self.assertEqual(restarted.catalog_revision, revision)
+        self.assertEqual(set(restarted.catalog), {"m1"})
+
+    def test_catalog_publish_failure_does_not_mutate_live_in_memory_revision(self):
+        store = self.store()
+        revision = store.catalog_revision
+        rows = [gamma_row("m2", "0x" + "2" * 64, ("yes-2", "no-2"))]
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        with patch(
+            "marketcow.polymarket_live._atomic_write_catalog",
+            side_effect=OSError("simulated atomic catalog write failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated"):
+                store.replace_catalog(markets, rows)
+        self.assertEqual(store.catalog_revision, revision)
+        self.assertEqual(set(store.catalog), {"m1"})
+        self.assertEqual(set(store.token_to_market), {"yes-1", "no-1"})
 
     def test_gamma_normalization_relations_and_metadata_versions(self):
         rows = [
@@ -265,6 +402,14 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertTrue(second.exists())
         second.write_bytes(second.read_bytes() + b" ")
         with self.assertRaisesRegex(RuntimeError, "raw catalog integrity"):
+            LiveStateStore(self.root / "live", now_provider=lambda: NOW)
+
+    def test_normalized_catalog_jsonl_is_hash_verified_on_restart(self):
+        store = self.store()
+        manifest = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+        normalized = Path(manifest["normalized_catalog"]["path"])
+        normalized.write_bytes(normalized.read_bytes() + b"{}\n")
+        with self.assertRaisesRegex(RuntimeError, "normalized live catalog integrity"):
             LiveStateStore(self.root / "live", now_provider=lambda: NOW)
 
     def test_subscription_sharding_and_dynamic_diff(self):
@@ -548,6 +693,29 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(len(shards), 4)
         self.assertTrue(all(len(item["assets_ids"]) == 500 for item in shards))
 
+    def test_current_scale_token_planning_and_books_batches_remain_bounded(self):
+        # Upper bound from the 2026-08-04 real traversal: 126,981 rows × 2 tokens.
+        token_count = 253_962
+        tokens = [f"token-{index:06d}" for index in range(token_count)]
+        shards = SubscriptionPlanner(shard_size=500).shards(tokens)
+        self.assertEqual(len(shards), 508)
+        self.assertTrue(all(len(item) <= 500 for item in shards))
+        groups = SubscriptionPlanner(shard_size=500).connection_groups(tokens, 32)
+        self.assertEqual(len(groups), 32)
+        self.assertEqual({token for group in groups for token in group}, set(tokens))
+        self.assertLessEqual(max(map(len, groups)) - min(map(len, groups)), 500)
+        batch_sizes = []
+
+        def requester(_url, **kwargs):
+            batch_sizes.append(len(kwargs["json"]))
+            return Response([])
+
+        rows = ClobBooksClient(requester=requester, batch_size=500).fetch(tokens)
+        self.assertEqual(rows, [])
+        self.assertEqual(len(batch_sizes), 508)
+        self.assertEqual(sum(batch_sizes), token_count)
+        self.assertTrue(all(size <= 500 for size in batch_sizes))
+
     def test_live_module_has_no_commercial_or_trial_provider_dependency(self):
         body = Path("src/marketcow/polymarket_live.py").read_text(
             encoding="utf-8"
@@ -638,6 +806,26 @@ class PolymarketLiveTest(unittest.TestCase):
         rows = ClobBooksClient(requester=requester, batch_size=2).fetch(["a", "b", "c"])
         self.assertEqual(len(rows), 3)
         self.assertEqual([len(batch) for batch in batches], [2, 1])
+
+    def test_clob_books_retries_and_reports_complete_coverage(self):
+        responses = [
+            Response({}, 429, {"Retry-After": "0"}),
+            Response({}, 500, {"Retry-After": "0"}),
+            Response([snapshot("a", "0.40", "0.42")]),
+        ]
+        sleeps = []
+        progress = []
+        client = ClobBooksClient(
+            requester=lambda *_args, **_kwargs: responses.pop(0),
+            sleeper=sleeps.append, progress=progress.append,
+        )
+        rows = client.fetch(["a"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(sleeps, [0.0, 0.0])
+        self.assertEqual(client.last_evidence["retry_count"], 2)
+        self.assertEqual(client.last_evidence["requested_token_count"], 1)
+        self.assertEqual(client.last_evidence["received_book_count"], 1)
+        self.assertTrue(progress[-1]["complete"])
 
     def test_api_contract_openapi_events_frames_health_and_public_facts(self):
         settings = Settings(
@@ -882,6 +1070,28 @@ class SocketContext:
 
 
 class PolymarketLiveCollectorTest(unittest.TestCase):
+    def test_large_subscription_group_uses_bounded_connections_and_messages(self):
+        with TemporaryDirectory() as folder:
+            socket = FakeSocket([])
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+                connector=lambda _url: SocketContext(socket),
+                shard_size=500,
+                max_websocket_connections=32,
+            )
+            tokens = [f"token-{index}" for index in range(1001)]
+            asyncio.run(collector._consume(tokens, message_limit=0))
+            messages = [json.loads(item) for item in socket.sent]
+            self.assertEqual(len(messages), 3)
+            self.assertEqual(messages[0]["type"], "market")
+            self.assertTrue(all(len(item["assets_ids"]) <= 500 for item in messages))
+            self.assertEqual(
+                {token for item in messages for token in item["assets_ids"]},
+                set(tokens),
+            )
+
     def test_public_websocket_subscription_ping_and_message(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)

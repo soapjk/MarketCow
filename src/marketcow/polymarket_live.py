@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
+import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -32,6 +35,7 @@ from .polymarket_sources import _atomic_write, utc_now
 
 LIVE_SCHEMA_VERSION = "marketcow.polymarket.live.v2"
 PUBLIC_DATA_KINDS = frozenset({"trades", "activity", "positions", "holders"})
+LOGGER = logging.getLogger(__name__)
 SETTLEMENT_CURRENCY = "pUSD"
 SIZE_INCREMENT = "0.01"
 SETTLEMENT_SOURCE_URL = "https://docs.polymarket.com/concepts/pusd"
@@ -103,6 +107,89 @@ def _state_checksum(token_id: str, tick_size: str, bids: dict[str, str], asks: d
             for price in sorted(asks, key=Decimal)
         ],
     })
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _atomic_copy(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as output:
+            temporary = Path(output.name)
+            with source.open("rb") as input_stream:
+                shutil.copyfileobj(input_stream, output, length=1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _market_sequence_sha256(markets: list[LiveMarket]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    for index, market in enumerate(markets):
+        if index:
+            digest.update(b",")
+        digest.update(canonical_json(market.model_dump(mode="json")))
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def _atomic_write_catalog(
+    path: Path,
+    *,
+    revision: str,
+    markets: list[LiveMarket],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_root = path.parent / "catalogs"
+    normalized_root.mkdir(parents=True, exist_ok=True)
+    normalized_path = normalized_root / f"{revision}.jsonl"
+    normalized_hasher = hashlib.sha256()
+    for market in markets:
+        normalized_hasher.update(
+            canonical_json(market.model_dump(mode="json")) + b"\n"
+        )
+    expected_normalized_sha256 = normalized_hasher.hexdigest()
+    temporary = None
+    if not normalized_path.exists():
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=normalized_root, delete=False,
+            ) as stream:
+                temporary = Path(stream.name)
+                for market in markets:
+                    stream.write(canonical_json(market.model_dump(mode="json")) + b"\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, normalized_path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    if _file_sha256(normalized_path) != expected_normalized_sha256:
+        raise RuntimeError("normalized live catalog integrity failed before publication")
+    normalized = {
+        "format": "canonical_jsonl",
+        "market_count": len(markets),
+        "path": str(normalized_path),
+        "sha256": expected_normalized_sha256,
+    }
+    _atomic_write(path, canonical_json({
+        "catalog_revision": revision,
+        "catalog_source": source,
+        "normalized_catalog": normalized,
+        "schema_version": LIVE_SCHEMA_VERSION,
+    }))
+    return normalized
 
 
 class LiveFactProvenance(BaseModel):
@@ -447,6 +534,27 @@ class PublicDataPage(BaseModel):
     items: list[dict[str, Any]]
 
 
+class GammaCatalogRows:
+    """One complete disk-backed Gamma snapshot; iteration keeps memory page-bounded."""
+
+    def __init__(self, path: Path, *, row_count: int, sha256: str):
+        self.path = path.resolve()
+        self.row_count = row_count
+        self.sha256 = sha256
+
+    def __len__(self) -> int:
+        return self.row_count
+
+    def __iter__(self):
+        with self.path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip():
+                    yield json.loads(line, parse_float=str, parse_int=str)
+
+    def cleanup(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
 class GammaKeysetCatalog:
     """Complete active-market discovery using Gamma's keyset endpoint."""
 
@@ -455,59 +563,154 @@ class GammaKeysetCatalog:
     def __init__(
         self,
         *,
-        requester: Callable[..., Any] = requests.get,
+        requester: Callable[..., Any] | None = None,
+        session: requests.Session | None = None,
         timeout: float = 20,
         page_limit: int = 100,
-        max_pages: int = 1000,
+        max_retries_per_page: int = 5,
+        progress_every_pages: int = 25,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        spool_root: Path | None = None,
         sleeper: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ):
-        self.requester = requester
+        self.session = session or requests.Session()
+        self.requester = requester or self.session.get
         self.timeout = timeout
         self.page_limit = min(100, max(1, page_limit))
-        self.max_pages = max(1, max_pages)
+        self.max_retries_per_page = max(0, max_retries_per_page)
+        self.progress_every_pages = max(1, progress_every_pages)
+        self.progress = progress or self._log_progress
+        self.spool_root = spool_root.resolve() if spool_root else None
         self.sleeper = sleeper
+        self.clock = clock
 
-    def fetch_all(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
+    @staticmethod
+    def _log_progress(evidence: dict[str, Any]) -> None:
+        LOGGER.info(
+            "gamma_catalog_progress pages=%s markets=%s elapsed_seconds=%.3f retries=%s cursor=%s",
+            evidence["pages"], evidence["market_count"], evidence["elapsed_seconds"],
+            evidence["retry_count"], evidence["last_cursor"],
+        )
+
+    def fetch_all(self) -> tuple[GammaCatalogRows, dict[str, Any]]:
+        if self.spool_root:
+            self.spool_root.mkdir(parents=True, exist_ok=True)
+        file_descriptor, spool_name = tempfile.mkstemp(
+            prefix="marketcow-gamma-catalog-", suffix=".jsonl",
+            dir=self.spool_root,
+        )
+        spool_path = Path(spool_name)
+        index_path = spool_path.with_suffix(".sqlite3")
         cursor: str | None = None
-        seen: set[str] = set()
-        attempts = 0
-        for page_number in range(1, self.max_pages + 1):
-            params: dict[str, Any] = {
-                "limit": self.page_limit, "closed": "false", "ascending": "true",
-            }
-            if cursor:
-                params["after_cursor"] = cursor
-            while True:
-                response = self.requester(
-                    self.endpoint, params=params, timeout=self.timeout,
-                    headers={"Accept": "application/json", "User-Agent": "MarketCow/0.2"},
-                )
-                if response.status_code != 429 and response.status_code < 500:
-                    break
-                attempts += 1
-                if attempts > 5:
+        page_number = 0
+        market_count = 0
+        retry_count = 0
+        started = self.clock()
+        raw_hasher = hashlib.sha256()
+        try:
+            with os.fdopen(file_descriptor, "wb") as spool, sqlite3.connect(index_path) as index:
+                index.execute("CREATE TABLE market_ids (value TEXT PRIMARY KEY)")
+                index.execute("CREATE TABLE cursors (value TEXT PRIMARY KEY)")
+                index.execute("CREATE TABLE page_hashes (value TEXT PRIMARY KEY)")
+                while True:
+                    page_number += 1
+                    params: dict[str, Any] = {
+                        "limit": self.page_limit,
+                        "closed": "false",
+                        "ascending": "true",
+                    }
+                    if cursor:
+                        params["after_cursor"] = cursor
+                    attempts = 0
+                    while True:
+                        response = self.requester(
+                            self.endpoint, params=params, timeout=self.timeout,
+                            headers={
+                                "Accept": "application/json",
+                                "User-Agent": "MarketCow/0.2",
+                            },
+                        )
+                        if response.status_code != 429 and response.status_code < 500:
+                            break
+                        if attempts >= self.max_retries_per_page:
+                            response.raise_for_status()
+                        attempts += 1
+                        retry_count += 1
+                        retry_after = min(
+                            8.0,
+                            float(response.headers.get("Retry-After") or 2 ** (attempts - 1)),
+                        )
+                        self.sleeper(retry_after)
                     response.raise_for_status()
-                retry_after = min(8.0, float(response.headers.get("Retry-After") or 2 ** (attempts - 1)))
-                self.sleeper(retry_after)
-            response.raise_for_status()
-            payload = json.loads(response.text, parse_float=str, parse_int=str)
-            page = payload.get("markets") or []
-            if not isinstance(page, list):
-                raise RuntimeError("Gamma keyset response markets must be a list")
-            rows.extend(page)
-            next_cursor = payload.get("next_cursor")
-            if not next_cursor:
-                return rows, {
-                    "pages": page_number, "market_count": len(rows),
-                    "complete": True, "last_cursor": cursor,
-                }
-            next_cursor = str(next_cursor)
-            if next_cursor in seen:
-                raise RuntimeError("Gamma keyset cursor loop detected")
-            seen.add(next_cursor)
-            cursor = next_cursor
-        raise RuntimeError("Gamma keyset pagination exceeded max_pages")
+                    payload = json.loads(response.text, parse_float=str, parse_int=str)
+                    if not isinstance(payload, dict):
+                        raise RuntimeError("Gamma keyset response must be an object")
+                    page = payload.get("markets")
+                    if not isinstance(page, list):
+                        raise RuntimeError("Gamma keyset response markets must be a list")
+                    next_cursor_value = payload.get("next_cursor")
+                    if next_cursor_value and str(next_cursor_value) == cursor:
+                        raise RuntimeError("Gamma keyset cursor loop: cursor did not advance")
+                    if not page and next_cursor_value:
+                        raise RuntimeError("Gamma keyset made no progress before terminal cursor")
+                    page_hash = content_sha256(page)
+                    try:
+                        index.execute("INSERT INTO page_hashes VALUES (?)", (page_hash,))
+                    except sqlite3.IntegrityError as exc:
+                        raise RuntimeError("Gamma keyset repeated a page without progress") from exc
+                    for row in page:
+                        market_id = str(row.get("id") or "")
+                        if not market_id:
+                            raise RuntimeError("Gamma keyset market lacks an id")
+                        try:
+                            index.execute("INSERT INTO market_ids VALUES (?)", (market_id,))
+                        except sqlite3.IntegrityError as exc:
+                            raise RuntimeError(
+                                f"Gamma keyset repeated market id {market_id}"
+                            ) from exc
+                        line = canonical_json(row) + b"\n"
+                        spool.write(line)
+                        raw_hasher.update(line)
+                        market_count += 1
+                    index.commit()
+                    elapsed = self.clock() - started
+                    if page_number % self.progress_every_pages == 0:
+                        self.progress({
+                            "pages": page_number, "market_count": market_count,
+                            "elapsed_seconds": elapsed, "retry_count": retry_count,
+                            "last_cursor": cursor, "complete": False,
+                        })
+                    if not next_cursor_value:
+                        spool.flush()
+                        os.fsync(spool.fileno())
+                        evidence = {
+                            "pages": page_number, "market_count": market_count,
+                            "complete": True, "last_cursor": cursor,
+                            "elapsed_seconds": elapsed, "retry_count": retry_count,
+                            "raw_payload_sha256": raw_hasher.hexdigest(),
+                            "raw_byte_size": spool.tell(),
+                            "http_connection_reuse": isinstance(
+                                getattr(self.requester, "__self__", None), requests.Session
+                            ),
+                        }
+                        self.progress(evidence)
+                        return GammaCatalogRows(
+                            spool_path, row_count=market_count,
+                            sha256=raw_hasher.hexdigest(),
+                        ), evidence
+                    next_cursor = str(next_cursor_value)
+                    try:
+                        index.execute("INSERT INTO cursors VALUES (?)", (next_cursor,))
+                        index.commit()
+                    except sqlite3.IntegrityError as exc:
+                        raise RuntimeError("Gamma keyset cursor loop detected") from exc
+                    cursor = next_cursor
+        except BaseException:
+            spool_path.unlink(missing_ok=True)
+            raise
+        finally:
+            index_path.unlink(missing_ok=True)
 
 
 class GammaLiveNormalizer:
@@ -525,8 +728,9 @@ class GammaLiveNormalizer:
         )
 
     @staticmethod
-    def normalize(rows: list[dict[str, Any]], observed_at: datetime) -> list[LiveMarket]:
+    def normalize(rows: Iterable[dict[str, Any]], observed_at: datetime) -> list[LiveMarket]:
         result = []
+        pair_labels: dict[str, str] = {}
         for row in rows:
             tokens = _list(row.get("clobTokenIds") or row.get("clob_token_ids"))
             outcomes = _list(row.get("outcomes"))
@@ -536,6 +740,9 @@ class GammaLiveNormalizer:
             market_id = str(row.get("id") or "")
             if not condition_id or not market_id:
                 continue
+            pair_labels[market_id] = str(
+                row.get("groupItemTitle") or row.get("group_item_title") or ""
+            )
             event = (row.get("events") or [{}])[0]
             event_id = str(row.get("event_id") or event.get("id") or market_id)
             instruments = [f"POLY:{condition_id}:{token}" for token in tokens]
@@ -758,11 +965,7 @@ class GammaLiveNormalizer:
                     outcome.outcome.strip().casefold(): outcome
                     for outcome in member_market.identity.outcomes
                 }
-                label = next((
-                    str(source.get("groupItemTitle") or source.get("group_item_title") or "")
-                    for source in rows
-                    if str(source.get("id") or "") == member_market.identity.market_id
-                ), "")
+                label = pair_labels.get(member_market.identity.market_id, "")
                 if set(by_label) != {"yes", "no"} or not label:
                     continue
                 yes, no = by_label["yes"], by_label["no"]
@@ -825,26 +1028,94 @@ class GammaLiveNormalizer:
 class ClobBooksClient:
     endpoint = "https://clob.polymarket.com/books"
 
-    def __init__(self, *, requester: Callable[..., Any] = requests.post, timeout: float = 20, batch_size: int = 500):
-        self.requester = requester
+    def __init__(
+        self,
+        *,
+        requester: Callable[..., Any] | None = None,
+        session: requests.Session | None = None,
+        timeout: float = 20,
+        batch_size: int = 500,
+        max_retries_per_batch: int = 5,
+        progress_every_batches: int = 25,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.session = session or requests.Session()
+        self.requester = requester or self.session.post
         self.timeout = timeout
-        self.batch_size = max(1, batch_size)
+        self.batch_size = min(500, max(1, batch_size))
+        self.max_retries_per_batch = max(0, max_retries_per_batch)
+        self.progress_every_batches = max(1, progress_every_batches)
+        self.progress = progress or self._log_progress
+        self.sleeper = sleeper
+        self.clock = clock
+        self.last_evidence: dict[str, Any] | None = None
+
+    @staticmethod
+    def _log_progress(evidence: dict[str, Any]) -> None:
+        LOGGER.info(
+            "clob_books_progress batches=%s/%s requested=%s received=%s elapsed_seconds=%.3f retries=%s",
+            evidence["batches"], evidence["batch_count"],
+            evidence["requested_token_count"], evidence["received_book_count"],
+            evidence["elapsed_seconds"], evidence["retry_count"],
+        )
 
     def fetch(self, token_ids: Iterable[str]) -> list[dict[str, Any]]:
         tokens = list(dict.fromkeys(str(item) for item in token_ids))
         rows = []
-        for start in range(0, len(tokens), self.batch_size):
-            response = self.requester(
-                self.endpoint,
-                json=[{"token_id": token} for token in tokens[start:start + self.batch_size]],
-                timeout=self.timeout,
-                headers={"Content-Type": "application/json", "User-Agent": "MarketCow/0.2"},
-            )
+        batch_count = (len(tokens) + self.batch_size - 1) // self.batch_size
+        retry_count = 0
+        started = self.clock()
+        for batch_number, start in enumerate(
+            range(0, len(tokens), self.batch_size), start=1,
+        ):
+            request_body = [
+                {"token_id": token}
+                for token in tokens[start:start + self.batch_size]
+            ]
+            attempts = 0
+            while True:
+                response = self.requester(
+                    self.endpoint, json=request_body, timeout=self.timeout,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "MarketCow/0.2",
+                    },
+                )
+                if response.status_code != 429 and response.status_code < 500:
+                    break
+                if attempts >= self.max_retries_per_batch:
+                    response.raise_for_status()
+                attempts += 1
+                retry_count += 1
+                retry_after = min(
+                    8.0,
+                    float(response.headers.get("Retry-After") or 2 ** (attempts - 1)),
+                )
+                self.sleeper(retry_after)
             response.raise_for_status()
             payload = json.loads(response.text, parse_float=str, parse_int=str)
             if not isinstance(payload, list):
                 raise RuntimeError("CLOB /books response must be a list")
             rows.extend(payload)
+            evidence = {
+                "batches": batch_number, "batch_count": batch_count,
+                "requested_token_count": len(tokens),
+                "received_book_count": len(rows),
+                "elapsed_seconds": self.clock() - started,
+                "retry_count": retry_count,
+                "complete": batch_number == batch_count,
+            }
+            if evidence["complete"] or batch_number % self.progress_every_batches == 0:
+                self.progress(evidence)
+        self.last_evidence = {
+            "batches": batch_count, "batch_count": batch_count,
+            "requested_token_count": len(tokens),
+            "received_book_count": len(rows),
+            "elapsed_seconds": self.clock() - started,
+            "retry_count": retry_count, "complete": True,
+        }
         return rows
 
 
@@ -858,6 +1129,18 @@ class SubscriptionPlanner:
     def shards(self, tokens: Iterable[str]) -> list[list[str]]:
         ordered = sorted(set(tokens))
         return [ordered[index:index + self.shard_size] for index in range(0, len(ordered), self.shard_size)]
+
+    def connection_groups(
+        self, tokens: Iterable[str], max_connections: int,
+    ) -> list[list[str]]:
+        shards = self.shards(tokens)
+        connection_count = min(max(1, max_connections), len(shards))
+        if not connection_count:
+            return []
+        groups: list[list[str]] = [[] for _ in range(connection_count)]
+        for index, shard in enumerate(shards):
+            groups[index % connection_count].extend(shard)
+        return groups
 
     def initial_messages(self, tokens: Iterable[str]) -> list[dict[str, Any]]:
         self.current = set(tokens)
@@ -897,6 +1180,7 @@ class LiveStateStore:
         self.checkpoint_path = self.root / "checkpoint.json"
         self.catalog_path = self.root / "catalog.json"
         self.raw_catalog_root = self.root / "raw" / "gamma-catalog"
+        self.normalized_catalog_root = self.root / "catalogs"
         self.raw_catalog_path: Path | None = None
         self.replay_capacity = max(1, replay_capacity)
         self.max_frame_skew_ms = max(0, max_frame_skew_ms)
@@ -926,50 +1210,83 @@ class LiveStateStore:
             stream.flush()
             os.fsync(stream.fileno())
 
-    def replace_catalog(self, markets: list[LiveMarket], raw_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def replace_catalog(
+        self,
+        markets: list[LiveMarket],
+        raw_rows: Iterable[dict[str, Any]] | GammaCatalogRows,
+    ) -> dict[str, Any]:
         by_id = {market.identity.market_id: market for market in markets}
         for market_id, previous in self.catalog.items():
             if market_id not in by_id and previous.lifecycle_state == "resolved":
                 by_id[market_id] = previous
         markets = list(by_id.values())
-        revision = content_sha256([
-            market.model_dump(mode="json") for market in sorted(markets, key=lambda item: item.identity.market_id)
-        ])
+        markets.sort(key=lambda item: item.identity.market_id)
+        revision = _market_sequence_sha256(markets)
         previous_tokens = set(self.token_to_market)
-        self.catalog = by_id
-        self.token_to_market = {
+        next_token_to_market = {
             outcome.token_id: market.identity.market_id
             for market in markets if market.active and not market.closed
             for outcome in market.identity.outcomes
         }
-        self.catalog_revision = revision
-        raw_body = canonical_json(raw_rows)
-        raw_sha256 = hashlib.sha256(raw_body).hexdigest()
-        self.raw_catalog_path = self.raw_catalog_root / f"{raw_sha256}.json"
-        self.catalog_source = {
+        if isinstance(raw_rows, GammaCatalogRows):
+            raw_sha256 = raw_rows.sha256
+            raw_format = "canonical_jsonl"
+            raw_suffix = ".jsonl"
+            raw_market_count = len(raw_rows)
+        else:
+            raw_rows = list(raw_rows)
+            raw_body = canonical_json(raw_rows)
+            raw_sha256 = hashlib.sha256(raw_body).hexdigest()
+            raw_format = "canonical_json_array"
+            raw_suffix = ".json"
+            raw_market_count = len(raw_rows)
+        next_raw_catalog_path = self.raw_catalog_root / f"{raw_sha256}{raw_suffix}"
+        next_catalog_source = {
             "source": "polymarket_gamma",
             "source_url": GammaKeysetCatalog.endpoint,
             "observed_at": self.now_provider().astimezone(timezone.utc).isoformat(),
             "raw_payload_sha256": raw_sha256,
-            "raw_path": str(self.raw_catalog_path),
+            "raw_path": str(next_raw_catalog_path),
+            "raw_format": raw_format,
+            "market_count": raw_market_count,
         }
-        payload = {
-            "schema_version": LIVE_SCHEMA_VERSION,
-            "catalog_revision": revision,
-            "markets": [market.model_dump(mode="json") for market in markets],
-            "catalog_source": self.catalog_source,
-        }
-        if not self.raw_catalog_path.exists():
-            _atomic_write(self.raw_catalog_path, raw_body)
-        catalog_body = canonical_json(payload)
-        _atomic_write(self.catalog_path, catalog_body)
-        self._catalog_file_sha256 = hashlib.sha256(catalog_body).hexdigest()
-        changed = sorted(previous_tokens ^ set(self.token_to_market))
-        self._emit(
-            "catalog_revision", {"catalog_revision": revision, "changed_tokens": changed},
-            {"markets": raw_rows}, applied=True,
+        if not next_raw_catalog_path.exists():
+            if isinstance(raw_rows, GammaCatalogRows):
+                _atomic_copy(raw_rows.path, next_raw_catalog_path)
+            else:
+                _atomic_write(next_raw_catalog_path, raw_body)
+        if _file_sha256(next_raw_catalog_path) != raw_sha256:
+            raise RuntimeError("live raw catalog integrity failed before publication")
+        _atomic_write_catalog(
+            self.catalog_path, revision=revision, markets=markets,
+            source=next_catalog_source,
         )
-        return {"catalog_revision": revision, "changed_tokens": changed}
+        self.catalog = by_id
+        self.token_to_market = next_token_to_market
+        self.catalog_revision = revision
+        self.raw_catalog_path = next_raw_catalog_path
+        self.catalog_source = next_catalog_source
+        self._catalog_file_sha256 = _file_sha256(self.catalog_path)
+        next_tokens = set(next_token_to_market)
+        added_tokens = sorted(next_tokens - previous_tokens)
+        removed_tokens = sorted(previous_tokens - next_tokens)
+        token_changes = {
+            "added_count": len(added_tokens),
+            "removed_count": len(removed_tokens),
+            "added_sha256": content_sha256(added_tokens),
+            "removed_sha256": content_sha256(removed_tokens),
+            "requires_bootstrap": True,
+        }
+        self._emit(
+            "catalog_revision",
+            {"catalog_revision": revision, "token_changes": token_changes},
+            {
+                "catalog_source": self.catalog_source,
+                "market_count": raw_market_count,
+            },
+            applied=True,
+        )
+        return {"catalog_revision": revision, "token_changes": token_changes}
 
     def _emit(
         self,
@@ -1370,15 +1687,29 @@ class LiveStateStore:
         self._checkpoint_cursor = checkpoint.cursor
         return checkpoint
 
-    def _load_catalog(self, body: bytes) -> None:
-        payload = json.loads(body, parse_float=str, parse_int=str)
-        markets = [
-            LiveMarket.model_validate(item) for item in payload.get("markets") or []
-        ]
-        observed_revision = content_sha256([
-            market.model_dump(mode="json")
-            for market in sorted(markets, key=lambda item: item.identity.market_id)
-        ])
+    def _load_catalog(self, path: Path) -> None:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream, parse_float=str, parse_int=str)
+        normalized = payload.get("normalized_catalog")
+        if not isinstance(normalized, dict):
+            raise RuntimeError("live catalog lacks normalized JSONL metadata")
+        normalized_path = Path(str(normalized.get("path") or "")).resolve()
+        if not normalized_path.is_relative_to(self.normalized_catalog_root):
+            raise RuntimeError("normalized live catalog escapes local storage root")
+        if (
+            not normalized_path.exists()
+            or _file_sha256(normalized_path) != normalized.get("sha256")
+        ):
+            raise RuntimeError("normalized live catalog integrity failed")
+        markets = []
+        with normalized_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip():
+                    markets.append(LiveMarket.model_validate_json(line))
+        if len(markets) != int(normalized.get("market_count") or -1):
+            raise RuntimeError("normalized live catalog row count mismatch")
+        markets.sort(key=lambda item: item.identity.market_id)
+        observed_revision = _market_sequence_sha256(markets)
         if observed_revision != payload.get("catalog_revision"):
             raise RuntimeError("live catalog integrity failed")
         catalog_source = payload.get("catalog_source")
@@ -1389,8 +1720,7 @@ class LiveStateStore:
                 raise RuntimeError("live raw catalog escapes local evidence root")
             if (
                 not raw_path.exists()
-                or hashlib.sha256(raw_path.read_bytes()).hexdigest()
-                != catalog_source.get("raw_payload_sha256")
+                or _file_sha256(raw_path) != catalog_source.get("raw_payload_sha256")
             ):
                 raise RuntimeError("live raw catalog integrity failed")
         self.catalog = {item.identity.market_id: item for item in markets}
@@ -1402,7 +1732,7 @@ class LiveStateStore:
         self.catalog_revision = payload.get("catalog_revision")
         self.catalog_source = catalog_source
         self.raw_catalog_path = raw_path
-        self._catalog_file_sha256 = hashlib.sha256(body).hexdigest()
+        self._catalog_file_sha256 = _file_sha256(path)
 
     @staticmethod
     def _validate_checkpoint(body: bytes) -> LiveCheckpoint:
@@ -1543,7 +1873,7 @@ class LiveStateStore:
     def recover(self) -> None:
         with self._sync_lock:
             if self.catalog_path.exists():
-                self._load_catalog(self.catalog_path.read_bytes())
+                self._load_catalog(self.catalog_path)
             checkpoint = None
             if self.checkpoint_path.exists():
                 body = self.checkpoint_path.read_bytes()
@@ -1557,10 +1887,9 @@ class LiveStateStore:
         """Tail a single writer's durable files into this read-side state."""
         with self._sync_lock:
             if self.catalog_path.exists():
-                body = self.catalog_path.read_bytes()
-                digest = hashlib.sha256(body).hexdigest()
+                digest = _file_sha256(self.catalog_path)
                 if digest != self._catalog_file_sha256:
-                    self._load_catalog(body)
+                    self._load_catalog(self.catalog_path)
 
             checkpoint_changed = False
             checkpoint = None
@@ -1740,6 +2069,7 @@ class PolymarketLiveCollector:
         *,
         connector: Callable[..., Any] = websockets.connect,
         shard_size: int = 500,
+        max_websocket_connections: int = 32,
         heartbeat_seconds: float = 10,
         reconnect_seconds: float = 1,
     ):
@@ -1748,6 +2078,7 @@ class PolymarketLiveCollector:
         self.books_client = books
         self.connector = connector
         self.planner = SubscriptionPlanner(shard_size)
+        self.max_websocket_connections = max(1, max_websocket_connections)
         self.heartbeat_seconds = max(0.01, heartbeat_seconds)
         self.reconnect_seconds = max(0.0, reconnect_seconds)
         self.sockets: list[Any] = []
@@ -1755,9 +2086,20 @@ class PolymarketLiveCollector:
 
     def refresh_catalog(self) -> dict[str, Any]:
         rows, evidence = self.catalog_client.fetch_all()
-        markets = GammaLiveNormalizer.normalize(rows, self.store.now_provider())
-        update = self.store.replace_catalog(markets, rows)
-        return {**evidence, **update, "active_token_count": len(self.store.token_to_market)}
+        publish_started = time.monotonic()
+        try:
+            markets = GammaLiveNormalizer.normalize(rows, self.store.now_provider())
+            update = self.store.replace_catalog(markets, rows)
+        finally:
+            rows.cleanup()
+        result = {
+            **evidence, **update,
+            "normalized_market_count": len(markets),
+            "active_token_count": len(self.store.token_to_market),
+            "publish_elapsed_seconds": time.monotonic() - publish_started,
+        }
+        LOGGER.info("gamma_catalog_published %s", result)
+        return result
 
     async def bootstrap_books(self, reason: str = "startup") -> str:
         recovery_id = self.store.mark_recovery_started(reason)
@@ -1765,6 +2107,11 @@ class PolymarketLiveCollector:
             self.books_client.fetch, sorted(self.store.token_to_market)
         )
         self.store.recover_from_books(rows, recovery_id)
+        LOGGER.info(
+            "clob_books_recovery_complete recovery_id=%s evidence=%s health=%s",
+            recovery_id, self.books_client.last_evidence,
+            self.store.health().model_dump(mode="json"),
+        )
         return recovery_id
 
     async def update_subscriptions(self) -> list[dict[str, Any]]:
@@ -1781,28 +2128,42 @@ class PolymarketLiveCollector:
                 }, separators=(",", ":")))
             self.socket_tokens.setdefault(socket, set()).difference_update(owned_removed)
         owned = set().union(*(self.socket_tokens.values() or [set()]))
+        additions: dict[Any, list[str]] = defaultdict(list)
         for token_id in sorted(desired - owned):
-            socket = min(self.sockets, key=lambda item: len(self.socket_tokens.get(item, set())))
-            await socket.send(json.dumps({
-                "assets_ids": [token_id], "operation": "subscribe",
-                "custom_feature_enabled": True,
-            }, separators=(",", ":")))
-            self.socket_tokens.setdefault(socket, set()).add(token_id)
+            socket = min(
+                self.sockets,
+                key=lambda item: len(self.socket_tokens.get(item, set()))
+                + len(additions[item]),
+            )
+            additions[socket].append(token_id)
+        for socket, token_ids in additions.items():
+            for shard in self.planner.shards(token_ids):
+                await socket.send(json.dumps({
+                    "assets_ids": shard, "operation": "subscribe",
+                    "custom_feature_enabled": True,
+                }, separators=(",", ":")))
+            self.socket_tokens.setdefault(socket, set()).update(token_ids)
         if messages:
             self.store._emit(
                 "subscription_change", {"messages": messages}, {}, applied=True
             )
         return messages
 
-    async def _consume(self, shard: list[str], *, message_limit: int | None = None) -> None:
+    async def _consume(self, tokens: list[str], *, message_limit: int | None = None) -> None:
         async with self.connector(self.endpoint) as socket:
             self.sockets.append(socket)
-            self.socket_tokens[socket] = set(shard)
+            self.socket_tokens[socket] = set(tokens)
             try:
+                shards = self.planner.shards(tokens)
                 await socket.send(json.dumps({
-                    "assets_ids": shard, "type": "market",
+                    "assets_ids": shards[0], "type": "market",
                     "custom_feature_enabled": True,
                 }, separators=(",", ":")))
+                for shard in shards[1:]:
+                    await socket.send(json.dumps({
+                        "assets_ids": shard, "operation": "subscribe",
+                        "custom_feature_enabled": True,
+                    }, separators=(",", ":")))
                 consumed = 0
                 while message_limit is None or consumed < message_limit:
                     try:
@@ -1828,11 +2189,13 @@ class PolymarketLiveCollector:
                 self.socket_tokens.pop(socket, None)
 
     async def run_once(self, *, message_limit: int | None = None) -> None:
-        shards = self.planner.shards(self.store.token_to_market)
-        if not shards:
+        groups = self.planner.connection_groups(
+            self.store.token_to_market, self.max_websocket_connections,
+        )
+        if not groups:
             raise RuntimeError("live collector has no active tokens")
         await asyncio.gather(*(
-            self._consume(shard, message_limit=message_limit) for shard in shards
+            self._consume(group, message_limit=message_limit) for group in groups
         ))
 
     async def run(self, *, max_connections: int | None = None) -> None:

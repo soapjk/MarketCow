@@ -36,8 +36,32 @@ Official contract references:
 
 `GammaKeysetCatalog` uses `/markets/keyset`, a maximum page size of 100, and only
 the opaque `next_cursor` as the next `after_cursor`. It never supplies an offset.
-It detects cursor loops, fails on an incomplete `max_pages` traversal, and retries
-HTTP 429/5xx with bounded `Retry-After`/exponential backoff.
+There is no static page-count ceiling: only a response without `next_cursor` marks the
+snapshot complete. It detects cursor loops, unchanged cursors, repeated page content,
+duplicate market IDs, empty nonterminal pages, and malformed responses. HTTP 429/5xx
+uses bounded per-page `Retry-After`/exponential backoff, so retries on an early page do
+not consume the budget of a later page.
+
+The default client owns one persistent `requests.Session`, reusing TLS connections for
+the entire traversal. Raw rows stream to a temporary canonical JSONL snapshot while a
+temporary SQLite uniqueness ledger tracks cursors, page hashes, and market IDs. Fetch
+memory is therefore bounded by one server page rather than total catalog size. Every
+25 pages (configurable) the collector logs pages, accumulated market count, elapsed
+seconds, retry count, and current cursor; final evidence also includes bytes and raw
+SHA-256.
+
+Normalization begins only after the server terminates the cursor. The complete JSONL
+snapshot is content-addressed and atomically copied to raw evidence; the normalized
+catalog itself is streamed to immutable content-addressed JSONL. The small atomic
+`catalog.json` manifest binds its path, row count, SHA-256, catalog revision, and raw
+source evidence. Restart verifies both JSONL hashes and rebuilds typed markets one row
+at a time, avoiding a second giant parsed raw catalog. Catalog revision, source
+hash/count/format, token map, and the catalog-revision event are swapped only after all
+validation succeeds. An exception or process restart during pagination sees the
+previous complete revision, never a mixture with the temporary spool.
+The revision event carries added/removed token counts and content hashes plus
+`requires_bootstrap=true`, not a hundreds-of-thousands-element token array; consumers
+reload the atomic bootstrap while the collector computes its subscription diff locally.
 
 `GammaLiveNormalizer` publishes reversible event, market, condition, outcome token,
 and `POLY:{condition_id}:{token_id}` instrument identities. A content revision covers
@@ -92,6 +116,12 @@ On startup and every reconnect:
 4. validate decimal strings, tick alignment, non-crossed books, and nonnegative size;
 5. start a new content-addressed `book_epoch`; and
 6. resolve the gap only after all token snapshots are installed and checkpointed.
+
+`POST /books` uses one persistent HTTP session, at most 500 token IDs per request,
+bounded per-batch 429/5xx retry/backoff, and progress evidence every 25 batches. The
+evidence reports requested token count, received books, elapsed time, retries, and
+batch coverage. A response traversal may finish, but recovery is not marked complete
+unless every active token appears; partial coverage therefore remains fail closed.
 
 `price_change.size` is an absolute level size. Zero removes the level. A full `book`
 replaces the state. MarketCow never manufactures a cancel, delta, or queue position.
@@ -194,13 +224,26 @@ only the supplied local storage directory.
 
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/run_polymarket_live.py \
-  --root '<MarketCow storage_root>/prediction-markets/polymarket-live'
+  --root '<MarketCow storage_root>/prediction-markets/polymarket-live' \
+  --catalog-progress-pages 25
 ```
 
 Use `--catalog-only` to validate discovery or `--bootstrap-only` to stop after complete
-REST recovery. Default WebSocket shards contain 500 tokens. Every socket immediately
-sends its subscription with `custom_feature_enabled=true`, sends `PING` every ten
-seconds, handles `PONG`, and supports official dynamic subscribe/unsubscribe messages.
+REST recovery. Every REST `/books` request and WebSocket subscription message is
+bounded to 500 tokens. Up to 32 WebSocket connections are used by default; all shards
+are distributed evenly across those connections and additional shards use the official
+dynamic subscribe operation. This bounds connection count without dropping catalog
+coverage. Every socket sends `custom_feature_enabled=true`, sends `PING` every ten
+seconds, handles `PONG`, and supports dynamic subscribe/unsubscribe messages. Both the
+message size and connection ceiling are configurable locally.
+
+On 2026-08-04, a local read-only traversal of the real `closed=false` keyset completed
+only after 1,270 pages and 126,981 markets. It took 700.262 seconds with zero retries,
+reused one HTTP session, and produced a 903,205,293-byte canonical JSONL snapshot with
+SHA-256 `12642d93b5f8d774715431a8e3dc0ab151fa12ea84f5f50ca7925173efbe8bed`.
+The spool was iterated to the same 126,981 count and then deleted without publication.
+At the two-token upper bound (253,962 tokens), planning uses 508 bounded REST/WS
+messages and 32 balanced WebSocket connection groups.
 
 No production service is started or restarted by this script. Operators should size
 file retention and disk monitoring before running an indefinite capture.
@@ -218,6 +261,7 @@ PYTHONPATH=src .venv/bin/python scripts/capture_polymarket_public_data.py \
 ## Operational failure policy
 
 - Gamma pagination incomplete or cursor loop: no catalog publication.
+- Gamma repeated/no-progress page or duplicate market ID: no catalog publication.
 - `/books` missing one active token: recovery remains failed and frames remain closed.
 - WebSocket disconnect: record coverage gap and require a new epoch/full recovery.
 - Rate limit or transient upstream failure: bounded retry/backoff; never synthesize.

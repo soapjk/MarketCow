@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 from pathlib import Path
 
 from marketcow.polymarket_live import (
@@ -27,12 +28,25 @@ def main() -> None:
     parser.add_argument("--catalog-only", action="store_true")
     parser.add_argument("--bootstrap-only", action="store_true")
     parser.add_argument("--shard-size", type=int, default=500)
+    parser.add_argument("--max-websocket-connections", type=int, default=32)
+    parser.add_argument("--catalog-progress-pages", type=int, default=25)
     arguments = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
     store = LiveStateStore(arguments.root)
     collector = PolymarketLiveCollector(
-        store, GammaKeysetCatalog(), ClobBooksClient(),
+        store,
+        GammaKeysetCatalog(
+            spool_root=arguments.root / "spool",
+            progress_every_pages=arguments.catalog_progress_pages,
+        ),
+        ClobBooksClient(),
         shard_size=arguments.shard_size,
+        max_websocket_connections=arguments.max_websocket_connections,
     )
     evidence = collector.refresh_catalog()
     print(evidence)

@@ -35,7 +35,12 @@ books that are absent or ambiguous stop frame readiness.
 | Boundary | Regression evidence |
 |---|---|
 | Complete discovery | multiple keyset pages, `after_cursor`, no offset, cursor loop/error bounds |
+| Unbounded traversal | 1,005-page regression terminates only on server cursor exhaustion |
+| Real Gamma traversal | 1,270 pages; 126,981 markets; terminal cursor; 700.262s; 0 retries |
+| Fetch memory | page-bounded JSONL spool plus SQLite cursor/page/market uniqueness ledger |
+| Observability | periodic page/count/elapsed/retry/cursor progress and terminal byte/hash evidence |
 | Backoff | HTTP 429 + `Retry-After` retry path |
+| HTTP reuse | one persistent session for the full traversal |
 | Dynamic subscriptions | deterministic shards and subscribe/unsubscribe diff |
 | Lifecycle | content revisions plus `new_market`/`market_resolved` catalog invalidation |
 | Binary/negative-risk | two-token frame plus all relation-member requirement |
@@ -51,6 +56,8 @@ books that are absent or ambiguous stop frame readiness.
 | Book correctness | decimal, tick, checksum, duplicate, out-of-order, crossed update rejection |
 | Resume/retention | cursor pages, `has_more`, expired-cursor failure, bounded replay storage |
 | Long stability | repeated event application with bounded in-memory retention |
+| Current-scale startup | 253,962-token upper bound; 508 ≤500-item messages; 32 WS groups |
+| Atomic restart | failed partial refresh preserves the prior revision across process recovery |
 | Public facts | wallet/profile/transaction provenance and float rejection |
 | API/OpenAPI | bootstrap, snapshot, events, checkpoint, health, gaps, public data |
 | Source policy | official public endpoints only; commercial/trial dependencies absent |
