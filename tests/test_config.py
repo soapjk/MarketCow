@@ -54,6 +54,27 @@ class SettingsTest(unittest.TestCase):
                 settings = Settings.from_env()
             self.assertFalse(settings.mcp_enabled)
 
+    def test_explicit_env_file_supports_launchd_safe_copy(self):
+        with tempfile.TemporaryDirectory(suffix="-test") as folder:
+            root = Path(folder)
+            env_file = root / "production.env"
+            env_file.write_text(
+                "MARKETCOW_PROFILE=test\n"
+                f"MARKETCOW_HOME={root!s}\n"
+                f"MARKETCOW_ALLOWED_ROOT={root.parent!s}\n"
+                "MARKETCOW_POSTGRES_DSN=postgresql://user:password@127.0.0.1/marketcow_test\n"
+                "MARKETCOW_CLICKHOUSE_PASSWORD=$1$literal\n"
+            )
+            with patch.dict(
+                os.environ,
+                {"MARKETCOW_ENV_FILE": str(env_file)},
+                clear=True,
+            ):
+                settings = Settings.from_env()
+
+            settings.validate_preflight()
+            self.assertEqual(settings.clickhouse_password, "$1$literal")
+
     def test_old_profile_and_missing_database_credentials_fail(self):
         with patch.dict(os.environ, {"MARKETCOW_PROFILE": "v2-test"}, clear=True):
             with self.assertRaisesRegex(ValueError, "production, development or test"):
