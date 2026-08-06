@@ -1,0 +1,115 @@
+{
+  "fixture_version": "marketcow.polymarket.live-consumer-fixture.v2",
+  "contract_version": "marketcow.prediction_market.v1",
+  "schema_version": "marketcow.polymarket.live.v2",
+  "bootstrap": {
+    "catalog_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "cursor": 9,
+    "markets": [
+      {
+        "market_id": "binary-1",
+        "condition_id": "condition-binary-1",
+        "instrument_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "settlement_currency": "pUSD",
+        "activation_at": "2026-08-01T00:00:00Z",
+        "expiration_at": "2026-09-01T00:00:00Z",
+        "price_increment": "0.01",
+        "size_increment": "0.01",
+        "minimum_order_size": "1",
+        "accepting_orders": true,
+        "lifecycle_state": "active",
+        "resolution": null,
+        "outcomes": [
+          {"label": "Yes", "token_id": "binary-yes", "instrument_id": "POLY:condition-binary-1:binary-yes"},
+          {"label": "No", "token_id": "binary-no", "instrument_id": "POLY:condition-binary-1:binary-no"}
+        ],
+        "fee_schedule": {
+          "schedule_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "schedule_version": "fixture-fee-v1",
+          "currency": "USDC",
+          "maker_rate": "0",
+          "taker_rate": "0.02",
+          "formula": "fee = C * rate * p * (1 - p)",
+          "exponent": "1",
+          "quantum": "0.00001",
+          "rounding_mode": "UNSPECIFIED",
+          "tie_semantics": "unspecified",
+          "calculation_status": "informational_only",
+          "effective_from": "2026-08-01T00:00:00Z"
+        }
+      },
+      {
+        "event_id": "event-neg-1",
+        "negative_risk_relation": {
+          "relation_id": "neg-risk:fixture-group",
+          "relation_revision": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rule_version": "gamma-standard-negative-risk-v1",
+          "members": [
+            "POLY:condition-a:a-yes",
+            "POLY:condition-b:b-yes",
+            "POLY:condition-c:c-yes"
+          ],
+          "outcome_pairs": [
+            {
+              "outcome_label": "Candidate A",
+              "market_id": "market-a",
+              "condition_id": "condition-a",
+              "yes_token_id": "a-yes",
+              "yes_instrument_id": "POLY:condition-a:a-yes",
+              "no_token_id": "a-no",
+              "no_instrument_id": "POLY:condition-a:a-no"
+            },
+            {
+              "outcome_label": "Candidate B",
+              "market_id": "market-b",
+              "condition_id": "condition-b",
+              "yes_token_id": "b-yes",
+              "yes_instrument_id": "POLY:condition-b:b-yes",
+              "no_token_id": "b-no",
+              "no_instrument_id": "POLY:condition-b:b-no"
+            },
+            {
+              "outcome_label": "Candidate C",
+              "market_id": "market-c",
+              "condition_id": "condition-c",
+              "yes_token_id": "c-yes",
+              "yes_instrument_id": "POLY:condition-c:c-yes",
+              "no_token_id": "c-no",
+              "no_instrument_id": "POLY:condition-c:c-no"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "snapshot": {
+    "cursor": 9,
+    "ordinary_binary_frame": {
+      "market_id": "binary-1",
+      "status": "ready",
+      "token_ids": ["binary-yes", "binary-no"]
+    },
+    "negative_risk_frame": {
+      "market_id": "market-a",
+      "status": "ready",
+      "binary_token_ids": ["a-yes", "a-no"],
+      "yes_member_token_ids": ["a-yes", "b-yes", "c-yes"],
+      "pair_count": 3
+    }
+  },
+  "events": {
+    "request": {"after_cursor": 9, "limit": 1000},
+    "response": {"after_cursor": 9, "next_cursor": 11, "has_more": false},
+    "required_envelope_fields": [
+      "cursor", "event_id", "event_type", "canonical_payload",
+      "canonical_payload_sha256", "raw_payload", "raw_payload_sha256",
+      "applied", "gaps"
+    ]
+  },
+  "checkpoint_resume": {
+    "checkpoint_cursor": 11,
+    "state_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "resume_request": {"after_cursor": 11, "limit": 1000},
+    "expired_cursor_recovery": ["bootstrap", "snapshot"]
+  }
+}
