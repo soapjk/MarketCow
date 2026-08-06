@@ -121,9 +121,11 @@ curl -X POST 'http://127.0.0.1:8790/v1/dividends/query' \
 - `last_refreshed_at` 表示最近一次成功刷新时间；即使官方来源没有返回任何公告，
   成功的空结果也会被缓存，避免每次请求重复访问上游。
 
-A 股和港股的首次查询使用结构化快速源，不再等待 PDF：
+A 股和港股的首次查询使用分类路由：
 
-- A 股优先读取 Tushare `dividend`，以 `end_date` 作为报告财年；Tushare 未配置、
+- 上交所基金/ETF 优先查询上交所基金公告目录并解析正式 PDF；按日期区间查询时应使用
+  [Fund Dividend History v1](fund-dividend-history.md)。
+- A 股股票优先读取 Tushare `dividend`，以 `end_date` 作为报告财年；Tushare 未配置、
   请求失败或没有记录时回退到 Longport。
 - 港股读取 Longport `FundamentalContext.dividend`。
 - 美股股票和 ETF 在 Longport 可用时也可取得结构化历史事件的三类日期；SEC
@@ -149,13 +151,13 @@ A 股和港股的首次查询使用结构化快速源，不再等待 PDF：
 
 响应额外提供 `refresh_status`、`query_source`、`refresh_completed_at`、
 `cache_schema_version` 和 `parser_version`，便于调用方审计来源、完成状态和缓存版本。
-数据库状态采用 `dividend-cache-v2` 与 `structured-v6-payment-year`。migration 10 会把旧
+数据库状态采用 `dividend-cache-v2` 与 `official-fund-v7-payment-year`。migration 10 会把旧
 `success` 标记迁移为旧版本 `success_empty`、旧 `failed` 标记为
 `failed_source`，但保留原始时间和错误；由于版本不匹配，这些记录不会命中新缓存。
 旧版本空缓存会在下一次普通 GET 或批量查询时同步重新抓取，旧版本有数据缓存会作为
 stale 返回并触发后台刷新。因此 Investrace 无需逐标的调用管理员强刷。
 
-`structured-v6-payment-year` 还包含以下完整度修复：
+`official-fund-v7-payment-year` 保留下列完整度修复，并使旧的 ETF 第三方快缓存失效：
 
 - Longport Fundamental 请求在进程内全局串行限速，遇到 429 做有上限退避重试；
   可通过 `MARKETCOW_DIVIDEND_LONGPORT_MIN_INTERVAL_SECONDS`（默认 0.65 秒）和

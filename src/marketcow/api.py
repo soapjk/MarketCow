@@ -322,6 +322,65 @@ class DividendQuery(BaseModel):
     fiscal_year: int = Field(ge=1991, le=2100)
 
 
+class FundDividendProvenance(BaseModel):
+    official: bool
+    confirmation_status: Optional[str] = None
+    raw_artifact_id: Optional[str] = None
+    declared_amount: Optional[str] = None
+    declared_unit_count: Optional[str] = None
+    declared_unit: Optional[str] = None
+
+
+class FundDividendEvent(BaseModel):
+    event_id: str
+    symbol: str
+    instrument_id: str
+    fund_name: Optional[str] = None
+    announcement_date: Optional[str] = None
+    record_date: Optional[str] = None
+    ex_date: Optional[str] = None
+    payment_date: Optional[str] = None
+    amount_per_unit: str
+    currency: str
+    dividend_type: str
+    event_status: str
+    source_url: Optional[str] = None
+    source_category: str
+    source_name: Optional[str] = None
+    source_document_id: Optional[str] = None
+    observed_at: Optional[str] = None
+    ingested_at: Optional[str] = None
+    provenance: FundDividendProvenance
+
+
+class FundDividendHistoryResponse(BaseModel):
+    schema_version: str
+    symbol: str
+    instrument_id: str
+    fund_name: Optional[str] = None
+    asset_type: str
+    status: Literal["complete", "incomplete", "no_dividends"]
+    date_from: str
+    date_to: str
+    date_basis: Literal["payment_date"]
+    event_count: int
+    events: list[FundDividendEvent]
+    aggregate: Dict[str, Any]
+    coverage: Dict[str, Any]
+    freshness: Dict[str, Any]
+
+
+class FundDividendErrorDetail(BaseModel):
+    code: Literal[
+        "invalid_request", "unsupported_asset_type", "provider_unavailable"
+    ]
+    message: str
+
+
+class FundDividendHttpError(BaseModel):
+    detail: FundDividendErrorDetail
+
+
 class CsvSchemaProfileInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     version: str = Field(min_length=1, max_length=50)
@@ -1425,6 +1484,52 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/funds/{symbol}/dividends",
+        response_model=FundDividendHistoryResponse,
+        responses={
+            400: {
+                "model": FundDividendHttpError,
+                "description": "invalid_symbol_or_date_range",
+            },
+            422: {
+                "model": FundDividendHttpError,
+                "description": "unsupported_asset_type",
+            },
+            502: {
+                "model": FundDividendHttpError,
+                "description": "provider_unavailable",
+            },
+        },
+    )
+    def fund_dividend_history_api(
+        symbol: str,
+        date_from: str = Query(alias="from"),
+        date_to: str = Query(alias="to"),
+        refresh: bool = True,
+    ):
+        try:
+            return service.get_fund_dividend_history(
+                symbol, date_from, date_to, refresh=refresh
+            )
+        except ValueError as exc:
+            message = str(exc)
+            code = (
+                "unsupported_asset_type"
+                if "not recognized as a fund or ETF" in message
+                else "invalid_request"
+            )
+            status_code = 422 if code == "unsupported_asset_type" else 400
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": code, "message": message},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "provider_unavailable", "message": str(exc)},
+            ) from exc
 
     @app.post("/v1/dividends/query")
     def dividends_query(request: DividendQuery):

@@ -99,16 +99,35 @@ class McpServerTest(unittest.TestCase):
         self.assertIn("get_quotes", names)
         self.assertIn("get_canonical_bars", names)
         self.assertIn("get_financial_statements", names)
+        self.assertIn("get_fund_dividend_history", names)
         self.assertTrue(all(tool["annotations"]["readOnlyHint"] for tool in tools))
         self.assertTrue(all(not tool["annotations"]["destructiveHint"] for tool in tools))
         open_world = {
             tool["name"] for tool in tools if tool["annotations"]["openWorldHint"]
         }
         self.assertEqual(open_world, {
+            "get_fund_dividend_history",
             "search_convertible_bonds",
             "get_convertible_bond",
             "get_convertible_bond_market",
         })
+
+    def test_fund_dividend_history_uses_inclusive_date_range(self) -> None:
+        response = self.request("tools/call", {
+            "name": "get_fund_dividend_history",
+            "arguments": {
+                "symbol": "563020.XSHG",
+                "from": "2025-08-06",
+                "to": "2026-08-06",
+                "refresh": False,
+            },
+        })
+        self.assertFalse(response["result"]["isError"])
+        request = self.requests[0]
+        self.assertEqual(request.url.path, "/v1/funds/563020.XSHG/dividends")
+        self.assertEqual(request.url.params["from"], "2025-08-06")
+        self.assertEqual(request.url.params["to"], "2026-08-06")
+        self.assertEqual(request.url.params["refresh"], "false")
 
     def test_tool_call_returns_text_and_structured_content(self) -> None:
         response = self.request("tools/call", {
@@ -262,7 +281,7 @@ class McpHttpEndpointTest(unittest.TestCase):
             health = client.get("/v1/health")
         self.assertEqual(initialized.status_code, 200)
         self.assertEqual(initialized.json()["result"]["protocolVersion"], "2025-11-25")
-        self.assertEqual(len(tools.json()["result"]["tools"]), 13)
+        self.assertEqual(len(tools.json()["result"]["tools"]), 14)
         self.assertEqual(health.json()["mcp"], {
             "enabled": True, "endpoint": "/mcp",
         })

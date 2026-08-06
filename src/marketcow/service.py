@@ -54,6 +54,7 @@ from .repositories import Repositories
 from .domain_columns import FUNDAMENTAL_COLUMNS
 from .dividends import (
     dividend_summary,
+    fund_dividend_history,
     normalize_dividend_announcement,
     normalize_dividend_symbol,
 )
@@ -80,7 +81,7 @@ EASTMONEY_DATA_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 EASTMONEY_QUOTE_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 BAOSTOCK_SOURCE_URL = "http://baostock.com/baostock/index.php/Python_API文档"
 DIVIDEND_CACHE_SCHEMA = "dividend-cache-v2"
-DIVIDEND_REFRESH_STRATEGY = "structured-v6-payment-year"
+DIVIDEND_REFRESH_STRATEGY = "official-fund-v7-payment-year"
 DIVIDEND_SUCCESS_STATES = frozenset({"success_data", "success_empty"})
 
 
@@ -808,7 +809,11 @@ class FundamentalService:
                 self, "us_structured_dividend_provider", self.sec_dividend_provider
             )
         elif instrument.market == "CN":
-            provider = self.cn_structured_dividend_provider
+            provider = (
+                self.cn_dividend_provider
+                if self._dividend_asset_type(instrument.instrument_id) == "etf"
+                else self.cn_structured_dividend_provider
+            )
         elif instrument.market == "HK":
             provider = self.longport_dividend_provider
         else:
@@ -988,6 +993,42 @@ class FundamentalService:
 
     def refresh_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
         return self._refresh_dividends_locked(symbol, fiscal_year, force=True)
+
+    def get_fund_dividend_history(
+        self,
+        symbol: str,
+        date_from: str,
+        date_to: str,
+        *,
+        refresh: bool = True,
+    ) -> Dict[str, Any]:
+        instrument = canonical_instrument(symbol)
+        if self._dividend_asset_type(instrument.instrument_id) != "etf":
+            raise ValueError("instrument is not recognized as a fund or ETF")
+        try:
+            start = datetime.strptime(date_from, "%Y-%m-%d").date()
+            end = datetime.strptime(date_to, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError("from and to must use YYYY-MM-DD") from exc
+        if start > end:
+            raise ValueError("from must be on or before to")
+        if (end - start).days > 3660:
+            raise ValueError("fund dividend history range cannot exceed 10 years")
+        yearly_results = []
+        for year in range(start.year, end.year + 1):
+            if refresh:
+                result = self.get_dividends(instrument.instrument_id, year)
+            else:
+                state = self._dividend_state(instrument.instrument_id, year)
+                result = self._with_dividend_cache_metadata(
+                    self._read_dividends(instrument.instrument_id, year),
+                    state,
+                    "fresh" if state else "cache_only",
+                )
+            yearly_results.append(result)
+        return fund_dividend_history(
+            instrument.instrument_id, date_from, date_to, yearly_results
+        )
 
     def discover_dividends(self, symbol: str, fiscal_year: int) -> Dict[str, Any]:
         instrument = canonical_instrument(symbol)
