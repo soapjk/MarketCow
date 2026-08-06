@@ -1,7 +1,7 @@
 # Codex 项目级安装 MarketCow MCP
 
 本文是 MarketCow 面向 Codex 新用户的**唯一权威 project-only 安装指南**。安装器只在
-一个明确的 Git workspace 根目录内管理 `.codex/config.toml` 和该目录下的本地备份；
+一个明确指定的 workspace 目录内管理 `.codex/config.toml` 和该目录下的本地备份；
 不会调用 `codex mcp add`，不会写入 `~/.codex`、`$CODEX_HOME`、用户/系统配置，也不会
 安装全局 Skill。
 
@@ -90,17 +90,20 @@ curl --fail --silent "${MARKETCOW_SERVICE_URL%/mcp}/v1/health"
 
 ## 3. 准备目标 Codex workspace
 
-目标必须是现有、可写的**绝对 Git workspace 根目录**：
+目标必须是用户明确指定的、现有且可写的**绝对 Codex workspace 目录**。它可以是
+Git 根目录，也可以完全没有 Git 元数据：
 
 ```bash
 export TARGET_WORKSPACE=/absolute/path/to/target-workspace
-git -C "$TARGET_WORKSPACE" rev-parse --show-toplevel
+test -d "$TARGET_WORKSPACE" && test -w "$TARGET_WORKSPACE"
 ```
 
-输出必须与 `TARGET_WORKSPACE` 解析后的路径完全相同。安装器拒绝：
+`--workspace` 本身就是作用域边界。安装器不会向上搜索父级 Git 仓库，也不会创建
+`.git`；所有受管文件必须精确位于该目录内。安装器拒绝：
 
-- 相对路径、Git 子目录、不存在或不可写目录；
-- `/`、HOME、`CODEX_HOME`，以及包含/位于 `CODEX_HOME` 的目录；
+- 相对路径、不存在或不可写目录；
+- `/`、HOME、当前 `CODEX_HOME`、用户级 `~/.codex`，以及包含/位于这些 Codex 配置
+  目录的路径；
 - symlink `.codex`、路径越界的备份或模糊目标。
 
 先审阅目标项目，再在 Codex 的信任提示中把它标记为 trusted；不信任时 Codex会忽略
@@ -131,7 +134,7 @@ git -C "$TARGET_WORKSPACE" rev-parse --show-toplevel
 
 ```toml
 # BEGIN MARKETCOW MCP MANAGED v1
-# installer_version = 1.0.0
+# installer_version = 1.1.0
 # observed_marketcow_version = 0.2.0
 # transport = http
 [mcp_servers.marketcow]
@@ -236,8 +239,8 @@ dry-run 后卸载：
 
 ## 9. 故障排查
 
-- `--workspace must be the exact Git root`：使用 `git ... rev-parse --show-toplevel`
-  的绝对输出，不要传子目录。
+- `--workspace must be an explicit absolute path`：传入希望 Codex 加载项目配置的现存
+  目录绝对路径；无需且不要为了安装器创建 `.git`。
 - `unmanaged [mcp_servers.marketcow] already exists`：安装器不会接管未知配置；人工审阅
   冲突表后再重试。
 - `/v1/health is not healthy`：先检查 PostgreSQL、ClickHouse、`.env.<profile>` 和
@@ -246,7 +249,7 @@ dry-run 后卸载：
   服务，且没有把 `/v1/health` 当成 MCP URL。
 - `version mismatch`：核对正在运行的服务和本地 CLI/wheel，不要绕过版本检查进行升级。
 - `missing required tools`：运行实例与安装包契约不一致；升级或回退服务后重新验证。
-- 配置成功但新会话没有工具：确认从正确 Git root 启动、项目已 trusted、配置路径是
+- 配置成功但新会话没有工具：确认从指定 workspace 启动、项目已 trusted、配置路径是
   `<workspace>/.codex/config.toml`，并真正新开会话。
 - stdio 失败：检查绝对 executable 仍存在、可执行，且其
   `MARKETCOW_MCP_BASE_URL` 指向可用 API。

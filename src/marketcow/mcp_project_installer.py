@@ -20,7 +20,7 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 
-INSTALLER_VERSION = "1.0.0"
+INSTALLER_VERSION = "1.1.0"
 MANAGED_BEGIN = "# BEGIN MARKETCOW MCP MANAGED v1"
 MANAGED_END = "# END MARKETCOW MCP MANAGED v1"
 SERVER_TABLE = "[mcp_servers.marketcow]"
@@ -87,21 +87,6 @@ def _mode_is_writable(path: Path) -> bool:
     return bool(path.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
 
 
-def _git_root(path: Path) -> Path | None:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return None
-    return Path(result.stdout.strip()).resolve()
-
-
 def validate_workspace(raw_workspace: str, *, codex_home: str | None = None) -> WorkspacePaths:
     supplied = Path(raw_workspace).expanduser()
     if not supplied.is_absolute():
@@ -113,19 +98,21 @@ def validate_workspace(raw_workspace: str, *, codex_home: str | None = None) -> 
     if not workspace.is_dir():
         raise InstallerError("--workspace must be an existing directory")
     home = Path.home().resolve()
+    user_codex_home = (home / ".codex").resolve()
     active_codex_home = Path(
-        codex_home or os.environ.get("CODEX_HOME") or (home / ".codex")
+        codex_home or os.environ.get("CODEX_HOME") or user_codex_home
     ).expanduser().resolve()
-    if workspace in {Path("/"), home, active_codex_home}:
-        raise InstallerError("--workspace cannot be /, HOME, or CODEX_HOME")
-    if active_codex_home in workspace.parents or workspace in active_codex_home.parents:
-        raise InstallerError("--workspace cannot contain or be inside CODEX_HOME")
-    root = _git_root(workspace)
-    if root is None:
-        raise InstallerError("--workspace must be the exact root of a Git workspace")
-    if root != workspace:
+    protected_codex_homes = {active_codex_home, user_codex_home}
+    if workspace in {Path("/"), home, *protected_codex_homes}:
         raise InstallerError(
-            f"--workspace must be the exact Git root; resolved root is {root}"
+            "--workspace cannot be /, HOME, CODEX_HOME, or the user Codex config directory"
+        )
+    if any(
+        protected in workspace.parents or workspace in protected.parents
+        for protected in protected_codex_homes
+    ):
+        raise InstallerError(
+            "--workspace cannot contain or be inside a Codex config directory"
         )
     if not _mode_is_writable(workspace) or not os.access(workspace, os.W_OK):
         raise InstallerError("--workspace is not writable")
@@ -711,7 +698,10 @@ def build_parser() -> argparse.ArgumentParser:
     def workspace_options(candidate: argparse.ArgumentParser) -> None:
         candidate.add_argument(
             "--workspace", required=True,
-            help="Absolute path to the exact Git workspace root to modify.",
+            help=(
+                "Absolute path to the existing Codex workspace directory to manage; "
+                "Git metadata is optional."
+            ),
         )
         candidate.add_argument(
             "--dry-run", action="store_true",
