@@ -1,6 +1,6 @@
 # Polymarket live local-candidate quality report
 
-Date: 2026-08-03. Baseline: MarketCow `743fdd1`.
+Date: 2026-08-04. Baseline: MarketCow `10229ab`.
 
 ## Delivered scope
 
@@ -18,6 +18,10 @@ Date: 2026-08-03. Baseline: MarketCow `743fdd1`.
   collector writes without restart.
 - Breaking `marketcow.polymarket.live.v2` Nautilus facts, complete typed fee schedules,
   and YES-only standard negative-risk relations with reversible YES/NO pairs.
+- Shared typed-fact missing-field derivation for invalid instrument and fee intervals.
+- Hash-verified terminal Gamma spool reuse after normalization/publication failure.
+- Partial `/books` coverage keeps affected frames closed without suppressing unrelated
+  complete markets or preventing the catalog/API from starting.
 
 ## Explicit limits
 
@@ -48,6 +52,7 @@ books that are absent or ambiguous stop frame readiness.
 | Typed fees | ID/version/currency/rates/formula/exponent/quantum/rounding/effective provenance |
 | Negative-risk solver | YES-only member set plus explicit YES/NO outcome pairs |
 | Missing business facts | named incomplete fields and stable fail-closed reason codes |
+| Invalid fact intervals | equal/reversed instrument and fee intervals normalize incomplete without catalog failure |
 | Consumer fixture | binary + three-outcome negative-risk bootstrap/snapshot/resume flow |
 | Recovery | disconnect gap, full `/books`, new epoch, checkpoint and post-checkpoint replay |
 | Cross-process visibility | API starts first; separate writer adds catalog/books; all live reads update |
@@ -58,6 +63,8 @@ books that are absent or ambiguous stop frame readiness.
 | Long stability | repeated event application with bounded in-memory retention |
 | Current-scale startup | 253,962-token upper bound; 508 ≤500-item messages; 32 WS groups |
 | Atomic restart | failed partial refresh preserves the prior revision across process recovery |
+| Verified retry | terminal spool endpoint/params/schema/count/size/hash validation and no-network reuse |
+| Partial book coverage | missing tokens remain gaps/degraded while complete two-token markets become ready |
 | Public facts | wallet/profile/transaction provenance and float rejection |
 | API/OpenAPI | bootstrap, snapshot, events, checkpoint, health, gaps, public data |
 | Source policy | official public endpoints only; commercial/trial dependencies absent |

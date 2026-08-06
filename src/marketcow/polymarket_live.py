@@ -84,6 +84,41 @@ def _bps_rate(value: Any, field: str) -> str:
     return format(bps / Decimal("10000"), "f")
 
 
+def _missing_fields(
+    required: dict[str, Any],
+    *,
+    intervals: Iterable[tuple[str, datetime | None, datetime | None]] = (),
+) -> list[str]:
+    """Single source of truth for typed-fact completeness."""
+    missing = {name for name, value in required.items() if value is None}
+    for name, start, end in intervals:
+        if start is not None and end is not None and start >= end:
+            missing.add(name)
+    return sorted(missing)
+
+
+def _instrument_missing_fields(values: dict[str, Any]) -> list[str]:
+    return _missing_fields(
+        values,
+        intervals=[(
+            "activation_expiration_interval",
+            values.get("activation_at"),
+            values.get("expiration_at"),
+        )],
+    )
+
+
+def _fee_missing_fields(
+    values: dict[str, Any], effective_to: datetime | None,
+) -> list[str]:
+    return _missing_fields(
+        values,
+        intervals=[(
+            "effective_interval", values.get("effective_from"), effective_to,
+        )],
+    )
+
+
 def _levels(value: Any, field: str) -> list[dict[str, str]]:
     levels = []
     for item in value or []:
@@ -230,9 +265,7 @@ class LiveInstrumentFacts(BaseModel):
             "size_increment": self.size_increment,
             "minimum_order_size": self.minimum_order_size,
         }
-        missing = sorted(name for name, value in required.items() if value is None)
-        if self.activation_at and self.expiration_at and self.activation_at >= self.expiration_at:
-            missing.append("activation_expiration_interval")
+        missing = _instrument_missing_fields(required)
         if sorted(set(self.missing_fields)) != sorted(set(missing)):
             raise ValueError("instrument missing_fields must describe the typed facts")
         if self.complete != (not missing):
@@ -292,9 +325,7 @@ class LiveFeeSchedule(BaseModel):
             "quantum": self.quantum,
             "effective_from": self.effective_from,
         }
-        missing = sorted(name for name, value in required.items() if value is None)
-        if self.effective_from and self.effective_to and self.effective_from >= self.effective_to:
-            missing.append("effective_interval")
+        missing = _fee_missing_fields(required, self.effective_to)
         if sorted(set(self.missing_fields)) != sorted(set(missing)):
             raise ValueError("fee missing_fields must describe the typed schedule")
         if self.complete != (not missing):
@@ -474,6 +505,7 @@ class LiveHealth(BaseModel):
     active_market_count: int
     subscribed_token_count: int
     book_token_count: int
+    missing_book_token_count: int
     ready_market_count: int
     unresolved_gap_count: int
     latest_cursor: int
@@ -537,10 +569,18 @@ class PublicDataPage(BaseModel):
 class GammaCatalogRows:
     """One complete disk-backed Gamma snapshot; iteration keeps memory page-bounded."""
 
-    def __init__(self, path: Path, *, row_count: int, sha256: str):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        row_count: int,
+        sha256: str,
+        retry_manifest_path: Path | None = None,
+    ):
         self.path = path.resolve()
         self.row_count = row_count
         self.sha256 = sha256
+        self.retry_manifest_path = retry_manifest_path
 
     def __len__(self) -> int:
         return self.row_count
@@ -552,13 +592,19 @@ class GammaCatalogRows:
                     yield json.loads(line, parse_float=str, parse_int=str)
 
     def cleanup(self) -> None:
-        self.path.unlink(missing_ok=True)
+        if self.retry_manifest_path is None:
+            self.path.unlink(missing_ok=True)
+
+    def mark_published(self) -> None:
+        if self.retry_manifest_path is not None:
+            self.retry_manifest_path.unlink(missing_ok=True)
 
 
 class GammaKeysetCatalog:
     """Complete active-market discovery using Gamma's keyset endpoint."""
 
     endpoint = "https://gamma-api.polymarket.com/markets/keyset"
+    spool_schema_version = "marketcow.polymarket.gamma-keyset-spool.v1"
 
     def __init__(
         self,
@@ -585,6 +631,80 @@ class GammaKeysetCatalog:
         self.sleeper = sleeper
         self.clock = clock
 
+    @property
+    def _request_identity(self) -> dict[str, Any]:
+        return {
+            "endpoint": self.endpoint,
+            "params": {
+                "limit": self.page_limit,
+                "closed": "false",
+                "ascending": "true",
+            },
+            "schema_version": self.spool_schema_version,
+        }
+
+    @property
+    def _retry_manifest_path(self) -> Path | None:
+        if self.spool_root is None:
+            return None
+        return self.spool_root / "gamma-keyset-verified-retry.json"
+
+    def _reuse_verified_spool(
+        self,
+    ) -> tuple[GammaCatalogRows, dict[str, Any]] | None:
+        manifest_path = self._retry_manifest_path
+        if manifest_path is None or not manifest_path.exists():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("verified Gamma spool manifest is unreadable") from exc
+        if any(
+            manifest.get(name) != expected
+            for name, expected in self._request_identity.items()
+        ):
+            raise RuntimeError("verified Gamma spool request identity mismatch")
+        if (
+            manifest.get("complete") is not True
+            or manifest.get("terminal_next_cursor") is not None
+            or manifest.get("format") != "canonical_jsonl"
+        ):
+            raise RuntimeError("verified Gamma spool is not terminal and complete")
+        spool_path = Path(str(manifest.get("path") or "")).resolve()
+        verified_root = (self.spool_root / "verified").resolve()
+        if not spool_path.is_relative_to(verified_root):
+            raise RuntimeError("verified Gamma spool escapes its storage root")
+        expected_size = int(manifest.get("raw_byte_size") or -1)
+        if not spool_path.exists() or spool_path.stat().st_size != expected_size:
+            raise RuntimeError("verified Gamma spool byte-size integrity failed")
+        expected_sha256 = str(manifest.get("raw_payload_sha256") or "")
+        if _file_sha256(spool_path) != expected_sha256:
+            raise RuntimeError("verified Gamma spool hash integrity failed")
+        market_count = int(manifest.get("market_count") or -1)
+        pages = int(manifest.get("pages") or -1)
+        if market_count < 0 or pages < 1:
+            raise RuntimeError("verified Gamma spool count metadata is invalid")
+        evidence = {
+            key: manifest[key]
+            for key in (
+                "pages", "market_count", "complete", "last_cursor",
+                "elapsed_seconds", "retry_count", "raw_payload_sha256",
+                "raw_byte_size", "http_connection_reuse",
+            )
+        }
+        evidence.update({
+            "reused_verified_spool": True,
+            "verified_spool_path": str(spool_path),
+            "verified_spool_manifest": str(manifest_path),
+        })
+        self.progress(evidence)
+        return GammaCatalogRows(
+            spool_path,
+            row_count=market_count,
+            sha256=expected_sha256,
+            retry_manifest_path=manifest_path,
+        ), evidence
+
     @staticmethod
     def _log_progress(evidence: dict[str, Any]) -> None:
         LOGGER.info(
@@ -596,6 +716,9 @@ class GammaKeysetCatalog:
     def fetch_all(self) -> tuple[GammaCatalogRows, dict[str, Any]]:
         if self.spool_root:
             self.spool_root.mkdir(parents=True, exist_ok=True)
+            reusable = self._reuse_verified_spool()
+            if reusable is not None:
+                return reusable
         file_descriptor, spool_name = tempfile.mkstemp(
             prefix="marketcow-gamma-catalog-", suffix=".jsonl",
             dir=self.spool_root,
@@ -693,7 +816,41 @@ class GammaKeysetCatalog:
                             "http_connection_reuse": isinstance(
                                 getattr(self.requester, "__self__", None), requests.Session
                             ),
+                            "reused_verified_spool": False,
                         }
+                        if self.spool_root is not None:
+                            verified_root = self.spool_root / "verified"
+                            verified_root.mkdir(parents=True, exist_ok=True)
+                            verified_path = (
+                                verified_root / f"{raw_hasher.hexdigest()}.jsonl"
+                            )
+                            if not verified_path.exists():
+                                _atomic_copy(spool_path, verified_path)
+                            if _file_sha256(verified_path) != raw_hasher.hexdigest():
+                                raise RuntimeError(
+                                    "verified Gamma spool integrity failed"
+                                )
+                            manifest_path = self._retry_manifest_path
+                            manifest = {
+                                **self._request_identity,
+                                **evidence,
+                                "format": "canonical_jsonl",
+                                "terminal_next_cursor": None,
+                                "path": str(verified_path.resolve()),
+                            }
+                            _atomic_write(manifest_path, canonical_json(manifest))
+                            evidence.update({
+                                "verified_spool_path": str(verified_path.resolve()),
+                                "verified_spool_manifest": str(manifest_path),
+                            })
+                            spool_path.unlink(missing_ok=True)
+                            self.progress(evidence)
+                            return GammaCatalogRows(
+                                verified_path,
+                                row_count=market_count,
+                                sha256=raw_hasher.hexdigest(),
+                                retry_manifest_path=manifest_path,
+                            ), evidence
                         self.progress(evidence)
                         return GammaCatalogRows(
                             spool_path, row_count=market_count,
@@ -870,9 +1027,7 @@ class GammaLiveNormalizer:
                 "size_increment": SIZE_INCREMENT,
                 "minimum_order_size": str(minimum) if minimum is not None else None,
             }
-            instrument_missing = sorted(
-                name for name, value in instrument_values.items() if value is None
-            )
+            instrument_missing = _instrument_missing_fields(instrument_values)
             instrument_revision = content_sha256({
                 "market_revision": revision,
                 "values": {
@@ -890,7 +1045,7 @@ class GammaLiveNormalizer:
                 "quantum": str(fee_quantum) if fee_quantum is not None else None,
                 "effective_from": effective_from,
             }
-            fee_missing = sorted(name for name, value in fee_values.items() if value is None)
+            fee_missing = _fee_missing_fields(fee_values, effective_to)
             fee_provenance = GammaLiveNormalizer._provenance(
                 source="polymarket_gamma", revision=fee_version,
                 source_url=GammaKeysetCatalog.endpoint, observed_at=observed_at,
@@ -954,11 +1109,7 @@ class GammaLiveNormalizer:
         for market in result:
             if market.identity.neg_risk and market.identity.neg_risk_market_id:
                 neg_risk_groups[market.identity.neg_risk_market_id].append(market)
-        for market in result:
-            group_id = market.identity.neg_risk_market_id
-            if not market.identity.neg_risk or not group_id:
-                continue
-            group = neg_risk_groups[group_id]
+        for group_id, group in neg_risk_groups.items():
             pairs = []
             for member_market in group:
                 by_label = {
@@ -1002,26 +1153,35 @@ class GammaLiveNormalizer:
                 missing_fields.append("complete_outcome_pairs")
             if len(pairs) < 2:
                 missing_fields.append("mutually_exclusive_yes_member_set")
-            relation = next(
-                item for item in market.relations
-                if item.relation_type == "standard_negative_risk"
-            )
-            relation.members = members
-            relation.outcome_pairs = pairs
-            relation.missing_fields = sorted(set(missing_fields))
-            relation.complete = not relation.missing_fields
-            relation.revision = content_sha256({
-                "relation_id": relation.relation_id, "members": members,
+            missing_fields = sorted(set(missing_fields))
+            relation_id = f"neg-risk:{group_id}"
+            relation_revision = content_sha256({
+                "relation_id": relation_id, "members": members,
                 "outcome_pairs": [item.model_dump(mode="json") for item in pairs],
                 "market_revisions": sorted(
-                    item.metadata_revision for item in result
-                    if item.identity.neg_risk_market_id == group_id
+                    item.metadata_revision for item in group
                 ),
             })
-            relation_index = market.relations.index(relation)
-            market.relations[relation_index] = LiveRelation.model_validate(
-                relation.model_dump(mode="json")
-            )
+            for market in group:
+                relation_index, previous = next(
+                    (index, item) for index, item in enumerate(market.relations)
+                    if item.relation_type == "standard_negative_risk"
+                )
+                market.relations[relation_index] = LiveRelation(
+                    relation_id=relation_id,
+                    relation_type="standard_negative_risk",
+                    members=members,
+                    convertible=previous.convertible,
+                    revision=relation_revision,
+                    rule_version=previous.rule_version,
+                    valid_from=previous.valid_from,
+                    valid_to=previous.valid_to,
+                    source=previous.source,
+                    provenance=previous.provenance,
+                    outcome_pairs=[item.model_copy() for item in pairs],
+                    missing_fields=missing_fields,
+                    complete=not missing_fields,
+                )
         return result
 
 
@@ -1062,8 +1222,17 @@ class ClobBooksClient:
         )
 
     def fetch(self, token_ids: Iterable[str]) -> list[dict[str, Any]]:
+        return self.fetch_stream(token_ids)
+
+    def fetch_stream(
+        self,
+        token_ids: Iterable[str],
+        *,
+        batch_consumer: Callable[[list[dict[str, Any]]], None] | None = None,
+    ) -> list[dict[str, Any]]:
         tokens = list(dict.fromkeys(str(item) for item in token_ids))
         rows = []
+        received_book_count = 0
         batch_count = (len(tokens) + self.batch_size - 1) // self.batch_size
         retry_count = 0
         started = self.clock()
@@ -1098,11 +1267,15 @@ class ClobBooksClient:
             payload = json.loads(response.text, parse_float=str, parse_int=str)
             if not isinstance(payload, list):
                 raise RuntimeError("CLOB /books response must be a list")
-            rows.extend(payload)
+            received_book_count += len(payload)
+            if batch_consumer is None:
+                rows.extend(payload)
+            else:
+                batch_consumer(payload)
             evidence = {
                 "batches": batch_number, "batch_count": batch_count,
                 "requested_token_count": len(tokens),
-                "received_book_count": len(rows),
+                "received_book_count": received_book_count,
                 "elapsed_seconds": self.clock() - started,
                 "retry_count": retry_count,
                 "complete": batch_number == batch_count,
@@ -1112,7 +1285,7 @@ class ClobBooksClient:
         self.last_evidence = {
             "batches": batch_count, "batch_count": batch_count,
             "requested_token_count": len(tokens),
-            "received_book_count": len(rows),
+            "received_book_count": received_book_count,
             "elapsed_seconds": self.clock() - started,
             "retry_count": retry_count, "complete": True,
         }
@@ -1192,6 +1365,7 @@ class LiveStateStore:
         self.gaps: list[GapEntry] = []
         self.events: deque[LiveEventEnvelope] = deque(maxlen=self.replay_capacity)
         self.seen_raw_hashes: set[str] = set()
+        self.active_recovery_id: str | None = None
         self.cursor = 0
         self.catalog_revision: str | None = None
         self.catalog_source: dict[str, Any] | None = None
@@ -1553,40 +1727,111 @@ class LiveStateStore:
 
     def mark_recovery_started(self, reason: str) -> str:
         recovery_id = content_sha256({"cursor": self.cursor, "reason": reason, "at": self.now_provider().isoformat()})
-        now = self.now_provider()
-        gaps = []
-        for token_id in self.token_to_market:
-            gap = GapEntry(
-                code="coverage_gap", token_id=token_id, observed=recovery_id,
-                detected_at=now,
-            )
-            self.gaps.append(gap)
-            gaps.append(gap)
+        self.active_recovery_id = recovery_id
         self._emit(
             "recovery_started", {"recovery_id": recovery_id, "reason": reason}, {},
-            applied=True, gaps=gaps,
+            applied=True,
         )
         return recovery_id
 
-    def recover_from_books(self, rows: list[dict[str, Any]], recovery_id: str) -> None:
-        recovered = set()
+    def new_book_recovery_tracker(self) -> dict[str, Any]:
+        return {
+            "expected": set(self.token_to_market),
+            "recovered": set(),
+            "invalid": {},
+            "duplicate_response_count": 0,
+            "unknown_response_count": 0,
+        }
+
+    def recover_book_batch(
+        self,
+        rows: list[dict[str, Any]],
+        recovery_id: str,
+        tracker: dict[str, Any],
+    ) -> None:
+        recovered = tracker["recovered"]
+        invalid = tracker["invalid"]
         for row in rows:
             token_id = str(row.get("asset_id") or row.get("token_id") or "")
-            self.apply_snapshot(row, recovery_id=recovery_id)
+            if token_id not in tracker["expected"]:
+                tracker["unknown_response_count"] += 1
+                continue
+            if token_id in recovered or token_id in invalid:
+                tracker["duplicate_response_count"] += 1
+                continue
+            try:
+                self.apply_snapshot(row, recovery_id=recovery_id)
+            except ValueError as exc:
+                reason = str(exc)
+                invalid[token_id] = reason
+                detected = self.now_provider()
+                gap = GapEntry(
+                    code="source_mismatch", token_id=token_id,
+                    observed=reason, detected_at=detected,
+                )
+                self.gaps.append(gap)
+                market_id = self.token_to_market[token_id]
+                market = self.catalog[market_id]
+                self._emit(
+                    "book", {"requires_snapshot_recovery": True}, row,
+                    applied=False, market_id=market_id,
+                    condition_id=market.identity.condition_id,
+                    token_id=token_id, received_at=detected,
+                    reason="invalid_rest_book", gaps=[gap],
+                )
+                continue
             recovered.add(token_id)
-        expected = set(self.token_to_market)
-        missing = expected - recovered
-        if missing:
-            raise RuntimeError(f"REST /books recovery missing {len(missing)} active tokens")
+
+    def complete_book_recovery(
+        self, recovery_id: str, tracker: dict[str, Any],
+    ) -> dict[str, Any]:
+        recovered = tracker["recovered"]
+        invalid = tracker["invalid"]
+        missing = tracker["expected"] - recovered
+        resolved_gap_token_ids = set()
         for gap in self.gaps:
             if not gap.resolved and gap.token_id in recovered:
                 gap.resolved = True
                 gap.resolution = f"rest_books_snapshot:{recovery_id}"
+                resolved_gap_token_ids.add(gap.token_id)
+        now = self.now_provider()
+        existing_coverage = {
+            gap.token_id for gap in self.gaps
+            if not gap.resolved and gap.code == "coverage_gap"
+        }
+        for token_id in sorted(missing - existing_coverage - set(invalid)):
+            self.gaps.append(GapEntry(
+                code="coverage_gap", token_id=token_id,
+                observed=recovery_id, detected_at=now,
+            ))
+        self.active_recovery_id = None
+        coverage = {
+            "recovery_id": recovery_id,
+            "requested_token_count": len(tracker["expected"]),
+            "recovered_token_count": len(recovered),
+            "recovered_token_sha256": content_sha256(sorted(recovered)),
+            "missing_token_count": len(missing),
+            "missing_token_sha256": content_sha256(sorted(missing)),
+            "invalid_book_token_count": len(invalid),
+            "invalid_book_token_sha256": content_sha256(sorted(invalid)),
+            "invalid_book_reason_sha256": content_sha256(invalid),
+            "duplicate_response_count": tracker["duplicate_response_count"],
+            "unknown_response_count": tracker["unknown_response_count"],
+            "coverage_complete": not missing,
+        }
         self._emit("recovery_completed", {
-            "recovery_id": recovery_id, "recovered_token_count": len(recovered),
-            "recovered_token_ids": sorted(recovered),
+            **coverage,
+            "resolved_gap_token_ids": sorted(resolved_gap_token_ids),
         }, {}, applied=True)
         self.checkpoint()
+        return coverage
+
+    def recover_from_books(
+        self, rows: list[dict[str, Any]], recovery_id: str,
+    ) -> dict[str, Any]:
+        tracker = self.new_book_recovery_tracker()
+        self.recover_book_batch(rows, recovery_id, tracker)
+        return self.complete_book_recovery(recovery_id, tracker)
 
     def frame(self, market_id: str, *, now: datetime | None = None) -> MarketFrame:
         market = self.catalog.get(market_id)
@@ -1594,6 +1839,8 @@ class LiveStateStore:
             raise KeyError(market_id)
         books = [self.books[token.token_id] for token in market.identity.outcomes if token.token_id in self.books]
         reasons = []
+        if self.active_recovery_id is not None:
+            reasons.append("recovery_in_progress")
         if len(books) != 2:
             reasons.append("missing_outcome_book")
         if not market.rules.rules_complete:
@@ -1787,13 +2034,19 @@ class LiveStateStore:
             )
         if event.event_type == "recovery_completed" and event.applied:
             recovered = set(
-                event.canonical_payload.get("recovered_token_ids") or []
+                event.canonical_payload.get("resolved_gap_token_ids")
+                or event.canonical_payload.get("recovered_token_ids") or []
             )
             recovery_id = str(event.canonical_payload.get("recovery_id") or "")
             for gap in self.gaps:
                 if not gap.resolved and gap.token_id in recovered:
                     gap.resolved = True
                     gap.resolution = f"rest_books_snapshot:{recovery_id}"
+            self.active_recovery_id = None
+        if event.event_type == "recovery_started" and event.applied:
+            self.active_recovery_id = str(
+                event.canonical_payload.get("recovery_id") or ""
+            ) or None
         self.cursor = max(self.cursor, event.cursor)
 
     def _read_all_events(self) -> tuple[list[LiveEventEnvelope], int]:
@@ -1838,6 +2091,7 @@ class LiveStateStore:
         self._checkpoint_cursor = checkpoint_cursor
         self.events.clear()
         self.seen_raw_hashes.clear()
+        self.active_recovery_id = None
         for event in events:
             self.events.append(event)
             self.seen_raw_hashes.add(event.raw_payload_sha256)
@@ -1961,7 +2215,9 @@ class LiveStateStore:
             status=status, catalog_revision=self.catalog_revision,
             active_market_count=len(active_market_ids),
             subscribed_token_count=len(self.token_to_market),
-            book_token_count=len(self.books), ready_market_count=ready,
+            book_token_count=len(self.books),
+            missing_book_token_count=max(0, len(self.token_to_market) - len(self.books)),
+            ready_market_count=ready,
             unresolved_gap_count=unresolved, latest_cursor=self.cursor,
             latest_received_at=latest, lag_ms=lag,
         )
@@ -2090,12 +2346,23 @@ class PolymarketLiveCollector:
         try:
             markets = GammaLiveNormalizer.normalize(rows, self.store.now_provider())
             update = self.store.replace_catalog(markets, rows)
+            rows.mark_published()
         finally:
             rows.cleanup()
+        instrument_interval_invalid = sum(
+            "activation_expiration_interval" in market.rules.instrument.missing_fields
+            for market in markets
+        )
+        fee_interval_invalid = sum(
+            "effective_interval" in market.rules.fee_schedule.missing_fields
+            for market in markets
+        )
         result = {
             **evidence, **update,
             "normalized_market_count": len(markets),
             "active_token_count": len(self.store.token_to_market),
+            "instrument_interval_invalid_count": instrument_interval_invalid,
+            "fee_interval_invalid_count": fee_interval_invalid,
             "publish_elapsed_seconds": time.monotonic() - publish_started,
         }
         LOGGER.info("gamma_catalog_published %s", result)
@@ -2103,10 +2370,17 @@ class PolymarketLiveCollector:
 
     async def bootstrap_books(self, reason: str = "startup") -> str:
         recovery_id = self.store.mark_recovery_started(reason)
-        rows = await asyncio.to_thread(
-            self.books_client.fetch, sorted(self.store.token_to_market)
+        tracker = self.store.new_book_recovery_tracker()
+        await asyncio.to_thread(
+            self.books_client.fetch_stream,
+            sorted(self.store.token_to_market),
+            batch_consumer=lambda rows: self.store.recover_book_batch(
+                rows, recovery_id, tracker,
+            ),
         )
-        self.store.recover_from_books(rows, recovery_id)
+        coverage = self.store.complete_book_recovery(recovery_id, tracker)
+        if self.books_client.last_evidence is not None:
+            self.books_client.last_evidence.update(coverage)
         LOGGER.info(
             "clob_books_recovery_complete recovery_id=%s evidence=%s health=%s",
             recovery_id, self.books_client.last_evidence,

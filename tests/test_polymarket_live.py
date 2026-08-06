@@ -293,6 +293,14 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(
             {item.no_token_id for item in relation.outcome_pairs}, {"b", "d"},
         )
+        second_relation = next(
+            item for item in markets[1].relations
+            if item.relation_type == "standard_negative_risk"
+        )
+        self.assertEqual(relation.revision, second_relation.revision)
+        self.assertIsNot(
+            relation.outcome_pairs[0], second_relation.outcome_pairs[0],
+        )
         self.assertTrue(markets[0].rules.rules_complete)
         self.assertTrue(markets[0].rules.fee_schedule.complete)
         changed = [dict(rows[0]), rows[1]]
@@ -313,6 +321,27 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(
             market.rules.fee_schedule.calculation_status, "informational_only",
         )
+
+    def test_negative_risk_relation_revision_scales_by_group_not_catalog(self):
+        rows = [
+            gamma_row(
+                f"neg-{index}", f"0x{index + 10:064x}",
+                (f"yes-{index}", f"no-{index}"), neg_risk=True,
+            )
+            for index in range(100)
+        ]
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        self.assertEqual(len(markets), 100)
+        relations = [
+            next(
+                relation for relation in market.relations
+                if relation.relation_type == "standard_negative_risk"
+            )
+            for market in markets
+        ]
+        self.assertEqual(len({item.revision for item in relations}), 1)
+        self.assertTrue(all(len(item.outcome_pairs) == 100 for item in relations))
+        self.assertTrue(all(item.complete for item in relations))
 
     def test_typed_nautilus_facts_have_explicit_source_revisions(self):
         market = GammaLiveNormalizer.normalize([gamma_row()], NOW)[0]
@@ -372,6 +401,102 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(frame.status, "fail_closed")
         self.assertIn("instrument_facts_incomplete", frame.reason_codes)
         self.assertIn("fee_schedule_incomplete", frame.reason_codes)
+
+    def test_invalid_instrument_and_fee_intervals_are_explicitly_incomplete(self):
+        equal = gamma_row("equal", "0x" + "3" * 64, ("yes-e", "no-e"))
+        equal["endDate"] = equal["startDate"]
+        reversed_interval = gamma_row(
+            "reversed", "0x" + "4" * 64, ("yes-r", "no-r"),
+        )
+        reversed_interval["startDate"] = "2026-09-02T00:00:00Z"
+        fee_interval = gamma_row(
+            "fee-interval", "0x" + "5" * 64, ("yes-f", "no-f"),
+        )
+        fee_interval["fee_schedule"] = {
+            **fee_interval["fee_schedule"],
+            "effectiveFrom": "2026-09-01T00:00:00Z",
+            "effectiveTo": "2026-09-01T00:00:00Z",
+        }
+
+        markets = GammaLiveNormalizer.normalize(
+            [equal, reversed_interval, fee_interval], NOW,
+        )
+        self.assertEqual(len(markets), 3)
+        by_id = {item.identity.market_id: item for item in markets}
+        for market_id in ("equal", "reversed"):
+            instrument = by_id[market_id].rules.instrument
+            self.assertFalse(instrument.complete)
+            self.assertEqual(
+                instrument.missing_fields, ["activation_expiration_interval"],
+            )
+            self.assertFalse(by_id[market_id].rules.rules_complete)
+        fee = by_id["fee-interval"].rules.fee_schedule
+        self.assertFalse(fee.complete)
+        self.assertEqual(fee.missing_fields, ["effective_interval"])
+
+        store = self.store([equal, reversed_interval, fee_interval])
+        self.assertEqual(len(store.catalog), 3)
+        self.assertFalse(store.catalog["equal"].rules.instrument.complete)
+        self.assertFalse(store.catalog["fee-interval"].rules.fee_schedule.complete)
+
+    def test_verified_gamma_spool_is_reused_after_publication_failure(self):
+        spool_root = self.root / "verified-spool"
+        calls = []
+
+        def requester(_url, **_kwargs):
+            calls.append(1)
+            return Response({"markets": [gamma_row()]})
+
+        store = LiveStateStore(self.root / "retry-live", now_provider=lambda: NOW)
+        collector = PolymarketLiveCollector(
+            store,
+            GammaKeysetCatalog(requester=requester, spool_root=spool_root),
+            ClobBooksClient(requester=lambda *_args, **_kwargs: Response([])),
+        )
+        with patch(
+            "marketcow.polymarket_live._atomic_write_catalog",
+            side_effect=OSError("simulated normalization/publication failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated"):
+                collector.refresh_catalog()
+        retry_manifest = spool_root / "gamma-keyset-verified-retry.json"
+        self.assertTrue(retry_manifest.exists())
+        self.assertEqual(len(calls), 1)
+
+        reused = PolymarketLiveCollector(
+            store,
+            GammaKeysetCatalog(
+                requester=lambda *_args, **_kwargs: self.fail(
+                    "verified retry must not call Gamma"
+                ),
+                spool_root=spool_root,
+            ),
+            ClobBooksClient(requester=lambda *_args, **_kwargs: Response([])),
+        ).refresh_catalog()
+        self.assertTrue(reused["reused_verified_spool"])
+        self.assertEqual(reused["normalized_market_count"], 1)
+        self.assertFalse(retry_manifest.exists())
+
+    def test_incomplete_verified_gamma_spool_is_never_reused(self):
+        spool_root = self.root / "partial-spool"
+        rows, _evidence = GammaKeysetCatalog(
+            requester=lambda *_args, **_kwargs: Response({
+                "markets": [gamma_row()],
+            }),
+            spool_root=spool_root,
+        ).fetch_all()
+        self.addCleanup(rows.cleanup)
+        manifest_path = spool_root / "gamma-keyset-verified-retry.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["complete"] = False
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "not terminal and complete"):
+            GammaKeysetCatalog(
+                requester=lambda *_args, **_kwargs: self.fail(
+                    "partial spool must fail before network fallback"
+                ),
+                spool_root=spool_root,
+            ).fetch_all()
 
     def test_legacy_gamma_bps_is_exactly_normalized_with_official_fee_facts(self):
         row = gamma_row()
@@ -826,6 +951,67 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(client.last_evidence["requested_token_count"], 1)
         self.assertEqual(client.last_evidence["received_book_count"], 1)
         self.assertTrue(progress[-1]["complete"])
+
+    def test_partial_books_bootstrap_starts_degraded_and_keeps_ready_markets(self):
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1")),
+            gamma_row("m2", "0x" + "2" * 64, ("yes-2", "no-2")),
+        ]
+        store = self.store(rows)
+        books = ClobBooksClient(requester=lambda *_args, **_kwargs: Response([
+            snapshot("yes-1", "0.40", "0.42"),
+            snapshot("no-1", "0.58", "0.60"),
+        ]))
+        collector = PolymarketLiveCollector(
+            store,
+            GammaKeysetCatalog(requester=lambda *_args, **_kwargs: Response({
+                "markets": rows,
+            })),
+            books,
+        )
+
+        recovery_id = asyncio.run(collector.bootstrap_books())
+        self.assertTrue(recovery_id)
+        health = store.health()
+        self.assertEqual(health.status, "degraded")
+        self.assertEqual(health.book_token_count, 2)
+        self.assertEqual(health.missing_book_token_count, 2)
+        self.assertEqual(health.ready_market_count, 1)
+        self.assertEqual(store.frame("m1", now=NOW).status, "ready")
+        self.assertEqual(store.frame("m2", now=NOW).status, "fail_closed")
+        self.assertEqual(books.last_evidence["missing_token_count"], 2)
+        self.assertFalse(books.last_evidence["coverage_complete"])
+
+    def test_invalid_rest_book_is_durable_gap_without_aborting_other_books(self):
+        store = self.store()
+        invalid = snapshot("yes-1", "0.40", "0.42")
+        invalid["last_trade_price"] = ""
+        recovery_id = store.mark_recovery_started("invalid_official_book")
+        coverage = store.recover_from_books([
+            invalid,
+            snapshot("no-1", "0.58", "0.60"),
+        ], recovery_id)
+        self.assertEqual(coverage["recovered_token_count"], 1)
+        self.assertEqual(coverage["invalid_book_token_count"], 1)
+        self.assertEqual(coverage["missing_token_count"], 1)
+        self.assertFalse(coverage["coverage_complete"])
+        self.assertNotIn("yes-1", store.books)
+        self.assertIn("no-1", store.books)
+        invalid_events = [
+            event for event in store.events
+            if event.fail_closed_reason == "invalid_rest_book"
+        ]
+        self.assertEqual(len(invalid_events), 1)
+        self.assertEqual(invalid_events[0].token_id, "yes-1")
+        restarted = LiveStateStore(
+            self.root / "live", now_provider=lambda: NOW,
+        )
+        unresolved = [
+            gap for gap in restarted.gaps
+            if not gap.resolved and gap.token_id == "yes-1"
+        ]
+        self.assertTrue(any(gap.code == "source_mismatch" for gap in unresolved))
+        self.assertEqual(restarted.frame("m1", now=NOW).status, "fail_closed")
 
     def test_api_contract_openapi_events_frames_health_and_public_facts(self):
         settings = Settings(
