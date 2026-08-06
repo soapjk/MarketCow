@@ -97,7 +97,8 @@ uv run marketcow --profile development start --host 127.0.0.1 --port 8792
 ```
 
 MCP 不直连数据库，也不开放刷新、导入或管理写操作。需要让 Agent 只在指定项目中
-接入时，参见 [项目级 MCP 安装指南](docs/mcp-project-installation.md)；服务协议、
+接入时，使用自带的 `marketcow-mcp-project` 安装/验证/升级/卸载 CLI，并严格遵循
+[唯一权威的 Codex 项目级 MCP 安装指南](docs/mcp-project-installation.md)；服务协议、
 工具清单和分析时的数据契约注意事项见 [MCP Server 文档](docs/mcp-server.md)。
 可转债申购评分所需的发行条款、日历、缺失语义与市场估值契约见
 [Convertible-Bond MCP v1](docs/mcp-convertible-bonds.md)。
