@@ -19,6 +19,7 @@ from marketcow.mcp_project_installer import (
     MANAGED_BEGIN,
     REQUIRED_TOOLS,
     _StdioSession,
+    _without_managed_block,
     InstallerError,
     VerificationResult,
     build_parser,
@@ -111,10 +112,6 @@ class WorkspaceFixture(unittest.TestCase):
         root = Path(self.temporary.name)
         self.workspace = root / "workspace"
         self.workspace.mkdir()
-        subprocess.run(
-            ["git", "init", "-q", str(self.workspace)], check=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
         self.codex_home = root / "codex-home"
         self.codex_home.mkdir()
 
@@ -128,21 +125,49 @@ class WorkspaceFixture(unittest.TestCase):
 
 
 class WorkspaceSafetyTest(WorkspaceFixture):
-    def test_workspace_must_be_explicit_git_root(self) -> None:
+    def test_workspace_must_be_explicit_existing_directory(self) -> None:
         with self.assertRaisesRegex(InstallerError, "absolute"):
             validate_workspace("workspace", codex_home=str(self.codex_home))
-        child = self.workspace / "child"
+        missing = self.workspace / "missing"
+        with self.assertRaisesRegex(InstallerError, "existing"):
+            validate_workspace(str(missing), codex_home=str(self.codex_home))
+
+    def test_git_root_and_non_git_child_are_both_exact_targets(self) -> None:
+        subprocess.run(
+            ["git", "init", "-q", str(self.workspace)], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        root_paths = self.paths()
+        self.assertEqual(root_paths.workspace, self.workspace.resolve())
+        child = self.workspace / "non-git-codex-workspace"
         child.mkdir()
-        with self.assertRaisesRegex(InstallerError, "exact Git root"):
-            validate_workspace(str(child), codex_home=str(self.codex_home))
+        child_paths = validate_workspace(
+            str(child), codex_home=str(self.codex_home)
+        )
+        self.assertEqual(child_paths.workspace, child.resolve())
+        self.assertEqual(child_paths.config, child.resolve() / ".codex/config.toml")
+        with patch(
+            "marketcow.mcp_project_installer.verify_target",
+            return_value=verified(),
+        ):
+            install_or_upgrade(
+                child_paths, action="install", transport="http",
+                service_url="http://127.0.0.1:8790/mcp", stdio_command=None,
+                expected_version=None, dry_run=False,
+            )
+        self.assertTrue((child / ".codex/config.toml").is_file())
+        self.assertFalse((self.workspace / ".codex").exists())
 
     def test_home_and_codex_home_fail_closed(self) -> None:
         with self.assertRaisesRegex(InstallerError, "HOME"):
             validate_workspace(str(Path.home()))
-        subprocess.run(["git", "init", "-q", str(self.codex_home)], check=True)
         with self.assertRaisesRegex(InstallerError, "CODEX_HOME"):
             validate_workspace(
                 str(self.codex_home), codex_home=str(self.codex_home)
+            )
+        with self.assertRaisesRegex(InstallerError, "Codex config"):
+            validate_workspace(
+                str(Path.home() / ".codex"), codex_home=str(self.codex_home)
             )
 
     def test_non_writable_workspace_and_symlink_codex_dir_are_rejected(self) -> None:
@@ -159,6 +184,27 @@ class WorkspaceSafetyTest(WorkspaceFixture):
         with self.assertRaisesRegex(InstallerError, "real directory"):
             self.paths()
 
+    def test_symlink_config_escape_is_rejected(self) -> None:
+        codex = self.workspace / ".codex"
+        codex.mkdir()
+        outside = Path(self.temporary.name) / "outside.toml"
+        outside.write_text('[mcp_servers.foreign]\nurl = "http://example.test/mcp"\n')
+        (codex / "config.toml").symlink_to(outside)
+        with self.assertRaisesRegex(InstallerError, "regular file"):
+            self.install_for_safety_test()
+        self.assertIn("foreign", outside.read_text())
+
+    def install_for_safety_test(self) -> None:
+        with patch(
+            "marketcow.mcp_project_installer.verify_target",
+            return_value=verified(),
+        ):
+            install_or_upgrade(
+                self.paths(), action="install", transport="http",
+                service_url="http://127.0.0.1:8790/mcp", stdio_command=None,
+                expected_version=None, dry_run=False,
+            )
+
     def test_url_and_stdio_entry_are_strict(self) -> None:
         self.assertEqual(
             validate_service_url("http://127.0.0.1:8790/mcp/"),
@@ -172,6 +218,13 @@ class WorkspaceSafetyTest(WorkspaceFixture):
                 validate_service_url(invalid)
         with self.assertRaisesRegex(InstallerError, "absolute"):
             validate_stdio_command("marketcow-mcp")
+
+    def test_cli_help_allows_git_or_non_git_workspace(self) -> None:
+        help_text = build_parser()._subparsers._group_actions[0].choices[
+            "install"
+        ].format_help()
+        self.assertIn("Git metadata is optional", help_text)
+        self.assertNotIn("exact Git", help_text)
 
 
 class ManagedConfigTest(WorkspaceFixture):
@@ -396,6 +449,66 @@ class ProtocolVerificationTest(WorkspaceFixture):
             {".codex/config.toml"},
         )
         self.assertFalse(any(self.codex_home.iterdir()))
+
+    def test_non_git_workspace_full_lifecycle_preserves_investrace_bytes(self) -> None:
+        codex = self.workspace / ".codex"
+        codex.mkdir()
+        original = (
+            "# existing project configuration\n"
+            "[mcp_servers.investrace]\n"
+            'url = "http://127.0.0.1:8798/mcp"\n'
+            "enabled = true\n"
+        )
+        config = codex / "config.toml"
+        config.write_text(original)
+        parser = build_parser()
+
+        def invoke(*values: str):
+            arguments = parser.parse_args(list(values))
+            with patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home)}):
+                return run(arguments)
+
+        with mcp_http_server() as first_url, mcp_http_server() as second_url:
+            installed = invoke(
+                "install", "--workspace", str(self.workspace),
+                "--service-url", first_url, "--expected-version", "0.2.0",
+            )
+            unmanaged, _ = _without_managed_block(config.read_text())
+            self.assertEqual(unmanaged, original)
+            self.assertEqual(
+                tomllib.loads(config.read_text())["mcp_servers"]["investrace"]["url"],
+                "http://127.0.0.1:8798/mcp",
+            )
+            repeated = invoke(
+                "install", "--workspace", str(self.workspace),
+                "--service-url", first_url, "--expected-version", "0.2.0",
+            )
+            self.assertFalse(repeated["changed"])
+            upgraded = invoke(
+                "upgrade", "--workspace", str(self.workspace),
+                "--service-url", second_url, "--expected-version", "0.2.0",
+            )
+            self.assertTrue(upgraded["changed"])
+            verified_result = invoke(
+                "verify", "--workspace", str(self.workspace),
+                "--service-url", second_url, "--expected-version", "0.2.0",
+            )
+            self.assertFalse(verified_result["changed"])
+
+        removed = invoke("uninstall", "--workspace", str(self.workspace))
+        self.assertEqual(config.read_text(), original)
+        restored = invoke(
+            "restore", "--workspace", str(self.workspace),
+            "--backup", removed["backup"],
+        )
+        self.assertFalse(restored["config_removed"])
+        unmanaged, _ = _without_managed_block(config.read_text())
+        self.assertEqual(unmanaged, original)
+        invoke(
+            "restore", "--workspace", str(self.workspace),
+            "--backup", installed["backup"],
+        )
+        self.assertEqual(config.read_text(), original)
 
 
 if __name__ == "__main__":
