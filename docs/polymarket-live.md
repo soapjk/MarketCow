@@ -51,7 +51,14 @@ seconds, retry count, and current cursor; final evidence also includes bytes and
 SHA-256.
 
 Normalization begins only after the server terminates the cursor. The complete JSONL
-snapshot is content-addressed and atomically copied to raw evidence; the normalized
+snapshot is fsynced, content-addressed, and accompanied by a small verified-retry
+manifest that binds the endpoint, exact base parameters, spool schema/format,
+terminal completeness, row/page/byte counts, and SHA-256. If normalization or atomic
+publication then fails, the next refresh validates every bound field plus the local
+file size/hash and reuses that immutable spool. An incomplete, nonterminal, corrupt,
+wrong-endpoint, wrong-parameter, or wrong-schema spool fails explicitly and is never
+treated as complete. The retry marker is removed only after catalog publication
+succeeds. The snapshot is then atomically copied to raw evidence; the normalized
 catalog itself is streamed to immutable content-addressed JSONL. The small atomic
 `catalog.json` manifest binds its path, row count, SHA-256, catalog revision, and raw
 source evidence. Restart verifies both JSONL hashes and rebuilds typed markets one row
@@ -73,7 +80,11 @@ documentation (modified 2026-04-17) and `0.01` size increment to the official CL
 rounding config pinned at commit `b076b04d61135657e25dccc1bbd6866a96bd8c6e`;
 Gamma supplies the per-market time, tick, and minimum-size fields. A missing source
 field is published in `missing_fields`, never replaced by a business default, and
-causes `instrument_facts_incomplete`.
+causes `instrument_facts_incomplete`. The model validator and Gamma normalizer share
+one missing-field function. In particular, `activation_at >= expiration_at` is retained
+verbatim and adds `activation_expiration_interval`; MarketCow never swaps, adjusts, or
+invents either time. Fee effective intervals use the same shared rule and add
+`effective_interval` when `effective_from >= effective_to`.
 
 Binary complement and standard negative-risk relations are explicit, versioned, and
 source-backed. A standard negative-risk relation's `members` is only the
@@ -112,16 +123,20 @@ On startup and every reconnect:
 
 1. open a recovery gap and a new recovery ID;
 2. fetch full snapshots for every active token through batched `POST /books`;
-3. require every requested token to be present;
+3. account for every requested token as recovered or missing;
 4. validate decimal strings, tick alignment, non-crossed books, and nonnegative size;
 5. start a new content-addressed `book_epoch`; and
-6. resolve the gap only after all token snapshots are installed and checkpointed.
+6. resolve each token's gap only after its snapshot is installed and checkpointed.
 
 `POST /books` uses one persistent HTTP session, at most 500 token IDs per request,
 bounded per-batch 429/5xx retry/backoff, and progress evidence every 25 batches. The
 evidence reports requested token count, received books, elapsed time, retries, and
-batch coverage. A response traversal may finish, but recovery is not marked complete
-unless every active token appears; partial coverage therefore remains fail closed.
+batch coverage. Missing tokens retain unresolved `coverage_gap` entries and every
+affected market remains fail closed. They do not abort the collector or hide the
+catalog: markets whose two-token books and all typed facts are complete may become
+ready, while health reports `degraded`, `missing_book_token_count`, unresolved gaps,
+and the ready-market count. MarketCow never substitutes an empty book for a missing
+official response.
 
 `price_change.size` is an absolute level size. Zero removes the level. A full `book`
 replaces the state. MarketCow never manufactures a cancel, delta, or queue position.
@@ -228,8 +243,9 @@ PYTHONPATH=src .venv/bin/python scripts/run_polymarket_live.py \
   --catalog-progress-pages 25
 ```
 
-Use `--catalog-only` to validate discovery or `--bootstrap-only` to stop after complete
-REST recovery. Every REST `/books` request and WebSocket subscription message is
+Use `--catalog-only` to validate discovery or `--bootstrap-only` to stop after REST
+recovery (which may honestly report partial coverage). Every REST `/books` request and
+WebSocket subscription message is
 bounded to 500 tokens. Up to 32 WebSocket connections are used by default; all shards
 are distributed evenly across those connections and additional shards use the official
 dynamic subscribe operation. This bounds connection count without dropping catalog
@@ -262,7 +278,8 @@ PYTHONPATH=src .venv/bin/python scripts/capture_polymarket_public_data.py \
 
 - Gamma pagination incomplete or cursor loop: no catalog publication.
 - Gamma repeated/no-progress page or duplicate market ID: no catalog publication.
-- `/books` missing one active token: recovery remains failed and frames remain closed.
+- `/books` missing active tokens: affected frames remain closed; catalog/API and
+  independently complete markets remain available with degraded coverage health.
 - WebSocket disconnect: record coverage gap and require a new epoch/full recovery.
 - Rate limit or transient upstream failure: bounded retry/backoff; never synthesize.
 - Cursor outside retention: HTTP 409 and full consumer resynchronization.
