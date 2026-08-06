@@ -109,6 +109,9 @@ class Settings:
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
+        explicit_env = os.getenv("MARKETCOW_ENV_FILE", "").strip()
+        if explicit_env:
+            load_dotenv(Path(explicit_env).expanduser(), override=False)
         profile = (profile or os.getenv("MARKETCOW_PROFILE", "production")).strip().lower()
         if profile not in PROFILES:
             raise ValueError("MARKETCOW_PROFILE must be production, development or test")

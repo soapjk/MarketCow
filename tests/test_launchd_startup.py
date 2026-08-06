@@ -1,0 +1,152 @@
+import os
+import subprocess
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+LAUNCHD = ROOT / "ops" / "launchd"
+
+
+class LaunchdStartupTest(unittest.TestCase):
+    def test_shell_scripts_are_valid(self) -> None:
+        for name in (
+            "start-production.sh",
+            "ensure-production-storage.sh",
+            "install.sh",
+            "uninstall.sh",
+        ):
+            subprocess.run(["/bin/sh", "-n", str(LAUNCHD / name)], check=True)
+        compile(
+            (LAUNCHD / "run-production.py").read_text(),
+            str(LAUNCHD / "run-production.py"),
+            "exec",
+        )
+
+    def test_startup_bootstraps_storage_before_api(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            support = root / "support"
+            project = root / "project"
+            python = project / ".venv" / "bin" / "python"
+            log = root / "order.log"
+            support.mkdir()
+            python.parent.mkdir(parents=True)
+            (support / "start-production.sh").write_bytes(
+                (LAUNCHD / "start-production.sh").read_bytes()
+            )
+            self._write_executable(
+                support / "ensure-production-storage.sh",
+                f"#!/bin/sh\necho storage >> {log!s}\n",
+            )
+            self._write_executable(
+                python,
+                f"#!/bin/sh\necho api >> {log!s}\n",
+            )
+
+            subprocess.run(
+                ["/bin/sh", str(support / "start-production.sh")],
+                check=True,
+                env={**os.environ, "MARKETCOW_PROJECT_DIR": str(project)},
+            )
+
+            self.assertEqual(log.read_text().splitlines(), ["storage", "api"])
+
+    def test_storage_bootstrap_starts_missing_dependencies_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = root / "project"
+            postgres_bin = root / "postgres-bin"
+            fake_bin = root / "bin"
+            state = root / "state"
+            runtime = root / "runtime"
+            project.mkdir()
+            postgres_bin.mkdir()
+            fake_bin.mkdir()
+            state.mkdir()
+            # Application secrets may legally contain shell metacharacters. The
+            # storage bootstrap validates this file exists but never sources it.
+            (project / ".env.production").write_text(
+                "MARKETCOW_CLICKHOUSE_USERNAME=marketcow\n"
+                "MARKETCOW_CLICKHOUSE_PASSWORD='$1$literal'\n"
+            )
+            (root / "clickhouse.xml").write_text("<clickhouse/>\n")
+
+            self._write_executable(
+                postgres_bin / "initdb",
+                '#!/bin/sh\nwhile [ "$1" != "-D" ]; do shift; done\nmkdir -p "$2"\necho 17 > "$2/PG_VERSION"\n',
+            )
+            self._write_executable(
+                postgres_bin / "pg_isready",
+                '#!/bin/sh\n[ -f "$FAKE_STATE/postgres-ready" ]\n',
+            )
+            self._write_executable(
+                postgres_bin / "pg_ctl",
+                '#!/bin/sh\ntouch "$FAKE_STATE/postgres-ready"\necho postgres-start >> "$FAKE_LOG"\n',
+            )
+            self._write_executable(
+                postgres_bin / "psql",
+                '#!/bin/sh\n[ -f "$FAKE_STATE/database-ready" ] && echo 1\n',
+            )
+            self._write_executable(
+                postgres_bin / "createdb",
+                '#!/bin/sh\ntouch "$FAKE_STATE/database-ready"\necho database-create >> "$FAKE_LOG"\n',
+            )
+            clickhouse = fake_bin / "clickhouse"
+            self._write_executable(
+                clickhouse,
+                "#!/bin/sh\n"
+                "[ \"$MARKETCOW_CLICKHOUSE_PASSWORD\" = '$1$literal' ]\n"
+                'touch "$FAKE_STATE/clickhouse-ready"\n'
+                'echo clickhouse-start >> "$FAKE_LOG"\n',
+            )
+            self._write_executable(
+                fake_bin / "curl",
+                '#!/bin/sh\n[ -f "$FAKE_STATE/clickhouse-ready" ]\n',
+            )
+            log = root / "actions.log"
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "FAKE_STATE": str(state),
+                "FAKE_LOG": str(log),
+                "MARKETCOW_PROJECT_DIR": str(project),
+                "MARKETCOW_RUNTIME_DIR": str(runtime),
+                "MARKETCOW_POSTGRES_BIN": str(postgres_bin),
+                "MARKETCOW_CLICKHOUSE_BIN": str(clickhouse),
+                "MARKETCOW_CLICKHOUSE_CONFIG": str(root / "clickhouse.xml"),
+                "MARKETCOW_STORAGE_READY_INTERVAL": "0",
+            }
+
+            for _ in range(2):
+                subprocess.run(
+                    ["/bin/sh", str(LAUNCHD / "ensure-production-storage.sh")],
+                    check=True,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertEqual(
+                log.read_text().splitlines(),
+                ["postgres-start", "database-create", "clickhouse-start"],
+            )
+
+    def test_installer_copies_dependency_bootstrap_assets(self) -> None:
+        installer = (LAUNCHD / "install.sh").read_text()
+        self.assertIn('cp "$script_dir/ensure-production-storage.sh"', installer)
+        self.assertIn('cp "$script_dir/clickhouse-production.xml"', installer)
+        self.assertIn('cp "$project_dir/.env.production" "$target_env"', installer)
+        self.assertIn('cp "$script_dir/run-production.py" "$target_runner"', installer)
+        self.assertIn('until launchctl bootstrap "$domain" "$target_plist"', installer)
+
+    @staticmethod
+    def _write_executable(path: Path, content: str) -> None:
+        path.write_text(textwrap.dedent(content))
+        path.chmod(0o700)
+
+
+if __name__ == "__main__":
+    unittest.main()
