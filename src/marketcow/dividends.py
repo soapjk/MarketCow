@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from datetime import date
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Mapping
 
 from .instruments import canonical_instrument
 
@@ -326,5 +326,199 @@ def dividend_summary(
             "currency": previous_currencies[0] if len(previous_currencies) == 1 else None,
             "is_estimate_basis": True,
             "basis": "confirmed_announcements",
+        },
+    }
+
+
+def fund_dividend_history(
+    symbol: str,
+    date_from: str,
+    date_to: str,
+    yearly_results: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Build the provider-neutral fund cash-distribution read contract.
+
+    The inclusive filter uses the actual cash payment date. Events without a
+    payment date remain auditable in the underlying dividend contract but are
+    excluded from a payment-window total instead of being assigned a guessed
+    date.
+    """
+    normalized_symbol = normalize_dividend_symbol(symbol)
+    start = _iso_date(date_from, "from", required=True)
+    end = _iso_date(date_to, "to", required=True)
+    if start > end:
+        raise ValueError("from must be on or before to")
+
+    refresh_states: list[Dict[str, Any]] = []
+    events_by_id: Dict[str, Dict[str, Any]] = {}
+    excluded_missing_payment_date = 0
+    for result in yearly_results:
+        refresh_states.append({
+            "fiscal_year": int(result["fiscal_year"]),
+            "data_status": result.get("data_status"),
+            "refresh_status": result.get("refresh_status"),
+            "last_refreshed_at": result.get("last_refreshed_at"),
+            "query_source": result.get("query_source"),
+        })
+        for raw in result.get("announcements") or ():
+            row = dict(raw)
+            payment_date = row.get("payment_date")
+            if not payment_date:
+                excluded_missing_payment_date += 1
+                continue
+            payment_date = str(payment_date)
+            if not start <= payment_date <= end:
+                continue
+            payload = dict(row.get("payload_json") or row.get("payload") or {})
+            source_type = str(row.get("source_type") or "third_party")
+            event = {
+                "event_id": str(row.get("dividend_id") or ""),
+                "symbol": normalized_symbol,
+                "instrument_id": normalized_symbol,
+                "fund_name": payload.get("fund_name") or None,
+                "announcement_date": row.get("announcement_date") or None,
+                "record_date": row.get("record_date") or None,
+                "ex_date": row.get("ex_date") or None,
+                "payment_date": payment_date,
+                "amount_per_unit": format(
+                    Decimal(str(row["amount_per_share"])), "f"
+                ),
+                "currency": str(row.get("currency") or ""),
+                "dividend_type": payload.get("dividend_type") or "cash",
+                "event_status": row.get("event_status") or "active",
+                "source_url": row.get("source_url") or None,
+                "source_category": source_type,
+                "source_name": row.get("source_name") or None,
+                "source_document_id": row.get("source_document_id") or None,
+                "observed_at": row.get("observed_at") or None,
+                "ingested_at": row.get("ingested_at") or None,
+                "provenance": {
+                    "official": source_type in OFFICIAL_SOURCE_TYPES,
+                    "confirmation_status": row.get("confirmation_status"),
+                    "raw_artifact_id": row.get("raw_artifact_id") or None,
+                    "declared_amount": payload.get("declared_amount") or None,
+                    "declared_unit_count": payload.get("declared_unit_count") or None,
+                    "declared_unit": payload.get("declared_unit") or None,
+                },
+            }
+            identity = event["event_id"] or "|".join((
+                normalized_symbol,
+                payment_date,
+                event["amount_per_unit"],
+                event["currency"],
+            ))
+            existing = events_by_id.get(identity)
+            if existing is None or (
+                not existing["provenance"]["official"]
+                and event["provenance"]["official"]
+            ):
+                events_by_id[identity] = event
+
+    events = sorted(
+        events_by_id.values(),
+        key=lambda item: (item["payment_date"], item["event_id"]),
+    )
+    fund_names = sorted({
+        str(event["fund_name"]) for event in events if event["fund_name"]
+    })
+    official_count = sum(
+        bool(event["provenance"]["official"]) for event in events
+    )
+    third_party_count = len(events) - official_count
+    missing_fields = sum(
+        value is None
+        for event in events
+        for value in (
+            event["fund_name"], event["announcement_date"],
+            event["record_date"], event["ex_date"], event["payment_date"],
+            event["source_url"], event["source_name"],
+            event["source_document_id"], event["ingested_at"],
+        )
+    )
+    warnings: list[Dict[str, str]] = []
+    if not events:
+        warnings.append({
+            "code": "no_dividend_events",
+            "message": "No cash dividend with a payment date in the requested range.",
+        })
+    if third_party_count:
+        warnings.append({
+            "code": "third_party_evidence_present",
+            "message": "One or more events are not confirmed by an official source.",
+        })
+    if missing_fields or excluded_missing_payment_date:
+        warnings.append({
+            "code": "incomplete_event_fields",
+            "message": "One or more source documents omit a requested event field.",
+        })
+    degraded_freshness = any(
+        state.get("data_status") in {"stale", "refreshing", "cache_only"}
+        or str(state.get("refresh_status") or "").startswith("failed_")
+        for state in refresh_states
+    )
+    if degraded_freshness:
+        warnings.append({
+            "code": "degraded_freshness",
+            "message": "At least one payment year is stale, cache-only, or failed refresh.",
+        })
+    by_currency: Dict[str, Decimal] = {}
+    for event in events:
+        currency = event["currency"]
+        by_currency[currency] = by_currency.get(currency, Decimal("0")) + Decimal(
+            event["amount_per_unit"]
+        )
+    currencies = sorted(by_currency)
+    status = (
+        "incomplete" if not events and degraded_freshness
+        else "no_dividends" if not events
+        else "complete" if (
+            official_count == len(events) and not missing_fields
+            and not degraded_freshness
+        )
+        else "incomplete"
+    )
+    return {
+        "schema_version": "marketcow.fund_dividend_history.v1",
+        "symbol": normalized_symbol,
+        "instrument_id": normalized_symbol,
+        "fund_name": fund_names[0] if len(fund_names) == 1 else None,
+        "asset_type": "fund_or_etf",
+        "status": status,
+        "date_from": start,
+        "date_to": end,
+        "date_basis": "payment_date",
+        "event_count": len(events),
+        "events": events,
+        "aggregate": {
+            "amount_per_unit_total": (
+                format(by_currency[currencies[0]], "f")
+                if len(currencies) == 1 else None
+            ),
+            "currency": currencies[0] if len(currencies) == 1 else None,
+            "totals_by_currency": {
+                currency: format(by_currency[currency], "f")
+                for currency in currencies
+            },
+            "event_count": len(events),
+            "basis": "sum_of_cash_dividend_events_by_payment_date",
+            "yield": None,
+            "yield_note": (
+                "No dividend yield is inferred. A trailing yield requires an explicit "
+                "price and observation timestamp from the caller. Index or constituent "
+                "yield is not a fund cash distribution."
+            ),
+        },
+        "coverage": {
+            "status": status,
+            "official_event_count": official_count,
+            "third_party_event_count": third_party_count,
+            "missing_field_count": missing_fields,
+            "excluded_missing_payment_date_count": excluded_missing_payment_date,
+            "requested_date_from": start,
+            "requested_date_to": end,
+            "warnings": warnings,
+        },
+        "freshness": {
+            "years": sorted(refresh_states, key=lambda item: item["fiscal_year"]),
         },
     }

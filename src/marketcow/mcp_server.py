@@ -336,6 +336,21 @@ def create_tools(client: MarketCowClient) -> dict[str, Tool]:
             "fiscal_year": _bounded_int(arguments, "fiscal_year", 2025, 1991, 2100),
         })
 
+    def get_fund_dividend_history(arguments: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = _path_segment(arguments, "symbol")
+        refresh = arguments.get("refresh", True)
+        if not isinstance(refresh, bool):
+            raise ToolInputError("refresh must be a boolean")
+        return client.request(
+            "GET",
+            f"/v1/funds/{symbol}/dividends",
+            params={
+                "from": _required_string(arguments, "from"),
+                "to": _required_string(arguments, "to"),
+                "refresh": refresh,
+            },
+        )
+
     def get_exposure_facts(arguments: Mapping[str, Any]) -> dict[str, Any]:
         symbol = _path_segment(arguments, "symbol")
         return client.request(
@@ -487,6 +502,24 @@ def create_tools(client: MarketCowClient) -> dict[str, Tool]:
                 "fiscal_year": _integer("Fiscal year.", 1991, 2100),
             }, ("symbol", "fiscal_year")),
             get_dividends,
+        ),
+        Tool(
+            "get_fund_dividend_history",
+            "Get auditable fund or ETF cash-dividend events for an inclusive payment-date range. This never substitutes index or constituent yield for fund cash distributions.",
+            _object_schema({
+                "symbol": _string(
+                    "Canonical fund or ETF identifier such as 563020.XSHG."
+                ),
+                "from": _string("Inclusive payment-date start in YYYY-MM-DD."),
+                "to": _string("Inclusive payment-date end in YYYY-MM-DD."),
+                "refresh": {
+                    "type": "boolean",
+                    "description": "Refresh missing or stale official evidence.",
+                    "default": True,
+                },
+            }, ("symbol", "from", "to")),
+            get_fund_dividend_history,
+            open_world=True,
         ),
         Tool(
             "get_exposure_facts",

@@ -66,13 +66,15 @@ sent through a proxy.
 - `get_fundamental`
 - `get_financial_statements`
 - `get_dividends`
+- `get_fund_dividend_history`
 - `get_exposure_facts`
 - `search_convertible_bonds`
 - `get_convertible_bond`
 - `get_convertible_bond_market`
 
-Every tool is declared read-only and forces cached reads (`refresh=false`). Batch sizes and
-history page sizes are bounded to protect the agent context window. For reproducible
+Every tool is declared read-only. Quote and bar tools force cached reads; the fund dividend
+history tool exposes an explicit `refresh` switch and defaults to refreshing missing or stale
+official evidence through MarketCow. Batch sizes and history page sizes are bounded to protect the agent context window. For reproducible
 analysis, prefer `get_canonical_bars`, follow `next_cursor`, and retain the returned
 manifest, provenance, quality, and adjustment fields with the analysis.
 
@@ -81,3 +83,7 @@ runtime dependency. This preserves MarketCow's tested `httpx` constraint.
 
 Convertible-bond field contracts, scorer mapping and missing-value semantics are
 documented in [Convertible-Bond MCP v1](mcp-convertible-bonds.md).
+
+Fund and ETF cash-distribution fields, source precedence, date-window semantics, and the
+distinction from index dividend yield are documented in
+[Fund Dividend History v1](fund-dividend-history.md).
