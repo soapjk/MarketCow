@@ -75,32 +75,17 @@ def _publication_lock(root: Path, *, exclusive: bool):
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    gate = (root.resolve() / ".publication.gate.lock").open("a+b")
     stream = path.open("a+b")
-    fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
-    try:
-        fcntl.flock(
-            stream.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
-        )
-    except BaseException:
-        fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
-        gate.close()
-        stream.close()
-        raise
-    if not exclusive:
-        fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
-        gate.close()
-        gate = None
-    held[key] = ((stream, gate), 1, exclusive)
+    fcntl.flock(
+        stream.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+    )
+    held[key] = (stream, 1, exclusive)
     try:
         yield
     finally:
         held.pop(key, None)
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         stream.close()
-        if gate is not None:
-            fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
-            gate.close()
 
 
 def _instant(value: Any) -> datetime:
