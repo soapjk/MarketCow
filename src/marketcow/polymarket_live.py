@@ -4133,6 +4133,8 @@ class PolymarketLiveCollector:
         )
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
+        self._snapshot_refresh_idle = threading.Event()
+        self._snapshot_refresh_idle.set()
 
     def refresh_catalog(self) -> dict[str, Any]:
         rows, evidence = self.catalog_client.fetch_all()
@@ -4189,26 +4191,30 @@ class PolymarketLiveCollector:
 
     async def refresh_books(self, reason: str = "periodic_snapshot_refresh") -> str:
         """Refresh a healthy scope without exposing recovery-in-progress state."""
-        with self.store._sync_lock:
-            recovery_id = content_sha256({
-                "reason": reason,
-                "cursor": self.store.cursor,
-                "observed_at": self.store.now_provider().isoformat(),
-            })
-            tracker = self.store.new_book_recovery_tracker()
-
-        def consume(rows: list[dict[str, Any]]) -> None:
+        self._snapshot_refresh_idle.clear()
+        try:
             with self.store._sync_lock:
-                self.store.recover_book_batch(rows, recovery_id, tracker)
+                recovery_id = content_sha256({
+                    "reason": reason,
+                    "cursor": self.store.cursor,
+                    "observed_at": self.store.now_provider().isoformat(),
+                })
+                tracker = self.store.new_book_recovery_tracker()
 
-        await asyncio.to_thread(
-            self.books_client.fetch_stream,
-            sorted(self.store.token_to_market),
-            batch_consumer=consume,
-        )
-        with self.store._sync_lock:
-            self.store.complete_book_recovery(recovery_id, tracker)
-        return recovery_id
+            def consume(rows: list[dict[str, Any]]) -> None:
+                with self.store._sync_lock:
+                    self.store.recover_book_batch(rows, recovery_id, tracker)
+
+            await asyncio.to_thread(
+                self.books_client.fetch_stream,
+                sorted(self.store.token_to_market),
+                batch_consumer=consume,
+            )
+            with self.store._sync_lock:
+                self.store.complete_book_recovery(recovery_id, tracker)
+            return recovery_id
+        finally:
+            self._snapshot_refresh_idle.set()
 
     async def update_subscriptions(self) -> list[dict[str, Any]]:
         desired = set(self.store.token_to_market)
@@ -4287,6 +4293,7 @@ class PolymarketLiveCollector:
                 self.socket_tokens.pop(socket, None)
 
     def _apply_websocket(self, item: dict[str, Any]) -> None:
+        self._snapshot_refresh_idle.wait()
         with self.store._sync_lock:
             self.store.apply_websocket(item)
 

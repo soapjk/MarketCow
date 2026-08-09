@@ -1947,6 +1947,28 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
 
             self.assertEqual(refreshed_while_applying, [True])
 
+    def test_periodic_refresh_has_priority_over_new_websocket_publications(self):
+        with TemporaryDirectory() as folder:
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+            )
+            collector.store.apply_websocket = lambda _item: None
+            collector._snapshot_refresh_idle.clear()
+            applied = threading.Event()
+            thread = threading.Thread(
+                target=lambda: (
+                    collector._apply_websocket({"event_type": "unknown"}),
+                    applied.set(),
+                )
+            )
+            thread.start()
+            self.assertFalse(applied.wait(timeout=0.05))
+            collector._snapshot_refresh_idle.set()
+            self.assertTrue(applied.wait(timeout=1))
+            thread.join(timeout=1)
+
     def test_large_subscription_group_uses_bounded_connections_and_messages(self):
         with TemporaryDirectory() as folder:
             socket = FakeSocket([])
