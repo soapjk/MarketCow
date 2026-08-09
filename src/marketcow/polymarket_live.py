@@ -4273,8 +4273,7 @@ class PolymarketLiveCollector:
                         continue
                     payload = json.loads(message, parse_float=str, parse_int=str)
                     for item in payload if isinstance(payload, list) else [payload]:
-                        with self.store._sync_lock:
-                            self.store.apply_websocket(item)
+                        await asyncio.to_thread(self._apply_websocket, item)
                         consumed += 1
                         if (
                             self.catalog_refresh_on_lifecycle_events
@@ -4286,6 +4285,10 @@ class PolymarketLiveCollector:
             finally:
                 self.sockets.remove(socket)
                 self.socket_tokens.pop(socket, None)
+
+    def _apply_websocket(self, item: dict[str, Any]) -> None:
+        with self.store._sync_lock:
+            self.store.apply_websocket(item)
 
     async def run_once(self, *, message_limit: int | None = None) -> None:
         groups = self.planner.connection_groups(

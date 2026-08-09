@@ -1893,6 +1893,60 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             )
             self.assertIn("periodic_snapshot_refresh_failed", captured.output[0])
 
+    def test_websocket_publication_does_not_starve_periodic_refresh(self):
+        with TemporaryDirectory() as folder:
+            rows = [gamma_row()]
+            selected_market = GammaLiveNormalizer.normalize(rows, NOW)[0]
+            socket = FakeSocket([json.dumps({
+                "event_type": "book",
+                "asset_id": "yes-1",
+                "market": selected_market.identity.condition_id,
+                "timestamp": "1785739201000",
+                "tick_size": "0.01",
+                "bids": [{"price": "0.4", "size": "2"}],
+                "asks": [{"price": "0.6", "size": "2"}],
+            })])
+            store = LiveStateStore(Path(folder), now_provider=lambda: NOW)
+            store.replace_catalog([selected_market], rows)
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+                connector=lambda _url: SocketContext(socket),
+                snapshot_refresh_seconds=0.01,
+            )
+            applying = threading.Event()
+            release = threading.Event()
+            original_apply = store.apply_websocket
+
+            def slow_apply(item):
+                applying.set()
+                release.wait(timeout=1)
+                return original_apply(item)
+
+            store.apply_websocket = slow_apply
+            refreshed_while_applying = []
+
+            async def refresh(reason="startup"):
+                refreshed_while_applying.append(applying.is_set())
+                release.set()
+                return "recovery"
+
+            collector.refresh_books = refresh
+
+            async def scenario():
+                periodic = asyncio.create_task(
+                    collector._refresh_snapshots_periodically()
+                )
+                await collector._consume(["yes-1"], message_limit=1)
+                periodic.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await periodic
+
+            asyncio.run(scenario())
+
+            self.assertEqual(refreshed_while_applying, [True])
+
     def test_large_subscription_group_uses_bounded_connections_and_messages(self):
         with TemporaryDirectory() as folder:
             socket = FakeSocket([])
