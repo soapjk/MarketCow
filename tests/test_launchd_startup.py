@@ -152,6 +152,16 @@ class LaunchdStartupTest(unittest.TestCase):
         self.assertNotIn("/Volumes/T9/projects/marketcow/data-production", storage_script)
         self.assertNotIn("/Volumes/T9/projects/marketcow/data-production", clickhouse_config)
 
+    def test_launchd_uses_installed_environment_and_stable_locale(self) -> None:
+        plist = (LAUNCHD / "com.marketcow.production.plist").read_text()
+
+        self.assertIn(
+            "/Users/androidjk/Library/Application Support/MarketCow/production.env",
+            plist,
+        )
+        self.assertIn("<key>LC_ALL</key>", plist)
+        self.assertIn("<string>C</string>", plist)
+
     @staticmethod
     def _write_executable(path: Path, content: str) -> None:
         path.write_text(textwrap.dedent(content))
