@@ -3489,8 +3489,32 @@ class LiveStateStore:
                 and _instant(row.get("timestamp") or self.now_provider())
                 < previous.exchange_at
             ):
-                recovered.add(token_id)
-                continue
+                market = self._market_for_token(token_id)
+                tick = decimal_text(
+                    row.get("tick_size")
+                    or market.rules.instrument.price_increment,
+                    "tick_size",
+                    allow_zero=False,
+                )
+                bids = {
+                    item["price"]: item["size"]
+                    for item in _levels(row.get("bids"), "bids")
+                }
+                asks = {
+                    item["price"]: item["size"]
+                    for item in _levels(row.get("asks"), "asks")
+                }
+                if _state_checksum(token_id, tick, bids, asks) != (
+                    previous.state_checksum
+                ):
+                    recovered.add(token_id)
+                    continue
+                row = {
+                    **row,
+                    "timestamp": str(
+                        int(previous.exchange_at.timestamp() * 1000)
+                    ),
+                }
             market_id = self.token_to_market.get(token_id)
             market_token_ids = [
                 candidate
