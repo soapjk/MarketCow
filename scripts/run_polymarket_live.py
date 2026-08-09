@@ -70,7 +70,7 @@ def main() -> None:
         snapshot_refresh_seconds=arguments.snapshot_refresh_seconds,
         catalog_refresh_on_lifecycle_events=not bool(arguments.market_id),
         publish_checkpoints=not bool(arguments.market_id),
-        minimum_snapshot_refresh_age_seconds=(1.0 if arguments.market_id else 0),
+        minimum_snapshot_refresh_age_seconds=(0.5 if arguments.market_id else 0),
         max_concurrent_snapshot_refreshes=(4 if arguments.market_id else 1),
     )
     if arguments.market_id:
