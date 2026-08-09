@@ -60,9 +60,11 @@ wrong-endpoint, wrong-parameter, or wrong-schema spool fails explicitly and is n
 treated as complete. The retry marker is removed only after catalog publication
 succeeds. The snapshot is then atomically copied to raw evidence; the normalized
 catalog itself is streamed to immutable content-addressed JSONL. The small atomic
-`catalog.json` manifest binds its path, row count, SHA-256, catalog revision, and raw
-source evidence. Restart verifies both JSONL hashes and rebuilds typed markets one row
-at a time, avoiding a second giant parsed raw catalog. Catalog revision, source
+`catalog.json` manifest binds its path, row count, SHA-256, catalog revision, raw
+source evidence, and an immutable SQLite offset index. The index stores every market
+row's byte offset, length and SHA-256 plus its reversible token mapping. Scoped readers
+seek and validate only selected rows; explicit full recovery still verifies both JSONL
+hashes and rebuilds typed markets one row at a time. Catalog revision, source
 hash/count/format, token map, and the catalog-revision event are swapped only after all
 validation succeeds. An exception or process restart during pagination sees the
 previous complete revision, never a mixture with the temporary spool.
@@ -166,7 +168,7 @@ strings in the normalized payload.
 All endpoints are local MarketCow reads and appear in OpenAPI:
 
 ```text
-GET /v1/prediction-markets/polymarket/live/bootstrap
+GET /v1/prediction-markets/polymarket/live/bootstrap?market_id=m1&market_id=m2
 GET /v1/prediction-markets/polymarket/live/snapshot?market_id=m1&market_id=m2
 GET /v1/prediction-markets/polymarket/live/events?after_cursor=123&limit=1000
 GET /v1/prediction-markets/polymarket/live/checkpoint
@@ -175,10 +177,13 @@ GET /v1/prediction-markets/polymarket/live/gaps?unresolved_only=true
 GET /v1/prediction-markets/polymarket/live/public-data/{kind}
 ```
 
-Bootstrap contains the complete canonical catalog, typed instrument/fee facts,
-relations/pairs, catalog revision, active token list, current cursor, sequence
-semantics, and recovery contract. Snapshot contains one `MarketFrame` per requested
-market. Every frame returns exactly the two books for its binary complete set. A
+Bootstrap requires 1–100 explicit `market_id` values and returns those canonical
+markets, typed instrument/fee facts, relations/pairs, catalog revision, active tokens,
+sequence semantics, and recovery contract. An unscoped request returns
+`polymarket_full_universe_disabled`; missing/legacy indexes return a machine-readable
+503 and index/row integrity failures return 409. During the catalog-index migration
+stage, snapshot/events/checkpoint/gaps remain fail closed until the durable latest-state
+and event-offset indexes are published. A
 standard negative-risk frame additionally returns every YES-member book and the exact
 pair metadata needed to verify its corresponding NO instrument. Frame revisions bind
 the instrument facts and fee schedule.
@@ -208,11 +213,11 @@ both must use the exact same local root:
 <MarketCow storage_root>/prediction-markets/polymarket-live
 ```
 
-Before every bootstrap, snapshot, events, checkpoint, health, or gaps response, FastAPI
-checks the atomic catalog/checkpoint identities and tails only complete newly fsynced
-JSONL records. A checkpoint change triggers deterministic rebuild from that checkpoint
-plus its verified successor events. Thus a collector that writes after FastAPI startup
-becomes visible without process restart, shared memory, or polling an upstream source.
+FastAPI construction and lightweight live health never deserialize the full catalog or
+replay the event log. Scoped bootstrap opens the immutable catalog index read-only and
+performs bounded offset reads. The collector remains the only writer. The forthcoming
+latest-state/event-offset index will expose snapshot and resume through the same
+bounded model; until then those endpoints never fall back to the full in-memory tailer.
 Multiple concurrent collector writers are not supported.
 
 Every event ID covers the entire envelope, including applied/failure semantics and gap
@@ -252,6 +257,14 @@ dynamic subscribe operation. This bounds connection count without dropping catal
 coverage. Every socket sends `custom_feature_enabled=true`, sends `PING` every ten
 seconds, handles `PONG`, and supports dynamic subscribe/unsubscribe messages. Both the
 message size and connection ceiling are configurable locally.
+
+For an existing verified legacy catalog, build and atomically attach its offset index
+without contacting an upstream source:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/build_polymarket_live_catalog_index.py \
+  --root '<MarketCow storage_root>/prediction-markets/polymarket-live'
+```
 
 On 2026-08-04, a local read-only traversal of the real `closed=false` keyset completed
 only after 1,270 pages and 126,981 markets. It took 700.262 seconds with zero retries,

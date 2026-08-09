@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
+from urllib.parse import quote
 
 import requests
 import websockets
@@ -179,6 +180,202 @@ def _market_sequence_sha256(markets: list[LiveMarket]) -> str:
     return digest.hexdigest()
 
 
+CATALOG_INDEX_SCHEMA_VERSION = "marketcow.polymarket.catalog-index.v1"
+LIVE_READ_SCHEMA_VERSION = "marketcow.polymarket.live-read-health.v1"
+
+
+def _readonly_sqlite(path: Path) -> sqlite3.Connection:
+    uri = f"file:{quote(str(path), safe='/')}?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _catalog_index_metadata(connection: sqlite3.Connection) -> dict[str, str]:
+    return {
+        str(row["key"]): str(row["value"])
+        for row in connection.execute("SELECT key, value FROM metadata")
+    }
+
+
+def _write_catalog_index(
+    path: Path,
+    *,
+    revision: str,
+    catalog_sha256: str,
+    rows: Iterable[tuple[LiveMarket, bytes]],
+    expected_market_count: int,
+) -> dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    token_count = 0
+    market_count = 0
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        with sqlite3.connect(temporary) as connection:
+            connection.executescript("""
+                PRAGMA journal_mode=DELETE;
+                PRAGMA synchronous=FULL;
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE markets (
+                    market_id TEXT PRIMARY KEY,
+                    byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
+                    byte_length INTEGER NOT NULL CHECK(byte_length > 0),
+                    row_sha256 TEXT NOT NULL,
+                    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                    closed INTEGER NOT NULL CHECK(closed IN (0, 1)),
+                    catalog_revision TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE tokens (
+                    token_id TEXT PRIMARY KEY,
+                    market_id TEXT NOT NULL,
+                    outcome_label TEXT NOT NULL,
+                    FOREIGN KEY(market_id) REFERENCES markets(market_id)
+                ) WITHOUT ROWID;
+                CREATE INDEX tokens_market_id ON tokens(market_id, token_id);
+            """)
+            offset = 0
+            for market, body in rows:
+                market_count += 1
+                market_id = market.identity.market_id
+                connection.execute(
+                    """INSERT INTO markets(
+                        market_id, byte_offset, byte_length, row_sha256,
+                        active, closed, catalog_revision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        market_id, offset, len(body), hashlib.sha256(body).hexdigest(),
+                        int(market.active), int(market.closed), revision,
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO tokens(token_id, market_id, outcome_label) VALUES (?, ?, ?)",
+                    [
+                        (outcome.token_id, market_id, outcome.outcome)
+                        for outcome in market.identity.outcomes
+                    ],
+                )
+                token_count += len(market.identity.outcomes)
+                offset += len(body) + 1
+            if market_count != expected_market_count:
+                raise RuntimeError("live catalog index row count mismatch")
+            metadata = {
+                "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+                "catalog_revision": revision,
+                "catalog_sha256": catalog_sha256,
+                "market_count": str(market_count),
+                "token_count": str(token_count),
+            }
+            connection.executemany(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                sorted(metadata.items()),
+            )
+            connection.commit()
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+    index_sha256 = _file_sha256(path)
+    with _readonly_sqlite(path) as connection:
+        observed = _catalog_index_metadata(connection)
+        observed_markets = connection.execute(
+            "SELECT COUNT(*) FROM markets"
+        ).fetchone()[0]
+        observed_tokens = connection.execute(
+            "SELECT COUNT(*) FROM tokens"
+        ).fetchone()[0]
+    if (
+        observed.get("schema_version") != CATALOG_INDEX_SCHEMA_VERSION
+        or observed.get("catalog_revision") != revision
+        or observed.get("catalog_sha256") != catalog_sha256
+        or int(observed.get("market_count", "-1")) != market_count
+        or int(observed.get("token_count", "-1")) != token_count
+        or observed_markets != market_count
+        or observed_tokens != token_count
+    ):
+        raise RuntimeError("live catalog index integrity failed before publication")
+    return {
+        "format": "sqlite-offset-v1",
+        "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+        "path": str(path),
+        "sha256": index_sha256,
+        "catalog_revision": revision,
+        "catalog_sha256": catalog_sha256,
+        "market_count": market_count,
+        "token_count": token_count,
+    }
+
+
+def _reuse_catalog_index(
+    path: Path,
+    *,
+    revision: str,
+    catalog_sha256: str,
+    rows: list[tuple[LiveMarket, bytes]],
+) -> dict[str, Any]:
+    try:
+        with _readonly_sqlite(path) as connection:
+            metadata = _catalog_index_metadata(connection)
+            indexed_markets = {
+                str(row["market_id"]): row
+                for row in connection.execute("SELECT * FROM markets")
+            }
+            indexed_tokens = {
+                (str(row["token_id"]), str(row["market_id"]), str(row["outcome_label"]))
+                for row in connection.execute(
+                    "SELECT token_id, market_id, outcome_label FROM tokens"
+                )
+            }
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError("existing live catalog index is invalid") from exc
+    offset = 0
+    expected_tokens = set()
+    for market, body in rows:
+        market_id = market.identity.market_id
+        indexed = indexed_markets.get(market_id)
+        if indexed is None or (
+            int(indexed["byte_offset"]) != offset
+            or int(indexed["byte_length"]) != len(body)
+            or indexed["row_sha256"] != hashlib.sha256(body).hexdigest()
+            or indexed["catalog_revision"] != revision
+        ):
+            raise RuntimeError("existing live catalog index row binding mismatch")
+        expected_tokens.update(
+            (outcome.token_id, market_id, outcome.outcome)
+            for outcome in market.identity.outcomes
+        )
+        offset += len(body) + 1
+    if (
+        metadata.get("schema_version") != CATALOG_INDEX_SCHEMA_VERSION
+        or metadata.get("catalog_revision") != revision
+        or metadata.get("catalog_sha256") != catalog_sha256
+        or int(metadata.get("market_count", "-1")) != len(rows)
+        or indexed_tokens != expected_tokens
+    ):
+        raise RuntimeError("existing live catalog index metadata mismatch")
+    return {
+        "format": "sqlite-offset-v1",
+        "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+        "path": str(path),
+        "sha256": _file_sha256(path),
+        "catalog_revision": revision,
+        "catalog_sha256": catalog_sha256,
+        "market_count": len(rows),
+        "token_count": len(expected_tokens),
+    }
+
+
 def _atomic_write_catalog(
     path: Path,
     *,
@@ -189,11 +386,13 @@ def _atomic_write_catalog(
     normalized_root = path.parent / "catalogs"
     normalized_root.mkdir(parents=True, exist_ok=True)
     normalized_path = normalized_root / f"{revision}.jsonl"
+    normalized_rows = [
+        (market, canonical_json(market.model_dump(mode="json")))
+        for market in markets
+    ]
     normalized_hasher = hashlib.sha256()
-    for market in markets:
-        normalized_hasher.update(
-            canonical_json(market.model_dump(mode="json")) + b"\n"
-        )
+    for _, body in normalized_rows:
+        normalized_hasher.update(body + b"\n")
     expected_normalized_sha256 = normalized_hasher.hexdigest()
     temporary = None
     if not normalized_path.exists():
@@ -202,8 +401,8 @@ def _atomic_write_catalog(
                 dir=normalized_root, delete=False,
             ) as stream:
                 temporary = Path(stream.name)
-                for market in markets:
-                    stream.write(canonical_json(market.model_dump(mode="json")) + b"\n")
+                for _, body in normalized_rows:
+                    stream.write(body + b"\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, normalized_path)
@@ -218,13 +417,92 @@ def _atomic_write_catalog(
         "path": str(normalized_path),
         "sha256": expected_normalized_sha256,
     }
+    index_path = path.parent / "catalog-indexes" / f"{revision}.sqlite3"
+    if index_path.exists():
+        catalog_index = _reuse_catalog_index(
+            index_path,
+            revision=revision,
+            catalog_sha256=expected_normalized_sha256,
+            rows=normalized_rows,
+        )
+    else:
+        catalog_index = _write_catalog_index(
+            index_path,
+            revision=revision,
+            catalog_sha256=expected_normalized_sha256,
+            rows=normalized_rows,
+            expected_market_count=len(normalized_rows),
+        )
     _atomic_write(path, canonical_json({
         "catalog_revision": revision,
         "catalog_source": source,
+        "catalog_index": catalog_index,
         "normalized_catalog": normalized,
         "schema_version": LIVE_SCHEMA_VERSION,
     }))
     return normalized
+
+
+def build_live_catalog_index(root: Path) -> dict[str, Any]:
+    """Build and atomically publish an offset index for one verified legacy catalog."""
+    root = root.resolve()
+    manifest_path = root / "catalog.json"
+    normalized_root = root / "catalogs"
+    index_root = root / "catalog-indexes"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("live catalog manifest is unavailable or invalid") from exc
+    normalized = payload.get("normalized_catalog")
+    if not isinstance(normalized, dict):
+        raise RuntimeError("live catalog lacks normalized JSONL metadata")
+    normalized_path = Path(str(normalized.get("path") or "")).resolve()
+    if not normalized_path.is_relative_to(normalized_root):
+        raise RuntimeError("normalized live catalog escapes local storage root")
+    expected_sha256 = str(normalized.get("sha256") or "")
+    expected_count = int(normalized.get("market_count") or -1)
+    revision = str(payload.get("catalog_revision") or "")
+    if not normalized_path.is_file() or _file_sha256(normalized_path) != expected_sha256:
+        raise RuntimeError("normalized live catalog integrity failed")
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    count = 0
+    with normalized_path.open("rb") as stream:
+        for line in stream:
+            body = line.removesuffix(b"\n")
+            if not body:
+                continue
+            market = LiveMarket.model_validate_json(body)
+            canonical = canonical_json(market.model_dump(mode="json"))
+            if canonical != body:
+                raise RuntimeError("normalized live catalog row is not canonical")
+            if count:
+                digest.update(b",")
+            digest.update(body)
+            count += 1
+    digest.update(b"]")
+    if count != expected_count or digest.hexdigest() != revision:
+        raise RuntimeError("live catalog revision or row count mismatch")
+
+    def rows() -> Iterable[tuple[LiveMarket, bytes]]:
+        with normalized_path.open("rb") as stream:
+            for line in stream:
+                body = line.removesuffix(b"\n")
+                if body:
+                    yield LiveMarket.model_validate_json(body), body
+
+    index_path = index_root / f"{revision}.sqlite3"
+    catalog_index = _write_catalog_index(
+        index_path,
+        revision=revision,
+        catalog_sha256=expected_sha256,
+        rows=rows(),
+        expected_market_count=expected_count,
+    )
+    payload["catalog_index"] = catalog_index
+    _atomic_write(manifest_path, canonical_json(payload))
+    return catalog_index
 
 
 class LiveFactProvenance(BaseModel):
@@ -564,6 +842,283 @@ class PublicDataPage(BaseModel):
     kind: Literal["trades", "activity", "positions", "holders"]
     count: int = Field(ge=0)
     items: list[dict[str, Any]]
+
+
+class LiveReadHealth(BaseModel):
+    schema_version: Literal[
+        "marketcow.polymarket.live-read-health.v1"
+    ] = LIVE_READ_SCHEMA_VERSION
+    status: Literal[
+        "not_configured", "legacy_unindexed", "index_ready",
+        "degraded", "integrity_failed",
+    ]
+    catalog_revision: str | None = None
+    catalog_index_ready: bool = False
+    latest_state_ready: bool = False
+    market_count: int = Field(default=0, ge=0)
+    token_count: int = Field(default=0, ge=0)
+    latest_cursor: int = Field(default=0, ge=0)
+    reason_codes: list[str] = Field(default_factory=list)
+    source_policy: Literal["official_free_only"] = "official_free_only"
+
+
+class PolymarketLiveReadError(RuntimeError):
+    def __init__(self, code: str, message: str, status_code: int):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
+class PolymarketLiveReadStore:
+    """Bounded, provider-neutral reads over immutable live indexes."""
+
+    max_scope_markets = 100
+
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        self.catalog_path = self.root / "catalog.json"
+        self.normalized_catalog_root = self.root / "catalogs"
+        self.catalog_index_root = self.root / "catalog-indexes"
+        self._binding_cache: tuple[
+            str, tuple[int, int], dict[str, Any], Path, Path, dict[str, str]
+        ] | None = None
+
+    def _manifest_binding(
+        self,
+    ) -> tuple[dict[str, Any], Path, Path, dict[str, str]]:
+        if not self.catalog_path.exists():
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_index_unavailable",
+                "Polymarket live catalog is not configured",
+                503,
+            )
+        try:
+            manifest_body = self.catalog_path.read_bytes()
+            manifest_sha256 = hashlib.sha256(manifest_body).hexdigest()
+            payload = json.loads(manifest_body)
+        except (OSError, ValueError) as exc:
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket live catalog manifest is invalid",
+                409,
+            ) from exc
+        normalized = payload.get("normalized_catalog")
+        catalog_index = payload.get("catalog_index")
+        if not isinstance(normalized, dict):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket live catalog lacks normalized metadata",
+                409,
+            )
+        if not isinstance(catalog_index, dict):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_index_unavailable",
+                "Polymarket live catalog is legacy and has no offset index",
+                503,
+            )
+        normalized_path = Path(str(normalized.get("path") or "")).resolve()
+        index_path = Path(str(catalog_index.get("path") or "")).resolve()
+        if not normalized_path.is_relative_to(self.normalized_catalog_root):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Normalized catalog escapes the live storage root",
+                409,
+            )
+        if not index_path.is_relative_to(self.catalog_index_root):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Catalog index escapes the live storage root",
+                409,
+            )
+        if not normalized_path.is_file() or not index_path.is_file():
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_index_unavailable",
+                "Polymarket catalog or index file is missing",
+                503,
+            )
+        index_stat = index_path.stat()
+        index_signature = (index_stat.st_size, index_stat.st_mtime_ns)
+        if self._binding_cache is not None:
+            cached_manifest, cached_index, *cached_binding = self._binding_cache
+            if (
+                cached_manifest == manifest_sha256
+                and cached_index == index_signature
+            ):
+                cached_payload, cached_normalized, cached_path, cached_metadata = (
+                    cached_binding
+                )
+                return (
+                    cached_payload, cached_normalized, cached_path, cached_metadata,
+                )
+        if _file_sha256(index_path) != catalog_index.get("sha256"):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog index hash mismatch",
+                409,
+            )
+        try:
+            with _readonly_sqlite(index_path) as connection:
+                metadata = _catalog_index_metadata(connection)
+        except sqlite3.DatabaseError as exc:
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog index is not readable",
+                409,
+            ) from exc
+        revision = str(payload.get("catalog_revision") or "")
+        expected = {
+            "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+            "catalog_revision": revision,
+            "catalog_sha256": str(normalized.get("sha256") or ""),
+            "market_count": str(normalized.get("market_count") or ""),
+        }
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog manifest and index binding disagree",
+                409,
+            )
+        self._binding_cache = (
+            manifest_sha256, index_signature, payload, normalized_path,
+            index_path, metadata,
+        )
+        return payload, normalized_path, index_path, metadata
+
+    @staticmethod
+    def _scope(market_ids: Iterable[str]) -> list[str]:
+        selected = list(dict.fromkeys(str(item).strip() for item in market_ids))
+        if not selected or any(not item for item in selected):
+            raise PolymarketLiveReadError(
+                "polymarket_market_scope_required",
+                "At least one non-empty market_id is required",
+                400,
+            )
+        if len(selected) > PolymarketLiveReadStore.max_scope_markets:
+            raise PolymarketLiveReadError(
+                "polymarket_scope_too_large",
+                "At most 100 distinct market_id values may be requested",
+                400,
+            )
+        return selected
+
+    def bootstrap(self, market_ids: Iterable[str]) -> LiveBootstrapResponse:
+        selected_ids = self._scope(market_ids)
+        payload, normalized_path, index_path, _ = self._manifest_binding()
+        placeholders = ",".join("?" for _ in selected_ids)
+        try:
+            with _readonly_sqlite(index_path) as connection:
+                indexed_rows = {
+                    str(row["market_id"]): row
+                    for row in connection.execute(
+                        f"""SELECT market_id, byte_offset, byte_length, row_sha256
+                            FROM markets WHERE market_id IN ({placeholders})""",
+                        selected_ids,
+                    )
+                }
+                token_rows = list(connection.execute(
+                    f"""SELECT token_id, market_id, outcome_label
+                        FROM tokens WHERE market_id IN ({placeholders})
+                        ORDER BY market_id, token_id""",
+                    selected_ids,
+                ))
+        except sqlite3.DatabaseError as exc:
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog index query failed",
+                409,
+            ) from exc
+        missing = [market_id for market_id in selected_ids if market_id not in indexed_rows]
+        if missing:
+            raise PolymarketLiveReadError(
+                "polymarket_live_market_not_found",
+                f"Unknown Polymarket live market_id: {missing[0]}",
+                404,
+            )
+        markets = []
+        with normalized_path.open("rb") as stream:
+            for market_id in selected_ids:
+                indexed = indexed_rows[market_id]
+                stream.seek(int(indexed["byte_offset"]))
+                body = stream.read(int(indexed["byte_length"]))
+                delimiter = stream.read(1)
+                if (
+                    delimiter != b"\n"
+                    or hashlib.sha256(body).hexdigest() != indexed["row_sha256"]
+                ):
+                    raise PolymarketLiveReadError(
+                        "polymarket_catalog_row_integrity_failed",
+                        f"Catalog row integrity failed for market_id {market_id}",
+                        409,
+                    )
+                try:
+                    market = LiveMarket.model_validate_json(body)
+                except ValueError as exc:
+                    raise PolymarketLiveReadError(
+                        "polymarket_catalog_row_integrity_failed",
+                        f"Catalog row schema failed for market_id {market_id}",
+                        409,
+                    ) from exc
+                if market.identity.market_id != market_id:
+                    raise PolymarketLiveReadError(
+                        "polymarket_catalog_row_integrity_failed",
+                        f"Catalog row identity failed for market_id {market_id}",
+                        409,
+                    )
+                markets.append(market)
+        expected_tokens = sorted(
+            (outcome.token_id, market.identity.market_id, outcome.outcome)
+            for market in markets for outcome in market.identity.outcomes
+        )
+        observed_tokens = sorted(
+            (str(row["token_id"]), str(row["market_id"]), str(row["outcome_label"]))
+            for row in token_rows
+        )
+        if expected_tokens != observed_tokens:
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog token index disagrees with selected rows",
+                409,
+            )
+        return LiveBootstrapResponse(
+            catalog_revision=str(payload["catalog_revision"]),
+            catalog_source=payload.get("catalog_source"),
+            cursor=0,
+            markets=markets,
+            active_token_ids=sorted(
+                outcome.token_id
+                for market in markets if market.active and not market.closed
+                for outcome in market.identity.outcomes
+            ),
+            sequence_semantics="deterministic_normalized",
+            recovery={
+                "bootstrap": "CLOB POST /books full snapshots",
+                "disconnect": "new book_epoch followed by full /books recovery",
+                "resume": "state index required before event resume",
+            },
+            source_policy="official_free_only",
+        )
+
+    def health(self) -> LiveReadHealth:
+        if not self.catalog_path.exists():
+            return LiveReadHealth(status="not_configured")
+        try:
+            _, _, _, metadata = self._manifest_binding()
+        except PolymarketLiveReadError as exc:
+            status = (
+                "legacy_unindexed"
+                if exc.code == "polymarket_catalog_index_unavailable"
+                else "integrity_failed"
+            )
+            return LiveReadHealth(status=status, reason_codes=[exc.code])
+        return LiveReadHealth(
+            status="index_ready",
+            catalog_revision=metadata["catalog_revision"],
+            catalog_index_ready=True,
+            latest_state_ready=False,
+            market_count=int(metadata["market_count"]),
+            token_count=int(metadata["token_count"]),
+            reason_codes=["polymarket_latest_state_index_unavailable"],
+        )
 
 
 class GammaCatalogRows:

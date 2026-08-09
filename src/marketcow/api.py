@@ -77,8 +77,10 @@ from .polymarket_live import (
     LiveCheckpoint,
     LiveEventPage,
     LiveGapPage,
-    LiveHealth,
+    LiveReadHealth,
     LiveSnapshotPage,
+    PolymarketLiveReadError,
+    PolymarketLiveReadStore,
     LiveStateStore,
     PUBLIC_DATA_KINDS,
     PublicDataPage,
@@ -538,6 +540,8 @@ def create_app(
         settings.storage_root / "prediction-markets" / "polymarket-live"
     )
     app.state.polymarket_live = polymarket_live
+    polymarket_live_read = PolymarketLiveReadStore(polymarket_live.root)
+    app.state.polymarket_live_read = polymarket_live_read
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None
     if history_repository is not None and all(hasattr(history_repository, name) for name in (
@@ -1220,14 +1224,19 @@ def create_app(
                 "message": str(exc),
             }) from exc
 
-    def _sync_polymarket_live() -> None:
-        try:
-            polymarket_live.sync()
-        except RuntimeError as exc:
+    def _raise_polymarket_read_error(exc: PolymarketLiveReadError) -> None:
+        raise HTTPException(status_code=exc.status_code, detail={
+            "code": exc.code,
+            "message": str(exc),
+        }) from exc
+
+    def _require_polymarket_scope(market_id: list[str] | None) -> list[str]:
+        if not market_id:
             raise HTTPException(status_code=409, detail={
-                "code": "polymarket_live_integrity_failed",
-                "message": str(exc),
-            }) from exc
+                "code": "polymarket_full_universe_disabled",
+                "message": "Use one or more market_id values for bounded reads",
+            })
+        return market_id
 
     @app.get(
         "/v1/prediction-markets/polymarket/datasets/{dataset_id}/bootstrap",
@@ -1289,30 +1298,15 @@ def create_app(
         response_model=LiveBootstrapResponse,
         summary="Read the provider-neutral Polymarket live catalog and resume contract",
     )
-    def polymarket_live_bootstrap():
-        _sync_polymarket_live()
-        return {
-            "contract_version": "marketcow.prediction_market.v1",
-            "schema_version": "marketcow.polymarket.live-bootstrap.v2",
-            "catalog_revision": polymarket_live.catalog_revision,
-            "catalog_source": polymarket_live.catalog_source,
-            "cursor": polymarket_live.cursor,
-            "markets": [
-                market.model_dump(mode="json")
-                for market in sorted(
-                    polymarket_live.catalog.values(),
-                    key=lambda item: item.identity.market_id,
-                )
-            ],
-            "active_token_ids": sorted(polymarket_live.token_to_market),
-            "sequence_semantics": "deterministic_normalized",
-            "recovery": {
-                "bootstrap": "CLOB POST /books full snapshots",
-                "disconnect": "new book_epoch followed by full /books recovery",
-                "resume": "use events.after_cursor while retained; otherwise refetch bootstrap/snapshot",
-            },
-            "source_policy": "official_free_only",
-        }
+    def polymarket_live_bootstrap(
+        market_id: list[str] | None = Query(default=None),
+    ):
+        try:
+            return polymarket_live_read.bootstrap(
+                _require_polymarket_scope(market_id)
+            ).model_dump(mode="json")
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/snapshot",
@@ -1322,22 +1316,11 @@ def create_app(
     def polymarket_live_snapshot(
         market_id: list[str] | None = Query(default=None),
     ):
-        _sync_polymarket_live()
-        selected = market_id or sorted(set(polymarket_live.token_to_market.values()))
-        try:
-            frames = [polymarket_live.frame(item) for item in selected]
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail={
-                "code": "polymarket_live_market_not_found",
-                "market_id": str(exc.args[0]),
-            }) from exc
-        return {
-            "schema_version": "marketcow.polymarket.live-snapshot.v2",
-            "catalog_revision": polymarket_live.catalog_revision,
-            "cursor": polymarket_live.cursor,
-            "count": len(frames),
-            "items": [frame.model_dump(mode="json") for frame in frames],
-        }
+        _require_polymarket_scope(market_id)
+        raise HTTPException(status_code=503, detail={
+            "code": "polymarket_latest_state_index_unavailable",
+            "message": "Scoped snapshots require the durable latest-state index",
+        })
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/events",
@@ -1345,25 +1328,15 @@ def create_app(
         summary="Resume provider-neutral Polymarket live events after a cursor",
     )
     def polymarket_live_events(
-        after_cursor: int = Query(0, ge=0), limit: int = Query(1000, ge=1, le=10000),
+        after_cursor: int = Query(0, ge=0),
+        limit: int = Query(1000, ge=1, le=10000),
+        market_id: list[str] | None = Query(default=None),
     ):
-        _sync_polymarket_live()
-        try:
-            items, has_more = polymarket_live.events_after(after_cursor, limit)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail={
-                "code": "polymarket_live_resume_cursor_expired",
-                "message": str(exc),
-                "recovery": "refetch live/bootstrap and live/snapshot",
-            }) from exc
-        next_cursor = items[-1].cursor if items else after_cursor
-        return {
-            "schema_version": "marketcow.polymarket.live-events.v2",
-            "after_cursor": after_cursor,
-            "next_cursor": next_cursor,
-            "has_more": has_more,
-            "items": [item.model_dump(mode="json") for item in items],
-        }
+        _require_polymarket_scope(market_id)
+        raise HTTPException(status_code=503, detail={
+            "code": "polymarket_event_index_unavailable",
+            "message": "Scoped event resume requires the durable event-offset index",
+        })
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/checkpoint",
@@ -1371,17 +1344,18 @@ def create_app(
         summary="Read a content-addressed Polymarket live checkpoint",
     )
     def polymarket_live_checkpoint():
-        _sync_polymarket_live()
-        return polymarket_live.checkpoint_payload().model_dump(mode="json")
+        raise HTTPException(status_code=503, detail={
+            "code": "polymarket_latest_state_index_unavailable",
+            "message": "Checkpoint reads require the durable latest-state index",
+        })
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/health",
-        response_model=LiveHealth,
+        response_model=LiveReadHealth,
         summary="Read live source coverage, lag, and gap health",
     )
     def polymarket_live_health():
-        _sync_polymarket_live()
-        return polymarket_live.health().model_dump(mode="json")
+        return polymarket_live_read.health().model_dump(mode="json")
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/gaps",
@@ -1389,16 +1363,10 @@ def create_app(
         summary="Read the Polymarket live gap ledger",
     )
     def polymarket_live_gaps(unresolved_only: bool = True):
-        _sync_polymarket_live()
-        gaps = [
-            item for item in polymarket_live.gaps
-            if not unresolved_only or not item.resolved
-        ]
-        return {
-            "schema_version": "marketcow.polymarket.live-gaps.v2",
-            "count": len(gaps),
-            "items": [item.model_dump(mode="json") for item in gaps],
-        }
+        raise HTTPException(status_code=503, detail={
+            "code": "polymarket_latest_state_index_unavailable",
+            "message": "Gap reads require the durable latest-state index",
+        })
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/public-data/{kind}",
