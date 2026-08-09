@@ -3,7 +3,7 @@ set -eu
 
 project_dir="${MARKETCOW_PROJECT_DIR:-/Volumes/T9/projects/marketcow}"
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-runtime_dir="${MARKETCOW_RUNTIME_DIR:-$project_dir/data-production/runtime}"
+runtime_dir="${MARKETCOW_RUNTIME_DIR:-/Volumes/T9/data/marketcow/production/runtime}"
 postgres_bin="${MARKETCOW_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}"
 clickhouse_bin="${MARKETCOW_CLICKHOUSE_BIN:-/Volumes/T9/posthog-native/bin/clickhouse}"
 postgres_dir="$runtime_dir/postgres"

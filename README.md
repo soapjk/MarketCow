@@ -24,6 +24,9 @@ cp .env.production.example .env.production
 配置文件必须保持在本地且不得提交。核心变量包括：
 
 - `MARKETCOW_ALLOWED_ROOT`
+
+See [docs/storage-layout.md](docs/storage-layout.md) for the local source/data
+separation and the production runtime directory layout.
 - `MARKETCOW_POSTGRES_DSN` / `MARKETCOW_POSTGRES_DSN_REF`
 - `MARKETCOW_CLICKHOUSE_PASSWORD` / `MARKETCOW_CLICKHOUSE_PASSWORD_REF`
 - `MARKETCOW_CLICKHOUSE_HOST`、`MARKETCOW_CLICKHOUSE_DATABASE`

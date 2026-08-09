@@ -142,6 +142,16 @@ class LaunchdStartupTest(unittest.TestCase):
         self.assertIn('cp "$script_dir/run-production.py" "$target_runner"', installer)
         self.assertIn('until launchctl bootstrap "$domain" "$target_plist"', installer)
 
+    def test_production_storage_defaults_live_outside_source_checkout(self) -> None:
+        storage_script = (LAUNCHD / "ensure-production-storage.sh").read_text()
+        clickhouse_config = (LAUNCHD / "clickhouse-production.xml").read_text()
+        expected_root = "/Volumes/T9/data/marketcow/production"
+
+        self.assertIn(f"{expected_root}/runtime", storage_script)
+        self.assertIn(f"{expected_root}/runtime/clickhouse/data/", clickhouse_config)
+        self.assertNotIn("/Volumes/T9/projects/marketcow/data-production", storage_script)
+        self.assertNotIn("/Volumes/T9/projects/marketcow/data-production", clickhouse_config)
+
     @staticmethod
     def _write_executable(path: Path, content: str) -> None:
         path.write_text(textwrap.dedent(content))
