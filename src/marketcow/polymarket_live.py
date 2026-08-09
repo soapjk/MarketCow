@@ -4442,19 +4442,43 @@ class PolymarketLiveCollector:
                 tracker = self.store.new_book_recovery_tracker()
 
             def consume(rows: list[dict[str, Any]]) -> None:
-                with (
-                    self.store._sync_lock,
-                    _publication_lock(self.store.root, exclusive=True),
-                    self.store.state_index.batch(),
-                ):
-                    self.store.recover_book_batch(
-                        rows,
-                        recovery_id,
-                        tracker,
-                        minimum_book_age_seconds=(
-                            self.minimum_snapshot_refresh_age_seconds
-                        ),
-                    )
+                with self.store._sync_lock:
+                    selected_rows = rows
+                    minimum_age = self.minimum_snapshot_refresh_age_seconds
+                    if minimum_age > 0:
+                        current = self.store.now_provider()
+                        refresh_market_ids = {
+                            market_id
+                            for token_id, market_id in self.store.token_to_market.items()
+                            if token_id not in self.store.books
+                            or (
+                                current - self.store.books[token_id].received_at
+                            ).total_seconds() >= minimum_age
+                        }
+                        selected_rows = []
+                        for row in rows:
+                            token_id = str(
+                                row.get("asset_id") or row.get("token_id") or ""
+                            )
+                            market_id = self.store.token_to_market.get(token_id)
+                            if (
+                                token_id in tracker["expected"]
+                                and market_id not in refresh_market_ids
+                            ):
+                                tracker["recovered"].add(token_id)
+                            else:
+                                selected_rows.append(row)
+                    if not selected_rows:
+                        return
+                    with (
+                        _publication_lock(self.store.root, exclusive=True),
+                        self.store.state_index.batch(),
+                    ):
+                        self.store.recover_book_batch(
+                            selected_rows,
+                            recovery_id,
+                            tracker,
+                        )
 
             await asyncio.to_thread(
                 self.books_client.fetch_stream,
