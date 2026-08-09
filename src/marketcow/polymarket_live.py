@@ -2994,6 +2994,7 @@ class LiveStateStore:
         self.catalog: dict[str, LiveMarket] = {}
         self.token_to_market: dict[str, str] = {}
         self.books: dict[str, LiveBook] = {}
+        self._rest_refresh_generation: dict[str, datetime] = {}
         self.gaps: list[GapEntry] = []
         self.events: deque[LiveEventEnvelope] = deque(maxlen=self.replay_capacity)
         self.seen_raw_hashes: set[str] = set()
@@ -3456,6 +3457,7 @@ class LiveStateStore:
         tracker: dict[str, Any],
         *,
         minimum_book_age_seconds: float = 0,
+        refresh_started_at: datetime | None = None,
     ) -> None:
         self._ensure_loaded()
         recovered = tracker["recovered"]
@@ -3470,36 +3472,14 @@ class LiveStateStore:
                 continue
             previous = self.books.get(token_id)
             if (
-                previous is not None
-                and _instant(row.get("timestamp") or self.now_provider())
-                < previous.exchange_at
+                refresh_started_at is not None
+                and refresh_started_at
+                < self._rest_refresh_generation.get(token_id, datetime.min.replace(
+                    tzinfo=timezone.utc
+                ))
             ):
-                market = self._market_for_token(token_id)
-                tick = decimal_text(
-                    row.get("tick_size")
-                    or market.rules.instrument.price_increment,
-                    "tick_size",
-                    allow_zero=False,
-                )
-                bids = {
-                    item["price"]: item["size"]
-                    for item in _levels(row.get("bids"), "bids")
-                }
-                asks = {
-                    item["price"]: item["size"]
-                    for item in _levels(row.get("asks"), "asks")
-                }
-                if _state_checksum(token_id, tick, bids, asks) != (
-                    previous.state_checksum
-                ):
-                    recovered.add(token_id)
-                    continue
-                row = {
-                    **row,
-                    "timestamp": str(
-                        int(previous.exchange_at.timestamp() * 1000)
-                    ),
-                }
+                recovered.add(token_id)
+                continue
             market_id = self.token_to_market.get(token_id)
             market_token_ids = [
                 candidate
@@ -3541,6 +3521,8 @@ class LiveStateStore:
                     reason="invalid_rest_book", gaps=[gap],
                 )
                 continue
+            if refresh_started_at is not None:
+                self._rest_refresh_generation[token_id] = refresh_started_at
             recovered.add(token_id)
 
     def complete_book_recovery(
@@ -4443,10 +4425,11 @@ class PolymarketLiveCollector:
         self._snapshot_refresh_started()
         try:
             with self.store._sync_lock:
+                refresh_started_at = self.store.now_provider()
                 recovery_id = content_sha256({
                     "reason": reason,
                     "cursor": self.store.cursor,
-                    "observed_at": self.store.now_provider().isoformat(),
+                    "observed_at": refresh_started_at.isoformat(),
                 })
                 tracker = self.store.new_book_recovery_tracker()
 
@@ -4487,6 +4470,7 @@ class PolymarketLiveCollector:
                             selected_rows,
                             recovery_id,
                             tracker,
+                            refresh_started_at=refresh_started_at,
                         )
 
             await asyncio.to_thread(
