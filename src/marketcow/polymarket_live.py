@@ -1375,7 +1375,9 @@ class LiveStateStore:
         self._event_offset = 0
         self._last_log_cursor = 0
         self._sync_lock = threading.RLock()
-        self.recover()
+        # API construction must not deserialize the multi-GB catalog or replay the
+        # event log. Stateful operations retain compatibility through _ensure_loaded.
+        self._recovered = False
 
     def _append(self, value: dict[str, Any]) -> None:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1389,6 +1391,7 @@ class LiveStateStore:
         markets: list[LiveMarket],
         raw_rows: Iterable[dict[str, Any]] | GammaCatalogRows,
     ) -> dict[str, Any]:
+        self._ensure_loaded()
         by_id = {market.identity.market_id: market for market in markets}
         for market_id, previous in self.catalog.items():
             if market_id not in by_id and previous.lifecycle_state == "resolved":
@@ -1516,6 +1519,7 @@ class LiveStateStore:
         recovery_id: str | None = None,
         received_at: datetime | None = None,
     ) -> LiveEventEnvelope:
+        self._ensure_loaded()
         token_id = str(raw.get("asset_id") or raw.get("token_id") or "")
         market = self._market_for_token(token_id)
         tick_value = raw.get("tick_size") or market.rules.instrument.price_increment
@@ -1556,6 +1560,7 @@ class LiveStateStore:
         )
 
     def apply_websocket(self, raw: dict[str, Any], *, received_at: datetime | None = None) -> list[LiveEventEnvelope]:
+        self._ensure_loaded()
         raw_hash = content_sha256(raw)
         event_type = str(raw.get("event_type") or raw.get("type") or "")
         received = received_at or self.now_provider()
@@ -1726,6 +1731,7 @@ class LiveStateStore:
         )
 
     def mark_recovery_started(self, reason: str) -> str:
+        self._ensure_loaded()
         recovery_id = content_sha256({"cursor": self.cursor, "reason": reason, "at": self.now_provider().isoformat()})
         self.active_recovery_id = recovery_id
         self._emit(
@@ -1749,6 +1755,7 @@ class LiveStateStore:
         recovery_id: str,
         tracker: dict[str, Any],
     ) -> None:
+        self._ensure_loaded()
         recovered = tracker["recovered"]
         invalid = tracker["invalid"]
         for row in rows:
@@ -1785,6 +1792,7 @@ class LiveStateStore:
     def complete_book_recovery(
         self, recovery_id: str, tracker: dict[str, Any],
     ) -> dict[str, Any]:
+        self._ensure_loaded()
         recovered = tracker["recovered"]
         invalid = tracker["invalid"]
         missing = tracker["expected"] - recovered
@@ -1829,11 +1837,13 @@ class LiveStateStore:
     def recover_from_books(
         self, rows: list[dict[str, Any]], recovery_id: str,
     ) -> dict[str, Any]:
+        self._ensure_loaded()
         tracker = self.new_book_recovery_tracker()
         self.recover_book_batch(rows, recovery_id, tracker)
         return self.complete_book_recovery(recovery_id, tracker)
 
     def frame(self, market_id: str, *, now: datetime | None = None) -> MarketFrame:
+        self._ensure_loaded()
         market = self.catalog.get(market_id)
         if market is None:
             raise KeyError(market_id)
@@ -1916,6 +1926,7 @@ class LiveStateStore:
         )
 
     def checkpoint_payload(self) -> LiveCheckpoint:
+        self._ensure_loaded()
         state = {
             "cursor": self.cursor, "catalog_revision": self.catalog_revision,
             "books": {key: value.model_dump(mode="json") for key, value in sorted(self.books.items())},
@@ -1927,6 +1938,7 @@ class LiveStateStore:
         return checkpoint
 
     def checkpoint(self) -> LiveCheckpoint:
+        self._ensure_loaded()
         checkpoint = self.checkpoint_payload()
         body = canonical_json(checkpoint.model_dump(mode="json"))
         _atomic_write(self.checkpoint_path, body)
@@ -2124,21 +2136,36 @@ class LiveStateStore:
                 self._apply_replayed_event(event)
         self._last_log_cursor = events[-1].cursor if events else 0
 
+    def _recover_unlocked(self) -> None:
+        """Rebuild state from durable files while the caller holds _sync_lock."""
+        if self.catalog_path.exists():
+            self._load_catalog(self.catalog_path)
+        checkpoint = None
+        if self.checkpoint_path.exists():
+            body = self.checkpoint_path.read_bytes()
+            checkpoint = self._validate_checkpoint(body)
+            self._checkpoint_file_sha256 = hashlib.sha256(body).hexdigest()
+        events, offset = self._read_all_events()
+        self._rebuild_from_checkpoint(checkpoint, events)
+        self._event_offset = offset
+
     def recover(self) -> None:
+        """Explicitly perform the full deterministic recovery once."""
         with self._sync_lock:
-            if self.catalog_path.exists():
-                self._load_catalog(self.catalog_path)
-            checkpoint = None
-            if self.checkpoint_path.exists():
-                body = self.checkpoint_path.read_bytes()
-                checkpoint = self._validate_checkpoint(body)
-                self._checkpoint_file_sha256 = hashlib.sha256(body).hexdigest()
-            events, offset = self._read_all_events()
-            self._rebuild_from_checkpoint(checkpoint, events)
-            self._event_offset = offset
+            self._recover_unlocked()
+            self._recovered = True
+
+    def _ensure_loaded(self) -> None:
+        """Preserve legacy stateful behavior without blocking app construction."""
+        with self._sync_lock:
+            if self._recovered:
+                return
+            self._recover_unlocked()
+            self._recovered = True
 
     def sync(self) -> None:
         """Tail a single writer's durable files into this read-side state."""
+        self._ensure_loaded()
         with self._sync_lock:
             if self.catalog_path.exists():
                 digest = _file_sha256(self.catalog_path)
@@ -2193,12 +2220,14 @@ class LiveStateStore:
                     self._event_offset = stream.tell()
 
     def events_after(self, cursor: int, limit: int) -> tuple[list[LiveEventEnvelope], bool]:
+        self._ensure_loaded()
         if self.events and cursor < self.events[0].cursor - 1:
             raise RuntimeError("resume_cursor_expired")
         selected = [event for event in self.events if event.cursor > cursor]
         return selected[:limit], len(selected) > limit
 
     def health(self) -> LiveHealth:
+        self._ensure_loaded()
         active_market_ids = sorted(set(self.token_to_market.values()))
         frames = [self.frame(market_id) for market_id in active_market_ids]
         latest = max((book.received_at for book in self.books.values()), default=None)

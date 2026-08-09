@@ -340,7 +340,28 @@ API 永不因该进程加载或失败而停止服务。
 10. **运行证据**：真实 production-like 数据验证启动时间、PID/health、catalog revision、
     scoped market IDs、cursor、coverage、RSS 和未触发全量加载。
 
-## 9. 需要评审的决策
+## 9. `marketcow-fix-1095` 评估与移植结论
+
+对 detached worktree `/private/tmp/marketcow-fix-1095` 的未提交实现做过逐项评估。
+其 47 项 Polymarket live 聚焦测试通过，但内容只部分符合本提案：
+
+| 内容 | 结论 | 处理 |
+|---|---|---|
+| 构造阶段移除同步 `recover()` | 有价值 | 已移植，作为 Phase 1 启动解耦 |
+| `_recover_unlocked()`、显式 `recover()`、锁保护的一次加载 | 有价值 | 已移植，保持现有 writer/full-mode 行为 |
+| restart/integrity 测试改为显式恢复 | 有价值 | 已移植 |
+| `load_catalog_markets()` 顺序扫描 JSONL | 不满足扩展性 | 不移植；由 offset index 取代 |
+| scoped 读取跳过 catalog 全文件 hash | 降低完整性 | 不移植；改为 index hash + row hash |
+| `tail_cursor()` 从末尾 1MB 猜最后可解析 cursor | 证据不足 | 不移植；由 durable event-offset index 取代 |
+| 无参请求通过 `_ensure_loaded()` 全量恢复 | 仅兼容过渡 | 不作为最终 API；主 API 最终默认禁用 full mode |
+| `measure_scoped.py` | 仅临时实验 | 不移植；硬编码 production 路径且 Ruff 失败 |
+| 原 Proposal v1 | 已被本方案替代 | 不移植 |
+
+移植后的 Phase 1 代码只保证 `create_app()` 不在构造阶段加载大文件。它不宣称已经完成
+scoped 扩展性修复：现有 Polymarket stateful/full 路径首次访问仍会执行兼容性恢复，必须
+继续实施 catalog index 和 latest-state index 后才能满足第 8 节全部验收标准。
+
+## 10. 需要评审的决策
 
 1. Catalog index 使用 SQLite 还是自定义紧凑 offset 文件；建议 SQLite，降低实现风险。
 2. Latest-state index 是否与 catalog index 分库；建议分库，发布周期和写入模型不同。
@@ -349,7 +370,7 @@ API 永不因该进程加载或失败而停止服务。
 5. 旧 1.8GB catalog 的一次性索引构建由运维命令还是 collector 自动执行；建议显式
    运维命令，完成后原子切换，避免主 API 隐式做重活。
 
-## 10. 结论
+## 11. 结论
 
 问题本质不是“线程不够”，而是把全市场、全事件的对象化恢复放进了共享 API 的启动和
 请求路径。升级后的方案通过 immutable catalog index、durable latest-state index 和
