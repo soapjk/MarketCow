@@ -3469,6 +3469,8 @@ class LiveStateStore:
         rows: list[dict[str, Any]],
         recovery_id: str,
         tracker: dict[str, Any],
+        *,
+        minimum_book_age_seconds: float = 0,
     ) -> None:
         self._ensure_loaded()
         recovered = tracker["recovered"]
@@ -3480,6 +3482,16 @@ class LiveStateStore:
                 continue
             if token_id in recovered or token_id in invalid:
                 tracker["duplicate_response_count"] += 1
+                continue
+            previous = self.books.get(token_id)
+            if (
+                previous is not None
+                and minimum_book_age_seconds > 0
+                and (
+                    self.now_provider() - previous.received_at
+                ).total_seconds() < minimum_book_age_seconds
+            ):
+                recovered.add(token_id)
                 continue
             try:
                 self.apply_snapshot(row, recovery_id=recovery_id)
@@ -4295,6 +4307,7 @@ class PolymarketLiveCollector:
         snapshot_refresh_seconds: float | None = None,
         catalog_refresh_on_lifecycle_events: bool = True,
         publish_checkpoints: bool = True,
+        minimum_snapshot_refresh_age_seconds: float = 0,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -4312,6 +4325,9 @@ class PolymarketLiveCollector:
             catalog_refresh_on_lifecycle_events
         )
         self.publish_checkpoints = publish_checkpoints
+        self.minimum_snapshot_refresh_age_seconds = max(
+            0, minimum_snapshot_refresh_age_seconds,
+        )
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
         self._snapshot_refresh_idle = threading.Event()
@@ -4396,7 +4412,14 @@ class PolymarketLiveCollector:
                     _publication_lock(self.store.root, exclusive=True),
                     self.store.state_index.batch(),
                 ):
-                    self.store.recover_book_batch(rows, recovery_id, tracker)
+                    self.store.recover_book_batch(
+                        rows,
+                        recovery_id,
+                        tracker,
+                        minimum_book_age_seconds=(
+                            self.minimum_snapshot_refresh_age_seconds
+                        ),
+                    )
 
             await asyncio.to_thread(
                 self.books_client.fetch_stream,

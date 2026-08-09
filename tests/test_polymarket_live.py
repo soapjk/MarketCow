@@ -1920,6 +1920,38 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertFalse(store.checkpoint_path.exists())
             self.assertEqual(set(store.books), {"yes-1", "no-1"})
 
+    def test_periodic_refresh_coalesces_recent_books_but_keeps_coverage(self):
+        with TemporaryDirectory() as folder:
+            rows = [gamma_row()]
+            store = LiveStateStore(Path(folder), now_provider=lambda: NOW)
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            store.apply_snapshot(
+                snapshot("yes-1", "0.40", "0.42"), received_at=NOW
+            )
+            store.apply_snapshot(
+                snapshot("no-1", "0.58", "0.60"), received_at=NOW
+            )
+            cursor = store.cursor
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(
+                    requester=lambda *_args, **_kwargs: Response([
+                        snapshot("yes-1", "0.40", "0.42"),
+                        snapshot("no-1", "0.58", "0.60"),
+                    ])
+                ),
+                publish_checkpoints=False,
+                minimum_snapshot_refresh_age_seconds=2,
+            )
+
+            asyncio.run(collector.refresh_books())
+
+            self.assertEqual(store.cursor, cursor)
+            self.assertEqual(
+                collector.books_client.last_evidence["received_book_count"], 2
+            )
+
     def test_periodic_snapshot_refresh_recovers_after_transient_failure(self):
         with TemporaryDirectory() as folder:
             collector = PolymarketLiveCollector(
