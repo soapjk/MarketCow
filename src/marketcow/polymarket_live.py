@@ -4302,7 +4302,15 @@ class PolymarketLiveCollector:
             return
         while True:
             await asyncio.sleep(self.snapshot_refresh_seconds)
-            await self.refresh_books("periodic_snapshot_refresh")
+            try:
+                await self.refresh_books("periodic_snapshot_refresh")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception(
+                    "periodic_snapshot_refresh_failed; retrying after %.3f seconds",
+                    self.snapshot_refresh_seconds,
+                )
 
     async def run(self, *, max_connections: int | None = None) -> None:
         refresh_task = (

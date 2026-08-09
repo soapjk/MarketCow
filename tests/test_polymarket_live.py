@@ -1850,6 +1850,49 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertGreaterEqual(len(reasons), 2)
             self.assertEqual(set(reasons), {"periodic_snapshot_refresh"})
 
+    def test_periodic_snapshot_refresh_recovers_after_transient_failure(self):
+        with TemporaryDirectory() as folder:
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(
+                    requester=lambda *_args, **_kwargs: Response({"markets": []})
+                ),
+                ClobBooksClient(
+                    requester=lambda *_args, **_kwargs: Response([])
+                ),
+                snapshot_refresh_seconds=0.01,
+            )
+            attempts = []
+
+            async def refresh(reason="startup"):
+                attempts.append(reason)
+                if len(attempts) == 1:
+                    raise RuntimeError("transient CLOB failure")
+                return "recovery"
+
+            collector.refresh_books = refresh
+
+            async def scenario():
+                task = asyncio.create_task(
+                    collector._refresh_snapshots_periodically()
+                )
+                while len(attempts) < 2:
+                    await asyncio.sleep(0.01)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            with self.assertLogs(
+                "marketcow.polymarket_live", level="ERROR"
+            ) as captured:
+                asyncio.run(scenario())
+
+            self.assertEqual(
+                attempts,
+                ["periodic_snapshot_refresh", "periodic_snapshot_refresh"],
+            )
+            self.assertIn("periodic_snapshot_refresh_failed", captured.output[0])
+
     def test_large_subscription_group_uses_bounded_connections_and_messages(self):
         with TemporaryDirectory() as folder:
             socket = FakeSocket([])
