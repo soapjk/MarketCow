@@ -30,6 +30,7 @@ from marketcow.polymarket_live import (
     atomic_write_public_facts,
     build_live_catalog_index,
     build_live_state_index,
+    catch_up_live_state_index,
     load_scoped_live_store,
 )
 from tests.test_market_data_api import Service
@@ -1372,6 +1373,31 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
         page = reader.events_after(["m1"], 0, 10)
         self.assertEqual([event.cursor for event in page.items], [2, 3])
+
+    def test_scoped_writer_catches_up_event_tail_left_by_interrupted_publish(self):
+        root = self.root / "live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        with (
+            patch.object(
+                writer.state_index, "append",
+                side_effect=RuntimeError("interrupted after durable append"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "interrupted after durable append"),
+        ):
+            writer.mark_recovery_started("restart-boundary")
+
+        recovered = catch_up_live_state_index(root)
+        self.assertEqual(recovered["previous_cursor"], 3)
+        self.assertEqual(recovered["latest_cursor"], 4)
+        self.assertEqual(recovered["replayed_events"], 1)
+        self.assertEqual(catch_up_live_state_index(root)["replayed_events"], 0)
+        scoped = load_scoped_live_store(root, ["m1"], now_provider=lambda: NOW)
+        self.assertEqual(scoped.cursor, 4)
+        self.assertIsNotNone(scoped.active_recovery_id)
 
     def test_event_resume_before_catalog_transition_expires_explicitly(self):
         root = self.root / "live"

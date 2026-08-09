@@ -3964,6 +3964,88 @@ def build_live_state_index(root: Path) -> dict[str, Any]:
     }
 
 
+def catch_up_live_state_index(root: Path) -> dict[str, int]:
+    """Replay a crash-truncated event-log tail into the mutable state index."""
+    root = root.resolve()
+    event_path = root / "events.jsonl"
+    state_index = LiveStateIndex(root)
+    if not state_index.path.is_file() or not event_path.is_file():
+        return {"previous_cursor": 0, "latest_cursor": 0, "replayed_events": 0}
+    with _publication_lock(root, exclusive=True):
+        with sqlite3.connect(state_index.path) as connection:
+            metadata = state_index._metadata(connection)
+        previous_cursor = int(metadata.get("latest_cursor", "0"))
+        offset = int(metadata.get("event_log_size", "0"))
+        actual_size = event_path.stat().st_size
+        if offset > actual_size:
+            raise RuntimeError("live state index is ahead of the durable event log")
+        if offset == actual_size:
+            return {
+                "previous_cursor": previous_cursor,
+                "latest_cursor": previous_cursor,
+                "replayed_events": 0,
+            }
+        catalog_revision = metadata.get("catalog_revision") or None
+        active_recovery_id = metadata.get("active_recovery_id") or None
+        expected_cursor = previous_cursor + 1
+        replayed = 0
+        with event_path.open("rb") as stream:
+            stream.seek(offset)
+            while offset < actual_size:
+                line = stream.readline()
+                if not line.endswith(b"\n"):
+                    raise RuntimeError("durable live event tail is incomplete")
+                event = LiveEventEnvelope.model_validate_json(line)
+                LiveStateStore._validate_event(event, expected_cursor)
+                if event.event_type == "catalog_revision" and event.applied:
+                    catalog_revision = str(
+                        event.canonical_payload.get("catalog_revision") or ""
+                    ) or catalog_revision
+                if event.event_type == "recovery_started" and event.applied:
+                    active_recovery_id = str(
+                        event.canonical_payload.get("recovery_id") or ""
+                    ) or None
+                elif event.event_type == "recovery_completed" and event.applied:
+                    active_recovery_id = None
+                book = None
+                if (
+                    event.applied and event.token_id
+                    and event.event_type in {
+                        "book", "price_change", "best_bid_ask",
+                        "last_trade_price", "tick_size_change",
+                    }
+                ):
+                    book = LiveBook.model_validate(event.canonical_payload)
+                next_offset = offset + len(line)
+                token_to_market = {
+                    gap.token_id: event.market_id
+                    for gap in event.gaps
+                    if gap.token_id and event.market_id
+                }
+                state_index.append(
+                    event,
+                    byte_offset=offset,
+                    byte_length=len(line),
+                    line_sha256=hashlib.sha256(line).hexdigest(),
+                    book=book,
+                    gaps=event.gaps,
+                    catalog_revision=catalog_revision,
+                    event_log_size=next_offset,
+                    token_to_market=token_to_market,
+                    active_recovery_id=active_recovery_id,
+                )
+                offset = next_offset
+                expected_cursor += 1
+                replayed += 1
+        if offset != actual_size:
+            raise RuntimeError("durable live event size changed during tail recovery")
+        return {
+            "previous_cursor": previous_cursor,
+            "latest_cursor": expected_cursor - 1,
+            "replayed_events": replayed,
+        }
+
+
 def load_scoped_live_store(
     root: Path,
     market_ids: Iterable[str],
@@ -3972,6 +4054,9 @@ def load_scoped_live_store(
 ) -> LiveStateStore:
     """Hydrate a bounded writer from published indexes without full recovery."""
     root = root.resolve()
+    recovery = catch_up_live_state_index(root)
+    if recovery["replayed_events"]:
+        LOGGER.warning("live_state_index_tail_recovered %s", recovery)
     reader = PolymarketLiveReadStore(root, now_provider=now_provider)
     selected_ids = reader._scope(market_ids)
     bootstrap = reader.bootstrap(selected_ids)
