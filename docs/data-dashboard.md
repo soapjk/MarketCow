@@ -37,6 +37,12 @@ The script writes secrets only to the local Grafana provisioning root, with mode
 Grafana LaunchAgent after provisioning. The dashboard is available under the
 `MarketCow` folder at `http://127.0.0.1:3001`.
 
+The file provider explicitly sets `folder: MarketCow`. This is an access-control
+boundary as well as navigation metadata: Grafana viewers inherit dashboard read
+permission from that folder. Do not provision these dashboards into the root/General
+folder (`folder: ""`), because an embedded anonymous Viewer can then receive
+`dashboards:read` forbidden even while Grafana itself is healthy.
+
 ## Continuity interpretation
 
 The initial gap check is intentionally conservative and operates on canonical FINAL

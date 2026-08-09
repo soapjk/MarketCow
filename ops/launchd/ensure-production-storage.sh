@@ -82,7 +82,8 @@ clickhouse_password="${MARKETCOW_CLICKHOUSE_PASSWORD:-$(read_env_value MARKETCOW
 export MARKETCOW_CLICKHOUSE_PASSWORD="$clickhouse_password"
 
 mkdir -p "$postgres_dir" "$clickhouse_dir/data" "$clickhouse_dir/tmp" \
-    "$clickhouse_dir/user_files" "$clickhouse_dir/format_schemas"
+    "$clickhouse_dir/user_files" "$clickhouse_dir/format_schemas" \
+    "$clickhouse_dir/access"
 
 if [ ! -f "$postgres_dir/PG_VERSION" ]; then
     echo "Initializing PostgreSQL storage at $postgres_dir"

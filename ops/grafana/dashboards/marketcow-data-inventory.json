@@ -183,6 +183,6 @@
   "timezone": "browser",
   "title": "MarketCow Data Inventory & Quality",
   "uid": "marketcow-data-inventory",
-  "version": 1,
+  "version": 2,
   "weekStart": "monday"
 }

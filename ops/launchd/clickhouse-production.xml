@@ -8,6 +8,14 @@
     <tmp_path>/Volumes/T9/data/marketcow/production/runtime/clickhouse/tmp/</tmp_path>
     <user_files_path>/Volumes/T9/data/marketcow/production/runtime/clickhouse/user_files/</user_files_path>
     <format_schema_path>/Volumes/T9/data/marketcow/production/runtime/clickhouse/format_schemas/</format_schema_path>
+    <user_directories>
+        <users_xml>
+            <path>/Users/androidjk/Library/Application Support/MarketCow/clickhouse-production.xml</path>
+        </users_xml>
+        <local_directory>
+            <path>/Volumes/T9/data/marketcow/production/runtime/clickhouse/access/</path>
+        </local_directory>
+    </user_directories>
     <listen_host>127.0.0.1</listen_host>
     <http_port>18192</http_port>
     <tcp_port>19092</tcp_port>
