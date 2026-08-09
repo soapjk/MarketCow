@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import unittest
+import requests
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1016,6 +1017,25 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(client.last_evidence["received_book_count"], 1)
         self.assertTrue(progress[-1]["complete"])
 
+    def test_clob_books_retries_transient_transport_failure(self):
+        responses = [
+            requests.Timeout("slow upstream"),
+            Response([snapshot("a", "0.40", "0.42")]),
+        ]
+
+        def requester(*_args, **_kwargs):
+            result = responses.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        client = ClobBooksClient(
+            requester=requester, max_retries_per_batch=1,
+        )
+
+        self.assertEqual(len(client.fetch(["a"])), 1)
+        self.assertEqual(client.last_evidence["retry_count"], 1)
+
     def test_partial_books_bootstrap_starts_degraded_and_keeps_ready_markets(self):
         rows = [
             gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1")),
@@ -1366,16 +1386,23 @@ class PolymarketLiveTest(unittest.TestCase):
             reader.snapshot(["m1"])
         self.assertEqual(tampered.exception.code, "polymarket_state_integrity_failed")
 
-        writer.state_index.rebuild(
-            event_path=writer.event_path, books=writer.books, gaps=writer.gaps,
-            catalog_revision=writer.catalog_revision,
-            token_to_market=writer.token_to_market,
+        tail_root = self.root / "tail-live"
+        tail_writer = LiveStateStore(tail_root, now_provider=lambda: NOW)
+        tail_writer.replace_catalog(
+            GammaLiveNormalizer.normalize(rows, NOW), rows,
         )
-        with writer.event_path.open("ab") as stream:
+        tail_writer.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+        )
+        tail_writer.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+        )
+        tail_reader = PolymarketLiveReadStore(tail_root, now_provider=lambda: NOW)
+        with tail_writer.event_path.open("ab") as stream:
             stream.write(b"partial-unindexed-event\n")
-        with self.assertRaises(PolymarketLiveReadError) as lagging:
-            reader.snapshot(["m1"])
-        self.assertEqual(lagging.exception.code, "polymarket_state_index_lagging")
+        self.assertEqual(tail_reader.snapshot(["m1"]).items[0].status, "ready")
+        with self.assertRaises(ValueError):
+            catch_up_live_state_index(tail_root)
 
     def test_state_index_rebuild_restores_scoped_snapshot_and_event_offsets(self):
         root = self.root / "live"
@@ -1629,7 +1656,7 @@ class PolymarketLiveTest(unittest.TestCase):
             reader.bootstrap([*market_ids, "overflow"])
         self.assertEqual(raised.exception.code, "polymarket_scope_too_large")
 
-    def test_event_and_state_index_publish_as_one_reader_visible_boundary(self):
+    def test_reader_uses_last_indexed_prefix_during_event_publication(self):
         root = self.root / "live"
         writer = LiveStateStore(root, now_provider=lambda: NOW)
         rows = [gamma_row()]
@@ -1677,16 +1704,15 @@ class PolymarketLiveTest(unittest.TestCase):
             read_worker = threading.Thread(target=read_snapshot)
             read_worker.start()
             read_worker.join(timeout=0.1)
-            self.assertTrue(read_worker.is_alive())
+            self.assertFalse(read_worker.is_alive())
+            self.assertEqual(read_errors, [])
+            self.assertEqual(pages[0].cursor, writer.cursor - 1)
             release.set()
             worker.join(timeout=2)
-            read_worker.join(timeout=2)
         self.assertFalse(worker.is_alive())
-        self.assertFalse(read_worker.is_alive())
         self.assertEqual(error, [])
-        self.assertEqual(read_errors, [])
-        self.assertEqual(pages[0].cursor, writer.cursor)
         self.assertEqual(pages[0].items[0].status, "ready")
+        self.assertEqual(reader.snapshot(["m1"]).cursor, writer.cursor)
 
     def test_post_checkpoint_invalid_gap_survives_restart_until_rest_recovery(self):
         store = self.store()
@@ -1932,15 +1958,19 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 snapshot("no-1", "0.58", "0.60"), received_at=NOW
             )
             cursor = store.cursor
+            requests = []
+
+            def requester(_url, **kwargs):
+                requests.append(kwargs["json"])
+                return Response([
+                    snapshot("yes-1", "0.40", "0.42"),
+                    snapshot("no-1", "0.58", "0.60"),
+                ])
+
             collector = PolymarketLiveCollector(
                 store,
                 GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
-                ClobBooksClient(
-                    requester=lambda *_args, **_kwargs: Response([
-                        snapshot("yes-1", "0.40", "0.42"),
-                        snapshot("no-1", "0.58", "0.60"),
-                    ])
-                ),
+                ClobBooksClient(requester=requester),
                 publish_checkpoints=False,
                 minimum_snapshot_refresh_age_seconds=2,
             )
@@ -1948,9 +1978,57 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             asyncio.run(collector.refresh_books())
 
             self.assertEqual(store.cursor, cursor)
-            self.assertEqual(
-                collector.books_client.last_evidence["received_book_count"], 2
+            self.assertEqual(requests, [])
+
+    def test_periodic_refresh_requests_only_stale_market_pairs(self):
+        with TemporaryDirectory() as folder:
+            current = [NOW]
+            rows = [gamma_row()]
+            store = LiveStateStore(
+                Path(folder), now_provider=lambda: current[0],
             )
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            store.apply_snapshot(
+                snapshot("yes-1", "0.40", "0.42"), received_at=NOW
+            )
+            store.apply_snapshot(
+                snapshot("no-1", "0.58", "0.60"), received_at=NOW
+            )
+            requested = []
+
+            def requester(_url, **kwargs):
+                requested.extend(item["token_id"] for item in kwargs["json"])
+                return Response([
+                    snapshot("yes-1", "0.40", "0.42"),
+                    snapshot("no-1", "0.58", "0.60"),
+                ])
+
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=requester),
+                publish_checkpoints=False,
+                minimum_snapshot_refresh_age_seconds=1,
+            )
+            current[0] = NOW + timedelta(seconds=2)
+            event_inode = store.event_path.stat().st_ino
+            event_fsyncs = []
+            real_fsync = polymarket_live_module.os.fsync
+
+            def track_fsync(file_descriptor):
+                if polymarket_live_module.os.fstat(file_descriptor).st_ino == event_inode:
+                    event_fsyncs.append(file_descriptor)
+                return real_fsync(file_descriptor)
+
+            with patch.object(
+                polymarket_live_module.os,
+                "fsync",
+                side_effect=track_fsync,
+            ):
+                asyncio.run(collector.refresh_books())
+
+            self.assertEqual(set(requested), {"yes-1", "no-1"})
+            self.assertEqual(len(event_fsyncs), 1)
 
     def test_periodic_snapshot_refresh_recovers_after_transient_failure(self):
         with TemporaryDirectory() as folder:
@@ -2049,7 +2127,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
 
             self.assertEqual(refreshed_while_applying, [True])
 
-    def test_periodic_refresh_has_priority_over_new_websocket_publications(self):
+    def test_websocket_publication_does_not_wait_for_rest_idle(self):
         with TemporaryDirectory() as folder:
             collector = PolymarketLiveCollector(
                 LiveStateStore(Path(folder), now_provider=lambda: NOW),
@@ -2057,7 +2135,6 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 ClobBooksClient(requester=lambda *_args, **_kwargs: None),
             )
             collector.store.apply_websocket = lambda _item, **_kwargs: None
-            collector._snapshot_refresh_idle.clear()
             applied = threading.Event()
             thread = threading.Thread(
                 target=lambda: (
@@ -2066,9 +2143,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 )
             )
             thread.start()
-            self.assertFalse(applied.wait(timeout=0.05))
-            collector._snapshot_refresh_idle.set()
-            self.assertTrue(applied.wait(timeout=1))
+            self.assertTrue(applied.wait(timeout=0.05))
             thread.join(timeout=1)
 
     def test_large_subscription_group_uses_bounded_connections_and_messages(self):

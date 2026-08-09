@@ -64,14 +64,17 @@ def main() -> None:
             spool_root=arguments.root / "spool",
             progress_every_pages=arguments.catalog_progress_pages,
         ),
-        ClobBooksClient(),
+        ClobBooksClient(
+            timeout=(1.75 if arguments.market_id else 20),
+            max_retries_per_batch=(1 if arguments.market_id else 5),
+        ),
         shard_size=arguments.shard_size,
         max_websocket_connections=arguments.max_websocket_connections,
         snapshot_refresh_seconds=arguments.snapshot_refresh_seconds,
         catalog_refresh_on_lifecycle_events=not bool(arguments.market_id),
         publish_checkpoints=not bool(arguments.market_id),
-        minimum_snapshot_refresh_age_seconds=(0.5 if arguments.market_id else 0),
-        max_concurrent_snapshot_refreshes=(4 if arguments.market_id else 1),
+        minimum_snapshot_refresh_age_seconds=(1.0 if arguments.market_id else 0),
+        max_concurrent_snapshot_refreshes=1,
     )
     if arguments.market_id:
         print({
