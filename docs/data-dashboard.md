@@ -37,6 +37,33 @@ The script writes secrets only to the local Grafana provisioning root, with mode
 Grafana LaunchAgent after provisioning. The dashboard is available under the
 `MarketCow` folder at `http://127.0.0.1:3001`.
 
+The file provider explicitly sets `folder: MarketCow`. This is an access-control
+boundary as well as navigation metadata: Grafana viewers inherit dashboard read
+permission from that folder. Do not provision these dashboards into the root/General
+folder (`folder: ""`), because an embedded anonymous Viewer can then receive
+`dashboards:read` forbidden even while Grafana itself is healthy.
+
+## Trader dashboards
+
+`MarketCow Trader Market Coverage` is the primary traditional-market view. Start
+with the `Market` selector, then narrow by interval or symbol. It separates:
+
+- registered instruments from symbols that actually have quotes or bars;
+- MarketCow ingestion age from the age of the latest exchange/provider event;
+- current quote price/session/source/tradability from historical bar coverage;
+- source and quality distributions from continuity exceptions.
+
+Database-wide storage and raw-artifact counts remain available at the bottom as
+operations evidence, but are intentionally not presented as trading coverage.
+
+`MarketCow Polymarket Live Coverage` is a separate fail-closed view. MarketCow
+projects its verified live read health into the singleton PostgreSQL table
+`prediction_market_live_observation` every 30 seconds. The dashboard shows catalog
+markets, outcome tokens, indexed book coverage, complete binary book pairs,
+unresolved gaps, cursor and catalog/state index readiness. A complete two-book pair
+is only a coverage fact; it does not override incomplete fee/rule facts, stale data,
+frame skew or gap failures.
+
 ## Continuity interpretation
 
 The initial gap check is intentionally conservative and operates on canonical FINAL

@@ -675,7 +675,54 @@ def create_app(
         identity = request.scope.get("admin_identity")
         return getattr(identity, "actor", "local-development")
 
+    projection_stop = asyncio.Event()
+    projection_task: asyncio.Task[None] | None = None
+
+    async def project_polymarket_dashboard_observation() -> None:
+        if metadata_repository is None or not hasattr(
+            metadata_repository, "upsert_prediction_market_live_observation"
+        ):
+            return
+        health = await asyncio.to_thread(polymarket_live_read.health)
+        payload = health.model_dump(mode="json")
+        payload["observed_at"] = clock().astimezone(timezone.utc).isoformat()
+        await asyncio.to_thread(
+            metadata_repository.upsert_prediction_market_live_observation,
+            payload,
+        )
+
+    async def polymarket_dashboard_projection_loop() -> None:
+        while not projection_stop.is_set():
+            try:
+                await project_polymarket_dashboard_observation()
+                app.state.polymarket_dashboard_projection_error = None
+            except Exception as exc:  # fail open: dashboard projection is observational
+                app.state.polymarket_dashboard_projection_error = sanitize_text(str(exc))
+            try:
+                await asyncio.wait_for(projection_stop.wait(), timeout=30.0)
+            except TimeoutError:
+                pass
+
+    async def startup() -> None:
+        nonlocal projection_task
+        if metadata_repository is not None and hasattr(
+            metadata_repository, "upsert_prediction_market_live_observation"
+        ):
+            try:
+                await project_polymarket_dashboard_observation()
+                app.state.polymarket_dashboard_projection_error = None
+            except Exception as exc:  # projection must not block the market-data API
+                app.state.polymarket_dashboard_projection_error = sanitize_text(str(exc))
+            projection_task = asyncio.create_task(
+                polymarket_dashboard_projection_loop(),
+                name="polymarket-dashboard-projection",
+            )
+            app.state.polymarket_dashboard_projection_task = projection_task
+
     async def shutdown() -> None:
+        projection_stop.set()
+        if projection_task is not None:
+            await projection_task
         try:
             await hub.close()
         finally:
@@ -687,6 +734,7 @@ def create_app(
                 owned_mcp_client.close()
             service.close()
 
+    app.add_event_handler("startup", startup)
     app.add_event_handler("shutdown", shutdown)
     health_evaluator = HealthEvaluator(wall_clock=clock)
 

@@ -107,11 +107,20 @@ DEFAULT_DASHBOARDS = (
     DashboardRegistration(
         key="marketcow-inventory",
         project="MarketCow",
-        name="数据库存与质量",
-        description="PostgreSQL、ClickHouse 数据库存、覆盖率和质量检查。",
+        name="交易市场数据覆盖",
+        description="按市场查看标的、报价、历史数据、时效、来源和连续性。",
         dashboard_uid="marketcow-data-inventory",
         slug="marketcow-data-inventory-quality",
         sort_order=10,
+    ),
+    DashboardRegistration(
+        key="marketcow-polymarket-live",
+        project="MarketCow",
+        name="Polymarket 实时覆盖",
+        description="目录、token、盘口索引、恢复游标和 fail-closed gap 状态。",
+        dashboard_uid="marketcow-polymarket-live",
+        slug="marketcow-polymarket-live",
+        sort_order=20,
     ),
     DashboardRegistration(
         key="marketcow-api-observability",
@@ -120,7 +129,7 @@ DEFAULT_DASHBOARDS = (
         description="Prometheus 请求速率、错误率、延迟分位数和在途请求。",
         dashboard_uid="marketcow-api-observability",
         slug="marketcow-api-observability",
-        sort_order=20,
+        sort_order=30,
     ),
 )
 

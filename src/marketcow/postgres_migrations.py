@@ -27,6 +27,7 @@ POSTGRES_TRANSACTION_DOMAINS = (
     "admin_audit_event",
     "csv_import_job",
     "csv_import_shard",
+    "prediction_market_live_observation",
     "runtime_config_version",
     "migration_checkpoint",
 )
@@ -828,6 +829,29 @@ POSTGRES_MIGRATIONS = [
             ) NOT VALID;
         ALTER TABLE csv_import_job
             VALIDATE CONSTRAINT csv_import_job_contract_v2_check;
+        """,
+    ),
+    (
+        24,
+        "current Polymarket live dashboard observation",
+        """
+        CREATE TABLE IF NOT EXISTS prediction_market_live_observation (
+            scope TEXT PRIMARY KEY CHECK (scope = 'polymarket'),
+            schema_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            catalog_revision TEXT,
+            catalog_index_ready BOOLEAN NOT NULL,
+            latest_state_ready BOOLEAN NOT NULL,
+            market_count BIGINT NOT NULL CHECK (market_count >= 0),
+            token_count BIGINT NOT NULL CHECK (token_count >= 0),
+            book_token_count BIGINT NOT NULL CHECK (book_token_count >= 0),
+            book_complete_market_count BIGINT NOT NULL
+                CHECK (book_complete_market_count >= 0),
+            unresolved_gap_count BIGINT NOT NULL CHECK (unresolved_gap_count >= 0),
+            latest_cursor BIGINT NOT NULL CHECK (latest_cursor >= 0),
+            reason_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+            observed_at TIMESTAMPTZ NOT NULL
+        );
         """,
     ),
 ]

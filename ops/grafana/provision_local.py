@@ -156,7 +156,7 @@ datasources:
 providers:
   - name: MarketCow
     orgId: 1
-    folder: ""
+    folder: MarketCow
     type: file
     disableDeletion: false
     updateIntervalSeconds: 30

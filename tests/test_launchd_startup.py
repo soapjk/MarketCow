@@ -149,6 +149,11 @@ class LaunchdStartupTest(unittest.TestCase):
 
         self.assertIn(f"{expected_root}/runtime", storage_script)
         self.assertIn(f"{expected_root}/runtime/clickhouse/data/", clickhouse_config)
+        self.assertIn(
+            f"{expected_root}/runtime/clickhouse/access/", clickhouse_config
+        )
+        self.assertIn("<local_directory>", clickhouse_config)
+        self.assertIn('"$clickhouse_dir/access"', storage_script)
         self.assertNotIn("/Volumes/T9/projects/marketcow/data-production", storage_script)
         self.assertNotIn("/Volumes/T9/projects/marketcow/data-production", clickhouse_config)
 
