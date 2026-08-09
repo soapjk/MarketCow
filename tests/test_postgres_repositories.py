@@ -32,8 +32,8 @@ class PostgresDomainInventoryTest(unittest.TestCase):
         self.assertEqual(decoded["request_json"], {"source": "vendor"})
 
     def test_bg003_inventory_is_explicit_and_complete(self):
-        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 25)
-        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 25)
+        self.assertEqual(len(POSTGRES_TRANSACTION_DOMAINS), 26)
+        self.assertEqual(len(set(POSTGRES_TRANSACTION_DOMAINS)), 26)
         self.assertIn("admin_audit_event", POSTGRES_TRANSACTION_DOMAINS)
         self.assertEqual(
             POSTGRES_TRANSACTION_DOMAINS[-2:],
@@ -41,6 +41,9 @@ class PostgresDomainInventoryTest(unittest.TestCase):
         )
         self.assertIn("csv_import_job", POSTGRES_TRANSACTION_DOMAINS)
         self.assertIn("csv_import_shard", POSTGRES_TRANSACTION_DOMAINS)
+        self.assertIn(
+            "prediction_market_live_observation", POSTGRES_TRANSACTION_DOMAINS
+        )
 
     def test_history_worker_lease_migration_is_backward_compatible(self):
         version, description, statement = next(
@@ -135,6 +138,19 @@ class PostgresDomainInventoryTest(unittest.TestCase):
         self.assertIn("NOT IN ('raw', 'qfq', 'hfq')", statement)
         self.assertIn("csv_import_job_contract_v2_check", statement)
         self.assertIn("VALIDATE CONSTRAINT", statement)
+
+    def test_polymarket_dashboard_observation_migration_is_bounded(self):
+        version, description, statement = next(
+            value for value in POSTGRES_MIGRATIONS if value[0] == 24
+        )
+
+        self.assertEqual(
+            description, "current Polymarket live dashboard observation"
+        )
+        self.assertIn("CREATE TABLE IF NOT EXISTS prediction_market_live_observation", statement)
+        self.assertIn("scope TEXT PRIMARY KEY", statement)
+        self.assertIn("book_complete_market_count", statement)
+        self.assertIn("unresolved_gap_count", statement)
 
 
 @unittest.skipUnless(
@@ -390,6 +406,25 @@ class PostgresRepositoryIntegrationTest(unittest.TestCase):
         self.repository.save_artifact(artifact)
         saved = self.repository.latest_artifact("fixture", "report_period", "20260331")
         self.assertEqual(saved["artifact_id"], "artifact-1")
+
+        observation = self.repository.upsert_prediction_market_live_observation({
+            "schema_version": "marketcow.polymarket.live-read-health.v1",
+            "status": "index_ready",
+            "catalog_revision": "a" * 64,
+            "catalog_index_ready": True,
+            "latest_state_ready": True,
+            "market_count": 20,
+            "token_count": 40,
+            "book_token_count": 38,
+            "book_complete_market_count": 19,
+            "unresolved_gap_count": 1,
+            "latest_cursor": 12,
+            "reason_codes": ["coverage_gap"],
+            "observed_at": "2026-08-09T00:00:00Z",
+        })
+        self.assertEqual(observation["scope"], "polymarket")
+        self.assertEqual(observation["book_token_count"], 38)
+        self.assertEqual(observation["reason_codes"], ["coverage_gap"])
 
     def test_runtime_config_pit_and_checkpoint_compare_and_swap(self):
         def config(version, observed, value, payload=None):

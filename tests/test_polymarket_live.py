@@ -1254,9 +1254,45 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(events["next_cursor"], writer.cursor)
         self.assertEqual(health["market_count"], 1)
         self.assertEqual(health["token_count"], 2)
+        self.assertEqual(health["book_token_count"], 2)
+        self.assertEqual(health["book_complete_market_count"], 1)
+        self.assertEqual(health["unresolved_gap_count"], 0)
         self.assertEqual(health["status"], "index_ready")
         self.assertTrue(health["latest_state_ready"])
         self.assertFalse(app.state.polymarket_live._recovered)
+
+    def test_api_startup_projects_polymarket_health_for_grafana(self):
+        class ObservingMetadata:
+            def __init__(self):
+                self.observations = []
+
+            def get_instrument(self, _instrument_id):
+                return None
+
+            def upsert_prediction_market_live_observation(self, row):
+                self.observations.append(dict(row))
+                return row
+
+        settings = Settings(
+            raw_path=self.root / "raw", storage_root=self.root,
+            allowed_root=self.root.parent,
+            postgres_dsn="postgresql://u:p@127.0.0.1/test",
+            clickhouse_password="x", profile="test", port=8793,
+            postgres_schema="test", clickhouse_database="test",
+            clickhouse_spool_path=self.root / "spool",
+        )
+        service = Service()
+        service.metadata_repository = ObservingMetadata()
+        app = create_app(settings, service, now_provider=lambda: NOW)
+
+        with TestClient(app):
+            self.assertGreaterEqual(
+                len(service.metadata_repository.observations), 1
+            )
+            observation = service.metadata_repository.observations[0]
+            self.assertEqual(observation["status"], "not_configured")
+            self.assertEqual(observation["market_count"], 0)
+            self.assertEqual(observation["observed_at"], NOW.isoformat())
 
     def test_state_index_lag_and_payload_tamper_fail_closed(self):
         root = self.root / "live"

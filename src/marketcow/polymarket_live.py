@@ -866,6 +866,9 @@ class LiveReadHealth(BaseModel):
     latest_state_ready: bool = False
     market_count: int = Field(default=0, ge=0)
     token_count: int = Field(default=0, ge=0)
+    book_token_count: int = Field(default=0, ge=0)
+    book_complete_market_count: int = Field(default=0, ge=0)
+    unresolved_gap_count: int = Field(default=0, ge=0)
     latest_cursor: int = Field(default=0, ge=0)
     reason_codes: list[str] = Field(default_factory=list)
     source_policy: Literal["official_free_only"] = "official_free_only"
@@ -1420,7 +1423,7 @@ class PolymarketLiveReadStore:
             )
             return LiveReadHealth(status=status, reason_codes=[exc.code])
         try:
-            _, state_metadata = self._state_binding()
+            state_path, state_metadata = self._state_binding()
         except PolymarketLiveReadError as exc:
             return LiveReadHealth(
                 status="degraded",
@@ -1432,6 +1435,18 @@ class PolymarketLiveReadStore:
                 reason_codes=[exc.code],
             )
         recovery_active = bool(state_metadata.get("active_recovery_id"))
+        with _readonly_state_sqlite(state_path) as connection:
+            book_token_count = int(
+                connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+            )
+            book_complete_market_count = int(connection.execute(
+                "SELECT COUNT(*) FROM ("
+                "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
+                ")"
+            ).fetchone()[0])
+            unresolved_gap_count = int(connection.execute(
+                "SELECT COUNT(*) FROM gaps WHERE resolved=0"
+            ).fetchone()[0])
         return LiveReadHealth(
             status="degraded" if recovery_active else "index_ready",
             catalog_revision=metadata["catalog_revision"],
@@ -1439,6 +1454,9 @@ class PolymarketLiveReadStore:
             latest_state_ready=True,
             market_count=int(metadata["market_count"]),
             token_count=int(metadata["token_count"]),
+            book_token_count=book_token_count,
+            book_complete_market_count=book_complete_market_count,
+            unresolved_gap_count=unresolved_gap_count,
             latest_cursor=int(state_metadata["latest_cursor"]),
             reason_codes=["recovery_in_progress"] if recovery_active else [],
         )

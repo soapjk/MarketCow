@@ -180,6 +180,45 @@ class _PostgresControlPlaneRepository:
                 "SELECT * FROM provider_health ORDER BY provider"
             ).fetchall())
 
+    def upsert_prediction_market_live_observation(
+        self, row: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        with self.database.connection() as connection:
+            return connection.execute(
+                """
+                INSERT INTO prediction_market_live_observation
+                    (scope, schema_version, status, catalog_revision,
+                     catalog_index_ready, latest_state_ready, market_count,
+                     token_count, book_token_count, book_complete_market_count,
+                     unresolved_gap_count, latest_cursor, reason_codes, observed_at)
+                VALUES ('polymarket', %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s)
+                ON CONFLICT (scope) DO UPDATE SET
+                    schema_version = EXCLUDED.schema_version,
+                    status = EXCLUDED.status,
+                    catalog_revision = EXCLUDED.catalog_revision,
+                    catalog_index_ready = EXCLUDED.catalog_index_ready,
+                    latest_state_ready = EXCLUDED.latest_state_ready,
+                    market_count = EXCLUDED.market_count,
+                    token_count = EXCLUDED.token_count,
+                    book_token_count = EXCLUDED.book_token_count,
+                    book_complete_market_count = EXCLUDED.book_complete_market_count,
+                    unresolved_gap_count = EXCLUDED.unresolved_gap_count,
+                    latest_cursor = EXCLUDED.latest_cursor,
+                    reason_codes = EXCLUDED.reason_codes,
+                    observed_at = EXCLUDED.observed_at
+                RETURNING *
+                """,
+                (
+                    row["schema_version"], row["status"], row.get("catalog_revision"),
+                    row["catalog_index_ready"], row["latest_state_ready"],
+                    row["market_count"], row["token_count"], row["book_token_count"],
+                    row["book_complete_market_count"], row["unresolved_gap_count"],
+                    row["latest_cursor"], Jsonb(row.get("reason_codes", [])),
+                    row["observed_at"],
+                ),
+            ).fetchone()
+
     def save_runtime_config_version(self, row: Dict[str, Any]) -> Dict[str, Any]:
         """Append an immutable, content-addressed current runtime configuration version."""
         config = row.get("config_json", row.get("config", {}))
