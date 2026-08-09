@@ -1570,6 +1570,29 @@ class LiveStateIndex:
         self.root = root.resolve()
         self.path = self.root / "indexes" / "latest-state.sqlite3"
         self.manifest_path = self.root / "state-index.json"
+        self._batch_state = threading.local()
+
+    @contextmanager
+    def batch(self):
+        """Commit a writer-visible event batch at one SQLite boundary."""
+        if getattr(self._batch_state, "connection", None) is not None:
+            yield
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path)
+        self._schema(connection)
+        self._batch_state.connection = connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            del self._batch_state.connection
+            connection.close()
+        self._publish_manifest()
 
     @staticmethod
     def _schema(connection: sqlite3.Connection, *, wal: bool = True) -> None:
@@ -1637,8 +1660,12 @@ class LiveStateIndex:
         active_recovery_id: str | None,
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as connection:
+        connection = getattr(self._batch_state, "connection", None)
+        owns_connection = connection is None
+        if owns_connection:
+            connection = sqlite3.connect(self.path)
             self._schema(connection)
+        try:
             metadata = self._metadata(connection)
             previous_cursor = int(metadata.get("latest_cursor", "0"))
             if previous_cursor != event.cursor - 1:
@@ -1703,8 +1730,17 @@ class LiveStateIndex:
                 "event_log_size": event_log_size,
                 "active_recovery_id": active_recovery_id or "",
             })
-            connection.commit()
-        self._publish_manifest()
+            if owns_connection:
+                connection.commit()
+        except BaseException:
+            if owns_connection:
+                connection.rollback()
+            raise
+        finally:
+            if owns_connection:
+                connection.close()
+        if owns_connection:
+            self._publish_manifest()
 
     def rebuild(
         self,
@@ -4315,7 +4351,11 @@ class PolymarketLiveCollector:
             tracker = self.store.new_book_recovery_tracker()
 
         def consume(rows: list[dict[str, Any]]) -> None:
-            with self.store._sync_lock:
+            with (
+                self.store._sync_lock,
+                _publication_lock(self.store.root, exclusive=True),
+                self.store.state_index.batch(),
+            ):
                 self.store.recover_book_batch(rows, recovery_id, tracker)
 
         await asyncio.to_thread(
@@ -4351,7 +4391,11 @@ class PolymarketLiveCollector:
                 tracker = self.store.new_book_recovery_tracker()
 
             def consume(rows: list[dict[str, Any]]) -> None:
-                with self.store._sync_lock:
+                with (
+                    self.store._sync_lock,
+                    _publication_lock(self.store.root, exclusive=True),
+                    self.store.state_index.batch(),
+                ):
                     self.store.recover_book_batch(rows, recovery_id, tracker)
 
             await asyncio.to_thread(
