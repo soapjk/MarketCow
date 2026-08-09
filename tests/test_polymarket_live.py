@@ -2024,6 +2024,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             store.apply_snapshot(
                 snapshot("no-1", "0.58", "0.60"), received_at=NOW
             )
+            cursor_before_refresh = store.cursor
             requested = []
 
             def requester(_url, **kwargs):
@@ -2058,7 +2059,15 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 asyncio.run(collector.refresh_books())
 
             self.assertEqual(set(requested), {"yes-1", "no-1"})
-            self.assertEqual(len(event_fsyncs), 1)
+            self.assertEqual(len(event_fsyncs), 0)
+            self.assertEqual(store.cursor, cursor_before_refresh)
+            refreshed = PolymarketLiveReadStore(
+                Path(folder), now_provider=lambda: current[0],
+            ).snapshot(["m1"])
+            self.assertEqual(
+                {book.received_at for book in refreshed.items[0].tokens},
+                {current[0]},
+            )
 
     def test_periodic_snapshot_refresh_recovers_after_transient_failure(self):
         with TemporaryDirectory() as folder:

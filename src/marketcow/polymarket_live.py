@@ -1302,6 +1302,38 @@ class PolymarketLiveReadStore:
         with self._state_snapshot() as (path, _, metadata):
             return path, metadata
 
+    @staticmethod
+    def _indexed_book(row: sqlite3.Row) -> LiveBook:
+        body = bytes(row["payload_json"])
+        if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed", "Book payload hash mismatch", 409,
+            )
+        book = LiveBook.model_validate_json(body)
+        if "confirmed_received_at" not in row.keys() or row["confirmed_received_at"] is None:
+            return book
+        confirmation = {
+            "token_id": book.token_id,
+            "exchange_at": str(row["confirmed_exchange_at"]),
+            "received_at": str(row["confirmed_received_at"]),
+            "state_checksum": str(row["confirmed_state_checksum"]),
+            "source_hash": row["confirmed_source_hash"],
+        }
+        if (
+            confirmation["state_checksum"] != book.state_checksum
+            or content_sha256(confirmation) != row["confirmation_sha256"]
+        ):
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "Book freshness confirmation integrity failed",
+                409,
+            )
+        return book.model_copy(update={
+            "exchange_at": _instant(confirmation["exchange_at"]),
+            "received_at": _instant(confirmation["received_at"]),
+            "source_hash": confirmation["source_hash"],
+        })
+
     def snapshot(self, market_ids: Iterable[str]) -> LiveSnapshotPage:
         selected_ids = self._scope(market_ids)
         bootstrap = self.bootstrap(selected_ids)
@@ -1324,7 +1356,15 @@ class PolymarketLiveReadStore:
                     409,
                 )
             book_rows = list(connection.execute(
-                f"SELECT payload_json, payload_sha256 FROM books WHERE market_id IN ({placeholders})",
+                f"""SELECT b.payload_json, b.payload_sha256,
+                    c.exchange_at AS confirmed_exchange_at,
+                    c.received_at AS confirmed_received_at,
+                    c.state_checksum AS confirmed_state_checksum,
+                    c.source_hash AS confirmed_source_hash,
+                    c.confirmation_sha256
+                    FROM books b LEFT JOIN book_confirmations c
+                    ON c.token_id=b.token_id
+                    WHERE b.market_id IN ({placeholders})""",
                 all_market_ids,
             ))
             gap_rows = list(connection.execute(
@@ -1334,12 +1374,7 @@ class PolymarketLiveReadStore:
             ))
         books = {}
         for row in book_rows:
-            body = bytes(row["payload_json"])
-            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
-                raise PolymarketLiveReadError(
-                    "polymarket_state_integrity_failed", "Book payload hash mismatch", 409,
-                )
-            book = LiveBook.model_validate_json(body)
+            book = self._indexed_book(row)
             books[book.token_id] = book
         gaps = []
         for row in gap_rows:
@@ -1489,8 +1524,15 @@ class PolymarketLiveReadStore:
                     409,
                 )
             book_rows = list(connection.execute(
-                f"""SELECT token_id, payload_json, payload_sha256 FROM books
-                    WHERE market_id IN ({placeholders}) ORDER BY token_id""",
+                f"""SELECT b.token_id, b.payload_json, b.payload_sha256,
+                    c.exchange_at AS confirmed_exchange_at,
+                    c.received_at AS confirmed_received_at,
+                    c.state_checksum AS confirmed_state_checksum,
+                    c.source_hash AS confirmed_source_hash,
+                    c.confirmation_sha256
+                    FROM books b LEFT JOIN book_confirmations c
+                    ON c.token_id=b.token_id
+                    WHERE b.market_id IN ({placeholders}) ORDER BY b.token_id""",
                 selected_ids,
             ))
             gap_rows = list(connection.execute(
@@ -1501,12 +1543,7 @@ class PolymarketLiveReadStore:
             ))
         books = {}
         for row in book_rows:
-            body = bytes(row["payload_json"])
-            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
-                raise PolymarketLiveReadError(
-                    "polymarket_state_integrity_failed", "Book payload hash mismatch", 409,
-                )
-            books[str(row["token_id"])] = LiveBook.model_validate_json(body)
+            books[str(row["token_id"])] = self._indexed_book(row)
         gaps = []
         for row in gap_rows:
             body = bytes(row["payload_json"])
@@ -1673,6 +1710,11 @@ class LiveStateIndex:
                 payload_sha256 TEXT NOT NULL
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS books_market_id ON books(market_id, token_id);
+            CREATE TABLE IF NOT EXISTS book_confirmations (
+                token_id TEXT PRIMARY KEY, exchange_at TEXT NOT NULL,
+                received_at TEXT NOT NULL, state_checksum TEXT NOT NULL,
+                source_hash TEXT, confirmation_sha256 TEXT NOT NULL
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS gaps (
                 gap_id TEXT PRIMARY KEY, market_id TEXT,
                 token_id TEXT, cursor INTEGER NOT NULL,
@@ -1688,6 +1730,60 @@ class LiveStateIndex:
             CREATE INDEX IF NOT EXISTS events_market_cursor
                 ON event_offsets(market_id, cursor);
         """)
+
+    def ensure_runtime_schema(self) -> None:
+        """Apply small forward-compatible tables once, never in the hot batch path."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _publication_lock(self.root, exclusive=True):
+            with sqlite3.connect(self.path, timeout=30) as connection:
+                connection.execute("PRAGMA busy_timeout=30000")
+                connection.execute("""CREATE TABLE IF NOT EXISTS book_confirmations (
+                    token_id TEXT PRIMARY KEY, exchange_at TEXT NOT NULL,
+                    received_at TEXT NOT NULL, state_checksum TEXT NOT NULL,
+                    source_hash TEXT, confirmation_sha256 TEXT NOT NULL
+                ) WITHOUT ROWID""")
+                connection.commit()
+
+    def confirm_book(self, book: LiveBook) -> None:
+        """Publish freshness for unchanged content without another full book event."""
+        connection = getattr(self._batch_state, "connection", None)
+        owns_connection = connection is None
+        if owns_connection:
+            connection = self._writer_connection()
+        confirmation = {
+            "token_id": book.token_id,
+            "exchange_at": book.exchange_at.isoformat(),
+            "received_at": book.received_at.isoformat(),
+            "state_checksum": book.state_checksum,
+            "source_hash": book.source_hash,
+        }
+        try:
+            connection.execute(
+                """INSERT INTO book_confirmations(
+                    token_id, exchange_at, received_at, state_checksum,
+                    source_hash, confirmation_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(token_id) DO UPDATE SET
+                    exchange_at=excluded.exchange_at,
+                    received_at=excluded.received_at,
+                    state_checksum=excluded.state_checksum,
+                    source_hash=excluded.source_hash,
+                    confirmation_sha256=excluded.confirmation_sha256""",
+                (
+                    book.token_id, confirmation["exchange_at"],
+                    confirmation["received_at"], book.state_checksum,
+                    book.source_hash, content_sha256(confirmation),
+                ),
+            )
+            if owns_connection:
+                connection.commit()
+        except BaseException:
+            if owns_connection:
+                connection.rollback()
+            raise
+        finally:
+            if owns_connection:
+                connection.close()
 
     @staticmethod
     def _metadata(connection: sqlite3.Connection) -> dict[str, str]:
@@ -1790,6 +1886,10 @@ class LiveStateIndex:
                         book.token_id, event.market_id, event.cursor, body,
                         hashlib.sha256(body).hexdigest(),
                     ),
+                )
+                connection.execute(
+                    "DELETE FROM book_confirmations WHERE token_id=?",
+                    (book.token_id,),
                 )
             for gap in gaps:
                 body = canonical_json(gap.model_dump(mode="json"))
@@ -3181,8 +3281,9 @@ class LiveStateStore:
         self._event_batch_state.stream = stream
         try:
             yield
-            stream.flush()
-            os.fsync(stream.fileno())
+            if stream.tell() != initial_offset:
+                stream.flush()
+                os.fsync(stream.fileno())
         except BaseException:
             stream.seek(initial_offset)
             stream.truncate()
@@ -3383,7 +3484,8 @@ class LiveStateStore:
         *,
         recovery_id: str | None = None,
         received_at: datetime | None = None,
-    ) -> LiveEventEnvelope:
+        allow_freshness_confirmation: bool = False,
+    ) -> LiveEventEnvelope | None:
         self._ensure_loaded()
         token_id = str(raw.get("asset_id") or raw.get("token_id") or "")
         market = self._market_for_token(token_id)
@@ -3398,23 +3500,40 @@ class LiveStateStore:
         received = received_at or self.now_provider()
         exchange = _instant(raw.get("timestamp") or received)
         previous = self.books.get(token_id)
+        source_hash = str(raw.get("hash") or "") or None
+        last_trade_price = (
+            decimal_text(raw["last_trade_price"], "last_trade_price")
+            if raw.get("last_trade_price") is not None else None
+        )
         epoch = content_sha256({
             "token_id": token_id, "recovery_id": recovery_id or "initial",
             "source_hash": raw.get("hash"), "exchange_at": exchange.isoformat(),
         })
         sequence = 1 if previous is None or previous.book_epoch != epoch else previous.sequence + 1
         checksum = _state_checksum(token_id, tick, state_bids, state_asks)
+        if (
+            allow_freshness_confirmation
+            and previous is not None
+            and previous.tick_size == tick
+            and previous.state_checksum == checksum
+            and previous.last_trade_price == last_trade_price
+        ):
+            confirmed = previous.model_copy(update={
+                "exchange_at": exchange,
+                "received_at": received,
+                "source_hash": source_hash,
+            })
+            self.books[token_id] = confirmed
+            self.state_index.confirm_book(confirmed)
+            return None
         book = LiveBook(
             token_id=token_id, condition_id=market.identity.condition_id,
             book_epoch=epoch, sequence=sequence,
             exchange_at=exchange, received_at=received,
             tick_version=content_sha256({"tick_size": tick}), tick_size=tick,
             bids=bids, asks=asks,
-            last_trade_price=(
-                decimal_text(raw["last_trade_price"], "last_trade_price")
-                if raw.get("last_trade_price") is not None else None
-            ),
-            state_checksum=checksum, source_hash=str(raw.get("hash") or "") or None,
+            last_trade_price=last_trade_price,
+            state_checksum=checksum, source_hash=source_hash,
         )
         self.books[token_id] = book
         return self._emit(
@@ -3697,6 +3816,7 @@ class LiveStateStore:
             try:
                 self.apply_snapshot(
                     row, recovery_id=recovery_id, received_at=received_at,
+                    allow_freshness_confirmation=(refresh_started_at is not None),
                 )
             except ValueError as exc:
                 reason = str(exc)
@@ -4366,6 +4486,7 @@ def load_scoped_live_store(
 ) -> LiveStateStore:
     """Hydrate a bounded writer from published indexes without full recovery."""
     root = root.resolve()
+    LiveStateIndex(root).ensure_runtime_schema()
     recovery = catch_up_live_state_index(root)
     if recovery["replayed_events"]:
         LOGGER.warning("live_state_index_tail_recovered %s", recovery)
