@@ -3209,7 +3209,13 @@ class LiveStateStore:
             exchange_at=exchange, received_at=received,
         )
 
-    def apply_websocket(self, raw: dict[str, Any], *, received_at: datetime | None = None) -> list[LiveEventEnvelope]:
+    def apply_websocket(
+        self,
+        raw: dict[str, Any],
+        *,
+        received_at: datetime | None = None,
+        stale_events_are_resolved: bool = False,
+    ) -> list[LiveEventEnvelope]:
         self._ensure_loaded()
         raw_hash = content_sha256(raw)
         event_type = str(raw.get("event_type") or raw.get("type") or "")
@@ -3284,10 +3290,26 @@ class LiveStateStore:
             envelopes = []
             for change in changes:
                 token_id = str(change.get("asset_id") or change.get("token_id") or "")
-                envelopes.append(self._apply_token_event(event_type, token_id, change, raw, exchange, received))
+                envelopes.append(self._apply_token_event(
+                    event_type,
+                    token_id,
+                    change,
+                    raw,
+                    exchange,
+                    received,
+                    stale_events_are_resolved=stale_events_are_resolved,
+                ))
             return envelopes
         token_id = str(raw.get("asset_id") or raw.get("token_id") or "")
-        return [self._apply_token_event(event_type, token_id, raw, raw, exchange, received)]
+        return [self._apply_token_event(
+            event_type,
+            token_id,
+            raw,
+            raw,
+            exchange,
+            received,
+            stale_events_are_resolved=stale_events_are_resolved,
+        )]
 
     def _apply_token_event(
         self,
@@ -3297,6 +3319,8 @@ class LiveStateStore:
         raw: dict[str, Any],
         exchange: datetime,
         received: datetime,
+        *,
+        stale_events_are_resolved: bool = False,
     ) -> LiveEventEnvelope:
         if event_type not in {"price_change", "best_bid_ask", "last_trade_price", "tick_size_change"}:
             raise ValueError("unsupported public market-channel event")
@@ -3319,6 +3343,11 @@ class LiveStateStore:
                 code="out_of_order", token_id=token_id,
                 expected=previous.exchange_at.isoformat(), observed=exchange.isoformat(),
                 event_at=exchange, detected_at=received,
+                resolved=stale_events_are_resolved,
+                resolution=(
+                    "superseded_by_newer_snapshot"
+                    if stale_events_are_resolved else None
+                ),
             )
             self.gaps.append(gap)
             return self._emit(
@@ -4420,7 +4449,12 @@ class PolymarketLiveCollector:
     def _apply_websocket(self, item: dict[str, Any]) -> None:
         self._snapshot_refresh_idle.wait()
         with self.store._sync_lock:
-            self.store.apply_websocket(item)
+            self.store.apply_websocket(
+                item,
+                stale_events_are_resolved=(
+                    self.snapshot_refresh_seconds is not None
+                ),
+            )
 
     async def run_once(self, *, message_limit: int | None = None) -> None:
         groups = self.planner.connection_groups(

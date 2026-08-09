@@ -634,6 +634,28 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(rejected.fail_closed_reason, "invalid_book_update")
         self.assertGreaterEqual(sum(not item.resolved for item in store.gaps), 2)
 
+    def test_periodic_snapshot_mode_audits_stale_events_as_resolved(self):
+        store = self.store()
+        store.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        rejected = store.apply_websocket(
+            {
+                "event_type": "last_trade_price",
+                "asset_id": "yes-1",
+                "timestamp": "1785739199000",
+                "price": "0.39",
+            },
+            received_at=NOW,
+            stale_events_are_resolved=True,
+        )[0]
+
+        self.assertFalse(rejected.applied)
+        self.assertEqual(rejected.fail_closed_reason, "out_of_order")
+        self.assertTrue(rejected.gaps[0].resolved)
+        self.assertEqual(
+            rejected.gaps[0].resolution, "superseded_by_newer_snapshot"
+        )
+        self.assertEqual(sum(not item.resolved for item in store.gaps), 0)
+
     def test_market_resolved_updates_lifecycle_and_is_retained_after_active_refresh(self):
         store = self.store()
         event = store.apply_websocket({
@@ -1967,7 +1989,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             release = threading.Event()
             original_apply = store.apply_websocket
 
-            def slow_apply(item):
+            def slow_apply(item, **_kwargs):
                 applying.set()
                 release.wait(timeout=1)
                 return original_apply(item)
@@ -2002,7 +2024,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
                 ClobBooksClient(requester=lambda *_args, **_kwargs: None),
             )
-            collector.store.apply_websocket = lambda _item: None
+            collector.store.apply_websocket = lambda _item, **_kwargs: None
             collector._snapshot_refresh_idle.clear()
             applied = threading.Event()
             thread = threading.Thread(
