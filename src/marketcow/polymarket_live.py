@@ -3484,6 +3484,13 @@ class LiveStateStore:
                 tracker["duplicate_response_count"] += 1
                 continue
             previous = self.books.get(token_id)
+            if (
+                previous is not None
+                and _instant(row.get("timestamp") or self.now_provider())
+                < previous.exchange_at
+            ):
+                recovered.add(token_id)
+                continue
             market_id = self.token_to_market.get(token_id)
             market_token_ids = [
                 candidate
@@ -4319,6 +4326,7 @@ class PolymarketLiveCollector:
         catalog_refresh_on_lifecycle_events: bool = True,
         publish_checkpoints: bool = True,
         minimum_snapshot_refresh_age_seconds: float = 0,
+        max_concurrent_snapshot_refreshes: int = 1,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -4339,10 +4347,26 @@ class PolymarketLiveCollector:
         self.minimum_snapshot_refresh_age_seconds = max(
             0, minimum_snapshot_refresh_age_seconds,
         )
+        self.max_concurrent_snapshot_refreshes = max(
+            1, max_concurrent_snapshot_refreshes,
+        )
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
         self._snapshot_refresh_idle = threading.Event()
         self._snapshot_refresh_idle.set()
+        self._snapshot_refresh_activity_lock = threading.Lock()
+        self._snapshot_refresh_activity_count = 0
+
+    def _snapshot_refresh_started(self) -> None:
+        with self._snapshot_refresh_activity_lock:
+            self._snapshot_refresh_activity_count += 1
+            self._snapshot_refresh_idle.clear()
+
+    def _snapshot_refresh_finished(self) -> None:
+        with self._snapshot_refresh_activity_lock:
+            self._snapshot_refresh_activity_count -= 1
+            if self._snapshot_refresh_activity_count == 0:
+                self._snapshot_refresh_idle.set()
 
     def refresh_catalog(self) -> dict[str, Any]:
         rows, evidence = self.catalog_client.fetch_all()
@@ -4407,7 +4431,7 @@ class PolymarketLiveCollector:
 
     async def refresh_books(self, reason: str = "periodic_snapshot_refresh") -> str:
         """Refresh a healthy scope without exposing recovery-in-progress state."""
-        self._snapshot_refresh_idle.clear()
+        self._snapshot_refresh_started()
         try:
             with self.store._sync_lock:
                 recovery_id = content_sha256({
@@ -4446,7 +4470,7 @@ class PolymarketLiveCollector:
                 )
             return recovery_id
         finally:
-            self._snapshot_refresh_idle.set()
+            self._snapshot_refresh_finished()
 
     async def update_subscriptions(self) -> list[dict[str, Any]]:
         desired = set(self.store.token_to_market)
@@ -4547,17 +4571,28 @@ class PolymarketLiveCollector:
     async def _refresh_snapshots_periodically(self) -> None:
         if self.snapshot_refresh_seconds is None:
             return
-        while True:
-            await asyncio.sleep(self.snapshot_refresh_seconds)
-            try:
-                await self.refresh_books("periodic_snapshot_refresh")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOGGER.exception(
-                    "periodic_snapshot_refresh_failed; retrying after %.3f seconds",
-                    self.snapshot_refresh_seconds,
-                )
+
+        async def worker(initial_delay: float) -> None:
+            await asyncio.sleep(self.snapshot_refresh_seconds + initial_delay)
+            while True:
+                try:
+                    await self.refresh_books("periodic_snapshot_refresh")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception(
+                        "periodic_snapshot_refresh_failed; retrying after %.3f seconds",
+                        self.snapshot_refresh_seconds,
+                    )
+                await asyncio.sleep(self.snapshot_refresh_seconds)
+
+        await asyncio.gather(*(
+            worker(
+                index * self.snapshot_refresh_seconds
+                / self.max_concurrent_snapshot_refreshes
+            )
+            for index in range(self.max_concurrent_snapshot_refreshes)
+        ))
 
     async def run(self, *, max_connections: int | None = None) -> None:
         refresh_task = (
