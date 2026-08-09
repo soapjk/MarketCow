@@ -170,10 +170,10 @@ All endpoints are local MarketCow reads and appear in OpenAPI:
 ```text
 GET /v1/prediction-markets/polymarket/live/bootstrap?market_id=m1&market_id=m2
 GET /v1/prediction-markets/polymarket/live/snapshot?market_id=m1&market_id=m2
-GET /v1/prediction-markets/polymarket/live/events?after_cursor=123&limit=1000
-GET /v1/prediction-markets/polymarket/live/checkpoint
+GET /v1/prediction-markets/polymarket/live/events?market_id=m1&after_cursor=123&limit=1000
+GET /v1/prediction-markets/polymarket/live/checkpoint?market_id=m1&market_id=m2
 GET /v1/prediction-markets/polymarket/live/health
-GET /v1/prediction-markets/polymarket/live/gaps?unresolved_only=true
+GET /v1/prediction-markets/polymarket/live/gaps?market_id=m1&unresolved_only=true
 GET /v1/prediction-markets/polymarket/live/public-data/{kind}
 ```
 
@@ -181,9 +181,11 @@ Bootstrap requires 1–100 explicit `market_id` values and returns those canonic
 markets, typed instrument/fee facts, relations/pairs, catalog revision, active tokens,
 sequence semantics, and recovery contract. An unscoped request returns
 `polymarket_full_universe_disabled`; missing/legacy indexes return a machine-readable
-503 and index/row integrity failures return 409. During the catalog-index migration
-stage, snapshot/events/checkpoint/gaps remain fail closed until the durable latest-state
-and event-offset indexes are published. A
+503 and index/row integrity failures return 409. Snapshot, events, checkpoint, and gaps
+use the durable latest-state/event-offset index and require the same 1–100 market scope.
+They return `polymarket_latest_state_index_unavailable` before migration,
+`polymarket_state_index_lagging` when the event log is ahead, and
+`polymarket_state_integrity_failed` for an index/log/revision/hash disagreement. A
 standard negative-risk frame additionally returns every YES-member book and the exact
 pair metadata needed to verify its corresponding NO instrument. Frame revisions bind
 the instrument facts and fee schedule.
@@ -197,16 +199,17 @@ Group-wide metadata failures additionally use `negative_risk_member_catalog_miss
 `negative_risk_member_instrument_facts_incomplete`, and
 `negative_risk_member_fee_schedule_incomplete`.
 
-Events are ordered by a process-independent monotonically increasing cursor and contain
+Events are ordered by a process-independent monotonically increasing global cursor and contain
 canonical and raw payloads plus separate hashes. A retained cursor resumes exactly;
-HTTP 409 `polymarket_live_resume_cursor_expired` requires a fresh bootstrap and snapshot.
-Checkpoint is content-addressed and restart recovery replays every complete canonical
-book event after the checkpoint. Health reports catalog/token/book coverage, ready frame
-count, lag, gap count, and latest cursor.
+the scoped result contains only matching markets while preserving that cursor order.
+Checkpoint is content-addressed over the selected markets at one indexed cursor.
+Restart recovery replays every verified event after the durable checkpoint and rebuilds
+the derived index. Health reports index readiness, catalog/token count, and latest cursor
+without loading the full catalog or replaying the log.
 
 ### Producer/consumer synchronization
 
-The collector is the single writer. The FastAPI process is a read-side durable tailer;
+The collector is the single writer. The FastAPI process is an indexed read-side consumer;
 both must use the exact same local root:
 
 ```text
@@ -215,10 +218,12 @@ both must use the exact same local root:
 
 FastAPI construction and lightweight live health never deserialize the full catalog or
 replay the event log. Scoped bootstrap opens the immutable catalog index read-only and
-performs bounded offset reads. The collector remains the only writer. The forthcoming
-latest-state/event-offset index will expose snapshot and resume through the same
-bounded model; until then those endpoints never fall back to the full in-memory tailer.
-Multiple concurrent collector writers are not supported.
+performs bounded offset reads. Snapshot/checkpoint/gaps use one SQLite read transaction;
+events seek only indexed byte ranges in the authoritative append-only log. The collector
+durably appends each event before updating the derived WAL index. A crash between those
+steps is visible as `polymarket_state_index_lagging`, never as a ready frame; explicit
+recovery deterministically rebuilds the index. Multiple concurrent collector writers
+are not supported.
 
 Every event ID covers the entire envelope, including applied/failure semantics and gap
 facts. Recovery separately recomputes canonical and raw payload hashes, enforces a
@@ -266,6 +271,31 @@ PYTHONPATH=src .venv/bin/python scripts/build_polymarket_live_catalog_index.py \
   --root '<MarketCow storage_root>/prediction-markets/polymarket-live'
 ```
 
+After the catalog index is present, replay the verified checkpoint/event evidence and
+atomically publish the latest-state/event-offset index. This is an explicit offline
+operation; the web application never performs it implicitly:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/build_polymarket_live_state_index.py \
+  --root '<MarketCow storage_root>/prediction-markets/polymarket-live'
+```
+
+The command validates catalog/raw evidence, checkpoint state hash, every event cursor,
+event ID, canonical/raw payload hash, and complete JSONL boundaries. It prints the
+published schema/revision/cursor, log size, path, and row counts. Failure leaves the
+previous published state index in place.
+
+After migration, the read-only measurement command exercises the complete scoped
+bootstrap → snapshot → events → checkpoint → gaps path with configurable repetition
+and concurrency. It accepts only an explicit root and 1–100 market IDs and reports
+latency distribution, response bytes, peak traced Python allocation, and cursor:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/measure_polymarket_live_scoped.py \
+  --root '<MarketCow storage_root>/prediction-markets/polymarket-live' \
+  --market-id 1005343 --market-id 1007579 --repeat 20 --concurrency 4
+```
+
 On 2026-08-04, a local read-only traversal of the real `closed=false` keyset completed
 only after 1,270 pages and 126,981 markets. It took 700.262 seconds with zero retries,
 reused one HTTP session, and produced a 903,205,293-byte canonical JSONL snapshot with
@@ -295,8 +325,9 @@ PYTHONPATH=src .venv/bin/python scripts/capture_polymarket_public_data.py \
   independently complete markets remain available with degraded coverage health.
 - WebSocket disconnect: record coverage gap and require a new epoch/full recovery.
 - Rate limit or transient upstream failure: bounded retry/backoff; never synthesize.
-- Cursor outside retention: HTTP 409 and full consumer resynchronization.
-- Durable tail/hash/cursor failure: HTTP 409; do not serve a partially replayed state.
+- State index behind the event log: HTTP 503; run explicit recovery/rebuild.
+- State index ahead, wrong revision, or durable hash/cursor failure: HTTP 409; do not
+  serve a partially replayed state.
 - Corrupt checkpoint/public fact file: explicit integrity error; never serve silently.
 - Missing/ambiguous fee or relation metadata: frame remains `fail_closed`.
 

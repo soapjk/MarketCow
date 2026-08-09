@@ -1316,11 +1316,12 @@ def create_app(
     def polymarket_live_snapshot(
         market_id: list[str] | None = Query(default=None),
     ):
-        _require_polymarket_scope(market_id)
-        raise HTTPException(status_code=503, detail={
-            "code": "polymarket_latest_state_index_unavailable",
-            "message": "Scoped snapshots require the durable latest-state index",
-        })
+        try:
+            return polymarket_live_read.snapshot(
+                _require_polymarket_scope(market_id)
+            ).model_dump(mode="json")
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/events",
@@ -1332,22 +1333,27 @@ def create_app(
         limit: int = Query(1000, ge=1, le=10000),
         market_id: list[str] | None = Query(default=None),
     ):
-        _require_polymarket_scope(market_id)
-        raise HTTPException(status_code=503, detail={
-            "code": "polymarket_event_index_unavailable",
-            "message": "Scoped event resume requires the durable event-offset index",
-        })
+        try:
+            return polymarket_live_read.events_after(
+                _require_polymarket_scope(market_id), after_cursor, limit,
+            ).model_dump(mode="json")
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/checkpoint",
         response_model=LiveCheckpoint,
         summary="Read a content-addressed Polymarket live checkpoint",
     )
-    def polymarket_live_checkpoint():
-        raise HTTPException(status_code=503, detail={
-            "code": "polymarket_latest_state_index_unavailable",
-            "message": "Checkpoint reads require the durable latest-state index",
-        })
+    def polymarket_live_checkpoint(
+        market_id: list[str] | None = Query(default=None),
+    ):
+        try:
+            return polymarket_live_read.checkpoint(
+                _require_polymarket_scope(market_id)
+            ).model_dump(mode="json")
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/health",
@@ -1362,11 +1368,17 @@ def create_app(
         response_model=LiveGapPage,
         summary="Read the Polymarket live gap ledger",
     )
-    def polymarket_live_gaps(unresolved_only: bool = True):
-        raise HTTPException(status_code=503, detail={
-            "code": "polymarket_latest_state_index_unavailable",
-            "message": "Gap reads require the durable latest-state index",
-        })
+    def polymarket_live_gaps(
+        unresolved_only: bool = True,
+        market_id: list[str] | None = Query(default=None),
+    ):
+        try:
+            return polymarket_live_read.gaps(
+                _require_polymarket_scope(market_id),
+                unresolved_only=unresolved_only,
+            ).model_dump(mode="json")
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/public-data/{kind}",
