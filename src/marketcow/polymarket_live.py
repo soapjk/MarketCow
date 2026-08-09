@@ -1180,6 +1180,10 @@ class PolymarketLiveReadStore:
         )
 
     def _state_path(self) -> Path:
+        _, path = self._state_manifest()
+        return path
+
+    def _state_manifest(self) -> tuple[dict[str, Any], Path]:
         if not self.state_manifest_path.is_file():
             raise PolymarketLiveReadError(
                 "polymarket_latest_state_index_unavailable",
@@ -1205,7 +1209,7 @@ class PolymarketLiveReadStore:
                 "Polymarket state index manifest binding is invalid",
                 409,
             )
-        return path
+        return manifest, path
 
     def _validate_state_connection(
         self, path: Path, connection: sqlite3.Connection,
@@ -1536,7 +1540,7 @@ class PolymarketLiveReadStore:
             )
             return LiveReadHealth(status=status, reason_codes=[exc.code])
         try:
-            state_path, state_metadata = self._state_binding()
+            state_manifest, _ = self._state_manifest()
         except PolymarketLiveReadError as exc:
             return LiveReadHealth(
                 status="degraded",
@@ -1547,19 +1551,46 @@ class PolymarketLiveReadStore:
                 token_count=int(metadata["token_count"]),
                 reason_codes=[exc.code],
             )
-        recovery_active = bool(state_metadata.get("active_recovery_id"))
-        with _readonly_state_sqlite(state_path) as connection:
-            book_token_count = int(
-                connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+        summary_keys = {
+            "catalog_revision", "latest_cursor", "active_recovery_id",
+            "book_token_count", "book_complete_market_count",
+            "unresolved_gap_count",
+        }
+        if summary_keys.issubset(state_manifest):
+            state_metadata = state_manifest
+            if state_metadata["catalog_revision"] != metadata["catalog_revision"]:
+                return LiveReadHealth(
+                    status="degraded",
+                    catalog_revision=metadata["catalog_revision"],
+                    catalog_index_ready=True,
+                    latest_state_ready=False,
+                    market_count=int(metadata["market_count"]),
+                    token_count=int(metadata["token_count"]),
+                    reason_codes=["polymarket_state_integrity_failed"],
+                )
+            book_token_count = int(state_metadata["book_token_count"])
+            book_complete_market_count = int(
+                state_metadata["book_complete_market_count"]
             )
-            book_complete_market_count = int(connection.execute(
-                "SELECT COUNT(*) FROM ("
-                "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
-                ")"
-            ).fetchone()[0])
-            unresolved_gap_count = int(connection.execute(
-                "SELECT COUNT(*) FROM gaps WHERE resolved=0"
-            ).fetchone()[0])
+            unresolved_gap_count = int(state_metadata["unresolved_gap_count"])
+        else:
+            # Compatibility for an index published by an older writer. The next
+            # committed batch upgrades the manifest and removes these scans from
+            # the request path.
+            state_path, state_metadata = self._state_binding()
+            with _readonly_state_sqlite(state_path) as connection:
+                book_token_count = int(
+                    connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+                )
+                book_complete_market_count = int(connection.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
+                    ")"
+                ).fetchone()[0])
+                unresolved_gap_count = int(connection.execute(
+                    "SELECT COUNT(*) FROM gaps WHERE resolved=0"
+                ).fetchone()[0])
+        recovery_active = bool(state_metadata.get("active_recovery_id"))
         return LiveReadHealth(
             status="degraded" if recovery_active else "index_ready",
             catalog_revision=metadata["catalog_revision"],
@@ -1614,17 +1645,19 @@ class LiveStateIndex:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = self._writer_connection()
         self._batch_state.connection = connection
+        published_metadata = None
         try:
             connection.execute("BEGIN IMMEDIATE")
             yield
             connection.commit()
+            published_metadata = self._metadata(connection)
         except BaseException:
             connection.rollback()
             raise
         finally:
             del self._batch_state.connection
             connection.close()
-        self._publish_manifest()
+        self._publish_manifest(published_metadata)
 
     @staticmethod
     def _schema(connection: sqlite3.Connection, *, wal: bool = True) -> None:
@@ -1671,10 +1704,39 @@ class LiveStateIndex:
             [(key, str(value)) for key, value in sorted(values.items())],
         )
 
-    def _publish_manifest(self) -> None:
+    @staticmethod
+    def _health_counts(connection: sqlite3.Connection) -> dict[str, int]:
+        return {
+            "book_token_count": int(
+                connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+            ),
+            "book_complete_market_count": int(connection.execute(
+                "SELECT COUNT(*) FROM ("
+                "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
+                ")"
+            ).fetchone()[0]),
+            "unresolved_gap_count": int(connection.execute(
+                "SELECT COUNT(*) FROM gaps WHERE resolved=0"
+            ).fetchone()[0]),
+        }
+
+    def _publish_manifest(self, metadata: dict[str, str] | None = None) -> None:
+        if metadata is None:
+            with sqlite3.connect(self.path) as connection:
+                metadata = self._metadata(connection)
+        summary = {
+            key: metadata[key]
+            for key in (
+                "catalog_revision", "latest_cursor", "active_recovery_id",
+                "book_token_count", "book_complete_market_count",
+                "unresolved_gap_count",
+            )
+            if key in metadata
+        }
         _atomic_write(self.manifest_path, canonical_json({
             "schema_version": STATE_INDEX_SCHEMA_VERSION,
             "path": str(self.path),
+            **summary,
         }))
 
     def append(
@@ -1690,6 +1752,9 @@ class LiveStateIndex:
         event_log_size: int,
         token_to_market: dict[str, str],
         active_recovery_id: str | None,
+        book_token_count: int | None = None,
+        book_complete_market_count: int | None = None,
+        unresolved_gap_count: int | None = None,
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = getattr(self._batch_state, "connection", None)
@@ -1754,15 +1819,24 @@ class LiveStateIndex:
                         f"UPDATE gaps SET resolved=1 WHERE token_id IN ({placeholders})",
                         recovered,
                     )
+            health_metadata = {
+                key: value for key, value in {
+                    "book_token_count": book_token_count,
+                    "book_complete_market_count": book_complete_market_count,
+                    "unresolved_gap_count": unresolved_gap_count,
+                }.items() if value is not None
+            }
             self._set_metadata(connection, {
                 "schema_version": STATE_INDEX_SCHEMA_VERSION,
                 "catalog_revision": catalog_revision or "",
                 "latest_cursor": event.cursor,
                 "event_log_size": event_log_size,
                 "active_recovery_id": active_recovery_id or "",
+                **health_metadata,
             })
             if owns_connection:
                 connection.commit()
+                published_metadata = self._metadata(connection)
         except BaseException:
             if owns_connection:
                 connection.rollback()
@@ -1771,7 +1845,7 @@ class LiveStateIndex:
             if owns_connection:
                 connection.close()
         if owns_connection:
-            self._publish_manifest()
+            self._publish_manifest(published_metadata)
 
     def rebuild(
         self,
@@ -1856,6 +1930,18 @@ class LiveStateIndex:
                     "latest_cursor": latest_cursor,
                     "event_log_size": event_log_size,
                     "active_recovery_id": active_recovery_id or "",
+                    "book_token_count": len(books),
+                    "book_complete_market_count": len({
+                        market_id for market_id in token_to_market.values()
+                        if sum(
+                            indexed_market_id == market_id
+                            for indexed_market_id in (
+                                token_to_market.get(token_id)
+                                for token_id in books
+                            )
+                        ) == 2
+                    }),
+                    "unresolved_gap_count": sum(not gap.resolved for gap in gaps),
                 })
                 connection.commit()
             os.replace(temporary, self.path)
@@ -2231,6 +2317,7 @@ class LiveStateIndex:
                 "latest_cursor": latest_cursor,
                 "event_log_size": event_log_size,
                 "active_recovery_id": active_recovery_id or "",
+                **self._health_counts(connection),
             })
 
         with temporary.open("rb") as stream:
@@ -3051,6 +3138,7 @@ class LiveStateStore:
         self.gaps: list[GapEntry] = []
         self.events: deque[LiveEventEnvelope] = deque(maxlen=self.replay_capacity)
         self.seen_raw_hashes: set[str] = set()
+        self._seen_raw_hash_order: deque[str] = deque()
         self.active_recovery_id: str | None = None
         self.cursor = 0
         self.catalog_revision: str | None = None
@@ -3065,6 +3153,15 @@ class LiveStateStore:
         # API construction must not deserialize the multi-GB catalog or replay the
         # event log. Stateful operations retain compatibility through _ensure_loaded.
         self._recovered = False
+
+    def _remember_raw_hash(self, raw_hash: str) -> None:
+        if raw_hash in self.seen_raw_hashes:
+            return
+        self.seen_raw_hashes.add(raw_hash)
+        self._seen_raw_hash_order.append(raw_hash)
+        while len(self._seen_raw_hash_order) > self.replay_capacity:
+            expired = self._seen_raw_hash_order.popleft()
+            self.seen_raw_hashes.discard(expired)
 
     @contextmanager
     def durable_event_batch(self):
@@ -3242,7 +3339,7 @@ class LiveStateStore:
         )
         self._event_offset = byte_offset + byte_length
         self._last_log_cursor = envelope.cursor
-        self.seen_raw_hashes.add(raw_hash)
+        self._remember_raw_hash(raw_hash)
         index_gaps = list(gaps or [])
         if event_type == "recovery_completed" and applied:
             recovered = set(
@@ -3264,6 +3361,13 @@ class LiveStateStore:
             event_log_size=self._event_offset,
             token_to_market=self.token_to_market,
             active_recovery_id=self.active_recovery_id,
+            book_token_count=len(self.books),
+            book_complete_market_count=sum(
+                all(outcome.token_id in self.books for outcome in market.identity.outcomes)
+                for market in self.catalog.values()
+                if market.active and not market.closed
+            ),
+            unresolved_gap_count=sum(not gap.resolved for gap in self.gaps),
         )
         return envelope
 
@@ -3946,10 +4050,11 @@ class LiveStateStore:
         self._checkpoint_cursor = checkpoint_cursor
         self.events.clear()
         self.seen_raw_hashes.clear()
+        self._seen_raw_hash_order.clear()
         self.active_recovery_id = None
         for event in events:
             self.events.append(event)
-            self.seen_raw_hashes.add(event.raw_payload_sha256)
+            self._remember_raw_hash(event.raw_payload_sha256)
             if event.cursor <= checkpoint_cursor:
                 self._apply_replayed_event(event)
         if checkpoint:
@@ -4065,7 +4170,7 @@ class LiveStateStore:
                         ) from exc
                     self._validate_event(event, self._last_log_cursor + 1)
                     self.events.append(event)
-                    self.seen_raw_hashes.add(event.raw_payload_sha256)
+                    self._remember_raw_hash(event.raw_payload_sha256)
                     self._apply_replayed_event(event)
                     self._last_log_cursor = event.cursor
                     self._event_offset = stream.tell()
@@ -4271,7 +4376,10 @@ def load_scoped_live_store(
     gaps = reader.gaps(selected_ids, unresolved_only=True)
     _, state_metadata = reader._state_binding()
 
-    store = LiveStateStore(root, now_provider=now_provider)
+    # Scoped collectors publish through the durable event/state indexes; they
+    # do not serve in-process replay. Keep only a small duplicate-detection
+    # horizon instead of retaining up to 100k full-depth book events.
+    store = LiveStateStore(root, replay_capacity=2_000, now_provider=now_provider)
     store.catalog = {
         market.identity.market_id: market for market in bootstrap.markets
     }

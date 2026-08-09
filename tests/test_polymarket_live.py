@@ -1334,6 +1334,36 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertTrue(health["latest_state_ready"])
         self.assertFalse(app.state.polymarket_live._recovered)
 
+    def test_live_health_uses_atomic_manifest_summary_without_state_scan(self):
+        root = self.root / "live-health-summary"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        reader._manifest_binding()
+
+        with patch.object(
+            reader, "_state_binding", side_effect=AssertionError("state scan")
+        ):
+            health = reader.health()
+
+        self.assertEqual(health.status, "index_ready")
+        self.assertEqual(health.latest_cursor, writer.cursor)
+        self.assertEqual(health.book_token_count, 2)
+        self.assertEqual(health.book_complete_market_count, 1)
+        self.assertEqual(health.unresolved_gap_count, 0)
+
+    def test_raw_hash_deduplication_memory_is_bounded_by_replay_capacity(self):
+        store = LiveStateStore(self.root / "bounded-hashes", replay_capacity=2)
+
+        for raw_hash in ("one", "two", "three"):
+            store._remember_raw_hash(raw_hash)
+
+        self.assertEqual(store.seen_raw_hashes, {"two", "three"})
+        self.assertEqual(list(store._seen_raw_hash_order), ["two", "three"])
+
     def test_api_startup_projects_polymarket_health_for_grafana(self):
         class ObservingMetadata:
             def __init__(self):
