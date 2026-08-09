@@ -75,15 +75,32 @@ def _publication_lock(root: Path, *, exclusive: bool):
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    gate = (root.resolve() / ".publication.gate.lock").open("a+b")
     stream = path.open("a+b")
-    fcntl.flock(stream.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-    held[key] = (stream, 1, exclusive)
+    fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
+    try:
+        fcntl.flock(
+            stream.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+        )
+    except BaseException:
+        fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+        gate.close()
+        stream.close()
+        raise
+    if not exclusive:
+        fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+        gate.close()
+        gate = None
+    held[key] = ((stream, gate), 1, exclusive)
     try:
         yield
     finally:
         held.pop(key, None)
         fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
         stream.close()
+        if gate is not None:
+            fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+            gate.close()
 
 
 def _instant(value: Any) -> datetime:
@@ -3428,6 +3445,7 @@ class LiveStateStore:
         tracker: dict[str, Any],
         *,
         write_checkpoint: bool = True,
+        publish_completion_event: bool = True,
     ) -> dict[str, Any]:
         self._ensure_loaded()
         recovered = tracker["recovered"]
@@ -3467,10 +3485,16 @@ class LiveStateStore:
             "unknown_response_count": tracker["unknown_response_count"],
             "coverage_complete": not missing,
         }
-        self._emit("recovery_completed", {
-            **coverage,
-            "resolved_gap_token_ids": sorted(resolved_gap_token_ids),
-        }, {}, applied=True, gaps=new_coverage_gaps)
+        if (
+            publish_completion_event
+            or resolved_gap_token_ids
+            or new_coverage_gaps
+            or invalid
+        ):
+            self._emit("recovery_completed", {
+                **coverage,
+                "resolved_gap_token_ids": sorted(resolved_gap_token_ids),
+            }, {}, applied=True, gaps=new_coverage_gaps)
         if write_checkpoint:
             self.checkpoint()
         return coverage
@@ -4311,6 +4335,7 @@ class PolymarketLiveCollector:
                     recovery_id,
                     tracker,
                     write_checkpoint=self.publish_checkpoints,
+                    publish_completion_event=False,
                 )
             return recovery_id
         finally:
