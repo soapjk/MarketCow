@@ -260,6 +260,7 @@ class PolymarketLiveTest(unittest.TestCase):
             catalog_sha,
         )
         restarted = LiveStateStore(self.root / "live", now_provider=lambda: NOW)
+        restarted.recover()
         self.assertEqual(restarted.catalog_revision, revision)
         self.assertEqual(set(restarted.catalog), {"m1"})
 
@@ -526,16 +527,18 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertTrue(first.exists())
         self.assertTrue(second.exists())
         second.write_bytes(second.read_bytes() + b" ")
+        restarted = LiveStateStore(self.root / "live", now_provider=lambda: NOW)
         with self.assertRaisesRegex(RuntimeError, "raw catalog integrity"):
-            LiveStateStore(self.root / "live", now_provider=lambda: NOW)
+            restarted.recover()
 
     def test_normalized_catalog_jsonl_is_hash_verified_on_restart(self):
         store = self.store()
         manifest = json.loads(store.catalog_path.read_text(encoding="utf-8"))
         normalized = Path(manifest["normalized_catalog"]["path"])
         normalized.write_bytes(normalized.read_bytes() + b"{}\n")
+        restarted = LiveStateStore(self.root / "live", now_provider=lambda: NOW)
         with self.assertRaisesRegex(RuntimeError, "normalized live catalog integrity"):
-            LiveStateStore(self.root / "live", now_provider=lambda: NOW)
+            restarted.recover()
 
     def test_subscription_sharding_and_dynamic_diff(self):
         planner = SubscriptionPlanner(shard_size=2)
@@ -635,6 +638,7 @@ class PolymarketLiveTest(unittest.TestCase):
             }],
         }, received_at=NOW)
         restarted = LiveStateStore(self.root / "live", now_provider=lambda: NOW)
+        restarted.recover()
         self.assertGreater(restarted.cursor, checkpoint.cursor)
         self.assertEqual(
             restarted.books["yes-1"].state_checksum,
@@ -1006,6 +1010,7 @@ class PolymarketLiveTest(unittest.TestCase):
         restarted = LiveStateStore(
             self.root / "live", now_provider=lambda: NOW,
         )
+        restarted.recover()
         unresolved = [
             gap for gap in restarted.gaps
             if not gap.resolved and gap.token_id == "yes-1"
@@ -1076,6 +1081,32 @@ class PolymarketLiveTest(unittest.TestCase):
             "polymarket_public_data_integrity_failed",
         )
 
+    def test_app_construction_defers_polymarket_full_recovery(self):
+        settings = Settings(
+            raw_path=self.root / "raw", storage_root=self.root,
+            allowed_root=self.root.parent,
+            postgres_dsn="postgresql://u:p@127.0.0.1/test",
+            clickhouse_password="x", profile="test", port=8793,
+            postgres_schema="test", clickhouse_database="test",
+            clickhouse_spool_path=self.root / "spool",
+        )
+        writer = LiveStateStore(
+            self.root / "prediction-markets" / "polymarket-live",
+            now_provider=lambda: NOW,
+        )
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+
+        app = create_app(settings, Service())
+        reader = app.state.polymarket_live
+        reader.now_provider = lambda: NOW
+        self.assertFalse(reader._recovered)
+        self.assertEqual(reader.catalog, {})
+
+        reader.recover()
+        self.assertTrue(reader._recovered)
+        self.assertEqual(set(reader.catalog), {"m1"})
+
     def test_running_api_durable_tails_collector_writes_after_startup(self):
         settings = Settings(
             raw_path=self.root / "raw", storage_root=self.root,
@@ -1141,6 +1172,7 @@ class PolymarketLiveTest(unittest.TestCase):
         restarted = LiveStateStore(
             self.root / "live", now_provider=lambda: NOW
         )
+        restarted.recover()
         self.assertEqual(sum(not item.resolved for item in restarted.gaps), 1)
         frame = restarted.frame("m1", now=NOW)
         self.assertEqual(frame.status, "fail_closed")
@@ -1180,6 +1212,7 @@ class PolymarketLiveTest(unittest.TestCase):
                 store.checkpoint()
                 store.apply_websocket(event, received_at=NOW)
                 restarted = LiveStateStore(root, now_provider=lambda: NOW)
+                restarted.recover()
                 unresolved = [gap for gap in restarted.gaps if not gap.resolved]
                 self.assertEqual(len(unresolved), 1)
                 self.assertEqual(unresolved[0].code, name)
@@ -1205,8 +1238,9 @@ class PolymarketLiveTest(unittest.TestCase):
                 mutate(event)
                 lines[0] = json.dumps(event, separators=(",", ":"))
                 store.event_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                restarted = LiveStateStore(root, now_provider=lambda: NOW)
                 with self.assertRaisesRegex(RuntimeError, "hash mismatch|identity mismatch"):
-                    LiveStateStore(root, now_provider=lambda: NOW)
+                    restarted.recover()
 
     def test_self_consistent_but_event_divergent_checkpoint_is_rejected(self):
         store = self.store()
@@ -1225,8 +1259,9 @@ class PolymarketLiveTest(unittest.TestCase):
         store.checkpoint_path.write_text(
             json.dumps(payload, separators=(",", ":")), encoding="utf-8"
         )
+        restarted = LiveStateStore(self.root / "live", now_provider=lambda: NOW)
         with self.assertRaisesRegex(RuntimeError, "books disagree"):
-            LiveStateStore(self.root / "live", now_provider=lambda: NOW)
+            restarted.recover()
 
 
 class FakeSocket:
