@@ -3484,12 +3484,23 @@ class LiveStateStore:
                 tracker["duplicate_response_count"] += 1
                 continue
             previous = self.books.get(token_id)
+            market_id = self.token_to_market.get(token_id)
+            market_token_ids = [
+                candidate
+                for candidate, candidate_market_id in self.token_to_market.items()
+                if candidate_market_id == market_id
+            ]
             if (
                 previous is not None
                 and minimum_book_age_seconds > 0
-                and (
-                    self.now_provider() - previous.received_at
-                ).total_seconds() < minimum_book_age_seconds
+                and market_token_ids
+                and all(
+                    candidate in self.books
+                    and (
+                        self.now_provider() - self.books[candidate].received_at
+                    ).total_seconds() < minimum_book_age_seconds
+                    for candidate in market_token_ids
+                )
             ):
                 recovered.add(token_id)
                 continue
