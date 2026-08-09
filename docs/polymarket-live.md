@@ -283,7 +283,10 @@ PYTHONPATH=src .venv/bin/python scripts/build_polymarket_live_state_index.py \
 The command validates catalog/raw evidence, checkpoint state hash, every event cursor,
 event ID, canonical/raw payload hash, and complete JSONL boundaries. It prints the
 published schema/revision/cursor, log size, path, and row counts. Failure leaves the
-previous published state index in place.
+previous published state index in place. Rebuilds stream the event log once, derive the
+token-to-market mapping directly from the catalog offset index, and commit private
+restart boundaries every 1,000 events. Re-running an interrupted build resumes from
+the last verified boundary without exposing the partial index to readers.
 
 After migration, the read-only measurement command exercises the complete scoped
 bootstrap → snapshot → events → checkpoint → gaps path with configurable repetition

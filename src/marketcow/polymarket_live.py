@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -47,6 +48,42 @@ SIZE_INCREMENT_SOURCE_URL = (
     "b076b04d61135657e25dccc1bbd6866a96bd8c6e/"
     "py_clob_client/order_builder/constants.py"
 )
+
+
+_PUBLICATION_LOCKS = threading.local()
+
+
+@contextmanager
+def _publication_lock(root: Path, *, exclusive: bool):
+    """Serialize cross-process catalog/event/index publication with API reads."""
+    path = (root.resolve() / ".publication.lock")
+    key = str(path)
+    held = getattr(_PUBLICATION_LOCKS, "held", None)
+    if held is None:
+        held = {}
+        _PUBLICATION_LOCKS.held = held
+    current = held.get(key)
+    if current is not None:
+        if exclusive and not current[2]:
+            raise RuntimeError("cannot upgrade a shared live publication lock")
+        held[key] = (current[0], current[1] + 1, current[2])
+        try:
+            yield
+        finally:
+            stream, count, mode = held[key]
+            held[key] = (stream, count - 1, mode)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = path.open("a+b")
+    fcntl.flock(stream.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    held[key] = (stream, 1, exclusive)
+    try:
+        yield
+    finally:
+        held.pop(key, None)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
 
 
 def _instant(value: Any) -> datetime:
@@ -122,13 +159,16 @@ def _fee_missing_fields(
 
 
 def _levels(value: Any, field: str) -> list[dict[str, str]]:
-    levels = []
+    levels = {}
     for item in value or []:
-        levels.append({
-            "price": decimal_text(item.get("price"), f"{field}.price"),
-            "size": decimal_text(item.get("size"), f"{field}.size"),
-        })
-    return levels
+        price = decimal_text(item.get("price"), f"{field}.price")
+        levels[price] = decimal_text(item.get("size"), f"{field}.size")
+    return [
+        {"price": price, "size": levels[price]}
+        for price in sorted(
+            levels, key=Decimal, reverse=field == "bids",
+        )
+    ]
 
 
 def _state_checksum(token_id: str, tick_size: str, bids: dict[str, str], asks: dict[str, str]) -> str:
@@ -899,6 +939,12 @@ class PolymarketLiveReadStore:
     def _manifest_binding(
         self,
     ) -> tuple[dict[str, Any], Path, Path, dict[str, str]]:
+        with _publication_lock(self.root, exclusive=False):
+            return self._manifest_binding_unlocked()
+
+    def _manifest_binding_unlocked(
+        self,
+    ) -> tuple[dict[str, Any], Path, Path, dict[str, str]]:
         if not self.catalog_path.exists():
             raise PolymarketLiveReadError(
                 "polymarket_catalog_index_unavailable",
@@ -1199,13 +1245,14 @@ class PolymarketLiveReadStore:
 
     @contextmanager
     def _state_snapshot(self):
-        path = self._state_path()
-        connection = _readonly_state_sqlite(path)
-        try:
-            connection.execute("BEGIN")
-            yield path, connection, self._validate_state_connection(path, connection)
-        finally:
-            connection.close()
+        with _publication_lock(self.root, exclusive=False):
+            path = self._state_path()
+            connection = _readonly_state_sqlite(path)
+            try:
+                connection.execute("BEGIN")
+                yield path, connection, self._validate_state_connection(path, connection)
+            finally:
+                connection.close()
 
     def _state_binding(self) -> tuple[Path, dict[str, str]]:
         with self._state_snapshot() as (path, _, metadata):
@@ -1290,6 +1337,34 @@ class PolymarketLiveReadStore:
                     "Scoped catalog and state snapshot revisions disagree",
                     409,
                 )
+            if after_cursor > 0:
+                transition_rows = list(connection.execute(
+                    """SELECT cursor, byte_offset, byte_length, line_sha256
+                       FROM event_offsets
+                       WHERE market_id IS NULL AND cursor > ?
+                       ORDER BY cursor""",
+                    (after_cursor,),
+                ))
+                with self.event_path.open("rb") as stream:
+                    for row in transition_rows:
+                        stream.seek(int(row["byte_offset"]))
+                        line = stream.read(int(row["byte_length"]))
+                        if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
+                            raise PolymarketLiveReadError(
+                                "polymarket_state_integrity_failed",
+                                "Catalog transition event hash mismatch",
+                                409,
+                            )
+                        event = LiveEventEnvelope.model_validate_json(line)
+                        if event.event_type == "catalog_revision":
+                            raise PolymarketLiveReadError(
+                                "resume_cursor_expired",
+                                (
+                                    "Resume cursor predates the current catalog; "
+                                    "perform a fresh scoped snapshot"
+                                ),
+                                409,
+                            )
             rows = list(connection.execute(
                 f"""SELECT * FROM event_offsets
                     WHERE market_id IN ({placeholders}) AND cursor > ?
@@ -1453,6 +1528,8 @@ def _gap_identity(gap: GapEntry) -> str:
 
 class LiveStateIndex:
     """Mutable derived state; the append-only event log remains authoritative."""
+
+    rebuild_batch_size = 1_000
 
     def __init__(self, root: Path):
         self.root = root.resolve()
@@ -1682,6 +1759,385 @@ class LiveStateIndex:
             os.replace(temporary, self.path)
         finally:
             temporary.unlink(missing_ok=True)
+        self._publish_manifest()
+
+    @staticmethod
+    def _commit_rebuild_batch(
+        connection: sqlite3.Connection, values: dict[str, Any],
+    ) -> None:
+        """Persist one restart-safe rebuild boundary."""
+        LiveStateIndex._set_metadata(connection, values)
+        connection.commit()
+
+    @staticmethod
+    def _checkpoint_matches_index(
+        connection: sqlite3.Connection,
+        checkpoint: LiveCheckpoint,
+        token_to_market: dict[str, str] | None = None,
+    ) -> bool:
+        expected_books = sorted(
+            (token_id, canonical_json(book.model_dump(mode="json")))
+            for token_id, book in checkpoint.books.items()
+        )
+        observed_books = [
+            (str(row[0]), bytes(row[1]))
+            for row in connection.execute(
+                "SELECT token_id, payload_json FROM books ORDER BY token_id"
+            )
+        ]
+        expected_gaps: dict[str, bytes] = {}
+        for gap in checkpoint.unresolved_gaps:
+            gap_id = _gap_identity(gap)
+            body = canonical_json(gap.model_dump(mode="json"))
+            if gap_id in expected_gaps and expected_gaps[gap_id] != body:
+                return False
+            expected_gaps[gap_id] = body
+        observed_gaps = {
+            str(row[0]): bytes(row[1])
+            for row in connection.execute(
+                "SELECT gap_id, payload_json FROM gaps WHERE resolved=0"
+            )
+        }
+        # The mutable writer may retain repeated, byte-identical gap entries;
+        # the derived index deliberately collapses them by semantic gap identity.
+        if (
+            expected_books != observed_books
+            or any(expected_gaps.get(key) != body for key, body in observed_gaps.items())
+        ):
+            return False
+        if token_to_market is None:
+            return expected_gaps == observed_gaps
+        for gap in checkpoint.unresolved_gaps:
+            gap_id = _gap_identity(gap)
+            if gap_id in observed_gaps:
+                continue
+            body = expected_gaps[gap_id]
+            connection.execute(
+                """INSERT INTO gaps(
+                    gap_id, market_id, token_id, cursor, payload_json,
+                    payload_sha256, resolved
+                ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(gap_id) DO UPDATE SET
+                    market_id=excluded.market_id,
+                    token_id=excluded.token_id,
+                    cursor=excluded.cursor,
+                    payload_json=excluded.payload_json,
+                    payload_sha256=excluded.payload_sha256,
+                    resolved=0""",
+                (
+                    gap_id, token_to_market.get(gap.token_id or ""), gap.token_id,
+                    checkpoint.cursor, body, hashlib.sha256(body).hexdigest(),
+                ),
+            )
+            observed_gaps[gap_id] = body
+        return expected_gaps == observed_gaps
+
+    @staticmethod
+    def _resume_rebuild(
+        connection: sqlite3.Connection,
+        *,
+        event_path: Path,
+        catalog_revision: str,
+        checkpoint_sha256: str,
+    ) -> tuple[int, int, str | None, bool] | None:
+        metadata = LiveStateIndex._metadata(connection)
+        if any(
+            metadata.get(key) != expected
+            for key, expected in {
+                "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                "build_status": "in_progress",
+                "catalog_revision": catalog_revision,
+                "checkpoint_sha256": checkpoint_sha256,
+            }.items()
+        ):
+            return None
+        try:
+            latest_cursor = int(metadata["latest_cursor"])
+            event_log_size = int(metadata["event_log_size"])
+            count, minimum, maximum = connection.execute(
+                "SELECT COUNT(*), MIN(cursor), MAX(cursor) FROM event_offsets"
+            ).fetchone()
+        except (KeyError, TypeError, ValueError, sqlite3.DatabaseError):
+            return None
+        if (
+            event_log_size < 0
+            or (latest_cursor == 0 and count != 0)
+            or (
+                latest_cursor > 0
+                and (count != latest_cursor or minimum != 1 or maximum != latest_cursor)
+            )
+        ):
+            return None
+        if latest_cursor:
+            row = connection.execute(
+                """SELECT byte_offset, byte_length, line_sha256
+                   FROM event_offsets WHERE cursor=?""",
+                (latest_cursor,),
+            ).fetchone()
+            if row is None or int(row[0]) + int(row[1]) != event_log_size:
+                return None
+            try:
+                with event_path.open("rb") as stream:
+                    stream.seek(int(row[0]))
+                    line = stream.read(int(row[1]))
+            except OSError:
+                return None
+            if (
+                len(line) != int(row[1])
+                or hashlib.sha256(line).hexdigest() != row[2]
+            ):
+                return None
+        elif event_log_size != 0:
+            return None
+        return (
+            latest_cursor,
+            event_log_size,
+            metadata.get("active_recovery_id") or None,
+            metadata.get("checkpoint_verified") == "1",
+        )
+
+    def rebuild_from_durable(
+        self,
+        *,
+        event_path: Path,
+        checkpoint: LiveCheckpoint | None,
+        checkpoint_sha256: str,
+        catalog_revision: str,
+        token_to_market: dict[str, str],
+        batch_size: int | None = None,
+    ) -> None:
+        """Single-pass, restart-safe rebuild from verified durable evidence."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.rebuild")
+        batch_size = max(1, batch_size or self.rebuild_batch_size)
+
+        resume = None
+        if temporary.exists():
+            try:
+                with sqlite3.connect(temporary) as connection:
+                    resume = self._resume_rebuild(
+                        connection,
+                        event_path=event_path,
+                        catalog_revision=catalog_revision,
+                        checkpoint_sha256=checkpoint_sha256,
+                    )
+            except sqlite3.DatabaseError:
+                resume = None
+            if resume is None:
+                temporary.unlink()
+
+        with sqlite3.connect(temporary) as connection:
+            self._schema(connection, wal=False)
+            if resume is None:
+                latest_cursor = 0
+                event_log_size = 0
+                active_recovery_id = None
+                checkpoint_verified = checkpoint is None
+                if checkpoint is not None and checkpoint.cursor == 0:
+                    checkpoint_verified = self._checkpoint_matches_index(
+                        connection, checkpoint, token_to_market,
+                    )
+                    if not checkpoint_verified:
+                        raise RuntimeError(
+                            "live checkpoint state disagrees with event replay"
+                        )
+                self._commit_rebuild_batch(connection, {
+                    "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                    "build_status": "in_progress",
+                    "catalog_revision": catalog_revision,
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "checkpoint_verified": int(checkpoint_verified),
+                    "latest_cursor": 0,
+                    "event_log_size": 0,
+                    "active_recovery_id": "",
+                })
+            else:
+                (
+                    latest_cursor, event_log_size, active_recovery_id,
+                    checkpoint_verified,
+                ) = resume
+
+            processed = 0
+            if event_path.exists():
+                with event_path.open("rb") as stream:
+                    stream.seek(event_log_size)
+                    while True:
+                        byte_offset = stream.tell()
+                        line = stream.readline()
+                        if not line:
+                            event_log_size = stream.tell()
+                            break
+                        if not line.endswith(b"\n"):
+                            raise RuntimeError(
+                                "live event log ends with a partial row"
+                            )
+                        try:
+                            event = LiveEventEnvelope.model_validate_json(line)
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                "live event log contains invalid JSON"
+                            ) from exc
+                        LiveStateStore._validate_event(event, latest_cursor + 1)
+                        connection.execute(
+                            """INSERT INTO event_offsets(
+                                cursor, byte_offset, byte_length, event_id,
+                                market_id, token_id, line_sha256
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                event.cursor, byte_offset, len(line), event.event_id,
+                                event.market_id, event.token_id,
+                                hashlib.sha256(line).hexdigest(),
+                            ),
+                        )
+                        if (
+                            event.applied and event.token_id
+                            and event.event_type in {
+                                "book", "price_change", "best_bid_ask",
+                                "last_trade_price", "tick_size_change",
+                            }
+                        ):
+                            book = LiveBook.model_validate(event.canonical_payload)
+                            body = canonical_json(book.model_dump(mode="json"))
+                            connection.execute(
+                                """INSERT INTO books(
+                                    token_id, market_id, cursor,
+                                    payload_json, payload_sha256
+                                ) VALUES (?, ?, ?, ?, ?)
+                                ON CONFLICT(token_id) DO UPDATE SET
+                                    market_id=excluded.market_id,
+                                    cursor=excluded.cursor,
+                                    payload_json=excluded.payload_json,
+                                    payload_sha256=excluded.payload_sha256""",
+                                (
+                                    event.token_id,
+                                    event.market_id
+                                    or token_to_market.get(event.token_id) or "",
+                                    event.cursor, body,
+                                    hashlib.sha256(body).hexdigest(),
+                                ),
+                            )
+                        for gap in event.gaps:
+                            body = canonical_json(gap.model_dump(mode="json"))
+                            connection.execute(
+                                """INSERT INTO gaps(
+                                    gap_id, market_id, token_id, cursor,
+                                    payload_json, payload_sha256, resolved
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(gap_id) DO UPDATE SET
+                                    market_id=excluded.market_id,
+                                    cursor=excluded.cursor,
+                                    payload_json=excluded.payload_json,
+                                    payload_sha256=excluded.payload_sha256,
+                                    resolved=excluded.resolved""",
+                                (
+                                    _gap_identity(gap),
+                                    token_to_market.get(gap.token_id or ""),
+                                    gap.token_id, event.cursor, body,
+                                    hashlib.sha256(body).hexdigest(),
+                                    int(gap.resolved),
+                                ),
+                            )
+                        if event.event_type == "recovery_completed" and event.applied:
+                            recovered = list(
+                                event.canonical_payload.get(
+                                    "resolved_gap_token_ids"
+                                )
+                                or event.canonical_payload.get(
+                                    "recovered_token_ids"
+                                )
+                                or []
+                            )
+                            if recovered:
+                                placeholders = ",".join("?" for _ in recovered)
+                                recovery_id = str(
+                                    event.canonical_payload.get("recovery_id") or ""
+                                )
+                                rows = connection.execute(
+                                    f"""SELECT gap_id, payload_json FROM gaps
+                                        WHERE token_id IN ({placeholders})
+                                        AND resolved=0""",
+                                    recovered,
+                                ).fetchall()
+                                for gap_id, payload_json in rows:
+                                    gap = GapEntry.model_validate_json(payload_json)
+                                    gap.resolved = True
+                                    gap.resolution = (
+                                        f"rest_books_snapshot:{recovery_id}"
+                                    )
+                                    body = canonical_json(
+                                        gap.model_dump(mode="json")
+                                    )
+                                    connection.execute(
+                                        """UPDATE gaps SET
+                                            payload_json=?, payload_sha256=?,
+                                            resolved=1 WHERE gap_id=?""",
+                                        (
+                                            body,
+                                            hashlib.sha256(body).hexdigest(),
+                                            gap_id,
+                                        ),
+                                    )
+                            active_recovery_id = None
+                        elif event.event_type == "recovery_started" and event.applied:
+                            active_recovery_id = str(
+                                event.canonical_payload.get("recovery_id") or ""
+                            ) or None
+
+                        latest_cursor = event.cursor
+                        event_log_size = stream.tell()
+                        processed += 1
+                        if checkpoint is not None and event.cursor == checkpoint.cursor:
+                            checkpoint_verified = self._checkpoint_matches_index(
+                                connection, checkpoint, token_to_market,
+                            )
+                            if not checkpoint_verified:
+                                raise RuntimeError(
+                                    "live checkpoint state disagrees with event replay"
+                                )
+                        if processed % batch_size == 0:
+                            self._commit_rebuild_batch(connection, {
+                                "latest_cursor": latest_cursor,
+                                "event_log_size": event_log_size,
+                                "active_recovery_id": active_recovery_id or "",
+                                "checkpoint_verified": int(checkpoint_verified),
+                            })
+
+            if checkpoint is not None and not checkpoint_verified:
+                raise RuntimeError(
+                    "live checkpoint cursor exceeds verified event log"
+                )
+
+            for token_id, market_id in connection.execute(
+                "SELECT token_id, market_id FROM books"
+            ).fetchall():
+                expected_market_id = token_to_market.get(str(token_id))
+                if expected_market_id is None:
+                    connection.execute(
+                        "DELETE FROM books WHERE token_id=?", (token_id,)
+                    )
+                elif market_id != expected_market_id:
+                    connection.execute(
+                        "UPDATE books SET market_id=? WHERE token_id=?",
+                        (expected_market_id, token_id),
+                    )
+            self._commit_rebuild_batch(connection, {
+                "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                "build_status": "complete",
+                "catalog_revision": catalog_revision,
+                "checkpoint_sha256": checkpoint_sha256,
+                "checkpoint_verified": int(checkpoint_verified),
+                "latest_cursor": latest_cursor,
+                "event_log_size": event_log_size,
+                "active_recovery_id": active_recovery_id or "",
+            })
+
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        # This is an offline operation. Stale sidecars belong to the database
+        # being replaced and must never be replayed over the completed rebuild.
+        for suffix in ("-wal", "-shm"):
+            self.path.with_name(f"{self.path.name}{suffix}").unlink(missing_ok=True)
+        os.replace(temporary, self.path)
         self._publish_manifest()
 
 
@@ -2557,35 +3013,36 @@ class LiveStateStore:
                 _atomic_write(next_raw_catalog_path, raw_body)
         if _file_sha256(next_raw_catalog_path) != raw_sha256:
             raise RuntimeError("live raw catalog integrity failed before publication")
-        _atomic_write_catalog(
-            self.catalog_path, revision=revision, markets=markets,
-            source=next_catalog_source,
-        )
-        self.catalog = by_id
-        self.token_to_market = next_token_to_market
-        self.catalog_revision = revision
-        self.raw_catalog_path = next_raw_catalog_path
-        self.catalog_source = next_catalog_source
-        self._catalog_file_sha256 = _file_sha256(self.catalog_path)
-        next_tokens = set(next_token_to_market)
-        added_tokens = sorted(next_tokens - previous_tokens)
-        removed_tokens = sorted(previous_tokens - next_tokens)
-        token_changes = {
-            "added_count": len(added_tokens),
-            "removed_count": len(removed_tokens),
-            "added_sha256": content_sha256(added_tokens),
-            "removed_sha256": content_sha256(removed_tokens),
-            "requires_bootstrap": True,
-        }
-        self._emit(
-            "catalog_revision",
-            {"catalog_revision": revision, "token_changes": token_changes},
-            {
-                "catalog_source": self.catalog_source,
-                "market_count": raw_market_count,
-            },
-            applied=True,
-        )
+        with _publication_lock(self.root, exclusive=True):
+            _atomic_write_catalog(
+                self.catalog_path, revision=revision, markets=markets,
+                source=next_catalog_source,
+            )
+            self.catalog = by_id
+            self.token_to_market = next_token_to_market
+            self.catalog_revision = revision
+            self.raw_catalog_path = next_raw_catalog_path
+            self.catalog_source = next_catalog_source
+            self._catalog_file_sha256 = _file_sha256(self.catalog_path)
+            next_tokens = set(next_token_to_market)
+            added_tokens = sorted(next_tokens - previous_tokens)
+            removed_tokens = sorted(previous_tokens - next_tokens)
+            token_changes = {
+                "added_count": len(added_tokens),
+                "removed_count": len(removed_tokens),
+                "added_sha256": content_sha256(added_tokens),
+                "removed_sha256": content_sha256(removed_tokens),
+                "requires_bootstrap": True,
+            }
+            self._emit(
+                "catalog_revision",
+                {"catalog_revision": revision, "token_changes": token_changes},
+                {
+                    "catalog_source": self.catalog_source,
+                    "market_count": raw_market_count,
+                },
+                applied=True, _publication_locked=True,
+            )
         return {"catalog_revision": revision, "token_changes": token_changes}
 
     def _emit(
@@ -2604,7 +3061,18 @@ class LiveStateStore:
         received_at: datetime | None = None,
         reason: str | None = None,
         gaps: list[GapEntry] | None = None,
+        _publication_locked: bool = False,
     ) -> LiveEventEnvelope:
+        if not _publication_locked:
+            with _publication_lock(self.root, exclusive=True):
+                return self._emit(
+                    event_type, canonical_payload, raw_payload,
+                    applied=applied, market_id=market_id,
+                    condition_id=condition_id, token_id=token_id,
+                    book_epoch=book_epoch, sequence=sequence,
+                    exchange_at=exchange_at, received_at=received_at,
+                    reason=reason, gaps=gaps, _publication_locked=True,
+                )
         received = received_at or self.now_provider()
         exchange = exchange_at or received
         self.cursor += 1
@@ -3411,11 +3879,57 @@ class LiveStateStore:
 
 
 def build_live_state_index(root: Path) -> dict[str, Any]:
-    """Explicitly replay durable live files and atomically publish derived indexes."""
+    """Single-pass replay of durable files into an atomically published index."""
     root = root.resolve()
-    store = LiveStateStore(root)
-    store.recover()
     reader = PolymarketLiveReadStore(root)
+    payload, normalized_path, catalog_index_path, catalog_metadata = (
+        reader._manifest_binding()
+    )
+    normalized = payload["normalized_catalog"]
+    if _file_sha256(normalized_path) != normalized.get("sha256"):
+        raise RuntimeError("normalized live catalog integrity failed")
+    catalog_source = payload.get("catalog_source")
+    if catalog_source:
+        raw_path = Path(str(catalog_source.get("raw_path") or "")).resolve()
+        raw_root = (root / "raw" / "gamma-catalog").resolve()
+        if not raw_path.is_relative_to(raw_root):
+            raise RuntimeError("live raw catalog escapes local evidence root")
+        if (
+            not raw_path.is_file()
+            or _file_sha256(raw_path)
+            != catalog_source.get("raw_payload_sha256")
+        ):
+            raise RuntimeError("live raw catalog integrity failed")
+
+    try:
+        with _readonly_sqlite(catalog_index_path) as connection:
+            token_to_market = {
+                str(row[0]): str(row[1])
+                for row in connection.execute(
+                    """SELECT tokens.token_id, tokens.market_id
+                       FROM tokens JOIN markets USING(market_id)
+                       WHERE markets.active=1 AND markets.closed=0"""
+                )
+            }
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError("live catalog token index is unreadable") from exc
+
+    checkpoint = None
+    checkpoint_sha256 = ""
+    checkpoint_path = root / "checkpoint.json"
+    if checkpoint_path.exists():
+        body = checkpoint_path.read_bytes()
+        checkpoint = LiveStateStore._validate_checkpoint(body)
+        checkpoint_sha256 = hashlib.sha256(body).hexdigest()
+
+    state_index = LiveStateIndex(root)
+    state_index.rebuild_from_durable(
+        event_path=root / "events.jsonl",
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+        catalog_revision=catalog_metadata["catalog_revision"],
+        token_to_market=token_to_market,
+    )
     path, metadata = reader._state_binding()
     with _readonly_state_sqlite(path) as connection:
         counts = {
@@ -3430,6 +3944,50 @@ def build_live_state_index(root: Path) -> dict[str, Any]:
         "path": str(path),
         **{f"{name}_count": count for name, count in counts.items()},
     }
+
+
+def load_scoped_live_store(
+    root: Path,
+    market_ids: Iterable[str],
+    *,
+    now_provider: Callable[[], datetime] = utc_now,
+) -> LiveStateStore:
+    """Hydrate a bounded writer from published indexes without full recovery."""
+    root = root.resolve()
+    reader = PolymarketLiveReadStore(root, now_provider=now_provider)
+    selected_ids = reader._scope(market_ids)
+    bootstrap = reader.bootstrap(selected_ids)
+    snapshot = reader.snapshot(selected_ids)
+    gaps = reader.gaps(selected_ids, unresolved_only=False)
+    _, state_metadata = reader._state_binding()
+
+    store = LiveStateStore(root, now_provider=now_provider)
+    store.catalog = {
+        market.identity.market_id: market for market in bootstrap.markets
+    }
+    store.token_to_market = {
+        outcome.token_id: market.identity.market_id
+        for market in bootstrap.markets if market.active and not market.closed
+        for outcome in market.identity.outcomes
+    }
+    store.books = {
+        book.token_id: book
+        for frame in snapshot.items
+        for book in frame.tokens
+    }
+    store.gaps = [gap.model_copy(deep=True) for gap in gaps.items]
+    store.cursor = int(state_metadata["latest_cursor"])
+    store.catalog_revision = bootstrap.catalog_revision
+    store.catalog_source = bootstrap.catalog_source
+    store.active_recovery_id = state_metadata.get("active_recovery_id") or None
+    store._event_offset = int(state_metadata["event_log_size"])
+    store._last_log_cursor = store.cursor
+    store._catalog_file_sha256 = _file_sha256(store.catalog_path)
+    checkpoint_path = root / "checkpoint.json"
+    if checkpoint_path.exists():
+        store._checkpoint_file_sha256 = _file_sha256(checkpoint_path)
+    store._recovered = True
+    return store
 
 
 class DataApiPublicNormalizer:
@@ -3537,6 +4095,8 @@ class PolymarketLiveCollector:
         max_websocket_connections: int = 32,
         heartbeat_seconds: float = 10,
         reconnect_seconds: float = 1,
+        snapshot_refresh_seconds: float | None = None,
+        catalog_refresh_on_lifecycle_events: bool = True,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -3546,6 +4106,13 @@ class PolymarketLiveCollector:
         self.max_websocket_connections = max(1, max_websocket_connections)
         self.heartbeat_seconds = max(0.01, heartbeat_seconds)
         self.reconnect_seconds = max(0.0, reconnect_seconds)
+        self.snapshot_refresh_seconds = (
+            max(0.1, snapshot_refresh_seconds)
+            if snapshot_refresh_seconds is not None else None
+        )
+        self.catalog_refresh_on_lifecycle_events = (
+            catalog_refresh_on_lifecycle_events
+        )
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
 
@@ -3578,16 +4145,21 @@ class PolymarketLiveCollector:
         return result
 
     async def bootstrap_books(self, reason: str = "startup") -> str:
-        recovery_id = self.store.mark_recovery_started(reason)
-        tracker = self.store.new_book_recovery_tracker()
+        with self.store._sync_lock:
+            recovery_id = self.store.mark_recovery_started(reason)
+            tracker = self.store.new_book_recovery_tracker()
+
+        def consume(rows: list[dict[str, Any]]) -> None:
+            with self.store._sync_lock:
+                self.store.recover_book_batch(rows, recovery_id, tracker)
+
         await asyncio.to_thread(
             self.books_client.fetch_stream,
             sorted(self.store.token_to_market),
-            batch_consumer=lambda rows: self.store.recover_book_batch(
-                rows, recovery_id, tracker,
-            ),
+            batch_consumer=consume,
         )
-        coverage = self.store.complete_book_recovery(recovery_id, tracker)
+        with self.store._sync_lock:
+            coverage = self.store.complete_book_recovery(recovery_id, tracker)
         if self.books_client.last_evidence is not None:
             self.books_client.last_evidence.update(coverage)
         LOGGER.info(
@@ -3595,6 +4167,29 @@ class PolymarketLiveCollector:
             recovery_id, self.books_client.last_evidence,
             self.store.health().model_dump(mode="json"),
         )
+        return recovery_id
+
+    async def refresh_books(self, reason: str = "periodic_snapshot_refresh") -> str:
+        """Refresh a healthy scope without exposing recovery-in-progress state."""
+        with self.store._sync_lock:
+            recovery_id = content_sha256({
+                "reason": reason,
+                "cursor": self.store.cursor,
+                "observed_at": self.store.now_provider().isoformat(),
+            })
+            tracker = self.store.new_book_recovery_tracker()
+
+        def consume(rows: list[dict[str, Any]]) -> None:
+            with self.store._sync_lock:
+                self.store.recover_book_batch(rows, recovery_id, tracker)
+
+        await asyncio.to_thread(
+            self.books_client.fetch_stream,
+            sorted(self.store.token_to_market),
+            batch_consumer=consume,
+        )
+        with self.store._sync_lock:
+            self.store.complete_book_recovery(recovery_id, tracker)
         return recovery_id
 
     async def update_subscriptions(self) -> list[dict[str, Any]]:
@@ -3660,11 +4255,14 @@ class PolymarketLiveCollector:
                         continue
                     payload = json.loads(message, parse_float=str, parse_int=str)
                     for item in payload if isinstance(payload, list) else [payload]:
-                        self.store.apply_websocket(item)
+                        with self.store._sync_lock:
+                            self.store.apply_websocket(item)
                         consumed += 1
-                        if str(item.get("event_type") or item.get("type") or "") in {
-                            "new_market", "market_resolved",
-                        }:
+                        if (
+                            self.catalog_refresh_on_lifecycle_events
+                            and str(item.get("event_type") or item.get("type") or "")
+                            in {"new_market", "market_resolved"}
+                        ):
                             await asyncio.to_thread(self.refresh_catalog)
                             await self.update_subscriptions()
             finally:
@@ -3681,21 +4279,40 @@ class PolymarketLiveCollector:
             self._consume(group, message_limit=message_limit) for group in groups
         ))
 
+    async def _refresh_snapshots_periodically(self) -> None:
+        if self.snapshot_refresh_seconds is None:
+            return
+        while True:
+            await asyncio.sleep(self.snapshot_refresh_seconds)
+            await self.refresh_books("periodic_snapshot_refresh")
+
     async def run(self, *, max_connections: int | None = None) -> None:
+        refresh_task = (
+            asyncio.create_task(self._refresh_snapshots_periodically())
+            if self.snapshot_refresh_seconds is not None else None
+        )
         attempts = 0
-        while max_connections is None or attempts < max_connections:
-            attempts += 1
-            if attempts > 1:
-                await self.bootstrap_books(f"websocket_reconnect:{attempts}")
-            try:
-                await self.run_once()
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                if max_connections is not None and attempts >= max_connections:
+        try:
+            while max_connections is None or attempts < max_connections:
+                attempts += 1
+                if attempts > 1:
+                    await self.bootstrap_books(f"websocket_reconnect:{attempts}")
+                try:
+                    await self.run_once()
+                    return
+                except asyncio.CancelledError:
                     raise
-                await asyncio.sleep(self.reconnect_seconds)
+                except Exception:
+                    if max_connections is not None and attempts >= max_connections:
+                        raise
+                    await asyncio.sleep(self.reconnect_seconds)
+        finally:
+            if refresh_task is not None:
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except asyncio.CancelledError:
+                    pass
 
 
 def atomic_write_public_facts(root: Path, kind: str, rows: list[dict[str, Any]]) -> Path:
