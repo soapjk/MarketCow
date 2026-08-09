@@ -1876,6 +1876,28 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertGreaterEqual(len(reasons), 2)
             self.assertEqual(set(reasons), {"periodic_snapshot_refresh"})
 
+    def test_scoped_collector_never_overwrites_global_checkpoint(self):
+        with TemporaryDirectory() as folder:
+            rows = [gamma_row()]
+            store = LiveStateStore(Path(folder), now_provider=lambda: NOW)
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(
+                    requester=lambda *_args, **_kwargs: Response([
+                        snapshot("yes-1", "0.40", "0.42"),
+                        snapshot("no-1", "0.58", "0.60"),
+                    ])
+                ),
+                publish_checkpoints=False,
+            )
+
+            asyncio.run(collector.bootstrap_books())
+
+            self.assertFalse(store.checkpoint_path.exists())
+            self.assertEqual(set(store.books), {"yes-1", "no-1"})
+
     def test_periodic_snapshot_refresh_recovers_after_transient_failure(self):
         with TemporaryDirectory() as folder:
             collector = PolymarketLiveCollector(

@@ -3423,7 +3423,11 @@ class LiveStateStore:
             recovered.add(token_id)
 
     def complete_book_recovery(
-        self, recovery_id: str, tracker: dict[str, Any],
+        self,
+        recovery_id: str,
+        tracker: dict[str, Any],
+        *,
+        write_checkpoint: bool = True,
     ) -> dict[str, Any]:
         self._ensure_loaded()
         recovered = tracker["recovered"]
@@ -3467,7 +3471,8 @@ class LiveStateStore:
             **coverage,
             "resolved_gap_token_ids": sorted(resolved_gap_token_ids),
         }, {}, applied=True, gaps=new_coverage_gaps)
-        self.checkpoint()
+        if write_checkpoint:
+            self.checkpoint()
         return coverage
 
     def recover_from_books(
@@ -4200,6 +4205,7 @@ class PolymarketLiveCollector:
         reconnect_seconds: float = 1,
         snapshot_refresh_seconds: float | None = None,
         catalog_refresh_on_lifecycle_events: bool = True,
+        publish_checkpoints: bool = True,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -4216,6 +4222,7 @@ class PolymarketLiveCollector:
         self.catalog_refresh_on_lifecycle_events = (
             catalog_refresh_on_lifecycle_events
         )
+        self.publish_checkpoints = publish_checkpoints
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
         self._snapshot_refresh_idle = threading.Event()
@@ -4264,7 +4271,11 @@ class PolymarketLiveCollector:
             batch_consumer=consume,
         )
         with self.store._sync_lock:
-            coverage = self.store.complete_book_recovery(recovery_id, tracker)
+            coverage = self.store.complete_book_recovery(
+                recovery_id,
+                tracker,
+                write_checkpoint=self.publish_checkpoints,
+            )
         if self.books_client.last_evidence is not None:
             self.books_client.last_evidence.update(coverage)
         LOGGER.info(
@@ -4296,7 +4307,11 @@ class PolymarketLiveCollector:
                 batch_consumer=consume,
             )
             with self.store._sync_lock:
-                self.store.complete_book_recovery(recovery_id, tracker)
+                self.store.complete_book_recovery(
+                    recovery_id,
+                    tracker,
+                    write_checkpoint=self.publish_checkpoints,
+                )
             return recovery_id
         finally:
             self._snapshot_refresh_idle.set()

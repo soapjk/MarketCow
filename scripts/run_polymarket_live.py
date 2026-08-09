@@ -69,6 +69,7 @@ def main() -> None:
         max_websocket_connections=arguments.max_websocket_connections,
         snapshot_refresh_seconds=arguments.snapshot_refresh_seconds,
         catalog_refresh_on_lifecycle_events=not bool(arguments.market_id),
+        publish_checkpoints=not bool(arguments.market_id),
     )
     if arguments.market_id:
         print({
