@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import threading
 import unittest
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
@@ -10,6 +12,7 @@ from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
+import marketcow.polymarket_live as polymarket_live_module
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.polymarket_contracts import content_sha256
@@ -20,9 +23,13 @@ from marketcow.polymarket_live import (
     GammaKeysetCatalog,
     GammaLiveNormalizer,
     LiveStateStore,
+    PolymarketLiveReadError,
+    PolymarketLiveReadStore,
     PolymarketLiveCollector,
     SubscriptionPlanner,
     atomic_write_public_facts,
+    build_live_catalog_index,
+    build_live_state_index,
 )
 from tests.test_market_data_api import Service
 
@@ -985,6 +992,9 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(store.frame("m2", now=NOW).status, "fail_closed")
         self.assertEqual(books.last_evidence["missing_token_count"], 2)
         self.assertFalse(books.last_evidence["coverage_complete"])
+        reader = PolymarketLiveReadStore(store.root, now_provider=lambda: NOW)
+        self.assertEqual(reader.gaps(["m2"], unresolved_only=True).count, 2)
+        self.assertEqual(reader.snapshot(["m2"]).items[0].status, "fail_closed")
 
     def test_invalid_rest_book_is_durable_gap_without_aborting_other_books(self):
         store = self.store()
@@ -1028,6 +1038,7 @@ class PolymarketLiveTest(unittest.TestCase):
         app = create_app(settings, Service())
         store = app.state.polymarket_live
         store.now_provider = lambda: NOW
+        app.state.polymarket_live_read.now_provider = lambda: NOW
         rows = [gamma_row()]
         store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
         store.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
@@ -1038,17 +1049,45 @@ class PolymarketLiveTest(unittest.TestCase):
         }], NOW)
         facts_path = atomic_write_public_facts(store.root, "trades", facts)
         client = TestClient(app)
-        bootstrap = client.get("/v1/prediction-markets/polymarket/live/bootstrap")
-        frame = client.get("/v1/prediction-markets/polymarket/live/snapshot")
-        events = client.get("/v1/prediction-markets/polymarket/live/events?after_cursor=0")
+        bootstrap = client.get(
+            "/v1/prediction-markets/polymarket/live/bootstrap?market_id=m1"
+        )
+        full = client.get("/v1/prediction-markets/polymarket/live/bootstrap")
+        frame = client.get(
+            "/v1/prediction-markets/polymarket/live/snapshot?market_id=m1"
+        )
+        events = client.get(
+            "/v1/prediction-markets/polymarket/live/events?after_cursor=0&market_id=m1"
+        )
         health = client.get("/v1/prediction-markets/polymarket/live/health")
+        checkpoint = client.get(
+            "/v1/prediction-markets/polymarket/live/checkpoint?market_id=m1"
+        )
+        gaps = client.get(
+            "/v1/prediction-markets/polymarket/live/gaps?market_id=m1"
+        )
         public = client.get("/v1/prediction-markets/polymarket/live/public-data/trades")
         openapi = client.get("/openapi.json").json()
         self.assertEqual(bootstrap.status_code, 200)
+        self.assertEqual(bootstrap.json()["markets"][0]["identity"]["market_id"], "m1")
+        self.assertEqual(full.json()["detail"]["code"], "polymarket_full_universe_disabled")
         self.assertEqual(frame.json()["items"][0]["status"], "ready")
-        self.assertGreater(len(events.json()["items"]), 0)
+        self.assertEqual(len(frame.json()["items"][0]["tokens"]), 2)
+        self.assertEqual(len(events.json()["items"]), 2)
+        self.assertEqual(health.json()["status"], "index_ready")
+        self.assertEqual(len(checkpoint.json()["books"]), 2)
+        self.assertEqual(gaps.json()["count"], 0)
         self.assertEqual(health.json()["source_policy"], "official_free_only")
         self.assertEqual(public.json()["count"], 1)
+        for path in ("snapshot", "events", "checkpoint", "gaps"):
+            unknown = client.get(
+                f"/v1/prediction-markets/polymarket/live/{path}?market_id=unknown"
+            )
+            self.assertEqual(unknown.status_code, 404)
+            self.assertEqual(
+                unknown.json()["detail"]["code"],
+                "polymarket_live_market_not_found",
+            )
         for path in (
             "/v1/prediction-markets/polymarket/live/bootstrap",
             "/v1/prediction-markets/polymarket/live/snapshot",
@@ -1107,6 +1146,68 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertTrue(reader._recovered)
         self.assertEqual(set(reader.catalog), {"m1"})
 
+    def test_catalog_offset_index_preserves_scope_order_and_row_integrity(self):
+        root = self.root / "live"
+        store = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row("m1"), gamma_row(
+            "m2", condition_id="0x" + "2" * 64,
+            tokens=("yes-2", "no-2"),
+        )]
+        store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        reader = PolymarketLiveReadStore(root)
+
+        with patch.object(
+            polymarket_live_module,
+            "_file_sha256",
+            wraps=polymarket_live_module._file_sha256,
+        ) as digest:
+            result = reader.bootstrap(["m2", "m1", "m2"])
+            reader.bootstrap(["m1"])
+        self.assertEqual(
+            [market.identity.market_id for market in result.markets],
+            ["m2", "m1"],
+        )
+        hashed_paths = [call.args[0] for call in digest.call_args_list]
+        self.assertEqual(hashed_paths, [reader.catalog_index_root / (
+            f"{result.catalog_revision}.sqlite3"
+        )])
+        self.assertNotIn(
+            Path(json.loads(reader.catalog_path.read_text())["normalized_catalog"]["path"]),
+            hashed_paths,
+        )
+        self.assertEqual(reader.health().status, "index_ready")
+
+        manifest = json.loads(reader.catalog_path.read_text(encoding="utf-8"))
+        normalized = Path(manifest["normalized_catalog"]["path"])
+        body = normalized.read_bytes()
+        normalized.write_bytes(body.replace(b'"market_id":"m1"', b'"market_id":"x1"'))
+        with self.assertRaises(PolymarketLiveReadError) as raised:
+            reader.bootstrap(["m1"])
+        self.assertEqual(
+            raised.exception.code, "polymarket_catalog_row_integrity_failed"
+        )
+
+    def test_catalog_index_tamper_and_legacy_catalog_fail_closed(self):
+        root = self.root / "live"
+        store = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        reader = PolymarketLiveReadStore(root)
+        manifest = json.loads(reader.catalog_path.read_text(encoding="utf-8"))
+        index = Path(manifest["catalog_index"]["path"])
+        self.assertEqual(reader.health().status, "index_ready")
+        index.write_bytes(index.read_bytes() + b"tampered")
+        health = reader.health()
+        self.assertEqual(health.status, "integrity_failed")
+        self.assertIn("polymarket_catalog_integrity_failed", health.reason_codes)
+
+        manifest.pop("catalog_index")
+        reader.catalog_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(reader.health().status, "legacy_unindexed")
+        rebuilt = build_live_catalog_index(root)
+        self.assertEqual(rebuilt["market_count"], 1)
+        self.assertEqual(reader.health().status, "index_ready")
+
     def test_running_api_durable_tails_collector_writes_after_startup(self):
         settings = Settings(
             raw_path=self.root / "raw", storage_root=self.root,
@@ -1118,13 +1219,13 @@ class PolymarketLiveTest(unittest.TestCase):
         )
         app = create_app(settings, Service())
         app.state.polymarket_live.now_provider = lambda: NOW
+        app.state.polymarket_live_read.now_provider = lambda: NOW
         client = TestClient(app)
-        self.assertEqual(
-            client.get(
-                "/v1/prediction-markets/polymarket/live/health"
-            ).json()["book_token_count"],
-            0,
-        )
+        initial_health = client.get(
+            "/v1/prediction-markets/polymarket/live/health"
+        ).json()
+        self.assertEqual(initial_health["status"], "not_configured")
+        self.assertFalse(app.state.polymarket_live._recovered)
 
         writer = LiveStateStore(
             self.root / "prediction-markets" / "polymarket-live",
@@ -1136,13 +1237,13 @@ class PolymarketLiveTest(unittest.TestCase):
         writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
 
         bootstrap = client.get(
-            "/v1/prediction-markets/polymarket/live/bootstrap"
+            "/v1/prediction-markets/polymarket/live/bootstrap?market_id=m1"
         ).json()
         frame = client.get(
-            "/v1/prediction-markets/polymarket/live/snapshot"
+            "/v1/prediction-markets/polymarket/live/snapshot?market_id=m1"
         ).json()
         events = client.get(
-            "/v1/prediction-markets/polymarket/live/events?after_cursor=0"
+            "/v1/prediction-markets/polymarket/live/events?after_cursor=0&market_id=m1"
         ).json()
         health = client.get(
             "/v1/prediction-markets/polymarket/live/health"
@@ -1151,8 +1252,129 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(frame["items"][0]["status"], "ready")
         self.assertEqual(len(frame["items"][0]["tokens"]), 2)
         self.assertEqual(events["next_cursor"], writer.cursor)
-        self.assertEqual(health["book_token_count"], 2)
-        self.assertEqual(health["status"], "ready")
+        self.assertEqual(health["market_count"], 1)
+        self.assertEqual(health["token_count"], 2)
+        self.assertEqual(health["status"], "index_ready")
+        self.assertTrue(health["latest_state_ready"])
+        self.assertFalse(app.state.polymarket_live._recovered)
+
+    def test_state_index_lag_and_payload_tamper_fail_closed(self):
+        root = self.root / "live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
+
+        with sqlite3.connect(writer.state_index.path) as connection:
+            connection.execute(
+                "UPDATE books SET payload_json=? WHERE token_id='yes-1'", (b"{}",)
+            )
+            connection.commit()
+        with self.assertRaises(PolymarketLiveReadError) as tampered:
+            reader.snapshot(["m1"])
+        self.assertEqual(tampered.exception.code, "polymarket_state_integrity_failed")
+
+        writer.state_index.rebuild(
+            event_path=writer.event_path, books=writer.books, gaps=writer.gaps,
+            catalog_revision=writer.catalog_revision,
+            token_to_market=writer.token_to_market,
+        )
+        with writer.event_path.open("ab") as stream:
+            stream.write(b"partial-unindexed-event\n")
+        with self.assertRaises(PolymarketLiveReadError) as lagging:
+            reader.snapshot(["m1"])
+        self.assertEqual(lagging.exception.code, "polymarket_state_index_lagging")
+
+    def test_state_index_rebuild_restores_scoped_snapshot_and_event_offsets(self):
+        root = self.root / "live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        writer.state_index.path.unlink()
+        writer.state_index.manifest_path.unlink()
+
+        rebuilt = build_live_state_index(root)
+        self.assertEqual(rebuilt["latest_cursor"], 3)
+        self.assertEqual(rebuilt["books_count"], 2)
+        self.assertEqual(rebuilt["event_offsets_count"], 3)
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
+        page = reader.events_after(["m1"], 0, 10)
+        self.assertEqual([event.cursor for event in page.items], [2, 3])
+
+    def test_scoped_reads_are_bounded_to_one_hundred_markets(self):
+        root = self.root / "live"
+        rows = [
+            gamma_row(
+                f"m{index}",
+                condition_id="0x" + f"{index + 1:064x}",
+                tokens=(f"yes-{index}", f"no-{index}"),
+            )
+            for index in range(100)
+        ]
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        market_ids = [f"m{index}" for index in range(100)]
+        page = reader.snapshot(market_ids)
+        self.assertEqual(page.count, 100)
+        self.assertEqual([item.market_id for item in page.items], market_ids)
+        self.assertTrue(all(item.status == "fail_closed" for item in page.items))
+        with self.assertRaises(PolymarketLiveReadError) as raised:
+            reader.bootstrap([*market_ids, "overflow"])
+        self.assertEqual(raised.exception.code, "polymarket_scope_too_large")
+
+    def test_event_first_write_window_is_observable_and_never_torn_ready(self):
+        root = self.root / "live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        entered = threading.Event()
+        release = threading.Event()
+        original_append = writer.state_index.append
+
+        def delayed_append(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            return original_append(*args, **kwargs)
+
+        error = []
+
+        def update_book():
+            try:
+                writer.apply_websocket({
+                    "event_type": "price_change",
+                    "timestamp": "1785739201000",
+                    "price_changes": [{
+                        "asset_id": "yes-1", "side": "BUY",
+                        "price": "0.40", "size": "12",
+                    }],
+                }, received_at=NOW)
+            except Exception as exc:  # pragma: no cover - asserted below
+                error.append(exc)
+
+        with patch.object(writer.state_index, "append", side_effect=delayed_append):
+            worker = threading.Thread(target=update_book)
+            worker.start()
+            self.assertTrue(entered.wait(timeout=2))
+            with self.assertRaises(PolymarketLiveReadError) as lagging:
+                reader.snapshot(["m1"])
+            self.assertEqual(
+                lagging.exception.code, "polymarket_state_index_lagging"
+            )
+            release.set()
+            worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(error, [])
+        self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
 
     def test_post_checkpoint_invalid_gap_survives_restart_until_rest_recovery(self):
         store = self.store()
@@ -1177,14 +1399,28 @@ class PolymarketLiveTest(unittest.TestCase):
         frame = restarted.frame("m1", now=NOW)
         self.assertEqual(frame.status, "fail_closed")
         self.assertIn("unresolved_gap", frame.reason_codes)
+        indexed_reader = PolymarketLiveReadStore(
+            self.root / "live", now_provider=lambda: NOW
+        )
+        self.assertEqual(indexed_reader.gaps(["m1"], unresolved_only=True).count, 1)
+        self.assertEqual(
+            indexed_reader.snapshot(["m1"]).items[0].status, "fail_closed"
+        )
 
         recovery_id = restarted.mark_recovery_started("integrity_recovery")
+        self.assertEqual(indexed_reader.health().status, "degraded")
+        self.assertIn(
+            "recovery_in_progress",
+            indexed_reader.snapshot(["m1"]).items[0].reason_codes,
+        )
         restarted.recover_from_books([
             snapshot("yes-1", "0.39", "0.41", "1785739203000"),
             snapshot("no-1", "0.59", "0.61", "1785739203000"),
         ], recovery_id)
         self.assertEqual(sum(not item.resolved for item in restarted.gaps), 0)
         self.assertEqual(restarted.frame("m1", now=NOW).status, "ready")
+        self.assertEqual(indexed_reader.gaps(["m1"], unresolved_only=True).count, 0)
+        self.assertEqual(indexed_reader.snapshot(["m1"]).items[0].status, "ready")
 
     def test_failed_event_types_are_durable_after_checkpoint(self):
         cases = {

@@ -11,10 +11,12 @@ import tempfile
 import threading
 import time
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
+from urllib.parse import quote
 
 import requests
 import websockets
@@ -179,6 +181,210 @@ def _market_sequence_sha256(markets: list[LiveMarket]) -> str:
     return digest.hexdigest()
 
 
+CATALOG_INDEX_SCHEMA_VERSION = "marketcow.polymarket.catalog-index.v1"
+LIVE_READ_SCHEMA_VERSION = "marketcow.polymarket.live-read-health.v1"
+STATE_INDEX_SCHEMA_VERSION = "marketcow.polymarket.state-index.v1"
+
+
+def _readonly_sqlite(path: Path) -> sqlite3.Connection:
+    uri = f"file:{quote(str(path), safe='/')}?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _readonly_state_sqlite(path: Path) -> sqlite3.Connection:
+    uri = f"file:{quote(str(path), safe='/')}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _catalog_index_metadata(connection: sqlite3.Connection) -> dict[str, str]:
+    return {
+        str(row["key"]): str(row["value"])
+        for row in connection.execute("SELECT key, value FROM metadata")
+    }
+
+
+def _write_catalog_index(
+    path: Path,
+    *,
+    revision: str,
+    catalog_sha256: str,
+    rows: Iterable[tuple[LiveMarket, bytes]],
+    expected_market_count: int,
+) -> dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    token_count = 0
+    market_count = 0
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        with sqlite3.connect(temporary) as connection:
+            connection.executescript("""
+                PRAGMA journal_mode=DELETE;
+                PRAGMA synchronous=FULL;
+                CREATE TABLE metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE markets (
+                    market_id TEXT PRIMARY KEY,
+                    byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
+                    byte_length INTEGER NOT NULL CHECK(byte_length > 0),
+                    row_sha256 TEXT NOT NULL,
+                    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                    closed INTEGER NOT NULL CHECK(closed IN (0, 1)),
+                    catalog_revision TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE tokens (
+                    token_id TEXT PRIMARY KEY,
+                    market_id TEXT NOT NULL,
+                    outcome_label TEXT NOT NULL,
+                    FOREIGN KEY(market_id) REFERENCES markets(market_id)
+                ) WITHOUT ROWID;
+                CREATE INDEX tokens_market_id ON tokens(market_id, token_id);
+            """)
+            offset = 0
+            for market, body in rows:
+                market_count += 1
+                market_id = market.identity.market_id
+                connection.execute(
+                    """INSERT INTO markets(
+                        market_id, byte_offset, byte_length, row_sha256,
+                        active, closed, catalog_revision
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        market_id, offset, len(body), hashlib.sha256(body).hexdigest(),
+                        int(market.active), int(market.closed), revision,
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO tokens(token_id, market_id, outcome_label) VALUES (?, ?, ?)",
+                    [
+                        (outcome.token_id, market_id, outcome.outcome)
+                        for outcome in market.identity.outcomes
+                    ],
+                )
+                token_count += len(market.identity.outcomes)
+                offset += len(body) + 1
+            if market_count != expected_market_count:
+                raise RuntimeError("live catalog index row count mismatch")
+            metadata = {
+                "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+                "catalog_revision": revision,
+                "catalog_sha256": catalog_sha256,
+                "market_count": str(market_count),
+                "token_count": str(token_count),
+            }
+            connection.executemany(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                sorted(metadata.items()),
+            )
+            connection.commit()
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+    index_sha256 = _file_sha256(path)
+    with _readonly_sqlite(path) as connection:
+        observed = _catalog_index_metadata(connection)
+        observed_markets = connection.execute(
+            "SELECT COUNT(*) FROM markets"
+        ).fetchone()[0]
+        observed_tokens = connection.execute(
+            "SELECT COUNT(*) FROM tokens"
+        ).fetchone()[0]
+    if (
+        observed.get("schema_version") != CATALOG_INDEX_SCHEMA_VERSION
+        or observed.get("catalog_revision") != revision
+        or observed.get("catalog_sha256") != catalog_sha256
+        or int(observed.get("market_count", "-1")) != market_count
+        or int(observed.get("token_count", "-1")) != token_count
+        or observed_markets != market_count
+        or observed_tokens != token_count
+    ):
+        raise RuntimeError("live catalog index integrity failed before publication")
+    return {
+        "format": "sqlite-offset-v1",
+        "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+        "path": str(path),
+        "sha256": index_sha256,
+        "catalog_revision": revision,
+        "catalog_sha256": catalog_sha256,
+        "market_count": market_count,
+        "token_count": token_count,
+    }
+
+
+def _reuse_catalog_index(
+    path: Path,
+    *,
+    revision: str,
+    catalog_sha256: str,
+    rows: list[tuple[LiveMarket, bytes]],
+) -> dict[str, Any]:
+    try:
+        with _readonly_sqlite(path) as connection:
+            metadata = _catalog_index_metadata(connection)
+            indexed_markets = {
+                str(row["market_id"]): row
+                for row in connection.execute("SELECT * FROM markets")
+            }
+            indexed_tokens = {
+                (str(row["token_id"]), str(row["market_id"]), str(row["outcome_label"]))
+                for row in connection.execute(
+                    "SELECT token_id, market_id, outcome_label FROM tokens"
+                )
+            }
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError("existing live catalog index is invalid") from exc
+    offset = 0
+    expected_tokens = set()
+    for market, body in rows:
+        market_id = market.identity.market_id
+        indexed = indexed_markets.get(market_id)
+        if indexed is None or (
+            int(indexed["byte_offset"]) != offset
+            or int(indexed["byte_length"]) != len(body)
+            or indexed["row_sha256"] != hashlib.sha256(body).hexdigest()
+            or indexed["catalog_revision"] != revision
+        ):
+            raise RuntimeError("existing live catalog index row binding mismatch")
+        expected_tokens.update(
+            (outcome.token_id, market_id, outcome.outcome)
+            for outcome in market.identity.outcomes
+        )
+        offset += len(body) + 1
+    if (
+        metadata.get("schema_version") != CATALOG_INDEX_SCHEMA_VERSION
+        or metadata.get("catalog_revision") != revision
+        or metadata.get("catalog_sha256") != catalog_sha256
+        or int(metadata.get("market_count", "-1")) != len(rows)
+        or indexed_tokens != expected_tokens
+    ):
+        raise RuntimeError("existing live catalog index metadata mismatch")
+    return {
+        "format": "sqlite-offset-v1",
+        "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+        "path": str(path),
+        "sha256": _file_sha256(path),
+        "catalog_revision": revision,
+        "catalog_sha256": catalog_sha256,
+        "market_count": len(rows),
+        "token_count": len(expected_tokens),
+    }
+
+
 def _atomic_write_catalog(
     path: Path,
     *,
@@ -189,11 +395,13 @@ def _atomic_write_catalog(
     normalized_root = path.parent / "catalogs"
     normalized_root.mkdir(parents=True, exist_ok=True)
     normalized_path = normalized_root / f"{revision}.jsonl"
+    normalized_rows = [
+        (market, canonical_json(market.model_dump(mode="json")))
+        for market in markets
+    ]
     normalized_hasher = hashlib.sha256()
-    for market in markets:
-        normalized_hasher.update(
-            canonical_json(market.model_dump(mode="json")) + b"\n"
-        )
+    for _, body in normalized_rows:
+        normalized_hasher.update(body + b"\n")
     expected_normalized_sha256 = normalized_hasher.hexdigest()
     temporary = None
     if not normalized_path.exists():
@@ -202,8 +410,8 @@ def _atomic_write_catalog(
                 dir=normalized_root, delete=False,
             ) as stream:
                 temporary = Path(stream.name)
-                for market in markets:
-                    stream.write(canonical_json(market.model_dump(mode="json")) + b"\n")
+                for _, body in normalized_rows:
+                    stream.write(body + b"\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, normalized_path)
@@ -218,13 +426,92 @@ def _atomic_write_catalog(
         "path": str(normalized_path),
         "sha256": expected_normalized_sha256,
     }
+    index_path = path.parent / "catalog-indexes" / f"{revision}.sqlite3"
+    if index_path.exists():
+        catalog_index = _reuse_catalog_index(
+            index_path,
+            revision=revision,
+            catalog_sha256=expected_normalized_sha256,
+            rows=normalized_rows,
+        )
+    else:
+        catalog_index = _write_catalog_index(
+            index_path,
+            revision=revision,
+            catalog_sha256=expected_normalized_sha256,
+            rows=normalized_rows,
+            expected_market_count=len(normalized_rows),
+        )
     _atomic_write(path, canonical_json({
         "catalog_revision": revision,
         "catalog_source": source,
+        "catalog_index": catalog_index,
         "normalized_catalog": normalized,
         "schema_version": LIVE_SCHEMA_VERSION,
     }))
     return normalized
+
+
+def build_live_catalog_index(root: Path) -> dict[str, Any]:
+    """Build and atomically publish an offset index for one verified legacy catalog."""
+    root = root.resolve()
+    manifest_path = root / "catalog.json"
+    normalized_root = root / "catalogs"
+    index_root = root / "catalog-indexes"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("live catalog manifest is unavailable or invalid") from exc
+    normalized = payload.get("normalized_catalog")
+    if not isinstance(normalized, dict):
+        raise RuntimeError("live catalog lacks normalized JSONL metadata")
+    normalized_path = Path(str(normalized.get("path") or "")).resolve()
+    if not normalized_path.is_relative_to(normalized_root):
+        raise RuntimeError("normalized live catalog escapes local storage root")
+    expected_sha256 = str(normalized.get("sha256") or "")
+    expected_count = int(normalized.get("market_count") or -1)
+    revision = str(payload.get("catalog_revision") or "")
+    if not normalized_path.is_file() or _file_sha256(normalized_path) != expected_sha256:
+        raise RuntimeError("normalized live catalog integrity failed")
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    count = 0
+    with normalized_path.open("rb") as stream:
+        for line in stream:
+            body = line.removesuffix(b"\n")
+            if not body:
+                continue
+            market = LiveMarket.model_validate_json(body)
+            canonical = canonical_json(market.model_dump(mode="json"))
+            if canonical != body:
+                raise RuntimeError("normalized live catalog row is not canonical")
+            if count:
+                digest.update(b",")
+            digest.update(body)
+            count += 1
+    digest.update(b"]")
+    if count != expected_count or digest.hexdigest() != revision:
+        raise RuntimeError("live catalog revision or row count mismatch")
+
+    def rows() -> Iterable[tuple[LiveMarket, bytes]]:
+        with normalized_path.open("rb") as stream:
+            for line in stream:
+                body = line.removesuffix(b"\n")
+                if body:
+                    yield LiveMarket.model_validate_json(body), body
+
+    index_path = index_root / f"{revision}.sqlite3"
+    catalog_index = _write_catalog_index(
+        index_path,
+        revision=revision,
+        catalog_sha256=expected_sha256,
+        rows=rows(),
+        expected_market_count=expected_count,
+    )
+    payload["catalog_index"] = catalog_index
+    _atomic_write(manifest_path, canonical_json(payload))
+    return catalog_index
 
 
 class LiveFactProvenance(BaseModel):
@@ -564,6 +851,838 @@ class PublicDataPage(BaseModel):
     kind: Literal["trades", "activity", "positions", "holders"]
     count: int = Field(ge=0)
     items: list[dict[str, Any]]
+
+
+class LiveReadHealth(BaseModel):
+    schema_version: Literal[
+        "marketcow.polymarket.live-read-health.v1"
+    ] = LIVE_READ_SCHEMA_VERSION
+    status: Literal[
+        "not_configured", "legacy_unindexed", "index_ready",
+        "degraded", "integrity_failed",
+    ]
+    catalog_revision: str | None = None
+    catalog_index_ready: bool = False
+    latest_state_ready: bool = False
+    market_count: int = Field(default=0, ge=0)
+    token_count: int = Field(default=0, ge=0)
+    latest_cursor: int = Field(default=0, ge=0)
+    reason_codes: list[str] = Field(default_factory=list)
+    source_policy: Literal["official_free_only"] = "official_free_only"
+
+
+class PolymarketLiveReadError(RuntimeError):
+    def __init__(self, code: str, message: str, status_code: int):
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
+class PolymarketLiveReadStore:
+    """Bounded, provider-neutral reads over immutable live indexes."""
+
+    max_scope_markets = 100
+
+    def __init__(self, root: Path, *, now_provider: Callable[[], datetime] = utc_now):
+        self.root = root.resolve()
+        self.now_provider = now_provider
+        self.catalog_path = self.root / "catalog.json"
+        self.normalized_catalog_root = self.root / "catalogs"
+        self.catalog_index_root = self.root / "catalog-indexes"
+        self.state_index_root = self.root / "indexes"
+        self.state_manifest_path = self.root / "state-index.json"
+        self.event_path = self.root / "events.jsonl"
+        self._binding_cache: tuple[
+            str, tuple[int, int], dict[str, Any], Path, Path, dict[str, str]
+        ] | None = None
+
+    def _manifest_binding(
+        self,
+    ) -> tuple[dict[str, Any], Path, Path, dict[str, str]]:
+        if not self.catalog_path.exists():
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_index_unavailable",
+                "Polymarket live catalog is not configured",
+                503,
+            )
+        try:
+            manifest_body = self.catalog_path.read_bytes()
+            manifest_sha256 = hashlib.sha256(manifest_body).hexdigest()
+            payload = json.loads(manifest_body)
+        except (OSError, ValueError) as exc:
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket live catalog manifest is invalid",
+                409,
+            ) from exc
+        normalized = payload.get("normalized_catalog")
+        catalog_index = payload.get("catalog_index")
+        if not isinstance(normalized, dict):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket live catalog lacks normalized metadata",
+                409,
+            )
+        if not isinstance(catalog_index, dict):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_index_unavailable",
+                "Polymarket live catalog is legacy and has no offset index",
+                503,
+            )
+        normalized_path = Path(str(normalized.get("path") or "")).resolve()
+        index_path = Path(str(catalog_index.get("path") or "")).resolve()
+        if not normalized_path.is_relative_to(self.normalized_catalog_root):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Normalized catalog escapes the live storage root",
+                409,
+            )
+        if not index_path.is_relative_to(self.catalog_index_root):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Catalog index escapes the live storage root",
+                409,
+            )
+        if not normalized_path.is_file() or not index_path.is_file():
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_index_unavailable",
+                "Polymarket catalog or index file is missing",
+                503,
+            )
+        index_stat = index_path.stat()
+        index_signature = (index_stat.st_size, index_stat.st_mtime_ns)
+        if self._binding_cache is not None:
+            cached_manifest, cached_index, *cached_binding = self._binding_cache
+            if (
+                cached_manifest == manifest_sha256
+                and cached_index == index_signature
+            ):
+                cached_payload, cached_normalized, cached_path, cached_metadata = (
+                    cached_binding
+                )
+                return (
+                    cached_payload, cached_normalized, cached_path, cached_metadata,
+                )
+        if _file_sha256(index_path) != catalog_index.get("sha256"):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog index hash mismatch",
+                409,
+            )
+        try:
+            with _readonly_sqlite(index_path) as connection:
+                metadata = _catalog_index_metadata(connection)
+        except sqlite3.DatabaseError as exc:
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog index is not readable",
+                409,
+            ) from exc
+        revision = str(payload.get("catalog_revision") or "")
+        expected = {
+            "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+            "catalog_revision": revision,
+            "catalog_sha256": str(normalized.get("sha256") or ""),
+            "market_count": str(normalized.get("market_count") or ""),
+        }
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog manifest and index binding disagree",
+                409,
+            )
+        self._binding_cache = (
+            manifest_sha256, index_signature, payload, normalized_path,
+            index_path, metadata,
+        )
+        return payload, normalized_path, index_path, metadata
+
+    @staticmethod
+    def _scope(market_ids: Iterable[str]) -> list[str]:
+        selected = list(dict.fromkeys(str(item).strip() for item in market_ids))
+        if not selected or any(not item for item in selected):
+            raise PolymarketLiveReadError(
+                "polymarket_market_scope_required",
+                "At least one non-empty market_id is required",
+                400,
+            )
+        if len(selected) > PolymarketLiveReadStore.max_scope_markets:
+            raise PolymarketLiveReadError(
+                "polymarket_scope_too_large",
+                "At most 100 distinct market_id values may be requested",
+                400,
+            )
+        return selected
+
+    def bootstrap(self, market_ids: Iterable[str]) -> LiveBootstrapResponse:
+        selected_ids = self._scope(market_ids)
+        payload, normalized_path, index_path, _ = self._manifest_binding()
+        placeholders = ",".join("?" for _ in selected_ids)
+        try:
+            with _readonly_sqlite(index_path) as connection:
+                indexed_rows = {
+                    str(row["market_id"]): row
+                    for row in connection.execute(
+                        f"""SELECT market_id, byte_offset, byte_length, row_sha256
+                            FROM markets WHERE market_id IN ({placeholders})""",
+                        selected_ids,
+                    )
+                }
+                token_rows = list(connection.execute(
+                    f"""SELECT token_id, market_id, outcome_label
+                        FROM tokens WHERE market_id IN ({placeholders})
+                        ORDER BY market_id, token_id""",
+                    selected_ids,
+                ))
+        except sqlite3.DatabaseError as exc:
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog index query failed",
+                409,
+            ) from exc
+        missing = [market_id for market_id in selected_ids if market_id not in indexed_rows]
+        if missing:
+            raise PolymarketLiveReadError(
+                "polymarket_live_market_not_found",
+                f"Unknown Polymarket live market_id: {missing[0]}",
+                404,
+            )
+        markets = []
+        with normalized_path.open("rb") as stream:
+            for market_id in selected_ids:
+                indexed = indexed_rows[market_id]
+                stream.seek(int(indexed["byte_offset"]))
+                body = stream.read(int(indexed["byte_length"]))
+                delimiter = stream.read(1)
+                if (
+                    delimiter != b"\n"
+                    or hashlib.sha256(body).hexdigest() != indexed["row_sha256"]
+                ):
+                    raise PolymarketLiveReadError(
+                        "polymarket_catalog_row_integrity_failed",
+                        f"Catalog row integrity failed for market_id {market_id}",
+                        409,
+                    )
+                try:
+                    market = LiveMarket.model_validate_json(body)
+                except ValueError as exc:
+                    raise PolymarketLiveReadError(
+                        "polymarket_catalog_row_integrity_failed",
+                        f"Catalog row schema failed for market_id {market_id}",
+                        409,
+                    ) from exc
+                if market.identity.market_id != market_id:
+                    raise PolymarketLiveReadError(
+                        "polymarket_catalog_row_integrity_failed",
+                        f"Catalog row identity failed for market_id {market_id}",
+                        409,
+                    )
+                markets.append(market)
+        expected_tokens = sorted(
+            (outcome.token_id, market.identity.market_id, outcome.outcome)
+            for market in markets for outcome in market.identity.outcomes
+        )
+        observed_tokens = sorted(
+            (str(row["token_id"]), str(row["market_id"]), str(row["outcome_label"]))
+            for row in token_rows
+        )
+        if expected_tokens != observed_tokens:
+            raise PolymarketLiveReadError(
+                "polymarket_catalog_integrity_failed",
+                "Polymarket catalog token index disagrees with selected rows",
+                409,
+            )
+        return LiveBootstrapResponse(
+            catalog_revision=str(payload["catalog_revision"]),
+            catalog_source=payload.get("catalog_source"),
+            cursor=0,
+            markets=markets,
+            active_token_ids=sorted(
+                outcome.token_id
+                for market in markets if market.active and not market.closed
+                for outcome in market.identity.outcomes
+            ),
+            sequence_semantics="deterministic_normalized",
+            recovery={
+                "bootstrap": "CLOB POST /books full snapshots",
+                "disconnect": "new book_epoch followed by full /books recovery",
+                "resume": "state index required before event resume",
+            },
+            source_policy="official_free_only",
+        )
+
+    def _state_path(self) -> Path:
+        if not self.state_manifest_path.is_file():
+            raise PolymarketLiveReadError(
+                "polymarket_latest_state_index_unavailable",
+                "Polymarket latest-state index is not published",
+                503,
+            )
+        try:
+            manifest = json.loads(self.state_manifest_path.read_text(encoding="utf-8"))
+            path = Path(str(manifest.get("path") or "")).resolve()
+        except (OSError, ValueError) as exc:
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "Polymarket state index manifest is invalid",
+                409,
+            ) from exc
+        if (
+            manifest.get("schema_version") != STATE_INDEX_SCHEMA_VERSION
+            or not path.is_relative_to(self.state_index_root)
+            or not path.is_file()
+        ):
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "Polymarket state index manifest binding is invalid",
+                409,
+            )
+        return path
+
+    def _validate_state_connection(
+        self, path: Path, connection: sqlite3.Connection,
+    ) -> dict[str, str]:
+        try:
+            metadata = LiveStateIndex._metadata(connection)
+            last = connection.execute(
+                """SELECT cursor, byte_offset, byte_length
+                   FROM event_offsets ORDER BY cursor DESC LIMIT 1"""
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "Polymarket state index is not readable",
+                409,
+            ) from exc
+        if metadata.get("schema_version") != STATE_INDEX_SCHEMA_VERSION:
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed", "State index schema mismatch", 409,
+            )
+        _, _, _, catalog_metadata = self._manifest_binding()
+        if metadata.get("catalog_revision") != catalog_metadata.get("catalog_revision"):
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "State and catalog revisions disagree",
+                409,
+            )
+        event_log_size = int(metadata.get("event_log_size", "-1"))
+        actual_size = self.event_path.stat().st_size if self.event_path.exists() else 0
+        if event_log_size > actual_size:
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "State index is ahead of the durable event log",
+                409,
+            )
+        if event_log_size < actual_size:
+            raise PolymarketLiveReadError(
+                "polymarket_state_index_lagging",
+                "State index is behind the durable event log",
+                503,
+            )
+        latest_cursor = int(metadata.get("latest_cursor", "0"))
+        if (latest_cursor == 0) != (last is None):
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "State cursor and event offset cardinality disagree",
+                409,
+            )
+        if last is not None and (
+            int(last["cursor"]) != latest_cursor
+            or int(last["byte_offset"]) + int(last["byte_length"]) != event_log_size
+        ):
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "State cursor and durable event boundary disagree",
+                409,
+            )
+        return metadata
+
+    @contextmanager
+    def _state_snapshot(self):
+        path = self._state_path()
+        connection = _readonly_state_sqlite(path)
+        try:
+            connection.execute("BEGIN")
+            yield path, connection, self._validate_state_connection(path, connection)
+        finally:
+            connection.close()
+
+    def _state_binding(self) -> tuple[Path, dict[str, str]]:
+        with self._state_snapshot() as (path, _, metadata):
+            return path, metadata
+
+    def snapshot(self, market_ids: Iterable[str]) -> LiveSnapshotPage:
+        selected_ids = self._scope(market_ids)
+        bootstrap = self.bootstrap(selected_ids)
+        relation_ids = sorted({
+            pair.market_id
+            for market in bootstrap.markets
+            for relation in market.relations
+            for pair in relation.outcome_pairs
+            if pair.market_id not in selected_ids
+        })
+        related = self.bootstrap(relation_ids).markets if relation_ids else []
+        markets = bootstrap.markets + related
+        all_market_ids = [market.identity.market_id for market in markets]
+        placeholders = ",".join("?" for _ in all_market_ids)
+        with self._state_snapshot() as (_, connection, metadata):
+            if metadata["catalog_revision"] != bootstrap.catalog_revision:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed",
+                    "Scoped catalog and state snapshot revisions disagree",
+                    409,
+                )
+            book_rows = list(connection.execute(
+                f"SELECT payload_json, payload_sha256 FROM books WHERE market_id IN ({placeholders})",
+                all_market_ids,
+            ))
+            gap_rows = list(connection.execute(
+                f"SELECT payload_json, payload_sha256 FROM gaps WHERE market_id IN ({placeholders})",
+                all_market_ids,
+            ))
+        books = {}
+        for row in book_rows:
+            body = bytes(row["payload_json"])
+            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed", "Book payload hash mismatch", 409,
+                )
+            book = LiveBook.model_validate_json(body)
+            books[book.token_id] = book
+        gaps = []
+        for row in gap_rows:
+            body = bytes(row["payload_json"])
+            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed", "Gap payload hash mismatch", 409,
+                )
+            gaps.append(GapEntry.model_validate_json(body))
+        transient = LiveStateStore(self.root / ".bounded-read")
+        transient.now_provider = self.now_provider
+        transient._recovered = True
+        transient.catalog = {market.identity.market_id: market for market in markets}
+        transient.token_to_market = {
+            outcome.token_id: market.identity.market_id
+            for market in markets for outcome in market.identity.outcomes
+        }
+        transient.catalog_revision = metadata["catalog_revision"]
+        transient.cursor = int(metadata["latest_cursor"])
+        transient.active_recovery_id = metadata.get("active_recovery_id") or None
+        transient.books = books
+        transient.gaps = gaps
+        return LiveSnapshotPage(
+            catalog_revision=transient.catalog_revision,
+            cursor=transient.cursor,
+            count=len(selected_ids),
+            items=[transient.frame(market_id) for market_id in selected_ids],
+        )
+
+    def events_after(
+        self, market_ids: Iterable[str], after_cursor: int, limit: int,
+    ) -> LiveEventPage:
+        selected_ids = self._scope(market_ids)
+        bootstrap = self.bootstrap(selected_ids)
+        placeholders = ",".join("?" for _ in selected_ids)
+        with self._state_snapshot() as (_, connection, metadata):
+            if metadata["catalog_revision"] != bootstrap.catalog_revision:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed",
+                    "Scoped catalog and state snapshot revisions disagree",
+                    409,
+                )
+            rows = list(connection.execute(
+                f"""SELECT * FROM event_offsets
+                    WHERE market_id IN ({placeholders}) AND cursor > ?
+                    ORDER BY cursor LIMIT ?""",
+                [*selected_ids, after_cursor, limit + 1],
+            ))
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items = []
+        with self.event_path.open("rb") as stream:
+            for row in rows:
+                stream.seek(int(row["byte_offset"]))
+                line = stream.read(int(row["byte_length"]))
+                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
+                    raise PolymarketLiveReadError(
+                        "polymarket_state_integrity_failed", "Event row hash mismatch", 409,
+                    )
+                event = LiveEventEnvelope.model_validate_json(line)
+                if (
+                    event.cursor != int(row["cursor"])
+                    or event.event_id != row["event_id"]
+                    or event.market_id not in selected_ids
+                    or content_sha256(event.canonical_payload)
+                    != event.canonical_payload_sha256
+                    or content_sha256(event.raw_payload) != event.raw_payload_sha256
+                    or live_event_identity(event) != event.event_id
+                ):
+                    raise PolymarketLiveReadError(
+                        "polymarket_state_integrity_failed", "Event index identity mismatch", 409,
+                    )
+                items.append(event)
+        next_cursor = items[-1].cursor if items else after_cursor
+        return LiveEventPage(
+            after_cursor=after_cursor, next_cursor=next_cursor,
+            has_more=has_more, items=items,
+        )
+
+    def gaps(
+        self, market_ids: Iterable[str], *, unresolved_only: bool,
+    ) -> LiveGapPage:
+        selected_ids = self._scope(market_ids)
+        bootstrap = self.bootstrap(selected_ids)
+        placeholders = ",".join("?" for _ in selected_ids)
+        resolved_clause = " AND resolved=0" if unresolved_only else ""
+        with self._state_snapshot() as (_, connection, metadata):
+            if metadata["catalog_revision"] != bootstrap.catalog_revision:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed",
+                    "Scoped catalog and state snapshot revisions disagree",
+                    409,
+                )
+            rows = list(connection.execute(
+                f"""SELECT payload_json, payload_sha256 FROM gaps
+                    WHERE market_id IN ({placeholders}){resolved_clause}
+                    ORDER BY cursor, gap_id""",
+                selected_ids,
+            ))
+        items = []
+        for row in rows:
+            body = bytes(row["payload_json"])
+            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed", "Gap payload hash mismatch", 409,
+                )
+            items.append(GapEntry.model_validate_json(body))
+        return LiveGapPage(count=len(items), items=items)
+
+    def checkpoint(self, market_ids: Iterable[str]) -> LiveCheckpoint:
+        selected_ids = self._scope(market_ids)
+        bootstrap = self.bootstrap(selected_ids)
+        placeholders = ",".join("?" for _ in selected_ids)
+        with self._state_snapshot() as (_, connection, metadata):
+            if metadata["catalog_revision"] != bootstrap.catalog_revision:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed",
+                    "Scoped catalog and state snapshot revisions disagree",
+                    409,
+                )
+            book_rows = list(connection.execute(
+                f"""SELECT token_id, payload_json, payload_sha256 FROM books
+                    WHERE market_id IN ({placeholders}) ORDER BY token_id""",
+                selected_ids,
+            ))
+            gap_rows = list(connection.execute(
+                f"""SELECT payload_json, payload_sha256 FROM gaps
+                    WHERE market_id IN ({placeholders}) AND resolved=0
+                    ORDER BY cursor, gap_id""",
+                selected_ids,
+            ))
+        books = {}
+        for row in book_rows:
+            body = bytes(row["payload_json"])
+            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed", "Book payload hash mismatch", 409,
+                )
+            books[str(row["token_id"])] = LiveBook.model_validate_json(body)
+        gaps = []
+        for row in gap_rows:
+            body = bytes(row["payload_json"])
+            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed", "Gap payload hash mismatch", 409,
+                )
+            gaps.append(GapEntry.model_validate_json(body))
+        state = {
+            "cursor": int(metadata["latest_cursor"]),
+            "catalog_revision": metadata["catalog_revision"],
+            "books": {
+                key: value.model_dump(mode="json") for key, value in sorted(books.items())
+            },
+            "unresolved_gaps": [gap.model_dump(mode="json") for gap in gaps],
+        }
+        return LiveCheckpoint(
+            **state, created_at=self.now_provider(), state_sha256=content_sha256(state)
+        )
+
+    def health(self) -> LiveReadHealth:
+        if not self.catalog_path.exists():
+            return LiveReadHealth(status="not_configured")
+        try:
+            _, _, _, metadata = self._manifest_binding()
+        except PolymarketLiveReadError as exc:
+            status = (
+                "legacy_unindexed"
+                if exc.code == "polymarket_catalog_index_unavailable"
+                else "integrity_failed"
+            )
+            return LiveReadHealth(status=status, reason_codes=[exc.code])
+        try:
+            _, state_metadata = self._state_binding()
+        except PolymarketLiveReadError as exc:
+            return LiveReadHealth(
+                status="degraded",
+                catalog_revision=metadata["catalog_revision"],
+                catalog_index_ready=True,
+                latest_state_ready=False,
+                market_count=int(metadata["market_count"]),
+                token_count=int(metadata["token_count"]),
+                reason_codes=[exc.code],
+            )
+        recovery_active = bool(state_metadata.get("active_recovery_id"))
+        return LiveReadHealth(
+            status="degraded" if recovery_active else "index_ready",
+            catalog_revision=metadata["catalog_revision"],
+            catalog_index_ready=True,
+            latest_state_ready=True,
+            market_count=int(metadata["market_count"]),
+            token_count=int(metadata["token_count"]),
+            latest_cursor=int(state_metadata["latest_cursor"]),
+            reason_codes=["recovery_in_progress"] if recovery_active else [],
+        )
+
+
+def _gap_identity(gap: GapEntry) -> str:
+    payload = gap.model_dump(mode="json")
+    payload.pop("resolved", None)
+    payload.pop("resolution", None)
+    return content_sha256(payload)
+
+
+class LiveStateIndex:
+    """Mutable derived state; the append-only event log remains authoritative."""
+
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        self.path = self.root / "indexes" / "latest-state.sqlite3"
+        self.manifest_path = self.root / "state-index.json"
+
+    @staticmethod
+    def _schema(connection: sqlite3.Connection, *, wal: bool = True) -> None:
+        connection.execute(f"PRAGMA journal_mode={'WAL' if wal else 'DELETE'}")
+        connection.executescript("""
+            PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS books (
+                token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
+                cursor INTEGER NOT NULL, payload_json BLOB NOT NULL,
+                payload_sha256 TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS books_market_id ON books(market_id, token_id);
+            CREATE TABLE IF NOT EXISTS gaps (
+                gap_id TEXT PRIMARY KEY, market_id TEXT,
+                token_id TEXT, cursor INTEGER NOT NULL,
+                payload_json BLOB NOT NULL, payload_sha256 TEXT NOT NULL,
+                resolved INTEGER NOT NULL CHECK(resolved IN (0, 1))
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS gaps_market_id ON gaps(market_id, resolved);
+            CREATE TABLE IF NOT EXISTS event_offsets (
+                cursor INTEGER PRIMARY KEY, byte_offset INTEGER NOT NULL,
+                byte_length INTEGER NOT NULL, event_id TEXT NOT NULL,
+                market_id TEXT, token_id TEXT, line_sha256 TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS events_market_cursor
+                ON event_offsets(market_id, cursor);
+        """)
+
+    @staticmethod
+    def _metadata(connection: sqlite3.Connection) -> dict[str, str]:
+        return {
+            str(row[0]): str(row[1])
+            for row in connection.execute("SELECT key, value FROM metadata")
+        }
+
+    @staticmethod
+    def _set_metadata(connection: sqlite3.Connection, values: dict[str, Any]) -> None:
+        connection.executemany(
+            """INSERT INTO metadata(key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            [(key, str(value)) for key, value in sorted(values.items())],
+        )
+
+    def _publish_manifest(self) -> None:
+        _atomic_write(self.manifest_path, canonical_json({
+            "schema_version": STATE_INDEX_SCHEMA_VERSION,
+            "path": str(self.path),
+        }))
+
+    def append(
+        self,
+        event: LiveEventEnvelope,
+        *,
+        byte_offset: int,
+        byte_length: int,
+        line_sha256: str,
+        book: LiveBook | None,
+        gaps: list[GapEntry],
+        catalog_revision: str | None,
+        event_log_size: int,
+        token_to_market: dict[str, str],
+        active_recovery_id: str | None,
+    ) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as connection:
+            self._schema(connection)
+            metadata = self._metadata(connection)
+            previous_cursor = int(metadata.get("latest_cursor", "0"))
+            if previous_cursor != event.cursor - 1:
+                raise RuntimeError("live state index cursor is not contiguous")
+            connection.execute(
+                """INSERT INTO event_offsets(
+                    cursor, byte_offset, byte_length, event_id,
+                    market_id, token_id, line_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event.cursor, byte_offset, byte_length, event.event_id,
+                    event.market_id, event.token_id, line_sha256,
+                ),
+            )
+            if book is not None and event.market_id is not None:
+                body = canonical_json(book.model_dump(mode="json"))
+                connection.execute(
+                    """INSERT INTO books(
+                        token_id, market_id, cursor, payload_json, payload_sha256
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(token_id) DO UPDATE SET
+                        market_id=excluded.market_id, cursor=excluded.cursor,
+                        payload_json=excluded.payload_json,
+                        payload_sha256=excluded.payload_sha256""",
+                    (
+                        book.token_id, event.market_id, event.cursor, body,
+                        hashlib.sha256(body).hexdigest(),
+                    ),
+                )
+            for gap in gaps:
+                body = canonical_json(gap.model_dump(mode="json"))
+                market_id = token_to_market.get(gap.token_id or "")
+                connection.execute(
+                    """INSERT INTO gaps(
+                        gap_id, market_id, token_id, cursor, payload_json,
+                        payload_sha256, resolved
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(gap_id) DO UPDATE SET
+                        cursor=excluded.cursor, payload_json=excluded.payload_json,
+                        payload_sha256=excluded.payload_sha256,
+                        resolved=excluded.resolved""",
+                    (
+                        _gap_identity(gap), market_id, gap.token_id, event.cursor,
+                        body, hashlib.sha256(body).hexdigest(), int(gap.resolved),
+                    ),
+                )
+            if event.event_type == "recovery_completed" and event.applied:
+                recovered = list(
+                    event.canonical_payload.get("resolved_gap_token_ids")
+                    or event.canonical_payload.get("recovered_token_ids") or []
+                )
+                if recovered:
+                    placeholders = ",".join("?" for _ in recovered)
+                    connection.execute(
+                        f"UPDATE gaps SET resolved=1 WHERE token_id IN ({placeholders})",
+                        recovered,
+                    )
+            self._set_metadata(connection, {
+                "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                "catalog_revision": catalog_revision or "",
+                "latest_cursor": event.cursor,
+                "event_log_size": event_log_size,
+                "active_recovery_id": active_recovery_id or "",
+            })
+            connection.commit()
+        self._publish_manifest()
+
+    def rebuild(
+        self,
+        *,
+        event_path: Path,
+        books: dict[str, LiveBook],
+        gaps: list[GapEntry],
+        catalog_revision: str | None,
+        token_to_market: dict[str, str],
+        active_recovery_id: str | None = None,
+    ) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        temporary.unlink(missing_ok=True)
+        latest_cursor = 0
+        event_log_size = 0
+        try:
+            with sqlite3.connect(temporary) as connection:
+                self._schema(connection, wal=False)
+                if event_path.exists():
+                    with event_path.open("rb") as stream:
+                        while True:
+                            byte_offset = stream.tell()
+                            line = stream.readline()
+                            if not line:
+                                event_log_size = stream.tell()
+                                break
+                            if not line.endswith(b"\n"):
+                                raise RuntimeError("live event log ends with a partial row")
+                            event = LiveEventEnvelope.model_validate_json(line)
+                            if event.cursor != latest_cursor + 1:
+                                raise RuntimeError("live event cursor is not contiguous")
+                            if content_sha256(event.canonical_payload) != event.canonical_payload_sha256:
+                                raise RuntimeError("live event canonical payload hash mismatch")
+                            if content_sha256(event.raw_payload) != event.raw_payload_sha256:
+                                raise RuntimeError("live event raw payload hash mismatch")
+                            if live_event_identity(event) != event.event_id:
+                                raise RuntimeError("live event identity mismatch")
+                            connection.execute(
+                                """INSERT INTO event_offsets(
+                                    cursor, byte_offset, byte_length, event_id,
+                                    market_id, token_id, line_sha256
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    event.cursor, byte_offset, len(line), event.event_id,
+                                    event.market_id, event.token_id,
+                                    hashlib.sha256(line).hexdigest(),
+                                ),
+                            )
+                            latest_cursor = event.cursor
+                            event_log_size = stream.tell()
+                for token_id, book in sorted(books.items()):
+                    market_id = token_to_market.get(token_id)
+                    if market_id is None:
+                        continue
+                    body = canonical_json(book.model_dump(mode="json"))
+                    connection.execute(
+                        """INSERT INTO books(
+                            token_id, market_id, cursor, payload_json, payload_sha256
+                        ) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            token_id, market_id, latest_cursor,
+                            body, hashlib.sha256(body).hexdigest(),
+                        ),
+                    )
+                for gap in gaps:
+                    body = canonical_json(gap.model_dump(mode="json"))
+                    connection.execute(
+                        """INSERT INTO gaps(
+                            gap_id, market_id, token_id, cursor, payload_json,
+                            payload_sha256, resolved
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            _gap_identity(gap), token_to_market.get(gap.token_id or ""),
+                            gap.token_id, latest_cursor, body,
+                            hashlib.sha256(body).hexdigest(), int(gap.resolved),
+                        ),
+                    )
+                self._set_metadata(connection, {
+                    "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                    "catalog_revision": catalog_revision or "",
+                    "latest_cursor": latest_cursor,
+                    "event_log_size": event_log_size,
+                    "active_recovery_id": active_recovery_id or "",
+                })
+                connection.commit()
+            os.replace(temporary, self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        self._publish_manifest()
 
 
 class GammaCatalogRows:
@@ -1355,6 +2474,7 @@ class LiveStateStore:
         self.raw_catalog_root = self.root / "raw" / "gamma-catalog"
         self.normalized_catalog_root = self.root / "catalogs"
         self.raw_catalog_path: Path | None = None
+        self.state_index = LiveStateIndex(self.root)
         self.replay_capacity = max(1, replay_capacity)
         self.max_frame_skew_ms = max(0, max_frame_skew_ms)
         self.stale_after_ms = max(1, stale_after_ms)
@@ -1379,12 +2499,15 @@ class LiveStateStore:
         # event log. Stateful operations retain compatibility through _ensure_loaded.
         self._recovered = False
 
-    def _append(self, value: dict[str, Any]) -> None:
+    def _append(self, value: dict[str, Any]) -> tuple[int, int, str]:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
+        body = canonical_json(value) + b"\n"
         with self.event_path.open("ab") as stream:
-            stream.write(canonical_json(value) + b"\n")
+            byte_offset = stream.tell()
+            stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
+        return byte_offset, len(body), hashlib.sha256(body).hexdigest()
 
     def replace_catalog(
         self,
@@ -1500,10 +2623,34 @@ class LiveStateStore:
         )
         envelope.event_id = live_event_identity(envelope)
         self.events.append(envelope)
-        self._append(envelope.model_dump(mode="json"))
+        byte_offset, byte_length, line_sha256 = self._append(
+            envelope.model_dump(mode="json")
+        )
         self._event_offset = self.event_path.stat().st_size
         self._last_log_cursor = envelope.cursor
         self.seen_raw_hashes.add(raw_hash)
+        index_gaps = list(gaps or [])
+        if event_type == "recovery_completed" and applied:
+            recovered = set(
+                canonical_payload.get("resolved_gap_token_ids")
+                or canonical_payload.get("recovered_token_ids") or []
+            )
+            index_gaps.extend(
+                gap for gap in self.gaps
+                if gap.token_id in recovered and gap not in index_gaps
+            )
+        self.state_index.append(
+            envelope,
+            byte_offset=byte_offset,
+            byte_length=byte_length,
+            line_sha256=line_sha256,
+            book=self.books.get(token_id or "") if applied else None,
+            gaps=index_gaps,
+            catalog_revision=self.catalog_revision,
+            event_log_size=self._event_offset,
+            token_to_market=self.token_to_market,
+            active_recovery_id=self.active_recovery_id,
+        )
         return envelope
 
     def _market_for_token(self, token_id: str) -> LiveMarket:
@@ -1807,11 +2954,14 @@ class LiveStateStore:
             gap.token_id for gap in self.gaps
             if not gap.resolved and gap.code == "coverage_gap"
         }
+        new_coverage_gaps = []
         for token_id in sorted(missing - existing_coverage - set(invalid)):
-            self.gaps.append(GapEntry(
+            gap = GapEntry(
                 code="coverage_gap", token_id=token_id,
                 observed=recovery_id, detected_at=now,
-            ))
+            )
+            self.gaps.append(gap)
+            new_coverage_gaps.append(gap)
         self.active_recovery_id = None
         coverage = {
             "recovery_id": recovery_id,
@@ -1830,7 +2980,7 @@ class LiveStateStore:
         self._emit("recovery_completed", {
             **coverage,
             "resolved_gap_token_ids": sorted(resolved_gap_token_ids),
-        }, {}, applied=True)
+        }, {}, applied=True, gaps=new_coverage_gaps)
         self.checkpoint()
         return coverage
 
@@ -2148,6 +3298,14 @@ class LiveStateStore:
         events, offset = self._read_all_events()
         self._rebuild_from_checkpoint(checkpoint, events)
         self._event_offset = offset
+        self.state_index.rebuild(
+            event_path=self.event_path,
+            books=self.books,
+            gaps=self.gaps,
+            catalog_revision=self.catalog_revision,
+            token_to_market=self.token_to_market,
+            active_recovery_id=self.active_recovery_id,
+        )
 
     def recover(self) -> None:
         """Explicitly perform the full deterministic recovery once."""
@@ -2250,6 +3408,28 @@ class LiveStateStore:
             unresolved_gap_count=unresolved, latest_cursor=self.cursor,
             latest_received_at=latest, lag_ms=lag,
         )
+
+
+def build_live_state_index(root: Path) -> dict[str, Any]:
+    """Explicitly replay durable live files and atomically publish derived indexes."""
+    root = root.resolve()
+    store = LiveStateStore(root)
+    store.recover()
+    reader = PolymarketLiveReadStore(root)
+    path, metadata = reader._state_binding()
+    with _readonly_state_sqlite(path) as connection:
+        counts = {
+            name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
+            for name in ("books", "gaps", "event_offsets")
+        }
+    return {
+        "schema_version": metadata["schema_version"],
+        "catalog_revision": metadata["catalog_revision"],
+        "latest_cursor": int(metadata["latest_cursor"]),
+        "event_log_size": int(metadata["event_log_size"]),
+        "path": str(path),
+        **{f"{name}_count": count for name, count in counts.items()},
+    }
 
 
 class DataApiPublicNormalizer:

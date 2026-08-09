@@ -1,8 +1,8 @@
 # Polymarket live：全量 catalog 阻塞主 API 的扩展性修复方案
 
-> 状态：Proposal v2（待评审）  
-> 日期：2026-08-09  
-> 关联：`docs/polymarket-live.md`、`docs/polymarket-live-quality-report.md`  
+> 状态：Accepted design v3（Phase 1–3 已实现，Phase 4 按需）
+> 日期：2026-08-09
+> 关联：`docs/polymarket-live.md`、`docs/polymarket-live-quality-report.md`
 > 触发场景：Tradude scoped paper 验证期间，MarketCow `:8790` 在启动阶段被
 > 1.8GB catalog 和 588MB event log 阻塞，端口迟迟不绑定。
 
@@ -185,7 +185,8 @@ events 确定性重建。更新顺序和 crash recovery 必须保证：
 
 - event 先 durable append，再更新 index；
 - index cursor 不得超过 durable event cursor；
-- 启动时若 index 落后，只重放 index checkpoint 之后的尾部；
+- 启动时若 index 落后，主 API 返回 503；显式 recovery/migration 从已验证
+  checkpoint + 完整 event log 确定性重建，普通请求绝不触发重放；
 - index 超前、hash 不匹配或 cursor 不连续时标记 `integrity_failed`，不得返回 ready；
 - API 使用只读事务获取同一 cursor 下的 books、gaps 和 market state。
 
@@ -218,9 +219,9 @@ GET /v1/prediction-markets/polymarket/live/snapshot
 
 #### Scoped events/resume
 
-现有 events API 增加 `market_id`/`token_id` 过滤，通过 `event_offsets` seek 权威日志。
-cursor 过旧或不在索引范围内返回现有的 resync 语义，要求客户端重新取 scoped
-bootstrap + snapshot。
+现有 events API 使用 1–100 个必填 `market_id` 过滤，通过 `event_offsets` seek 权威
+日志。索引当前覆盖完整本地 append-only log；未来若引入保留窗口，窗口外 cursor 必须
+返回稳定 resync 语义，要求客户端重新取 scoped bootstrap + snapshot。
 
 #### Full-universe 读取
 
@@ -275,7 +276,7 @@ bootstrap + snapshot。
 
 ## 6. 迁移与兼容
 
-### Phase 1：立即恢复主 API 可用性
+### Phase 1：立即恢复主 API 可用性（已完成）
 
 1. 移除构造阶段 `recover()`；
 2. `/v1/health` 只读小型 manifest；
@@ -283,14 +284,14 @@ bootstrap + snapshot。
 4. scoped/full Polymarket 读取在 index 就绪前返回机器可读 unavailable；
 5. 非 Polymarket API 不受影响。
 
-### Phase 2：Catalog index 与 scoped bootstrap
+### Phase 2：Catalog index 与 scoped bootstrap（已完成）
 
 1. materializer 生成 index；
 2. 提供离线 migration 命令为既有 immutable catalog 建索引；
 3. 原子切换 manifest；
 4. 上线 scoped bootstrap 和 OpenAPI schema。
 
-### Phase 3：Latest-state index 与 scoped snapshot/events
+### Phase 3：Latest-state index 与 scoped snapshot/events（已完成）
 
 1. collector 双写 append log + derived state index；
 2. 从现有 checkpoint/events 构建初始 index；
@@ -311,7 +312,7 @@ API 永不因该进程加载或失败而停止服务。
 | index 与 catalog revision 不一致 | 409 `polymarket_catalog_integrity_failed` |
 | selected row hash 失败 | 409 `polymarket_catalog_row_integrity_failed` |
 | latest-state cursor 超前或 hash 失败 | 409 `polymarket_state_integrity_failed` |
-| state index 落后 | frame fail closed，reason `state_index_lagging` |
+| state index 落后 | 503 `polymarket_state_index_lagging` |
 | market 不存在 | 404 `polymarket_live_market_not_found` |
 | market 参数超限 | 400 `polymarket_scope_too_large` |
 | 无参全量读取未启用 | 409/403 `polymarket_full_universe_disabled` |
@@ -357,18 +358,18 @@ API 永不因该进程加载或失败而停止服务。
 | `measure_scoped.py` | 仅临时实验 | 不移植；硬编码 production 路径且 Ruff 失败 |
 | 原 Proposal v1 | 已被本方案替代 | 不移植 |
 
-移植后的 Phase 1 代码只保证 `create_app()` 不在构造阶段加载大文件。它不宣称已经完成
-scoped 扩展性修复：现有 Polymarket stateful/full 路径首次访问仍会执行兼容性恢复，必须
-继续实施 catalog index 和 latest-state index 后才能满足第 8 节全部验收标准。
+Phase 1 的启动解耦、Phase 2 的 immutable catalog offset index，以及 Phase 3 的
+latest-state/event-offset WAL index 均已在专用实现分支完成。主 API 的七条实时读取路径
+要求显式 scope；不会调用兼容性 full recovery。`LiveStateStore._ensure_loaded()` 仅保留给
+collector、离线迁移与显式 full-state 内部操作。
 
-## 10. 需要评审的决策
+## 10. 已落地决策
 
-1. Catalog index 使用 SQLite 还是自定义紧凑 offset 文件；建议 SQLite，降低实现风险。
-2. Latest-state index 是否与 catalog index 分库；建议分库，发布周期和写入模型不同。
-3. 无参全量 API 返回 409 还是仅在独立端口提供；建议主 API 返回明确错误。
-4. scoped 请求上限初值；建议 100 markets，并以负载测试调整。
-5. 旧 1.8GB catalog 的一次性索引构建由运维命令还是 collector 自动执行；建议显式
-   运维命令，完成后原子切换，避免主 API 隐式做重活。
+1. Catalog index 使用 immutable SQLite offset 文件；manifest 绑定其 SHA-256。
+2. Latest-state index 单独使用 SQLite WAL；event log 仍是权威来源。
+3. 无参全量 API 在主服务返回 `polymarket_full_universe_disabled`。
+4. scoped 请求上限为 100 个去重 market IDs。
+5. 旧数据通过两个显式离线命令依次构建 catalog 与 state index；主 API 不自动迁移。
 
 ## 11. 结论
 

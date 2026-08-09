@@ -1,6 +1,6 @@
 # Polymarket live local-candidate quality report
 
-Date: 2026-08-04. Baseline: MarketCow `10229ab`.
+Date: 2026-08-09. Baseline: MarketCow `48a8055`.
 
 ## Delivered scope
 
@@ -22,6 +22,10 @@ Date: 2026-08-04. Baseline: MarketCow `10229ab`.
 - Hash-verified terminal Gamma spool reuse after normalization/publication failure.
 - Partial `/books` coverage keeps affected frames closed without suppressing unrelated
   complete markets or preventing the catalog/API from starting.
+- Immutable catalog offset indexing and a mutable derived latest-state/event-offset WAL
+  index make all main-API live reads explicitly scoped and bounded.
+- Explicit offline catalog/state migrations validate all source hashes and publish only
+  after deterministic recovery; request paths never trigger full recovery.
 
 ## Explicit limits
 
@@ -67,7 +71,23 @@ books that are absent or ambiguous stop frame readiness.
 | Partial book coverage | missing tokens remain gaps/degraded while complete two-token markets become ready |
 | Public facts | wallet/profile/transaction provenance and float rejection |
 | API/OpenAPI | bootstrap, snapshot, events, checkpoint, health, gaps, public data |
+| Scoped indexed reads | 1–100 markets; row offsets, one state snapshot transaction, event seeks |
+| Index failure policy | legacy/missing, lagging, ahead, revision mismatch and payload/event tamper |
+| Offline migration | deterministic catalog and checkpoint/event state index rebuild |
+| Startup isolation | app construction and lightweight health do not deserialize catalog/replay events |
 | Source policy | official public endpoints only; commercial/trial dependencies absent |
 
-The final Artifact records exact focused/full test counts, lint, build, commit, and
-worktree status after verification.
+The final local handoff records exact focused/full test counts, lint, build, commit,
+and worktree status after verification.
+
+## Indexed-recovery verification
+
+The 2026-08-09 indexed-recovery candidate passed 53 focused Polymarket live tests and
+the complete 605-test MarketCow suite with zero failures/errors (21 existing skips).
+Repository-wide Ruff, `git diff --check`, Python script compilation, and
+`uv build --offline` all passed. The focused matrix includes the 100-market hard bound,
+event-before-index crash window, cross-instance visibility, active recovery, coverage
+gaps, checkpoint restart, state/catalog revision binding, payload/event tamper, and
+offline deterministic index rebuild. Production data and the running service were not
+modified or restarted; the included read-only measurement command is the handoff for
+an operator-approved production-like latency/RSS run.
