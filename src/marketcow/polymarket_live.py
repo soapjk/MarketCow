@@ -4268,9 +4268,10 @@ class LiveStateStore:
         exchange = _instant(raw.get("timestamp") or received)
         previous = self.books.get(token_id)
         source_hash = str(raw.get("hash") or "") or None
+        raw_last_trade_price = raw.get("last_trade_price")
         last_trade_price = (
-            decimal_text(raw["last_trade_price"], "last_trade_price")
-            if raw.get("last_trade_price") is not None else None
+            decimal_text(raw_last_trade_price, "last_trade_price")
+            if raw_last_trade_price not in (None, "") else None
         )
         epoch = content_sha256({
             "token_id": token_id, "recovery_id": recovery_id or "initial",

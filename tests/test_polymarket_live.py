@@ -1110,37 +1110,27 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(reader.gaps(["m2"], unresolved_only=True).count, 2)
         self.assertEqual(reader.snapshot(["m2"]).items[0].status, "fail_closed")
 
-    def test_invalid_rest_book_is_durable_gap_without_aborting_other_books(self):
+    def test_empty_rest_last_trade_price_is_normalized_as_unavailable(self):
         store = self.store()
-        invalid = snapshot("yes-1", "0.40", "0.42")
-        invalid["last_trade_price"] = ""
-        recovery_id = store.mark_recovery_started("invalid_official_book")
+        without_trade = snapshot("yes-1", "0.40", "0.42")
+        without_trade["last_trade_price"] = ""
+        recovery_id = store.mark_recovery_started("official_book_without_trade")
         coverage = store.recover_from_books([
-            invalid,
+            without_trade,
             snapshot("no-1", "0.58", "0.60"),
         ], recovery_id)
-        self.assertEqual(coverage["recovered_token_count"], 1)
-        self.assertEqual(coverage["invalid_book_token_count"], 1)
-        self.assertEqual(coverage["missing_token_count"], 1)
-        self.assertFalse(coverage["coverage_complete"])
-        self.assertNotIn("yes-1", store.books)
+        self.assertEqual(coverage["recovered_token_count"], 2)
+        self.assertEqual(coverage["invalid_book_token_count"], 0)
+        self.assertEqual(coverage["missing_token_count"], 0)
+        self.assertTrue(coverage["coverage_complete"])
+        self.assertIsNone(store.books["yes-1"].last_trade_price)
         self.assertIn("no-1", store.books)
-        invalid_events = [
-            event for event in store.events
-            if event.fail_closed_reason == "invalid_rest_book"
-        ]
-        self.assertEqual(len(invalid_events), 1)
-        self.assertEqual(invalid_events[0].token_id, "yes-1")
         restarted = LiveStateStore(
             self.root / "live", now_provider=lambda: NOW,
         )
         restarted.recover()
-        unresolved = [
-            gap for gap in restarted.gaps
-            if not gap.resolved and gap.token_id == "yes-1"
-        ]
-        self.assertTrue(any(gap.code == "source_mismatch" for gap in unresolved))
-        self.assertEqual(restarted.frame("m1", now=NOW).status, "fail_closed")
+        self.assertIsNone(restarted.books["yes-1"].last_trade_price)
+        self.assertEqual(restarted.frame("m1", now=NOW).status, "ready")
 
     def test_api_contract_openapi_events_frames_health_and_public_facts(self):
         settings = Settings(
