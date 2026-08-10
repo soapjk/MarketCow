@@ -73,6 +73,7 @@ from .polymarket_contracts import (
     PredictionMarketManifest,
 )
 from .polymarket_live import (
+    CandidateSnapshot,
     LiveBootstrapResponse,
     LiveCheckpoint,
     LiveEventPage,
@@ -1368,6 +1369,30 @@ def create_app(
             return polymarket_live_read.snapshot(
                 _require_polymarket_scope(market_id)
             ).model_dump(mode="json")
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
+
+    @app.get(
+        "/v1/prediction-markets/polymarket/live/candidates",
+        response_model=CandidateSnapshot,
+        summary="Read the checksum-bound full Polymarket candidate catalog",
+    )
+    def polymarket_live_candidates():
+        try:
+            path, metadata = polymarket_live_read.candidate_snapshot_path()
+            return FileResponse(
+                path,
+                media_type="application/json",
+                headers={
+                    "ETag": f'"{metadata["sha256"]}"',
+                    "X-Polymarket-Catalog-Revision": str(
+                        metadata["catalog_revision"]
+                    ),
+                    "X-Polymarket-Payload-SHA256": str(
+                        metadata["payload_sha256"]
+                    ),
+                },
+            )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 

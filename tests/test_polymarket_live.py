@@ -8,6 +8,7 @@ import unittest
 import requests
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -18,6 +19,7 @@ from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.polymarket_contracts import content_sha256
 from marketcow.polymarket_live import (
+    CandidateSnapshot,
     ClobBooksClient,
     DataApiPublicClient,
     DataApiPublicNormalizer,
@@ -30,6 +32,7 @@ from marketcow.polymarket_live import (
     SubscriptionPlanner,
     atomic_write_public_facts,
     build_live_catalog_index,
+    build_live_candidate_snapshot,
     build_live_state_index,
     catch_up_live_state_index,
     load_scoped_live_store,
@@ -1201,6 +1204,7 @@ class PolymarketLiveTest(unittest.TestCase):
             )
         for path in (
             "/v1/prediction-markets/polymarket/live/bootstrap",
+            "/v1/prediction-markets/polymarket/live/candidates",
             "/v1/prediction-markets/polymarket/live/snapshot",
             "/v1/prediction-markets/polymarket/live/events",
             "/v1/prediction-markets/polymarket/live/checkpoint",
@@ -1218,6 +1222,8 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertIn("LiveInstrumentFacts", schemas)
         self.assertIn("LiveFeeSchedule", schemas)
         self.assertIn("LiveOutcomePair", schemas)
+        self.assertIn("CandidateSnapshot", schemas)
+        self.assertIn("CandidateNegativeRiskRelation", schemas)
         self.assertIn("relation_pairs", schemas["MarketFrame"]["properties"])
         self.assertIn("instrument_revision", schemas["MarketFrame"]["properties"])
         self.assertIn("fee_schedule_id", schemas["MarketFrame"]["properties"])
@@ -1297,6 +1303,108 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(
             raised.exception.code, "polymarket_catalog_row_integrity_failed"
         )
+
+    def test_candidate_snapshot_is_atomic_deterministic_and_fail_closed(self):
+        root = self.root / "prediction-markets" / "polymarket-live"
+        store = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),
+            gamma_row("m2", "0x" + "2" * 64, ("c", "d"), neg_risk=True),
+            gamma_row("m3", "0x" + "3" * 64, ("e", "f"), neg_risk=True),
+        ]
+        rows[0]["liquidityNum"] = "100.2300"
+        rows[1]["liquidityNum"] = None
+        rows[2]["outcomes"] = '["Maybe","No"]'
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        store.replace_catalog(markets, rows)
+        manifest = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+        metadata = manifest["candidate_snapshot"]
+        path = Path(metadata["path"])
+        initial = path.read_bytes()
+        candidate = CandidateSnapshot.model_validate_json(initial)
+
+        self.assertEqual(candidate.catalog_revision, store.catalog_revision)
+        self.assertEqual(candidate.payload.candidate_count, 3)
+        by_id = {item.market_id: item for item in candidate.payload.candidates}
+        self.assertEqual(by_id["m1"].liquidity_num, "100.2300")
+        self.assertIsNone(by_id["m2"].liquidity_num)
+        self.assertFalse(by_id["m3"].binary_yes_no)
+        relation = candidate.payload.relations[0]
+        self.assertFalse(relation.complete)
+        self.assertEqual(relation.expected_member_count, 3)
+        self.assertEqual(relation.actual_member_count, 2)
+        self.assertIn("member_count_mismatch", relation.reason_codes)
+        self.assertIn("source_member_not_binary_yes_no", relation.reason_codes)
+
+        rebuilt = build_live_candidate_snapshot(root)
+        self.assertEqual(rebuilt["sha256"], metadata["sha256"])
+        self.assertEqual(path.read_bytes(), initial)
+
+        settings = Settings(
+            raw_path=self.root / "raw", storage_root=self.root,
+            allowed_root=self.root.parent,
+            postgres_dsn="postgresql://u:p@127.0.0.1/test",
+            clickhouse_password="x", profile="test", port=8793,
+            postgres_schema="test", clickhouse_database="test",
+            clickhouse_spool_path=self.root / "spool",
+        )
+        client = TestClient(create_app(settings, Service()))
+        first = client.get(
+            "/v1/prediction-markets/polymarket/live/candidates"
+        )
+        second = client.get(
+            "/v1/prediction-markets/polymarket/live/candidates"
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.content, initial)
+        self.assertEqual(second.content, initial)
+        self.assertEqual(first.headers["etag"], f'"{metadata["sha256"]}"')
+        self.assertEqual(
+            first.headers["x-polymarket-payload-sha256"],
+            candidate.payload_sha256,
+        )
+
+    def test_candidate_snapshot_supports_exact_50_and_100_relation_atomic_scopes(self):
+        root = self.root / "candidate-selector"
+        store = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = []
+        for index in range(105):
+            market_id = f"m{index:03d}"
+            row = gamma_row(
+                market_id,
+                "0x" + f"{index + 1:064x}",
+                (f"yes-{index}", f"no-{index}"),
+                neg_risk=index < 5,
+            )
+            row["liquidityNum"] = f"{1000 - index}.0000"
+            rows.append(row)
+        store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        metadata = json.loads(store.catalog_path.read_text())[
+            "candidate_snapshot"
+        ]
+        snapshot = CandidateSnapshot.model_validate_json(
+            Path(metadata["path"]).read_bytes()
+        )
+        relation = snapshot.payload.relations[0]
+        self.assertTrue(relation.complete)
+        relation_ids = {item.market_id for item in relation.members}
+        eligible = [
+            item for item in snapshot.payload.candidates
+            if item.active and item.accepting_orders and not item.closed
+            and item.rules_complete and item.binary_yes_no
+        ]
+        eligible.sort(
+            key=lambda item: Decimal(item.liquidity_num or "-1"), reverse=True,
+        )
+        for limit in (50, 100):
+            selected = list(relation_ids)
+            selected.extend(
+                item.market_id for item in eligible
+                if item.market_id not in relation_ids
+            )
+            selected = selected[:limit]
+            self.assertEqual(len(selected), limit)
+            self.assertTrue(relation_ids.issubset(selected))
 
     def test_catalog_index_tamper_and_legacy_catalog_fail_closed(self):
         root = self.root / "live"

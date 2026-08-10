@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -241,6 +242,9 @@ def _market_sequence_sha256(markets: list[LiveMarket]) -> str:
 CATALOG_INDEX_SCHEMA_VERSION = "marketcow.polymarket.catalog-index.v1"
 LIVE_READ_SCHEMA_VERSION = "marketcow.polymarket.live-read-health.v1"
 STATE_INDEX_SCHEMA_VERSION = "marketcow.polymarket.state-index.v1"
+CANDIDATE_SNAPSHOT_SCHEMA_VERSION = (
+    "marketcow.polymarket.candidate-snapshot.v1"
+)
 
 
 def _readonly_sqlite(path: Path) -> sqlite3.Connection:
@@ -442,6 +446,490 @@ def _reuse_catalog_index(
     }
 
 
+def _iter_raw_catalog_rows(
+    path: Path, raw_format: str,
+) -> Iterable[tuple[bytes, dict[str, Any]]]:
+    if raw_format == "canonical_jsonl":
+        with path.open("rb") as stream:
+            for line in stream:
+                body = line.removesuffix(b"\n")
+                if body:
+                    yield body, json.loads(body)
+        return
+    if raw_format == "canonical_json_array":
+        payload = json.loads(path.read_bytes())
+        if not isinstance(payload, list):
+            raise RuntimeError("live raw catalog array is invalid")
+        for row in payload:
+            if not isinstance(row, dict):
+                raise RuntimeError("live raw catalog row is invalid")
+            yield canonical_json(row), row
+        return
+    raise RuntimeError("live raw catalog format is unsupported")
+
+
+def _write_candidate_snapshot(
+    root: Path,
+    *,
+    revision: str,
+    normalized: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    """Materialize one immutable, metadata-only candidate catalog boundary."""
+    root = root.resolve()
+    normalized_path = Path(str(normalized.get("path") or "")).resolve()
+    raw_path = Path(str(source.get("raw_path") or "")).resolve()
+    if not normalized_path.is_relative_to(root / "catalogs"):
+        raise RuntimeError("candidate normalized catalog escapes live storage")
+    if not raw_path.is_relative_to(root / "raw"):
+        raise RuntimeError("candidate raw catalog escapes live storage")
+    if (
+        not normalized_path.is_file()
+        or _file_sha256(normalized_path) != normalized.get("sha256")
+    ):
+        raise RuntimeError("candidate normalized catalog integrity failed")
+    if (
+        not raw_path.is_file()
+        or _file_sha256(raw_path) != source.get("raw_payload_sha256")
+    ):
+        raise RuntimeError("candidate raw catalog integrity failed")
+    observed_at = _instant(source.get("observed_at"))
+    source_url = str(source.get("source_url") or "")
+    if not source_url:
+        raise RuntimeError("candidate source URL is missing")
+
+    candidate_root = root / "candidate-snapshots"
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    destination = candidate_root / f"{revision}.json"
+    with tempfile.TemporaryDirectory(
+        dir=root, prefix=".candidate-snapshot-",
+    ) as temporary_name:
+        temporary_root = Path(temporary_name)
+        raw_index_path = temporary_root / "raw.sqlite3"
+        candidates_path = temporary_root / "candidates.json"
+        relations_path = temporary_root / "relations.json"
+        payload_path = temporary_root / "payload.json"
+        output_path = temporary_root / "snapshot.json"
+        with sqlite3.connect(raw_index_path) as raw_index:
+            raw_index.executescript("""
+                CREATE TABLE raw_markets (
+                    market_id TEXT PRIMARY KEY,
+                    liquidity_num TEXT,
+                    neg_risk INTEGER NOT NULL CHECK(neg_risk IN (0, 1)),
+                    neg_risk_group TEXT,
+                    group_outcome_label TEXT,
+                    binary_yes_no INTEGER NOT NULL CHECK(binary_yes_no IN (0, 1)),
+                    raw_payload_sha256 TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE INDEX raw_neg_risk_group
+                    ON raw_markets(neg_risk_group, market_id);
+            """)
+            raw_count = 0
+            for raw_body, row in _iter_raw_catalog_rows(
+                raw_path, str(source.get("raw_format") or ""),
+            ):
+                market_id = str(row.get("id") or "")
+                if not market_id:
+                    continue
+                tokens = _list(
+                    row.get("clobTokenIds") or row.get("clob_token_ids")
+                )
+                outcomes = [
+                    str(item).strip().casefold()
+                    for item in _list(row.get("outcomes"))
+                ]
+                neg_risk = bool(row.get("negRisk") or row.get("neg_risk"))
+                event = (row.get("events") or [{}])[0]
+                group_id = str(
+                    row.get("negRiskMarketID")
+                    or row.get("neg_risk_market_id")
+                    or event.get("negRiskMarketID")
+                    or ""
+                ) or None
+                liquidity = row.get("liquidityNum")
+                raw_index.execute(
+                    """INSERT INTO raw_markets VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        market_id,
+                        str(liquidity) if liquidity is not None else None,
+                        int(neg_risk), group_id,
+                        str(
+                            row.get("groupItemTitle")
+                            or row.get("group_item_title")
+                            or ""
+                        ) or None,
+                        int(len(tokens) == 2 and set(outcomes) == {"yes", "no"}),
+                        hashlib.sha256(raw_body).hexdigest(),
+                    ),
+                )
+                raw_count += 1
+            raw_index.commit()
+            expected_raw_count = source.get("market_count")
+            if expected_raw_count is None or raw_count != int(expected_raw_count):
+                raise RuntimeError("candidate raw catalog row count mismatch")
+
+            candidate_count = 0
+            normalized_hasher = hashlib.sha256()
+            actual_relations: dict[str, dict[str, Any]] = {}
+            market_observed_at: dict[str, datetime] = {}
+            with candidates_path.open("wb") as candidate_stream:
+                candidate_stream.write(b"[")
+                with normalized_path.open("rb") as normalized_stream:
+                    for line in normalized_stream:
+                        normalized_hasher.update(line)
+                        body = line.removesuffix(b"\n")
+                        if not body:
+                            continue
+                        market = LiveMarket.model_validate_json(body)
+                        market_id = market.identity.market_id
+                        raw = raw_index.execute(
+                            "SELECT * FROM raw_markets WHERE market_id=?",
+                            (market_id,),
+                        ).fetchone()
+                        raw_in_current_catalog = raw is not None
+                        if raw_in_current_catalog:
+                            raw = dict(zip(
+                                [item[1] for item in raw_index.execute(
+                                    "PRAGMA table_info(raw_markets)"
+                                )],
+                                raw,
+                            ))
+                        else:
+                            raw = {
+                                "liquidity_num": None,
+                                "raw_payload_sha256": market.raw_payload_sha256,
+                            }
+                        if (
+                            raw_in_current_catalog
+                            and market.raw_payload_sha256
+                            != raw["raw_payload_sha256"]
+                        ):
+                            raise RuntimeError(
+                                "candidate normalized market raw binding mismatch"
+                            )
+                        by_outcome = {
+                            outcome.outcome.strip().casefold(): outcome
+                            for outcome in market.identity.outcomes
+                        }
+                        binary_yes_no = set(by_outcome) == {"yes", "no"}
+                        relation_id = next((
+                            relation.relation_id for relation in market.relations
+                            if relation.relation_type == "standard_negative_risk"
+                        ), None)
+                        if relation_id == "neg-risk:None":
+                            relation_id = None
+                        normalized_row_sha256 = hashlib.sha256(body).hexdigest()
+                        field_paths = [
+                            "id", "conditionId", "clobTokenIds", "outcomes",
+                            "active", "acceptingOrders", "closed",
+                            "liquidityNum", "endDate", "negRisk",
+                            "negRiskMarketID", "groupItemTitle",
+                        ]
+                        evidence_payload = {
+                            "catalog_revision": revision,
+                            "market_id": market_id,
+                            "normalized_row_sha256": normalized_row_sha256,
+                            "raw_payload_sha256": raw["raw_payload_sha256"],
+                            "field_paths": field_paths,
+                        }
+                        candidate = CandidateMarket(
+                            market_id=market_id,
+                            condition_id=market.identity.condition_id,
+                            yes_token_id=(
+                                by_outcome["yes"].token_id
+                                if binary_yes_no else None
+                            ),
+                            no_token_id=(
+                                by_outcome["no"].token_id
+                                if binary_yes_no else None
+                            ),
+                            active=market.active,
+                            accepting_orders=market.accepting_orders,
+                            closed=market.closed,
+                            rules_complete=market.rules.rules_complete,
+                            binary_yes_no=binary_yes_no,
+                            negative_risk=market.identity.neg_risk,
+                            negative_risk_relation_id=relation_id,
+                            liquidity_num=raw["liquidity_num"],
+                            end_time=market.end_at,
+                            evidence=CandidateEvidence(
+                                source_url=source_url,
+                                raw_payload_sha256=raw["raw_payload_sha256"],
+                                normalized_row_sha256=normalized_row_sha256,
+                                raw_row_in_current_catalog=raw_in_current_catalog,
+                                field_paths=field_paths,
+                                evidence_sha256=content_sha256(evidence_payload),
+                            ),
+                        )
+                        if candidate_count:
+                            candidate_stream.write(b",")
+                        candidate_stream.write(canonical_json(
+                            candidate.model_dump(mode="json")
+                        ))
+                        candidate_count += 1
+                        market_observed_at[market_id] = market.observed_at
+                        for relation in market.relations:
+                            if relation.relation_type != "standard_negative_risk":
+                                continue
+                            if relation.relation_id == "neg-risk:None":
+                                continue
+                            relation_payload = {
+                                "revision": relation.revision,
+                                "complete": relation.complete,
+                                "missing_fields": relation.missing_fields,
+                                "outcome_pairs": [
+                                    item.model_dump(mode="json")
+                                    for item in relation.outcome_pairs
+                                ],
+                            }
+                            previous = actual_relations.get(relation.relation_id)
+                            if previous is None:
+                                actual_relations[relation.relation_id] = {
+                                    **relation_payload,
+                                    "copies_disagree": False,
+                                }
+                            elif any(
+                                previous[key] != value
+                                for key, value in relation_payload.items()
+                            ):
+                                previous["copies_disagree"] = True
+                candidate_stream.write(b"]")
+                candidate_stream.flush()
+                os.fsync(candidate_stream.fileno())
+            if (
+                normalized_hasher.hexdigest() != normalized.get("sha256")
+                or normalized.get("market_count") is None
+                or candidate_count != int(normalized["market_count"])
+            ):
+                raise RuntimeError("candidate normalized catalog stream mismatch")
+
+            raw_groups = list(raw_index.execute(
+                """SELECT neg_risk_group, COUNT(*), SUM(binary_yes_no)
+                    FROM raw_markets
+                    WHERE neg_risk=1 AND neg_risk_group IS NOT NULL
+                    GROUP BY neg_risk_group ORDER BY neg_risk_group"""
+            ))
+            relation_count = 0
+            with relations_path.open("wb") as relation_stream:
+                relation_stream.write(b"[")
+                for group_id, expected_count, raw_binary_count in raw_groups:
+                    relation_id = f"neg-risk:{group_id}"
+                    actual = actual_relations.pop(relation_id, None)
+                    pairs = list((actual or {}).get("outcome_pairs") or [])
+                    members = [CandidateRelationMember(
+                        market_id=str(pair["market_id"]),
+                        condition_id=str(pair["condition_id"]),
+                        outcome_label=str(pair["outcome_label"]),
+                        yes_token_id=str(pair["yes_token_id"]),
+                        no_token_id=str(pair["no_token_id"]),
+                        pair_revision=str(pair["pair_revision"]),
+                        evidence_sha256=content_sha256({
+                            "pair_revision": pair["pair_revision"],
+                            "provenance": pair["provenance"],
+                        }),
+                    ) for pair in pairs]
+                    member_observations = [
+                        market_observed_at[item.market_id]
+                        for item in members
+                        if item.market_id in market_observed_at
+                    ]
+                    same_observation = (
+                        len({item.isoformat() for item in member_observations}) <= 1
+                        and len(member_observations) == int(expected_count)
+                    )
+                    reasons = []
+                    if actual is None:
+                        reasons.append("normalized_relation_missing")
+                    if len(members) != int(expected_count):
+                        reasons.append("member_count_mismatch")
+                    if int(raw_binary_count or 0) != int(expected_count):
+                        reasons.append("source_member_not_binary_yes_no")
+                    if len(members) < 2:
+                        reasons.append("insufficient_members")
+                    if actual is not None and (
+                        not actual["complete"] or actual["missing_fields"]
+                    ):
+                        reasons.append("outcome_pairs_incomplete")
+                    if actual is not None and actual["copies_disagree"]:
+                        reasons.append("relation_copies_disagree")
+                    if not same_observation:
+                        reasons.append("catalog_observation_incoherent")
+                    reasons = sorted(set(reasons))
+                    raw_member_hashes = [
+                        str(item[0]) for item in raw_index.execute(
+                            """SELECT raw_payload_sha256 FROM raw_markets
+                                WHERE neg_risk_group=? ORDER BY market_id""",
+                            (group_id,),
+                        )
+                    ]
+                    relation = CandidateNegativeRiskRelation(
+                        relation_id=relation_id,
+                        complete=not reasons,
+                        expected_member_count=int(expected_count),
+                        actual_member_count=len(members),
+                        members=members,
+                        reason_codes=reasons,
+                        producer_received_at=observed_at,
+                        coherence=CandidateRelationCoherence(
+                            status="coherent" if not reasons else "incomplete",
+                            catalog_revision=revision,
+                            producer_received_at=observed_at,
+                            member_observed_at_min=(
+                                min(member_observations)
+                                if member_observations else None
+                            ),
+                            member_observed_at_max=(
+                                max(member_observations)
+                                if member_observations else None
+                            ),
+                            all_members_same_catalog_observation=same_observation,
+                        ),
+                        evidence_sha256=content_sha256({
+                            "catalog_revision": revision,
+                            "relation_id": relation_id,
+                            "raw_member_hashes": raw_member_hashes,
+                            "relation_revision": (
+                                actual["revision"] if actual else None
+                            ),
+                        }),
+                    )
+                    if relation_count:
+                        relation_stream.write(b",")
+                    relation_stream.write(canonical_json(
+                        relation.model_dump(mode="json")
+                    ))
+                    relation_count += 1
+                for relation_id, actual in sorted(actual_relations.items()):
+                    pairs = list(actual.get("outcome_pairs") or [])
+                    members = [CandidateRelationMember(
+                        market_id=str(pair["market_id"]),
+                        condition_id=str(pair["condition_id"]),
+                        outcome_label=str(pair["outcome_label"]),
+                        yes_token_id=str(pair["yes_token_id"]),
+                        no_token_id=str(pair["no_token_id"]),
+                        pair_revision=str(pair["pair_revision"]),
+                        evidence_sha256=content_sha256({
+                            "pair_revision": pair["pair_revision"],
+                            "provenance": pair["provenance"],
+                        }),
+                    ) for pair in pairs]
+                    member_observations = [
+                        market_observed_at[item.market_id]
+                        for item in members
+                        if item.market_id in market_observed_at
+                    ]
+                    same_observation = (
+                        len({item.isoformat() for item in member_observations}) <= 1
+                        and len(member_observations) == len(members)
+                    )
+                    reasons = [
+                        "source_expected_member_count_missing",
+                        "source_relation_group_missing",
+                    ]
+                    if len(members) < 2:
+                        reasons.append("insufficient_members")
+                    if not actual["complete"] or actual["missing_fields"]:
+                        reasons.append("outcome_pairs_incomplete")
+                    if actual["copies_disagree"]:
+                        reasons.append("relation_copies_disagree")
+                    relation = CandidateNegativeRiskRelation(
+                        relation_id=relation_id,
+                        complete=False,
+                        expected_member_count=None,
+                        actual_member_count=len(members),
+                        members=members,
+                        reason_codes=sorted(set(reasons)),
+                        producer_received_at=observed_at,
+                        coherence=CandidateRelationCoherence(
+                            status="incomplete",
+                            catalog_revision=revision,
+                            producer_received_at=observed_at,
+                            member_observed_at_min=(
+                                min(member_observations)
+                                if member_observations else None
+                            ),
+                            member_observed_at_max=(
+                                max(member_observations)
+                                if member_observations else None
+                            ),
+                            all_members_same_catalog_observation=same_observation,
+                        ),
+                        evidence_sha256=content_sha256({
+                            "catalog_revision": revision,
+                            "relation_id": relation_id,
+                            "relation_revision": actual["revision"],
+                            "source_group_missing": True,
+                        }),
+                    )
+                    if relation_count:
+                        relation_stream.write(b",")
+                    relation_stream.write(canonical_json(
+                        relation.model_dump(mode="json")
+                    ))
+                    relation_count += 1
+                relation_stream.write(b"]")
+                relation_stream.flush()
+                os.fsync(relation_stream.fileno())
+
+        with payload_path.open("wb") as payload_stream:
+            payload_stream.write(
+                b'{"candidate_count":' + str(candidate_count).encode("ascii")
+                + b',"candidates":'
+            )
+            with candidates_path.open("rb") as candidates:
+                shutil.copyfileobj(candidates, payload_stream)
+            payload_stream.write(
+                b',"relation_count":' + str(relation_count).encode("ascii")
+                + b',"relations":'
+            )
+            with relations_path.open("rb") as relations:
+                shutil.copyfileobj(relations, payload_stream)
+            payload_stream.write(b"}")
+            payload_stream.flush()
+            os.fsync(payload_stream.fileno())
+        payload_sha256 = _file_sha256(payload_path)
+        source_binding = {
+            "catalog_sha256": str(normalized["sha256"]),
+            "raw_payload_sha256": str(source["raw_payload_sha256"]),
+            "source": "polymarket_gamma",
+            "source_url": source_url,
+        }
+        with output_path.open("wb") as output:
+            output.write(
+                b'{"catalog_revision":' + canonical_json(revision)
+                + b',"observed_at":'
+                + canonical_json(observed_at.isoformat().replace("+00:00", "Z"))
+                + b',"payload":'
+            )
+            with payload_path.open("rb") as payload_stream:
+                shutil.copyfileobj(payload_stream, output)
+            output.write(
+                b',"payload_sha256":' + canonical_json(payload_sha256)
+                + b',"schema_version":'
+                + canonical_json(CANDIDATE_SNAPSHOT_SCHEMA_VERSION)
+                + b',"source":' + canonical_json(source_binding) + b"}"
+            )
+            output.flush()
+            os.fsync(output.fileno())
+        snapshot_sha256 = _file_sha256(output_path)
+        if destination.exists():
+            if _file_sha256(destination) != snapshot_sha256:
+                raise RuntimeError("existing candidate snapshot is not deterministic")
+        else:
+            os.replace(output_path, destination)
+    return {
+        "format": "canonical_json",
+        "schema_version": CANDIDATE_SNAPSHOT_SCHEMA_VERSION,
+        "path": str(destination),
+        "sha256": snapshot_sha256,
+        "payload_sha256": payload_sha256,
+        "catalog_revision": revision,
+        "observed_at": observed_at.isoformat(),
+        "candidate_count": candidate_count,
+        "relation_count": relation_count,
+    }
+
+
 def _atomic_write_catalog(
     path: Path,
     *,
@@ -499,10 +987,17 @@ def _atomic_write_catalog(
             rows=normalized_rows,
             expected_market_count=len(normalized_rows),
         )
+    candidate_snapshot = _write_candidate_snapshot(
+        path.parent,
+        revision=revision,
+        normalized=normalized,
+        source=source,
+    )
     _atomic_write(path, canonical_json({
         "catalog_revision": revision,
         "catalog_source": source,
         "catalog_index": catalog_index,
+        "candidate_snapshot": candidate_snapshot,
         "normalized_catalog": normalized,
         "schema_version": LIVE_SCHEMA_VERSION,
     }))
@@ -569,6 +1064,34 @@ def build_live_catalog_index(root: Path) -> dict[str, Any]:
     payload["catalog_index"] = catalog_index
     _atomic_write(manifest_path, canonical_json(payload))
     return catalog_index
+
+
+def build_live_candidate_snapshot(root: Path) -> dict[str, Any]:
+    """Build and atomically attach the immutable full-catalog candidate view."""
+    root = root.resolve()
+    manifest_path = root / "catalog.json"
+    with _publication_lock(root, exclusive=True):
+        try:
+            manifest_body = manifest_path.read_bytes()
+            payload = json.loads(manifest_body)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("live catalog manifest is unavailable or invalid") from exc
+        normalized = payload.get("normalized_catalog")
+        source = payload.get("catalog_source")
+        revision = str(payload.get("catalog_revision") or "")
+        if not isinstance(normalized, dict) or not isinstance(source, dict):
+            raise RuntimeError("live catalog candidate inputs are unavailable")
+        candidate_snapshot = _write_candidate_snapshot(
+            root,
+            revision=revision,
+            normalized=normalized,
+            source=source,
+        )
+        if manifest_path.read_bytes() != manifest_body:
+            raise RuntimeError("live catalog changed during candidate publication")
+        payload["candidate_snapshot"] = candidate_snapshot
+        _atomic_write(manifest_path, canonical_json(payload))
+    return candidate_snapshot
 
 
 class LiveFactProvenance(BaseModel):
@@ -767,6 +1290,132 @@ class LiveMarket(BaseModel):
         return self
 
 
+class CandidateEvidence(BaseModel):
+    source: Literal["polymarket_gamma"] = "polymarket_gamma"
+    source_url: str
+    raw_payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    normalized_row_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$",
+    )
+    raw_row_in_current_catalog: bool
+    field_paths: list[str] = Field(min_length=1)
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CandidateMarket(BaseModel):
+    market_id: str
+    condition_id: str
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
+    active: bool
+    accepting_orders: bool
+    closed: bool
+    rules_complete: bool
+    binary_yes_no: bool
+    negative_risk: bool
+    negative_risk_relation_id: str | None = None
+    liquidity_num: str | None = None
+    liquidity_source_field: Literal["liquidityNum"] = "liquidityNum"
+    end_time: datetime | None = None
+    evidence: CandidateEvidence
+
+    @model_validator(mode="after")
+    def canonical_binary_and_liquidity(self):
+        token_pair = self.yes_token_id is not None and self.no_token_id is not None
+        if self.binary_yes_no != token_pair:
+            raise ValueError("candidate binary flag disagrees with canonical token pair")
+        if self.yes_token_id is not None and self.yes_token_id == self.no_token_id:
+            raise ValueError("candidate Yes/No token IDs must be distinct")
+        if not self.negative_risk and self.negative_risk_relation_id is not None:
+            raise ValueError("non-negative-risk candidate cannot name a relation")
+        if self.liquidity_num is not None:
+            try:
+                Decimal(self.liquidity_num)
+            except Exception as exc:
+                raise ValueError("candidate liquidityNum is not decimal") from exc
+        return self
+
+
+class CandidateRelationMember(BaseModel):
+    market_id: str
+    condition_id: str
+    outcome_label: str
+    yes_token_id: str
+    no_token_id: str
+    pair_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CandidateRelationCoherence(BaseModel):
+    status: Literal["coherent", "incomplete"]
+    catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    producer_received_at: datetime
+    member_observed_at_min: datetime | None = None
+    member_observed_at_max: datetime | None = None
+    all_members_same_catalog_observation: bool
+
+
+class CandidateNegativeRiskRelation(BaseModel):
+    relation_id: str
+    relation_type: Literal["standard_negative_risk"] = "standard_negative_risk"
+    complete: bool
+    expected_member_count: int | None = Field(default=None, ge=1)
+    actual_member_count: int = Field(ge=0)
+    members: list[CandidateRelationMember]
+    reason_codes: list[str]
+    producer_received_at: datetime
+    coherence: CandidateRelationCoherence
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def counted_members(self):
+        if self.actual_member_count != len(self.members):
+            raise ValueError("candidate relation actual count disagrees with members")
+        if self.complete != (
+            not self.reason_codes
+            and self.expected_member_count is not None
+            and self.actual_member_count == self.expected_member_count
+            and self.actual_member_count >= 2
+            and self.coherence.status == "coherent"
+        ):
+            raise ValueError("candidate relation completeness disagrees")
+        return self
+
+
+class CandidateSnapshotPayload(BaseModel):
+    candidate_count: int = Field(ge=0)
+    candidates: list[CandidateMarket]
+    relation_count: int = Field(ge=0)
+    relations: list[CandidateNegativeRiskRelation]
+
+    @model_validator(mode="after")
+    def counted_payload(self):
+        if self.candidate_count != len(self.candidates):
+            raise ValueError("candidate snapshot market count disagrees")
+        if self.relation_count != len(self.relations):
+            raise ValueError("candidate snapshot relation count disagrees")
+        return self
+
+
+class CandidateSnapshot(BaseModel):
+    schema_version: Literal[
+        "marketcow.polymarket.candidate-snapshot.v1"
+    ] = CANDIDATE_SNAPSHOT_SCHEMA_VERSION
+    catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: datetime
+    payload: CandidateSnapshotPayload
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source: dict[str, Any]
+
+    @model_validator(mode="after")
+    def checksum_bound_payload(self):
+        if self.payload_sha256 != content_sha256(
+            self.payload.model_dump(mode="json")
+        ):
+            raise ValueError("candidate snapshot payload checksum mismatch")
+        return self
+
+
 class LiveBook(BaseModel):
     token_id: str
     condition_id: str
@@ -949,11 +1598,15 @@ class PolymarketLiveReadStore:
         self.catalog_path = self.root / "catalog.json"
         self.normalized_catalog_root = self.root / "catalogs"
         self.catalog_index_root = self.root / "catalog-indexes"
+        self.candidate_snapshot_root = self.root / "candidate-snapshots"
         self.state_index_root = self.root / "indexes"
         self.state_manifest_path = self.root / "state-index.json"
         self.event_path = self.root / "events.jsonl"
         self._binding_cache: tuple[
             str, tuple[int, int], dict[str, Any], Path, Path, dict[str, str]
+        ] | None = None
+        self._candidate_binding_cache: tuple[
+            str, tuple[int, int], str
         ] | None = None
 
     def _manifest_binding(
@@ -1081,6 +1734,45 @@ class PolymarketLiveReadStore:
                 400,
             )
         return selected
+
+    def candidate_snapshot_path(self) -> tuple[Path, dict[str, Any]]:
+        payload, _, _, _ = self._manifest_binding()
+        metadata = payload.get("candidate_snapshot")
+        if not isinstance(metadata, dict):
+            raise PolymarketLiveReadError(
+                "polymarket_candidate_snapshot_unavailable",
+                "Polymarket candidate snapshot has not been materialized",
+                503,
+            )
+        path = Path(str(metadata.get("path") or "")).resolve()
+        revision = str(payload.get("catalog_revision") or "")
+        expected_sha256 = str(metadata.get("sha256") or "")
+        if (
+            not path.is_relative_to(self.candidate_snapshot_root)
+            or metadata.get("schema_version") != CANDIDATE_SNAPSHOT_SCHEMA_VERSION
+            or metadata.get("catalog_revision") != revision
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or not path.is_file()
+        ):
+            raise PolymarketLiveReadError(
+                "polymarket_candidate_snapshot_integrity_failed",
+                "Polymarket candidate snapshot binding is invalid",
+                409,
+            )
+        stat = path.stat()
+        signature = (stat.st_size, stat.st_mtime_ns)
+        cached = self._candidate_binding_cache
+        if cached != (revision, signature, expected_sha256):
+            if _file_sha256(path) != expected_sha256:
+                raise PolymarketLiveReadError(
+                    "polymarket_candidate_snapshot_integrity_failed",
+                    "Polymarket candidate snapshot hash mismatch",
+                    409,
+                )
+            self._candidate_binding_cache = (
+                revision, signature, expected_sha256,
+            )
+        return path, metadata
 
     def bootstrap(self, market_ids: Iterable[str]) -> LiveBootstrapResponse:
         selected_ids = self._scope(market_ids)
