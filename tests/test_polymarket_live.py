@@ -1363,6 +1363,15 @@ class PolymarketLiveTest(unittest.TestCase):
             first.headers["x-polymarket-payload-sha256"],
             candidate.payload_sha256,
         )
+        path.write_bytes(initial + b" ")
+        tampered = client.get(
+            "/v1/prediction-markets/polymarket/live/candidates"
+        )
+        self.assertEqual(tampered.status_code, 409)
+        self.assertEqual(
+            tampered.json()["detail"]["code"],
+            "polymarket_candidate_snapshot_integrity_failed",
+        )
 
     def test_candidate_snapshot_supports_exact_50_and_100_relation_atomic_scopes(self):
         root = self.root / "candidate-selector"
