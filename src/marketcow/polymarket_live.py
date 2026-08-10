@@ -1778,7 +1778,9 @@ class PolymarketLiveReadStore:
             )
         return path, metadata
 
-    def bootstrap(self, market_ids: Iterable[str]) -> LiveBootstrapResponse:
+    def bootstrap(
+        self, market_ids: Iterable[str], *, _bind_live_books: bool = True,
+    ) -> LiveBootstrapResponse:
         selected_ids = self._scope(market_ids)
         payload, normalized_path, index_path, _ = self._manifest_binding()
         normalized_stat = normalized_path.stat()
@@ -1790,7 +1792,10 @@ class PolymarketLiveReadStore:
         cached = self._bootstrap_cache.get(cache_key)
         if cached is not None:
             self._bootstrap_cache.move_to_end(cache_key)
-            return self._bind_bootstrap_to_live_books(cached)
+            return (
+                self._bind_bootstrap_to_live_books(cached)
+                if _bind_live_books else cached
+            )
         placeholders = ",".join("?" for _ in selected_ids)
         try:
             with _readonly_sqlite(index_path) as connection:
@@ -1888,7 +1893,10 @@ class PolymarketLiveReadStore:
         self._bootstrap_cache.move_to_end(cache_key)
         while len(self._bootstrap_cache) > 8:
             self._bootstrap_cache.popitem(last=False)
-        return self._bind_bootstrap_to_live_books(response)
+        return (
+            self._bind_bootstrap_to_live_books(response)
+            if _bind_live_books else response
+        )
 
     def _state_path(self) -> Path:
         _, path = self._state_manifest()
@@ -2069,7 +2077,11 @@ class PolymarketLiveReadStore:
         })
 
     def _bind_bootstrap_to_live_books(
-        self, response: LiveBootstrapResponse,
+        self,
+        response: LiveBootstrapResponse,
+        *,
+        indexed_books: dict[str, list[LiveBook]] | None = None,
+        state_metadata: dict[str, str] | None = None,
     ) -> LiveBootstrapResponse:
         """Project dynamic CLOB tick facts into one scoped catalog boundary.
 
@@ -2081,30 +2093,36 @@ class PolymarketLiveReadStore:
         market_ids = [market.identity.market_id for market in response.markets]
         if not market_ids:
             return response
-        placeholders = ",".join("?" for _ in market_ids)
-        try:
-            with self._state_snapshot() as (_, connection, metadata):
-                rows = list(connection.execute(
-                    f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
-                        c.exchange_at AS confirmed_exchange_at,
-                        c.received_at AS confirmed_received_at,
-                        c.state_checksum AS confirmed_state_checksum,
-                        c.source_hash AS confirmed_source_hash,
-                        c.confirmation_sha256
-                        FROM books b LEFT JOIN book_confirmations c
-                        ON c.token_id=b.token_id
-                        WHERE b.market_id IN ({placeholders})""",
-                    market_ids,
-                ))
-        except PolymarketLiveReadError as exc:
-            if exc.status_code == 503:
-                return response
-            raise
-        books_by_market: dict[str, list[LiveBook]] = defaultdict(list)
-        for row in rows:
-            books_by_market[str(row["market_id"])].append(
-                self._indexed_book(row)
-            )
+        if indexed_books is None:
+            placeholders = ",".join("?" for _ in market_ids)
+            try:
+                with self._state_snapshot() as (_, connection, metadata):
+                    rows = list(connection.execute(
+                        f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
+                            c.exchange_at AS confirmed_exchange_at,
+                            c.received_at AS confirmed_received_at,
+                            c.state_checksum AS confirmed_state_checksum,
+                            c.source_hash AS confirmed_source_hash,
+                            c.confirmation_sha256
+                            FROM books b LEFT JOIN book_confirmations c
+                            ON c.token_id=b.token_id
+                            WHERE b.market_id IN ({placeholders})""",
+                        market_ids,
+                    ))
+            except PolymarketLiveReadError as exc:
+                if exc.status_code == 503:
+                    return response
+                raise
+            books_by_market: dict[str, list[LiveBook]] = defaultdict(list)
+            for row in rows:
+                books_by_market[str(row["market_id"])].append(
+                    self._indexed_book(row)
+                )
+        else:
+            books_by_market = indexed_books
+            metadata = state_metadata
+        if metadata is None:
+            raise RuntimeError("live book binding requires state metadata")
         result = response.model_copy(deep=True)
         result.cursor = int(metadata["latest_cursor"])
         for market in result.markets:
@@ -2144,7 +2162,7 @@ class PolymarketLiveReadStore:
 
     def snapshot(self, market_ids: Iterable[str]) -> LiveSnapshotPage:
         selected_ids = self._scope(market_ids)
-        bootstrap = self.bootstrap(selected_ids)
+        bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         relation_ids = sorted({
             pair.market_id
             for market in bootstrap.markets
@@ -2152,7 +2170,11 @@ class PolymarketLiveReadStore:
             for pair in relation.outcome_pairs
             if pair.market_id not in selected_ids
         })
-        related = self.bootstrap(relation_ids).markets if relation_ids else []
+        related_bootstrap = (
+            self.bootstrap(relation_ids, _bind_live_books=False)
+            if relation_ids else None
+        )
+        related = related_bootstrap.markets if related_bootstrap else []
         markets = bootstrap.markets + related
         all_market_ids = [market.identity.market_id for market in markets]
         placeholders = ",".join("?" for _ in all_market_ids)
@@ -2164,7 +2186,7 @@ class PolymarketLiveReadStore:
                     409,
                 )
             book_rows = list(connection.execute(
-                f"""SELECT b.payload_json, b.payload_sha256,
+                f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
                     c.exchange_at AS confirmed_exchange_at,
                     c.received_at AS confirmed_received_at,
                     c.state_checksum AS confirmed_state_checksum,
@@ -2181,9 +2203,26 @@ class PolymarketLiveReadStore:
                 all_market_ids,
             ))
         books = {}
+        books_by_market: dict[str, list[LiveBook]] = defaultdict(list)
         for row in book_rows:
             book = self._indexed_book(row)
             books[book.token_id] = book
+            books_by_market[str(row["market_id"])].append(book)
+        bootstrap = self._bind_bootstrap_to_live_books(
+            bootstrap,
+            indexed_books=books_by_market,
+            state_metadata=metadata,
+        )
+        related_bootstrap = (
+            self._bind_bootstrap_to_live_books(
+                related_bootstrap,
+                indexed_books=books_by_market,
+                state_metadata=metadata,
+            )
+            if related_bootstrap else None
+        )
+        related = related_bootstrap.markets if related_bootstrap else []
+        markets = bootstrap.markets + related
         gaps = []
         for row in gap_rows:
             body = bytes(row["payload_json"])
@@ -2216,7 +2255,7 @@ class PolymarketLiveReadStore:
         self, market_ids: Iterable[str], after_cursor: int, limit: int,
     ) -> LiveEventPage:
         selected_ids = self._scope(market_ids)
-        bootstrap = self.bootstrap(selected_ids)
+        bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         placeholders = ",".join("?" for _ in selected_ids)
         with self._state_snapshot() as (_, connection, metadata):
             if metadata["catalog_revision"] != bootstrap.catalog_revision:
@@ -2294,7 +2333,7 @@ class PolymarketLiveReadStore:
         self, market_ids: Iterable[str], *, unresolved_only: bool,
     ) -> LiveGapPage:
         selected_ids = self._scope(market_ids)
-        bootstrap = self.bootstrap(selected_ids)
+        bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         placeholders = ",".join("?" for _ in selected_ids)
         resolved_clause = " AND resolved=0" if unresolved_only else ""
         with self._state_snapshot() as (_, connection, metadata):
@@ -2322,7 +2361,7 @@ class PolymarketLiveReadStore:
 
     def checkpoint(self, market_ids: Iterable[str]) -> LiveCheckpoint:
         selected_ids = self._scope(market_ids)
-        bootstrap = self.bootstrap(selected_ids)
+        bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         placeholders = ",".join("?" for _ in selected_ids)
         with self._state_snapshot() as (_, connection, metadata):
             if metadata["catalog_revision"] != bootstrap.catalog_revision:

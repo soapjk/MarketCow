@@ -1640,6 +1640,27 @@ class PolymarketLiveTest(unittest.TestCase):
         writer.state_index.close()
         self.assertIsNone(writer.state_index._writer)
 
+    def test_scoped_snapshot_reads_one_atomic_live_state_boundary(self):
+        root = self.root / "single-state-read-live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+        )
+        writer.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+        )
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+
+        with patch.object(
+            reader, "_state_snapshot", wraps=reader._state_snapshot,
+        ) as state_snapshot:
+            result = reader.snapshot(["m1"])
+
+        self.assertEqual(result.items[0].status, "ready")
+        self.assertEqual(state_snapshot.call_count, 1)
+
     def test_state_index_rebuild_restores_scoped_snapshot_and_event_offsets(self):
         root = self.root / "live"
         writer = LiveStateStore(root, now_provider=lambda: NOW)
