@@ -1160,7 +1160,7 @@ class PolymarketLiveReadStore:
                 "Polymarket catalog token index disagrees with selected rows",
                 409,
             )
-        return LiveBootstrapResponse(
+        response = LiveBootstrapResponse(
             catalog_revision=str(payload["catalog_revision"]),
             catalog_source=payload.get("catalog_source"),
             cursor=0,
@@ -1178,6 +1178,7 @@ class PolymarketLiveReadStore:
             },
             source_policy="official_free_only",
         )
+        return self._bind_bootstrap_to_live_books(response)
 
     def _state_path(self) -> Path:
         _, path = self._state_manifest()
@@ -1333,6 +1334,80 @@ class PolymarketLiveReadStore:
             "received_at": _instant(confirmation["received_at"]),
             "source_hash": confirmation["source_hash"],
         })
+
+    def _bind_bootstrap_to_live_books(
+        self, response: LiveBootstrapResponse,
+    ) -> LiveBootstrapResponse:
+        """Project dynamic CLOB tick facts into one scoped catalog boundary.
+
+        Gamma's minimum tick is an initial market fact; Polymarket can tighten
+        it while a market is live. The latest-state index is authoritative for
+        that dynamic instrument fact, while every other catalog field remains
+        bound to the immutable normalized row.
+        """
+        market_ids = [market.identity.market_id for market in response.markets]
+        if not market_ids:
+            return response
+        placeholders = ",".join("?" for _ in market_ids)
+        try:
+            with self._state_snapshot() as (_, connection, metadata):
+                rows = list(connection.execute(
+                    f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
+                        c.exchange_at AS confirmed_exchange_at,
+                        c.received_at AS confirmed_received_at,
+                        c.state_checksum AS confirmed_state_checksum,
+                        c.source_hash AS confirmed_source_hash,
+                        c.confirmation_sha256
+                        FROM books b LEFT JOIN book_confirmations c
+                        ON c.token_id=b.token_id
+                        WHERE b.market_id IN ({placeholders})""",
+                    market_ids,
+                ))
+        except PolymarketLiveReadError as exc:
+            if exc.status_code == 503:
+                return response
+            raise
+        books_by_market: dict[str, list[LiveBook]] = defaultdict(list)
+        for row in rows:
+            books_by_market[str(row["market_id"])].append(
+                self._indexed_book(row)
+            )
+        result = response.model_copy(deep=True)
+        result.cursor = int(metadata["latest_cursor"])
+        for market in result.markets:
+            books = books_by_market.get(market.identity.market_id, [])
+            expected_tokens = {outcome.token_id for outcome in market.identity.outcomes}
+            if {book.token_id for book in books} != expected_tokens:
+                continue
+            if any(book.condition_id != market.identity.condition_id for book in books):
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed",
+                    "Live book condition differs from scoped catalog facts",
+                    409,
+                )
+            ticks = {book.tick_size for book in books}
+            if len(ticks) != 1:
+                raise PolymarketLiveReadError(
+                    "polymarket_instrument_book_binding_incomplete",
+                    "Outcome books disagree on the live market tick",
+                    503,
+                )
+            tick = next(iter(ticks))
+            instrument = market.rules.instrument
+            if instrument.price_increment == tick:
+                continue
+            base_revision = instrument.revision
+            instrument.price_increment = tick
+            instrument.revision = content_sha256({
+                "base_revision": base_revision,
+                "live_price_increment": tick,
+                "binding": "polymarket_clob_book_tick_v1",
+            })
+            market.metadata_revision = content_sha256({
+                "base_revision": market.metadata_revision,
+                "instrument_revision": instrument.revision,
+            })
+        return result
 
     def snapshot(self, market_ids: Iterable[str]) -> LiveSnapshotPage:
         selected_ids = self._scope(market_ids)

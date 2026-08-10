@@ -1355,6 +1355,37 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(health.book_complete_market_count, 1)
         self.assertEqual(health.unresolved_gap_count, 0)
 
+    def test_bootstrap_binds_dynamic_clob_tick_to_instrument_facts(self):
+        root = self.root / "live-dynamic-tick"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        for token, bid, ask in (
+            ("yes-1", "0.400", "0.420"),
+            ("no-1", "0.580", "0.600"),
+        ):
+            raw = snapshot(token, bid, ask)
+            raw["tick_size"] = "0.001"
+            writer.apply_snapshot(raw, received_at=NOW)
+
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        bootstrap = reader.bootstrap(["m1"])
+        page = reader.snapshot(["m1"])
+
+        self.assertEqual(bootstrap.cursor, writer.cursor)
+        self.assertEqual(
+            bootstrap.markets[0].rules.instrument.price_increment,
+            "0.001",
+        )
+        self.assertEqual(
+            {book.tick_size for book in page.items[0].tokens},
+            {"0.001"},
+        )
+        self.assertEqual(
+            bootstrap.markets[0].rules.instrument.price_increment,
+            page.items[0].tokens[0].tick_size,
+        )
+
     def test_raw_hash_deduplication_memory_is_bounded_by_replay_capacity(self):
         store = LiveStateStore(self.root / "bounded-hashes", replay_capacity=2)
 
