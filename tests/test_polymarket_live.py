@@ -766,6 +766,44 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual({item.token_id for item in frame.relation_tokens}, {"a", "c", "e"})
         self.assertEqual(len(frame.relation_pairs), 3)
 
+    def test_negative_risk_frame_skew_uses_observation_not_last_exchange_change(self):
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),
+            gamma_row("m2", "0x" + "2" * 64, ("c", "d"), neg_risk=True),
+            gamma_row("m3", "0x" + "3" * 64, ("e", "f"), neg_risk=True),
+        ]
+        store = LiveStateStore(
+            self.root / "negative-risk-observation-skew",
+            now_provider=lambda: NOW,
+            stale_after_ms=60_000,
+        )
+        store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        for token, bid, ask, timestamp in (
+            ("a", "0.20", "0.22", "1785739200000"),
+            ("b", "0.78", "0.80", "1785739200000"),
+            ("c", "0.30", "0.32", "1785739210000"),
+            ("d", "0.68", "0.70", "1785739210000"),
+            ("e", "0.40", "0.42", "1785739220000"),
+            ("f", "0.58", "0.60", "1785739220000"),
+        ):
+            store.apply_snapshot(
+                snapshot(token, bid, ask, timestamp), received_at=NOW,
+            )
+
+        self.assertEqual(store.frame("m1", now=NOW).status, "ready")
+
+        delayed = NOW + timedelta(seconds=6)
+        for token, bid, ask in (
+            ("c", "0.30", "0.32"), ("d", "0.68", "0.70"),
+        ):
+            store.apply_snapshot(
+                snapshot(token, bid, ask, "1785739211000"),
+                received_at=delayed,
+            )
+        frame = store.frame("m1", now=delayed)
+        self.assertEqual(frame.status, "fail_closed")
+        self.assertIn("negative_risk_frame_skew", frame.reason_codes)
+
     def test_ambiguous_negative_risk_pair_metadata_fails_closed(self):
         rows = [
             gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),

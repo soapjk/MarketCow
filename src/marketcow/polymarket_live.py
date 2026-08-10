@@ -4041,8 +4041,8 @@ class LiveStateStore:
                 reasons.append("negative_risk_member_missing")
             if relation_books:
                 relation_skew = (
-                    max(item.exchange_at for item in relation_books)
-                    - min(item.exchange_at for item in relation_books)
+                    max(item.received_at for item in relation_books)
+                    - min(item.received_at for item in relation_books)
                 ).total_seconds() * 1000
                 if relation_skew > self.max_frame_skew_ms:
                     reasons.append("negative_risk_frame_skew")
