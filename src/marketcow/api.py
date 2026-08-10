@@ -1353,7 +1353,7 @@ def create_app(
         try:
             return polymarket_live_read.bootstrap(
                 _require_polymarket_scope(market_id)
-            ).model_dump(mode="json")
+            )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1368,7 +1368,7 @@ def create_app(
         try:
             return polymarket_live_read.snapshot(
                 _require_polymarket_scope(market_id)
-            ).model_dump(mode="json")
+            )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1409,7 +1409,7 @@ def create_app(
         try:
             return polymarket_live_read.events_after(
                 _require_polymarket_scope(market_id), after_cursor, limit,
-            ).model_dump(mode="json")
+            )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1424,7 +1424,7 @@ def create_app(
         try:
             return polymarket_live_read.checkpoint(
                 _require_polymarket_scope(market_id)
-            ).model_dump(mode="json")
+            )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1434,7 +1434,7 @@ def create_app(
         summary="Read live source coverage, lag, and gap health",
     )
     def polymarket_live_health():
-        return polymarket_live_read.health().model_dump(mode="json")
+        return polymarket_live_read.health()
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/gaps",
@@ -1449,7 +1449,7 @@ def create_app(
             return polymarket_live_read.gaps(
                 _require_polymarket_scope(market_id),
                 unresolved_only=unresolved_only,
-            ).model_dump(mode="json")
+            )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
