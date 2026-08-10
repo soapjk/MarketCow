@@ -2427,18 +2427,36 @@ class LiveStateIndex:
         self.path = self.root / "indexes" / "latest-state.sqlite3"
         self.manifest_path = self.root / "state-index.json"
         self._batch_state = threading.local()
+        self._writer_lock = threading.RLock()
+        self._writer: sqlite3.Connection | None = None
 
     def _writer_connection(self) -> sqlite3.Connection:
-        initialize = not self.path.exists()
-        connection = sqlite3.connect(self.path, timeout=30)
-        if initialize:
-            self._schema(connection)
-        else:
-            # WAL mode is persistent. Re-running DDL and journal-mode PRAGMAs
-            # for every live batch takes a schema lock and stalls readers.
-            connection.execute("PRAGMA synchronous=FULL")
-            connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+        if self._writer is None:
+            initialize = not self.path.exists()
+            connection = sqlite3.connect(
+                self.path, timeout=30, check_same_thread=False,
+            )
+            if initialize:
+                self._schema(connection)
+            else:
+                # Rebuilds use DELETE mode for an atomic standalone temporary
+                # file. Promote the published file once, when the live writer
+                # opens it; otherwise every hot transaction excludes API reads.
+                connection.execute("PRAGMA journal_mode=WAL")
+                # The event log is fsynced before this derived index commits.
+                # NORMAL keeps the WAL transaction atomic while allowing crash
+                # recovery to replay a durable log tail if the derived pages lag.
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA busy_timeout=30000")
+            self._writer = connection
+        return self._writer
+
+    def close(self) -> None:
+        """Close the process-lifetime WAL writer, primarily for rebuilds/tests."""
+        with self._writer_lock:
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None
 
     @contextmanager
     def batch(self):
@@ -2447,27 +2465,27 @@ class LiveStateIndex:
             yield
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = self._writer_connection()
-        self._batch_state.connection = connection
-        published_metadata = None
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            yield
-            connection.commit()
-            published_metadata = self._metadata(connection)
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            del self._batch_state.connection
-            connection.close()
+        with self._writer_lock:
+            connection = self._writer_connection()
+            self._batch_state.connection = connection
+            published_metadata = None
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield
+                connection.commit()
+                published_metadata = self._metadata(connection)
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                del self._batch_state.connection
         self._publish_manifest(published_metadata)
 
     @staticmethod
     def _schema(connection: sqlite3.Connection, *, wal: bool = True) -> None:
         connection.execute(f"PRAGMA journal_mode={'WAL' if wal else 'DELETE'}")
         connection.executescript("""
-            PRAGMA synchronous=FULL;
+            PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             ) WITHOUT ROWID;
@@ -2548,9 +2566,6 @@ class LiveStateIndex:
             if owns_connection:
                 connection.rollback()
             raise
-        finally:
-            if owns_connection:
-                connection.close()
 
     @staticmethod
     def _metadata(connection: sqlite3.Connection) -> dict[str, str]:
@@ -2708,9 +2723,6 @@ class LiveStateIndex:
             if owns_connection:
                 connection.rollback()
             raise
-        finally:
-            if owns_connection:
-                connection.close()
         if owns_connection:
             self._publish_manifest(published_metadata)
 
@@ -2724,6 +2736,7 @@ class LiveStateIndex:
         token_to_market: dict[str, str],
         active_recovery_id: str | None = None,
     ) -> None:
+        self.close()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         temporary.unlink(missing_ok=True)

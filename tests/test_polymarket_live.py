@@ -1610,6 +1610,33 @@ class PolymarketLiveTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             catch_up_live_state_index(tail_root)
 
+    def test_live_state_writer_keeps_wal_open_across_hot_batches(self):
+        root = self.root / "persistent-wal-live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+        )
+        connection = writer.state_index._writer
+        self.assertIsNotNone(connection)
+        self.assertEqual(
+            connection.execute("PRAGMA journal_mode").fetchone()[0], "wal",
+        )
+
+        writer.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+        )
+
+        self.assertIs(writer.state_index._writer, connection)
+        self.assertEqual(
+            PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+            .snapshot(["m1"]).items[0].status,
+            "ready",
+        )
+        writer.state_index.close()
+        self.assertIsNone(writer.state_index._writer)
+
     def test_state_index_rebuild_restores_scoped_snapshot_and_event_offsets(self):
         root = self.root / "live"
         writer = LiveStateStore(root, now_provider=lambda: NOW)
