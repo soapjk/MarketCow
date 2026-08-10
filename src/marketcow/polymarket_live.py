@@ -1611,6 +1611,7 @@ class PolymarketLiveReadStore:
         self._bootstrap_cache: OrderedDict[
             tuple[str, tuple[int, int], tuple[str, ...]], LiveBootstrapResponse
         ] = OrderedDict()
+        self._state_reader = threading.local()
 
     def _manifest_binding(
         self,
@@ -1976,12 +1977,34 @@ class PolymarketLiveReadStore:
             )
         return metadata
 
+    def _state_reader_connection(self, path: Path) -> sqlite3.Connection:
+        stat = path.stat()
+        signature = (stat.st_dev, stat.st_ino)
+        cached = getattr(self._state_reader, "binding", None)
+        if cached is not None and cached[:2] == (path, signature):
+            return cached[2]
+        if cached is not None:
+            cached[2].close()
+        connection = _readonly_state_sqlite(path)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA busy_timeout=20000")
+        connection.execute("PRAGMA cache_size=-32768")
+        connection.execute("PRAGMA mmap_size=268435456")
+        self._state_reader.binding = (path, signature, connection)
+        return connection
+
+    def _discard_state_reader(self, connection: sqlite3.Connection) -> None:
+        cached = getattr(self._state_reader, "binding", None)
+        if cached is not None and cached[2] is connection:
+            del self._state_reader.binding
+        connection.close()
+
     @contextmanager
     def _state_snapshot(self):
         revision_error = None
         for attempt in range(3):
             path = self._state_path()
-            connection = _readonly_state_sqlite(path)
+            connection = self._state_reader_connection(path)
             try:
                 connection.execute("BEGIN")
                 try:
@@ -1993,17 +2016,18 @@ class PolymarketLiveReadStore:
                         and attempt < 2
                     ):
                         revision_error = exc
-                        connection.close()
+                        connection.rollback()
+                        self._discard_state_reader(connection)
                         time.sleep(0.01)
                         continue
                     raise
                 try:
                     yield path, connection, metadata
                 finally:
-                    connection.close()
+                    connection.rollback()
                 return
             except BaseException:
-                connection.close()
+                connection.rollback()
                 raise
         if revision_error is not None:  # pragma: no cover - loop always raises
             raise revision_error

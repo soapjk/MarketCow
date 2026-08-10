@@ -1629,10 +1629,13 @@ class PolymarketLiveTest(unittest.TestCase):
         )
 
         self.assertIs(writer.state_index._writer, connection)
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
+        reader_connection = reader._state_reader.binding[2]
+        self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
+        self.assertIs(reader._state_reader.binding[2], reader_connection)
         self.assertEqual(
-            PolymarketLiveReadStore(root, now_provider=lambda: NOW)
-            .snapshot(["m1"]).items[0].status,
-            "ready",
+            reader_connection.execute("PRAGMA query_only").fetchone()[0], 1,
         )
         writer.state_index.close()
         self.assertIsNone(writer.state_index._writer)
