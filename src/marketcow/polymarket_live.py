@@ -12,7 +12,7 @@ import sqlite3
 import tempfile
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -1608,6 +1608,9 @@ class PolymarketLiveReadStore:
         self._candidate_binding_cache: tuple[
             str, tuple[int, int], str
         ] | None = None
+        self._bootstrap_cache: OrderedDict[
+            tuple[str, tuple[int, int], tuple[str, ...]], LiveBootstrapResponse
+        ] = OrderedDict()
 
     def _manifest_binding(
         self,
@@ -1777,6 +1780,16 @@ class PolymarketLiveReadStore:
     def bootstrap(self, market_ids: Iterable[str]) -> LiveBootstrapResponse:
         selected_ids = self._scope(market_ids)
         payload, normalized_path, index_path, _ = self._manifest_binding()
+        normalized_stat = normalized_path.stat()
+        cache_key = (
+            hashlib.sha256(canonical_json(payload)).hexdigest(),
+            (normalized_stat.st_size, normalized_stat.st_mtime_ns),
+            tuple(selected_ids),
+        )
+        cached = self._bootstrap_cache.get(cache_key)
+        if cached is not None:
+            self._bootstrap_cache.move_to_end(cache_key)
+            return self._bind_bootstrap_to_live_books(cached)
         placeholders = ",".join("?" for _ in selected_ids)
         try:
             with _readonly_sqlite(index_path) as connection:
@@ -1870,6 +1883,10 @@ class PolymarketLiveReadStore:
             },
             source_policy="official_free_only",
         )
+        self._bootstrap_cache[cache_key] = response
+        self._bootstrap_cache.move_to_end(cache_key)
+        while len(self._bootstrap_cache) > 8:
+            self._bootstrap_cache.popitem(last=False)
         return self._bind_bootstrap_to_live_books(response)
 
     def _state_path(self) -> Path:
