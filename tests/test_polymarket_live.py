@@ -2162,7 +2162,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             )
             reasons = []
 
-            async def refresh(reason="startup"):
+            async def refresh(reason="startup", **_partition):
                 reasons.append(reason)
                 return "recovery"
 
@@ -2296,6 +2296,71 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 {current[0]},
             )
 
+    def test_periodic_refresh_partitions_market_pairs_without_splitting(self):
+        with TemporaryDirectory() as folder:
+            current = [NOW]
+            rows = [
+                gamma_row(
+                    market_id=f"m{index}",
+                    tokens=(f"yes-{index}", f"no-{index}"),
+                )
+                for index in range(4)
+            ]
+            store = LiveStateStore(
+                Path(folder), now_provider=lambda: current[0],
+            )
+            markets = GammaLiveNormalizer.normalize(rows, NOW)
+            store.replace_catalog(markets, rows)
+            requested = []
+
+            def requester(_url, **kwargs):
+                tokens = [item["token_id"] for item in kwargs["json"]]
+                requested.append(tokens)
+                return Response([
+                    snapshot(token, "0.40", "0.42") for token in tokens
+                ])
+
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=requester),
+                publish_checkpoints=False,
+            )
+
+            asyncio.run(collector.refresh_books(
+                partition_index=1, partition_count=2,
+            ))
+
+            selected_markets = {
+                store.token_to_market[token]
+                for batch in requested for token in batch
+            }
+            self.assertEqual(
+                selected_markets,
+                set(sorted(store.catalog)[1::2]),
+            )
+            self.assertTrue(all(
+                {
+                    token
+                    for token, market_id in store.token_to_market.items()
+                    if market_id == selected
+                } <= set(requested[0])
+                for selected in selected_markets
+            ))
+
+    def test_snapshot_refresh_partition_rejects_invalid_bounds(self):
+        with TemporaryDirectory() as folder:
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+            )
+
+            with self.assertRaisesRegex(ValueError, "partition"):
+                asyncio.run(collector.refresh_books(
+                    partition_index=2, partition_count=2,
+                ))
+
     def test_periodic_snapshot_refresh_recovers_after_transient_failure(self):
         with TemporaryDirectory() as folder:
             collector = PolymarketLiveCollector(
@@ -2310,7 +2375,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             )
             attempts = []
 
-            async def refresh(reason="startup"):
+            async def refresh(reason="startup", **_partition):
                 attempts.append(reason)
                 if len(attempts) == 1:
                     raise RuntimeError("transient CLOB failure")
@@ -2373,7 +2438,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             store.apply_websocket = slow_apply
             refreshed_while_applying = []
 
-            async def refresh(reason="startup"):
+            async def refresh(reason="startup", **_partition):
                 refreshed_while_applying.append(applying.is_set())
                 release.set()
                 return "recovery"

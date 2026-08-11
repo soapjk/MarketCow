@@ -5591,8 +5591,16 @@ class PolymarketLiveCollector:
         )
         return recovery_id
 
-    async def refresh_books(self, reason: str = "periodic_snapshot_refresh") -> str:
+    async def refresh_books(
+        self,
+        reason: str = "periodic_snapshot_refresh",
+        *,
+        partition_index: int = 0,
+        partition_count: int = 1,
+    ) -> str:
         """Refresh a healthy scope without exposing recovery-in-progress state."""
+        if not 0 <= partition_index < partition_count:
+            raise ValueError("snapshot refresh partition is invalid")
         with self.store._sync_lock:
             refresh_started_at = self.store.now_provider()
             recovery_id = content_sha256({
@@ -5602,7 +5610,7 @@ class PolymarketLiveCollector:
             })
             tracker = self.store.new_book_recovery_tracker()
             minimum_age = self.minimum_snapshot_refresh_age_seconds
-            refresh_market_ids = {
+            stale_market_ids = {
                 market_id
                 for token_id, market_id in self.store.token_to_market.items()
                 if token_id not in self.store.books
@@ -5610,6 +5618,11 @@ class PolymarketLiveCollector:
                 or (
                     refresh_started_at - self.store.books[token_id].received_at
                 ).total_seconds() >= minimum_age
+            }
+            refresh_market_ids = {
+                market_id
+                for index, market_id in enumerate(sorted(stale_market_ids))
+                if index % partition_count == partition_index
             }
             refresh_token_ids = sorted(
                 token_id
@@ -5755,11 +5768,15 @@ class PolymarketLiveCollector:
         if self.snapshot_refresh_seconds is None:
             return
 
-        async def worker(initial_delay: float) -> None:
+        async def worker(partition_index: int, initial_delay: float) -> None:
             await asyncio.sleep(self.snapshot_refresh_seconds + initial_delay)
             while True:
                 try:
-                    await self.refresh_books("periodic_snapshot_refresh")
+                    await self.refresh_books(
+                        "periodic_snapshot_refresh",
+                        partition_index=partition_index,
+                        partition_count=self.max_concurrent_snapshot_refreshes,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -5771,6 +5788,7 @@ class PolymarketLiveCollector:
 
         await asyncio.gather(*(
             worker(
+                index,
                 index * self.snapshot_refresh_seconds
                 / self.max_concurrent_snapshot_refreshes
             )
