@@ -1591,6 +1591,12 @@ class PolymarketLiveReadStore:
     """Bounded, provider-neutral reads over immutable live indexes."""
 
     max_scope_markets = 100
+    # A full live event carries the canonical and raw source payload plus both
+    # integrity hashes.  In production a 1,000-event page is several MiB and
+    # requires a second validation/serialization pass in the API process.  Keep
+    # each response bounded while preserving ordinary cursor pagination.
+    max_event_page_items = 250
+    max_event_page_bytes = 1_048_576
 
     def __init__(self, root: Path, *, now_provider: Callable[[], datetime] = utc_now):
         self.root = root.resolve()
@@ -2257,6 +2263,7 @@ class PolymarketLiveReadStore:
         selected_ids = self._scope(market_ids)
         bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         placeholders = ",".join("?" for _ in selected_ids)
+        page_limit = min(limit, self.max_event_page_items)
         with self._state_snapshot() as (_, connection, metadata):
             if metadata["catalog_revision"] != bootstrap.catalog_revision:
                 raise PolymarketLiveReadError(
@@ -2296,10 +2303,20 @@ class PolymarketLiveReadStore:
                 f"""SELECT * FROM event_offsets
                     WHERE market_id IN ({placeholders}) AND cursor > ?
                     ORDER BY cursor LIMIT ?""",
-                [*selected_ids, after_cursor, limit + 1],
+                [*selected_ids, after_cursor, page_limit + 1],
             ))
-        has_more = len(rows) > limit
-        rows = rows[:limit]
+        has_more = len(rows) > page_limit
+        rows = rows[:page_limit]
+        bounded_rows = []
+        bounded_bytes = 0
+        for row in rows:
+            row_bytes = int(row["byte_length"])
+            if bounded_rows and bounded_bytes + row_bytes > self.max_event_page_bytes:
+                has_more = True
+                break
+            bounded_rows.append(row)
+            bounded_bytes += row_bytes
+        rows = bounded_rows
         items = []
         with self.event_path.open("rb") as stream:
             for row in rows:
@@ -5560,6 +5577,52 @@ class PolymarketLiveCollector:
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
 
+    def _coherent_refresh_groups(self) -> list[tuple[str, ...]]:
+        """Return stable refresh units without splitting relation members.
+
+        REST freshness confirmation is a publication boundary.  If members of
+        one Standard Negative Risk relation are assigned to different refresh
+        workers, readers can observe different confirmation generations and
+        correctly fail closed on frame skew.  Connected relation members must
+        therefore share one request and one SQLite transaction.
+        """
+        market_ids = set(self.store.token_to_market.values())
+        parent = {market_id: market_id for market_id in market_ids}
+
+        def find(market_id: str) -> str:
+            while parent[market_id] != market_id:
+                parent[market_id] = parent[parent[market_id]]
+                market_id = parent[market_id]
+            return market_id
+
+        def union(left: str, right: str) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root == right_root:
+                return
+            if left_root < right_root:
+                parent[right_root] = left_root
+            else:
+                parent[left_root] = right_root
+
+        for market_id in sorted(market_ids):
+            market = self.store.catalog.get(market_id)
+            if market is None:
+                continue
+            for relation in market.relations:
+                if relation.relation_type != "standard_negative_risk":
+                    continue
+                members = sorted({
+                    pair.market_id for pair in relation.outcome_pairs
+                    if pair.market_id in market_ids
+                })
+                for member in members[1:]:
+                    union(members[0], member)
+
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for market_id in sorted(market_ids):
+            grouped[find(market_id)].append(market_id)
+        return sorted(tuple(members) for members in grouped.values())
+
     def refresh_catalog(self) -> dict[str, Any]:
         rows, evidence = self.catalog_client.fetch_all()
         publish_started = time.monotonic()
@@ -5654,11 +5717,16 @@ class PolymarketLiveCollector:
                     refresh_started_at - self.store.books[token_id].received_at
                 ).total_seconds() >= minimum_age
             }
-            refresh_market_ids = {
-                market_id
-                for index, market_id in enumerate(sorted(stale_market_ids))
-                if index % partition_count == partition_index
-            }
+            refresh_market_ids: set[str] = set()
+            # Partition the stable full group list, not the currently stale
+            # subset.  Workers start at slightly different times; assigning the
+            # filtered list would let a group migrate between workers.
+            for index, group in enumerate(self._coherent_refresh_groups()):
+                if (
+                    index % partition_count == partition_index
+                    and stale_market_ids.intersection(group)
+                ):
+                    refresh_market_ids.update(group)
             refresh_token_ids = sorted(
                 token_id
                 for token_id, market_id in self.store.token_to_market.items()

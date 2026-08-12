@@ -9,6 +9,19 @@ import sys
 from pathlib import Path
 
 
+MINIMUM_SAFE_REFRESH_SECONDS = 1.0
+MAXIMUM_SAFE_REFRESH_SECONDS = 2.0
+
+
+def validate_snapshot_refresh_seconds(value: float) -> float:
+    if not MINIMUM_SAFE_REFRESH_SECONDS <= value <= MAXIMUM_SAFE_REFRESH_SECONDS:
+        raise ValueError(
+            "snapshot refresh must be between 1 and 2 seconds for an "
+            "exact-100 scoped collector"
+        )
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run the Polymarket collector from a checksum-bound scope manifest"
@@ -18,10 +31,15 @@ def main() -> None:
     parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--catalog-revision", required=True)
     parser.add_argument("--scope-id", required=True)
-    parser.add_argument("--snapshot-refresh-seconds", type=float, default=0.1)
+    parser.add_argument("--snapshot-refresh-seconds", type=float, default=2.0)
     parser.add_argument("--bootstrap-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     arguments = parser.parse_args()
+
+    try:
+        validate_snapshot_refresh_seconds(arguments.snapshot_refresh_seconds)
+    except ValueError as exc:
+        parser.error(f"--snapshot-refresh-seconds {exc}")
 
     manifest_body = arguments.manifest.resolve().read_bytes()
     observed_sha256 = hashlib.sha256(manifest_body).hexdigest()

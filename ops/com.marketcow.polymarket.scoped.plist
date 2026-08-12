@@ -19,7 +19,7 @@
     <string>--scope-id</string>
     <string>491662fade3d24593d00a8315d8cfa14f6693eb83c8427c6c4c539078a89a89f</string>
     <string>--snapshot-refresh-seconds</string>
-    <string>0.1</string>
+    <string>2.0</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

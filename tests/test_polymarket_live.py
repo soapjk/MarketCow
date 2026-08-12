@@ -15,6 +15,9 @@ from tempfile import TemporaryDirectory
 from fastapi.testclient import TestClient
 
 import marketcow.polymarket_live as polymarket_live_module
+from scripts.run_polymarket_scoped_manifest import (
+    validate_snapshot_refresh_seconds,
+)
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.polymarket_contracts import content_sha256
@@ -1762,6 +1765,62 @@ class PolymarketLiveTest(unittest.TestCase):
         page = reader.events_after(["m1"], 0, 10)
         self.assertEqual([event.cursor for event in page.items], [2, 3])
 
+    def test_scoped_event_pages_are_bounded_without_skipping_cursors(self):
+        root = self.root / "bounded-live-events"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        with (
+            polymarket_live_module._publication_lock(root, exclusive=True),
+            writer.state_index.batch(),
+            writer.durable_event_batch(),
+        ):
+            for index in range(300):
+                writer._emit(
+                    "price_change", {"index": index}, {"index": index},
+                    applied=True, market_id="m1", _publication_locked=True,
+                )
+
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        first = reader.events_after(["m1"], 0, 1_000)
+        second = reader.events_after(["m1"], first.next_cursor, 1_000)
+
+        self.assertEqual(len(first.items), reader.max_event_page_items)
+        self.assertTrue(first.has_more)
+        self.assertEqual(len(second.items), 50)
+        self.assertFalse(second.has_more)
+        cursors = [event.cursor for event in [*first.items, *second.items]]
+        self.assertEqual(cursors, list(range(2, 302)))
+
+    def test_scoped_event_byte_budget_keeps_cursor_resume_lossless(self):
+        root = self.root / "byte-bounded-live-events"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        with (
+            polymarket_live_module._publication_lock(root, exclusive=True),
+            writer.state_index.batch(),
+            writer.durable_event_batch(),
+        ):
+            for index in range(3):
+                writer._emit(
+                    "price_change", {"index": index}, {"index": index},
+                    applied=True, market_id="m1", _publication_locked=True,
+                )
+
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+        reader.max_event_page_bytes = 1
+        cursors = []
+        after_cursor = 0
+        while True:
+            page = reader.events_after(["m1"], after_cursor, 1_000)
+            cursors.extend(event.cursor for event in page.items)
+            after_cursor = page.next_cursor
+            if not page.has_more:
+                break
+
+        self.assertEqual(cursors, [2, 3, 4])
+
     def test_scoped_writer_catches_up_event_tail_left_by_interrupted_publish(self):
         root = self.root / "live"
         writer = LiveStateStore(root, now_provider=lambda: NOW)
@@ -2204,6 +2263,14 @@ class SocketContext:
 
 
 class PolymarketLiveCollectorTest(unittest.TestCase):
+    def test_exact_scope_refresh_interval_rejects_event_amplifying_values(self):
+        self.assertEqual(validate_snapshot_refresh_seconds(2), 2)
+        self.assertEqual(validate_snapshot_refresh_seconds(1), 1)
+        for unsafe in (0.1, 0.99, 2.01, 5):
+            with self.subTest(unsafe=unsafe):
+                with self.assertRaisesRegex(ValueError, "between 1 and 2"):
+                    validate_snapshot_refresh_seconds(unsafe)
+
     def test_pinned_scope_does_not_refresh_full_catalog_on_lifecycle_event(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -2429,6 +2496,68 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 } <= set(requested[0])
                 for selected in selected_markets
             ))
+
+    def test_periodic_refresh_keeps_negative_risk_group_in_one_transaction(self):
+        with TemporaryDirectory() as folder:
+            current = [NOW]
+            rows = [
+                gamma_row(
+                    f"m{index}", f"0x{index + 1:064x}",
+                    (f"yes-{index}", f"no-{index}"), neg_risk=True,
+                )
+                for index in range(3)
+            ] + [gamma_row(
+                "standalone", "0x" + "f" * 64,
+                ("yes-standalone", "no-standalone"),
+            )]
+            store = LiveStateStore(
+                Path(folder), now_provider=lambda: current[0],
+            )
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            for market in store.catalog.values():
+                for outcome in market.identity.outcomes:
+                    store.apply_snapshot(
+                        snapshot(outcome.token_id, "0.40", "0.60"),
+                        received_at=NOW,
+                    )
+            requested = []
+
+            def requester(_url, **kwargs):
+                token_ids = [item["token_id"] for item in kwargs["json"]]
+                requested.append(token_ids)
+                return Response([
+                    snapshot(token_id, "0.40", "0.60")
+                    for token_id in token_ids
+                ])
+
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=requester),
+                publish_checkpoints=False,
+                minimum_snapshot_refresh_age_seconds=1,
+            )
+            current[0] = NOW + timedelta(seconds=2)
+
+            for partition_index in range(4):
+                asyncio.run(collector.refresh_books(
+                    partition_index=partition_index, partition_count=4,
+                ))
+
+            relation_tokens = {
+                f"{side}-{index}"
+                for index in range(3) for side in ("yes", "no")
+            }
+            relation_batches = [
+                set(batch) for batch in requested
+                if relation_tokens.intersection(batch)
+            ]
+            self.assertEqual(relation_batches, [relation_tokens])
+            relation_received_at = {
+                store.books[token_id].received_at for token_id in relation_tokens
+            }
+            self.assertEqual(relation_received_at, {current[0]})
+            self.assertEqual(store.frame("m0", now=current[0]).status, "ready")
 
     def test_snapshot_refresh_partition_rejects_invalid_bounds(self):
         with TemporaryDirectory() as folder:
