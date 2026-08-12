@@ -2688,6 +2688,99 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertTrue(applied.wait(timeout=0.05))
             thread.join(timeout=1)
 
+    def test_websocket_batch_uses_one_durable_flush_and_contiguous_cursors(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            store = LiveStateStore(root, now_provider=lambda: NOW)
+            rows = [gamma_row()]
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            store.apply_snapshot(
+                snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+            )
+            store.apply_snapshot(
+                snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+            )
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+                publish_checkpoints=False,
+            )
+            cursor = store.cursor
+            event_inode = store.event_path.stat().st_ino
+            event_fsyncs = []
+            real_fsync = polymarket_live_module.os.fsync
+
+            def track_fsync(file_descriptor):
+                if polymarket_live_module.os.fstat(file_descriptor).st_ino == event_inode:
+                    event_fsyncs.append(file_descriptor)
+                return real_fsync(file_descriptor)
+
+            changes = [
+                {
+                    "event_type": "price_change",
+                    "timestamp": "1785739201000",
+                    "price_changes": [{
+                        "asset_id": token_id, "side": "BUY",
+                        "price": "0.40", "size": size,
+                    }],
+                }
+                for token_id, size in (("yes-1", "12"), ("no-1", "13"))
+            ]
+            with patch.object(
+                polymarket_live_module.os, "fsync", side_effect=track_fsync,
+            ):
+                collector._apply_websocket_batch(changes)
+
+            self.assertEqual(len(event_fsyncs), 1)
+            page = PolymarketLiveReadStore(
+                root, now_provider=lambda: NOW,
+            ).events_after(["m1"], cursor, 10)
+            self.assertEqual(
+                [event.cursor for event in page.items], [cursor + 1, cursor + 2],
+            )
+
+    def test_hot_batches_throttle_manifest_fsync_without_hiding_recovery(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            store = LiveStateStore(root, now_provider=lambda: NOW)
+            rows = [gamma_row()]
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+                publish_checkpoints=False,
+            )
+            writes = []
+            real_atomic_write = polymarket_live_module._atomic_write
+
+            def track_write(path, body):
+                if path == store.state_index.manifest_path:
+                    writes.append(bytes(body))
+                return real_atomic_write(path, body)
+
+            with patch.object(
+                polymarket_live_module, "_atomic_write", side_effect=track_write,
+            ):
+                collector._apply_websocket_batch([{
+                    "event_type": "book",
+                    **snapshot("yes-1", "0.40", "0.42"),
+                }])
+                collector._apply_websocket_batch([{
+                    "event_type": "book",
+                    **snapshot("no-1", "0.58", "0.60"),
+                }])
+                with store.state_index.batch(), store.durable_event_batch():
+                    store.mark_recovery_started("test")
+
+            # The two adjacent market-data batches share the existing manifest
+            # publication window; recovery state is always forced immediately.
+            self.assertEqual(len(writes), 1)
+            health = PolymarketLiveReadStore(root).health()
+            self.assertEqual(health.status, "degraded")
+            self.assertIn("recovery_in_progress", health.reason_codes)
+
     def test_large_subscription_group_uses_bounded_connections_and_messages(self):
         with TemporaryDirectory() as folder:
             socket = FakeSocket([])

@@ -2518,6 +2518,7 @@ class LiveStateIndex:
     """Mutable derived state; the append-only event log remains authoritative."""
 
     rebuild_batch_size = 1_000
+    manifest_publish_interval_seconds = 0.5
 
     def __init__(self, root: Path):
         self.root = root.resolve()
@@ -2525,7 +2526,9 @@ class LiveStateIndex:
         self.manifest_path = self.root / "state-index.json"
         self._batch_state = threading.local()
         self._writer_lock = threading.RLock()
+        self._manifest_lock = threading.Lock()
         self._writer: sqlite3.Connection | None = None
+        self._last_manifest_publish = 0.0
 
     def _writer_connection(self) -> sqlite3.Connection:
         if self._writer is None:
@@ -2565,6 +2568,7 @@ class LiveStateIndex:
         with self._writer_lock:
             connection = self._writer_connection()
             self._batch_state.connection = connection
+            self._batch_state.force_manifest = False
             published_metadata = None
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -2576,7 +2580,9 @@ class LiveStateIndex:
                 raise
             finally:
                 del self._batch_state.connection
-        self._publish_manifest(published_metadata)
+        force_manifest = bool(self._batch_state.force_manifest)
+        del self._batch_state.force_manifest
+        self._publish_manifest(published_metadata, force=force_manifest)
 
     @staticmethod
     def _schema(connection: sqlite3.Connection, *, wal: bool = True) -> None:
@@ -2695,24 +2701,36 @@ class LiveStateIndex:
             ).fetchone()[0]),
         }
 
-    def _publish_manifest(self, metadata: dict[str, str] | None = None) -> None:
-        if metadata is None:
-            with sqlite3.connect(self.path) as connection:
-                metadata = self._metadata(connection)
-        summary = {
-            key: metadata[key]
-            for key in (
-                "catalog_revision", "latest_cursor", "active_recovery_id",
-                "book_token_count", "book_complete_market_count",
-                "unresolved_gap_count",
-            )
-            if key in metadata
-        }
-        _atomic_write(self.manifest_path, canonical_json({
-            "schema_version": STATE_INDEX_SCHEMA_VERSION,
-            "path": str(self.path),
-            **summary,
-        }))
+    def _publish_manifest(
+        self, metadata: dict[str, str] | None = None, *, force: bool = True,
+    ) -> None:
+        with self._manifest_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self.manifest_path.exists()
+                and now - self._last_manifest_publish
+                < self.manifest_publish_interval_seconds
+            ):
+                return
+            if metadata is None:
+                with sqlite3.connect(self.path) as connection:
+                    metadata = self._metadata(connection)
+            summary = {
+                key: metadata[key]
+                for key in (
+                    "catalog_revision", "latest_cursor", "active_recovery_id",
+                    "book_token_count", "book_complete_market_count",
+                    "unresolved_gap_count",
+                )
+                if key in metadata
+            }
+            _atomic_write(self.manifest_path, canonical_json({
+                "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                "path": str(self.path),
+                **summary,
+            }))
+            self._last_manifest_publish = now
 
     def append(
         self,
@@ -2813,6 +2831,10 @@ class LiveStateIndex:
                 "active_recovery_id": active_recovery_id or "",
                 **health_metadata,
             })
+            if event.event_type in {
+                "catalog_revision", "recovery_started", "recovery_completed",
+            }:
+                self._batch_state.force_manifest = True
             if owns_connection:
                 connection.commit()
                 published_metadata = self._metadata(connection)
@@ -5551,6 +5573,8 @@ class PolymarketLiveCollector:
         publish_checkpoints: bool = True,
         minimum_snapshot_refresh_age_seconds: float = 0,
         max_concurrent_snapshot_refreshes: int = 1,
+        websocket_flush_seconds: float = 0.1,
+        max_websocket_batch_messages: int = 256,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -5574,6 +5598,8 @@ class PolymarketLiveCollector:
         self.max_concurrent_snapshot_refreshes = max(
             1, max_concurrent_snapshot_refreshes,
         )
+        self.websocket_flush_seconds = max(0, websocket_flush_seconds)
+        self.max_websocket_batch_messages = max(1, max_websocket_batch_messages)
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
 
@@ -5829,34 +5855,62 @@ class PolymarketLiveCollector:
                         continue
                     if message == "PONG":
                         continue
-                    payload = json.loads(message, parse_float=str, parse_int=str)
-                    for item in payload if isinstance(payload, list) else [payload]:
-                        await asyncio.to_thread(self._apply_websocket, item)
-                        consumed += 1
-                        if (
-                            self.catalog_refresh_on_lifecycle_events
-                            and str(item.get("event_type") or item.get("type") or "")
+                    messages = [message]
+                    if message_limit is None and self.websocket_flush_seconds > 0:
+                        deadline = time.monotonic() + self.websocket_flush_seconds
+                        while len(messages) < self.max_websocket_batch_messages:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            try:
+                                candidate = await asyncio.wait_for(
+                                    socket.recv(), timeout=remaining,
+                                )
+                            except asyncio.TimeoutError:
+                                break
+                            if candidate != "PONG":
+                                messages.append(candidate)
+                    items = []
+                    for raw_message in messages:
+                        payload = json.loads(
+                            raw_message, parse_float=str, parse_int=str,
+                        )
+                        items.extend(
+                            payload if isinstance(payload, list) else [payload]
+                        )
+                    await asyncio.to_thread(self._apply_websocket_batch, items)
+                    consumed += len(items)
+                    if (
+                        self.catalog_refresh_on_lifecycle_events
+                        and any(
+                            str(item.get("event_type") or item.get("type") or "")
                             in {"new_market", "market_resolved"}
-                        ):
-                            await asyncio.to_thread(self.refresh_catalog)
-                            await self.update_subscriptions()
+                            for item in items
+                        )
+                    ):
+                        await asyncio.to_thread(self.refresh_catalog)
+                        await self.update_subscriptions()
             finally:
                 self.sockets.remove(socket)
                 self.socket_tokens.pop(socket, None)
 
     def _apply_websocket(self, item: dict[str, Any]) -> None:
+        self._apply_websocket_batch([item])
+
+    def _apply_websocket_batch(self, items: list[dict[str, Any]]) -> None:
         with (
             self.store._sync_lock,
             _publication_lock(self.store.root, exclusive=True),
             self.store.state_index.batch(),
             self.store.durable_event_batch(),
         ):
-            self.store.apply_websocket(
-                item,
-                stale_events_are_resolved=(
-                    self.snapshot_refresh_seconds is not None
-                ),
-            )
+            for item in items:
+                self.store.apply_websocket(
+                    item,
+                    stale_events_are_resolved=(
+                        self.snapshot_refresh_seconds is not None
+                    ),
+                )
 
     async def run_once(self, *, message_limit: int | None = None) -> None:
         groups = self.planner.connection_groups(
