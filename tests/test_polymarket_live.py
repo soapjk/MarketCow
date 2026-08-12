@@ -2877,6 +2877,44 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
             self.assertEqual(store.frame("m1", now=current[0]).status, "ready")
 
+    def test_periodic_empty_book_retains_previous_stable_boundary(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            current = [NOW]
+            store = LiveStateStore(root, now_provider=lambda: current[0])
+            rows = [gamma_row()]
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            for book in (
+                snapshot("yes-1", "0.40", "0.42"),
+                snapshot("no-1", "0.58", "0.60"),
+            ):
+                store.apply_snapshot(book, received_at=NOW)
+            cursor = store.cursor
+            empty = snapshot("yes-1", "0.40", "0.42")
+            empty["asks"] = []
+
+            def requester(_url, **_kwargs):
+                return Response([
+                    empty,
+                    snapshot("no-1", "0.58", "0.60"),
+                ])
+
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=requester),
+                publish_checkpoints=False,
+                minimum_snapshot_refresh_age_seconds=1,
+            )
+            current[0] = NOW + timedelta(seconds=2)
+
+            with self.assertRaisesRegex(RuntimeError, "empty-sided"):
+                asyncio.run(collector.refresh_books())
+
+            self.assertEqual(store.cursor, cursor)
+            self.assertEqual(store.books["yes-1"].received_at, NOW)
+            self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
+
     def test_periodic_refresh_partitions_market_pairs_without_splitting(self):
         with TemporaryDirectory() as folder:
             current = [NOW]
