@@ -2172,7 +2172,11 @@ class PolymarketLiveTest(unittest.TestCase):
         )
 
         recovery_id = restarted.mark_recovery_started("integrity_recovery")
-        self.assertEqual(indexed_reader.health().status, "degraded")
+        with self.assertRaises(PolymarketLiveReadError) as recovery_health:
+            indexed_reader.health()
+        self.assertEqual(
+            recovery_health.exception.code, "polymarket_state_index_lagging"
+        )
         with self.assertRaises(PolymarketLiveReadError) as recovering:
             indexed_reader.snapshot(["m1"])
         self.assertEqual(
@@ -2228,9 +2232,9 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(
             incomplete.exception.code, "polymarket_state_index_lagging"
         )
-        health = fail_fast.health()
-        self.assertEqual(health.status, "degraded")
-        self.assertEqual(health.reason_codes, ["unresolved_gap"])
+        with self.assertRaises(PolymarketLiveReadError) as health:
+            fail_fast.health()
+        self.assertEqual(health.exception.code, "polymarket_state_index_lagging")
 
         reader = PolymarketLiveReadStore(
             root,
@@ -2273,6 +2277,119 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(pages[0].count, 3)
         self.assertTrue(all(item.status == "ready" for item in pages[0].items))
         self.assertEqual(fail_fast.health().status, "index_ready")
+
+    def test_health_bootstrap_and_snapshot_wait_for_same_recovery_boundary(self):
+        root = self.root / "coherent-recovery-reads"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        books = [
+            snapshot("yes-1", "0.40", "0.42"),
+            snapshot("no-1", "0.58", "0.60"),
+        ]
+        for book in books:
+            writer.apply_snapshot(book, received_at=NOW)
+        recovery_id = writer.mark_recovery_started("websocket_reconnect:2")
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: NOW,
+            stable_read_wait_seconds=0.5,
+            stable_read_poll_seconds=0.005,
+        )
+        results, errors = {}, []
+
+        def read(name, operation):
+            try:
+                results[name] = operation()
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=read, args=("health", reader.health)),
+            threading.Thread(
+                target=read, args=("bootstrap", lambda: reader.bootstrap(["m1"])),
+            ),
+            threading.Thread(
+                target=read, args=("snapshot", lambda: reader.snapshot(["m1"])),
+            ),
+        ]
+        for worker in workers:
+            worker.start()
+        time.sleep(0.05)
+        self.assertTrue(all(worker.is_alive() for worker in workers))
+        writer.recover_from_books(books, recovery_id)
+        for worker in workers:
+            worker.join(timeout=2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(results["health"].status, "index_ready")
+        self.assertEqual(results["health"].latest_cursor, writer.cursor)
+        self.assertEqual(results["bootstrap"].cursor, writer.cursor)
+        self.assertEqual(results["snapshot"].cursor, writer.cursor)
+        self.assertEqual(results["snapshot"].items[0].status, "ready")
+
+    def test_persistent_recovery_is_retryable_for_all_boundary_routes(self):
+        settings = Settings(
+            raw_path=self.root / "raw", storage_root=self.root,
+            allowed_root=self.root.parent,
+            postgres_dsn="postgresql://u:p@127.0.0.1/test",
+            clickhouse_password="x", profile="test", port=8793,
+            postgres_schema="test", clickhouse_database="test",
+            clickhouse_spool_path=self.root / "spool",
+        )
+        app = create_app(settings, Service())
+        store = app.state.polymarket_live
+        store.now_provider = lambda: NOW
+        reader = app.state.polymarket_live_read
+        reader.now_provider = lambda: NOW
+        reader._stable_read_wait_seconds = 0
+        rows = [gamma_row()]
+        store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        books = [
+            snapshot("yes-1", "0.40", "0.42"),
+            snapshot("no-1", "0.58", "0.60"),
+        ]
+        for book in books:
+            store.apply_snapshot(book, received_at=NOW)
+        recovery_id = store.mark_recovery_started("persistent_recovery")
+        client = TestClient(app)
+
+        for suffix in (
+            "health",
+            "bootstrap?market_id=m1",
+            "snapshot?market_id=m1",
+            "events?after_cursor=0&market_id=m1",
+        ):
+            response = client.get(
+                f"/v1/prediction-markets/polymarket/live/{suffix}"
+            )
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(
+                response.json()["detail"]["code"],
+                "polymarket_state_index_lagging",
+            )
+            self.assertEqual(response.headers["Retry-After"], "1")
+
+        store.recover_from_books(books, recovery_id)
+        self.assertEqual(
+            client.get(
+                "/v1/prediction-markets/polymarket/live/health"
+            ).json()["status"],
+            "index_ready",
+        )
+        self.assertEqual(
+            client.get(
+                "/v1/prediction-markets/polymarket/live/bootstrap?market_id=m1"
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            client.get(
+                "/v1/prediction-markets/polymarket/live/snapshot?market_id=m1"
+            ).json()["items"][0]["status"],
+            "ready",
+        )
 
     def test_snapshot_waits_for_one_complete_fresh_book_boundary(self):
         root = self.root / "fresh-snapshot-boundary"
@@ -3042,9 +3159,13 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             # The two adjacent market-data batches share the existing manifest
             # publication window; recovery state is always forced immediately.
             self.assertEqual(len(writes), 1)
-            health = PolymarketLiveReadStore(root).health()
-            self.assertEqual(health.status, "degraded")
-            self.assertIn("recovery_in_progress", health.reason_codes)
+            with self.assertRaises(PolymarketLiveReadError) as health:
+                PolymarketLiveReadStore(
+                    root, stable_read_wait_seconds=0,
+                ).health()
+            self.assertEqual(
+                health.exception.code, "polymarket_state_index_lagging"
+            )
 
     def test_large_subscription_group_uses_bounded_connections_and_messages(self):
         with TemporaryDirectory() as folder:

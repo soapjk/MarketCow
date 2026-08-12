@@ -1280,10 +1280,16 @@ def create_app(
             }) from exc
 
     def _raise_polymarket_read_error(exc: PolymarketLiveReadError) -> None:
-        raise HTTPException(status_code=exc.status_code, detail={
-            "code": exc.code,
-            "message": str(exc),
-        }) from exc
+        headers = (
+            {"Retry-After": "1"}
+            if exc.code == "polymarket_state_index_lagging"
+            else None
+        )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": str(exc)},
+            headers=headers,
+        ) from exc
 
     def _require_polymarket_scope(market_id: list[str] | None) -> list[str]:
         if not market_id:
@@ -1440,7 +1446,10 @@ def create_app(
         summary="Read live source coverage, lag, and gap health",
     )
     def polymarket_live_health():
-        return polymarket_live_read.health()
+        try:
+            return polymarket_live_read.health()
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/gaps",
