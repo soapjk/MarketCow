@@ -2391,6 +2391,39 @@ class PolymarketLiveTest(unittest.TestCase):
             "ready",
         )
 
+    def test_empty_book_is_not_a_complete_stable_read_boundary(self):
+        root = self.root / "empty-book-boundary"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        empty = snapshot("yes-1", "0.40", "0.42")
+        empty["asks"] = []
+        writer.apply_snapshot(empty, received_at=NOW)
+        writer.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+        )
+        writer.state_index._publish_manifest()
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: NOW,
+            stable_read_wait_seconds=0,
+            stable_snapshot_max_book_age_seconds=2,
+        )
+
+        with self.assertRaises(PolymarketLiveReadError) as health:
+            reader.health()
+        self.assertEqual(health.exception.code, "polymarket_state_index_lagging")
+        with self.assertRaises(PolymarketLiveReadError) as scoped:
+            reader.snapshot(["m1"])
+        self.assertEqual(scoped.exception.code, "polymarket_state_index_lagging")
+
+        writer.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+        )
+        writer.state_index._publish_manifest()
+        self.assertEqual(reader.health().book_complete_market_count, 1)
+        self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
+
     def test_snapshot_waits_for_one_complete_fresh_book_boundary(self):
         root = self.root / "fresh-snapshot-boundary"
         current = [NOW]

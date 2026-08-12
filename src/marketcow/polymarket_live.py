@@ -2303,6 +2303,10 @@ class PolymarketLiveReadStore:
                     {str(row["token_id"]) for row in book_rows}
                     == expected_token_ids
                     and all(
+                        json.loads(bytes(row["payload_json"]))[side]
+                        for row in book_rows for side in ("bids", "asks")
+                    )
+                    and all(
                         0
                         <= (
                             observed_at
@@ -2599,6 +2603,10 @@ class PolymarketLiveReadStore:
             while (
                 state_metadata.get("active_recovery_id")
                 or int(state_metadata["unresolved_gap_count"]) > 0
+                or (
+                    int(state_metadata["book_complete_market_count"]) * 2
+                    < int(state_metadata["book_token_count"])
+                )
             ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -2638,7 +2646,10 @@ class PolymarketLiveReadStore:
                 )
                 book_complete_market_count = int(connection.execute(
                     "SELECT COUNT(*) FROM ("
-                    "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
+                    "SELECT market_id FROM books "
+                    "WHERE json_array_length(payload_json, '$.bids') > 0 "
+                    "AND json_array_length(payload_json, '$.asks') > 0 "
+                    "GROUP BY market_id HAVING COUNT(*) = 2"
                     ")"
                 ).fetchone()[0])
                 unresolved_gap_count = int(connection.execute(
@@ -2850,7 +2861,10 @@ class LiveStateIndex:
             ),
             "book_complete_market_count": int(connection.execute(
                 "SELECT COUNT(*) FROM ("
-                "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
+                "SELECT market_id FROM books "
+                "WHERE json_array_length(payload_json, '$.bids') > 0 "
+                "AND json_array_length(payload_json, '$.asks') > 0 "
+                "GROUP BY market_id HAVING COUNT(*) = 2"
                 ")"
             ).fetchone()[0]),
             "unresolved_gap_count": int(connection.execute(
@@ -4554,7 +4568,12 @@ class LiveStateStore:
             active_recovery_id=self.active_recovery_id,
             book_token_count=len(self.books),
             book_complete_market_count=sum(
-                all(outcome.token_id in self.books for outcome in market.identity.outcomes)
+                all(
+                    outcome.token_id in self.books
+                    and self.books[outcome.token_id].bids
+                    and self.books[outcome.token_id].asks
+                    for outcome in market.identity.outcomes
+                )
                 for market in self.catalog.values()
                 if market.active and not market.closed
             ),
