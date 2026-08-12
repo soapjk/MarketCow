@@ -541,7 +541,13 @@ def create_app(
         settings.storage_root / "prediction-markets" / "polymarket-live"
     )
     app.state.polymarket_live = polymarket_live
-    polymarket_live_read = PolymarketLiveReadStore(polymarket_live.root)
+    polymarket_live_read = PolymarketLiveReadStore(
+        polymarket_live.root,
+        # The strict live consumer evaluates at a five-second maximum age.
+        # Reserve transport/projection headroom by publishing only a boundary
+        # whose producer observation is at most two seconds old.
+        stable_snapshot_max_book_age_seconds=2.0,
+    )
     app.state.polymarket_live_read = polymarket_live_read
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None

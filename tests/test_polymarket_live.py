@@ -2274,6 +2274,75 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertTrue(all(item.status == "ready" for item in pages[0].items))
         self.assertEqual(fail_fast.health().status, "index_ready")
 
+    def test_snapshot_waits_for_one_complete_fresh_book_boundary(self):
+        root = self.root / "fresh-snapshot-boundary"
+        current = [NOW]
+        writer = LiveStateStore(root, now_provider=lambda: current[0])
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        books = [
+            snapshot("yes-1", "0.40", "0.42"),
+            snapshot("no-1", "0.58", "0.60"),
+        ]
+        for book in books:
+            writer.apply_snapshot(book, received_at=current[0])
+        current[0] = NOW + timedelta(seconds=3)
+
+        fail_fast = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: current[0],
+            stable_read_wait_seconds=0,
+            stable_snapshot_max_book_age_seconds=2,
+        )
+        with self.assertRaises(PolymarketLiveReadError) as stale:
+            fail_fast.snapshot(["m1"])
+        self.assertEqual(stale.exception.code, "polymarket_state_index_lagging")
+
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: current[0],
+            stable_read_wait_seconds=0.5,
+            stable_read_poll_seconds=0.01,
+            stable_snapshot_max_book_age_seconds=2,
+        )
+        sleep_entered = threading.Event()
+        release_sleep = threading.Event()
+        real_sleep = polymarket_live_module.time.sleep
+
+        def blocked_poll(seconds):
+            sleep_entered.set()
+            self.assertTrue(release_sleep.wait(timeout=2))
+            real_sleep(seconds)
+
+        pages, errors = [], []
+
+        def read_snapshot():
+            try:
+                pages.append(reader.snapshot(["m1"]))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with patch.object(
+            polymarket_live_module.time, "sleep", side_effect=blocked_poll,
+        ):
+            read_worker = threading.Thread(target=read_snapshot)
+            read_worker.start()
+            self.assertTrue(sleep_entered.wait(timeout=2))
+            recovery_id = writer.mark_recovery_started("stale_book_recovery")
+            writer.recover_from_books(books, recovery_id)
+            release_sleep.set()
+            read_worker.join(timeout=2)
+
+        self.assertFalse(read_worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0].cursor, writer.cursor)
+        self.assertEqual(pages[0].items[0].status, "ready")
+        self.assertTrue(all(
+            book.received_at == current[0]
+            for book in pages[0].items[0].tokens
+        ))
+
     def test_failed_event_types_are_durable_after_checkpoint(self):
         cases = {
             "missing_snapshot": {

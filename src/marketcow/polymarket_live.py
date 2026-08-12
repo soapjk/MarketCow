@@ -1603,7 +1603,7 @@ class PolymarketLiveReadStore:
     # between them must not receive a partially usable relation snapshot.
     # Briefly follow the immutable state-index boundary; persistent gaps still
     # fail closed with the existing retryable state-index status.
-    stable_read_wait_seconds = 2.0
+    stable_read_wait_seconds = 4.0
     stable_read_poll_seconds = 0.025
 
     def __init__(
@@ -1613,6 +1613,7 @@ class PolymarketLiveReadStore:
         now_provider: Callable[[], datetime] = utc_now,
         stable_read_wait_seconds: float | None = None,
         stable_read_poll_seconds: float | None = None,
+        stable_snapshot_max_book_age_seconds: float | None = None,
     ):
         self.root = root.resolve()
         self.now_provider = now_provider
@@ -1625,6 +1626,11 @@ class PolymarketLiveReadStore:
             self.stable_read_poll_seconds
             if stable_read_poll_seconds is None
             else max(0.001, stable_read_poll_seconds)
+        )
+        self._stable_snapshot_max_book_age_seconds = (
+            None
+            if stable_snapshot_max_book_age_seconds is None
+            else max(0.001, stable_snapshot_max_book_age_seconds)
         )
         self.catalog_path = self.root / "catalog.json"
         self.normalized_catalog_root = self.root / "catalogs"
@@ -2208,6 +2214,11 @@ class PolymarketLiveReadStore:
         related = related_bootstrap.markets if related_bootstrap else []
         markets = bootstrap.markets + related
         all_market_ids = [market.identity.market_id for market in markets]
+        expected_token_ids = {
+            outcome.token_id
+            for market in markets
+            for outcome in market.identity.outcomes
+        }
         placeholders = ",".join("?" for _ in all_market_ids)
         deadline = time.monotonic() + self._stable_read_wait_seconds
         while True:
@@ -2219,7 +2230,10 @@ class PolymarketLiveReadStore:
                         409,
                     )
                 book_rows = list(connection.execute(
-                    f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
+                    f"""SELECT b.token_id, b.market_id,
+                        b.payload_json, b.payload_sha256,
+                        json_extract(b.payload_json, '$.received_at')
+                            AS book_received_at,
                         c.exchange_at AS confirmed_exchange_at,
                         c.received_at AS confirmed_received_at,
                         c.state_checksum AS confirmed_state_checksum,
@@ -2235,7 +2249,26 @@ class PolymarketLiveReadStore:
                         WHERE market_id IN ({placeholders}) AND resolved=0""",
                     all_market_ids,
                 ))
-            if not gap_rows:
+            stable = not gap_rows
+            if stable and self._stable_snapshot_max_book_age_seconds is not None:
+                observed_at = self.now_provider()
+                stable = (
+                    {str(row["token_id"]) for row in book_rows}
+                    == expected_token_ids
+                    and all(
+                        0
+                        <= (
+                            observed_at
+                            - _instant(
+                                row["confirmed_received_at"]
+                                or row["book_received_at"]
+                            )
+                        ).total_seconds()
+                        <= self._stable_snapshot_max_book_age_seconds
+                        for row in book_rows
+                    )
+                )
+            if stable:
                 break
             for row in gap_rows:
                 body = bytes(row["payload_json"])
@@ -2250,8 +2283,8 @@ class PolymarketLiveReadStore:
                 raise PolymarketLiveReadError(
                     "polymarket_state_index_lagging",
                     (
-                        "Scoped Polymarket state is awaiting durable gap "
-                        "recovery; retry the complete snapshot"
+                        "Scoped Polymarket state is awaiting a complete, "
+                        "fresh recovery boundary; retry the snapshot"
                     ),
                     503,
                 )
