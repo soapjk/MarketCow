@@ -2136,18 +2136,22 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(frame.status, "fail_closed")
         self.assertIn("unresolved_gap", frame.reason_codes)
         indexed_reader = PolymarketLiveReadStore(
-            self.root / "live", now_provider=lambda: NOW
+            self.root / "live", now_provider=lambda: NOW,
+            stable_read_wait_seconds=0,
         )
         self.assertEqual(indexed_reader.gaps(["m1"], unresolved_only=True).count, 1)
+        with self.assertRaises(PolymarketLiveReadError) as unresolved:
+            indexed_reader.snapshot(["m1"])
         self.assertEqual(
-            indexed_reader.snapshot(["m1"]).items[0].status, "fail_closed"
+            unresolved.exception.code, "polymarket_state_index_lagging"
         )
 
         recovery_id = restarted.mark_recovery_started("integrity_recovery")
         self.assertEqual(indexed_reader.health().status, "degraded")
-        self.assertIn(
-            "recovery_in_progress",
-            indexed_reader.snapshot(["m1"]).items[0].reason_codes,
+        with self.assertRaises(PolymarketLiveReadError) as recovering:
+            indexed_reader.snapshot(["m1"])
+        self.assertEqual(
+            recovering.exception.code, "polymarket_state_index_lagging"
         )
         restarted.recover_from_books([
             snapshot("yes-1", "0.39", "0.41", "1785739203000"),
@@ -2157,6 +2161,93 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(restarted.frame("m1", now=NOW).status, "ready")
         self.assertEqual(indexed_reader.gaps(["m1"], unresolved_only=True).count, 0)
         self.assertEqual(indexed_reader.snapshot(["m1"]).items[0].status, "ready")
+
+    def test_snapshot_waits_for_one_complete_relation_recovery_boundary(self):
+        root = self.root / "relation-recovery-boundary"
+        rows = [
+            gamma_row(
+                market_id,
+                condition_id="0x" + f"{index:064x}",
+                tokens=(f"yes-{index}", f"no-{index}"),
+                neg_risk=True,
+            )
+            for index, market_id in enumerate(("m1", "m2", "m3"), start=1)
+        ]
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        books = [
+            snapshot(token_id, bid, ask)
+            for index in range(1, 4)
+            for token_id, bid, ask in (
+                (f"yes-{index}", "0.40", "0.42"),
+                (f"no-{index}", "0.58", "0.60"),
+            )
+        ]
+        for book in books:
+            writer.apply_snapshot(book, received_at=NOW)
+        writer.apply_websocket({
+            "event_type": "price_change",
+            "timestamp": "1785739201000",
+            "price_changes": [{
+                "asset_id": "yes-3", "side": "BUY",
+                "price": "0.43", "size": "1",
+            }],
+        }, received_at=NOW)
+        writer.state_index._publish_manifest()
+
+        fail_fast = PolymarketLiveReadStore(
+            root, now_provider=lambda: NOW, stable_read_wait_seconds=0,
+        )
+        with self.assertRaises(PolymarketLiveReadError) as incomplete:
+            fail_fast.snapshot(["m1", "m2", "m3"])
+        self.assertEqual(
+            incomplete.exception.code, "polymarket_state_index_lagging"
+        )
+        health = fail_fast.health()
+        self.assertEqual(health.status, "degraded")
+        self.assertEqual(health.reason_codes, ["unresolved_gap"])
+
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: NOW,
+            stable_read_wait_seconds=0.5,
+            stable_read_poll_seconds=0.01,
+        )
+        sleep_entered = threading.Event()
+        release_sleep = threading.Event()
+        real_sleep = polymarket_live_module.time.sleep
+
+        def blocked_poll(seconds):
+            sleep_entered.set()
+            self.assertTrue(release_sleep.wait(timeout=2))
+            real_sleep(seconds)
+
+        pages, errors = [], []
+
+        def read_snapshot():
+            try:
+                pages.append(reader.snapshot(["m1", "m2", "m3"]))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        with patch.object(
+            polymarket_live_module.time, "sleep", side_effect=blocked_poll,
+        ):
+            read_worker = threading.Thread(target=read_snapshot)
+            read_worker.start()
+            self.assertTrue(sleep_entered.wait(timeout=2))
+            recovery_id = writer.mark_recovery_started("relation_gap_recovery")
+            writer.recover_from_books(books, recovery_id)
+            release_sleep.set()
+            read_worker.join(timeout=2)
+
+        self.assertFalse(read_worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0].cursor, writer.cursor)
+        self.assertEqual(pages[0].count, 3)
+        self.assertTrue(all(item.status == "ready" for item in pages[0].items))
+        self.assertEqual(fail_fast.health().status, "index_ready")
 
     def test_failed_event_types_are_durable_after_checkpoint(self):
         cases = {

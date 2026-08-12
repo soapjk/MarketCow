@@ -1597,10 +1597,35 @@ class PolymarketLiveReadStore:
     # each response bounded while preserving ordinary cursor pagination.
     max_event_page_items = 250
     max_event_page_bytes = 1_048_576
+    # A periodic REST confirmation can close a source-mismatch gap less than a
+    # second after the WebSocket event that opened it.  The gap and its
+    # recovery are two durable cursor boundaries, so a reader that lands
+    # between them must not receive a partially usable relation snapshot.
+    # Briefly follow the immutable state-index boundary; persistent gaps still
+    # fail closed with the existing retryable state-index status.
+    stable_read_wait_seconds = 2.0
+    stable_read_poll_seconds = 0.025
 
-    def __init__(self, root: Path, *, now_provider: Callable[[], datetime] = utc_now):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        now_provider: Callable[[], datetime] = utc_now,
+        stable_read_wait_seconds: float | None = None,
+        stable_read_poll_seconds: float | None = None,
+    ):
         self.root = root.resolve()
         self.now_provider = now_provider
+        self._stable_read_wait_seconds = (
+            self.stable_read_wait_seconds
+            if stable_read_wait_seconds is None
+            else max(0.0, stable_read_wait_seconds)
+        )
+        self._stable_read_poll_seconds = (
+            self.stable_read_poll_seconds
+            if stable_read_poll_seconds is None
+            else max(0.001, stable_read_poll_seconds)
+        )
         self.catalog_path = self.root / "catalog.json"
         self.normalized_catalog_root = self.root / "catalogs"
         self.catalog_index_root = self.root / "catalog-indexes"
@@ -2184,30 +2209,53 @@ class PolymarketLiveReadStore:
         markets = bootstrap.markets + related
         all_market_ids = [market.identity.market_id for market in markets]
         placeholders = ",".join("?" for _ in all_market_ids)
-        with self._state_snapshot() as (_, connection, metadata):
-            if metadata["catalog_revision"] != bootstrap.catalog_revision:
+        deadline = time.monotonic() + self._stable_read_wait_seconds
+        while True:
+            with self._state_snapshot() as (_, connection, metadata):
+                if metadata["catalog_revision"] != bootstrap.catalog_revision:
+                    raise PolymarketLiveReadError(
+                        "polymarket_state_integrity_failed",
+                        "Scoped catalog and state snapshot revisions disagree",
+                        409,
+                    )
+                book_rows = list(connection.execute(
+                    f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
+                        c.exchange_at AS confirmed_exchange_at,
+                        c.received_at AS confirmed_received_at,
+                        c.state_checksum AS confirmed_state_checksum,
+                        c.source_hash AS confirmed_source_hash,
+                        c.confirmation_sha256
+                        FROM books b LEFT JOIN book_confirmations c
+                        ON c.token_id=b.token_id
+                        WHERE b.market_id IN ({placeholders})""",
+                    all_market_ids,
+                ))
+                gap_rows = list(connection.execute(
+                    f"""SELECT payload_json, payload_sha256 FROM gaps
+                        WHERE market_id IN ({placeholders}) AND resolved=0""",
+                    all_market_ids,
+                ))
+            if not gap_rows:
+                break
+            for row in gap_rows:
+                body = bytes(row["payload_json"])
+                if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
+                    raise PolymarketLiveReadError(
+                        "polymarket_state_integrity_failed",
+                        "Gap payload hash mismatch",
+                        409,
+                    )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise PolymarketLiveReadError(
-                    "polymarket_state_integrity_failed",
-                    "Scoped catalog and state snapshot revisions disagree",
-                    409,
+                    "polymarket_state_index_lagging",
+                    (
+                        "Scoped Polymarket state is awaiting durable gap "
+                        "recovery; retry the complete snapshot"
+                    ),
+                    503,
                 )
-            book_rows = list(connection.execute(
-                f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
-                    c.exchange_at AS confirmed_exchange_at,
-                    c.received_at AS confirmed_received_at,
-                    c.state_checksum AS confirmed_state_checksum,
-                    c.source_hash AS confirmed_source_hash,
-                    c.confirmation_sha256
-                    FROM books b LEFT JOIN book_confirmations c
-                    ON c.token_id=b.token_id
-                    WHERE b.market_id IN ({placeholders})""",
-                all_market_ids,
-            ))
-            gap_rows = list(connection.execute(
-                f"""SELECT payload_json, payload_sha256 FROM gaps
-                    WHERE market_id IN ({placeholders}) AND resolved=0""",
-                all_market_ids,
-            ))
+            time.sleep(min(self._stable_read_poll_seconds, remaining))
         books = {}
         books_by_market: dict[str, list[LiveBook]] = defaultdict(list)
         for row in book_rows:
@@ -2459,6 +2507,19 @@ class PolymarketLiveReadStore:
         }
         if summary_keys.issubset(state_manifest):
             state_metadata = state_manifest
+            deadline = time.monotonic() + self._stable_read_wait_seconds
+            while (
+                not state_metadata.get("active_recovery_id")
+                and int(state_metadata["unresolved_gap_count"]) > 0
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(self._stable_read_poll_seconds, remaining))
+                next_manifest, _ = self._state_manifest()
+                if not summary_keys.issubset(next_manifest):
+                    break
+                state_metadata = next_manifest
             if state_metadata["catalog_revision"] != metadata["catalog_revision"]:
                 return LiveReadHealth(
                     status="degraded",
@@ -2492,8 +2553,14 @@ class PolymarketLiveReadStore:
                     "SELECT COUNT(*) FROM gaps WHERE resolved=0"
                 ).fetchone()[0])
         recovery_active = bool(state_metadata.get("active_recovery_id"))
+        unresolved = unresolved_gap_count > 0
+        reason_codes = []
+        if recovery_active:
+            reason_codes.append("recovery_in_progress")
+        if unresolved:
+            reason_codes.append("unresolved_gap")
         return LiveReadHealth(
-            status="degraded" if recovery_active else "index_ready",
+            status="degraded" if recovery_active or unresolved else "index_ready",
             catalog_revision=metadata["catalog_revision"],
             catalog_index_ready=True,
             latest_state_ready=True,
@@ -2503,7 +2570,7 @@ class PolymarketLiveReadStore:
             book_complete_market_count=book_complete_market_count,
             unresolved_gap_count=unresolved_gap_count,
             latest_cursor=int(state_metadata["latest_cursor"]),
-            reason_codes=["recovery_in_progress"] if recovery_active else [],
+            reason_codes=reason_codes,
         )
 
 
