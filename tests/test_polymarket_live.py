@@ -2915,6 +2915,74 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertEqual(store.books["yes-1"].received_at, NOW)
             self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
 
+    def test_failed_refresh_restores_memory_and_next_cursor_is_contiguous(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            current = [NOW]
+            store = LiveStateStore(root, now_provider=lambda: current[0])
+            rows = [gamma_row()]
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            for book in (
+                snapshot("yes-1", "0.40", "0.42"),
+                snapshot("no-1", "0.58", "0.60"),
+            ):
+                store.apply_snapshot(book, received_at=NOW)
+            initial_cursor = store.cursor
+            initial_size = store.event_path.stat().st_size
+
+            def requester(_url, **kwargs):
+                return Response([
+                    snapshot(
+                        item["token_id"],
+                        "0.39" if item["token_id"] == "yes-1" else "0.57",
+                        "0.41" if item["token_id"] == "yes-1" else "0.59",
+                    )
+                    for item in kwargs["json"]
+                ])
+
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=requester),
+                publish_checkpoints=False,
+                minimum_snapshot_refresh_age_seconds=1,
+            )
+            current[0] = NOW + timedelta(seconds=2)
+            real_append = store.state_index.append
+            calls = [0]
+
+            def fail_second_append(*args, **kwargs):
+                calls[0] += 1
+                if calls[0] == 2:
+                    raise RuntimeError("injected derived-index failure")
+                return real_append(*args, **kwargs)
+
+            with (
+                patch.object(
+                    store.state_index, "append", side_effect=fail_second_append,
+                ),
+                self.assertRaisesRegex(RuntimeError, "injected derived-index"),
+            ):
+                asyncio.run(collector.refresh_books())
+
+            self.assertEqual(store.cursor, initial_cursor)
+            self.assertEqual(store.event_path.stat().st_size, initial_size)
+            self.assertEqual(store.books["yes-1"].received_at, NOW)
+            self.assertEqual(store.books["no-1"].received_at, NOW)
+
+            asyncio.run(collector.refresh_books())
+            metadata = store.state_index._metadata(store.state_index._writer_connection())
+            self.assertEqual(int(metadata["latest_cursor"]), store.cursor)
+            self.assertEqual(catch_up_live_state_index(root)["replayed_events"], 0)
+
+    def test_live_collector_lease_rejects_overlapping_writer(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            with polymarket_live_module.live_collector_lease(root):
+                with self.assertRaisesRegex(RuntimeError, "already owns"):
+                    with polymarket_live_module.live_collector_lease(root):
+                        self.fail("overlapping writer lease was granted")
+
     def test_periodic_refresh_partitions_market_pairs_without_splitting(self):
         with TemporaryDirectory() as folder:
             current = [NOW]

@@ -104,6 +104,31 @@ def _publication_lock(root: Path, *, exclusive: bool):
             gate.close()
 
 
+@contextmanager
+def live_collector_lease(root: Path):
+    """Permit exactly one durable live-state writer for a storage root.
+
+    The short-lived publication lock serializes individual transactions, but
+    it cannot make two collector processes' in-memory cursors coherent.  Hold
+    this lease for the writer process lifetime so a launchd replacement cannot
+    overlap the collector it is replacing.
+    """
+    path = root.resolve() / ".collector.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = path.open("a+b")
+    try:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(
+                "another Polymarket live collector already owns this root"
+            ) from exc
+        yield
+    finally:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
+
+
 def _instant(value: Any) -> datetime:
     if isinstance(value, datetime):
         parsed = value
@@ -4398,6 +4423,41 @@ class LiveStateStore:
             del self._event_batch_state.stream
             stream.close()
 
+    @contextmanager
+    def memory_state_batch(self):
+        """Restore mutable writer state when a durable batch rolls back.
+
+        SQLite and the event file already roll back together.  Without the
+        matching in-memory rollback, the next retry starts from a skipped
+        cursor and can append a permanently discontinuous log tail.
+        """
+        snapshot = {
+            "books": self.books.copy(),
+            "rest_refresh_generation": self._rest_refresh_generation.copy(),
+            "gaps": [gap.model_copy(deep=True) for gap in self.gaps],
+            "events": deque(self.events, maxlen=self.events.maxlen),
+            "seen_raw_hashes": self.seen_raw_hashes.copy(),
+            "seen_raw_hash_order": deque(self._seen_raw_hash_order),
+            "active_recovery_id": self.active_recovery_id,
+            "cursor": self.cursor,
+            "event_offset": self._event_offset,
+            "last_log_cursor": self._last_log_cursor,
+        }
+        try:
+            yield
+        except BaseException:
+            self.books = snapshot["books"]
+            self._rest_refresh_generation = snapshot["rest_refresh_generation"]
+            self.gaps = snapshot["gaps"]
+            self.events = snapshot["events"]
+            self.seen_raw_hashes = snapshot["seen_raw_hashes"]
+            self._seen_raw_hash_order = snapshot["seen_raw_hash_order"]
+            self.active_recovery_id = snapshot["active_recovery_id"]
+            self.cursor = snapshot["cursor"]
+            self._event_offset = snapshot["event_offset"]
+            self._last_log_cursor = snapshot["last_log_cursor"]
+            raise
+
     def _append(self, value: dict[str, Any]) -> tuple[int, int, str]:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
         body = canonical_json(value) + b"\n"
@@ -5881,6 +5941,7 @@ class PolymarketLiveCollector:
         with (
             self.store._sync_lock,
             _publication_lock(self.store.root, exclusive=True),
+            self.store.memory_state_batch(),
             self.store.state_index.batch(),
             self.store.durable_event_batch(),
         ):
@@ -6174,6 +6235,7 @@ class PolymarketLiveCollector:
         with (
             self.store._sync_lock,
             _publication_lock(self.store.root, exclusive=True),
+            self.store.memory_state_batch(),
             self.store.state_index.batch(),
             self.store.durable_event_batch(),
         ):
