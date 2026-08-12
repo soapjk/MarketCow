@@ -2170,6 +2170,11 @@ class PolymarketLiveReadStore:
         market_ids = [market.identity.market_id for market in response.markets]
         if not market_ids:
             return response
+        expected_token_ids = {
+            outcome.token_id
+            for market in response.markets
+            for outcome in market.identity.outcomes
+        }
         if indexed_books is None:
             placeholders = ",".join("?" for _ in market_ids)
             deadline = time.monotonic() + self._stable_read_wait_seconds
@@ -2177,7 +2182,10 @@ class PolymarketLiveReadStore:
                 try:
                     with self._state_snapshot() as (_, connection, metadata):
                         rows = list(connection.execute(
-                            f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
+                            f"""SELECT b.token_id, b.market_id,
+                                b.payload_json, b.payload_sha256,
+                                json_extract(b.payload_json, '$.received_at')
+                                    AS book_received_at,
                                 c.exchange_at AS confirmed_exchange_at,
                                 c.received_at AS confirmed_received_at,
                                 c.state_checksum AS confirmed_state_checksum,
@@ -2204,6 +2212,10 @@ class PolymarketLiveReadStore:
                     and not metadata.get("active_recovery_id")
                     and gap_count == 0
                 )
+                if stable and self._stable_snapshot_max_book_age_seconds is not None:
+                    stable = self._book_rows_form_fresh_boundary(
+                        rows, expected_token_ids,
+                    )
                 if stable:
                     break
                 remaining = deadline - time.monotonic()
@@ -2256,6 +2268,35 @@ class PolymarketLiveReadStore:
                 "instrument_revision": instrument.revision,
             })
         return result
+
+    def _book_rows_form_fresh_boundary(
+        self,
+        rows: Iterable[sqlite3.Row],
+        expected_token_ids: set[str],
+    ) -> bool:
+        """Return whether indexed rows form one complete, fresh read boundary."""
+        materialized = list(rows)
+        if {str(row["token_id"]) for row in materialized} != expected_token_ids:
+            return False
+        observed_at = self.now_provider()
+        maximum_age = self._stable_snapshot_max_book_age_seconds
+        return all(
+            json.loads(bytes(row["payload_json"]))[side]
+            for row in materialized for side in ("bids", "asks")
+        ) and (
+            maximum_age is None
+            or all(
+                0
+                <= (
+                    observed_at
+                    - _instant(
+                        row["confirmed_received_at"] or row["book_received_at"]
+                    )
+                ).total_seconds()
+                <= maximum_age
+                for row in materialized
+            )
+        )
 
     def snapshot(
         self,
@@ -2323,26 +2364,8 @@ class PolymarketLiveReadStore:
                 and _wait_for_stable_boundary
                 and self._stable_snapshot_max_book_age_seconds is not None
             ):
-                observed_at = self.now_provider()
-                stable = (
-                    {str(row["token_id"]) for row in book_rows}
-                    == expected_token_ids
-                    and all(
-                        json.loads(bytes(row["payload_json"]))[side]
-                        for row in book_rows for side in ("bids", "asks")
-                    )
-                    and all(
-                        0
-                        <= (
-                            observed_at
-                            - _instant(
-                                row["confirmed_received_at"]
-                                or row["book_received_at"]
-                            )
-                        ).total_seconds()
-                        <= self._stable_snapshot_max_book_age_seconds
-                        for row in book_rows
-                    )
+                stable = self._book_rows_form_fresh_boundary(
+                    book_rows, expected_token_ids,
                 )
             if stable:
                 break
@@ -2625,14 +2648,41 @@ class PolymarketLiveReadStore:
         if summary_keys.issubset(state_manifest):
             state_metadata = state_manifest
             deadline = time.monotonic() + self._stable_read_wait_seconds
-            while (
-                state_metadata.get("active_recovery_id")
-                or int(state_metadata["unresolved_gap_count"]) > 0
-                or (
-                    int(state_metadata["book_complete_market_count"]) * 2
-                    < int(state_metadata["book_token_count"])
+            while True:
+                structurally_stable = not (
+                    state_metadata.get("active_recovery_id")
+                    or int(state_metadata["unresolved_gap_count"]) > 0
+                    or (
+                        int(state_metadata["book_complete_market_count"]) * 2
+                        < int(state_metadata["book_token_count"])
+                    )
                 )
-            ):
+                fresh = structurally_stable
+                if (
+                    fresh
+                    and self._stable_snapshot_max_book_age_seconds is not None
+                ):
+                    with self._state_snapshot() as (_, connection, indexed_metadata):
+                        rows = list(connection.execute(
+                            """SELECT b.token_id, b.payload_json,
+                                json_extract(b.payload_json, '$.received_at')
+                                    AS book_received_at,
+                                c.received_at AS confirmed_received_at
+                                FROM books b LEFT JOIN book_confirmations c
+                                ON c.token_id=b.token_id"""
+                        ))
+                    expected_token_ids = {str(row["token_id"]) for row in rows}
+                    fresh = (
+                        indexed_metadata.get("latest_cursor")
+                        == state_metadata.get("latest_cursor")
+                        and len(expected_token_ids)
+                        == int(state_metadata["book_token_count"])
+                        and self._book_rows_form_fresh_boundary(
+                            rows, expected_token_ids,
+                        )
+                    )
+                if fresh:
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise self._stable_boundary_unavailable("health")

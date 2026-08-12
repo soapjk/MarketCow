@@ -2447,6 +2447,16 @@ class PolymarketLiveTest(unittest.TestCase):
         with self.assertRaises(PolymarketLiveReadError) as stale:
             fail_fast.snapshot(["m1"])
         self.assertEqual(stale.exception.code, "polymarket_state_index_lagging")
+        with self.assertRaises(PolymarketLiveReadError) as stale_health:
+            fail_fast.health()
+        self.assertEqual(
+            stale_health.exception.code, "polymarket_state_index_lagging",
+        )
+        with self.assertRaises(PolymarketLiveReadError) as stale_bootstrap:
+            fail_fast.bootstrap(["m1"])
+        self.assertEqual(
+            stale_bootstrap.exception.code, "polymarket_state_index_lagging",
+        )
 
         reader = PolymarketLiveReadStore(
             root,
@@ -2513,11 +2523,20 @@ class PolymarketLiveTest(unittest.TestCase):
         )
 
         current[0] = NOW + timedelta(seconds=3.49)
+        self.assertEqual(reader.health().status, "index_ready")
+        self.assertEqual(len(reader.bootstrap(["m1"]).markets), 1)
         self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
         current[0] = NOW + timedelta(seconds=3.51)
-        with self.assertRaises(PolymarketLiveReadError) as stale:
-            reader.snapshot(["m1"])
-        self.assertEqual(stale.exception.code, "polymarket_state_index_lagging")
+        for operation in (
+            reader.health,
+            lambda: reader.bootstrap(["m1"]),
+            lambda: reader.snapshot(["m1"]),
+        ):
+            with self.assertRaises(PolymarketLiveReadError) as stale:
+                operation()
+            self.assertEqual(
+                stale.exception.code, "polymarket_state_index_lagging",
+            )
 
     def test_failed_event_types_are_durable_after_checkpoint(self):
         cases = {
