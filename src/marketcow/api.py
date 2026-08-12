@@ -544,9 +544,11 @@ def create_app(
     polymarket_live_read = PolymarketLiveReadStore(
         polymarket_live.root,
         # The strict live consumer evaluates at a five-second maximum age.
-        # Reserve transport/projection headroom by publishing only a boundary
-        # whose producer observation is at most two seconds old.
-        stable_snapshot_max_book_age_seconds=2.0,
+        # Reserve at least 1.5 seconds of transport/projection headroom while
+        # allowing one ordinary two-second REST cadence to bridge a transient
+        # empty-sided upstream response. The consumer's five-second limit is
+        # unchanged and remains the final fail-closed boundary.
+        stable_snapshot_max_book_age_seconds=3.5,
     )
     app.state.polymarket_live_read = polymarket_live_read
     history_repository = getattr(service, "metadata_repository", None)

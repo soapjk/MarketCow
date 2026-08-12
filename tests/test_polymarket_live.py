@@ -2493,6 +2493,32 @@ class PolymarketLiveTest(unittest.TestCase):
             for book in pages[0].items[0].tokens
         ))
 
+    def test_snapshot_three_and_half_second_budget_preserves_consumer_headroom(self):
+        root = self.root / "snapshot-headroom-boundary"
+        current = [NOW]
+        writer = LiveStateStore(root, now_provider=lambda: current[0])
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+        )
+        writer.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+        )
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: current[0],
+            stable_read_wait_seconds=0,
+            stable_snapshot_max_book_age_seconds=3.5,
+        )
+
+        current[0] = NOW + timedelta(seconds=3.49)
+        self.assertEqual(reader.snapshot(["m1"]).items[0].status, "ready")
+        current[0] = NOW + timedelta(seconds=3.51)
+        with self.assertRaises(PolymarketLiveReadError) as stale:
+            reader.snapshot(["m1"])
+        self.assertEqual(stale.exception.code, "polymarket_state_index_lagging")
+
     def test_failed_event_types_are_durable_after_checkpoint(self):
         cases = {
             "missing_snapshot": {
