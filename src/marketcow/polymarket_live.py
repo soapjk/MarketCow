@@ -5996,6 +5996,7 @@ class PolymarketLiveCollector:
         async def worker(partition_index: int, initial_delay: float) -> None:
             await asyncio.sleep(self.snapshot_refresh_seconds + initial_delay)
             while True:
+                refresh_started = time.monotonic()
                 try:
                     await self.refresh_books(
                         "periodic_snapshot_refresh",
@@ -6009,7 +6010,12 @@ class PolymarketLiveCollector:
                         "periodic_snapshot_refresh_failed; retrying after %.3f seconds",
                         self.snapshot_refresh_seconds,
                     )
-                await asyncio.sleep(self.snapshot_refresh_seconds)
+                elapsed = time.monotonic() - refresh_started
+                # Keep a start-to-start cadence. Sleeping the full interval
+                # after a slow upstream request made a configured two-second
+                # refresh silently drift to four seconds or more, leaving too
+                # little room for a strict consumer's bounded read latency.
+                await asyncio.sleep(max(0, self.snapshot_refresh_seconds - elapsed))
 
         await asyncio.gather(*(
             worker(

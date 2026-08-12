@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 import threading
+import time
 import unittest
 import requests
 from unittest.mock import patch
@@ -2420,6 +2421,43 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             asyncio.run(scenario())
             self.assertGreaterEqual(len(reasons), 2)
             self.assertEqual(set(reasons), {"periodic_snapshot_refresh"})
+
+    def test_periodic_snapshot_refresh_does_not_add_interval_after_slow_fetch(self):
+        with TemporaryDirectory() as folder:
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(
+                    requester=lambda *_args, **_kwargs: Response({"markets": []})
+                ),
+                ClobBooksClient(
+                    requester=lambda *_args, **_kwargs: Response([])
+                ),
+                snapshot_refresh_seconds=0.1,
+            )
+            starts = []
+
+            async def slow_refresh(reason="startup", **_partition):
+                starts.append(time.monotonic())
+                await asyncio.sleep(0.15)
+                return "recovery"
+
+            collector.refresh_books = slow_refresh
+
+            async def scenario():
+                task = asyncio.create_task(
+                    collector._refresh_snapshots_periodically()
+                )
+                while len(starts) < 2:
+                    await asyncio.sleep(0.01)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            asyncio.run(scenario())
+
+            # A completion-relative scheduler would add another 100ms and
+            # start the second request after roughly 250ms.
+            self.assertLess(starts[1] - starts[0], 0.21)
 
     def test_scoped_collector_never_overwrites_global_checkpoint(self):
         with TemporaryDirectory() as folder:
