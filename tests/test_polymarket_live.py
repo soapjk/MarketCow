@@ -2784,6 +2784,66 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 {current[0]},
             )
 
+    def test_periodic_gap_recovery_uses_one_durable_book_completion_flush(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            current = [NOW]
+            store = LiveStateStore(root, now_provider=lambda: current[0])
+            rows = [gamma_row()]
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            store.apply_snapshot(
+                snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+            )
+            store.apply_snapshot(
+                snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+            )
+            store.apply_websocket({
+                "event_type": "price_change",
+                "timestamp": "1785739201000",
+                "price_changes": [{
+                    "asset_id": "yes-1", "side": "BUY",
+                    "price": "0.405", "size": "1",
+                }],
+            }, received_at=NOW)
+            self.assertEqual(sum(not gap.resolved for gap in store.gaps), 1)
+            current[0] = NOW + timedelta(seconds=2)
+
+            def requester(_url, **kwargs):
+                token_ids = [item["token_id"] for item in kwargs["json"]]
+                return Response([
+                    snapshot(
+                        token_id,
+                        "0.41" if token_id == "yes-1" else "0.58",
+                        "0.42" if token_id == "yes-1" else "0.60",
+                    )
+                    for token_id in token_ids
+                ])
+
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=requester),
+                publish_checkpoints=False,
+                minimum_snapshot_refresh_age_seconds=1,
+            )
+            event_inode = store.event_path.stat().st_ino
+            event_fsyncs = []
+            real_fsync = polymarket_live_module.os.fsync
+
+            def track_fsync(file_descriptor):
+                if polymarket_live_module.os.fstat(file_descriptor).st_ino == event_inode:
+                    event_fsyncs.append(file_descriptor)
+                return real_fsync(file_descriptor)
+
+            with patch.object(
+                polymarket_live_module.os, "fsync", side_effect=track_fsync,
+            ):
+                asyncio.run(collector.refresh_books())
+
+            self.assertEqual(len(event_fsyncs), 1)
+            self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
+            self.assertEqual(store.frame("m1", now=current[0]).status, "ready")
+
     def test_periodic_refresh_partitions_market_pairs_without_splitting(self):
         with TemporaryDirectory() as folder:
             current = [NOW]

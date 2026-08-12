@@ -1604,10 +1604,10 @@ class PolymarketLiveReadStore:
     # inside either transition must not receive a partially usable relation.
     # Briefly follow the immutable state-index boundary; persistent recovery or
     # gaps fail closed with the existing retryable state-index status.
-    # Tradude's loopback client has a ten-second request timeout. Eight seconds
-    # covers one failed 1.75-second upstream CLOB attempt plus the next complete
-    # two-second refresh while retaining response/serialization headroom.
-    stable_read_wait_seconds = 8.0
+    # Tradude's loopback client has a ten-second request timeout. Keep enough
+    # response/serialization headroom that a persistent boundary always becomes
+    # the machine-readable 503 below instead of an ambiguous client timeout.
+    stable_read_wait_seconds = 6.0
     stable_read_poll_seconds = 0.025
 
     @staticmethod
@@ -5846,35 +5846,91 @@ class PolymarketLiveCollector:
         LOGGER.info("gamma_catalog_published %s", result)
         return result
 
+    def _commit_recovery_rows(
+        self,
+        rows: list[dict[str, Any]],
+        recovery_id: str,
+        tracker: dict[str, Any],
+        *,
+        complete: bool,
+        refresh_started_at: datetime | None = None,
+        received_at: datetime | None = None,
+        write_checkpoint: bool,
+        publish_completion_event: bool,
+    ) -> dict[str, Any] | None:
+        """Publish recovered books and their completion in one durable flush."""
+        with (
+            self.store._sync_lock,
+            _publication_lock(self.store.root, exclusive=True),
+            self.store.state_index.batch(),
+            self.store.durable_event_batch(),
+        ):
+            if rows:
+                self.store.recover_book_batch(
+                    rows,
+                    recovery_id,
+                    tracker,
+                    refresh_started_at=refresh_started_at,
+                    received_at=received_at,
+                )
+            if complete:
+                return self.store.complete_book_recovery(
+                    recovery_id,
+                    tracker,
+                    write_checkpoint=write_checkpoint,
+                    publish_completion_event=publish_completion_event,
+                )
+        return None
+
     async def bootstrap_books(self, reason: str = "startup") -> str:
         with self.store._sync_lock:
             recovery_id = self.store.mark_recovery_started(reason)
             tracker = self.store.new_book_recovery_tracker()
 
         def consume(rows: list[dict[str, Any]]) -> None:
-            received_at = self.store.now_provider()
-            with (
-                self.store._sync_lock,
-                _publication_lock(self.store.root, exclusive=True),
-                self.store.state_index.batch(),
-                self.store.durable_event_batch(),
-            ):
-                self.store.recover_book_batch(
-                    rows, recovery_id, tracker, received_at=received_at,
-                )
-
-        await asyncio.to_thread(
-            self.books_client.fetch_stream,
-            sorted(self.store.token_to_market),
-            batch_consumer=consume,
-            require_complete_batches=True,
-        )
-        with self.store._sync_lock:
-            coverage = self.store.complete_book_recovery(
+            self._commit_recovery_rows(
+                rows,
                 recovery_id,
                 tracker,
-                write_checkpoint=self.publish_checkpoints,
+                complete=False,
+                received_at=self.store.now_provider(),
+                write_checkpoint=False,
+                publish_completion_event=False,
             )
+
+        token_ids = sorted(self.store.token_to_market)
+        if len(token_ids) <= self.books_client.batch_size:
+            rows = await asyncio.to_thread(
+                self.books_client.fetch_stream,
+                token_ids,
+                require_complete_batches=True,
+            )
+            coverage = self._commit_recovery_rows(
+                rows,
+                recovery_id,
+                tracker,
+                complete=True,
+                received_at=self.store.now_provider(),
+                write_checkpoint=self.publish_checkpoints,
+                publish_completion_event=True,
+            )
+        else:
+            await asyncio.to_thread(
+                self.books_client.fetch_stream,
+                token_ids,
+                batch_consumer=consume,
+                require_complete_batches=True,
+            )
+            coverage = self._commit_recovery_rows(
+                [],
+                recovery_id,
+                tracker,
+                complete=True,
+                write_checkpoint=self.publish_checkpoints,
+                publish_completion_event=True,
+            )
+        if coverage is None:  # pragma: no cover - complete=True above
+            raise RuntimeError("book recovery did not publish completion")
         if self.books_client.last_evidence is not None:
             self.books_client.last_evidence.update(coverage)
         LOGGER.info(
@@ -5932,35 +5988,49 @@ class PolymarketLiveCollector:
             )
 
         def consume(rows: list[dict[str, Any]]) -> None:
-            received_at = self.store.now_provider()
-            with (
-                self.store._sync_lock,
-                _publication_lock(self.store.root, exclusive=True),
-                self.store.state_index.batch(),
-                self.store.durable_event_batch(),
-            ):
-                self.store.recover_book_batch(
+            self._commit_recovery_rows(
+                rows,
+                recovery_id,
+                tracker,
+                complete=False,
+                refresh_started_at=refresh_started_at,
+                received_at=self.store.now_provider(),
+                write_checkpoint=False,
+                publish_completion_event=False,
+            )
+
+        if refresh_token_ids:
+            if len(refresh_token_ids) <= self.books_client.batch_size:
+                rows = await asyncio.to_thread(
+                    self.books_client.fetch_stream,
+                    refresh_token_ids,
+                    require_complete_batches=True,
+                )
+                self._commit_recovery_rows(
                     rows,
                     recovery_id,
                     tracker,
+                    complete=True,
                     refresh_started_at=refresh_started_at,
-                    received_at=received_at,
+                    received_at=self.store.now_provider(),
+                    write_checkpoint=self.publish_checkpoints,
+                    publish_completion_event=False,
                 )
-
-        if refresh_token_ids:
+                return recovery_id
             await asyncio.to_thread(
                 self.books_client.fetch_stream,
                 refresh_token_ids,
                 batch_consumer=consume,
                 require_complete_batches=True,
             )
-        with self.store._sync_lock:
-            self.store.complete_book_recovery(
-                recovery_id,
-                tracker,
-                write_checkpoint=self.publish_checkpoints,
-                publish_completion_event=False,
-            )
+        self._commit_recovery_rows(
+            [],
+            recovery_id,
+            tracker,
+            complete=True,
+            write_checkpoint=self.publish_checkpoints,
+            publish_completion_event=False,
+        )
         return recovery_id
 
     async def update_subscriptions(self) -> list[dict[str, Any]]:
