@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.marketcow.production</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/Users/androidjk/Library/Application Support/MarketCow/start-production.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LC_ALL</key><string>C</string>
+    <key>MARKETCOW_ENV_FILE</key><string>/Users/androidjk/Library/Application Support/MarketCow/production.env</string>
+    <key>MARKETCOW_LONGPORT_ENABLE_OVERNIGHT</key><string>true</string>
+    <key>MARKETCOW_PROFILE</key><string>production</string>
+    <key>PYTHONPATH</key><string>/Volumes/T9/projects/marketcow-polymarket-live-state-index-performance/src</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Background</string>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/Users/androidjk/Library/Logs/MarketCow/production.error.log</string>
+  <key>StandardOutPath</key><string>/Users/androidjk/Library/Logs/MarketCow/production.log</string>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>

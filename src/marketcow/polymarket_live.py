@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -47,6 +49,59 @@ SIZE_INCREMENT_SOURCE_URL = (
     "b076b04d61135657e25dccc1bbd6866a96bd8c6e/"
     "py_clob_client/order_builder/constants.py"
 )
+
+
+_PUBLICATION_LOCKS = threading.local()
+
+
+@contextmanager
+def _publication_lock(root: Path, *, exclusive: bool):
+    """Serialize cross-process catalog/event/index publication with API reads."""
+    path = (root.resolve() / ".publication.lock")
+    key = str(path)
+    held = getattr(_PUBLICATION_LOCKS, "held", None)
+    if held is None:
+        held = {}
+        _PUBLICATION_LOCKS.held = held
+    current = held.get(key)
+    if current is not None:
+        if exclusive and not current[2]:
+            raise RuntimeError("cannot upgrade a shared live publication lock")
+        held[key] = (current[0], current[1] + 1, current[2])
+        try:
+            yield
+        finally:
+            stream, count, mode = held[key]
+            held[key] = (stream, count - 1, mode)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    gate = (root.resolve() / ".publication.gate.lock").open("a+b")
+    stream = path.open("a+b")
+    fcntl.flock(gate.fileno(), fcntl.LOCK_EX)
+    try:
+        fcntl.flock(
+            stream.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+        )
+    except BaseException:
+        fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+        gate.close()
+        stream.close()
+        raise
+    if not exclusive:
+        fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+        gate.close()
+        gate = None
+    held[key] = ((stream, gate), 1, exclusive)
+    try:
+        yield
+    finally:
+        held.pop(key, None)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
+        if gate is not None:
+            fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+            gate.close()
 
 
 def _instant(value: Any) -> datetime:
@@ -122,13 +177,16 @@ def _fee_missing_fields(
 
 
 def _levels(value: Any, field: str) -> list[dict[str, str]]:
-    levels = []
+    levels = {}
     for item in value or []:
-        levels.append({
-            "price": decimal_text(item.get("price"), f"{field}.price"),
-            "size": decimal_text(item.get("size"), f"{field}.size"),
-        })
-    return levels
+        price = decimal_text(item.get("price"), f"{field}.price")
+        levels[price] = decimal_text(item.get("size"), f"{field}.size")
+    return [
+        {"price": price, "size": levels[price]}
+        for price in sorted(
+            levels, key=Decimal, reverse=field == "bids",
+        )
+    ]
 
 
 def _state_checksum(token_id: str, tick_size: str, bids: dict[str, str], asks: dict[str, str]) -> str:
@@ -184,6 +242,9 @@ def _market_sequence_sha256(markets: list[LiveMarket]) -> str:
 CATALOG_INDEX_SCHEMA_VERSION = "marketcow.polymarket.catalog-index.v1"
 LIVE_READ_SCHEMA_VERSION = "marketcow.polymarket.live-read-health.v1"
 STATE_INDEX_SCHEMA_VERSION = "marketcow.polymarket.state-index.v1"
+CANDIDATE_SNAPSHOT_SCHEMA_VERSION = (
+    "marketcow.polymarket.candidate-snapshot.v1"
+)
 
 
 def _readonly_sqlite(path: Path) -> sqlite3.Connection:
@@ -385,6 +446,490 @@ def _reuse_catalog_index(
     }
 
 
+def _iter_raw_catalog_rows(
+    path: Path, raw_format: str,
+) -> Iterable[tuple[bytes, dict[str, Any]]]:
+    if raw_format == "canonical_jsonl":
+        with path.open("rb") as stream:
+            for line in stream:
+                body = line.removesuffix(b"\n")
+                if body:
+                    yield body, json.loads(body)
+        return
+    if raw_format == "canonical_json_array":
+        payload = json.loads(path.read_bytes())
+        if not isinstance(payload, list):
+            raise RuntimeError("live raw catalog array is invalid")
+        for row in payload:
+            if not isinstance(row, dict):
+                raise RuntimeError("live raw catalog row is invalid")
+            yield canonical_json(row), row
+        return
+    raise RuntimeError("live raw catalog format is unsupported")
+
+
+def _write_candidate_snapshot(
+    root: Path,
+    *,
+    revision: str,
+    normalized: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    """Materialize one immutable, metadata-only candidate catalog boundary."""
+    root = root.resolve()
+    normalized_path = Path(str(normalized.get("path") or "")).resolve()
+    raw_path = Path(str(source.get("raw_path") or "")).resolve()
+    if not normalized_path.is_relative_to(root / "catalogs"):
+        raise RuntimeError("candidate normalized catalog escapes live storage")
+    if not raw_path.is_relative_to(root / "raw"):
+        raise RuntimeError("candidate raw catalog escapes live storage")
+    if (
+        not normalized_path.is_file()
+        or _file_sha256(normalized_path) != normalized.get("sha256")
+    ):
+        raise RuntimeError("candidate normalized catalog integrity failed")
+    if (
+        not raw_path.is_file()
+        or _file_sha256(raw_path) != source.get("raw_payload_sha256")
+    ):
+        raise RuntimeError("candidate raw catalog integrity failed")
+    observed_at = _instant(source.get("observed_at"))
+    source_url = str(source.get("source_url") or "")
+    if not source_url:
+        raise RuntimeError("candidate source URL is missing")
+
+    candidate_root = root / "candidate-snapshots"
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    destination = candidate_root / f"{revision}.json"
+    with tempfile.TemporaryDirectory(
+        dir=root, prefix=".candidate-snapshot-",
+    ) as temporary_name:
+        temporary_root = Path(temporary_name)
+        raw_index_path = temporary_root / "raw.sqlite3"
+        candidates_path = temporary_root / "candidates.json"
+        relations_path = temporary_root / "relations.json"
+        payload_path = temporary_root / "payload.json"
+        output_path = temporary_root / "snapshot.json"
+        with sqlite3.connect(raw_index_path) as raw_index:
+            raw_index.executescript("""
+                CREATE TABLE raw_markets (
+                    market_id TEXT PRIMARY KEY,
+                    liquidity_num TEXT,
+                    neg_risk INTEGER NOT NULL CHECK(neg_risk IN (0, 1)),
+                    neg_risk_group TEXT,
+                    group_outcome_label TEXT,
+                    binary_yes_no INTEGER NOT NULL CHECK(binary_yes_no IN (0, 1)),
+                    raw_payload_sha256 TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE INDEX raw_neg_risk_group
+                    ON raw_markets(neg_risk_group, market_id);
+            """)
+            raw_count = 0
+            for raw_body, row in _iter_raw_catalog_rows(
+                raw_path, str(source.get("raw_format") or ""),
+            ):
+                market_id = str(row.get("id") or "")
+                if not market_id:
+                    continue
+                tokens = _list(
+                    row.get("clobTokenIds") or row.get("clob_token_ids")
+                )
+                outcomes = [
+                    str(item).strip().casefold()
+                    for item in _list(row.get("outcomes"))
+                ]
+                neg_risk = bool(row.get("negRisk") or row.get("neg_risk"))
+                event = (row.get("events") or [{}])[0]
+                group_id = str(
+                    row.get("negRiskMarketID")
+                    or row.get("neg_risk_market_id")
+                    or event.get("negRiskMarketID")
+                    or ""
+                ) or None
+                liquidity = row.get("liquidityNum")
+                raw_index.execute(
+                    """INSERT INTO raw_markets VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        market_id,
+                        str(liquidity) if liquidity is not None else None,
+                        int(neg_risk), group_id,
+                        str(
+                            row.get("groupItemTitle")
+                            or row.get("group_item_title")
+                            or ""
+                        ) or None,
+                        int(len(tokens) == 2 and set(outcomes) == {"yes", "no"}),
+                        hashlib.sha256(raw_body).hexdigest(),
+                    ),
+                )
+                raw_count += 1
+            raw_index.commit()
+            expected_raw_count = source.get("market_count")
+            if expected_raw_count is None or raw_count != int(expected_raw_count):
+                raise RuntimeError("candidate raw catalog row count mismatch")
+
+            candidate_count = 0
+            normalized_hasher = hashlib.sha256()
+            actual_relations: dict[str, dict[str, Any]] = {}
+            market_observed_at: dict[str, datetime] = {}
+            with candidates_path.open("wb") as candidate_stream:
+                candidate_stream.write(b"[")
+                with normalized_path.open("rb") as normalized_stream:
+                    for line in normalized_stream:
+                        normalized_hasher.update(line)
+                        body = line.removesuffix(b"\n")
+                        if not body:
+                            continue
+                        market = LiveMarket.model_validate_json(body)
+                        market_id = market.identity.market_id
+                        raw = raw_index.execute(
+                            "SELECT * FROM raw_markets WHERE market_id=?",
+                            (market_id,),
+                        ).fetchone()
+                        raw_in_current_catalog = raw is not None
+                        if raw_in_current_catalog:
+                            raw = dict(zip(
+                                [item[1] for item in raw_index.execute(
+                                    "PRAGMA table_info(raw_markets)"
+                                )],
+                                raw,
+                            ))
+                        else:
+                            raw = {
+                                "liquidity_num": None,
+                                "raw_payload_sha256": market.raw_payload_sha256,
+                            }
+                        if (
+                            raw_in_current_catalog
+                            and market.raw_payload_sha256
+                            != raw["raw_payload_sha256"]
+                        ):
+                            raise RuntimeError(
+                                "candidate normalized market raw binding mismatch"
+                            )
+                        by_outcome = {
+                            outcome.outcome.strip().casefold(): outcome
+                            for outcome in market.identity.outcomes
+                        }
+                        binary_yes_no = set(by_outcome) == {"yes", "no"}
+                        relation_id = next((
+                            relation.relation_id for relation in market.relations
+                            if relation.relation_type == "standard_negative_risk"
+                        ), None)
+                        if relation_id == "neg-risk:None":
+                            relation_id = None
+                        normalized_row_sha256 = hashlib.sha256(body).hexdigest()
+                        field_paths = [
+                            "id", "conditionId", "clobTokenIds", "outcomes",
+                            "active", "acceptingOrders", "closed",
+                            "liquidityNum", "endDate", "negRisk",
+                            "negRiskMarketID", "groupItemTitle",
+                        ]
+                        evidence_payload = {
+                            "catalog_revision": revision,
+                            "market_id": market_id,
+                            "normalized_row_sha256": normalized_row_sha256,
+                            "raw_payload_sha256": raw["raw_payload_sha256"],
+                            "field_paths": field_paths,
+                        }
+                        candidate = CandidateMarket(
+                            market_id=market_id,
+                            condition_id=market.identity.condition_id,
+                            yes_token_id=(
+                                by_outcome["yes"].token_id
+                                if binary_yes_no else None
+                            ),
+                            no_token_id=(
+                                by_outcome["no"].token_id
+                                if binary_yes_no else None
+                            ),
+                            active=market.active,
+                            accepting_orders=market.accepting_orders,
+                            closed=market.closed,
+                            rules_complete=market.rules.rules_complete,
+                            binary_yes_no=binary_yes_no,
+                            negative_risk=market.identity.neg_risk,
+                            negative_risk_relation_id=relation_id,
+                            liquidity_num=raw["liquidity_num"],
+                            end_time=market.end_at,
+                            evidence=CandidateEvidence(
+                                source_url=source_url,
+                                raw_payload_sha256=raw["raw_payload_sha256"],
+                                normalized_row_sha256=normalized_row_sha256,
+                                raw_row_in_current_catalog=raw_in_current_catalog,
+                                field_paths=field_paths,
+                                evidence_sha256=content_sha256(evidence_payload),
+                            ),
+                        )
+                        if candidate_count:
+                            candidate_stream.write(b",")
+                        candidate_stream.write(canonical_json(
+                            candidate.model_dump(mode="json")
+                        ))
+                        candidate_count += 1
+                        market_observed_at[market_id] = market.observed_at
+                        for relation in market.relations:
+                            if relation.relation_type != "standard_negative_risk":
+                                continue
+                            if relation.relation_id == "neg-risk:None":
+                                continue
+                            relation_payload = {
+                                "revision": relation.revision,
+                                "complete": relation.complete,
+                                "missing_fields": relation.missing_fields,
+                                "outcome_pairs": [
+                                    item.model_dump(mode="json")
+                                    for item in relation.outcome_pairs
+                                ],
+                            }
+                            previous = actual_relations.get(relation.relation_id)
+                            if previous is None:
+                                actual_relations[relation.relation_id] = {
+                                    **relation_payload,
+                                    "copies_disagree": False,
+                                }
+                            elif any(
+                                previous[key] != value
+                                for key, value in relation_payload.items()
+                            ):
+                                previous["copies_disagree"] = True
+                candidate_stream.write(b"]")
+                candidate_stream.flush()
+                os.fsync(candidate_stream.fileno())
+            if (
+                normalized_hasher.hexdigest() != normalized.get("sha256")
+                or normalized.get("market_count") is None
+                or candidate_count != int(normalized["market_count"])
+            ):
+                raise RuntimeError("candidate normalized catalog stream mismatch")
+
+            raw_groups = list(raw_index.execute(
+                """SELECT neg_risk_group, COUNT(*), SUM(binary_yes_no)
+                    FROM raw_markets
+                    WHERE neg_risk=1 AND neg_risk_group IS NOT NULL
+                    GROUP BY neg_risk_group ORDER BY neg_risk_group"""
+            ))
+            relation_count = 0
+            with relations_path.open("wb") as relation_stream:
+                relation_stream.write(b"[")
+                for group_id, expected_count, raw_binary_count in raw_groups:
+                    relation_id = f"neg-risk:{group_id}"
+                    actual = actual_relations.pop(relation_id, None)
+                    pairs = list((actual or {}).get("outcome_pairs") or [])
+                    members = [CandidateRelationMember(
+                        market_id=str(pair["market_id"]),
+                        condition_id=str(pair["condition_id"]),
+                        outcome_label=str(pair["outcome_label"]),
+                        yes_token_id=str(pair["yes_token_id"]),
+                        no_token_id=str(pair["no_token_id"]),
+                        pair_revision=str(pair["pair_revision"]),
+                        evidence_sha256=content_sha256({
+                            "pair_revision": pair["pair_revision"],
+                            "provenance": pair["provenance"],
+                        }),
+                    ) for pair in pairs]
+                    member_observations = [
+                        market_observed_at[item.market_id]
+                        for item in members
+                        if item.market_id in market_observed_at
+                    ]
+                    same_observation = (
+                        len({item.isoformat() for item in member_observations}) <= 1
+                        and len(member_observations) == int(expected_count)
+                    )
+                    reasons = []
+                    if actual is None:
+                        reasons.append("normalized_relation_missing")
+                    if len(members) != int(expected_count):
+                        reasons.append("member_count_mismatch")
+                    if int(raw_binary_count or 0) != int(expected_count):
+                        reasons.append("source_member_not_binary_yes_no")
+                    if len(members) < 2:
+                        reasons.append("insufficient_members")
+                    if actual is not None and (
+                        not actual["complete"] or actual["missing_fields"]
+                    ):
+                        reasons.append("outcome_pairs_incomplete")
+                    if actual is not None and actual["copies_disagree"]:
+                        reasons.append("relation_copies_disagree")
+                    if not same_observation:
+                        reasons.append("catalog_observation_incoherent")
+                    reasons = sorted(set(reasons))
+                    raw_member_hashes = [
+                        str(item[0]) for item in raw_index.execute(
+                            """SELECT raw_payload_sha256 FROM raw_markets
+                                WHERE neg_risk_group=? ORDER BY market_id""",
+                            (group_id,),
+                        )
+                    ]
+                    relation = CandidateNegativeRiskRelation(
+                        relation_id=relation_id,
+                        complete=not reasons,
+                        expected_member_count=int(expected_count),
+                        actual_member_count=len(members),
+                        members=members,
+                        reason_codes=reasons,
+                        producer_received_at=observed_at,
+                        coherence=CandidateRelationCoherence(
+                            status="coherent" if not reasons else "incomplete",
+                            catalog_revision=revision,
+                            producer_received_at=observed_at,
+                            member_observed_at_min=(
+                                min(member_observations)
+                                if member_observations else None
+                            ),
+                            member_observed_at_max=(
+                                max(member_observations)
+                                if member_observations else None
+                            ),
+                            all_members_same_catalog_observation=same_observation,
+                        ),
+                        evidence_sha256=content_sha256({
+                            "catalog_revision": revision,
+                            "relation_id": relation_id,
+                            "raw_member_hashes": raw_member_hashes,
+                            "relation_revision": (
+                                actual["revision"] if actual else None
+                            ),
+                        }),
+                    )
+                    if relation_count:
+                        relation_stream.write(b",")
+                    relation_stream.write(canonical_json(
+                        relation.model_dump(mode="json")
+                    ))
+                    relation_count += 1
+                for relation_id, actual in sorted(actual_relations.items()):
+                    pairs = list(actual.get("outcome_pairs") or [])
+                    members = [CandidateRelationMember(
+                        market_id=str(pair["market_id"]),
+                        condition_id=str(pair["condition_id"]),
+                        outcome_label=str(pair["outcome_label"]),
+                        yes_token_id=str(pair["yes_token_id"]),
+                        no_token_id=str(pair["no_token_id"]),
+                        pair_revision=str(pair["pair_revision"]),
+                        evidence_sha256=content_sha256({
+                            "pair_revision": pair["pair_revision"],
+                            "provenance": pair["provenance"],
+                        }),
+                    ) for pair in pairs]
+                    member_observations = [
+                        market_observed_at[item.market_id]
+                        for item in members
+                        if item.market_id in market_observed_at
+                    ]
+                    same_observation = (
+                        len({item.isoformat() for item in member_observations}) <= 1
+                        and len(member_observations) == len(members)
+                    )
+                    reasons = [
+                        "source_expected_member_count_missing",
+                        "source_relation_group_missing",
+                    ]
+                    if len(members) < 2:
+                        reasons.append("insufficient_members")
+                    if not actual["complete"] or actual["missing_fields"]:
+                        reasons.append("outcome_pairs_incomplete")
+                    if actual["copies_disagree"]:
+                        reasons.append("relation_copies_disagree")
+                    relation = CandidateNegativeRiskRelation(
+                        relation_id=relation_id,
+                        complete=False,
+                        expected_member_count=None,
+                        actual_member_count=len(members),
+                        members=members,
+                        reason_codes=sorted(set(reasons)),
+                        producer_received_at=observed_at,
+                        coherence=CandidateRelationCoherence(
+                            status="incomplete",
+                            catalog_revision=revision,
+                            producer_received_at=observed_at,
+                            member_observed_at_min=(
+                                min(member_observations)
+                                if member_observations else None
+                            ),
+                            member_observed_at_max=(
+                                max(member_observations)
+                                if member_observations else None
+                            ),
+                            all_members_same_catalog_observation=same_observation,
+                        ),
+                        evidence_sha256=content_sha256({
+                            "catalog_revision": revision,
+                            "relation_id": relation_id,
+                            "relation_revision": actual["revision"],
+                            "source_group_missing": True,
+                        }),
+                    )
+                    if relation_count:
+                        relation_stream.write(b",")
+                    relation_stream.write(canonical_json(
+                        relation.model_dump(mode="json")
+                    ))
+                    relation_count += 1
+                relation_stream.write(b"]")
+                relation_stream.flush()
+                os.fsync(relation_stream.fileno())
+
+        with payload_path.open("wb") as payload_stream:
+            payload_stream.write(
+                b'{"candidate_count":' + str(candidate_count).encode("ascii")
+                + b',"candidates":'
+            )
+            with candidates_path.open("rb") as candidates:
+                shutil.copyfileobj(candidates, payload_stream)
+            payload_stream.write(
+                b',"relation_count":' + str(relation_count).encode("ascii")
+                + b',"relations":'
+            )
+            with relations_path.open("rb") as relations:
+                shutil.copyfileobj(relations, payload_stream)
+            payload_stream.write(b"}")
+            payload_stream.flush()
+            os.fsync(payload_stream.fileno())
+        payload_sha256 = _file_sha256(payload_path)
+        source_binding = {
+            "catalog_sha256": str(normalized["sha256"]),
+            "raw_payload_sha256": str(source["raw_payload_sha256"]),
+            "source": "polymarket_gamma",
+            "source_url": source_url,
+        }
+        with output_path.open("wb") as output:
+            output.write(
+                b'{"catalog_revision":' + canonical_json(revision)
+                + b',"observed_at":'
+                + canonical_json(observed_at.isoformat().replace("+00:00", "Z"))
+                + b',"payload":'
+            )
+            with payload_path.open("rb") as payload_stream:
+                shutil.copyfileobj(payload_stream, output)
+            output.write(
+                b',"payload_sha256":' + canonical_json(payload_sha256)
+                + b',"schema_version":'
+                + canonical_json(CANDIDATE_SNAPSHOT_SCHEMA_VERSION)
+                + b',"source":' + canonical_json(source_binding) + b"}"
+            )
+            output.flush()
+            os.fsync(output.fileno())
+        snapshot_sha256 = _file_sha256(output_path)
+        if destination.exists():
+            if _file_sha256(destination) != snapshot_sha256:
+                raise RuntimeError("existing candidate snapshot is not deterministic")
+        else:
+            os.replace(output_path, destination)
+    return {
+        "format": "canonical_json",
+        "schema_version": CANDIDATE_SNAPSHOT_SCHEMA_VERSION,
+        "path": str(destination),
+        "sha256": snapshot_sha256,
+        "payload_sha256": payload_sha256,
+        "catalog_revision": revision,
+        "observed_at": observed_at.isoformat(),
+        "candidate_count": candidate_count,
+        "relation_count": relation_count,
+    }
+
+
 def _atomic_write_catalog(
     path: Path,
     *,
@@ -442,10 +987,17 @@ def _atomic_write_catalog(
             rows=normalized_rows,
             expected_market_count=len(normalized_rows),
         )
+    candidate_snapshot = _write_candidate_snapshot(
+        path.parent,
+        revision=revision,
+        normalized=normalized,
+        source=source,
+    )
     _atomic_write(path, canonical_json({
         "catalog_revision": revision,
         "catalog_source": source,
         "catalog_index": catalog_index,
+        "candidate_snapshot": candidate_snapshot,
         "normalized_catalog": normalized,
         "schema_version": LIVE_SCHEMA_VERSION,
     }))
@@ -512,6 +1064,34 @@ def build_live_catalog_index(root: Path) -> dict[str, Any]:
     payload["catalog_index"] = catalog_index
     _atomic_write(manifest_path, canonical_json(payload))
     return catalog_index
+
+
+def build_live_candidate_snapshot(root: Path) -> dict[str, Any]:
+    """Build and atomically attach the immutable full-catalog candidate view."""
+    root = root.resolve()
+    manifest_path = root / "catalog.json"
+    with _publication_lock(root, exclusive=True):
+        try:
+            manifest_body = manifest_path.read_bytes()
+            payload = json.loads(manifest_body)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("live catalog manifest is unavailable or invalid") from exc
+        normalized = payload.get("normalized_catalog")
+        source = payload.get("catalog_source")
+        revision = str(payload.get("catalog_revision") or "")
+        if not isinstance(normalized, dict) or not isinstance(source, dict):
+            raise RuntimeError("live catalog candidate inputs are unavailable")
+        candidate_snapshot = _write_candidate_snapshot(
+            root,
+            revision=revision,
+            normalized=normalized,
+            source=source,
+        )
+        if manifest_path.read_bytes() != manifest_body:
+            raise RuntimeError("live catalog changed during candidate publication")
+        payload["candidate_snapshot"] = candidate_snapshot
+        _atomic_write(manifest_path, canonical_json(payload))
+    return candidate_snapshot
 
 
 class LiveFactProvenance(BaseModel):
@@ -710,6 +1290,132 @@ class LiveMarket(BaseModel):
         return self
 
 
+class CandidateEvidence(BaseModel):
+    source: Literal["polymarket_gamma"] = "polymarket_gamma"
+    source_url: str
+    raw_payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    normalized_row_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$",
+    )
+    raw_row_in_current_catalog: bool
+    field_paths: list[str] = Field(min_length=1)
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CandidateMarket(BaseModel):
+    market_id: str
+    condition_id: str
+    yes_token_id: str | None = None
+    no_token_id: str | None = None
+    active: bool
+    accepting_orders: bool
+    closed: bool
+    rules_complete: bool
+    binary_yes_no: bool
+    negative_risk: bool
+    negative_risk_relation_id: str | None = None
+    liquidity_num: str | None = None
+    liquidity_source_field: Literal["liquidityNum"] = "liquidityNum"
+    end_time: datetime | None = None
+    evidence: CandidateEvidence
+
+    @model_validator(mode="after")
+    def canonical_binary_and_liquidity(self):
+        token_pair = self.yes_token_id is not None and self.no_token_id is not None
+        if self.binary_yes_no != token_pair:
+            raise ValueError("candidate binary flag disagrees with canonical token pair")
+        if self.yes_token_id is not None and self.yes_token_id == self.no_token_id:
+            raise ValueError("candidate Yes/No token IDs must be distinct")
+        if not self.negative_risk and self.negative_risk_relation_id is not None:
+            raise ValueError("non-negative-risk candidate cannot name a relation")
+        if self.liquidity_num is not None:
+            try:
+                Decimal(self.liquidity_num)
+            except Exception as exc:
+                raise ValueError("candidate liquidityNum is not decimal") from exc
+        return self
+
+
+class CandidateRelationMember(BaseModel):
+    market_id: str
+    condition_id: str
+    outcome_label: str
+    yes_token_id: str
+    no_token_id: str
+    pair_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CandidateRelationCoherence(BaseModel):
+    status: Literal["coherent", "incomplete"]
+    catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    producer_received_at: datetime
+    member_observed_at_min: datetime | None = None
+    member_observed_at_max: datetime | None = None
+    all_members_same_catalog_observation: bool
+
+
+class CandidateNegativeRiskRelation(BaseModel):
+    relation_id: str
+    relation_type: Literal["standard_negative_risk"] = "standard_negative_risk"
+    complete: bool
+    expected_member_count: int | None = Field(default=None, ge=1)
+    actual_member_count: int = Field(ge=0)
+    members: list[CandidateRelationMember]
+    reason_codes: list[str]
+    producer_received_at: datetime
+    coherence: CandidateRelationCoherence
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def counted_members(self):
+        if self.actual_member_count != len(self.members):
+            raise ValueError("candidate relation actual count disagrees with members")
+        if self.complete != (
+            not self.reason_codes
+            and self.expected_member_count is not None
+            and self.actual_member_count == self.expected_member_count
+            and self.actual_member_count >= 2
+            and self.coherence.status == "coherent"
+        ):
+            raise ValueError("candidate relation completeness disagrees")
+        return self
+
+
+class CandidateSnapshotPayload(BaseModel):
+    candidate_count: int = Field(ge=0)
+    candidates: list[CandidateMarket]
+    relation_count: int = Field(ge=0)
+    relations: list[CandidateNegativeRiskRelation]
+
+    @model_validator(mode="after")
+    def counted_payload(self):
+        if self.candidate_count != len(self.candidates):
+            raise ValueError("candidate snapshot market count disagrees")
+        if self.relation_count != len(self.relations):
+            raise ValueError("candidate snapshot relation count disagrees")
+        return self
+
+
+class CandidateSnapshot(BaseModel):
+    schema_version: Literal[
+        "marketcow.polymarket.candidate-snapshot.v1"
+    ] = CANDIDATE_SNAPSHOT_SCHEMA_VERSION
+    catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: datetime
+    payload: CandidateSnapshotPayload
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source: dict[str, Any]
+
+    @model_validator(mode="after")
+    def checksum_bound_payload(self):
+        if self.payload_sha256 != content_sha256(
+            self.payload.model_dump(mode="json")
+        ):
+            raise ValueError("candidate snapshot payload checksum mismatch")
+        return self
+
+
 class LiveBook(BaseModel):
     token_id: str
     condition_id: str
@@ -892,14 +1598,30 @@ class PolymarketLiveReadStore:
         self.catalog_path = self.root / "catalog.json"
         self.normalized_catalog_root = self.root / "catalogs"
         self.catalog_index_root = self.root / "catalog-indexes"
+        self.candidate_snapshot_root = self.root / "candidate-snapshots"
         self.state_index_root = self.root / "indexes"
         self.state_manifest_path = self.root / "state-index.json"
         self.event_path = self.root / "events.jsonl"
         self._binding_cache: tuple[
             str, tuple[int, int], dict[str, Any], Path, Path, dict[str, str]
         ] | None = None
+        self._candidate_binding_cache: tuple[
+            str, tuple[int, int], str
+        ] | None = None
+        self._bootstrap_cache: OrderedDict[
+            tuple[str, tuple[int, int], tuple[str, ...]], LiveBootstrapResponse
+        ] = OrderedDict()
+        self._state_reader = threading.local()
 
     def _manifest_binding(
+        self,
+    ) -> tuple[dict[str, Any], Path, Path, dict[str, str]]:
+        # The manifest is atomically replaced and its referenced catalog/index
+        # files are immutable, so readers do not need to contend with live
+        # event publication.
+        return self._manifest_binding_unlocked()
+
+    def _manifest_binding_unlocked(
         self,
     ) -> tuple[dict[str, Any], Path, Path, dict[str, str]]:
         if not self.catalog_path.exists():
@@ -1017,9 +1739,63 @@ class PolymarketLiveReadStore:
             )
         return selected
 
-    def bootstrap(self, market_ids: Iterable[str]) -> LiveBootstrapResponse:
+    def candidate_snapshot_path(self) -> tuple[Path, dict[str, Any]]:
+        payload, _, _, _ = self._manifest_binding()
+        metadata = payload.get("candidate_snapshot")
+        if not isinstance(metadata, dict):
+            raise PolymarketLiveReadError(
+                "polymarket_candidate_snapshot_unavailable",
+                "Polymarket candidate snapshot has not been materialized",
+                503,
+            )
+        path = Path(str(metadata.get("path") or "")).resolve()
+        revision = str(payload.get("catalog_revision") or "")
+        expected_sha256 = str(metadata.get("sha256") or "")
+        if (
+            not path.is_relative_to(self.candidate_snapshot_root)
+            or metadata.get("schema_version") != CANDIDATE_SNAPSHOT_SCHEMA_VERSION
+            or metadata.get("catalog_revision") != revision
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or not path.is_file()
+        ):
+            raise PolymarketLiveReadError(
+                "polymarket_candidate_snapshot_integrity_failed",
+                "Polymarket candidate snapshot binding is invalid",
+                409,
+            )
+        stat = path.stat()
+        signature = (stat.st_size, stat.st_mtime_ns)
+        cached = self._candidate_binding_cache
+        if cached != (revision, signature, expected_sha256):
+            if _file_sha256(path) != expected_sha256:
+                raise PolymarketLiveReadError(
+                    "polymarket_candidate_snapshot_integrity_failed",
+                    "Polymarket candidate snapshot hash mismatch",
+                    409,
+                )
+            self._candidate_binding_cache = (
+                revision, signature, expected_sha256,
+            )
+        return path, metadata
+
+    def bootstrap(
+        self, market_ids: Iterable[str], *, _bind_live_books: bool = True,
+    ) -> LiveBootstrapResponse:
         selected_ids = self._scope(market_ids)
         payload, normalized_path, index_path, _ = self._manifest_binding()
+        normalized_stat = normalized_path.stat()
+        cache_key = (
+            hashlib.sha256(canonical_json(payload)).hexdigest(),
+            (normalized_stat.st_size, normalized_stat.st_mtime_ns),
+            tuple(selected_ids),
+        )
+        cached = self._bootstrap_cache.get(cache_key)
+        if cached is not None:
+            self._bootstrap_cache.move_to_end(cache_key)
+            return (
+                self._bind_bootstrap_to_live_books(cached)
+                if _bind_live_books else cached
+            )
         placeholders = ",".join("?" for _ in selected_ids)
         try:
             with _readonly_sqlite(index_path) as connection:
@@ -1095,7 +1871,7 @@ class PolymarketLiveReadStore:
                 "Polymarket catalog token index disagrees with selected rows",
                 409,
             )
-        return LiveBootstrapResponse(
+        response = LiveBootstrapResponse(
             catalog_revision=str(payload["catalog_revision"]),
             catalog_source=payload.get("catalog_source"),
             cursor=0,
@@ -1113,8 +1889,20 @@ class PolymarketLiveReadStore:
             },
             source_policy="official_free_only",
         )
+        self._bootstrap_cache[cache_key] = response
+        self._bootstrap_cache.move_to_end(cache_key)
+        while len(self._bootstrap_cache) > 8:
+            self._bootstrap_cache.popitem(last=False)
+        return (
+            self._bind_bootstrap_to_live_books(response)
+            if _bind_live_books else response
+        )
 
     def _state_path(self) -> Path:
+        _, path = self._state_manifest()
+        return path
+
+    def _state_manifest(self) -> tuple[dict[str, Any], Path]:
         if not self.state_manifest_path.is_file():
             raise PolymarketLiveReadError(
                 "polymarket_latest_state_index_unavailable",
@@ -1140,7 +1928,7 @@ class PolymarketLiveReadStore:
                 "Polymarket state index manifest binding is invalid",
                 409,
             )
-        return path
+        return manifest, path
 
     def _validate_state_connection(
         self, path: Path, connection: sqlite3.Connection,
@@ -1176,12 +1964,9 @@ class PolymarketLiveReadStore:
                 "State index is ahead of the durable event log",
                 409,
             )
-        if event_log_size < actual_size:
-            raise PolymarketLiveReadError(
-                "polymarket_state_index_lagging",
-                "State index is behind the durable event log",
-                503,
-            )
+        # A writer durably appends its batch before committing the derived WAL
+        # transaction.  Bytes beyond this metadata boundary are an unpublished
+        # tail; readers remain on the last complete indexed prefix.
         latest_cursor = int(metadata.get("latest_cursor", "0"))
         if (latest_cursor == 0) != (last is None):
             raise PolymarketLiveReadError(
@@ -1200,23 +1985,184 @@ class PolymarketLiveReadStore:
             )
         return metadata
 
+    def _state_reader_connection(self, path: Path) -> sqlite3.Connection:
+        stat = path.stat()
+        signature = (stat.st_dev, stat.st_ino)
+        cached = getattr(self._state_reader, "binding", None)
+        if cached is not None and cached[:2] == (path, signature):
+            return cached[2]
+        if cached is not None:
+            cached[2].close()
+        connection = _readonly_state_sqlite(path)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA busy_timeout=20000")
+        connection.execute("PRAGMA cache_size=-32768")
+        connection.execute("PRAGMA mmap_size=268435456")
+        self._state_reader.binding = (path, signature, connection)
+        return connection
+
+    def _discard_state_reader(self, connection: sqlite3.Connection) -> None:
+        cached = getattr(self._state_reader, "binding", None)
+        if cached is not None and cached[2] is connection:
+            del self._state_reader.binding
+        connection.close()
+
     @contextmanager
     def _state_snapshot(self):
-        path = self._state_path()
-        connection = _readonly_state_sqlite(path)
-        try:
-            connection.execute("BEGIN")
-            yield path, connection, self._validate_state_connection(path, connection)
-        finally:
-            connection.close()
+        revision_error = None
+        for attempt in range(3):
+            path = self._state_path()
+            connection = self._state_reader_connection(path)
+            try:
+                connection.execute("BEGIN")
+                try:
+                    metadata = self._validate_state_connection(path, connection)
+                except PolymarketLiveReadError as exc:
+                    if (
+                        exc.code == "polymarket_state_integrity_failed"
+                        and "revisions disagree" in str(exc)
+                        and attempt < 2
+                    ):
+                        revision_error = exc
+                        connection.rollback()
+                        self._discard_state_reader(connection)
+                        time.sleep(0.01)
+                        continue
+                    raise
+                try:
+                    yield path, connection, metadata
+                finally:
+                    connection.rollback()
+                return
+            except BaseException:
+                connection.rollback()
+                raise
+        if revision_error is not None:  # pragma: no cover - loop always raises
+            raise revision_error
 
     def _state_binding(self) -> tuple[Path, dict[str, str]]:
         with self._state_snapshot() as (path, _, metadata):
             return path, metadata
 
+    @staticmethod
+    def _indexed_book(row: sqlite3.Row) -> LiveBook:
+        body = bytes(row["payload_json"])
+        if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed", "Book payload hash mismatch", 409,
+            )
+        book = LiveBook.model_validate_json(body)
+        if "confirmed_received_at" not in row.keys() or row["confirmed_received_at"] is None:
+            return book
+        confirmation = {
+            "token_id": book.token_id,
+            "exchange_at": str(row["confirmed_exchange_at"]),
+            "received_at": str(row["confirmed_received_at"]),
+            "state_checksum": str(row["confirmed_state_checksum"]),
+            "source_hash": row["confirmed_source_hash"],
+        }
+        if (
+            confirmation["state_checksum"] != book.state_checksum
+            or content_sha256(confirmation) != row["confirmation_sha256"]
+        ):
+            raise PolymarketLiveReadError(
+                "polymarket_state_integrity_failed",
+                "Book freshness confirmation integrity failed",
+                409,
+            )
+        return book.model_copy(update={
+            "exchange_at": _instant(confirmation["exchange_at"]),
+            "received_at": _instant(confirmation["received_at"]),
+            "source_hash": confirmation["source_hash"],
+        })
+
+    def _bind_bootstrap_to_live_books(
+        self,
+        response: LiveBootstrapResponse,
+        *,
+        indexed_books: dict[str, list[LiveBook]] | None = None,
+        state_metadata: dict[str, str] | None = None,
+    ) -> LiveBootstrapResponse:
+        """Project dynamic CLOB tick facts into one scoped catalog boundary.
+
+        Gamma's minimum tick is an initial market fact; Polymarket can tighten
+        it while a market is live. The latest-state index is authoritative for
+        that dynamic instrument fact, while every other catalog field remains
+        bound to the immutable normalized row.
+        """
+        market_ids = [market.identity.market_id for market in response.markets]
+        if not market_ids:
+            return response
+        if indexed_books is None:
+            placeholders = ",".join("?" for _ in market_ids)
+            try:
+                with self._state_snapshot() as (_, connection, metadata):
+                    rows = list(connection.execute(
+                        f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
+                            c.exchange_at AS confirmed_exchange_at,
+                            c.received_at AS confirmed_received_at,
+                            c.state_checksum AS confirmed_state_checksum,
+                            c.source_hash AS confirmed_source_hash,
+                            c.confirmation_sha256
+                            FROM books b LEFT JOIN book_confirmations c
+                            ON c.token_id=b.token_id
+                            WHERE b.market_id IN ({placeholders})""",
+                        market_ids,
+                    ))
+            except PolymarketLiveReadError as exc:
+                if exc.status_code == 503:
+                    return response
+                raise
+            books_by_market: dict[str, list[LiveBook]] = defaultdict(list)
+            for row in rows:
+                books_by_market[str(row["market_id"])].append(
+                    self._indexed_book(row)
+                )
+        else:
+            books_by_market = indexed_books
+            metadata = state_metadata
+        if metadata is None:
+            raise RuntimeError("live book binding requires state metadata")
+        result = response.model_copy(deep=True)
+        result.cursor = int(metadata["latest_cursor"])
+        for market in result.markets:
+            books = books_by_market.get(market.identity.market_id, [])
+            expected_tokens = {outcome.token_id for outcome in market.identity.outcomes}
+            if {book.token_id for book in books} != expected_tokens:
+                continue
+            if any(book.condition_id != market.identity.condition_id for book in books):
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed",
+                    "Live book condition differs from scoped catalog facts",
+                    409,
+                )
+            ticks = {book.tick_size for book in books}
+            if len(ticks) != 1:
+                raise PolymarketLiveReadError(
+                    "polymarket_instrument_book_binding_incomplete",
+                    "Outcome books disagree on the live market tick",
+                    503,
+                )
+            tick = next(iter(ticks))
+            instrument = market.rules.instrument
+            if instrument.price_increment == tick:
+                continue
+            base_revision = instrument.revision
+            instrument.price_increment = tick
+            instrument.revision = content_sha256({
+                "base_revision": base_revision,
+                "live_price_increment": tick,
+                "binding": "polymarket_clob_book_tick_v1",
+            })
+            market.metadata_revision = content_sha256({
+                "base_revision": market.metadata_revision,
+                "instrument_revision": instrument.revision,
+            })
+        return result
+
     def snapshot(self, market_ids: Iterable[str]) -> LiveSnapshotPage:
         selected_ids = self._scope(market_ids)
-        bootstrap = self.bootstrap(selected_ids)
+        bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         relation_ids = sorted({
             pair.market_id
             for market in bootstrap.markets
@@ -1224,7 +2170,11 @@ class PolymarketLiveReadStore:
             for pair in relation.outcome_pairs
             if pair.market_id not in selected_ids
         })
-        related = self.bootstrap(relation_ids).markets if relation_ids else []
+        related_bootstrap = (
+            self.bootstrap(relation_ids, _bind_live_books=False)
+            if relation_ids else None
+        )
+        related = related_bootstrap.markets if related_bootstrap else []
         markets = bootstrap.markets + related
         all_market_ids = [market.identity.market_id for market in markets]
         placeholders = ",".join("?" for _ in all_market_ids)
@@ -1236,22 +2186,43 @@ class PolymarketLiveReadStore:
                     409,
                 )
             book_rows = list(connection.execute(
-                f"SELECT payload_json, payload_sha256 FROM books WHERE market_id IN ({placeholders})",
+                f"""SELECT b.market_id, b.payload_json, b.payload_sha256,
+                    c.exchange_at AS confirmed_exchange_at,
+                    c.received_at AS confirmed_received_at,
+                    c.state_checksum AS confirmed_state_checksum,
+                    c.source_hash AS confirmed_source_hash,
+                    c.confirmation_sha256
+                    FROM books b LEFT JOIN book_confirmations c
+                    ON c.token_id=b.token_id
+                    WHERE b.market_id IN ({placeholders})""",
                 all_market_ids,
             ))
             gap_rows = list(connection.execute(
-                f"SELECT payload_json, payload_sha256 FROM gaps WHERE market_id IN ({placeholders})",
+                f"""SELECT payload_json, payload_sha256 FROM gaps
+                    WHERE market_id IN ({placeholders}) AND resolved=0""",
                 all_market_ids,
             ))
         books = {}
+        books_by_market: dict[str, list[LiveBook]] = defaultdict(list)
         for row in book_rows:
-            body = bytes(row["payload_json"])
-            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
-                raise PolymarketLiveReadError(
-                    "polymarket_state_integrity_failed", "Book payload hash mismatch", 409,
-                )
-            book = LiveBook.model_validate_json(body)
+            book = self._indexed_book(row)
             books[book.token_id] = book
+            books_by_market[str(row["market_id"])].append(book)
+        bootstrap = self._bind_bootstrap_to_live_books(
+            bootstrap,
+            indexed_books=books_by_market,
+            state_metadata=metadata,
+        )
+        related_bootstrap = (
+            self._bind_bootstrap_to_live_books(
+                related_bootstrap,
+                indexed_books=books_by_market,
+                state_metadata=metadata,
+            )
+            if related_bootstrap else None
+        )
+        related = related_bootstrap.markets if related_bootstrap else []
+        markets = bootstrap.markets + related
         gaps = []
         for row in gap_rows:
             body = bytes(row["payload_json"])
@@ -1284,7 +2255,7 @@ class PolymarketLiveReadStore:
         self, market_ids: Iterable[str], after_cursor: int, limit: int,
     ) -> LiveEventPage:
         selected_ids = self._scope(market_ids)
-        bootstrap = self.bootstrap(selected_ids)
+        bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         placeholders = ",".join("?" for _ in selected_ids)
         with self._state_snapshot() as (_, connection, metadata):
             if metadata["catalog_revision"] != bootstrap.catalog_revision:
@@ -1293,6 +2264,34 @@ class PolymarketLiveReadStore:
                     "Scoped catalog and state snapshot revisions disagree",
                     409,
                 )
+            if after_cursor > 0:
+                transition_rows = list(connection.execute(
+                    """SELECT cursor, byte_offset, byte_length, line_sha256
+                       FROM event_offsets
+                       WHERE market_id IS NULL AND cursor > ?
+                       ORDER BY cursor""",
+                    (after_cursor,),
+                ))
+                with self.event_path.open("rb") as stream:
+                    for row in transition_rows:
+                        stream.seek(int(row["byte_offset"]))
+                        line = stream.read(int(row["byte_length"]))
+                        if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
+                            raise PolymarketLiveReadError(
+                                "polymarket_state_integrity_failed",
+                                "Catalog transition event hash mismatch",
+                                409,
+                            )
+                        event = LiveEventEnvelope.model_validate_json(line)
+                        if event.event_type == "catalog_revision":
+                            raise PolymarketLiveReadError(
+                                "resume_cursor_expired",
+                                (
+                                    "Resume cursor predates the current catalog; "
+                                    "perform a fresh scoped snapshot"
+                                ),
+                                409,
+                            )
             rows = list(connection.execute(
                 f"""SELECT * FROM event_offsets
                     WHERE market_id IN ({placeholders}) AND cursor > ?
@@ -1334,7 +2333,7 @@ class PolymarketLiveReadStore:
         self, market_ids: Iterable[str], *, unresolved_only: bool,
     ) -> LiveGapPage:
         selected_ids = self._scope(market_ids)
-        bootstrap = self.bootstrap(selected_ids)
+        bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         placeholders = ",".join("?" for _ in selected_ids)
         resolved_clause = " AND resolved=0" if unresolved_only else ""
         with self._state_snapshot() as (_, connection, metadata):
@@ -1362,7 +2361,7 @@ class PolymarketLiveReadStore:
 
     def checkpoint(self, market_ids: Iterable[str]) -> LiveCheckpoint:
         selected_ids = self._scope(market_ids)
-        bootstrap = self.bootstrap(selected_ids)
+        bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
         placeholders = ",".join("?" for _ in selected_ids)
         with self._state_snapshot() as (_, connection, metadata):
             if metadata["catalog_revision"] != bootstrap.catalog_revision:
@@ -1372,8 +2371,15 @@ class PolymarketLiveReadStore:
                     409,
                 )
             book_rows = list(connection.execute(
-                f"""SELECT token_id, payload_json, payload_sha256 FROM books
-                    WHERE market_id IN ({placeholders}) ORDER BY token_id""",
+                f"""SELECT b.token_id, b.payload_json, b.payload_sha256,
+                    c.exchange_at AS confirmed_exchange_at,
+                    c.received_at AS confirmed_received_at,
+                    c.state_checksum AS confirmed_state_checksum,
+                    c.source_hash AS confirmed_source_hash,
+                    c.confirmation_sha256
+                    FROM books b LEFT JOIN book_confirmations c
+                    ON c.token_id=b.token_id
+                    WHERE b.market_id IN ({placeholders}) ORDER BY b.token_id""",
                 selected_ids,
             ))
             gap_rows = list(connection.execute(
@@ -1384,12 +2390,7 @@ class PolymarketLiveReadStore:
             ))
         books = {}
         for row in book_rows:
-            body = bytes(row["payload_json"])
-            if hashlib.sha256(body).hexdigest() != row["payload_sha256"]:
-                raise PolymarketLiveReadError(
-                    "polymarket_state_integrity_failed", "Book payload hash mismatch", 409,
-                )
-            books[str(row["token_id"])] = LiveBook.model_validate_json(body)
+            books[str(row["token_id"])] = self._indexed_book(row)
         gaps = []
         for row in gap_rows:
             body = bytes(row["payload_json"])
@@ -1423,7 +2424,7 @@ class PolymarketLiveReadStore:
             )
             return LiveReadHealth(status=status, reason_codes=[exc.code])
         try:
-            state_path, state_metadata = self._state_binding()
+            state_manifest, _ = self._state_manifest()
         except PolymarketLiveReadError as exc:
             return LiveReadHealth(
                 status="degraded",
@@ -1434,19 +2435,46 @@ class PolymarketLiveReadStore:
                 token_count=int(metadata["token_count"]),
                 reason_codes=[exc.code],
             )
-        recovery_active = bool(state_metadata.get("active_recovery_id"))
-        with _readonly_state_sqlite(state_path) as connection:
-            book_token_count = int(
-                connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+        summary_keys = {
+            "catalog_revision", "latest_cursor", "active_recovery_id",
+            "book_token_count", "book_complete_market_count",
+            "unresolved_gap_count",
+        }
+        if summary_keys.issubset(state_manifest):
+            state_metadata = state_manifest
+            if state_metadata["catalog_revision"] != metadata["catalog_revision"]:
+                return LiveReadHealth(
+                    status="degraded",
+                    catalog_revision=metadata["catalog_revision"],
+                    catalog_index_ready=True,
+                    latest_state_ready=False,
+                    market_count=int(metadata["market_count"]),
+                    token_count=int(metadata["token_count"]),
+                    reason_codes=["polymarket_state_integrity_failed"],
+                )
+            book_token_count = int(state_metadata["book_token_count"])
+            book_complete_market_count = int(
+                state_metadata["book_complete_market_count"]
             )
-            book_complete_market_count = int(connection.execute(
-                "SELECT COUNT(*) FROM ("
-                "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
-                ")"
-            ).fetchone()[0])
-            unresolved_gap_count = int(connection.execute(
-                "SELECT COUNT(*) FROM gaps WHERE resolved=0"
-            ).fetchone()[0])
+            unresolved_gap_count = int(state_metadata["unresolved_gap_count"])
+        else:
+            # Compatibility for an index published by an older writer. The next
+            # committed batch upgrades the manifest and removes these scans from
+            # the request path.
+            state_path, state_metadata = self._state_binding()
+            with _readonly_state_sqlite(state_path) as connection:
+                book_token_count = int(
+                    connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+                )
+                book_complete_market_count = int(connection.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
+                    ")"
+                ).fetchone()[0])
+                unresolved_gap_count = int(connection.execute(
+                    "SELECT COUNT(*) FROM gaps WHERE resolved=0"
+                ).fetchone()[0])
+        recovery_active = bool(state_metadata.get("active_recovery_id"))
         return LiveReadHealth(
             status="degraded" if recovery_active else "index_ready",
             catalog_revision=metadata["catalog_revision"],
@@ -1472,16 +2500,72 @@ def _gap_identity(gap: GapEntry) -> str:
 class LiveStateIndex:
     """Mutable derived state; the append-only event log remains authoritative."""
 
+    rebuild_batch_size = 1_000
+
     def __init__(self, root: Path):
         self.root = root.resolve()
         self.path = self.root / "indexes" / "latest-state.sqlite3"
         self.manifest_path = self.root / "state-index.json"
+        self._batch_state = threading.local()
+        self._writer_lock = threading.RLock()
+        self._writer: sqlite3.Connection | None = None
+
+    def _writer_connection(self) -> sqlite3.Connection:
+        if self._writer is None:
+            initialize = not self.path.exists()
+            connection = sqlite3.connect(
+                self.path, timeout=30, check_same_thread=False,
+            )
+            if initialize:
+                self._schema(connection)
+            else:
+                # Rebuilds use DELETE mode for an atomic standalone temporary
+                # file. Promote the published file once, when the live writer
+                # opens it; otherwise every hot transaction excludes API reads.
+                connection.execute("PRAGMA journal_mode=WAL")
+                # The event log is fsynced before this derived index commits.
+                # NORMAL keeps the WAL transaction atomic while allowing crash
+                # recovery to replay a durable log tail if the derived pages lag.
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA busy_timeout=30000")
+            self._writer = connection
+        return self._writer
+
+    def close(self) -> None:
+        """Close the process-lifetime WAL writer, primarily for rebuilds/tests."""
+        with self._writer_lock:
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None
+
+    @contextmanager
+    def batch(self):
+        """Commit a writer-visible event batch at one SQLite boundary."""
+        if getattr(self._batch_state, "connection", None) is not None:
+            yield
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._writer_lock:
+            connection = self._writer_connection()
+            self._batch_state.connection = connection
+            published_metadata = None
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield
+                connection.commit()
+                published_metadata = self._metadata(connection)
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                del self._batch_state.connection
+        self._publish_manifest(published_metadata)
 
     @staticmethod
     def _schema(connection: sqlite3.Connection, *, wal: bool = True) -> None:
         connection.execute(f"PRAGMA journal_mode={'WAL' if wal else 'DELETE'}")
         connection.executescript("""
-            PRAGMA synchronous=FULL;
+            PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             ) WITHOUT ROWID;
@@ -1491,6 +2575,11 @@ class LiveStateIndex:
                 payload_sha256 TEXT NOT NULL
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS books_market_id ON books(market_id, token_id);
+            CREATE TABLE IF NOT EXISTS book_confirmations (
+                token_id TEXT PRIMARY KEY, exchange_at TEXT NOT NULL,
+                received_at TEXT NOT NULL, state_checksum TEXT NOT NULL,
+                source_hash TEXT, confirmation_sha256 TEXT NOT NULL
+            ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS gaps (
                 gap_id TEXT PRIMARY KEY, market_id TEXT,
                 token_id TEXT, cursor INTEGER NOT NULL,
@@ -1507,6 +2596,57 @@ class LiveStateIndex:
                 ON event_offsets(market_id, cursor);
         """)
 
+    def ensure_runtime_schema(self) -> None:
+        """Apply small forward-compatible tables once, never in the hot batch path."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _publication_lock(self.root, exclusive=True):
+            with sqlite3.connect(self.path, timeout=30) as connection:
+                connection.execute("PRAGMA busy_timeout=30000")
+                connection.execute("""CREATE TABLE IF NOT EXISTS book_confirmations (
+                    token_id TEXT PRIMARY KEY, exchange_at TEXT NOT NULL,
+                    received_at TEXT NOT NULL, state_checksum TEXT NOT NULL,
+                    source_hash TEXT, confirmation_sha256 TEXT NOT NULL
+                ) WITHOUT ROWID""")
+                connection.commit()
+
+    def confirm_book(self, book: LiveBook) -> None:
+        """Publish freshness for unchanged content without another full book event."""
+        connection = getattr(self._batch_state, "connection", None)
+        owns_connection = connection is None
+        if owns_connection:
+            connection = self._writer_connection()
+        confirmation = {
+            "token_id": book.token_id,
+            "exchange_at": book.exchange_at.isoformat(),
+            "received_at": book.received_at.isoformat(),
+            "state_checksum": book.state_checksum,
+            "source_hash": book.source_hash,
+        }
+        try:
+            connection.execute(
+                """INSERT INTO book_confirmations(
+                    token_id, exchange_at, received_at, state_checksum,
+                    source_hash, confirmation_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(token_id) DO UPDATE SET
+                    exchange_at=excluded.exchange_at,
+                    received_at=excluded.received_at,
+                    state_checksum=excluded.state_checksum,
+                    source_hash=excluded.source_hash,
+                    confirmation_sha256=excluded.confirmation_sha256""",
+                (
+                    book.token_id, confirmation["exchange_at"],
+                    confirmation["received_at"], book.state_checksum,
+                    book.source_hash, content_sha256(confirmation),
+                ),
+            )
+            if owns_connection:
+                connection.commit()
+        except BaseException:
+            if owns_connection:
+                connection.rollback()
+            raise
+
     @staticmethod
     def _metadata(connection: sqlite3.Connection) -> dict[str, str]:
         return {
@@ -1522,10 +2662,39 @@ class LiveStateIndex:
             [(key, str(value)) for key, value in sorted(values.items())],
         )
 
-    def _publish_manifest(self) -> None:
+    @staticmethod
+    def _health_counts(connection: sqlite3.Connection) -> dict[str, int]:
+        return {
+            "book_token_count": int(
+                connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+            ),
+            "book_complete_market_count": int(connection.execute(
+                "SELECT COUNT(*) FROM ("
+                "SELECT market_id FROM books GROUP BY market_id HAVING COUNT(*) = 2"
+                ")"
+            ).fetchone()[0]),
+            "unresolved_gap_count": int(connection.execute(
+                "SELECT COUNT(*) FROM gaps WHERE resolved=0"
+            ).fetchone()[0]),
+        }
+
+    def _publish_manifest(self, metadata: dict[str, str] | None = None) -> None:
+        if metadata is None:
+            with sqlite3.connect(self.path) as connection:
+                metadata = self._metadata(connection)
+        summary = {
+            key: metadata[key]
+            for key in (
+                "catalog_revision", "latest_cursor", "active_recovery_id",
+                "book_token_count", "book_complete_market_count",
+                "unresolved_gap_count",
+            )
+            if key in metadata
+        }
         _atomic_write(self.manifest_path, canonical_json({
             "schema_version": STATE_INDEX_SCHEMA_VERSION,
             "path": str(self.path),
+            **summary,
         }))
 
     def append(
@@ -1541,10 +2710,16 @@ class LiveStateIndex:
         event_log_size: int,
         token_to_market: dict[str, str],
         active_recovery_id: str | None,
+        book_token_count: int | None = None,
+        book_complete_market_count: int | None = None,
+        unresolved_gap_count: int | None = None,
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as connection:
-            self._schema(connection)
+        connection = getattr(self._batch_state, "connection", None)
+        owns_connection = connection is None
+        if owns_connection:
+            connection = self._writer_connection()
+        try:
             metadata = self._metadata(connection)
             previous_cursor = int(metadata.get("latest_cursor", "0"))
             if previous_cursor != event.cursor - 1:
@@ -1574,6 +2749,10 @@ class LiveStateIndex:
                         hashlib.sha256(body).hexdigest(),
                     ),
                 )
+                connection.execute(
+                    "DELETE FROM book_confirmations WHERE token_id=?",
+                    (book.token_id,),
+                )
             for gap in gaps:
                 body = canonical_json(gap.model_dump(mode="json"))
                 market_id = token_to_market.get(gap.token_id or "")
@@ -1602,15 +2781,30 @@ class LiveStateIndex:
                         f"UPDATE gaps SET resolved=1 WHERE token_id IN ({placeholders})",
                         recovered,
                     )
+            health_metadata = {
+                key: value for key, value in {
+                    "book_token_count": book_token_count,
+                    "book_complete_market_count": book_complete_market_count,
+                    "unresolved_gap_count": unresolved_gap_count,
+                }.items() if value is not None
+            }
             self._set_metadata(connection, {
                 "schema_version": STATE_INDEX_SCHEMA_VERSION,
                 "catalog_revision": catalog_revision or "",
                 "latest_cursor": event.cursor,
                 "event_log_size": event_log_size,
                 "active_recovery_id": active_recovery_id or "",
+                **health_metadata,
             })
-            connection.commit()
-        self._publish_manifest()
+            if owns_connection:
+                connection.commit()
+                published_metadata = self._metadata(connection)
+        except BaseException:
+            if owns_connection:
+                connection.rollback()
+            raise
+        if owns_connection:
+            self._publish_manifest(published_metadata)
 
     def rebuild(
         self,
@@ -1622,6 +2816,7 @@ class LiveStateIndex:
         token_to_market: dict[str, str],
         active_recovery_id: str | None = None,
     ) -> None:
+        self.close()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         temporary.unlink(missing_ok=True)
@@ -1695,11 +2890,403 @@ class LiveStateIndex:
                     "latest_cursor": latest_cursor,
                     "event_log_size": event_log_size,
                     "active_recovery_id": active_recovery_id or "",
+                    "book_token_count": len(books),
+                    "book_complete_market_count": len({
+                        market_id for market_id in token_to_market.values()
+                        if sum(
+                            indexed_market_id == market_id
+                            for indexed_market_id in (
+                                token_to_market.get(token_id)
+                                for token_id in books
+                            )
+                        ) == 2
+                    }),
+                    "unresolved_gap_count": sum(not gap.resolved for gap in gaps),
                 })
                 connection.commit()
             os.replace(temporary, self.path)
         finally:
             temporary.unlink(missing_ok=True)
+        self._publish_manifest()
+
+    @staticmethod
+    def _commit_rebuild_batch(
+        connection: sqlite3.Connection, values: dict[str, Any],
+    ) -> None:
+        """Persist one restart-safe rebuild boundary."""
+        LiveStateIndex._set_metadata(connection, values)
+        connection.commit()
+
+    @staticmethod
+    def _checkpoint_matches_index(
+        connection: sqlite3.Connection,
+        checkpoint: LiveCheckpoint,
+        token_to_market: dict[str, str] | None = None,
+    ) -> bool:
+        expected_books = sorted(
+            (token_id, canonical_json(book.model_dump(mode="json")))
+            for token_id, book in checkpoint.books.items()
+        )
+        observed_books = [
+            (str(row[0]), bytes(row[1]))
+            for row in connection.execute(
+                "SELECT token_id, payload_json FROM books ORDER BY token_id"
+            )
+        ]
+        expected_gaps: dict[str, bytes] = {}
+        for gap in checkpoint.unresolved_gaps:
+            gap_id = _gap_identity(gap)
+            body = canonical_json(gap.model_dump(mode="json"))
+            if gap_id in expected_gaps and expected_gaps[gap_id] != body:
+                return False
+            expected_gaps[gap_id] = body
+        observed_gaps = {
+            str(row[0]): bytes(row[1])
+            for row in connection.execute(
+                "SELECT gap_id, payload_json FROM gaps WHERE resolved=0"
+            )
+        }
+        # The mutable writer may retain repeated, byte-identical gap entries;
+        # the derived index deliberately collapses them by semantic gap identity.
+        if (
+            expected_books != observed_books
+            or any(expected_gaps.get(key) != body for key, body in observed_gaps.items())
+        ):
+            return False
+        if token_to_market is None:
+            return expected_gaps == observed_gaps
+        for gap in checkpoint.unresolved_gaps:
+            gap_id = _gap_identity(gap)
+            if gap_id in observed_gaps:
+                continue
+            body = expected_gaps[gap_id]
+            connection.execute(
+                """INSERT INTO gaps(
+                    gap_id, market_id, token_id, cursor, payload_json,
+                    payload_sha256, resolved
+                ) VALUES (?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(gap_id) DO UPDATE SET
+                    market_id=excluded.market_id,
+                    token_id=excluded.token_id,
+                    cursor=excluded.cursor,
+                    payload_json=excluded.payload_json,
+                    payload_sha256=excluded.payload_sha256,
+                    resolved=0""",
+                (
+                    gap_id, token_to_market.get(gap.token_id or ""), gap.token_id,
+                    checkpoint.cursor, body, hashlib.sha256(body).hexdigest(),
+                ),
+            )
+            observed_gaps[gap_id] = body
+        return expected_gaps == observed_gaps
+
+    @staticmethod
+    def _resume_rebuild(
+        connection: sqlite3.Connection,
+        *,
+        event_path: Path,
+        catalog_revision: str,
+        checkpoint_sha256: str,
+    ) -> tuple[int, int, str | None, bool] | None:
+        metadata = LiveStateIndex._metadata(connection)
+        if any(
+            metadata.get(key) != expected
+            for key, expected in {
+                "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                "build_status": "in_progress",
+                "catalog_revision": catalog_revision,
+                "checkpoint_sha256": checkpoint_sha256,
+            }.items()
+        ):
+            return None
+        try:
+            latest_cursor = int(metadata["latest_cursor"])
+            event_log_size = int(metadata["event_log_size"])
+            count, minimum, maximum = connection.execute(
+                "SELECT COUNT(*), MIN(cursor), MAX(cursor) FROM event_offsets"
+            ).fetchone()
+        except (KeyError, TypeError, ValueError, sqlite3.DatabaseError):
+            return None
+        if (
+            event_log_size < 0
+            or (latest_cursor == 0 and count != 0)
+            or (
+                latest_cursor > 0
+                and (count != latest_cursor or minimum != 1 or maximum != latest_cursor)
+            )
+        ):
+            return None
+        if latest_cursor:
+            row = connection.execute(
+                """SELECT byte_offset, byte_length, line_sha256
+                   FROM event_offsets WHERE cursor=?""",
+                (latest_cursor,),
+            ).fetchone()
+            if row is None or int(row[0]) + int(row[1]) != event_log_size:
+                return None
+            try:
+                with event_path.open("rb") as stream:
+                    stream.seek(int(row[0]))
+                    line = stream.read(int(row[1]))
+            except OSError:
+                return None
+            if (
+                len(line) != int(row[1])
+                or hashlib.sha256(line).hexdigest() != row[2]
+            ):
+                return None
+        elif event_log_size != 0:
+            return None
+        return (
+            latest_cursor,
+            event_log_size,
+            metadata.get("active_recovery_id") or None,
+            metadata.get("checkpoint_verified") == "1",
+        )
+
+    def rebuild_from_durable(
+        self,
+        *,
+        event_path: Path,
+        checkpoint: LiveCheckpoint | None,
+        checkpoint_sha256: str,
+        catalog_revision: str,
+        token_to_market: dict[str, str],
+        batch_size: int | None = None,
+    ) -> None:
+        """Single-pass, restart-safe rebuild from verified durable evidence."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.rebuild")
+        batch_size = max(1, batch_size or self.rebuild_batch_size)
+
+        resume = None
+        if temporary.exists():
+            try:
+                with sqlite3.connect(temporary) as connection:
+                    resume = self._resume_rebuild(
+                        connection,
+                        event_path=event_path,
+                        catalog_revision=catalog_revision,
+                        checkpoint_sha256=checkpoint_sha256,
+                    )
+            except sqlite3.DatabaseError:
+                resume = None
+            if resume is None:
+                temporary.unlink()
+
+        with sqlite3.connect(temporary) as connection:
+            self._schema(connection, wal=False)
+            if resume is None:
+                latest_cursor = 0
+                event_log_size = 0
+                active_recovery_id = None
+                checkpoint_verified = checkpoint is None
+                if checkpoint is not None and checkpoint.cursor == 0:
+                    checkpoint_verified = self._checkpoint_matches_index(
+                        connection, checkpoint, token_to_market,
+                    )
+                    if not checkpoint_verified:
+                        raise RuntimeError(
+                            "live checkpoint state disagrees with event replay"
+                        )
+                self._commit_rebuild_batch(connection, {
+                    "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                    "build_status": "in_progress",
+                    "catalog_revision": catalog_revision,
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "checkpoint_verified": int(checkpoint_verified),
+                    "latest_cursor": 0,
+                    "event_log_size": 0,
+                    "active_recovery_id": "",
+                })
+            else:
+                (
+                    latest_cursor, event_log_size, active_recovery_id,
+                    checkpoint_verified,
+                ) = resume
+
+            processed = 0
+            if event_path.exists():
+                with event_path.open("rb") as stream:
+                    stream.seek(event_log_size)
+                    while True:
+                        byte_offset = stream.tell()
+                        line = stream.readline()
+                        if not line:
+                            event_log_size = stream.tell()
+                            break
+                        if not line.endswith(b"\n"):
+                            raise RuntimeError(
+                                "live event log ends with a partial row"
+                            )
+                        try:
+                            event = LiveEventEnvelope.model_validate_json(line)
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                "live event log contains invalid JSON"
+                            ) from exc
+                        LiveStateStore._validate_event(event, latest_cursor + 1)
+                        connection.execute(
+                            """INSERT INTO event_offsets(
+                                cursor, byte_offset, byte_length, event_id,
+                                market_id, token_id, line_sha256
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                event.cursor, byte_offset, len(line), event.event_id,
+                                event.market_id, event.token_id,
+                                hashlib.sha256(line).hexdigest(),
+                            ),
+                        )
+                        if (
+                            event.applied and event.token_id
+                            and event.event_type in {
+                                "book", "price_change", "best_bid_ask",
+                                "last_trade_price", "tick_size_change",
+                            }
+                        ):
+                            book = LiveBook.model_validate(event.canonical_payload)
+                            body = canonical_json(book.model_dump(mode="json"))
+                            connection.execute(
+                                """INSERT INTO books(
+                                    token_id, market_id, cursor,
+                                    payload_json, payload_sha256
+                                ) VALUES (?, ?, ?, ?, ?)
+                                ON CONFLICT(token_id) DO UPDATE SET
+                                    market_id=excluded.market_id,
+                                    cursor=excluded.cursor,
+                                    payload_json=excluded.payload_json,
+                                    payload_sha256=excluded.payload_sha256""",
+                                (
+                                    event.token_id,
+                                    event.market_id
+                                    or token_to_market.get(event.token_id) or "",
+                                    event.cursor, body,
+                                    hashlib.sha256(body).hexdigest(),
+                                ),
+                            )
+                        for gap in event.gaps:
+                            body = canonical_json(gap.model_dump(mode="json"))
+                            connection.execute(
+                                """INSERT INTO gaps(
+                                    gap_id, market_id, token_id, cursor,
+                                    payload_json, payload_sha256, resolved
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                ON CONFLICT(gap_id) DO UPDATE SET
+                                    market_id=excluded.market_id,
+                                    cursor=excluded.cursor,
+                                    payload_json=excluded.payload_json,
+                                    payload_sha256=excluded.payload_sha256,
+                                    resolved=excluded.resolved""",
+                                (
+                                    _gap_identity(gap),
+                                    token_to_market.get(gap.token_id or ""),
+                                    gap.token_id, event.cursor, body,
+                                    hashlib.sha256(body).hexdigest(),
+                                    int(gap.resolved),
+                                ),
+                            )
+                        if event.event_type == "recovery_completed" and event.applied:
+                            recovered = list(
+                                event.canonical_payload.get(
+                                    "resolved_gap_token_ids"
+                                )
+                                or event.canonical_payload.get(
+                                    "recovered_token_ids"
+                                )
+                                or []
+                            )
+                            if recovered:
+                                placeholders = ",".join("?" for _ in recovered)
+                                recovery_id = str(
+                                    event.canonical_payload.get("recovery_id") or ""
+                                )
+                                rows = connection.execute(
+                                    f"""SELECT gap_id, payload_json FROM gaps
+                                        WHERE token_id IN ({placeholders})
+                                        AND resolved=0""",
+                                    recovered,
+                                ).fetchall()
+                                for gap_id, payload_json in rows:
+                                    gap = GapEntry.model_validate_json(payload_json)
+                                    gap.resolved = True
+                                    gap.resolution = (
+                                        f"rest_books_snapshot:{recovery_id}"
+                                    )
+                                    body = canonical_json(
+                                        gap.model_dump(mode="json")
+                                    )
+                                    connection.execute(
+                                        """UPDATE gaps SET
+                                            payload_json=?, payload_sha256=?,
+                                            resolved=1 WHERE gap_id=?""",
+                                        (
+                                            body,
+                                            hashlib.sha256(body).hexdigest(),
+                                            gap_id,
+                                        ),
+                                    )
+                            active_recovery_id = None
+                        elif event.event_type == "recovery_started" and event.applied:
+                            active_recovery_id = str(
+                                event.canonical_payload.get("recovery_id") or ""
+                            ) or None
+
+                        latest_cursor = event.cursor
+                        event_log_size = stream.tell()
+                        processed += 1
+                        if checkpoint is not None and event.cursor == checkpoint.cursor:
+                            checkpoint_verified = self._checkpoint_matches_index(
+                                connection, checkpoint, token_to_market,
+                            )
+                            if not checkpoint_verified:
+                                raise RuntimeError(
+                                    "live checkpoint state disagrees with event replay"
+                                )
+                        if processed % batch_size == 0:
+                            self._commit_rebuild_batch(connection, {
+                                "latest_cursor": latest_cursor,
+                                "event_log_size": event_log_size,
+                                "active_recovery_id": active_recovery_id or "",
+                                "checkpoint_verified": int(checkpoint_verified),
+                            })
+
+            if checkpoint is not None and not checkpoint_verified:
+                raise RuntimeError(
+                    "live checkpoint cursor exceeds verified event log"
+                )
+
+            for token_id, market_id in connection.execute(
+                "SELECT token_id, market_id FROM books"
+            ).fetchall():
+                expected_market_id = token_to_market.get(str(token_id))
+                if expected_market_id is None:
+                    connection.execute(
+                        "DELETE FROM books WHERE token_id=?", (token_id,)
+                    )
+                elif market_id != expected_market_id:
+                    connection.execute(
+                        "UPDATE books SET market_id=? WHERE token_id=?",
+                        (expected_market_id, token_id),
+                    )
+            self._commit_rebuild_batch(connection, {
+                "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                "build_status": "complete",
+                "catalog_revision": catalog_revision,
+                "checkpoint_sha256": checkpoint_sha256,
+                "checkpoint_verified": int(checkpoint_verified),
+                "latest_cursor": latest_cursor,
+                "event_log_size": event_log_size,
+                "active_recovery_id": active_recovery_id or "",
+                **self._health_counts(connection),
+            })
+
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        # This is an offline operation. Stale sidecars belong to the database
+        # being replaced and must never be replayed over the completed rebuild.
+        for suffix in ("-wal", "-shm"):
+            self.path.with_name(f"{self.path.name}{suffix}").unlink(missing_ok=True)
+        os.replace(temporary, self.path)
         self._publish_manifest()
 
 
@@ -2366,6 +3953,7 @@ class ClobBooksClient:
         token_ids: Iterable[str],
         *,
         batch_consumer: Callable[[list[dict[str, Any]]], None] | None = None,
+        require_complete_batches: bool = False,
     ) -> list[dict[str, Any]]:
         tokens = list(dict.fromkeys(str(item) for item in token_ids))
         rows = []
@@ -2380,35 +3968,75 @@ class ClobBooksClient:
                 {"token_id": token}
                 for token in tokens[start:start + self.batch_size]
             ]
-            attempts = 0
+            batch_payload: list[dict[str, Any]] = []
+            coverage_attempts = 0
             while True:
-                response = self.requester(
-                    self.endpoint, json=request_body, timeout=self.timeout,
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "MarketCow/0.2",
-                    },
-                )
-                if response.status_code != 429 and response.status_code < 500:
+                attempts = 0
+                while True:
+                    try:
+                        response = self.requester(
+                            self.endpoint, json=request_body, timeout=self.timeout,
+                            headers={
+                                "Content-Type": "application/json",
+                                "User-Agent": "MarketCow/0.2",
+                            },
+                        )
+                    except requests.RequestException:
+                        if attempts >= self.max_retries_per_batch:
+                            raise
+                        attempts += 1
+                        retry_count += 1
+                        continue
+                    if response.status_code != 429 and response.status_code < 500:
+                        break
+                    if attempts >= self.max_retries_per_batch:
+                        response.raise_for_status()
+                    attempts += 1
+                    retry_count += 1
+                    retry_after = min(
+                        8.0,
+                        float(
+                            response.headers.get("Retry-After")
+                            or 2 ** (attempts - 1)
+                        ),
+                    )
+                    self.sleeper(retry_after)
+                response.raise_for_status()
+                payload = json.loads(response.text, parse_float=str, parse_int=str)
+                if not isinstance(payload, list):
+                    raise RuntimeError("CLOB /books response must be a list")
+                if any(not isinstance(row, dict) for row in payload):
+                    raise RuntimeError("CLOB /books response rows must be objects")
+                batch_payload.extend(payload)
+                if not require_complete_batches:
                     break
-                if attempts >= self.max_retries_per_batch:
-                    response.raise_for_status()
-                attempts += 1
+                requested = {item["token_id"] for item in request_body}
+                received = {
+                    str(row.get("asset_id") or row.get("token_id") or "")
+                    for row in payload
+                }
+                unexpected = received - requested - {""}
+                if unexpected:
+                    raise RuntimeError(
+                        "CLOB /books response contains an unexpected token"
+                    )
+                missing = requested - received
+                if not missing:
+                    break
+                if coverage_attempts >= self.max_retries_per_batch:
+                    raise RuntimeError(
+                        "CLOB /books response omitted requested tokens after retries"
+                    )
+                coverage_attempts += 1
                 retry_count += 1
-                retry_after = min(
-                    8.0,
-                    float(response.headers.get("Retry-After") or 2 ** (attempts - 1)),
-                )
-                self.sleeper(retry_after)
-            response.raise_for_status()
-            payload = json.loads(response.text, parse_float=str, parse_int=str)
-            if not isinstance(payload, list):
-                raise RuntimeError("CLOB /books response must be a list")
-            received_book_count += len(payload)
+                request_body = [
+                    {"token_id": token} for token in sorted(missing)
+                ]
+            received_book_count += len(batch_payload)
             if batch_consumer is None:
-                rows.extend(payload)
+                rows.extend(batch_payload)
             else:
-                batch_consumer(payload)
+                batch_consumer(batch_payload)
             evidence = {
                 "batches": batch_number, "batch_count": batch_count,
                 "requested_token_count": len(tokens),
@@ -2500,9 +4128,11 @@ class LiveStateStore:
         self.catalog: dict[str, LiveMarket] = {}
         self.token_to_market: dict[str, str] = {}
         self.books: dict[str, LiveBook] = {}
+        self._rest_refresh_generation: dict[str, datetime] = {}
         self.gaps: list[GapEntry] = []
         self.events: deque[LiveEventEnvelope] = deque(maxlen=self.replay_capacity)
         self.seen_raw_hashes: set[str] = set()
+        self._seen_raw_hash_order: deque[str] = deque()
         self.active_recovery_id: str | None = None
         self.cursor = 0
         self.catalog_revision: str | None = None
@@ -2513,19 +4143,65 @@ class LiveStateStore:
         self._event_offset = 0
         self._last_log_cursor = 0
         self._sync_lock = threading.RLock()
+        self._event_batch_state = threading.local()
         # API construction must not deserialize the multi-GB catalog or replay the
         # event log. Stateful operations retain compatibility through _ensure_loaded.
         self._recovered = False
 
+    def _remember_raw_hash(self, raw_hash: str) -> None:
+        if raw_hash in self.seen_raw_hashes:
+            return
+        self.seen_raw_hashes.add(raw_hash)
+        self._seen_raw_hash_order.append(raw_hash)
+        while len(self._seen_raw_hash_order) > self.replay_capacity:
+            expired = self._seen_raw_hash_order.popleft()
+            self.seen_raw_hashes.discard(expired)
+
+    @contextmanager
+    def durable_event_batch(self):
+        """Append a group of events with one durable flush.
+
+        The durable log is entered after the SQLite batch, so it flushes before
+        the derived index commits.  A failed batch truncates its unpublished
+        tail while the publication lock is still held.
+        """
+        if getattr(self._event_batch_state, "stream", None) is not None:
+            yield
+            return
+        self.event_path.parent.mkdir(parents=True, exist_ok=True)
+        stream = self.event_path.open("a+b")
+        stream.seek(0, os.SEEK_END)
+        initial_offset = stream.tell()
+        self._event_batch_state.stream = stream
+        try:
+            yield
+            if stream.tell() != initial_offset:
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            stream.seek(initial_offset)
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+            raise
+        finally:
+            del self._event_batch_state.stream
+            stream.close()
+
     def _append(self, value: dict[str, Any]) -> tuple[int, int, str]:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
         body = canonical_json(value) + b"\n"
-        with self.event_path.open("ab") as stream:
+        stream = getattr(self._event_batch_state, "stream", None)
+        if stream is not None:
             byte_offset = stream.tell()
             stream.write(body)
-            stream.flush()
-            os.fsync(stream.fileno())
-        return byte_offset, len(body), hashlib.sha256(body).hexdigest()
+            return byte_offset, len(body), hashlib.sha256(body).hexdigest()
+        with self.event_path.open("ab") as standalone:
+            byte_offset = standalone.tell()
+            standalone.write(body)
+            standalone.flush()
+            os.fsync(standalone.fileno())
+            return byte_offset, len(body), hashlib.sha256(body).hexdigest()
 
     def replace_catalog(
         self,
@@ -2575,35 +4251,36 @@ class LiveStateStore:
                 _atomic_write(next_raw_catalog_path, raw_body)
         if _file_sha256(next_raw_catalog_path) != raw_sha256:
             raise RuntimeError("live raw catalog integrity failed before publication")
-        _atomic_write_catalog(
-            self.catalog_path, revision=revision, markets=markets,
-            source=next_catalog_source,
-        )
-        self.catalog = by_id
-        self.token_to_market = next_token_to_market
-        self.catalog_revision = revision
-        self.raw_catalog_path = next_raw_catalog_path
-        self.catalog_source = next_catalog_source
-        self._catalog_file_sha256 = _file_sha256(self.catalog_path)
-        next_tokens = set(next_token_to_market)
-        added_tokens = sorted(next_tokens - previous_tokens)
-        removed_tokens = sorted(previous_tokens - next_tokens)
-        token_changes = {
-            "added_count": len(added_tokens),
-            "removed_count": len(removed_tokens),
-            "added_sha256": content_sha256(added_tokens),
-            "removed_sha256": content_sha256(removed_tokens),
-            "requires_bootstrap": True,
-        }
-        self._emit(
-            "catalog_revision",
-            {"catalog_revision": revision, "token_changes": token_changes},
-            {
-                "catalog_source": self.catalog_source,
-                "market_count": raw_market_count,
-            },
-            applied=True,
-        )
+        with _publication_lock(self.root, exclusive=True):
+            _atomic_write_catalog(
+                self.catalog_path, revision=revision, markets=markets,
+                source=next_catalog_source,
+            )
+            self.catalog = by_id
+            self.token_to_market = next_token_to_market
+            self.catalog_revision = revision
+            self.raw_catalog_path = next_raw_catalog_path
+            self.catalog_source = next_catalog_source
+            self._catalog_file_sha256 = _file_sha256(self.catalog_path)
+            next_tokens = set(next_token_to_market)
+            added_tokens = sorted(next_tokens - previous_tokens)
+            removed_tokens = sorted(previous_tokens - next_tokens)
+            token_changes = {
+                "added_count": len(added_tokens),
+                "removed_count": len(removed_tokens),
+                "added_sha256": content_sha256(added_tokens),
+                "removed_sha256": content_sha256(removed_tokens),
+                "requires_bootstrap": True,
+            }
+            self._emit(
+                "catalog_revision",
+                {"catalog_revision": revision, "token_changes": token_changes},
+                {
+                    "catalog_source": self.catalog_source,
+                    "market_count": raw_market_count,
+                },
+                applied=True, _publication_locked=True,
+            )
         return {"catalog_revision": revision, "token_changes": token_changes}
 
     def _emit(
@@ -2622,7 +4299,18 @@ class LiveStateStore:
         received_at: datetime | None = None,
         reason: str | None = None,
         gaps: list[GapEntry] | None = None,
+        _publication_locked: bool = False,
     ) -> LiveEventEnvelope:
+        if not _publication_locked:
+            with _publication_lock(self.root, exclusive=True):
+                return self._emit(
+                    event_type, canonical_payload, raw_payload,
+                    applied=applied, market_id=market_id,
+                    condition_id=condition_id, token_id=token_id,
+                    book_epoch=book_epoch, sequence=sequence,
+                    exchange_at=exchange_at, received_at=received_at,
+                    reason=reason, gaps=gaps, _publication_locked=True,
+                )
         received = received_at or self.now_provider()
         exchange = exchange_at or received
         self.cursor += 1
@@ -2644,9 +4332,9 @@ class LiveStateStore:
         byte_offset, byte_length, line_sha256 = self._append(
             envelope.model_dump(mode="json")
         )
-        self._event_offset = self.event_path.stat().st_size
+        self._event_offset = byte_offset + byte_length
         self._last_log_cursor = envelope.cursor
-        self.seen_raw_hashes.add(raw_hash)
+        self._remember_raw_hash(raw_hash)
         index_gaps = list(gaps or [])
         if event_type == "recovery_completed" and applied:
             recovered = set(
@@ -2668,6 +4356,13 @@ class LiveStateStore:
             event_log_size=self._event_offset,
             token_to_market=self.token_to_market,
             active_recovery_id=self.active_recovery_id,
+            book_token_count=len(self.books),
+            book_complete_market_count=sum(
+                all(outcome.token_id in self.books for outcome in market.identity.outcomes)
+                for market in self.catalog.values()
+                if market.active and not market.closed
+            ),
+            unresolved_gap_count=sum(not gap.resolved for gap in self.gaps),
         )
         return envelope
 
@@ -2683,7 +4378,8 @@ class LiveStateStore:
         *,
         recovery_id: str | None = None,
         received_at: datetime | None = None,
-    ) -> LiveEventEnvelope:
+        allow_freshness_confirmation: bool = False,
+    ) -> LiveEventEnvelope | None:
         self._ensure_loaded()
         token_id = str(raw.get("asset_id") or raw.get("token_id") or "")
         market = self._market_for_token(token_id)
@@ -2698,23 +4394,41 @@ class LiveStateStore:
         received = received_at or self.now_provider()
         exchange = _instant(raw.get("timestamp") or received)
         previous = self.books.get(token_id)
+        source_hash = str(raw.get("hash") or "") or None
+        raw_last_trade_price = raw.get("last_trade_price")
+        last_trade_price = (
+            decimal_text(raw_last_trade_price, "last_trade_price")
+            if raw_last_trade_price not in (None, "") else None
+        )
         epoch = content_sha256({
             "token_id": token_id, "recovery_id": recovery_id or "initial",
             "source_hash": raw.get("hash"), "exchange_at": exchange.isoformat(),
         })
         sequence = 1 if previous is None or previous.book_epoch != epoch else previous.sequence + 1
         checksum = _state_checksum(token_id, tick, state_bids, state_asks)
+        if (
+            allow_freshness_confirmation
+            and previous is not None
+            and previous.tick_size == tick
+            and previous.state_checksum == checksum
+            and previous.last_trade_price == last_trade_price
+        ):
+            confirmed = previous.model_copy(update={
+                "exchange_at": exchange,
+                "received_at": received,
+                "source_hash": source_hash,
+            })
+            self.books[token_id] = confirmed
+            self.state_index.confirm_book(confirmed)
+            return None
         book = LiveBook(
             token_id=token_id, condition_id=market.identity.condition_id,
             book_epoch=epoch, sequence=sequence,
             exchange_at=exchange, received_at=received,
             tick_version=content_sha256({"tick_size": tick}), tick_size=tick,
             bids=bids, asks=asks,
-            last_trade_price=(
-                decimal_text(raw["last_trade_price"], "last_trade_price")
-                if raw.get("last_trade_price") is not None else None
-            ),
-            state_checksum=checksum, source_hash=str(raw.get("hash") or "") or None,
+            last_trade_price=last_trade_price,
+            state_checksum=checksum, source_hash=source_hash,
         )
         self.books[token_id] = book
         return self._emit(
@@ -2724,7 +4438,13 @@ class LiveStateStore:
             exchange_at=exchange, received_at=received,
         )
 
-    def apply_websocket(self, raw: dict[str, Any], *, received_at: datetime | None = None) -> list[LiveEventEnvelope]:
+    def apply_websocket(
+        self,
+        raw: dict[str, Any],
+        *,
+        received_at: datetime | None = None,
+        stale_events_are_resolved: bool = False,
+    ) -> list[LiveEventEnvelope]:
         self._ensure_loaded()
         raw_hash = content_sha256(raw)
         event_type = str(raw.get("event_type") or raw.get("type") or "")
@@ -2799,10 +4519,26 @@ class LiveStateStore:
             envelopes = []
             for change in changes:
                 token_id = str(change.get("asset_id") or change.get("token_id") or "")
-                envelopes.append(self._apply_token_event(event_type, token_id, change, raw, exchange, received))
+                envelopes.append(self._apply_token_event(
+                    event_type,
+                    token_id,
+                    change,
+                    raw,
+                    exchange,
+                    received,
+                    stale_events_are_resolved=stale_events_are_resolved,
+                ))
             return envelopes
         token_id = str(raw.get("asset_id") or raw.get("token_id") or "")
-        return [self._apply_token_event(event_type, token_id, raw, raw, exchange, received)]
+        return [self._apply_token_event(
+            event_type,
+            token_id,
+            raw,
+            raw,
+            exchange,
+            received,
+            stale_events_are_resolved=stale_events_are_resolved,
+        )]
 
     def _apply_token_event(
         self,
@@ -2812,6 +4548,8 @@ class LiveStateStore:
         raw: dict[str, Any],
         exchange: datetime,
         received: datetime,
+        *,
+        stale_events_are_resolved: bool = False,
     ) -> LiveEventEnvelope:
         if event_type not in {"price_change", "best_bid_ask", "last_trade_price", "tick_size_change"}:
             raise ValueError("unsupported public market-channel event")
@@ -2834,6 +4572,11 @@ class LiveStateStore:
                 code="out_of_order", token_id=token_id,
                 expected=previous.exchange_at.isoformat(), observed=exchange.isoformat(),
                 event_at=exchange, detected_at=received,
+                resolved=stale_events_are_resolved,
+                resolution=(
+                    "superseded_by_newer_snapshot"
+                    if stale_events_are_resolved else None
+                ),
             )
             self.gaps.append(gap)
             return self._emit(
@@ -2919,6 +4662,10 @@ class LiveStateStore:
         rows: list[dict[str, Any]],
         recovery_id: str,
         tracker: dict[str, Any],
+        *,
+        minimum_book_age_seconds: float = 0,
+        refresh_started_at: datetime | None = None,
+        received_at: datetime | None = None,
     ) -> None:
         self._ensure_loaded()
         recovered = tracker["recovered"]
@@ -2931,8 +4678,41 @@ class LiveStateStore:
             if token_id in recovered or token_id in invalid:
                 tracker["duplicate_response_count"] += 1
                 continue
+            previous = self.books.get(token_id)
+            if (
+                refresh_started_at is not None
+                and refresh_started_at
+                < self._rest_refresh_generation.get(token_id, datetime.min.replace(
+                    tzinfo=timezone.utc
+                ))
+            ):
+                recovered.add(token_id)
+                continue
+            market_id = self.token_to_market.get(token_id)
+            market_token_ids = [
+                candidate
+                for candidate, candidate_market_id in self.token_to_market.items()
+                if candidate_market_id == market_id
+            ]
+            if (
+                previous is not None
+                and minimum_book_age_seconds > 0
+                and market_token_ids
+                and all(
+                    candidate in self.books
+                    and (
+                        self.now_provider() - self.books[candidate].received_at
+                    ).total_seconds() < minimum_book_age_seconds
+                    for candidate in market_token_ids
+                )
+            ):
+                recovered.add(token_id)
+                continue
             try:
-                self.apply_snapshot(row, recovery_id=recovery_id)
+                self.apply_snapshot(
+                    row, recovery_id=recovery_id, received_at=received_at,
+                    allow_freshness_confirmation=(refresh_started_at is not None),
+                )
             except ValueError as exc:
                 reason = str(exc)
                 invalid[token_id] = reason
@@ -2952,10 +4732,17 @@ class LiveStateStore:
                     reason="invalid_rest_book", gaps=[gap],
                 )
                 continue
+            if refresh_started_at is not None:
+                self._rest_refresh_generation[token_id] = refresh_started_at
             recovered.add(token_id)
 
     def complete_book_recovery(
-        self, recovery_id: str, tracker: dict[str, Any],
+        self,
+        recovery_id: str,
+        tracker: dict[str, Any],
+        *,
+        write_checkpoint: bool = True,
+        publish_completion_event: bool = True,
     ) -> dict[str, Any]:
         self._ensure_loaded()
         recovered = tracker["recovered"]
@@ -2995,11 +4782,18 @@ class LiveStateStore:
             "unknown_response_count": tracker["unknown_response_count"],
             "coverage_complete": not missing,
         }
-        self._emit("recovery_completed", {
-            **coverage,
-            "resolved_gap_token_ids": sorted(resolved_gap_token_ids),
-        }, {}, applied=True, gaps=new_coverage_gaps)
-        self.checkpoint()
+        if (
+            publish_completion_event
+            or resolved_gap_token_ids
+            or new_coverage_gaps
+            or invalid
+        ):
+            self._emit("recovery_completed", {
+                **coverage,
+                "resolved_gap_token_ids": sorted(resolved_gap_token_ids),
+            }, {}, applied=True, gaps=new_coverage_gaps)
+        if write_checkpoint:
+            self.checkpoint()
         return coverage
 
     def recover_from_books(
@@ -3067,8 +4861,8 @@ class LiveStateStore:
                 reasons.append("negative_risk_member_missing")
             if relation_books:
                 relation_skew = (
-                    max(item.exchange_at for item in relation_books)
-                    - min(item.exchange_at for item in relation_books)
+                    max(item.received_at for item in relation_books)
+                    - min(item.received_at for item in relation_books)
                 ).total_seconds() * 1000
                 if relation_skew > self.max_frame_skew_ms:
                     reasons.append("negative_risk_frame_skew")
@@ -3271,10 +5065,11 @@ class LiveStateStore:
         self._checkpoint_cursor = checkpoint_cursor
         self.events.clear()
         self.seen_raw_hashes.clear()
+        self._seen_raw_hash_order.clear()
         self.active_recovery_id = None
         for event in events:
             self.events.append(event)
-            self.seen_raw_hashes.add(event.raw_payload_sha256)
+            self._remember_raw_hash(event.raw_payload_sha256)
             if event.cursor <= checkpoint_cursor:
                 self._apply_replayed_event(event)
         if checkpoint:
@@ -3390,7 +5185,7 @@ class LiveStateStore:
                         ) from exc
                     self._validate_event(event, self._last_log_cursor + 1)
                     self.events.append(event)
-                    self.seen_raw_hashes.add(event.raw_payload_sha256)
+                    self._remember_raw_hash(event.raw_payload_sha256)
                     self._apply_replayed_event(event)
                     self._last_log_cursor = event.cursor
                     self._event_offset = stream.tell()
@@ -3429,11 +5224,57 @@ class LiveStateStore:
 
 
 def build_live_state_index(root: Path) -> dict[str, Any]:
-    """Explicitly replay durable live files and atomically publish derived indexes."""
+    """Single-pass replay of durable files into an atomically published index."""
     root = root.resolve()
-    store = LiveStateStore(root)
-    store.recover()
     reader = PolymarketLiveReadStore(root)
+    payload, normalized_path, catalog_index_path, catalog_metadata = (
+        reader._manifest_binding()
+    )
+    normalized = payload["normalized_catalog"]
+    if _file_sha256(normalized_path) != normalized.get("sha256"):
+        raise RuntimeError("normalized live catalog integrity failed")
+    catalog_source = payload.get("catalog_source")
+    if catalog_source:
+        raw_path = Path(str(catalog_source.get("raw_path") or "")).resolve()
+        raw_root = (root / "raw" / "gamma-catalog").resolve()
+        if not raw_path.is_relative_to(raw_root):
+            raise RuntimeError("live raw catalog escapes local evidence root")
+        if (
+            not raw_path.is_file()
+            or _file_sha256(raw_path)
+            != catalog_source.get("raw_payload_sha256")
+        ):
+            raise RuntimeError("live raw catalog integrity failed")
+
+    try:
+        with _readonly_sqlite(catalog_index_path) as connection:
+            token_to_market = {
+                str(row[0]): str(row[1])
+                for row in connection.execute(
+                    """SELECT tokens.token_id, tokens.market_id
+                       FROM tokens JOIN markets USING(market_id)
+                       WHERE markets.active=1 AND markets.closed=0"""
+                )
+            }
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError("live catalog token index is unreadable") from exc
+
+    checkpoint = None
+    checkpoint_sha256 = ""
+    checkpoint_path = root / "checkpoint.json"
+    if checkpoint_path.exists():
+        body = checkpoint_path.read_bytes()
+        checkpoint = LiveStateStore._validate_checkpoint(body)
+        checkpoint_sha256 = hashlib.sha256(body).hexdigest()
+
+    state_index = LiveStateIndex(root)
+    state_index.rebuild_from_durable(
+        event_path=root / "events.jsonl",
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+        catalog_revision=catalog_metadata["catalog_revision"],
+        token_to_market=token_to_market,
+    )
     path, metadata = reader._state_binding()
     with _readonly_state_sqlite(path) as connection:
         counts = {
@@ -3448,6 +5289,139 @@ def build_live_state_index(root: Path) -> dict[str, Any]:
         "path": str(path),
         **{f"{name}_count": count for name, count in counts.items()},
     }
+
+
+def catch_up_live_state_index(root: Path) -> dict[str, int]:
+    """Replay a crash-truncated event-log tail into the mutable state index."""
+    root = root.resolve()
+    event_path = root / "events.jsonl"
+    state_index = LiveStateIndex(root)
+    if not state_index.path.is_file() or not event_path.is_file():
+        return {"previous_cursor": 0, "latest_cursor": 0, "replayed_events": 0}
+    with _publication_lock(root, exclusive=True):
+        with sqlite3.connect(state_index.path) as connection:
+            metadata = state_index._metadata(connection)
+        previous_cursor = int(metadata.get("latest_cursor", "0"))
+        offset = int(metadata.get("event_log_size", "0"))
+        actual_size = event_path.stat().st_size
+        if offset > actual_size:
+            raise RuntimeError("live state index is ahead of the durable event log")
+        if offset == actual_size:
+            return {
+                "previous_cursor": previous_cursor,
+                "latest_cursor": previous_cursor,
+                "replayed_events": 0,
+            }
+        catalog_revision = metadata.get("catalog_revision") or None
+        active_recovery_id = metadata.get("active_recovery_id") or None
+        expected_cursor = previous_cursor + 1
+        replayed = 0
+        with event_path.open("rb") as stream:
+            stream.seek(offset)
+            while offset < actual_size:
+                line = stream.readline()
+                if not line.endswith(b"\n"):
+                    raise RuntimeError("durable live event tail is incomplete")
+                event = LiveEventEnvelope.model_validate_json(line)
+                LiveStateStore._validate_event(event, expected_cursor)
+                if event.event_type == "catalog_revision" and event.applied:
+                    catalog_revision = str(
+                        event.canonical_payload.get("catalog_revision") or ""
+                    ) or catalog_revision
+                if event.event_type == "recovery_started" and event.applied:
+                    active_recovery_id = str(
+                        event.canonical_payload.get("recovery_id") or ""
+                    ) or None
+                elif event.event_type == "recovery_completed" and event.applied:
+                    active_recovery_id = None
+                book = None
+                if (
+                    event.applied and event.token_id
+                    and event.event_type in {
+                        "book", "price_change", "best_bid_ask",
+                        "last_trade_price", "tick_size_change",
+                    }
+                ):
+                    book = LiveBook.model_validate(event.canonical_payload)
+                next_offset = offset + len(line)
+                token_to_market = {
+                    gap.token_id: event.market_id
+                    for gap in event.gaps
+                    if gap.token_id and event.market_id
+                }
+                state_index.append(
+                    event,
+                    byte_offset=offset,
+                    byte_length=len(line),
+                    line_sha256=hashlib.sha256(line).hexdigest(),
+                    book=book,
+                    gaps=event.gaps,
+                    catalog_revision=catalog_revision,
+                    event_log_size=next_offset,
+                    token_to_market=token_to_market,
+                    active_recovery_id=active_recovery_id,
+                )
+                offset = next_offset
+                expected_cursor += 1
+                replayed += 1
+        if offset != actual_size:
+            raise RuntimeError("durable live event size changed during tail recovery")
+        return {
+            "previous_cursor": previous_cursor,
+            "latest_cursor": expected_cursor - 1,
+            "replayed_events": replayed,
+        }
+
+
+def load_scoped_live_store(
+    root: Path,
+    market_ids: Iterable[str],
+    *,
+    now_provider: Callable[[], datetime] = utc_now,
+) -> LiveStateStore:
+    """Hydrate a bounded writer from published indexes without full recovery."""
+    root = root.resolve()
+    LiveStateIndex(root).ensure_runtime_schema()
+    recovery = catch_up_live_state_index(root)
+    if recovery["replayed_events"]:
+        LOGGER.warning("live_state_index_tail_recovered %s", recovery)
+    reader = PolymarketLiveReadStore(root, now_provider=now_provider)
+    selected_ids = reader._scope(market_ids)
+    bootstrap = reader.bootstrap(selected_ids)
+    snapshot = reader.snapshot(selected_ids)
+    gaps = reader.gaps(selected_ids, unresolved_only=True)
+    _, state_metadata = reader._state_binding()
+
+    # Scoped collectors publish through the durable event/state indexes; they
+    # do not serve in-process replay. Keep only a small duplicate-detection
+    # horizon instead of retaining up to 100k full-depth book events.
+    store = LiveStateStore(root, replay_capacity=2_000, now_provider=now_provider)
+    store.catalog = {
+        market.identity.market_id: market for market in bootstrap.markets
+    }
+    store.token_to_market = {
+        outcome.token_id: market.identity.market_id
+        for market in bootstrap.markets if market.active and not market.closed
+        for outcome in market.identity.outcomes
+    }
+    store.books = {
+        book.token_id: book
+        for frame in snapshot.items
+        for book in frame.tokens
+    }
+    store.gaps = [gap.model_copy(deep=True) for gap in gaps.items]
+    store.cursor = int(state_metadata["latest_cursor"])
+    store.catalog_revision = bootstrap.catalog_revision
+    store.catalog_source = bootstrap.catalog_source
+    store.active_recovery_id = state_metadata.get("active_recovery_id") or None
+    store._event_offset = int(state_metadata["event_log_size"])
+    store._last_log_cursor = store.cursor
+    store._catalog_file_sha256 = _file_sha256(store.catalog_path)
+    checkpoint_path = root / "checkpoint.json"
+    if checkpoint_path.exists():
+        store._checkpoint_file_sha256 = _file_sha256(checkpoint_path)
+    store._recovered = True
+    return store
 
 
 class DataApiPublicNormalizer:
@@ -3555,6 +5529,11 @@ class PolymarketLiveCollector:
         max_websocket_connections: int = 32,
         heartbeat_seconds: float = 10,
         reconnect_seconds: float = 1,
+        snapshot_refresh_seconds: float | None = None,
+        catalog_refresh_on_lifecycle_events: bool = True,
+        publish_checkpoints: bool = True,
+        minimum_snapshot_refresh_age_seconds: float = 0,
+        max_concurrent_snapshot_refreshes: int = 1,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -3564,6 +5543,20 @@ class PolymarketLiveCollector:
         self.max_websocket_connections = max(1, max_websocket_connections)
         self.heartbeat_seconds = max(0.01, heartbeat_seconds)
         self.reconnect_seconds = max(0.0, reconnect_seconds)
+        self.snapshot_refresh_seconds = (
+            max(0.1, snapshot_refresh_seconds)
+            if snapshot_refresh_seconds is not None else None
+        )
+        self.catalog_refresh_on_lifecycle_events = (
+            catalog_refresh_on_lifecycle_events
+        )
+        self.publish_checkpoints = publish_checkpoints
+        self.minimum_snapshot_refresh_age_seconds = max(
+            0, minimum_snapshot_refresh_age_seconds,
+        )
+        self.max_concurrent_snapshot_refreshes = max(
+            1, max_concurrent_snapshot_refreshes,
+        )
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
 
@@ -3596,16 +5589,33 @@ class PolymarketLiveCollector:
         return result
 
     async def bootstrap_books(self, reason: str = "startup") -> str:
-        recovery_id = self.store.mark_recovery_started(reason)
-        tracker = self.store.new_book_recovery_tracker()
+        with self.store._sync_lock:
+            recovery_id = self.store.mark_recovery_started(reason)
+            tracker = self.store.new_book_recovery_tracker()
+
+        def consume(rows: list[dict[str, Any]]) -> None:
+            received_at = self.store.now_provider()
+            with (
+                self.store._sync_lock,
+                _publication_lock(self.store.root, exclusive=True),
+                self.store.state_index.batch(),
+                self.store.durable_event_batch(),
+            ):
+                self.store.recover_book_batch(
+                    rows, recovery_id, tracker, received_at=received_at,
+                )
+
         await asyncio.to_thread(
             self.books_client.fetch_stream,
             sorted(self.store.token_to_market),
-            batch_consumer=lambda rows: self.store.recover_book_batch(
-                rows, recovery_id, tracker,
-            ),
+            batch_consumer=consume,
         )
-        coverage = self.store.complete_book_recovery(recovery_id, tracker)
+        with self.store._sync_lock:
+            coverage = self.store.complete_book_recovery(
+                recovery_id,
+                tracker,
+                write_checkpoint=self.publish_checkpoints,
+            )
         if self.books_client.last_evidence is not None:
             self.books_client.last_evidence.update(coverage)
         LOGGER.info(
@@ -3613,6 +5623,80 @@ class PolymarketLiveCollector:
             recovery_id, self.books_client.last_evidence,
             self.store.health().model_dump(mode="json"),
         )
+        return recovery_id
+
+    async def refresh_books(
+        self,
+        reason: str = "periodic_snapshot_refresh",
+        *,
+        partition_index: int = 0,
+        partition_count: int = 1,
+    ) -> str:
+        """Refresh a healthy scope without exposing recovery-in-progress state."""
+        if not 0 <= partition_index < partition_count:
+            raise ValueError("snapshot refresh partition is invalid")
+        with self.store._sync_lock:
+            refresh_started_at = self.store.now_provider()
+            recovery_id = content_sha256({
+                "reason": reason,
+                "cursor": self.store.cursor,
+                "observed_at": refresh_started_at.isoformat(),
+            })
+            tracker = self.store.new_book_recovery_tracker()
+            minimum_age = self.minimum_snapshot_refresh_age_seconds
+            stale_market_ids = {
+                market_id
+                for token_id, market_id in self.store.token_to_market.items()
+                if token_id not in self.store.books
+                or minimum_age <= 0
+                or (
+                    refresh_started_at - self.store.books[token_id].received_at
+                ).total_seconds() >= minimum_age
+            }
+            refresh_market_ids = {
+                market_id
+                for index, market_id in enumerate(sorted(stale_market_ids))
+                if index % partition_count == partition_index
+            }
+            refresh_token_ids = sorted(
+                token_id
+                for token_id, market_id in self.store.token_to_market.items()
+                if market_id in refresh_market_ids
+            )
+            tracker["recovered"].update(
+                tracker["expected"] - set(refresh_token_ids)
+            )
+
+        def consume(rows: list[dict[str, Any]]) -> None:
+            received_at = self.store.now_provider()
+            with (
+                self.store._sync_lock,
+                _publication_lock(self.store.root, exclusive=True),
+                self.store.state_index.batch(),
+                self.store.durable_event_batch(),
+            ):
+                self.store.recover_book_batch(
+                    rows,
+                    recovery_id,
+                    tracker,
+                    refresh_started_at=refresh_started_at,
+                    received_at=received_at,
+                )
+
+        if refresh_token_ids:
+            await asyncio.to_thread(
+                self.books_client.fetch_stream,
+                refresh_token_ids,
+                batch_consumer=consume,
+                require_complete_batches=True,
+            )
+        with self.store._sync_lock:
+            self.store.complete_book_recovery(
+                recovery_id,
+                tracker,
+                write_checkpoint=self.publish_checkpoints,
+                publish_completion_event=False,
+            )
         return recovery_id
 
     async def update_subscriptions(self) -> list[dict[str, Any]]:
@@ -3678,16 +5762,32 @@ class PolymarketLiveCollector:
                         continue
                     payload = json.loads(message, parse_float=str, parse_int=str)
                     for item in payload if isinstance(payload, list) else [payload]:
-                        self.store.apply_websocket(item)
+                        await asyncio.to_thread(self._apply_websocket, item)
                         consumed += 1
-                        if str(item.get("event_type") or item.get("type") or "") in {
-                            "new_market", "market_resolved",
-                        }:
+                        if (
+                            self.catalog_refresh_on_lifecycle_events
+                            and str(item.get("event_type") or item.get("type") or "")
+                            in {"new_market", "market_resolved"}
+                        ):
                             await asyncio.to_thread(self.refresh_catalog)
                             await self.update_subscriptions()
             finally:
                 self.sockets.remove(socket)
                 self.socket_tokens.pop(socket, None)
+
+    def _apply_websocket(self, item: dict[str, Any]) -> None:
+        with (
+            self.store._sync_lock,
+            _publication_lock(self.store.root, exclusive=True),
+            self.store.state_index.batch(),
+            self.store.durable_event_batch(),
+        ):
+            self.store.apply_websocket(
+                item,
+                stale_events_are_resolved=(
+                    self.snapshot_refresh_seconds is not None
+                ),
+            )
 
     async def run_once(self, *, message_limit: int | None = None) -> None:
         groups = self.planner.connection_groups(
@@ -3699,21 +5799,64 @@ class PolymarketLiveCollector:
             self._consume(group, message_limit=message_limit) for group in groups
         ))
 
-    async def run(self, *, max_connections: int | None = None) -> None:
-        attempts = 0
-        while max_connections is None or attempts < max_connections:
-            attempts += 1
-            if attempts > 1:
-                await self.bootstrap_books(f"websocket_reconnect:{attempts}")
-            try:
-                await self.run_once()
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                if max_connections is not None and attempts >= max_connections:
+    async def _refresh_snapshots_periodically(self) -> None:
+        if self.snapshot_refresh_seconds is None:
+            return
+
+        async def worker(partition_index: int, initial_delay: float) -> None:
+            await asyncio.sleep(self.snapshot_refresh_seconds + initial_delay)
+            while True:
+                try:
+                    await self.refresh_books(
+                        "periodic_snapshot_refresh",
+                        partition_index=partition_index,
+                        partition_count=self.max_concurrent_snapshot_refreshes,
+                    )
+                except asyncio.CancelledError:
                     raise
-                await asyncio.sleep(self.reconnect_seconds)
+                except Exception:
+                    LOGGER.exception(
+                        "periodic_snapshot_refresh_failed; retrying after %.3f seconds",
+                        self.snapshot_refresh_seconds,
+                    )
+                await asyncio.sleep(self.snapshot_refresh_seconds)
+
+        await asyncio.gather(*(
+            worker(
+                index,
+                index * self.snapshot_refresh_seconds
+                / self.max_concurrent_snapshot_refreshes
+            )
+            for index in range(self.max_concurrent_snapshot_refreshes)
+        ))
+
+    async def run(self, *, max_connections: int | None = None) -> None:
+        refresh_task = (
+            asyncio.create_task(self._refresh_snapshots_periodically())
+            if self.snapshot_refresh_seconds is not None else None
+        )
+        attempts = 0
+        try:
+            while max_connections is None or attempts < max_connections:
+                attempts += 1
+                if attempts > 1:
+                    await self.bootstrap_books(f"websocket_reconnect:{attempts}")
+                try:
+                    await self.run_once()
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if max_connections is not None and attempts >= max_connections:
+                        raise
+                    await asyncio.sleep(self.reconnect_seconds)
+        finally:
+            if refresh_task is not None:
+                refresh_task.cancel()
+                try:
+                    await refresh_task
+                except asyncio.CancelledError:
+                    pass
 
 
 def atomic_write_public_facts(root: Path, kind: str, rows: list[dict[str, Any]]) -> Path:

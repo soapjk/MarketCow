@@ -1,0 +1,83 @@
+{
+  "schema": "marketcow.polymarket.scoped-production-gate.v1",
+  "verified_at_utc": "2026-08-09T11:54:36Z",
+  "base_url": "http://127.0.0.1:8790",
+  "catalog_revision": "5179b9820a2704680f33425e9f750647294593066c2ebf976528732fff4009a6",
+  "selection": {
+    "method": "Top 50 by Gamma liquidityNum after strict canonical eligibility filtering",
+    "eligible_candidate_count": 492,
+    "market_count": 50,
+    "token_count": 100,
+    "all_active": true,
+    "all_accepting_orders": true,
+    "all_closed_false": true,
+    "all_neg_risk_false": true,
+    "all_binary_yes_no": true,
+    "all_rules_complete": true,
+    "market_ids": [
+      "2774056", "703257", "665374", "663583", "3128885",
+      "560317", "703258", "567621", "666861", "2633430",
+      "2633429", "2155000", "3231771", "2774057", "908713",
+      "2176270", "2696747", "997488", "2034729", "2633428",
+      "559651", "1633611", "2473336", "1393070", "1393068",
+      "573656", "2696746", "677366", "948958", "3215074",
+      "2374271", "1144471", "2737255", "3290739", "1394086",
+      "2911874", "3096416", "1059772", "2995866", "2507618",
+      "3257332", "1163699", "1057883", "701503", "701539",
+      "1535973", "2154920", "1633606", "568116", "2820206"
+    ]
+  },
+  "state_repair": {
+    "stale_checkpoint_detected": true,
+    "stale_checkpoint_backup": "/Volumes/T9/data/marketcow/production/prediction-markets/polymarket-live/checkpoint.stale-20260809T112958Z.json",
+    "resumed_verified_cursor": 391000,
+    "published_cursor": 415233,
+    "new_checkpoint_sha256": "e76f85e99f4025982fd1e2dc357f0276533e41b5c808b5d52c40951475312800",
+    "checkpoint_exact_book_gap_match": true
+  },
+  "collector": {
+    "launchd_label": "com.marketcow.polymarket.scoped",
+    "plist": "/Users/androidjk/Library/LaunchAgents/com.marketcow.polymarket.scoped.plist",
+    "state": "running",
+    "collector_pid": 74612,
+    "production_pid": 38696,
+    "snapshot_refresh_seconds": 2,
+    "starting_cursor": 415335,
+    "bootstrap_received_books": 100,
+    "bootstrap_invalid_books": 0,
+    "continuous_websocket": true,
+    "keepalive": true
+  },
+  "api_gate": {
+    "health_http": 200,
+    "health_status": "index_ready",
+    "latest_state_ready": true,
+    "health_reason_codes": [],
+    "bootstrap_http": 200,
+    "bootstrap_market_count": 50,
+    "bootstrap_token_count": 100,
+    "bootstrap_exact_scope": true,
+    "snapshot_http": 200,
+    "snapshot_exact_scope": true,
+    "events_http": 200,
+    "events_within_scope": true,
+    "events_observed": 2626
+  },
+  "freshness_observations": [
+    {"cursor": 417530, "ready_markets": 50, "token_books": 100, "max_age_seconds": 1.667, "reason_codes": []},
+    {"cursor": 417631, "ready_markets": 50, "token_books": 100, "max_age_seconds": 1.950, "reason_codes": []},
+    {"cursor": 417732, "ready_markets": 50, "token_books": 100, "max_age_seconds": 1.944, "reason_codes": []}
+  ],
+  "producer_contract": {
+    "all_bids_strict_descending": true,
+    "all_asks_strict_ascending": true,
+    "all_state_checksums_valid": true,
+    "all_source_hashes_present": true
+  },
+  "safety": {
+    "local_marketcow_only": true,
+    "trading_orders_submitted": false,
+    "tradude_wallet_accessed": false,
+    "real_funds_accessed": false
+  }
+}
