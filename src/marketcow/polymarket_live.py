@@ -5609,6 +5609,7 @@ class PolymarketLiveCollector:
             self.books_client.fetch_stream,
             sorted(self.store.token_to_market),
             batch_consumer=consume,
+            require_complete_batches=True,
         )
         with self.store._sync_lock:
             coverage = self.store.complete_book_recovery(

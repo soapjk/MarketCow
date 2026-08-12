@@ -1113,16 +1113,19 @@ class PolymarketLiveTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
             client.fetch_stream(["a"], require_complete_batches=True)
 
-    def test_partial_books_bootstrap_starts_degraded_and_keeps_ready_markets(self):
+    def test_partial_books_bootstrap_does_not_publish_incomplete_batch(self):
         rows = [
             gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1")),
             gamma_row("m2", "0x" + "2" * 64, ("yes-2", "no-2")),
         ]
         store = self.store(rows)
-        books = ClobBooksClient(requester=lambda *_args, **_kwargs: Response([
-            snapshot("yes-1", "0.40", "0.42"),
-            snapshot("no-1", "0.58", "0.60"),
-        ]))
+        books = ClobBooksClient(
+            requester=lambda *_args, **_kwargs: Response([
+                snapshot("yes-1", "0.40", "0.42"),
+                snapshot("no-1", "0.58", "0.60"),
+            ]),
+            max_retries_per_batch=0,
+        )
         collector = PolymarketLiveCollector(
             store,
             GammaKeysetCatalog(requester=lambda *_args, **_kwargs: Response({
@@ -1131,20 +1134,63 @@ class PolymarketLiveTest(unittest.TestCase):
             books,
         )
 
-        recovery_id = asyncio.run(collector.bootstrap_books())
-        self.assertTrue(recovery_id)
+        with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
+            asyncio.run(collector.bootstrap_books())
+
         health = store.health()
         self.assertEqual(health.status, "degraded")
-        self.assertEqual(health.book_token_count, 2)
-        self.assertEqual(health.missing_book_token_count, 2)
-        self.assertEqual(health.ready_market_count, 1)
-        self.assertEqual(store.frame("m1", now=NOW).status, "ready")
+        self.assertEqual(health.book_token_count, 0)
+        self.assertEqual(health.missing_book_token_count, 4)
+        self.assertEqual(health.ready_market_count, 0)
+        self.assertIsNotNone(store.active_recovery_id)
+        self.assertEqual(store.frame("m1", now=NOW).status, "fail_closed")
         self.assertEqual(store.frame("m2", now=NOW).status, "fail_closed")
-        self.assertEqual(books.last_evidence["missing_token_count"], 2)
-        self.assertFalse(books.last_evidence["coverage_complete"])
-        reader = PolymarketLiveReadStore(store.root, now_provider=lambda: NOW)
-        self.assertEqual(reader.gaps(["m2"], unresolved_only=True).count, 2)
-        self.assertEqual(reader.snapshot(["m2"]).items[0].status, "fail_closed")
+
+    def test_bootstrap_retry_after_incomplete_batch_converges_recovery(self):
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1")),
+            gamma_row("m2", "0x" + "2" * 64, ("yes-2", "no-2")),
+        ]
+        store = self.store(rows)
+        partial = ClobBooksClient(
+            requester=lambda *_args, **_kwargs: Response([
+                snapshot("yes-1", "0.40", "0.42"),
+                snapshot("no-1", "0.58", "0.60"),
+            ]),
+            max_retries_per_batch=0,
+        )
+        collector = PolymarketLiveCollector(
+            store,
+            GammaKeysetCatalog(requester=lambda *_args, **_kwargs: Response({
+                "markets": rows,
+            })),
+            partial,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
+            asyncio.run(collector.bootstrap_books())
+        self.assertEqual(store.books, {})
+        self.assertIsNotNone(store.active_recovery_id)
+
+        collector.books_client = ClobBooksClient(
+            requester=lambda *_args, **_kwargs: Response([
+                snapshot("yes-1", "0.40", "0.42"),
+                snapshot("no-1", "0.58", "0.60"),
+                snapshot("yes-2", "0.30", "0.32"),
+                snapshot("no-2", "0.68", "0.70"),
+            ]),
+            max_retries_per_batch=0,
+        )
+        recovery_id = asyncio.run(collector.bootstrap_books("startup_retry"))
+
+        self.assertTrue(recovery_id)
+        health = store.health()
+        self.assertEqual(health.book_token_count, 4)
+        self.assertEqual(health.missing_book_token_count, 0)
+        self.assertEqual(health.ready_market_count, 2)
+        self.assertIsNone(store.active_recovery_id)
+        self.assertEqual(store.frame("m1", now=NOW).status, "ready")
+        self.assertEqual(store.frame("m2", now=NOW).status, "ready")
 
     def test_empty_rest_last_trade_price_is_normalized_as_unavailable(self):
         store = self.store()
