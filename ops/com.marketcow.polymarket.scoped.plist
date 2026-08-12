@@ -6,74 +6,33 @@
   <string>com.marketcow.polymarket.scoped</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/env</string>
-    <string>PYTHONPATH=/Volumes/T9/projects/marketcow-polymarket-live-state-index-performance/src</string>
-    <string>PYTHONUNBUFFERED=1</string>
     <string>/Volumes/T9/projects/marketcow/.venv/bin/python</string>
-    <string>/Volumes/T9/projects/marketcow-polymarket-live-state-index-performance/scripts/run_polymarket_live.py</string>
+    <string>/Volumes/T9/projects/marketcow-polymarket-live-state-index-performance/scripts/run_polymarket_scoped_manifest.py</string>
     <string>--root</string>
     <string>/Volumes/T9/data/marketcow/production/prediction-markets/polymarket-live</string>
-    <string>--market-id</string><string>2774056</string>
-    <string>--market-id</string><string>703257</string>
-    <string>--market-id</string><string>665374</string>
-    <string>--market-id</string><string>663583</string>
-    <string>--market-id</string><string>3128885</string>
-    <string>--market-id</string><string>560317</string>
-    <string>--market-id</string><string>703258</string>
-    <string>--market-id</string><string>567621</string>
-    <string>--market-id</string><string>666861</string>
-    <string>--market-id</string><string>2633430</string>
-    <string>--market-id</string><string>2633429</string>
-    <string>--market-id</string><string>2155000</string>
-    <string>--market-id</string><string>3231771</string>
-    <string>--market-id</string><string>2774057</string>
-    <string>--market-id</string><string>908713</string>
-    <string>--market-id</string><string>2176270</string>
-    <string>--market-id</string><string>2696747</string>
-    <string>--market-id</string><string>997488</string>
-    <string>--market-id</string><string>2034729</string>
-    <string>--market-id</string><string>2633428</string>
-    <string>--market-id</string><string>559651</string>
-    <string>--market-id</string><string>1633611</string>
-    <string>--market-id</string><string>2473336</string>
-    <string>--market-id</string><string>1393070</string>
-    <string>--market-id</string><string>1393068</string>
-    <string>--market-id</string><string>573656</string>
-    <string>--market-id</string><string>2696746</string>
-    <string>--market-id</string><string>677366</string>
-    <string>--market-id</string><string>948958</string>
-    <string>--market-id</string><string>3215074</string>
-    <string>--market-id</string><string>2374271</string>
-    <string>--market-id</string><string>1144471</string>
-    <string>--market-id</string><string>2737255</string>
-    <string>--market-id</string><string>3290739</string>
-    <string>--market-id</string><string>1394086</string>
-    <string>--market-id</string><string>2911874</string>
-    <string>--market-id</string><string>3096416</string>
-    <string>--market-id</string><string>1059772</string>
-    <string>--market-id</string><string>2995866</string>
-    <string>--market-id</string><string>2507618</string>
-    <string>--market-id</string><string>3257332</string>
-    <string>--market-id</string><string>1163699</string>
-    <string>--market-id</string><string>1057883</string>
-    <string>--market-id</string><string>701503</string>
-    <string>--market-id</string><string>701539</string>
-    <string>--market-id</string><string>1535973</string>
-    <string>--market-id</string><string>2154920</string>
-    <string>--market-id</string><string>1633606</string>
-    <string>--market-id</string><string>568116</string>
-    <string>--market-id</string><string>2820206</string>
+    <string>--manifest</string>
+    <string>/Volumes/T9/projects/trade/tradude-worktrees/polymarket-live-trading/.tradude-local/polymarket-live/relation-shadow-current-scope/scopes/491662fade3d24593d00a8315d8cfa14f6693eb83c8427c6c4c539078a89a89f/manifest.json</string>
+    <string>--manifest-sha256</string>
+    <string>980db9748d55fbfddd42b4bffd958c0aaf559ab50bde68b28f2cc461877cb85b</string>
+    <string>--catalog-revision</string>
+    <string>631aa91c68488703bb09ad785b647c7421e5f58ec9c941142f696671ea3c4a09</string>
+    <string>--scope-id</string>
+    <string>491662fade3d24593d00a8315d8cfa14f6693eb83c8427c6c4c539078a89a89f</string>
     <string>--snapshot-refresh-seconds</string>
-        <string>0.1</string>
+    <string>0.1</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/Volumes/T9/projects/marketcow-polymarket-live-state-index-performance/src</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
   <key>WorkingDirectory</key>
   <string>/Volumes/T9/projects/marketcow-polymarket-live-state-index-performance</string>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>ThrottleInterval</key>
-  <integer>5</integer>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
   <key>StandardOutPath</key>
   <string>/Users/androidjk/Library/Logs/MarketCow/polymarket-scoped.log</string>
   <key>StandardErrorPath</key>
