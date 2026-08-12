@@ -3953,6 +3953,7 @@ class ClobBooksClient:
         token_ids: Iterable[str],
         *,
         batch_consumer: Callable[[list[dict[str, Any]]], None] | None = None,
+        require_complete_batches: bool = False,
     ) -> list[dict[str, Any]]:
         tokens = list(dict.fromkeys(str(item) for item in token_ids))
         rows = []
@@ -3967,42 +3968,75 @@ class ClobBooksClient:
                 {"token_id": token}
                 for token in tokens[start:start + self.batch_size]
             ]
-            attempts = 0
+            batch_payload: list[dict[str, Any]] = []
+            coverage_attempts = 0
             while True:
-                try:
-                    response = self.requester(
-                        self.endpoint, json=request_body, timeout=self.timeout,
-                        headers={
-                            "Content-Type": "application/json",
-                            "User-Agent": "MarketCow/0.2",
-                        },
-                    )
-                except requests.RequestException:
+                attempts = 0
+                while True:
+                    try:
+                        response = self.requester(
+                            self.endpoint, json=request_body, timeout=self.timeout,
+                            headers={
+                                "Content-Type": "application/json",
+                                "User-Agent": "MarketCow/0.2",
+                            },
+                        )
+                    except requests.RequestException:
+                        if attempts >= self.max_retries_per_batch:
+                            raise
+                        attempts += 1
+                        retry_count += 1
+                        continue
+                    if response.status_code != 429 and response.status_code < 500:
+                        break
                     if attempts >= self.max_retries_per_batch:
-                        raise
+                        response.raise_for_status()
                     attempts += 1
                     retry_count += 1
-                    continue
-                if response.status_code != 429 and response.status_code < 500:
+                    retry_after = min(
+                        8.0,
+                        float(
+                            response.headers.get("Retry-After")
+                            or 2 ** (attempts - 1)
+                        ),
+                    )
+                    self.sleeper(retry_after)
+                response.raise_for_status()
+                payload = json.loads(response.text, parse_float=str, parse_int=str)
+                if not isinstance(payload, list):
+                    raise RuntimeError("CLOB /books response must be a list")
+                if any(not isinstance(row, dict) for row in payload):
+                    raise RuntimeError("CLOB /books response rows must be objects")
+                batch_payload.extend(payload)
+                if not require_complete_batches:
                     break
-                if attempts >= self.max_retries_per_batch:
-                    response.raise_for_status()
-                attempts += 1
+                requested = {item["token_id"] for item in request_body}
+                received = {
+                    str(row.get("asset_id") or row.get("token_id") or "")
+                    for row in payload
+                }
+                unexpected = received - requested - {""}
+                if unexpected:
+                    raise RuntimeError(
+                        "CLOB /books response contains an unexpected token"
+                    )
+                missing = requested - received
+                if not missing:
+                    break
+                if coverage_attempts >= self.max_retries_per_batch:
+                    raise RuntimeError(
+                        "CLOB /books response omitted requested tokens after retries"
+                    )
+                coverage_attempts += 1
                 retry_count += 1
-                retry_after = min(
-                    8.0,
-                    float(response.headers.get("Retry-After") or 2 ** (attempts - 1)),
-                )
-                self.sleeper(retry_after)
-            response.raise_for_status()
-            payload = json.loads(response.text, parse_float=str, parse_int=str)
-            if not isinstance(payload, list):
-                raise RuntimeError("CLOB /books response must be a list")
-            received_book_count += len(payload)
+                request_body = [
+                    {"token_id": token} for token in sorted(missing)
+                ]
+            received_book_count += len(batch_payload)
             if batch_consumer is None:
-                rows.extend(payload)
+                rows.extend(batch_payload)
             else:
-                batch_consumer(payload)
+                batch_consumer(batch_payload)
             evidence = {
                 "batches": batch_number, "batch_count": batch_count,
                 "requested_token_count": len(tokens),
@@ -5654,6 +5688,7 @@ class PolymarketLiveCollector:
                 self.books_client.fetch_stream,
                 refresh_token_ids,
                 batch_consumer=consume,
+                require_complete_batches=True,
             )
         with self.store._sync_lock:
             self.store.complete_book_recovery(

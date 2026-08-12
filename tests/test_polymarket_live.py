@@ -1077,6 +1077,42 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(len(client.fetch(["a"])), 1)
         self.assertEqual(client.last_evidence["retry_count"], 1)
 
+    def test_clob_books_complete_batch_retries_only_omitted_tokens(self):
+        requests_seen = []
+        responses = [
+            Response([snapshot("a", "0.40", "0.42")]),
+            Response([snapshot("b", "0.58", "0.60")]),
+        ]
+
+        def requester(*_args, **kwargs):
+            requests_seen.append([item["token_id"] for item in kwargs["json"]])
+            return responses.pop(0)
+
+        client = ClobBooksClient(
+            requester=requester, max_retries_per_batch=2,
+        )
+        consumed = []
+        rows = client.fetch_stream(
+            ["a", "b"],
+            batch_consumer=consumed.extend,
+            require_complete_batches=True,
+        )
+
+        self.assertEqual(rows, [])
+        self.assertEqual([row["asset_id"] for row in consumed], ["a", "b"])
+        self.assertEqual(requests_seen, [["a", "b"], ["b"]])
+        self.assertEqual(client.last_evidence["received_book_count"], 2)
+        self.assertEqual(client.last_evidence["retry_count"], 1)
+
+    def test_clob_books_complete_batch_fails_after_omission_retries(self):
+        client = ClobBooksClient(
+            requester=lambda *_args, **_kwargs: Response([]),
+            max_retries_per_batch=1,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
+            client.fetch_stream(["a"], require_complete_batches=True)
+
     def test_partial_books_bootstrap_starts_degraded_and_keeps_ready_markets(self):
         rows = [
             gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1")),
