@@ -1604,7 +1604,10 @@ class PolymarketLiveReadStore:
     # inside either transition must not receive a partially usable relation.
     # Briefly follow the immutable state-index boundary; persistent recovery or
     # gaps fail closed with the existing retryable state-index status.
-    stable_read_wait_seconds = 4.0
+    # Tradude's loopback client has a ten-second request timeout. Eight seconds
+    # covers one failed 1.75-second upstream CLOB attempt plus the next complete
+    # two-second refresh while retaining response/serialization headroom.
+    stable_read_wait_seconds = 8.0
     stable_read_poll_seconds = 0.025
 
     @staticmethod
