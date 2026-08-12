@@ -29,4 +29,4 @@ node_modules/
 artifacts/mcvi-*-evidence.json
 AGENTS.md
 # Corptie local Agent configuration
-/.corptie/
+/.corptie
