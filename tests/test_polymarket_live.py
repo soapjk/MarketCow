@@ -2615,6 +2615,49 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             )
             self.assertIn("periodic_snapshot_refresh_failed", captured.output[0])
 
+    def test_websocket_reconnect_retries_transient_book_recovery_failure(self):
+        with TemporaryDirectory() as folder:
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(
+                    requester=lambda *_args, **_kwargs: Response({"markets": []})
+                ),
+                ClobBooksClient(
+                    requester=lambda *_args, **_kwargs: Response([])
+                ),
+                reconnect_seconds=0,
+            )
+            connection_attempts = []
+            recovery_attempts = []
+
+            async def run_once():
+                connection_attempts.append(len(connection_attempts) + 1)
+                if len(connection_attempts) == 1:
+                    raise ConnectionError("simulated websocket disconnect")
+
+            async def bootstrap(reason="startup"):
+                recovery_attempts.append(reason)
+                if len(recovery_attempts) == 1:
+                    raise TimeoutError("simulated CLOB connect timeout")
+                return "recovered"
+
+            collector.run_once = run_once
+            collector.bootstrap_books = bootstrap
+
+            with self.assertLogs(
+                "marketcow.polymarket_live", level="ERROR"
+            ) as captured:
+                asyncio.run(collector.run(max_connections=3))
+
+            self.assertEqual(connection_attempts, [1, 2])
+            self.assertEqual(
+                recovery_attempts,
+                ["websocket_reconnect:2", "websocket_reconnect:3"],
+            )
+            self.assertIn(
+                "websocket_reconnect_recovery_failed", captured.output[0]
+            )
+
     def test_websocket_publication_does_not_starve_periodic_refresh(self):
         with TemporaryDirectory() as folder:
             rows = [gamma_row()]

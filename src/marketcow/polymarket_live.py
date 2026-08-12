@@ -5963,7 +5963,25 @@ class PolymarketLiveCollector:
             while max_connections is None or attempts < max_connections:
                 attempts += 1
                 if attempts > 1:
-                    await self.bootstrap_books(f"websocket_reconnect:{attempts}")
+                    try:
+                        await self.bootstrap_books(
+                            f"websocket_reconnect:{attempts}"
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if (
+                            max_connections is not None
+                            and attempts >= max_connections
+                        ):
+                            raise
+                        LOGGER.exception(
+                            "websocket_reconnect_recovery_failed; retrying after "
+                            "%.3f seconds",
+                            self.reconnect_seconds,
+                        )
+                        await asyncio.sleep(self.reconnect_seconds)
+                        continue
                 try:
                     await self.run_once()
                     return
