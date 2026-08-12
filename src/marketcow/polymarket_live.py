@@ -4929,7 +4929,14 @@ class LiveStateStore:
             reasons.append("unresolved_gap")
         current = now or self.now_provider()
         if books:
-            skew = (max(item.exchange_at for item in books) - min(item.exchange_at for item in books)).total_seconds() * 1000
+            # Exchange timestamps describe the last source-side change and may
+            # legitimately differ when only one binary outcome changes. Frame
+            # coherence is about when the producer observed/published the two
+            # books, matching the Standard Negative Risk relation contract.
+            skew = (
+                max(item.received_at for item in books)
+                - min(item.received_at for item in books)
+            ).total_seconds() * 1000
             if skew > self.max_frame_skew_ms:
                 reasons.append("token_frame_skew")
             if any((current - item.received_at).total_seconds() * 1000 > self.stale_after_ms for item in books):

@@ -811,6 +811,30 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(frame.status, "fail_closed")
         self.assertIn("negative_risk_frame_skew", frame.reason_codes)
 
+    def test_binary_frame_skew_uses_observation_not_last_exchange_change(self):
+        store = self.store()
+        store.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42", "1785739200000"),
+            received_at=NOW,
+        )
+        store.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60", "1785739220000"),
+            received_at=NOW,
+        )
+
+        # Different exchange-side change times do not create a partial
+        # publication when both books were observed at one producer boundary.
+        self.assertEqual(store.frame("m1", now=NOW).status, "ready")
+
+        delayed = NOW + timedelta(seconds=6)
+        store.apply_snapshot(
+            snapshot("yes-1", "0.39", "0.41", "1785739221000"),
+            received_at=delayed,
+        )
+        frame = store.frame("m1", now=delayed)
+        self.assertEqual(frame.status, "fail_closed")
+        self.assertIn("token_frame_skew", frame.reason_codes)
+
     def test_ambiguous_negative_risk_pair_metadata_fails_closed(self):
         rows = [
             gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),
