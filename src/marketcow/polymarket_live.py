@@ -4310,7 +4310,8 @@ class ClobBooksClient:
                     break
                 if coverage_attempts >= self.max_retries_per_batch:
                     raise RuntimeError(
-                        "CLOB /books response omitted requested tokens after retries"
+                        "CLOB /books response omitted requested tokens after retries; "
+                        "missing_token_ids=" + ",".join(sorted(missing))
                     )
                 coverage_attempts += 1
                 retry_count += 1

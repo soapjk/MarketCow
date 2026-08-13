@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 import marketcow.polymarket_live as polymarket_live_module
 from scripts.run_polymarket_scoped_manifest import (
+    validate_scope_lifetime,
     validate_snapshot_refresh_seconds,
 )
 from marketcow.api import create_app
@@ -1138,7 +1139,9 @@ class PolymarketLiveTest(unittest.TestCase):
             max_retries_per_batch=1,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
+        with self.assertRaisesRegex(
+            RuntimeError, "omitted requested tokens.*missing_token_ids=a"
+        ):
             client.fetch_stream(["a"], require_complete_batches=True)
 
     def test_partial_books_bootstrap_does_not_publish_incomplete_batch(self):
@@ -2650,6 +2653,65 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             with self.subTest(unsafe=unsafe):
                 with self.assertRaisesRegex(ValueError, "between 1 and 2"):
                     validate_snapshot_refresh_seconds(unsafe)
+
+    def test_exact_scope_lifetime_is_bound_to_candidate_snapshot(self):
+        manifest = {
+            "candidate_snapshot_id": "candidate-1",
+            "catalog_revision": "catalog-1",
+            "market_ids": ["1", "2"],
+        }
+        candidate = {
+            "snapshot_id": "candidate-1",
+            "catalog_revision": "catalog-1",
+            "markets": [
+                {"market_id": "1", "end_at_ns": 20_000_000_000},
+                {"market_id": "2", "end_at_ns": 30_000_000_000},
+            ],
+        }
+
+        evidence = validate_scope_lifetime(
+            manifest, candidate, 10, now_ns=1_000_000_000,
+        )
+
+        self.assertEqual(evidence["earliest_end_at_ns"], 20_000_000_000)
+        self.assertEqual(evidence["required_valid_until_ns"], 11_000_000_000)
+
+    def test_exact_scope_lifetime_rejects_expiry_inside_run_window(self):
+        manifest = {
+            "candidate_snapshot_id": "candidate-1",
+            "catalog_revision": "catalog-1",
+            "market_ids": ["1", "2"],
+        }
+        candidate = {
+            "snapshot_id": "candidate-1",
+            "catalog_revision": "catalog-1",
+            "markets": [
+                {"market_id": "1", "end_at_ns": 10_000_000_000},
+                {"market_id": "2", "end_at_ns": 30_000_000_000},
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "expiring markets=1"):
+            validate_scope_lifetime(
+                manifest, candidate, 10, now_ns=1_000_000_000,
+            )
+
+    def test_exact_scope_lifetime_rejects_binding_mismatch(self):
+        manifest = {
+            "candidate_snapshot_id": "candidate-1",
+            "catalog_revision": "catalog-1",
+            "market_ids": ["1"],
+        }
+        candidate = {
+            "snapshot_id": "candidate-2",
+            "catalog_revision": "catalog-1",
+            "markets": [{"market_id": "1", "end_at_ns": 30_000_000_000}],
+        }
+
+        with self.assertRaisesRegex(ValueError, "snapshot ID mismatch"):
+            validate_scope_lifetime(
+                manifest, candidate, 10, now_ns=1_000_000_000,
+            )
 
     def test_pinned_scope_does_not_refresh_full_catalog_on_lifecycle_event(self):
         with TemporaryDirectory() as folder:
