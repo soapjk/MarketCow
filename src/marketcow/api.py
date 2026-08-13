@@ -1380,8 +1380,11 @@ def create_app(
         market_id: list[str] | None = Query(default=None),
     ):
         try:
-            return polymarket_live_read.snapshot(
-                _require_polymarket_scope(market_id)
+            return Response(
+                content=polymarket_live_read.snapshot_json(
+                    _require_polymarket_scope(market_id)
+                ),
+                media_type="application/json",
             )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)

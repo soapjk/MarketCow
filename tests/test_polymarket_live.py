@@ -2541,6 +2541,54 @@ class PolymarketLiveTest(unittest.TestCase):
                 stale.exception.code, "polymarket_state_index_lagging",
             )
 
+    def test_snapshot_response_fails_closed_after_slow_serialization(self):
+        settings = Settings(
+            raw_path=self.root / "raw", storage_root=self.root,
+            allowed_root=self.root.parent,
+            postgres_dsn="postgresql://u:p@127.0.0.1/test",
+            clickhouse_password="x", profile="test", port=8793,
+            postgres_schema="test", clickhouse_database="test",
+            clickhouse_spool_path=self.root / "spool",
+        )
+        current = [NOW + timedelta(seconds=1)]
+        app = create_app(settings, Service())
+        store = app.state.polymarket_live
+        store.now_provider = lambda: current[0]
+        reader = app.state.polymarket_live_read
+        reader.now_provider = lambda: current[0]
+        reader._stable_read_wait_seconds = 0
+        rows = [gamma_row()]
+        store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        store.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+        )
+        store.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+        )
+        client = TestClient(app)
+        original_dump = polymarket_live_module.LiveSnapshotPage.model_dump_json
+
+        def delayed_dump(page, *args, **kwargs):
+            payload = original_dump(page, *args, **kwargs)
+            current[0] = NOW + timedelta(seconds=3.51)
+            return payload
+
+        with patch.object(
+            polymarket_live_module.LiveSnapshotPage,
+            "model_dump_json",
+            new=delayed_dump,
+        ):
+            response = client.get(
+                "/v1/prediction-markets/polymarket/live/snapshot?market_id=m1"
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["detail"]["code"],
+            "polymarket_state_index_lagging",
+        )
+        self.assertEqual(response.headers["Retry-After"], "1")
+
     def test_failed_event_types_are_durable_after_checkpoint(self):
         cases = {
             "missing_snapshot": {

@@ -2430,6 +2430,35 @@ class PolymarketLiveReadStore:
             items=[transient.frame(market_id) for market_id in selected_ids],
         )
 
+    def snapshot_json(self, market_ids: Iterable[str]) -> bytes:
+        """Serialize one snapshot and recheck freshness at the response edge.
+
+        ``snapshot`` validates the immutable SQLite boundary before it builds
+        the Pydantic response.  A CPU or scheduling stall during projection or
+        JSON serialization can otherwise consume the transport headroom and
+        expose a structurally complete page whose books are already stale when
+        the caller receives it.  Serialize first, then validate the timestamps
+        carried by that exact page.  The API can return these bytes directly,
+        avoiding a second response-model serialization pass.
+        """
+        page = self.snapshot(market_ids)
+        payload = page.model_dump_json().encode("utf-8")
+        maximum_age = self._stable_snapshot_max_book_age_seconds
+        if maximum_age is None:
+            return payload
+        observed_at = self.now_provider()
+        books = {
+            book.token_id: book
+            for frame in page.items
+            for book in (*frame.tokens, *frame.relation_tokens)
+        }
+        if not books or any(
+            not 0 <= (observed_at - book.received_at).total_seconds() <= maximum_age
+            for book in books.values()
+        ):
+            raise self._stable_boundary_unavailable("snapshot response")
+        return payload
+
     def events_after(
         self, market_ids: Iterable[str], after_cursor: int, limit: int,
     ) -> LiveEventPage:
