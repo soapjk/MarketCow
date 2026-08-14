@@ -3567,6 +3567,34 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertIn("PING", socket.sent)
             self.assertIn("yes-1", store.books)
 
+    def test_public_websocket_heartbeat_is_not_starved_by_active_messages(self):
+        class ActiveSocket(FakeSocket):
+            async def recv(self):
+                await asyncio.sleep(0.006)
+                return await super().recv()
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            store = LiveStateStore(root, now_provider=lambda: NOW)
+            rows = [gamma_row()]
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            socket = ActiveSocket([
+                json.dumps(snapshot("yes-1", "0.40", "0.42"))
+                for _ in range(5)
+            ])
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+                connector=lambda _url: SocketContext(socket),
+                heartbeat_seconds=0.01,
+                websocket_flush_seconds=0,
+            )
+
+            asyncio.run(collector._consume(["yes-1"], message_limit=5))
+
+            self.assertIn("PING", socket.sent)
+
 
 if __name__ == "__main__":
     unittest.main()

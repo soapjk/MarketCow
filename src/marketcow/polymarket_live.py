@@ -6259,13 +6259,17 @@ class PolymarketLiveCollector:
                         "custom_feature_enabled": True,
                     }, separators=(",", ":")))
                 consumed = 0
+                loop = asyncio.get_running_loop()
+                next_heartbeat = loop.time() + self.heartbeat_seconds
                 while message_limit is None or consumed < message_limit:
                     try:
                         message = await asyncio.wait_for(
-                            socket.recv(), timeout=self.heartbeat_seconds
+                            socket.recv(),
+                            timeout=max(0, next_heartbeat - loop.time()),
                         )
                     except asyncio.TimeoutError:
                         await socket.send("PING")
+                        next_heartbeat = loop.time() + self.heartbeat_seconds
                         continue
                     if message == "PONG":
                         continue
