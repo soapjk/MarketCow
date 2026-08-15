@@ -76,7 +76,12 @@ def main() -> None:
             catalog_refresh_on_lifecycle_events=not bool(arguments.market_id),
             publish_checkpoints=not bool(arguments.market_id),
             minimum_snapshot_refresh_age_seconds=(0.25 if arguments.market_id else 0),
-            max_concurrent_snapshot_refreshes=(4 if arguments.market_id else 1),
+            # A bounded scope has at most 200 tokens, so /books can refresh it
+            # in one request.  Parallel workers share one requests.Session and
+            # serialize on the same durable publication boundary; under load
+            # they create overlapping TLS requests and an unbounded commit
+            # backlog that makes the resulting state older, not fresher.
+            max_concurrent_snapshot_refreshes=1,
         )
         if arguments.market_id:
             print({
