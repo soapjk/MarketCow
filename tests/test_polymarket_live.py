@@ -1613,6 +1613,40 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(health.book_complete_market_count, 1)
         self.assertEqual(health.unresolved_gap_count, 0)
 
+    def test_live_health_api_uses_dedicated_executor(self):
+        settings = Settings(
+            raw_path=self.root / "raw",
+            storage_root=self.root,
+            allowed_root=self.root.parent,
+            postgres_dsn="postgresql://u:p@127.0.0.1/test",
+            clickhouse_password="x",
+            profile="test",
+            port=8793,
+            postgres_schema="test",
+            clickhouse_database="test",
+            clickhouse_spool_path=self.root / "spool",
+        )
+        app = create_app(settings, Service())
+        reader = app.state.polymarket_live_read
+        original_health = reader.health
+        health_threads: list[str] = []
+
+        def observed_health():
+            health_threads.append(threading.current_thread().name)
+            return original_health()
+
+        with patch.object(reader, "health", side_effect=observed_health):
+            response = TestClient(app).get(
+                "/v1/prediction-markets/polymarket/live/health"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "not_configured")
+        self.assertEqual(len(health_threads), 1)
+        self.assertTrue(
+            health_threads[0].startswith("marketcow-polymarket-live-health")
+        )
+
     def test_bootstrap_binds_dynamic_clob_tick_to_instrument_facts(self):
         root = self.root / "live-dynamic-tick"
         writer = LiveStateStore(root, now_provider=lambda: NOW)

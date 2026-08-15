@@ -23,6 +23,11 @@ from starlette.responses import (
 )
 from starlette.staticfiles import StaticFiles
 
+_POLYMARKET_LIVE_HEALTH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="marketcow-polymarket-live-health",
+)
+
 from . import __version__
 from .config import Settings
 from .dividends import normalize_dividend_symbol
@@ -551,6 +556,12 @@ def create_app(
         stable_snapshot_max_book_age_seconds=3.5,
     )
     app.state.polymarket_live_read = polymarket_live_read
+
+    async def read_polymarket_live_health():
+        return await asyncio.get_running_loop().run_in_executor(
+            _POLYMARKET_LIVE_HEALTH_EXECUTOR,
+            polymarket_live_read.health,
+        )
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None
     if history_repository is not None and all(hasattr(history_repository, name) for name in (
@@ -692,7 +703,7 @@ def create_app(
             metadata_repository, "upsert_prediction_market_live_observation"
         ):
             return
-        health = await asyncio.to_thread(polymarket_live_read.health)
+        health = await read_polymarket_live_health()
         payload = health.model_dump(mode="json")
         payload["observed_at"] = clock().astimezone(timezone.utc).isoformat()
         await asyncio.to_thread(
@@ -1450,9 +1461,9 @@ def create_app(
         response_model=LiveReadHealth,
         summary="Read live source coverage, lag, and gap health",
     )
-    def polymarket_live_health():
+    async def polymarket_live_health():
         try:
-            return polymarket_live_read.health()
+            return await read_polymarket_live_health()
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
