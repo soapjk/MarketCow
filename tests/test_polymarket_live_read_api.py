@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+import threading
+import time
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+from marketcow.polymarket_live import (
+    GammaLiveNormalizer,
+    LiveStateStore,
+)
+from marketcow.polymarket_live_read_api import create_polymarket_live_read_app
+from tests.test_polymarket_live import gamma_row, snapshot
+
+
+NOW = datetime(2026, 8, 15, 10, 0, tzinfo=timezone.utc)
+
+
+class PolymarketLiveReadApiTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = TemporaryDirectory()
+        self.root = Path(self.temporary.name) / "live"
+        writer = LiveStateStore(self.root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42"), received_at=NOW
+        )
+        writer.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60"), received_at=NOW
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def app(self):
+        app = create_polymarket_live_read_app(
+            root=self.root,
+            stable_snapshot_max_book_age_seconds=3.5,
+            stable_read_wait_seconds=6,
+            stable_read_poll_seconds=0.025,
+            executor_workers=4,
+        )
+        app.state.polymarket_live_read.now_provider = lambda: NOW
+        return app
+
+    def test_contract_matches_bounded_live_read_routes(self):
+        with TestClient(self.app()) as client:
+            health = client.get(
+                "/v1/prediction-markets/polymarket/live/health"
+            )
+            bootstrap = client.get(
+                "/v1/prediction-markets/polymarket/live/bootstrap?market_id=m1"
+            )
+            full = client.get(
+                "/v1/prediction-markets/polymarket/live/bootstrap"
+            )
+            frame = client.get(
+                "/v1/prediction-markets/polymarket/live/snapshot?market_id=m1"
+            )
+            events = client.get(
+                "/v1/prediction-markets/polymarket/live/events"
+                "?after_cursor=0&market_id=m1"
+            )
+            gaps = client.get(
+                "/v1/prediction-markets/polymarket/live/gaps"
+                "?unresolved_only=false&market_id=m1"
+            )
+
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["status"], "index_ready")
+        self.assertEqual(bootstrap.status_code, 200)
+        self.assertEqual(bootstrap.json()["markets"][0]["identity"]["market_id"], "m1")
+        self.assertEqual(full.status_code, 409)
+        self.assertEqual(
+            full.json()["detail"]["code"], "polymarket_full_universe_disabled"
+        )
+        self.assertEqual(frame.status_code, 200)
+        self.assertEqual(frame.json()["items"][0]["status"], "ready")
+        self.assertEqual(events.status_code, 200)
+        self.assertEqual(len(events.json()["items"]), 2)
+        self.assertEqual(gaps.status_code, 200)
+        self.assertEqual(gaps.json()["count"], 0)
+
+    def test_health_runs_while_snapshot_worker_is_blocked(self):
+        app = self.app()
+        reader = app.state.polymarket_live_read
+        original_snapshot = reader.snapshot_json
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+
+        def blocked_snapshot(market_ids):
+            snapshot_started.set()
+            release_snapshot.wait(timeout=5)
+            return original_snapshot(market_ids)
+
+        with patch.object(reader, "snapshot_json", side_effect=blocked_snapshot):
+            with TestClient(app) as client:
+                result: list[object] = []
+                worker = threading.Thread(
+                    target=lambda: result.append(
+                        client.get(
+                            "/v1/prediction-markets/polymarket/live/snapshot"
+                            "?market_id=m1"
+                        )
+                    )
+                )
+                worker.start()
+                self.assertTrue(snapshot_started.wait(timeout=2))
+                started = time.monotonic()
+                health = client.get(
+                    "/v1/prediction-markets/polymarket/live/health"
+                )
+                elapsed = time.monotonic() - started
+                release_snapshot.set()
+                worker.join(timeout=5)
+
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["status"], "index_ready")
+        self.assertLess(elapsed, 1)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status_code, 200)
+
+
+if __name__ == "__main__":
+    unittest.main()
