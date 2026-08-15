@@ -2672,7 +2672,7 @@ class PolymarketLiveReadStore:
         summary_keys = {
             "catalog_revision", "latest_cursor", "active_recovery_id",
             "book_token_count", "book_complete_market_count",
-            "unresolved_gap_count",
+            "unresolved_gap_count", "oldest_book_received_at",
         }
         if summary_keys.issubset(state_manifest):
             state_metadata = state_manifest
@@ -2691,25 +2691,19 @@ class PolymarketLiveReadStore:
                     fresh
                     and self._stable_snapshot_max_book_age_seconds is not None
                 ):
-                    with self._state_snapshot() as (_, connection, indexed_metadata):
-                        rows = list(connection.execute(
-                            """SELECT b.token_id, b.payload_json,
-                                json_extract(b.payload_json, '$.received_at')
-                                    AS book_received_at,
-                                c.received_at AS confirmed_received_at
-                                FROM books b LEFT JOIN book_confirmations c
-                                ON c.token_id=b.token_id"""
-                        ))
-                    expected_token_ids = {str(row["token_id"]) for row in rows}
-                    fresh = (
-                        indexed_metadata.get("latest_cursor")
-                        == state_metadata.get("latest_cursor")
-                        and len(expected_token_ids)
-                        == int(state_metadata["book_token_count"])
-                        and self._book_rows_form_fresh_boundary(
-                            rows, expected_token_ids,
+                    if int(state_metadata["book_token_count"]) <= 0:
+                        fresh = False
+                    else:
+                        oldest_received_at = _instant(
+                            state_metadata["oldest_book_received_at"]
                         )
-                    )
+                        age = (
+                            self.now_provider() - oldest_received_at
+                        ).total_seconds()
+                        fresh = (
+                            0 <= age
+                            <= self._stable_snapshot_max_book_age_seconds
+                        )
                 if fresh:
                     break
                 remaining = deadline - time.monotonic()
@@ -2904,7 +2898,9 @@ class LiveStateIndex:
                 ) WITHOUT ROWID""")
                 connection.commit()
 
-    def confirm_book(self, book: LiveBook) -> None:
+    def confirm_book(
+        self, book: LiveBook, *, oldest_book_received_at: datetime,
+    ) -> None:
         """Publish freshness for unchanged content without another full book event."""
         connection = getattr(self._batch_state, "connection", None)
         owns_connection = connection is None
@@ -2935,6 +2931,9 @@ class LiveStateIndex:
                     book.source_hash, content_sha256(confirmation),
                 ),
             )
+            self._set_metadata(connection, {
+                "oldest_book_received_at": oldest_book_received_at.isoformat(),
+            })
             if owns_connection:
                 connection.commit()
         except BaseException:
@@ -2958,7 +2957,7 @@ class LiveStateIndex:
         )
 
     @staticmethod
-    def _health_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    def _health_counts(connection: sqlite3.Connection) -> dict[str, Any]:
         return {
             "book_token_count": int(
                 connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
@@ -2974,7 +2973,22 @@ class LiveStateIndex:
             "unresolved_gap_count": int(connection.execute(
                 "SELECT COUNT(*) FROM gaps WHERE resolved=0"
             ).fetchone()[0]),
+            "oldest_book_received_at": str(connection.execute(
+                """SELECT COALESCE(
+                    MIN(COALESCE(
+                        c.received_at,
+                        json_extract(b.payload_json, '$.received_at')
+                    )), ''
+                    ) FROM books b LEFT JOIN book_confirmations c
+                    ON c.token_id=b.token_id"""
+            ).fetchone()[0]),
         }
+
+    def refresh_health_summary(self) -> None:
+        """Recompute manifest health metadata after bounded tail replay."""
+        with self.batch():
+            connection = self._batch_state.connection
+            self._set_metadata(connection, self._health_counts(connection))
 
     def _publish_manifest(
         self, metadata: dict[str, str] | None = None, *, force: bool = True,
@@ -2996,7 +3010,7 @@ class LiveStateIndex:
                 for key in (
                     "catalog_revision", "latest_cursor", "active_recovery_id",
                     "book_token_count", "book_complete_market_count",
-                    "unresolved_gap_count",
+                    "unresolved_gap_count", "oldest_book_received_at",
                 )
                 if key in metadata
             }
@@ -3023,6 +3037,7 @@ class LiveStateIndex:
         book_token_count: int | None = None,
         book_complete_market_count: int | None = None,
         unresolved_gap_count: int | None = None,
+        oldest_book_received_at: str | None = None,
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = getattr(self._batch_state, "connection", None)
@@ -3096,6 +3111,7 @@ class LiveStateIndex:
                     "book_token_count": book_token_count,
                     "book_complete_market_count": book_complete_market_count,
                     "unresolved_gap_count": unresolved_gap_count,
+                    "oldest_book_received_at": oldest_book_received_at,
                 }.items() if value is not None
             }
             self._set_metadata(connection, {
@@ -3216,6 +3232,10 @@ class LiveStateIndex:
                         ) == 2
                     }),
                     "unresolved_gap_count": sum(not gap.resolved for gap in gaps),
+                    "oldest_book_received_at": (
+                        min(book.received_at for book in books.values()).isoformat()
+                        if books else ""
+                    ),
                 })
                 connection.commit()
             os.replace(temporary, self.path)
@@ -4718,6 +4738,10 @@ class LiveStateStore:
                 if market.active and not market.closed
             ),
             unresolved_gap_count=sum(not gap.resolved for gap in self.gaps),
+            oldest_book_received_at=(
+                min(book.received_at for book in self.books.values()).isoformat()
+                if self.books else ""
+            ),
         )
         return envelope
 
@@ -4774,7 +4798,12 @@ class LiveStateStore:
                 "source_hash": source_hash,
             })
             self.books[token_id] = confirmed
-            self.state_index.confirm_book(confirmed)
+            self.state_index.confirm_book(
+                confirmed,
+                oldest_book_received_at=min(
+                    book.received_at for book in self.books.values()
+                ),
+            )
             return None
         book = LiveBook(
             token_id=token_id, condition_id=market.identity.condition_id,
@@ -5728,6 +5757,8 @@ def catch_up_live_state_index(root: Path) -> dict[str, int]:
                 replayed += 1
         if offset != actual_size:
             raise RuntimeError("durable live event size changed during tail recovery")
+        if replayed:
+            state_index.refresh_health_summary()
         return {
             "previous_cursor": previous_cursor,
             "latest_cursor": expected_cursor - 1,

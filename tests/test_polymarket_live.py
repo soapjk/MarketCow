@@ -2541,6 +2541,72 @@ class PolymarketLiveTest(unittest.TestCase):
                 stale.exception.code, "polymarket_state_index_lagging",
             )
 
+    def test_health_uses_transactional_freshness_summary_without_book_scan(self):
+        root = self.root / "health-freshness-summary"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        writer.replace_catalog(
+            GammaLiveNormalizer.normalize([gamma_row()], NOW), [gamma_row()]
+        )
+        writer.apply_snapshot(
+            snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+        )
+        writer.apply_snapshot(
+            snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+        )
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: NOW + timedelta(seconds=1),
+            stable_read_wait_seconds=0,
+            stable_snapshot_max_book_age_seconds=3.5,
+        )
+
+        with patch.object(
+            reader, "_state_snapshot",
+            side_effect=AssertionError("health must not scan live books"),
+        ):
+            health = reader.health()
+
+        self.assertEqual(health.status, "index_ready")
+        self.assertEqual(health.book_token_count, 2)
+
+    def test_unchanged_book_confirmations_advance_health_freshness_summary(self):
+        root = self.root / "confirmed-health-freshness-summary"
+        current = [NOW]
+        writer = LiveStateStore(root, now_provider=lambda: current[0])
+        writer.state_index.manifest_publish_interval_seconds = 0
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        books = [
+            snapshot("yes-1", "0.40", "0.42"),
+            snapshot("no-1", "0.58", "0.60"),
+        ]
+        for book in books:
+            writer.apply_snapshot(book, received_at=NOW)
+        original_cursor = writer.cursor
+        current[0] = NOW + timedelta(seconds=3)
+        with writer.state_index.batch():
+            for book in books:
+                self.assertIsNone(writer.apply_snapshot(
+                    book,
+                    received_at=current[0],
+                    allow_freshness_confirmation=True,
+                ))
+
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: current[0] + timedelta(seconds=1),
+            stable_read_wait_seconds=0,
+            stable_snapshot_max_book_age_seconds=3.5,
+        )
+        with patch.object(
+            reader, "_state_snapshot",
+            side_effect=AssertionError("health must use confirmed summary"),
+        ):
+            health = reader.health()
+
+        self.assertEqual(writer.cursor, original_cursor)
+        self.assertEqual(health.status, "index_ready")
+
     def test_snapshot_response_fails_closed_after_slow_serialization(self):
         settings = Settings(
             raw_path=self.root / "raw", storage_root=self.root,
