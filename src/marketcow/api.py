@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
@@ -94,6 +95,11 @@ from .polymarket_live import (
 from .dashboard_registry import load_dashboard_registry, registry_document
 from .admin_control import AdminAuditService
 from .http_metrics import RequestMetrics, RequestMetricsMiddleware
+from .polymarket_events_observability import (
+    PolymarketEventMetrics,
+    PolymarketEventsTraceMiddleware,
+    server_timing,
+)
 from .admin_events import ALLOWED_EVENT_TYPES, AdminEventHub, encode_sse
 from .admin_auth import (
     CSRF_COOKIE, SESSION_COOKIE, AdminAuth, AdminSecurityMiddleware,
@@ -549,13 +555,26 @@ def create_app(
     polymarket_live_read = PolymarketLiveReadStore(
         polymarket_live.root,
         # The strict live consumer evaluates at a five-second maximum age.
-        # Reserve at least 1.5 seconds of transport/projection headroom while
-        # allowing one ordinary two-second REST cadence to bridge a transient
-        # empty-sided upstream response. The consumer's five-second limit is
-        # unchanged and remains the final fail-closed boundary.
-        stable_snapshot_max_book_age_seconds=3.5,
+        # The 100-market collector can spend roughly four seconds between its
+        # common REST receive timestamp and the atomic 200-book publication.
+        # The optimized response path normally projects and writes in well
+        # under 0.5s, and snapshot_json rechecks the exact serialized page at
+        # the response edge. Keep that measured half-second transport margin
+        # inside Tradude's unchanged five-second final fail-closed boundary.
+        stable_snapshot_max_book_age_seconds=4.5,
     )
     app.state.polymarket_live_read = polymarket_live_read
+    polymarket_event_executor = ThreadPoolExecutor(
+        max_workers=4,
+        thread_name_prefix="marketcow-polymarket-events",
+    )
+    polymarket_event_metrics = PolymarketEventMetrics()
+    app.add_middleware(
+        PolymarketEventsTraceMiddleware,
+        metrics=polymarket_event_metrics,
+    )
+    app.state.polymarket_event_executor = polymarket_event_executor
+    app.state.polymarket_event_metrics = polymarket_event_metrics
 
     async def read_polymarket_live_health():
         return await asyncio.get_running_loop().run_in_executor(
@@ -752,6 +771,9 @@ def create_app(
                 csv_import_service.close()
             if owned_mcp_client is not None:
                 owned_mcp_client.close()
+            polymarket_event_executor.shutdown(
+                wait=False, cancel_futures=True,
+            )
             service.close()
 
     app.add_event_handler("startup", startup)
@@ -1035,7 +1057,7 @@ def create_app(
     @app.get("/metrics", include_in_schema=False)
     def prometheus_metrics():
         return Response(
-            request_metrics.render(),
+            request_metrics.render() + polymarket_event_metrics.render(),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
 
@@ -1429,16 +1451,48 @@ def create_app(
         response_model=LiveEventPage,
         summary="Resume provider-neutral Polymarket live events after a cursor",
     )
-    def polymarket_live_events(
+    async def polymarket_live_events(
+        request: Request,
         after_cursor: int = Query(0, ge=0),
         limit: int = Query(1000, ge=1, le=10000),
         market_id: list[str] | None = Query(default=None),
     ):
-        try:
-            return polymarket_live_read.events_after(
+        trace = request.scope["polymarket_events_trace"]
+        submitted = time.perf_counter()
+        phases: dict[str, float] = {}
+
+        def read_and_serialize_events():
+            queue_ms = (time.perf_counter() - submitted) * 1000
+            trace["executor_queue_ms"] = queue_ms
+            payload, _, page = polymarket_live_read.events_json(
                 _require_polymarket_scope(market_id), after_cursor, limit,
+                _phase_ms=phases,
+            )
+            return queue_ms, payload, phases, page
+
+        try:
+            queue_ms, payload, phases, page = await (
+                asyncio.get_running_loop().run_in_executor(
+                    polymarket_event_executor,
+                    read_and_serialize_events,
+                )
+            )
+            trace.update(phases)
+            trace.update({
+                "executor_queue_ms": queue_ms,
+                "next_cursor": page.next_cursor,
+                "event_count": len(page.items),
+                "has_more": page.has_more,
+            })
+            return Response(
+                content=payload,
+                media_type="application/json",
+                headers={"Server-Timing": server_timing(phases, queue_ms)},
             )
         except PolymarketLiveReadError as exc:
+            trace.update(phases)
+            trace["error_code"] = exc.code
+            trace["timed_out"] = exc.code == "polymarket_state_index_lagging"
             _raise_polymarket_read_error(exc)
 
     @app.get(

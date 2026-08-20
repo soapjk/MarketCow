@@ -2072,7 +2072,11 @@ class PolymarketLiveReadStore:
             cached[2].close()
         connection = _readonly_state_sqlite(path)
         connection.execute("PRAGMA query_only=ON")
-        connection.execute("PRAGMA busy_timeout=20000")
+        # A loopback consumer times out after ten seconds. WAL readers should
+        # not ordinarily wait for the writer at all; bound an exceptional lock
+        # wait well below that transport deadline so the API can return its
+        # explicit fail-closed 503 instead of abandoning a worker for 20s.
+        connection.execute("PRAGMA busy_timeout=500")
         connection.execute("PRAGMA cache_size=-32768")
         connection.execute("PRAGMA mmap_size=268435456")
         self._state_reader.binding = (path, signature, connection)
@@ -2111,6 +2115,12 @@ class PolymarketLiveReadStore:
                 finally:
                     connection.rollback()
                 return
+            except sqlite3.OperationalError as exc:
+                connection.rollback()
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    self._discard_state_reader(connection)
+                    raise self._stable_boundary_unavailable("SQLite read") from exc
+                raise
             except BaseException:
                 connection.rollback()
                 raise
@@ -2460,14 +2470,33 @@ class PolymarketLiveReadStore:
         return payload
 
     def events_after(
-        self, market_ids: Iterable[str], after_cursor: int, limit: int,
+        self,
+        market_ids: Iterable[str],
+        after_cursor: int,
+        limit: int,
+        *,
+        _phase_ms: dict[str, float] | None = None,
     ) -> LiveEventPage:
+        phases = _phase_ms if _phase_ms is not None else {}
+        scope_started = time.perf_counter()
         selected_ids = self._scope(market_ids)
         bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
+        phases["scope_bootstrap_ms"] = (
+            time.perf_counter() - scope_started
+        ) * 1000
         placeholders = ",".join("?" for _ in selected_ids)
+        # For broad scopes, walking the cursor primary key naturally returns
+        # the first page in order. The (market_id,cursor) index makes SQLite
+        # merge and temp-sort one range per market, which has measurable tail
+        # cost for the 100-market production scope. Narrow scopes retain that
+        # selective index so sparse-market catch-up does not scan the universe.
+        event_table_hint = " NOT INDEXED" if len(selected_ids) >= 8 else ""
         page_limit = min(limit, self.max_event_page_items)
         deadline = time.monotonic() + self._stable_read_wait_seconds
+        sqlite_seconds = 0.0
+        stable_wait_seconds = 0.0
         while True:
+            query_started = time.perf_counter()
             with self._state_snapshot() as (_, connection, metadata):
                 if metadata["catalog_revision"] != bootstrap.catalog_revision:
                     raise PolymarketLiveReadError(
@@ -2482,46 +2511,36 @@ class PolymarketLiveReadStore:
                 ).fetchone()[0])
                 stable = not metadata.get("active_recovery_id") and gap_count == 0
                 if stable:
-                    if after_cursor > 0:
-                        transition_rows = list(connection.execute(
+                    transition_rows = (
+                        list(connection.execute(
                             """SELECT cursor, byte_offset, byte_length, line_sha256
                                FROM event_offsets
                                WHERE market_id IS NULL AND cursor > ?
                                ORDER BY cursor""",
                             (after_cursor,),
                         ))
-                        with self.event_path.open("rb") as stream:
-                            for row in transition_rows:
-                                stream.seek(int(row["byte_offset"]))
-                                line = stream.read(int(row["byte_length"]))
-                                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
-                                    raise PolymarketLiveReadError(
-                                        "polymarket_state_integrity_failed",
-                                        "Catalog transition event hash mismatch",
-                                        409,
-                                    )
-                                event = LiveEventEnvelope.model_validate_json(line)
-                                if event.event_type == "catalog_revision":
-                                    raise PolymarketLiveReadError(
-                                        "resume_cursor_expired",
-                                        (
-                                            "Resume cursor predates the current catalog; "
-                                            "perform a fresh scoped snapshot"
-                                        ),
-                                        409,
-                                    )
+                        if after_cursor > 0 else []
+                    )
                     rows = list(connection.execute(
-                        f"""SELECT * FROM event_offsets
+                        f"""SELECT * FROM event_offsets{event_table_hint}
                             WHERE market_id IN ({placeholders}) AND cursor > ?
                             ORDER BY cursor LIMIT ?""",
                         [*selected_ids, after_cursor, page_limit + 1],
                     ))
+            sqlite_seconds += time.perf_counter() - query_started
             if stable:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                phases["sqlite_query_ms"] = sqlite_seconds * 1000
+                phases["stable_boundary_wait_ms"] = stable_wait_seconds * 1000
                 raise self._stable_boundary_unavailable("events")
-            time.sleep(min(self._stable_read_poll_seconds, remaining))
+            sleep_seconds = min(self._stable_read_poll_seconds, remaining)
+            wait_started = time.perf_counter()
+            time.sleep(sleep_seconds)
+            stable_wait_seconds += time.perf_counter() - wait_started
+        phases["sqlite_query_ms"] = sqlite_seconds * 1000
+        phases["stable_boundary_wait_ms"] = stable_wait_seconds * 1000
         has_more = len(rows) > page_limit
         rows = rows[:page_limit]
         bounded_rows = []
@@ -2534,6 +2553,27 @@ class PolymarketLiveReadStore:
             bounded_rows.append(row)
             bounded_bytes += row_bytes
         rows = bounded_rows
+        model_started = time.perf_counter()
+        with self.event_path.open("rb") as stream:
+            for row in transition_rows:
+                stream.seek(int(row["byte_offset"]))
+                line = stream.read(int(row["byte_length"]))
+                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
+                    raise PolymarketLiveReadError(
+                        "polymarket_state_integrity_failed",
+                        "Catalog transition event hash mismatch",
+                        409,
+                    )
+                event = LiveEventEnvelope.model_validate_json(line)
+                if event.event_type == "catalog_revision":
+                    raise PolymarketLiveReadError(
+                        "resume_cursor_expired",
+                        (
+                            "Resume cursor predates the current catalog; "
+                            "perform a fresh scoped snapshot"
+                        ),
+                        409,
+                    )
         items = []
         with self.event_path.open("rb") as stream:
             for row in rows:
@@ -2558,10 +2598,45 @@ class PolymarketLiveReadStore:
                     )
                 items.append(event)
         next_cursor = items[-1].cursor if items else after_cursor
-        return LiveEventPage(
+        page = LiveEventPage(
             after_cursor=after_cursor, next_cursor=next_cursor,
             has_more=has_more, items=items,
         )
+        phases["model_construction_ms"] = (
+            time.perf_counter() - model_started
+        ) * 1000
+        phases["selected_event_bytes"] = float(bounded_bytes)
+        return page
+
+    def events_json(
+        self,
+        market_ids: Iterable[str],
+        after_cursor: int,
+        limit: int,
+        *,
+        _phase_ms: dict[str, float] | None = None,
+    ) -> tuple[bytes, dict[str, float], LiveEventPage]:
+        """Build and serialize a verified event page exactly once.
+
+        The shared API runs this whole operation on its dedicated event-read
+        executor. Returning immutable JSON bytes prevents FastAPI from doing a
+        second response-model conversion and serialization pass on the event
+        loop for responses near the one MiB transport bound.
+        """
+        phases = _phase_ms if _phase_ms is not None else {}
+        page = self.events_after(
+            market_ids, after_cursor, limit, _phase_ms=phases,
+        )
+        serialization_started = time.perf_counter()
+        payload = page.model_dump_json().encode("utf-8")
+        phases["json_serialization_ms"] = (
+            time.perf_counter() - serialization_started
+        ) * 1000
+        # The ASGI middleware records bytes actually handed to the transport.
+        # Keep the pre-send size under a distinct diagnostic name so it is not
+        # added to the emitted body size a second time.
+        phases["serialized_response_bytes"] = float(len(payload))
+        return payload, phases, page
 
     def gaps(
         self, market_ids: Iterable[str], *, unresolved_only: bool,
