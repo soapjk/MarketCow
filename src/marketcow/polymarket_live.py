@@ -6036,6 +6036,11 @@ class PolymarketLiveCollector:
         self.max_websocket_batch_messages = max(1, max_websocket_batch_messages)
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
+        # Periodic REST refreshes and reconnect recovery both fetch the same
+        # books and publish through one durable boundary.  Letting their fetches
+        # overlap only creates a publication backlog whose snapshots are stale
+        # by the time they acquire the writer lock.
+        self._snapshot_operation_lock = asyncio.Lock()
 
     def _coherent_refresh_groups(self) -> list[tuple[str, ...]]:
         """Return stable refresh units without splitting relation members.
@@ -6124,29 +6129,46 @@ class PolymarketLiveCollector:
         publish_completion_event: bool,
     ) -> dict[str, Any] | None:
         """Publish recovered books and their completion in one durable flush."""
-        with (
-            self.store._sync_lock,
-            _publication_lock(self.store.root, exclusive=True),
-            self.store.memory_state_batch(),
-            self.store.state_index.batch(),
-            self.store.durable_event_batch(),
-        ):
-            if rows:
-                self.store.recover_book_batch(
-                    rows,
-                    recovery_id,
-                    tracker,
-                    refresh_started_at=refresh_started_at,
-                    received_at=received_at,
+        wait_started = time.monotonic()
+        with self.store._sync_lock:
+            sync_wait_seconds = time.monotonic() - wait_started
+            publication_wait_started = time.monotonic()
+            with _publication_lock(self.store.root, exclusive=True):
+                publication_wait_seconds = (
+                    time.monotonic() - publication_wait_started
                 )
-            if complete:
-                return self.store.complete_book_recovery(
-                    recovery_id,
-                    tracker,
-                    write_checkpoint=write_checkpoint,
-                    publish_completion_event=publish_completion_event,
-                )
-        return None
+                publish_started = time.monotonic()
+                with (
+                    self.store.memory_state_batch(),
+                    self.store.state_index.batch(),
+                    self.store.durable_event_batch(),
+                ):
+                    if rows:
+                        self.store.recover_book_batch(
+                            rows,
+                            recovery_id,
+                            tracker,
+                            refresh_started_at=refresh_started_at,
+                            received_at=received_at,
+                        )
+                    result = (
+                        self.store.complete_book_recovery(
+                            recovery_id,
+                            tracker,
+                            write_checkpoint=write_checkpoint,
+                            publish_completion_event=publish_completion_event,
+                        )
+                        if complete else None
+                    )
+                publish_seconds = time.monotonic() - publish_started
+        LOGGER.info(
+            "clob_books_publish_phase recovery_id=%s rows=%d complete=%s "
+            "sync_wait_seconds=%.6f publication_wait_seconds=%.6f "
+            "publish_seconds=%.6f cursor=%d",
+            recovery_id, len(rows), complete, sync_wait_seconds,
+            publication_wait_seconds, publish_seconds, self.store.cursor,
+        )
+        return result
 
     @staticmethod
     def _require_usable_book_rows(rows: list[dict[str, Any]]) -> None:
@@ -6163,6 +6185,7 @@ class PolymarketLiveCollector:
 
     async def bootstrap_books(self, reason: str = "startup") -> str:
         with self.store._sync_lock:
+            recovery_started_at = self.store.now_provider()
             recovery_id = self.store.mark_recovery_started(reason)
             tracker = self.store.new_book_recovery_tracker()
 
@@ -6172,6 +6195,7 @@ class PolymarketLiveCollector:
                 recovery_id,
                 tracker,
                 complete=False,
+                refresh_started_at=recovery_started_at,
                 received_at=self.store.now_provider(),
                 write_checkpoint=False,
                 publish_completion_event=False,
@@ -6190,6 +6214,7 @@ class PolymarketLiveCollector:
                 recovery_id,
                 tracker,
                 complete=True,
+                refresh_started_at=recovery_started_at,
                 received_at=self.store.now_provider(),
                 write_checkpoint=self.publish_checkpoints,
                 publish_completion_event=True,
@@ -6206,6 +6231,7 @@ class PolymarketLiveCollector:
                 recovery_id,
                 tracker,
                 complete=True,
+                refresh_started_at=recovery_started_at,
                 write_checkpoint=self.publish_checkpoints,
                 publish_completion_event=True,
             )
@@ -6456,11 +6482,12 @@ class PolymarketLiveCollector:
             while True:
                 refresh_started = time.monotonic()
                 try:
-                    await self.refresh_books(
-                        "periodic_snapshot_refresh",
-                        partition_index=partition_index,
-                        partition_count=self.max_concurrent_snapshot_refreshes,
-                    )
+                    async with self._snapshot_operation_lock:
+                        await self.refresh_books(
+                            "periodic_snapshot_refresh",
+                            partition_index=partition_index,
+                            partition_count=self.max_concurrent_snapshot_refreshes,
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -6495,9 +6522,10 @@ class PolymarketLiveCollector:
                 attempts += 1
                 if attempts > 1:
                     try:
-                        await self.bootstrap_books(
-                            f"websocket_reconnect:{attempts}"
-                        )
+                        async with self._snapshot_operation_lock:
+                            await self.bootstrap_books(
+                                f"websocket_reconnect:{attempts}"
+                            )
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -6521,6 +6549,11 @@ class PolymarketLiveCollector:
                 except Exception:
                     if max_connections is not None and attempts >= max_connections:
                         raise
+                    LOGGER.exception(
+                        "websocket_disconnected attempt=%d; reconnecting after "
+                        "%.3f seconds",
+                        attempts, self.reconnect_seconds,
+                    )
                     await asyncio.sleep(self.reconnect_seconds)
         finally:
             if refresh_task is not None:
