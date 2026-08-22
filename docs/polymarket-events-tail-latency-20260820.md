@@ -173,3 +173,49 @@ Final automated results:
   both passed.
 - `uv run --group dev ruff check .`: passed.
 - `uv build`: source distribution and wheel built successfully.
+
+## 2026-08-22 collector stability follow-up
+
+Tradude's next preflight exposed a collector feedback loop rather than an
+`/events` read-path regression. Both read APIs correctly returned fail-closed
+503 responses because the oldest live book was repeatedly more than five
+seconds old, even though the durable index remained structurally complete at
+100 markets, 200 book tokens, and zero unresolved gaps.
+
+Timestamped event inspection established the ordering failure: higher cursors
+from a periodic REST refresh carried older `received_at` timestamps than lower
+cursors already published by the WebSocket stream. Commit `45f6065` serialized
+periodic refresh and reconnect recovery, but neither operation was coordinated
+with WebSocket publication. A REST request could therefore start, receive newer
+WebSocket state while in flight, and then overwrite it with its older snapshot.
+The two-second refresh repeatedly wrote nearly all 200 books, amplified durable
+book events, held the SQLite publication lock, and delayed the WebSocket event
+loop. Lock waits reached 14--25 seconds and the resulting scheduling pressure
+caused keepalive ping timeouts, reconnect recovery, and yet more full-state
+publication. An empty `active_recovery_id` only proves that recovery is not
+active; it does not satisfy the separate freshness boundary enforced by health.
+
+Commit `a8db7a8` breaks that loop without weakening fail-closed behavior:
+
+- An in-flight REST row is marked superseded and not published when a newer
+  WebSocket generation or `received_at` value already exists.
+- WebSocket arrays are durably published in bounded 32-item chunks, preserving
+  order while limiting lock hold time and yielding to keepalive processing.
+- A periodic refresh that spent an entire refresh interval waiting behind
+  recovery is discarded and replaced by a fresh cycle.
+- The default WebSocket connector retains 20-second pings but permits a bounded
+  60-second pong timeout under transient local publication load.
+- Slow WebSocket publish phases now record item count, emitted events, sync
+  wait, publish time, and cursor.
+
+After restarting the collector and both read APIs from the task worktree, the
+first 200-token bootstrap fetched REST in 1.395 seconds and published in 0.074
+seconds. Subsequent refresh publication was normally 0.02--0.06 seconds; no
+timestamped `websocket_disconnected` event was observed after the restart.
+A 60-second v48-frequency concurrent smoke run (not the formal one-hour
+acceptance) produced 111 successful `/events` samples, p99 0.234223 seconds,
+maximum 0.252672 seconds, zero ten-second timeouts, and zero unavailable time.
+Cursor advanced from 14,880,453 to 14,883,295 with zero gaps, duplicates, or
+integrity failures. Concurrent health, bootstrap, snapshot, and the secondary
+read API all succeeded; maximum observed book age was 2.949552 seconds. Shadow
+mode remained enabled and real order submission remained disabled.
