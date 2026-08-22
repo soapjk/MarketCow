@@ -119,8 +119,10 @@ def create_polymarket_live_read_app(
         try:
             scope = _require_scope(market_id)
             if stream_client is not None:
-                return await run_read(projection.bootstrap, reader, scope)
-            return await run_read(reader.bootstrap, scope)
+                body = await run_read(projection.bootstrap_json, reader, scope)
+            else:
+                body = await run_read(reader.bootstrap_json, scope)
+            return Response(content=body, media_type="application/json")
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
 
@@ -172,12 +174,13 @@ def create_polymarket_live_read_app(
         market_id: list[str] | None = Query(default=None),
     ):
         try:
-            return await run_read(
-                projection.events_after if stream_client is not None else reader.events_after,
+            payload, _, _ = await run_read(
+                projection.events_json if stream_client is not None else reader.events_json,
                 _require_scope(market_id),
                 after_cursor,
                 limit,
             )
+            return Response(content=payload, media_type="application/json")
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
 
@@ -198,7 +201,7 @@ def create_polymarket_live_read_app(
     async def health():
         try:
             if stream_client is not None:
-                return projection.health()
+                return projection.health(reader)
             return await run_read(reader.health)
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)

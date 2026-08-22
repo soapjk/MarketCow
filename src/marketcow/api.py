@@ -11,6 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Literal, Optional
 from zoneinfo import ZoneInfo
@@ -585,17 +586,22 @@ def create_app(
         max_workers=4,
         thread_name_prefix="marketcow-polymarket-events",
     )
+    polymarket_frame_executor = ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="marketcow-polymarket-frames",
+    )
     polymarket_event_metrics = PolymarketEventMetrics()
     app.add_middleware(
         PolymarketEventsTraceMiddleware,
         metrics=polymarket_event_metrics,
     )
     app.state.polymarket_event_executor = polymarket_event_executor
+    app.state.polymarket_frame_executor = polymarket_frame_executor
     app.state.polymarket_event_metrics = polymarket_event_metrics
 
     async def read_polymarket_live_health():
         if polymarket_live_stream_client is not None:
-            return polymarket_live_projection.health()
+            return polymarket_live_projection.health(polymarket_live_read)
         return await asyncio.get_running_loop().run_in_executor(
             _POLYMARKET_LIVE_HEALTH_EXECUTOR,
             polymarket_live_read.health,
@@ -803,6 +809,9 @@ def create_app(
             if owned_mcp_client is not None:
                 owned_mcp_client.close()
             polymarket_event_executor.shutdown(
+                wait=False, cancel_futures=True,
+            )
+            polymarket_frame_executor.shutdown(
                 wait=False, cancel_futures=True,
             )
             service.close()
@@ -1425,16 +1434,23 @@ def create_app(
         response_model=LiveBootstrapResponse,
         summary="Read the provider-neutral Polymarket live catalog and resume contract",
     )
-    def polymarket_live_bootstrap(
+    async def polymarket_live_bootstrap(
         market_id: list[str] | None = Query(default=None),
     ):
         try:
             scope = _require_polymarket_scope(market_id)
             if polymarket_live_stream_client is not None:
-                return polymarket_live_projection.bootstrap(
-                    polymarket_live_read, scope
+                action = partial(
+                    polymarket_live_projection.bootstrap_json,
+                    polymarket_live_read,
+                    scope,
                 )
-            return polymarket_live_read.bootstrap(scope)
+            else:
+                action = partial(polymarket_live_read.bootstrap_json, scope)
+            body = await asyncio.get_running_loop().run_in_executor(
+                polymarket_frame_executor, action,
+            )
+            return Response(content=body, media_type="application/json")
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1443,23 +1459,23 @@ def create_app(
         response_model=LiveSnapshotPage,
         summary="Read consistent fail-closed market frames",
     )
-    def polymarket_live_snapshot(
+    async def polymarket_live_snapshot(
         market_id: list[str] | None = Query(default=None),
     ):
         try:
             scope = _require_polymarket_scope(market_id)
             if polymarket_live_stream_client is not None:
-                body = polymarket_live_projection.snapshot_json(
-                    polymarket_live_read, scope
+                action = partial(
+                    polymarket_live_projection.snapshot_json,
+                    polymarket_live_read,
+                    scope,
                 )
-                return Response(
-                    content=body,
-                    media_type="application/json",
-                )
-            return Response(
-                content=polymarket_live_read.snapshot_json(scope),
-                media_type="application/json",
+            else:
+                action = partial(polymarket_live_read.snapshot_json, scope)
+            body = await asyncio.get_running_loop().run_in_executor(
+                polymarket_frame_executor, action,
             )
+            return Response(content=body, media_type="application/json")
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 

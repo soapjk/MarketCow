@@ -272,3 +272,31 @@ The final correction removes durable storage from the real-time data path:
 The v49 run covered only 1,522.74 seconds and failed; it is not acceptance
 evidence. A new one-hour shadow run is required after deployment of this
 architecture.
+
+## 2026-08-23 v54 in-memory projection freshness failure
+
+Tradude v54 confirmed that `/events` was using `memory_projection` with
+`sqlite_query_ms=0`, but its tenth health sample failed closed after a combined
+100-market bootstrap/snapshot read took 7.882 seconds. The returned frame
+carried book ages from 6.427 to 8.667 seconds even though `/health` still
+reported `index_ready`, a connected stream, zero gaps, and an empty persistence
+queue. This was a separate in-process scheduling defect, not a regression to
+the SQLite hot path.
+
+Code inspection found three mutually reinforcing causes:
+
+- bootstrap response-model validation and roughly 1 MiB JSON serialization ran
+  on the API event loop;
+- `/events` held the projection ingestion lock while calling
+  `model_dump_json()` for every candidate event to bound response size;
+- projection health checked structural completeness but not the actual book
+  timestamps used by snapshot consumers.
+
+The correction moves bootstrap/snapshot construction and encoding to a
+dedicated frame executor and returns pre-encoded bytes, snapshots event and
+market references under a short lock before expensive copying/serialization,
+and rechecks both the current projection and the timestamps carried by the
+exact serialized snapshot. Projection health now uses the same freshness
+threshold and raises the existing retryable HTTP 503 boundary error when the
+readable books are stale. JSONL and SQLite persistence remain asynchronous and
+are not consulted by any of these real-time routes.

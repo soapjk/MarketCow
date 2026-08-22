@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from marketcow.api import create_app
@@ -57,6 +59,9 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.app.state.polymarket_event_executor.shutdown(
+            wait=True, cancel_futures=True,
+        )
+        self.app.state.polymarket_frame_executor.shutdown(
             wait=True, cancel_futures=True,
         )
         self.temporary.cleanup()
@@ -133,55 +138,95 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
             release.wait(timeout=5)
             return original(*args, **kwargs)
 
-        event_responses: list[object] = []
-        event_errors: list[BaseException] = []
-
-        def request_event() -> None:
-            # Starlette's TestClient owns a portal and is not safe to share
-            # across caller threads.  A client per request keeps this test
-            # focused on the application's dedicated executors instead of a
-            # race in the test transport itself.
-            try:
-                client = TestClient(self.app)
-                event_responses.append(client.get(
-                    f"{EVENTS_PATH}?market_id=m1&after_cursor=0&limit=1000"
-                ))
-            except BaseException as exc:
-                event_errors.append(exc)
-
         with patch.object(self.reader, "events_json", side_effect=blocked):
-            client = TestClient(self.app)
-            workers = [
-                threading.Thread(target=request_event)
-                for _ in range(4)
-            ]
-            for worker in workers:
-                worker.start()
-            self.assertTrue(all_workers_started.wait(timeout=2))
-            began = time.perf_counter()
-            health = client.get(
-                "/v1/prediction-markets/polymarket/live/health"
+            async def exercise():
+                transport = httpx.ASGITransport(app=self.app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    event_tasks = [
+                        asyncio.create_task(client.get(
+                            f"{EVENTS_PATH}"
+                            "?market_id=m1&after_cursor=0&limit=1000"
+                        ))
+                        for _ in range(4)
+                    ]
+                    try:
+                        self.assertTrue(await asyncio.to_thread(
+                            all_workers_started.wait, 2
+                        ))
+                        began = time.perf_counter()
+                        health = await client.get(
+                            "/v1/prediction-markets/polymarket/live/health"
+                        )
+                        bootstrap = await client.get(
+                            "/v1/prediction-markets/polymarket/live/bootstrap"
+                            "?market_id=m1"
+                        )
+                        frame = await client.get(
+                            "/v1/prediction-markets/polymarket/live/snapshot"
+                            "?market_id=m1"
+                        )
+                        elapsed = time.perf_counter() - began
+                    finally:
+                        release.set()
+                    responses = await asyncio.wait_for(
+                        asyncio.gather(*event_tasks), timeout=10
+                    )
+                    return health, bootstrap, frame, elapsed, responses
+
+            health, bootstrap, frame, concurrent_elapsed, event_responses = (
+                asyncio.run(exercise())
             )
-            bootstrap = client.get(
-                "/v1/prediction-markets/polymarket/live/bootstrap?market_id=m1"
-            )
-            frame = client.get(
-                "/v1/prediction-markets/polymarket/live/snapshot?market_id=m1"
-            )
-            concurrent_elapsed = time.perf_counter() - began
-            release.set()
-            for worker in workers:
-                worker.join(timeout=10)
 
         self.assertLess(concurrent_elapsed, 1)
         self.assertEqual(health.status_code, 200)
         self.assertEqual(bootstrap.status_code, 200)
         self.assertEqual(frame.status_code, 200)
         self.assertEqual(frame.json()["items"][0]["status"], "ready")
-        self.assertEqual(event_errors, [])
         self.assertEqual(len(event_responses), 4)
         self.assertTrue(all(response.status_code == 200 for response in event_responses))
-        self.assertTrue(all(not worker.is_alive() for worker in workers))
+
+    def test_bootstrap_and_snapshot_construct_and_serialize_on_frame_executor(self):
+        observed_threads: list[str] = []
+        original_bootstrap = self.reader.bootstrap_json
+        original_snapshot = self.reader.snapshot_json
+
+        def observed(action):
+            def wrapper(*args, **kwargs):
+                observed_threads.append(threading.current_thread().name)
+                return action(*args, **kwargs)
+
+            return wrapper
+
+        with (
+            patch.object(
+                self.reader,
+                "bootstrap_json",
+                side_effect=observed(original_bootstrap),
+            ),
+            patch.object(
+                self.reader,
+                "snapshot_json",
+                side_effect=observed(original_snapshot),
+            ),
+        ):
+            client = TestClient(self.app)
+            bootstrap = client.get(
+                "/v1/prediction-markets/polymarket/live/bootstrap?market_id=m1"
+            )
+            frame = client.get(
+                "/v1/prediction-markets/polymarket/live/snapshot?market_id=m1"
+            )
+
+        self.assertEqual(bootstrap.status_code, 200)
+        self.assertEqual(frame.status_code, 200)
+        self.assertEqual(len(observed_threads), 2)
+        self.assertTrue(all(
+            name.startswith("marketcow-polymarket-frames")
+            for name in observed_threads
+        ))
 
     def test_broad_scope_uses_cursor_order_without_temp_market_range_merge(self):
         root = self.root / "broad-cursor-plan"

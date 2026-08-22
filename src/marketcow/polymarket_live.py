@@ -1980,6 +1980,10 @@ class PolymarketLiveReadStore:
             if _bind_live_books else response
         )
 
+    def bootstrap_json(self, market_ids: Iterable[str]) -> bytes:
+        """Construct and encode bootstrap away from the ASGI event loop."""
+        return self.bootstrap(market_ids).model_dump_json().encode("utf-8")
+
     def _state_path(self) -> Path:
         _, path = self._state_manifest()
         return path

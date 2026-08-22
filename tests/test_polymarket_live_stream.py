@@ -5,7 +5,7 @@ import socket
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -13,6 +13,7 @@ from unittest.mock import patch
 from marketcow.polymarket_live import (
     GammaLiveNormalizer,
     LiveStateStore,
+    PolymarketLiveReadError,
     PolymarketLiveReadStore,
 )
 from marketcow.polymarket_live import content_sha256, live_event_identity
@@ -166,6 +167,18 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
                 frame = projection.snapshot(reader, ["m1"])
             self.assertEqual(bootstrap.cursor, projection.latest_cursor)
             self.assertEqual(frame.items[0].status, "ready")
+
+            reader.now_provider = lambda: NOW + timedelta(seconds=5)
+            for action in (
+                lambda: projection.health(reader),
+                lambda: projection.bootstrap_json(reader, ["m1"]),
+                lambda: projection.snapshot_json(reader, ["m1"]),
+            ):
+                with self.assertRaises(PolymarketLiveReadError) as stale:
+                    action()
+                self.assertEqual(
+                    stale.exception.code, "polymarket_state_index_lagging"
+                )
         finally:
             stop.set()
             task.cancel()
@@ -222,6 +235,65 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             sorted(event.cursor for event in page.items),
         )
         self.assertTrue(page.has_more)
+
+    async def test_event_page_sizing_does_not_hold_ingestion_lock(self):
+        projection = PolymarketLiveProjection(replay_capacity=10)
+        projection.install_state({
+            "schema_version": "marketcow.polymarket.live-stream.v1",
+            "type": "state",
+            "catalog_revision": None,
+            "catalog_source": None,
+            "latest_cursor": 0,
+            "persisted_cursor": 0,
+            "active_recovery_id": None,
+            "markets": [],
+            "books": [],
+            "gaps": [],
+        })
+        projection.mark_ready({"latest_cursor": 0})
+        with TemporaryDirectory() as temporary:
+            template = populated_store(Path(temporary) / "template").events[-1]
+        first = template.model_copy(update={
+            "cursor": 1,
+            "event_id": "0" * 64,
+            "market_id": "m1",
+        })
+        first.event_id = live_event_identity(first)
+        projection.apply_live(first.model_dump(mode="json"))
+        second = first.model_copy(update={
+            "cursor": 2,
+            "event_id": "0" * 64,
+        })
+        second.event_id = live_event_identity(second)
+
+        sizing_started = threading.Event()
+        release_sizing = threading.Event()
+        original = type(first).model_dump_json
+
+        def blocked_sizing(event, *args, **kwargs):
+            sizing_started.set()
+            release_sizing.wait(timeout=5)
+            return original(event, *args, **kwargs)
+
+        result: list[object] = []
+        with patch.object(type(first), "model_dump_json", blocked_sizing):
+            worker = threading.Thread(
+                target=lambda: result.append(
+                    projection.events_after(["m1"], 0, 1000)
+                )
+            )
+            worker.start()
+            self.assertTrue(sizing_started.wait(timeout=2))
+            started = time.perf_counter()
+            projection.apply_live(second.model_dump(mode="json"))
+            elapsed = time.perf_counter() - started
+            release_sizing.set()
+            worker.join(timeout=5)
+
+        self.assertLess(elapsed, 0.1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(result), 1)
+        self.assertEqual(projection.latest_cursor, 2)
 
     async def test_cursor_gap_fails_closed_without_advancing_projection(self):
         projection = PolymarketLiveProjection(replay_capacity=10)
