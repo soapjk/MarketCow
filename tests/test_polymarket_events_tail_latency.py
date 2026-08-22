@@ -134,14 +134,25 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
             return original(*args, **kwargs)
 
         event_responses: list[object] = []
+        event_errors: list[BaseException] = []
+
+        def request_event() -> None:
+            # Starlette's TestClient owns a portal and is not safe to share
+            # across caller threads.  A client per request keeps this test
+            # focused on the application's dedicated executors instead of a
+            # race in the test transport itself.
+            try:
+                client = TestClient(self.app)
+                event_responses.append(client.get(
+                    f"{EVENTS_PATH}?market_id=m1&after_cursor=0&limit=1000"
+                ))
+            except BaseException as exc:
+                event_errors.append(exc)
+
         with patch.object(self.reader, "events_json", side_effect=blocked):
             client = TestClient(self.app)
             workers = [
-                threading.Thread(
-                    target=lambda: event_responses.append(client.get(
-                        f"{EVENTS_PATH}?market_id=m1&after_cursor=0&limit=1000"
-                    ))
-                )
+                threading.Thread(target=request_event)
                 for _ in range(4)
             ]
             for worker in workers:
@@ -160,13 +171,14 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
             concurrent_elapsed = time.perf_counter() - began
             release.set()
             for worker in workers:
-                worker.join(timeout=5)
+                worker.join(timeout=10)
 
         self.assertLess(concurrent_elapsed, 1)
         self.assertEqual(health.status_code, 200)
         self.assertEqual(bootstrap.status_code, 200)
         self.assertEqual(frame.status_code, 200)
         self.assertEqual(frame.json()["items"][0]["status"], "ready")
+        self.assertEqual(event_errors, [])
         self.assertEqual(len(event_responses), 4)
         self.assertTrue(all(response.status_code == 200 for response in event_responses))
         self.assertTrue(all(not worker.is_alive() for worker in workers))
