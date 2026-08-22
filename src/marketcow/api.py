@@ -575,14 +575,6 @@ def create_app(
     )
     app.state.polymarket_event_executor = polymarket_event_executor
     app.state.polymarket_event_metrics = polymarket_event_metrics
-    polymarket_event_inflight: dict[
-        tuple[int, tuple[str, ...], int, int], asyncio.Future
-    ] = {}
-    # Leave transport headroom for an explicit fail-closed response if an
-    # external-volume read stalls.  The underlying single-flight query keeps
-    # running and a retry joins it instead of multiplying identical SQLite and
-    # JSONL reads across all four workers.
-    polymarket_event_query_deadline_seconds = 2.5
 
     async def read_polymarket_live_health():
         return await asyncio.get_running_loop().run_in_executor(
@@ -1468,46 +1460,23 @@ def create_app(
         trace = request.scope["polymarket_events_trace"]
         submitted = time.perf_counter()
         phases: dict[str, float] = {}
-        selected_scope = _require_polymarket_scope(market_id)
-        loop = asyncio.get_running_loop()
-        request_key = (id(loop), tuple(selected_scope), after_cursor, limit)
 
         def read_and_serialize_events():
             queue_ms = (time.perf_counter() - submitted) * 1000
             trace["executor_queue_ms"] = queue_ms
             payload, _, page = polymarket_live_read.events_json(
-                selected_scope, after_cursor, limit,
+                _require_polymarket_scope(market_id), after_cursor, limit,
                 _phase_ms=phases,
             )
             return queue_ms, payload, phases, page
 
         try:
-            future = polymarket_event_inflight.get(request_key)
-            if future is None:
-                future = loop.run_in_executor(
+            queue_ms, payload, phases, page = await (
+                asyncio.get_running_loop().run_in_executor(
                     polymarket_event_executor,
                     read_and_serialize_events,
                 )
-                polymarket_event_inflight[request_key] = future
-
-                def discard_finished(completed: asyncio.Future) -> None:
-                    if polymarket_event_inflight.get(request_key) is completed:
-                        polymarket_event_inflight.pop(request_key, None)
-
-                future.add_done_callback(discard_finished)
-            else:
-                trace["singleflight_joined"] = True
-            try:
-                queue_ms, payload, phases, page = await asyncio.wait_for(
-                    asyncio.shield(future),
-                    timeout=polymarket_event_query_deadline_seconds,
-                )
-            except TimeoutError as exc:
-                trace["timed_out"] = True
-                trace["error_code"] = "polymarket_state_index_lagging"
-                raise polymarket_live_read._stable_boundary_unavailable(
-                    "events query"
-                ) from exc
+            )
             trace.update(phases)
             trace.update({
                 "executor_queue_ms": queue_ms,
