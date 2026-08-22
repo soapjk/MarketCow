@@ -100,6 +100,10 @@ from .polymarket_events_observability import (
     PolymarketEventsTraceMiddleware,
     server_timing,
 )
+from .polymarket_live_stream import (
+    PolymarketLiveProjection,
+    PolymarketLiveStreamClient,
+)
 from .admin_events import ALLOWED_EVENT_TYPES, AdminEventHub, encode_sse
 from .admin_auth import (
     CSRF_COOKIE, SESSION_COOKIE, AdminAuth, AdminSecurityMiddleware,
@@ -564,6 +568,19 @@ def create_app(
         stable_snapshot_max_book_age_seconds=4.5,
     )
     app.state.polymarket_live_read = polymarket_live_read
+    polymarket_live_projection = PolymarketLiveProjection(
+        replay_capacity=settings.polymarket_live_stream_replay_capacity
+    )
+    polymarket_live_stream_client = (
+        PolymarketLiveStreamClient(
+            settings.polymarket_live_stream_uri,
+            polymarket_live_projection,
+        )
+        if settings.polymarket_live_stream_uri else None
+    )
+    polymarket_live_stream_stop = asyncio.Event()
+    polymarket_live_stream_task: asyncio.Task[None] | None = None
+    app.state.polymarket_live_projection = polymarket_live_projection
     polymarket_event_executor = ThreadPoolExecutor(
         max_workers=4,
         thread_name_prefix="marketcow-polymarket-events",
@@ -577,6 +594,8 @@ def create_app(
     app.state.polymarket_event_metrics = polymarket_event_metrics
 
     async def read_polymarket_live_health():
+        if polymarket_live_stream_client is not None:
+            return polymarket_live_projection.health()
         return await asyncio.get_running_loop().run_in_executor(
             _POLYMARKET_LIVE_HEALTH_EXECUTOR,
             polymarket_live_read.health,
@@ -743,7 +762,13 @@ def create_app(
                 pass
 
     async def startup() -> None:
-        nonlocal projection_task
+        nonlocal projection_task, polymarket_live_stream_task
+        if polymarket_live_stream_client is not None:
+            polymarket_live_stream_task = asyncio.create_task(
+                polymarket_live_stream_client.run(polymarket_live_stream_stop),
+                name="polymarket-live-stream-client",
+            )
+            app.state.polymarket_live_stream_task = polymarket_live_stream_task
         if metadata_repository is not None and hasattr(
             metadata_repository, "upsert_prediction_market_live_observation"
         ):
@@ -759,6 +784,12 @@ def create_app(
             app.state.polymarket_dashboard_projection_task = projection_task
 
     async def shutdown() -> None:
+        polymarket_live_stream_stop.set()
+        if polymarket_live_stream_task is not None:
+            polymarket_live_stream_task.cancel()
+            await asyncio.gather(
+                polymarket_live_stream_task, return_exceptions=True
+            )
         projection_stop.set()
         if projection_task is not None:
             await projection_task
@@ -1398,9 +1429,12 @@ def create_app(
         market_id: list[str] | None = Query(default=None),
     ):
         try:
-            return polymarket_live_read.bootstrap(
-                _require_polymarket_scope(market_id)
-            )
+            scope = _require_polymarket_scope(market_id)
+            if polymarket_live_stream_client is not None:
+                return polymarket_live_projection.bootstrap(
+                    polymarket_live_read, scope
+                )
+            return polymarket_live_read.bootstrap(scope)
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1413,10 +1447,17 @@ def create_app(
         market_id: list[str] | None = Query(default=None),
     ):
         try:
+            scope = _require_polymarket_scope(market_id)
+            if polymarket_live_stream_client is not None:
+                page = polymarket_live_projection.snapshot(
+                    polymarket_live_read, scope
+                )
+                return Response(
+                    content=page.model_dump_json().encode("utf-8"),
+                    media_type="application/json",
+                )
             return Response(
-                content=polymarket_live_read.snapshot_json(
-                    _require_polymarket_scope(market_id)
-                ),
+                content=polymarket_live_read.snapshot_json(scope),
                 media_type="application/json",
             )
         except PolymarketLiveReadError as exc:
@@ -1464,7 +1505,12 @@ def create_app(
         def read_and_serialize_events():
             queue_ms = (time.perf_counter() - submitted) * 1000
             trace["executor_queue_ms"] = queue_ms
-            payload, _, page = polymarket_live_read.events_json(
+            event_source = (
+                polymarket_live_projection
+                if polymarket_live_stream_client is not None
+                else polymarket_live_read
+            )
+            payload, _, page = event_source.events_json(
                 _require_polymarket_scope(market_id), after_cursor, limit,
                 _phase_ms=phases,
             )
@@ -1484,6 +1530,9 @@ def create_app(
                 "event_count": len(page.items),
                 "has_more": page.has_more,
             })
+            if polymarket_live_stream_client is not None:
+                trace.update(polymarket_live_projection.watermarks())
+                trace["read_source"] = "memory_projection"
             return Response(
                 content=payload,
                 media_type="application/json",
@@ -1494,6 +1543,65 @@ def create_app(
             trace["error_code"] = exc.code
             trace["timed_out"] = exc.code == "polymarket_state_index_lagging"
             _raise_polymarket_read_error(exc)
+
+    @app.websocket("/v1/prediction-markets/polymarket/live/stream")
+    async def polymarket_live_stream(
+        websocket: WebSocket,
+        after_cursor: int = Query(0, ge=0),
+        market_id: list[str] | None = Query(default=None),
+    ):
+        await websocket.accept()
+        if polymarket_live_stream_client is None:
+            await websocket.send_json({
+                "type": "error",
+                "code": "polymarket_live_stream_not_configured",
+                "retryable": False,
+            })
+            await websocket.close(code=1013)
+            return
+        queue = polymarket_live_projection.subscribe(capacity=2048)
+        cursor = after_cursor
+        try:
+            scope = _require_polymarket_scope(market_id)
+            while True:
+                page = polymarket_live_projection.events_after(scope, cursor, 1000)
+                for event in page.items:
+                    await websocket.send_json({
+                        "type": "event",
+                        "cursor": event.cursor,
+                        "event": event.model_dump(mode="json"),
+                    })
+                    cursor = event.cursor
+                if not page.has_more:
+                    break
+            await websocket.send_json({
+                "type": "ready",
+                "cursor": polymarket_live_projection.latest_cursor,
+            })
+            while True:
+                event = await queue.get()
+                if event.cursor <= cursor:
+                    continue
+                if event.market_id is not None and event.market_id not in scope:
+                    continue
+                await websocket.send_json({
+                    "type": "event",
+                    "cursor": event.cursor,
+                    "event": event.model_dump(mode="json"),
+                })
+                cursor = event.cursor
+        except PolymarketLiveReadError as exc:
+            await websocket.send_json({
+                "type": "error",
+                "code": exc.code,
+                "message": str(exc),
+                "retryable": exc.status_code == 503,
+            })
+            await websocket.close(code=1013)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        finally:
+            polymarket_live_projection.unsubscribe(queue)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/checkpoint",

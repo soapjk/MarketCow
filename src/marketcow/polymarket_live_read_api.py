@@ -9,7 +9,7 @@ from functools import partial
 from pathlib import Path
 from typing import Callable, NoReturn, TypeVar
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from starlette.responses import FileResponse, Response
 
 from .polymarket_live import (
@@ -25,6 +25,10 @@ from .polymarket_live import (
     PolymarketLiveReadStore,
     PublicDataPage,
 )
+from .polymarket_live_stream import (
+    PolymarketLiveProjection,
+    PolymarketLiveStreamClient,
+)
 
 T = TypeVar("T")
 
@@ -36,6 +40,8 @@ def create_polymarket_live_read_app(
     stable_read_wait_seconds: float,
     stable_read_poll_seconds: float,
     executor_workers: int,
+    live_stream_uri: str = "",
+    live_stream_replay_capacity: int = 10_000,
 ) -> FastAPI:
     if not root.is_absolute():
         raise ValueError("Polymarket live read root must be absolute")
@@ -60,10 +66,32 @@ def create_polymarket_live_read_app(
         max_workers=executor_workers,
         thread_name_prefix="marketcow-polymarket-live-read",
     )
+    projection = PolymarketLiveProjection(
+        replay_capacity=live_stream_replay_capacity
+    )
+    stream_client = (
+        PolymarketLiveStreamClient(live_stream_uri, projection)
+        if live_stream_uri else None
+    )
+    stream_stop = asyncio.Event()
+    stream_task: asyncio.Task[None] | None = None
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        yield
-        executor.shutdown(wait=True, cancel_futures=True)
+        nonlocal stream_task
+        if stream_client is not None:
+            stream_task = asyncio.create_task(
+                stream_client.run(stream_stop),
+                name="polymarket-live-stream-client",
+            )
+        try:
+            yield
+        finally:
+            stream_stop.set()
+            if stream_task is not None:
+                stream_task.cancel()
+                await asyncio.gather(stream_task, return_exceptions=True)
+            executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(
         title="MarketCow Polymarket Live Read API",
@@ -71,6 +99,7 @@ def create_polymarket_live_read_app(
     )
     app.state.polymarket_live_read = reader
     app.state.polymarket_live_read_executor = executor
+    app.state.polymarket_live_projection = projection
 
     async def run_read(
         action: Callable[..., T],
@@ -88,7 +117,10 @@ def create_polymarket_live_read_app(
     )
     async def bootstrap(market_id: list[str] | None = Query(default=None)):
         try:
-            return await run_read(reader.bootstrap, _require_scope(market_id))
+            scope = _require_scope(market_id)
+            if stream_client is not None:
+                return await run_read(projection.bootstrap, reader, scope)
+            return await run_read(reader.bootstrap, scope)
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
 
@@ -98,7 +130,12 @@ def create_polymarket_live_read_app(
     )
     async def snapshot(market_id: list[str] | None = Query(default=None)):
         try:
-            body = await run_read(reader.snapshot_json, _require_scope(market_id))
+            scope = _require_scope(market_id)
+            if stream_client is not None:
+                page = await run_read(projection.snapshot, reader, scope)
+                body = page.model_dump_json().encode("utf-8")
+            else:
+                body = await run_read(reader.snapshot_json, scope)
             return Response(content=body, media_type="application/json")
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
@@ -137,7 +174,7 @@ def create_polymarket_live_read_app(
     ):
         try:
             return await run_read(
-                reader.events_after,
+                projection.events_after if stream_client is not None else reader.events_after,
                 _require_scope(market_id),
                 after_cursor,
                 limit,
@@ -161,6 +198,8 @@ def create_polymarket_live_read_app(
     )
     async def health():
         try:
+            if stream_client is not None:
+                return projection.health()
             return await run_read(reader.health)
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
@@ -181,6 +220,60 @@ def create_polymarket_live_read_app(
             )
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
+
+    @app.websocket("/v1/prediction-markets/polymarket/live/stream")
+    async def live_stream(
+        websocket: WebSocket,
+        after_cursor: int = Query(0, ge=0),
+        market_id: list[str] | None = Query(default=None),
+    ):
+        await websocket.accept()
+        if stream_client is None:
+            await websocket.send_json({
+                "type": "error",
+                "code": "polymarket_live_stream_not_configured",
+                "retryable": False,
+            })
+            await websocket.close(code=1013)
+            return
+        queue = projection.subscribe(capacity=2048)
+        cursor = after_cursor
+        try:
+            scope = _require_scope(market_id)
+            while True:
+                page = projection.events_after(scope, cursor, 1000)
+                for event in page.items:
+                    await websocket.send_json({
+                        "type": "event", "cursor": event.cursor,
+                        "event": event.model_dump(mode="json"),
+                    })
+                    cursor = event.cursor
+                if not page.has_more:
+                    break
+            await websocket.send_json({
+                "type": "ready", "cursor": projection.latest_cursor,
+            })
+            while True:
+                event = await queue.get()
+                if event.cursor <= cursor:
+                    continue
+                if event.market_id is not None and event.market_id not in scope:
+                    continue
+                await websocket.send_json({
+                    "type": "event", "cursor": event.cursor,
+                    "event": event.model_dump(mode="json"),
+                })
+                cursor = event.cursor
+        except PolymarketLiveReadError as exc:
+            await websocket.send_json({
+                "type": "error", "code": exc.code, "message": str(exc),
+                "retryable": exc.status_code == 503,
+            })
+            await websocket.close(code=1013)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        finally:
+            projection.unsubscribe(queue)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/public-data/{kind}",

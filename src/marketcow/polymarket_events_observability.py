@@ -21,6 +21,7 @@ PHASES = (
     "scope_bootstrap",
     "stable_boundary_wait",
     "sqlite_query",
+    "memory_projection",
     "model_construction",
     "json_serialization",
     "response_write",

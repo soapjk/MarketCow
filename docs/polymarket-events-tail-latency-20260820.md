@@ -219,3 +219,56 @@ Cursor advanced from 14,880,453 to 14,883,295 with zero gaps, duplicates, or
 integrity failures. Concurrent health, bootstrap, snapshot, and the secondary
 read API all succeeded; maximum observed book age was 2.949552 seconds. Shadow
 mode remained enabled and real order submission remained disabled.
+
+## 2026-08-22 v49 failure and real-time architecture correction
+
+The subsequent v49 formal run invalidated SQLite as a production hot-read
+boundary even after the earlier query-plan and executor fixes. At approximately
+17:28 Asia/Shanghai, two identical-cursor `/events` retries spent 12.57--12.58
+seconds in SQLite; one complete request took 17.09 seconds, including 4.41
+seconds of model construction. Another trace reached 21.42 seconds with 20.32
+seconds in the SQLite phase. Tradude's unchanged ten-second timeout and retry
+policy consequently exceeded 30 seconds of consecutive availability loss.
+
+At the same timestamps the collector continued publishing. Its normal
+200-token transactions completed in roughly 0.04--0.18 seconds, occasional
+WebSocket batches in 0.25--2.77 seconds, and the logs contained no correlated
+SQLite `busy` or `locked` error. The index was approximately 4.5 GiB and the
+append-only event log approximately 54 GiB. The evidence supports external
+volume page-in/random-read stalls, amplified by overlapping retries for the
+same cursor, rather than WAL writer-lock contention. The PostgreSQL connection
+timeouts in `production.error.log` remain a separate subsystem and do not occur
+on the Polymarket event read code path.
+
+Evidence:
+
+- Tradude artifact root:
+  `/Volumes/T9/projects/trade/tradude/.tradude-local/polymarket-live/supervised-shadow-v49-shared-api-formal-20260822T170211CST`
+- Health monitor errors: `logs/health-monitor.stderr.log`
+- Shadow request errors: `logs/shadow.stderr.log`
+- MarketCow request traces:
+  `/Users/androidjk/Library/Logs/MarketCow/events-soak.error.log`
+- Collector phases:
+  `/Users/androidjk/Library/Logs/MarketCow/polymarket-scoped.error.log`
+
+The final correction removes durable storage from the real-time data path:
+
+- The collector assigns the canonical cursor, updates memory, and immediately
+  publishes the event to a loopback WebSocket hub.
+- 8790 and 8791 independently consume that stream into bounded memory replay
+  rings and live book projections. `/events`, health, and snapshot use those
+  projections; `/events` records `sqlite_query_ms=0` and an explicit
+  `memory_projection_ms` phase.
+- JSONL and SQLite are written by one independent serial persistence thread in
+  batches. The writer fsyncs the JSONL batch before committing its corresponding
+  WAL transaction, preserving crash recovery without delaying publication.
+- `published_cursor`, `persisted_cursor`, persistence lag, queue depth, stream
+  connectivity, and persistence failure are separate watermarks. Persistence
+  failure is observable but cannot apply backpressure to the real-time queue.
+- Cursor gaps, stream disconnection, history-window expiry, incomplete books,
+  stale books, or unresolved gaps remain explicit fail-closed states. Slow
+  WebSocket consumers are disconnected rather than blocking the hub.
+
+The v49 run covered only 1,522.74 seconds and failed; it is not acceptance
+evidence. A new one-hour shadow run is required after deployment of this
+architecture.
