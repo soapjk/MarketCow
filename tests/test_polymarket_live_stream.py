@@ -216,6 +216,23 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(projection.ready)
         self.assertEqual(projection.latest_cursor, 0)
 
+    async def test_persistence_watermark_may_lead_local_websocket_decode(self):
+        projection = PolymarketLiveProjection(replay_capacity=10)
+        projection.install_state({
+            "schema_version": "marketcow.polymarket.live-stream.v1",
+            "type": "state",
+            "catalog_revision": None,
+            "catalog_source": None,
+            "latest_cursor": 10,
+            "persisted_cursor": 10,
+            "active_recovery_id": None,
+            "markets": [], "books": [], "gaps": [],
+        })
+        projection.mark_ready({"latest_cursor": 10})
+        projection.update_persistence(12, queue_depth=0)
+        self.assertEqual(projection.watermarks()["persisted_cursor"], 12)
+        self.assertEqual(projection.watermarks()["persistence_lag_events"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

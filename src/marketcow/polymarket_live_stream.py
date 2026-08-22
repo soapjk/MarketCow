@@ -180,7 +180,13 @@ class PolymarketLiveProjection:
         self, cursor: int, *, queue_depth: int = 0, error: str | None = None,
     ) -> None:
         with self._lock:
-            if cursor < self._persisted_cursor or cursor > self._latest_cursor:
+            # The persistence worker and each WebSocket sender are independent
+            # consumers of the collector's published queue. A sender may report
+            # a durable watermark a few events ahead of the last event this API
+            # process has decoded. Only regression is invalid; the local event
+            # projection will deterministically catch up to the global durable
+            # watermark.
+            if cursor < self._persisted_cursor:
                 raise ValueError("Polymarket persisted cursor watermark is invalid")
             self._persisted_cursor = cursor
             self._persistence_queue_depth = max(0, queue_depth)
@@ -192,7 +198,7 @@ class PolymarketLiveProjection:
                 "published_cursor": self._latest_cursor,
                 "persisted_cursor": self._persisted_cursor,
                 "persistence_lag_events": (
-                    self._latest_cursor - self._persisted_cursor
+                    max(0, self._latest_cursor - self._persisted_cursor)
                 ),
                 "persistence_queue_depth": self._persistence_queue_depth,
                 "live_stream_connected": self._connected,
@@ -456,7 +462,7 @@ class PolymarketLiveProjection:
                 latest_cursor=self._latest_cursor,
                 persisted_cursor=self._persisted_cursor,
                 persistence_lag_events=(
-                    self._latest_cursor - self._persisted_cursor
+                    max(0, self._latest_cursor - self._persisted_cursor)
                 ),
                 persistence_queue_depth=self._persistence_queue_depth,
                 live_stream_connected=self._connected,
@@ -733,8 +739,8 @@ class PolymarketLiveStreamClient:
                     else "polymarket_live_stream_disconnected"
                 )
                 LOGGER.warning(
-                    "polymarket_live_stream_disconnected uri=%s error=%s",
-                    self.uri, type(exc).__name__,
+                    "polymarket_live_stream_disconnected uri=%s error=%s detail=%s",
+                    self.uri, type(exc).__name__, str(exc)[:300],
                 )
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.reconnect_seconds)
