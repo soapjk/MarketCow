@@ -2754,7 +2754,7 @@ class PolymarketLiveTest(unittest.TestCase):
 
         def delayed_dump(page, *args, **kwargs):
             payload = original_dump(page, *args, **kwargs)
-            current[0] = NOW + timedelta(seconds=4.51)
+            current[0] = NOW + timedelta(seconds=4.91)
             return payload
 
         with patch.object(

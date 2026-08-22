@@ -562,10 +562,10 @@ def create_app(
         # The 100-market collector can spend roughly four seconds between its
         # common REST receive timestamp and the atomic 200-book publication.
         # The optimized response path normally projects and writes in well
-        # under 0.5s, and snapshot_json rechecks the exact serialized page at
-        # the response edge. Keep that measured half-second transport margin
-        # inside Tradude's unchanged five-second final fail-closed boundary.
-        stable_snapshot_max_book_age_seconds=4.5,
+        # directly from memory, and snapshot_json rechecks the exact serialized
+        # page at the response edge. Keep a measured 100ms loopback transport
+        # margin inside Tradude's unchanged five-second fail-closed boundary.
+        stable_snapshot_max_book_age_seconds=4.9,
     )
     app.state.polymarket_live_read = polymarket_live_read
     polymarket_live_projection = PolymarketLiveProjection(
@@ -1449,11 +1449,11 @@ def create_app(
         try:
             scope = _require_polymarket_scope(market_id)
             if polymarket_live_stream_client is not None:
-                page = polymarket_live_projection.snapshot(
+                body = polymarket_live_projection.snapshot_json(
                     polymarket_live_read, scope
                 )
                 return Response(
-                    content=page.model_dump_json().encode("utf-8"),
+                    content=body,
                     media_type="application/json",
                 )
             return Response(

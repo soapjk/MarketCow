@@ -10,7 +10,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from marketcow.polymarket_live import GammaLiveNormalizer, LiveStateStore
+from marketcow.polymarket_live import (
+    GammaLiveNormalizer,
+    LiveStateStore,
+    PolymarketLiveReadStore,
+)
 from marketcow.polymarket_live import content_sha256, live_event_identity
 from marketcow.polymarket_live_stream import (
     PolymarketLiveProjection,
@@ -133,6 +137,18 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health.status, "index_ready")
             self.assertTrue(health.latest_state_ready)
             self.assertEqual(health.book_complete_market_count, 1)
+            reader = PolymarketLiveReadStore(
+                store.root,
+                now_provider=lambda: NOW,
+                stable_snapshot_max_book_age_seconds=4.9,
+            )
+            with patch.object(
+                reader, "bootstrap", side_effect=AssertionError("disk hot read")
+            ):
+                bootstrap = projection.bootstrap(reader, ["m1"])
+                frame = projection.snapshot(reader, ["m1"])
+            self.assertEqual(bootstrap.cursor, projection.latest_cursor)
+            self.assertEqual(frame.items[0].status, "ready")
         finally:
             stop.set()
             task.cancel()

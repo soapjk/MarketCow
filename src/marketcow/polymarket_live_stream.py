@@ -344,20 +344,58 @@ class PolymarketLiveProjection:
         ) * 1000
         return payload, phases, page
 
-    def _transient(self, reader: PolymarketLiveReadStore, market_ids: list[str]) -> LiveStateStore:
-        bootstrap = reader.bootstrap(market_ids, _bind_live_books=False)
+    def _selected_markets(self, market_ids: list[str]) -> list[Any]:
+        with self._lock:
+            missing = [item for item in market_ids if item not in self._markets]
+            if missing:
+                raise PolymarketLiveReadError(
+                    "polymarket_market_not_found",
+                    "One or more markets are outside the live projection",
+                    404,
+                )
+            markets = [self._markets[item].model_copy(deep=True) for item in market_ids]
+            books = dict(self._books)
+        for market in markets:
+            expected = {outcome.token_id for outcome in market.identity.outcomes}
+            live_books = [books[token] for token in expected if token in books]
+            if len(live_books) != len(expected):
+                continue
+            ticks = {book.tick_size for book in live_books}
+            if len(ticks) != 1:
+                raise PolymarketLiveReadError(
+                    "polymarket_instrument_book_binding_incomplete",
+                    "Outcome books disagree on the live market tick",
+                    503,
+                )
+            tick = next(iter(ticks))
+            instrument = market.rules.instrument
+            if instrument.price_increment == tick:
+                continue
+            base_revision = instrument.revision
+            instrument.price_increment = tick
+            instrument.revision = content_sha256({
+                "base_revision": base_revision,
+                "live_price_increment": tick,
+                "binding": "polymarket_clob_book_tick_v1",
+            })
+            market.metadata_revision = content_sha256({
+                "base_revision": market.metadata_revision,
+                "instrument_revision": instrument.revision,
+            })
+        return markets
+
+    def _transient(
+        self, reader: PolymarketLiveReadStore, market_ids: list[str]
+    ) -> LiveStateStore:
+        selected = self._selected_markets(market_ids)
         related_ids = sorted({
             pair.market_id
-            for market in bootstrap.markets
+            for market in selected
             for relation in market.relations
             for pair in relation.outcome_pairs
             if pair.market_id not in market_ids
         })
-        related = (
-            reader.bootstrap(related_ids, _bind_live_books=False).markets
-            if related_ids else []
-        )
-        markets = bootstrap.markets + related
+        markets = selected + self._selected_markets(related_ids)
         with self._lock:
             transient = LiveStateStore(reader.root / ".live-stream-projection")
             transient._recovered = True
@@ -382,11 +420,29 @@ class PolymarketLiveProjection:
     ) -> LiveBootstrapResponse:
         self._require_ready()
         selected = PolymarketLiveReadStore._scope(market_ids)
-        response = reader.bootstrap(selected, _bind_live_books=False)
         with self._lock:
-            response = response.model_copy(deep=True)
-            response.cursor = self._latest_cursor
-        return response
+            cursor = self._latest_cursor
+            revision = self._catalog_revision
+            source = self._catalog_source
+        markets = self._selected_markets(selected)
+        return LiveBootstrapResponse(
+            catalog_revision=revision,
+            catalog_source=source,
+            cursor=cursor,
+            markets=markets,
+            active_token_ids=[
+                outcome.token_id
+                for market in markets if market.active and not market.closed
+                for outcome in market.identity.outcomes
+            ],
+            sequence_semantics="deterministic_normalized",
+            recovery={
+                "bootstrap": "CLOB POST /books full snapshots",
+                "disconnect": "new book_epoch followed by full /books recovery",
+                "resume": "in-memory live stream replay required before event resume",
+            },
+            source_policy="official_free_only",
+        )
 
     def snapshot(
         self, reader: PolymarketLiveReadStore, market_ids: Iterable[str]
@@ -416,6 +472,29 @@ class PolymarketLiveProjection:
                     "snapshot response"
                 )
         return page
+
+    def snapshot_json(
+        self, reader: PolymarketLiveReadStore, market_ids: Iterable[str]
+    ) -> bytes:
+        page = self.snapshot(reader, market_ids)
+        payload = page.model_dump_json().encode("utf-8")
+        maximum_age = reader._stable_snapshot_max_book_age_seconds
+        if maximum_age is None:
+            return payload
+        observed_at = reader.now_provider()
+        books = {
+            book.token_id: book
+            for frame in page.items
+            for book in (*frame.tokens, *frame.relation_tokens)
+        }
+        if not books or any(
+            not 0 <= (observed_at - book.received_at).total_seconds() <= maximum_age
+            for book in books.values()
+        ):
+            raise PolymarketLiveReadStore._stable_boundary_unavailable(
+                "snapshot response"
+            )
+        return payload
 
     def health(self) -> LiveReadHealth:
         with self._lock:

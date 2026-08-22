@@ -132,8 +132,7 @@ def create_polymarket_live_read_app(
         try:
             scope = _require_scope(market_id)
             if stream_client is not None:
-                page = await run_read(projection.snapshot, reader, scope)
-                body = page.model_dump_json().encode("utf-8")
+                body = await run_read(projection.snapshot_json, reader, scope)
             else:
                 body = await run_read(reader.snapshot_json, scope)
             return Response(content=body, media_type="application/json")
