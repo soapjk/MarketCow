@@ -2511,10 +2511,20 @@ class PolymarketLiveReadStore:
                 ).fetchone()[0])
                 stable = not metadata.get("active_recovery_id") and gap_count == 0
                 if stable:
+                    recent_floor = int(
+                        metadata.get("recent_event_floor_cursor", "0") or 0
+                    )
+                    use_recent_tail = (
+                        recent_floor > 0 and after_cursor >= recent_floor - 1
+                    )
+                    event_table = (
+                        "recent_event_offsets" if use_recent_tail else "event_offsets"
+                    )
+                    table_hint = "" if use_recent_tail else event_table_hint
                     transition_rows = (
                         list(connection.execute(
-                            """SELECT cursor, byte_offset, byte_length, line_sha256
-                               FROM event_offsets
+                            f"""SELECT cursor, byte_offset, byte_length, line_sha256
+                               FROM {event_table}{table_hint}
                                WHERE market_id IS NULL AND cursor > ?
                                ORDER BY cursor""",
                             (after_cursor,),
@@ -2522,7 +2532,7 @@ class PolymarketLiveReadStore:
                         if after_cursor > 0 else []
                     )
                     rows = list(connection.execute(
-                        f"""SELECT * FROM event_offsets{event_table_hint}
+                        f"""SELECT * FROM {event_table}{table_hint}
                             WHERE market_id IN ({placeholders}) AND cursor > ?
                             ORDER BY cursor LIMIT ?""",
                         [*selected_ids, after_cursor, page_limit + 1],
@@ -2554,18 +2564,30 @@ class PolymarketLiveReadStore:
             bounded_bytes += row_bytes
         rows = bounded_rows
         model_started = time.perf_counter()
-        with self.event_path.open("rb") as stream:
-            for row in transition_rows:
-                stream.seek(int(row["byte_offset"]))
-                line = stream.read(int(row["byte_length"]))
+        items = []
+        transition_cursors = {int(row["cursor"]) for row in transition_rows}
+        stream = None
+        try:
+            for row in [*transition_rows, *rows]:
+                if "payload_json" in row.keys():
+                    line = bytes(row["payload_json"]) + b"\n"
+                else:
+                    if stream is None:
+                        stream = self.event_path.open("rb")
+                    stream.seek(int(row["byte_offset"]))
+                    line = stream.read(int(row["byte_length"]))
                 if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
                     raise PolymarketLiveReadError(
-                        "polymarket_state_integrity_failed",
-                        "Catalog transition event hash mismatch",
-                        409,
+                        "polymarket_state_integrity_failed", "Event row hash mismatch", 409,
                     )
                 event = LiveEventEnvelope.model_validate_json(line)
-                if event.event_type == "catalog_revision":
+                if int(row["cursor"]) in transition_cursors:
+                    if event.event_type != "catalog_revision":
+                        raise PolymarketLiveReadError(
+                            "polymarket_state_integrity_failed",
+                            "Catalog transition row has the wrong event type",
+                            409,
+                        )
                     raise PolymarketLiveReadError(
                         "resume_cursor_expired",
                         (
@@ -2574,16 +2596,6 @@ class PolymarketLiveReadStore:
                         ),
                         409,
                     )
-        items = []
-        with self.event_path.open("rb") as stream:
-            for row in rows:
-                stream.seek(int(row["byte_offset"]))
-                line = stream.read(int(row["byte_length"]))
-                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
-                    raise PolymarketLiveReadError(
-                        "polymarket_state_integrity_failed", "Event row hash mismatch", 409,
-                    )
-                event = LiveEventEnvelope.model_validate_json(line)
                 if (
                     event.cursor != int(row["cursor"])
                     or event.event_id != row["event_id"]
@@ -2597,6 +2609,9 @@ class PolymarketLiveReadStore:
                         "polymarket_state_integrity_failed", "Event index identity mismatch", 409,
                     )
                 items.append(event)
+        finally:
+            if stream is not None:
+                stream.close()
         next_cursor = items[-1].cursor if items else after_cursor
         page = LiveEventPage(
             after_cursor=after_cursor, next_cursor=next_cursor,
@@ -2958,6 +2973,14 @@ class LiveStateIndex:
             );
             CREATE INDEX IF NOT EXISTS events_market_cursor
                 ON event_offsets(market_id, cursor);
+            CREATE TABLE IF NOT EXISTS recent_event_offsets (
+                cursor INTEGER PRIMARY KEY, byte_offset INTEGER NOT NULL,
+                byte_length INTEGER NOT NULL, event_id TEXT NOT NULL,
+                market_id TEXT, token_id TEXT, line_sha256 TEXT NOT NULL,
+                payload_json BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS recent_events_market_cursor
+                ON recent_event_offsets(market_id, cursor);
         """)
 
     def ensure_runtime_schema(self) -> None:
@@ -2971,6 +2994,21 @@ class LiveStateIndex:
                     received_at TEXT NOT NULL, state_checksum TEXT NOT NULL,
                     source_hash TEXT, confirmation_sha256 TEXT NOT NULL
                 ) WITHOUT ROWID""")
+                connection.execute("""CREATE TABLE IF NOT EXISTS recent_event_offsets (
+                    cursor INTEGER PRIMARY KEY, byte_offset INTEGER NOT NULL,
+                    byte_length INTEGER NOT NULL, event_id TEXT NOT NULL,
+                    market_id TEXT, token_id TEXT, line_sha256 TEXT NOT NULL,
+                    payload_json BLOB NOT NULL
+                )""")
+                connection.execute("""CREATE INDEX IF NOT EXISTS
+                    recent_events_market_cursor
+                    ON recent_event_offsets(market_id, cursor)""")
+                metadata = self._metadata(connection)
+                if "recent_event_floor_cursor" not in metadata:
+                    latest_cursor = int(metadata.get("latest_cursor", "0"))
+                    self._set_metadata(connection, {
+                        "recent_event_floor_cursor": latest_cursor + 1,
+                    })
                 connection.commit()
 
     def confirm_book(
@@ -3134,6 +3172,42 @@ class LiveStateIndex:
                     event.market_id, event.token_id, line_sha256,
                 ),
             )
+            # Keep a bounded, payload-bearing tail beside the full immutable
+            # offset index.  The production index is several GiB and an
+            # external-volume page-in can occasionally take longer than the
+            # loopback client's deadline.  Current cursor consumers use this
+            # compact hot B-tree and avoid a second random read from the much
+            # larger events.jsonl.  Older cursors retain the verified full-index
+            # path below, so retention never skips or invents an event.
+            event_body = canonical_json(event.model_dump(mode="json"))
+            event_line = event_body + b"\n"
+            if (
+                len(event_line) != byte_length
+                or hashlib.sha256(event_line).hexdigest() != line_sha256
+            ):
+                raise RuntimeError("recent event payload differs from durable log")
+            connection.execute(
+                """INSERT INTO recent_event_offsets(
+                    cursor, byte_offset, byte_length, event_id, market_id,
+                    token_id, line_sha256, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event.cursor, byte_offset, byte_length, event.event_id,
+                    event.market_id, event.token_id, line_sha256, event_body,
+                ),
+            )
+            metadata_floor = metadata.get("recent_event_floor_cursor")
+            if metadata_floor is None:
+                metadata_floor = str(event.cursor)
+            if event.cursor % 1_000 == 0:
+                connection.execute(
+                    "DELETE FROM recent_event_offsets WHERE cursor < ?",
+                    (max(1, event.cursor - 50_000),),
+                )
+                first_recent = connection.execute(
+                    "SELECT MIN(cursor) FROM recent_event_offsets"
+                ).fetchone()[0]
+                metadata_floor = str(first_recent or event.cursor + 1)
             if book is not None and event.market_id is not None:
                 body = canonical_json(book.model_dump(mode="json"))
                 connection.execute(
@@ -3195,6 +3269,7 @@ class LiveStateIndex:
                 "latest_cursor": event.cursor,
                 "event_log_size": event_log_size,
                 "active_recovery_id": active_recovery_id or "",
+                "recent_event_floor_cursor": metadata_floor,
                 **health_metadata,
             })
             if event.event_type in {

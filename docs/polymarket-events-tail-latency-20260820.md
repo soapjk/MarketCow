@@ -219,3 +219,34 @@ Cursor advanced from 14,880,453 to 14,883,295 with zero gaps, duplicates, or
 integrity failures. Concurrent health, bootstrap, snapshot, and the secondary
 read API all succeeded; maximum observed book age was 2.949552 seconds. Shadow
 mode remained enabled and real order submission remained disabled.
+
+## 2026-08-22 v49 formal-run storage-tail failure
+
+The next formal shadow run lasted 1,522.74 seconds and did not pass. At
+`2026-08-22T09:28:06.777305+00:00`, three retries from the same
+`after_cursor=15045858` overlapped. Their SQLite phases took 20.316, 12.569,
+and 12.580 seconds; subsequent payload reads and model validation took as much
+as 4.408 seconds. The collector was still committing normally through this
+window: the surrounding 200-token publications generally completed in
+0.04--0.18 seconds and SQLite emitted no busy or locked error. This rules out a
+writer transaction or WAL busy wait as the direct cause.
+
+The evidence instead identifies an external-volume page-in stall on the
+4.5-GiB `event_offsets` B-tree and 54-GiB `events.jsonl`, amplified when retries
+ran the identical query on multiple executor workers. The same I/O and CPU/GIL
+pressure delayed the concurrent bootstrap read. The supervisor's unrelated
+terminal-session lifetime problem shortened orchestration coverage but did not
+cause the API failure; its child processes continued until the MarketCow tail
+event.
+
+The follow-up fix maintains a bounded `recent_event_offsets` table containing
+the last 50,000 cursor offsets and the exact canonical payload whose newline
+hash is checked against the durable event log before commit. Current cursor
+reads use that compact hot B-tree and validate the same event ID, cursor,
+canonical/raw hashes, scope, and catalog-transition rules without seeking the
+large JSONL file. A cursor older than the retained floor automatically uses the
+original full index and event log, preserving complete historical pagination.
+Identical shared-API reads are single-flight, and a storage operation exceeding
+2.5 seconds returns the existing explicit fail-closed 503 while the underlying
+query finishes; retries join it rather than multiplying I/O. No empty page is
+synthesized on timeout.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from marketcow.api import create_app
@@ -117,6 +119,48 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
         ):
             self.assertIn(field, trace)
 
+    def test_identical_slow_reads_are_singleflight_and_fail_closed_before_timeout(self):
+        original = self.reader.events_json
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def blocked(*args, **kwargs):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            started.set()
+            release.wait(timeout=5)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                finished.set()
+
+        async def exercise():
+            transport = httpx.ASGITransport(app=self.app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver",
+            ) as client:
+                path = f"{EVENTS_PATH}?market_id=m1&after_cursor=0&limit=1000"
+                first = asyncio.create_task(client.get(path))
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                second = asyncio.create_task(client.get(path))
+                return await asyncio.gather(first, second)
+
+        with patch.object(self.reader, "events_json", side_effect=blocked):
+            responses = asyncio.run(exercise())
+            release.set()
+            self.assertTrue(finished.wait(timeout=2))
+
+        self.assertEqual(calls, 1)
+        self.assertTrue(all(response.status_code == 503 for response in responses))
+        self.assertTrue(all(
+            response.json()["detail"]["code"] == "polymarket_state_index_lagging"
+            for response in responses
+        ))
+
     def test_blocked_event_workers_do_not_delay_health_bootstrap_or_snapshot(self):
         original = self.reader.events_json
         started = 0
@@ -138,11 +182,12 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
             client = TestClient(self.app)
             workers = [
                 threading.Thread(
-                    target=lambda: event_responses.append(client.get(
-                        f"{EVENTS_PATH}?market_id=m1&after_cursor=0&limit=1000"
+                    target=lambda cursor=cursor: event_responses.append(client.get(
+                        f"{EVENTS_PATH}?market_id=m1"
+                        f"&after_cursor={cursor}&limit=1000"
                     ))
                 )
-                for _ in range(4)
+                for cursor in range(4)
             ]
             for worker in workers:
                 worker.start()
@@ -160,7 +205,7 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
             concurrent_elapsed = time.perf_counter() - began
             release.set()
             for worker in workers:
-                worker.join(timeout=5)
+                worker.join(timeout=10)
 
         self.assertLess(concurrent_elapsed, 1)
         self.assertEqual(health.status_code, 200)
@@ -171,7 +216,7 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
         self.assertTrue(all(response.status_code == 200 for response in event_responses))
         self.assertTrue(all(not worker.is_alive() for worker in workers))
 
-    def test_broad_scope_uses_cursor_order_without_temp_market_range_merge(self):
+    def test_broad_scope_uses_compact_payload_tail_in_cursor_order(self):
         root = self.root / "broad-cursor-plan"
         rows = [
             gamma_row(
@@ -197,6 +242,10 @@ class PolymarketEventsTailLatencyTest(unittest.TestCase):
         self.assertGreater(len(payload), 0)
         self.assertIn("sqlite_query_ms", phases)
         self.assertTrue(any(
+            "FROM recent_event_offsets" in statement
+            for statement in statements
+        ))
+        self.assertFalse(any(
             "FROM event_offsets NOT INDEXED" in statement
             for statement in statements
         ))
