@@ -75,20 +75,37 @@ class PolymarketAsyncPersistenceTest(unittest.TestCase):
                 self.assertEqual(store.event_path.stat().st_size, previous_size)
                 self.assertEqual(store.persisted_cursor, previous_cursor)
 
+                # A persistence worker can own the file/index publication lock
+                # for an arbitrarily slow fsync/SQLite commit.  Subsequent live
+                # events must still publish without trying to acquire it.
+                with patch(
+                    "marketcow.polymarket_live._publication_lock",
+                    side_effect=AssertionError("disk lock entered hot path"),
+                ):
+                    second_started = time.perf_counter()
+                    second = store.apply_snapshot(
+                        snapshot("no-1", "0.57", "0.59", "1785739211000"),
+                        received_at=NOW,
+                    )
+                    second_elapsed = time.perf_counter() - second_started
+                self.assertIsNotNone(second)
+                self.assertEqual(published, [previous_cursor + 1, previous_cursor + 2])
+                self.assertLess(second_elapsed, 0.1)
+
                 release_persistence.set()
                 store.flush_async_persistence(
-                    target_cursor=previous_cursor + 1, timeout=5
+                    target_cursor=previous_cursor + 2, timeout=5
                 )
                 store.close_async_persistence(timeout=5)
 
             self.assertGreater(store.event_path.stat().st_size, previous_size)
-            self.assertEqual(store.persisted_cursor, previous_cursor + 1)
+            self.assertEqual(store.persisted_cursor, previous_cursor + 2)
             recovered = LiveStateStore(store.root, now_provider=lambda: NOW)
             recovered.recover()
-            self.assertEqual(recovered.cursor, previous_cursor + 1)
+            self.assertEqual(recovered.cursor, previous_cursor + 2)
             self.assertEqual(
-                [event.cursor for event in recovered.events][-2:],
-                [previous_cursor, previous_cursor + 1],
+                [event.cursor for event in recovered.events][-3:],
+                [previous_cursor, previous_cursor + 1, previous_cursor + 2],
             )
 
 

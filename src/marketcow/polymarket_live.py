@@ -4965,7 +4965,14 @@ class LiveStateStore:
         gaps: list[GapEntry] | None = None,
         _publication_locked: bool = False,
     ) -> LiveEventEnvelope:
-        if not _publication_locked:
+        # In streaming mode the collector's in-memory state is the canonical
+        # real-time publication boundary.  The persistence worker owns the
+        # cross-process file/index lock and may hold it for seconds while an
+        # external volume pages in SQLite data or fsyncs JSONL.  Reacquiring
+        # that lock here would put the disk stall straight back onto WebSocket
+        # ingestion even though the actual writes are queued asynchronously.
+        # Collector mutations are already serialized by _sync_lock.
+        if not _publication_locked and not self._async_persistence:
             with _publication_lock(self.root, exclusive=True):
                 return self._emit(
                     event_type, canonical_payload, raw_payload,
