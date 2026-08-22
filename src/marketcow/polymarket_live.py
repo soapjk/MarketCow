@@ -5111,6 +5111,7 @@ class LiveStateStore:
         return {
             "expected": set(self.token_to_market),
             "recovered": set(),
+            "superseded": set(),
             "invalid": {},
             "duplicate_response_count": 0,
             "unknown_response_count": 0,
@@ -5140,12 +5141,23 @@ class LiveStateStore:
             previous = self.books.get(token_id)
             if (
                 refresh_started_at is not None
-                and refresh_started_at
-                < self._rest_refresh_generation.get(token_id, datetime.min.replace(
-                    tzinfo=timezone.utc
-                ))
+                and (
+                    refresh_started_at
+                    < self._rest_refresh_generation.get(
+                        token_id, datetime.min.replace(tzinfo=timezone.utc),
+                    )
+                    or (
+                        previous is not None
+                        and refresh_started_at < previous.received_at
+                    )
+                )
             ):
+                # The REST request was in flight while a newer WebSocket or
+                # refresh generation updated this token.  Publishing its older
+                # snapshot would regress freshness, amplify the event log, and
+                # make the queued WebSocket delta apply a second time.
                 recovered.add(token_id)
+                tracker["superseded"].add(token_id)
                 continue
             market_id = self.token_to_market.get(token_id)
             market_token_ids = [
@@ -5232,6 +5244,10 @@ class LiveStateStore:
             "requested_token_count": len(tracker["expected"]),
             "recovered_token_count": len(recovered),
             "recovered_token_sha256": content_sha256(sorted(recovered)),
+            "superseded_token_count": len(tracker["superseded"]),
+            "superseded_token_sha256": content_sha256(
+                sorted(tracker["superseded"])
+            ),
             "missing_token_count": len(missing),
             "missing_token_sha256": content_sha256(sorted(missing)),
             "invalid_book_token_count": len(invalid),
@@ -5997,7 +6013,7 @@ class PolymarketLiveCollector:
         catalog: GammaKeysetCatalog,
         books: ClobBooksClient,
         *,
-        connector: Callable[..., Any] = websockets.connect,
+        connector: Callable[..., Any] | None = None,
         shard_size: int = 500,
         max_websocket_connections: int = 32,
         heartbeat_seconds: float = 10,
@@ -6009,6 +6025,7 @@ class PolymarketLiveCollector:
         max_concurrent_snapshot_refreshes: int = 1,
         websocket_flush_seconds: float = 0.1,
         max_websocket_batch_messages: int = 256,
+        max_websocket_batch_items: int = 32,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -6034,6 +6051,7 @@ class PolymarketLiveCollector:
         )
         self.websocket_flush_seconds = max(0, websocket_flush_seconds)
         self.max_websocket_batch_messages = max(1, max_websocket_batch_messages)
+        self.max_websocket_batch_items = max(1, max_websocket_batch_items)
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
         # Periodic REST refreshes and reconnect recovery both fetch the same
@@ -6376,7 +6394,19 @@ class PolymarketLiveCollector:
         return messages
 
     async def _consume(self, tokens: list[str], *, message_limit: int | None = None) -> None:
-        async with self.connector(self.endpoint) as socket:
+        socket_context = (
+            self.connector(self.endpoint)
+            if self.connector is not None
+            else websockets.connect(
+                self.endpoint,
+                ping_interval=20,
+                # Durable publication can briefly saturate an older multi-GB
+                # index.  Keep protocol liveness detection, but do not turn a
+                # transient local scheduling delay into a recovery feedback loop.
+                ping_timeout=max(60, self.heartbeat_seconds * 6),
+            )
+        )
+        async with socket_context as socket:
             self.sockets.append(socket)
             self.socket_tokens[socket] = set(tokens)
             try:
@@ -6428,7 +6458,15 @@ class PolymarketLiveCollector:
                         items.extend(
                             payload if isinstance(payload, list) else [payload]
                         )
-                    await asyncio.to_thread(self._apply_websocket_batch, items)
+                    for offset in range(0, len(items), self.max_websocket_batch_items):
+                        await asyncio.to_thread(
+                            self._apply_websocket_batch,
+                            items[offset:offset + self.max_websocket_batch_items],
+                        )
+                        # Give protocol keepalive, REST freshness publication,
+                        # and the next socket read a scheduling point between
+                        # bounded durable transactions.
+                        await asyncio.sleep(0)
                     consumed += len(items)
                     if (
                         self.catalog_refresh_on_lifecycle_events
@@ -6448,20 +6486,33 @@ class PolymarketLiveCollector:
         self._apply_websocket_batch([item])
 
     def _apply_websocket_batch(self, items: list[dict[str, Any]]) -> None:
-        with (
-            self.store._sync_lock,
-            _publication_lock(self.store.root, exclusive=True),
-            self.store.memory_state_batch(),
-            self.store.state_index.batch(),
-            self.store.durable_event_batch(),
-        ):
-            for item in items:
-                self.store.apply_websocket(
-                    item,
-                    stale_events_are_resolved=(
-                        self.snapshot_refresh_seconds is not None
-                    ),
-                )
+        wait_started = time.monotonic()
+        with self.store._sync_lock:
+            sync_wait_seconds = time.monotonic() - wait_started
+            publish_started = time.monotonic()
+            cursor_started = self.store.cursor
+            with (
+                _publication_lock(self.store.root, exclusive=True),
+                self.store.memory_state_batch(),
+                self.store.state_index.batch(),
+                self.store.durable_event_batch(),
+            ):
+                for item in items:
+                    self.store.apply_websocket(
+                        item,
+                        stale_events_are_resolved=(
+                            self.snapshot_refresh_seconds is not None
+                        ),
+                    )
+            publish_seconds = time.monotonic() - publish_started
+            cursor_finished = self.store.cursor
+        if sync_wait_seconds >= 0.25 or publish_seconds >= 0.25:
+            LOGGER.info(
+                "websocket_publish_phase items=%d emitted_events=%d "
+                "sync_wait_seconds=%.6f publish_seconds=%.6f cursor=%d",
+                len(items), cursor_finished - cursor_started,
+                sync_wait_seconds, publish_seconds, cursor_finished,
+            )
 
     async def run_once(self, *, message_limit: int | None = None) -> None:
         groups = self.planner.connection_groups(
@@ -6483,11 +6534,20 @@ class PolymarketLiveCollector:
                 refresh_started = time.monotonic()
                 try:
                     async with self._snapshot_operation_lock:
-                        await self.refresh_books(
-                            "periodic_snapshot_refresh",
-                            partition_index=partition_index,
-                            partition_count=self.max_concurrent_snapshot_refreshes,
-                        )
+                        queued_seconds = time.monotonic() - refresh_started
+                        if queued_seconds >= self.snapshot_refresh_seconds:
+                            LOGGER.info(
+                                "periodic_snapshot_refresh_superseded "
+                                "partition=%d queued_seconds=%.6f interval_seconds=%.6f",
+                                partition_index, queued_seconds,
+                                self.snapshot_refresh_seconds,
+                            )
+                        else:
+                            await self.refresh_books(
+                                "periodic_snapshot_refresh",
+                                partition_index=partition_index,
+                                partition_count=self.max_concurrent_snapshot_refreshes,
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
