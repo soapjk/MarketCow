@@ -60,6 +60,8 @@ class PolymarketLiveProjection:
         self._persistence_queue_depth = 0
         self._persistence_error: str | None = None
         self._connected = False
+        self._disconnect_count = 0
+        self._event_loop_stall_max_ms = 0.0
         self._ready = False
         self._error_code: str | None = "polymarket_live_stream_disconnected"
         self._last_message_at: datetime | None = None
@@ -83,6 +85,8 @@ class PolymarketLiveProjection:
 
     def mark_disconnected(self, code: str = "polymarket_live_stream_disconnected") -> None:
         with self._lock:
+            if self._connected or self._ready:
+                self._disconnect_count += 1
             self._connected = False
             self._ready = False
             self._error_code = code
@@ -101,7 +105,15 @@ class PolymarketLiveProjection:
 
         validated_markets = [LiveMarket.model_validate(item) for item in markets]
         validated_books = [LiveBook.model_validate(item) for item in books]
-        validated_gaps = [GapEntry.model_validate(item) for item in gaps]
+        # Resolved gaps belong to the durable audit/history path.  Keeping the
+        # complete ledger in the hot projection made every broad snapshot copy
+        # and rescan tens of thousands of irrelevant entries.  The live read
+        # contract only needs unresolved gaps to fail closed; recovery removes
+        # them once their completion event has been applied.
+        validated_gaps = [
+            gap for item in gaps
+            if not (gap := GapEntry.model_validate(item)).resolved
+        ]
         latest_cursor = int(payload.get("latest_cursor", -1))
         persisted_cursor = int(payload.get("persisted_cursor", -1))
         if latest_cursor < 0 or persisted_cursor < 0 or persisted_cursor > latest_cursor:
@@ -155,6 +167,12 @@ class PolymarketLiveProjection:
     def apply_live(self, raw: dict[str, Any]) -> LiveEventEnvelope:
         event = LiveEventEnvelope.model_validate(raw)
         _validate_event(event)
+        return self.apply_validated_live(event)
+
+    def apply_validated_live(
+        self, event: LiveEventEnvelope,
+    ) -> LiveEventEnvelope:
+        """Apply an already authenticated event without CPU work on the loop."""
         with self._lock:
             if not self._ready:
                 raise ValueError("Polymarket live event arrived before replay was ready")
@@ -202,11 +220,23 @@ class PolymarketLiveProjection:
                 ),
                 "persistence_queue_depth": self._persistence_queue_depth,
                 "live_stream_connected": self._connected,
+                "live_stream_disconnect_count": self._disconnect_count,
+                "event_loop_stall_max_ms": self._event_loop_stall_max_ms,
                 "persistence_error": self._persistence_error,
             }
 
+    def observe_event_loop_stall(self, milliseconds: float) -> None:
+        with self._lock:
+            self._event_loop_stall_max_ms = max(
+                self._event_loop_stall_max_ms, max(0.0, milliseconds)
+            )
+
     def confirm_book(self, raw: dict[str, Any]) -> None:
         book = LiveBook.model_validate(raw)
+        self.confirm_validated_book(book)
+
+    def confirm_validated_book(self, book: LiveBook) -> None:
+        """Apply an already validated confirmation in constant bounded time."""
         with self._lock:
             previous = self._books.get(book.token_id)
             if previous is None or previous.state_checksum != book.state_checksum:
@@ -244,10 +274,9 @@ class PolymarketLiveProjection:
                 event.canonical_payload.get("resolved_gap_token_ids")
                 or event.canonical_payload.get("recovered_token_ids") or []
             )
-            for gap in self._gaps:
-                if not gap.resolved and gap.token_id in recovered:
-                    gap.resolved = True
-                    gap.resolution = "live_stream_recovery_completed"
+            self._gaps = [
+                gap for gap in self._gaps if gap.token_id not in recovered
+            ]
             self._active_recovery_id = None
 
     def _require_ready(self) -> None:
@@ -466,7 +495,7 @@ class PolymarketLiveProjection:
             return
         now = reader.now_provider()
         if any(
-            not 0 <= (now - book.received_at).total_seconds() <= maximum_age
+            not 0 <= (now - book.received_at).total_seconds() < maximum_age
             for book in books if book is not None
         ):
             raise PolymarketLiveReadStore._stable_boundary_unavailable(context)
@@ -488,7 +517,7 @@ class PolymarketLiveProjection:
         }
         observed_at = reader.now_provider()
         if not books or any(
-            not 0 <= (observed_at - book.received_at).total_seconds() <= maximum_age
+            not 0 <= (observed_at - book.received_at).total_seconds() < maximum_age
             for book in books.values()
         ):
             raise PolymarketLiveReadStore._stable_boundary_unavailable(context)
@@ -584,7 +613,7 @@ class PolymarketLiveProjection:
                 maximum_age = reader._stable_snapshot_max_book_age_seconds
                 stale = any(
                     book is None
-                    or not 0 <= (now - book.received_at).total_seconds() <= maximum_age
+                    or not 0 <= (now - book.received_at).total_seconds() < maximum_age
                     for book in books
                 )
             ready = (
@@ -623,10 +652,12 @@ class PolymarketLiveProjection:
                 ),
                 persistence_queue_depth=self._persistence_queue_depth,
                 live_stream_connected=self._connected,
+                live_stream_disconnect_count=self._disconnect_count,
+                event_loop_stall_max_ms=self._event_loop_stall_max_ms,
+                events_read_source="memory_projection",
+                realtime_sqlite_query_ms=0,
                 reason_codes=sorted(set(reasons)),
             )
-        if reader is not None and not health.latest_state_ready:
-            raise PolymarketLiveReadStore._stable_boundary_unavailable("health")
         return health
 
     def subscribe(self, *, capacity: int = 1024) -> asyncio.Queue[LiveEventEnvelope]:
@@ -693,7 +724,10 @@ class PolymarketLiveStreamServer:
             return
         loop.call_soon_threadsafe(
             self._broadcast,
-            {"type": "event", "event": event.model_copy(deep=True)},
+            # Events are immutable publication records after _emit returns.
+            # Copying their canonical/raw payload here would put response-size
+            # CPU work back on the collector's receive/publish path.
+            {"type": "event", "event": event},
         )
 
     def publish_book_confirmation(self, book: LiveBook) -> None:
@@ -702,7 +736,9 @@ class PolymarketLiveStreamServer:
             return
         loop.call_soon_threadsafe(
             self._broadcast,
-            {"type": "book_confirmation", "book": book.model_copy(deep=True)},
+            # LiveStateStore replaces books instead of mutating published
+            # instances, so a reference is a stable publication snapshot.
+            {"type": "book_confirmation", "book": book},
         )
 
     def _broadcast(self, message: dict[str, Any]) -> None:
@@ -720,6 +756,12 @@ class PolymarketLiveStreamServer:
     def _state(self) -> tuple[dict[str, Any], list[LiveEventEnvelope]]:
         with self.store._sync_lock:
             history = list(self.store.events)[-self.replay_capacity:]
+            markets = sorted(
+                self.store.catalog.values(),
+                key=lambda item: item.identity.market_id,
+            )
+            books = sorted(self.store.books.items())
+            gaps = [gap for gap in self.store.gaps if not gap.resolved]
             state = {
                 "schema_version": STREAM_SCHEMA,
                 "type": "state",
@@ -732,22 +774,19 @@ class PolymarketLiveStreamServer:
                 "persistence_queue_depth": self.store._persistence_queue.qsize(),
                 "persistence_error": self.store.persistence_error,
                 "active_recovery_id": self.store.active_recovery_id,
-                "markets": [
-                    market.model_dump(mode="json")
-                    for market in sorted(
-                        self.store.catalog.values(),
-                        key=lambda item: item.identity.market_id,
-                    )
-                ],
-                "books": [
-                    book.model_dump(mode="json")
-                    for _, book in sorted(self.store.books.items())
-                ],
-                "gaps": [gap.model_dump(mode="json") for gap in self.store.gaps],
                 "history_oldest_cursor": (
                     history[0].cursor if history else self.store.cursor + 1
                 ),
             }
+        # Serialization is intentionally outside the collector state lock.
+        # Captured model instances are replaced, not mutated, by publication.
+        state.update({
+            "markets": [market.model_dump(mode="json") for market in markets],
+            "books": [book.model_dump(mode="json") for _, book in books],
+            # The loopback real-time projection only consumes unresolved gaps.
+            # SQLite/JSONL retain the complete audit ledger.
+            "gaps": [gap.model_dump(mode="json") for gap in gaps],
+        })
         return state, history
 
     async def _handler(self, websocket: Any) -> None:
@@ -850,16 +889,30 @@ class PolymarketLiveStreamClient:
                 ) as websocket:
                     await websocket.send(json.dumps({"type": "subscribe"}))
                     async for raw in websocket:
-                        message = json.loads(raw)
+                        # JSON decoding, Pydantic validation, and integrity hash
+                        # verification are CPU-bound.  Keeping them off the API
+                        # event loop prevents broad frame serialization or a
+                        # slow HTTP writer from starving WebSocket receive.
+                        message = await asyncio.to_thread(json.loads, raw)
                         kind = message.get("type")
                         if kind == "state":
-                            self.projection.install_state(message)
+                            await asyncio.to_thread(
+                                self.projection.install_state, message
+                            )
                         elif kind == "history":
-                            self.projection.add_history(message.get("items") or [])
+                            await asyncio.to_thread(
+                                self.projection.add_history,
+                                message.get("items") or [],
+                            )
                         elif kind == "ready":
                             self.projection.mark_ready(message)
                         elif kind == "event":
-                            self.projection.apply_live(message["event"])
+                            event = await asyncio.to_thread(
+                                LiveEventEnvelope.model_validate,
+                                message["event"],
+                            )
+                            await asyncio.to_thread(_validate_event, event)
+                            self.projection.apply_validated_live(event)
                             self.projection.update_persistence(
                                 int(message.get("persisted_cursor", 0)),
                                 queue_depth=int(
@@ -868,7 +921,10 @@ class PolymarketLiveStreamClient:
                                 error=message.get("persistence_error"),
                             )
                         elif kind == "book_confirmation":
-                            self.projection.confirm_book(message["book"])
+                            book = await asyncio.to_thread(
+                                LiveBook.model_validate, message["book"]
+                            )
+                            self.projection.confirm_validated_book(book)
                             self.projection.update_persistence(
                                 int(message.get("persisted_cursor", 0)),
                                 queue_depth=int(

@@ -1606,6 +1606,12 @@ class LiveReadHealth(BaseModel):
     persistence_lag_events: int = Field(default=0, ge=0)
     persistence_queue_depth: int = Field(default=0, ge=0)
     live_stream_connected: bool = False
+    live_stream_disconnect_count: int = Field(default=0, ge=0)
+    event_loop_stall_max_ms: float = Field(default=0, ge=0)
+    events_read_source: Literal["memory_projection", "durable_index"] = (
+        "durable_index"
+    )
+    realtime_sqlite_query_ms: float = Field(default=0, ge=0)
     reason_codes: list[str] = Field(default_factory=list)
     source_policy: Literal["official_free_only"] = "official_free_only"
 
@@ -2312,7 +2318,7 @@ class PolymarketLiveReadStore:
                         row["confirmed_received_at"] or row["book_received_at"]
                     )
                 ).total_seconds()
-                <= maximum_age
+                < maximum_age
                 for row in materialized
             )
         )
@@ -2472,7 +2478,7 @@ class PolymarketLiveReadStore:
             for book in (*frame.tokens, *frame.relation_tokens)
         }
         if not books or any(
-            not 0 <= (observed_at - book.received_at).total_seconds() <= maximum_age
+            not 0 <= (observed_at - book.received_at).total_seconds() < maximum_age
             for book in books.values()
         ):
             raise self._stable_boundary_unavailable("snapshot response")

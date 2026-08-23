@@ -622,6 +622,7 @@ def create_app(
     )
     polymarket_live_stream_stop = asyncio.Event()
     polymarket_live_stream_task: asyncio.Task[None] | None = None
+    polymarket_event_loop_monitor_task: asyncio.Task[None] | None = None
     app.state.polymarket_live_projection = polymarket_live_projection
     polymarket_event_executor = ThreadPoolExecutor(
         max_workers=4,
@@ -647,6 +648,18 @@ def create_app(
             _POLYMARKET_LIVE_HEALTH_EXECUTOR,
             polymarket_live_read.health,
         )
+
+    async def monitor_polymarket_event_loop() -> None:
+        interval = 0.05
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + interval
+        while not polymarket_live_stream_stop.is_set():
+            await asyncio.sleep(interval)
+            observed = loop.time()
+            polymarket_live_projection.observe_event_loop_stall(
+                (observed - expected) * 1000
+            )
+            expected = observed + interval
     history_repository = getattr(service, "metadata_repository", None)
     history_manager = None
     if history_repository is not None and all(hasattr(history_repository, name) for name in (
@@ -810,12 +823,20 @@ def create_app(
 
     async def startup() -> None:
         nonlocal projection_task, polymarket_live_stream_task
+        nonlocal polymarket_event_loop_monitor_task
         if polymarket_live_stream_client is not None:
             polymarket_live_stream_task = asyncio.create_task(
                 polymarket_live_stream_client.run(polymarket_live_stream_stop),
                 name="polymarket-live-stream-client",
             )
             app.state.polymarket_live_stream_task = polymarket_live_stream_task
+            polymarket_event_loop_monitor_task = asyncio.create_task(
+                monitor_polymarket_event_loop(),
+                name="polymarket-event-loop-stall-monitor",
+            )
+            app.state.polymarket_event_loop_monitor_task = (
+                polymarket_event_loop_monitor_task
+            )
         if metadata_repository is not None and hasattr(
             metadata_repository, "upsert_prediction_market_live_observation"
         ):
@@ -836,6 +857,11 @@ def create_app(
             polymarket_live_stream_task.cancel()
             await asyncio.gather(
                 polymarket_live_stream_task, return_exceptions=True
+            )
+        if polymarket_event_loop_monitor_task is not None:
+            polymarket_event_loop_monitor_task.cancel()
+            await asyncio.gather(
+                polymarket_event_loop_monitor_task, return_exceptions=True
             )
         projection_stop.set()
         if projection_task is not None:
@@ -1682,7 +1708,17 @@ def create_app(
     )
     async def polymarket_live_health():
         try:
-            return await read_polymarket_live_health()
+            health = await read_polymarket_live_health()
+            return Response(
+                content=health.model_dump_json(),
+                media_type="application/json",
+                status_code=(
+                    503
+                    if polymarket_live_stream_client is not None
+                    and not health.latest_state_ready
+                    else 200
+                ),
+            )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
