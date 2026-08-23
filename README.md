@@ -32,6 +32,9 @@ separation and the production runtime directory layout.
 - `MARKETCOW_CLICKHOUSE_HOST`、`MARKETCOW_CLICKHOUSE_DATABASE`
 - Provider 凭证，例如 `TUSHARE_TOKEN` 与 `MARKETCOW_LONGPORT_*`
 
+供 LLMAY 使用的公网只读入口默认关闭；双 JWT、接口白名单、限流、审计和密钥轮换
+配置见 [LLMAY 公网只读接入](docs/public-read-api.md)。
+
 ## 启动
 
 ```bash

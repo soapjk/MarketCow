@@ -98,6 +98,13 @@ from .admin_events import ALLOWED_EVENT_TYPES, AdminEventHub, encode_sse
 from .admin_auth import (
     CSRF_COOKIE, SESSION_COOKIE, AdminAuth, AdminSecurityMiddleware,
 )
+from .public_access import (
+    JwtPolicy,
+    PublicAccessConfig,
+    PublicAuditLogger,
+    PublicReadOnlyMiddleware,
+    parse_key_set,
+)
 from .mcp_server import (
     SUPPORTED_PROTOCOL_VERSIONS,
     MarketCowClient,
@@ -535,6 +542,40 @@ def create_app(
         metrics=request_metrics,
         event_sink=admin_events.request_completed,
     )
+    jwt_clock = lambda: (
+        now_provider() if now_provider is not None else datetime.now(timezone.utc)
+    ).timestamp()
+    public_access_config = PublicAccessConfig(
+        enabled=settings.public_read_enabled,
+        allowlist=settings.public_read_allowlist,
+        access_token_policy=JwtPolicy(
+            issuer=settings.investrace_jwt_issuer,
+            audience=settings.investrace_jwt_audience,
+            required_scope=settings.investrace_jwt_scope,
+            keys=parse_key_set(settings.investrace_jwt_keys_json),
+            leeway_seconds=settings.public_jwt_leeway_seconds,
+            max_lifetime_seconds=settings.public_jwt_max_lifetime_seconds,
+        ),
+        marketcow_token_policy=JwtPolicy(
+            issuer=settings.marketcow_jwt_issuer,
+            audience=settings.marketcow_jwt_audience,
+            required_scope=settings.marketcow_jwt_scope,
+            keys=parse_key_set(settings.marketcow_jwt_keys_json),
+            leeway_seconds=settings.public_jwt_leeway_seconds,
+            max_lifetime_seconds=settings.public_jwt_max_lifetime_seconds,
+        ),
+        rate_limit_requests=settings.public_rate_limit_requests,
+        rate_limit_window_seconds=settings.public_rate_limit_window_seconds,
+    )
+    public_audit = PublicAuditLogger(settings.public_audit_path, jwt_clock)
+    app.add_middleware(
+        PublicReadOnlyMiddleware,
+        config=public_access_config,
+        audit=public_audit,
+        clock=jwt_clock,
+    )
+    app.state.public_access_config = public_access_config
+    app.state.public_audit = public_audit
     app.state.request_metrics = request_metrics
     app.state.admin_events = admin_events
     app.state.service = service

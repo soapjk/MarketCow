@@ -106,6 +106,21 @@ class Settings:
     admin_live_enabled: bool = True
     admin_live_max_connections: int = 100
     mcp_enabled: bool = True
+    public_read_enabled: bool = False
+    public_read_allowlist: tuple[str, ...] = ()
+    public_rate_limit_requests: int = 60
+    public_rate_limit_window_seconds: int = 60
+    public_audit_path: Path | None = None
+    investrace_jwt_issuer: str = ""
+    investrace_jwt_audience: str = "marketcow-public"
+    investrace_jwt_scope: str = "marketcow:read"
+    investrace_jwt_keys_json: str = ""
+    marketcow_jwt_issuer: str = "marketcow"
+    marketcow_jwt_audience: str = "llmay"
+    marketcow_jwt_scope: str = "llmay:read"
+    marketcow_jwt_keys_json: str = ""
+    public_jwt_leeway_seconds: int = 30
+    public_jwt_max_lifetime_seconds: int = 3600
 
     @classmethod
     def from_env(cls, profile: str | None = None) -> "Settings":
@@ -288,6 +303,50 @@ class Settings:
                 "MARKETCOW_ADMIN_LIVE_MAX_CONNECTIONS", "100"
             )),
             mcp_enabled=_bool_env("MARKETCOW_MCP_ENABLED", True),
+            public_read_enabled=_bool_env("MARKETCOW_PUBLIC_READ_ENABLED", False),
+            public_read_allowlist=_string_tuple_json_env(
+                "MARKETCOW_PUBLIC_READ_ALLOWLIST_JSON", "[]"
+            ),
+            public_rate_limit_requests=int(os.getenv(
+                "MARKETCOW_PUBLIC_RATE_LIMIT_REQUESTS", "60"
+            )),
+            public_rate_limit_window_seconds=int(os.getenv(
+                "MARKETCOW_PUBLIC_RATE_LIMIT_WINDOW_SECONDS", "60"
+            )),
+            public_audit_path=Path(os.getenv(
+                "MARKETCOW_PUBLIC_AUDIT_PATH",
+                str(root / "audit/public-access.jsonl"),
+            )).expanduser(),
+            investrace_jwt_issuer=os.getenv(
+                "MARKETCOW_INVESTRACE_JWT_ISSUER", ""
+            ).strip(),
+            investrace_jwt_audience=os.getenv(
+                "MARKETCOW_INVESTRACE_JWT_AUDIENCE", "marketcow-public"
+            ).strip(),
+            investrace_jwt_scope=os.getenv(
+                "MARKETCOW_INVESTRACE_JWT_SCOPE", "marketcow:read"
+            ).strip(),
+            investrace_jwt_keys_json=os.getenv(
+                "MARKETCOW_INVESTRACE_JWT_KEYS_JSON", ""
+            ).strip(),
+            marketcow_jwt_issuer=os.getenv(
+                "MARKETCOW_PUBLIC_JWT_ISSUER", "marketcow"
+            ).strip(),
+            marketcow_jwt_audience=os.getenv(
+                "MARKETCOW_PUBLIC_JWT_AUDIENCE", "llmay"
+            ).strip(),
+            marketcow_jwt_scope=os.getenv(
+                "MARKETCOW_PUBLIC_JWT_SCOPE", "llmay:read"
+            ).strip(),
+            marketcow_jwt_keys_json=os.getenv(
+                "MARKETCOW_PUBLIC_JWT_KEYS_JSON", ""
+            ).strip(),
+            public_jwt_leeway_seconds=int(os.getenv(
+                "MARKETCOW_PUBLIC_JWT_LEEWAY_SECONDS", "30"
+            )),
+            public_jwt_max_lifetime_seconds=int(os.getenv(
+                "MARKETCOW_PUBLIC_JWT_MAX_LIFETIME_SECONDS", "3600"
+            )),
         )
 
     def validate_runtime_isolation(self) -> None:
@@ -366,6 +425,36 @@ class Settings:
             raise ValueError("realtime replay capacity must be between 1 and 100000")
         if not 0.1 <= self.realtime_heartbeat_seconds <= 60:
             raise ValueError("realtime heartbeat must be between 0.1 and 60 seconds")
+        if self.public_read_enabled:
+            from .public_access import JwtPolicy, PublicAccessConfig, parse_key_set
+
+            PublicAccessConfig(
+                enabled=True,
+                allowlist=self.public_read_allowlist,
+                access_token_policy=JwtPolicy(
+                    issuer=self.investrace_jwt_issuer,
+                    audience=self.investrace_jwt_audience,
+                    required_scope=self.investrace_jwt_scope,
+                    keys=parse_key_set(self.investrace_jwt_keys_json),
+                    leeway_seconds=self.public_jwt_leeway_seconds,
+                    max_lifetime_seconds=self.public_jwt_max_lifetime_seconds,
+                ),
+                marketcow_token_policy=JwtPolicy(
+                    issuer=self.marketcow_jwt_issuer,
+                    audience=self.marketcow_jwt_audience,
+                    required_scope=self.marketcow_jwt_scope,
+                    keys=parse_key_set(self.marketcow_jwt_keys_json),
+                    leeway_seconds=self.public_jwt_leeway_seconds,
+                    max_lifetime_seconds=self.public_jwt_max_lifetime_seconds,
+                ),
+                rate_limit_requests=self.public_rate_limit_requests,
+                rate_limit_window_seconds=self.public_rate_limit_window_seconds,
+            ).validate()
+            if self.public_audit_path is None:
+                raise ValueError("public access requires an audit path")
+            audit_path = self.public_audit_path.resolve()
+            if audit_path != root and root not in audit_path.parents:
+                raise ValueError("public audit path escapes the storage root")
 
     @staticmethod
     def _loopback(host: str) -> bool:
@@ -384,3 +473,14 @@ def _bool_env(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _string_tuple_json_env(name: str, default: str) -> tuple[str, ...]:
+    raw = os.getenv(name, default)
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON") from exc
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a JSON array of strings")
+    return tuple(value)
