@@ -74,6 +74,7 @@ def main() -> None:
     lock = threading.Lock()
     latencies: dict[str, list[float]] = {route: [] for route in ROUTES}
     failures: dict[str, int] = {route: 0 for route in ROUTES}
+    expected_fail_closed: dict[str, int] = {route: 0 for route in ROUTES}
     timeouts: dict[str, int] = {route: 0 for route in ROUTES}
     errors: list[dict[str, Any]] = []
     maximum_book_age_seconds = 0.0
@@ -126,6 +127,25 @@ def main() -> None:
                 latencies[route].append(elapsed)
             payload = response.json()
             if response.status_code != 200:
+                detail = payload.get("detail", {}) if isinstance(payload, dict) else {}
+                expected_503 = (
+                    response.status_code == 503
+                    and (
+                        (
+                            route == "health"
+                            and payload.get("status") == "degraded"
+                            and bool(payload.get("reason_codes"))
+                        )
+                        or (
+                            route in {"bootstrap", "snapshot"}
+                            and detail.get("code") == "polymarket_state_index_lagging"
+                        )
+                    )
+                )
+                if expected_503:
+                    with lock:
+                        expected_fail_closed[route] += 1
+                    return response, payload
                 record_failure(route, None, payload)
                 return response, payload
             return response, payload
@@ -151,9 +171,13 @@ def main() -> None:
             timeout=timeout_seconds, limits=limits, trust_env=False
         ) as client:
             while time.monotonic() < deadline:
-                _, health = fetch(client, "health")
-                _, bootstrap = fetch(client, "bootstrap", params=market_params)
-                _, snapshot = fetch(client, "snapshot", params=market_params)
+                health_response, health = fetch(client, "health")
+                bootstrap_response, bootstrap = fetch(
+                    client, "bootstrap", params=market_params
+                )
+                snapshot_response, snapshot = fetch(
+                    client, "snapshot", params=market_params
+                )
                 cycle_maximum_age = 0.0
                 if health is not None:
                     with lock:
@@ -182,7 +206,7 @@ def main() -> None:
                         )
                         if not health.get("live_stream_connected", False):
                             websocket_disconnected_observations += 1
-                if bootstrap is not None:
+                if bootstrap_response is not None and bootstrap_response.status_code == 200:
                     returned = {
                         str(item["identity"]["market_id"])
                         for item in bootstrap.get("markets") or []
@@ -190,7 +214,7 @@ def main() -> None:
                     if returned != set(config["market_ids"]):
                         with lock:
                             integrity_failure_count += 1
-                if snapshot is not None:
+                if snapshot_response is not None and snapshot_response.status_code == 200:
                     returned = {
                         str(item["market_id"])
                         for item in snapshot.get("items") or []
@@ -221,7 +245,12 @@ def main() -> None:
                         )
                         if cycle_maximum_age >= 5:
                             successful_stale_snapshot_count += 1
-                            if health and health.get("status") == "index_ready":
+                            if (
+                                health_response is not None
+                                and health_response.status_code == 200
+                                and health
+                                and health.get("status") == "index_ready"
+                            ):
                                 health_index_ready_with_stale_snapshot_count += 1
                 sleep_for = min(1.0, max(0.0, deadline - time.monotonic()))
                 if sleep_for:
@@ -360,6 +389,7 @@ def main() -> None:
             health_index_ready_with_stale_snapshot_count
         ),
         "route_failure_counts": failures,
+        "expected_fail_closed_counts": expected_fail_closed,
         "route_timeout_counts": timeouts,
         "errors": errors,
     }
