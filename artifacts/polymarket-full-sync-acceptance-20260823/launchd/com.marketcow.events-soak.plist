@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.marketcow.events-soak</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/androidjk/Library/Application Support/MarketCow/atomic-freshness-venv/bin/python</string>
+    <string>-m</string><string>marketcow</string><string>--profile</string><string>production</string>
+    <string>start</string><string>--host</string><string>127.0.0.1</string><string>--port</string><string>8790</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>LC_ALL</key><string>C</string>
+    <key>MARKETCOW_ENV_FILE</key><string>/Users/androidjk/Library/Application Support/MarketCow/production.env</string>
+    <key>MARKETCOW_PROFILE</key><string>production</string>
+    <key>PYTHONPATH</key><string>/Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332/src</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>WorkingDirectory</key><string>/Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/androidjk/Library/Logs/MarketCow/events-soak.log</string>
+  <key>StandardErrorPath</key><string>/Users/androidjk/Library/Logs/MarketCow/events-soak.error.log</string>
+</dict></plist>

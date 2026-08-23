@@ -1,0 +1,12 @@
+schema: tradude.polymarket.live_trading.v3
+mode: shadow
+multi_strategy_config: /Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332/artifacts/polymarket-full-sync-acceptance-20260823/multi-strategy.yaml
+canary_config: /Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332/artifacts/polymarket-full-sync-acceptance-20260823/canary.yaml
+paper_fok:
+  maximum_book_age_ns: 5000000000
+runtime:
+  event_page_limit: 1000
+  run_duration_seconds: 3600
+  poll_interval_seconds: 0.5
+  unavailable_retry:
+    maximum_consecutive_seconds: 30

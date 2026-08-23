@@ -223,13 +223,21 @@ def main() -> None:
                         with lock:
                             integrity_failure_count += 1
                     observed = datetime.now(timezone.utc)
-                    unique_books: dict[str, dict[str, Any]] = {}
+                    unique_books: dict[str, dict[str, Any]] = snapshot.get("books") or {}
+                    referenced_token_ids: set[str] = set()
                     for frame in snapshot.get("items") or []:
                         if frame.get("status") != "ready":
                             with lock:
                                 integrity_failure_count += 1
-                        for book in (*frame.get("tokens", []), *frame.get("relation_tokens", [])):
-                            unique_books[str(book["token_id"])] = book
+                        referenced_token_ids.update(
+                            str(item) for item in frame.get("token_ids", [])
+                        )
+                        referenced_token_ids.update(
+                            str(item) for item in frame.get("relation_token_ids", [])
+                        )
+                    if referenced_token_ids != set(unique_books):
+                        with lock:
+                            integrity_failure_count += 1
                     if len(unique_books) != 200:
                         with lock:
                             integrity_failure_count += 1

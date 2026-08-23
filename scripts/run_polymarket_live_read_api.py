@@ -26,6 +26,12 @@ def main() -> None:
     parser.add_argument(
         "--stable-snapshot-max-book-age-seconds", required=True, type=float
     )
+    parser.add_argument(
+        "--consumer-maximum-book-age-seconds", required=True, type=float
+    )
+    parser.add_argument(
+        "--minimum-delivery-headroom-seconds", required=True, type=float
+    )
     parser.add_argument("--stable-read-wait-seconds", required=True, type=float)
     parser.add_argument("--stable-read-poll-seconds", required=True, type=float)
     parser.add_argument("--executor-workers", required=True, type=int)
@@ -33,6 +39,8 @@ def main() -> None:
         "--live-stream-uri", default="ws://127.0.0.1:8794"
     )
     parser.add_argument("--live-stream-replay-capacity", type=int, default=10_000)
+    parser.add_argument("--log-level", default="info")
+    parser.add_argument("--no-access-log", action="store_true")
     arguments = parser.parse_args()
     if not arguments.root.is_absolute():
         parser.error("--root must be absolute")
@@ -49,8 +57,20 @@ def main() -> None:
         executor_workers=arguments.executor_workers,
         live_stream_uri=arguments.live_stream_uri,
         live_stream_replay_capacity=arguments.live_stream_replay_capacity,
+        consumer_maximum_book_age_seconds=(
+            arguments.consumer_maximum_book_age_seconds
+        ),
+        minimum_delivery_headroom_seconds=(
+            arguments.minimum_delivery_headroom_seconds
+        ),
     )
-    uvicorn.run(app, host=arguments.host, port=arguments.port)
+    uvicorn.run(
+        app,
+        host=arguments.host,
+        port=arguments.port,
+        log_level=arguments.log_level,
+        access_log=not arguments.no_access_log,
+    )
 
 
 if __name__ == "__main__":

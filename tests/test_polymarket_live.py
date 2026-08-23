@@ -588,8 +588,8 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(len(store.books["yes-1"].state_checksum), 64)
         frame = store.frame("m1", now=NOW + timedelta(seconds=1))
         self.assertEqual(frame.status, "ready")
-        self.assertEqual(len(frame.tokens), 2)
-        self.assertNotEqual(frame.tokens[0].book_epoch, "")
+        self.assertEqual(len(frame.token_ids), 2)
+        self.assertNotEqual(store.books[frame.token_ids[0]].book_epoch, "")
 
     def test_price_change_message_validates_all_token_levels_atomically(self):
         store = self.store()
@@ -784,7 +784,7 @@ class PolymarketLiveTest(unittest.TestCase):
             store.apply_snapshot(snapshot(token, bid, ask), received_at=NOW)
         frame = store.frame("m1", now=NOW)
         self.assertEqual(frame.status, "ready")
-        self.assertEqual(len(frame.relation_tokens), 2)
+        self.assertEqual(len(frame.relation_token_ids), 2)
         self.assertEqual(
             {item.yes_token_id for item in frame.relation_pairs}, {"a", "c"},
         )
@@ -821,7 +821,7 @@ class PolymarketLiveTest(unittest.TestCase):
             store.apply_snapshot(snapshot(token, bid, ask), received_at=NOW)
         frame = store.frame("m1", now=NOW)
         self.assertEqual(frame.status, "ready")
-        self.assertEqual({item.token_id for item in frame.relation_tokens}, {"a", "c", "e"})
+        self.assertEqual(set(frame.relation_token_ids), {"a", "c", "e"})
         self.assertEqual(len(frame.relation_pairs), 3)
 
     def test_negative_risk_frame_skew_uses_observation_not_last_exchange_change(self):
@@ -1423,7 +1423,8 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(bootstrap.json()["markets"][0]["identity"]["market_id"], "m1")
         self.assertEqual(full.json()["detail"]["code"], "polymarket_full_universe_disabled")
         self.assertEqual(frame.json()["items"][0]["status"], "ready")
-        self.assertEqual(len(frame.json()["items"][0]["tokens"]), 2)
+        self.assertEqual(len(frame.json()["items"][0]["token_ids"]), 2)
+        self.assertEqual(len(frame.json()["books"]), 2)
         self.assertEqual(len(events.json()["items"]), 2)
         self.assertEqual(health.json()["status"], "index_ready")
         self.assertEqual(len(checkpoint.json()["books"]), 2)
@@ -1715,7 +1716,8 @@ class PolymarketLiveTest(unittest.TestCase):
         ).json()
         self.assertEqual(len(bootstrap["markets"]), 1)
         self.assertEqual(frame["items"][0]["status"], "ready")
-        self.assertEqual(len(frame["items"][0]["tokens"]), 2)
+        self.assertEqual(len(frame["items"][0]["token_ids"]), 2)
+        self.assertEqual(len(frame["books"]), 2)
         self.assertEqual(events["next_cursor"], writer.cursor)
         self.assertEqual(health["market_count"], 1)
         self.assertEqual(health["token_count"], 2)
@@ -1804,12 +1806,12 @@ class PolymarketLiveTest(unittest.TestCase):
             "0.001",
         )
         self.assertEqual(
-            {book.tick_size for book in page.items[0].tokens},
+            {page.books[token_id].tick_size for token_id in page.items[0].token_ids},
             {"0.001"},
         )
         self.assertEqual(
             bootstrap.markets[0].rules.instrument.price_increment,
-            page.items[0].tokens[0].tick_size,
+            page.books[page.items[0].token_ids[0]].tick_size,
         )
 
     def test_raw_hash_deduplication_memory_is_bounded_by_replay_capacity(self):
@@ -2671,7 +2673,7 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(pages[0].items[0].status, "ready")
         self.assertTrue(all(
             book.received_at == current[0]
-            for book in pages[0].items[0].tokens
+            for book in pages[0].books.values()
         ))
 
     def test_snapshot_three_and_half_second_budget_preserves_consumer_headroom(self):
@@ -2819,8 +2821,9 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(
             response.json()["detail"]["code"],
-            "polymarket_state_index_lagging",
+            "polymarket_snapshot_freshness_budget_exhausted",
         )
+        self.assertTrue(response.json()["detail"]["retryable"])
         self.assertEqual(response.headers["Retry-After"], "1")
 
     def test_failed_event_types_are_durable_after_checkpoint(self):
@@ -3202,7 +3205,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 Path(folder), now_provider=lambda: current[0],
             ).snapshot(["m1"])
             self.assertEqual(
-                {book.received_at for book in refreshed.items[0].tokens},
+                {book.received_at for book in refreshed.books.values()},
                 {current[0]},
             )
 

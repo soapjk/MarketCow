@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import threading
 import time
@@ -152,7 +153,14 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([event.cursor for event in page.items], [after + 1])
             self.assertEqual(page.next_cursor, after + 1)
             self.assertFalse(page.has_more)
-            health = projection.health()
+            health = projection.health(
+                PolymarketLiveReadStore(
+                    store.root,
+                    now_provider=lambda: NOW,
+                    stable_snapshot_max_book_age_seconds=5,
+                ),
+                ["m1"],
+            )
             self.assertEqual(health.status, "index_ready")
             self.assertTrue(health.latest_state_ready)
             self.assertEqual(health.book_complete_market_count, 1)
@@ -170,10 +178,12 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(frame.items[0].status, "ready")
 
             reader.now_provider = lambda: NOW + timedelta(seconds=5)
-            stale_health = projection.health(reader)
-            self.assertEqual(stale_health.status, "degraded")
-            self.assertFalse(stale_health.latest_state_ready)
-            self.assertIn("stale_book_state", stale_health.reason_codes)
+            with self.assertRaises(PolymarketLiveReadError) as stale_health:
+                projection.health(reader, ["m1"])
+            self.assertEqual(
+                stale_health.exception.code,
+                "polymarket_snapshot_freshness_budget_exhausted",
+            )
             for action in (
                 lambda: projection.bootstrap_json(reader, ["m1"]),
                 lambda: projection.snapshot_json(reader, ["m1"]),
@@ -181,7 +191,8 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(PolymarketLiveReadError) as stale:
                     action()
                 self.assertEqual(
-                    stale.exception.code, "polymarket_state_index_lagging"
+                    stale.exception.code,
+                    "polymarket_snapshot_freshness_budget_exhausted",
                 )
         finally:
             stop.set()
@@ -250,16 +261,19 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             snapshot_body = projection.snapshot_json(reader, scope)
         elapsed = time.perf_counter() - started
 
-        self.assertEqual(projection.health(reader).unresolved_gap_count, 0)
+        self.assertEqual(projection.health(reader, scope).unresolved_gap_count, 0)
         self.assertEqual(projection._gaps, [])
         self.assertGreater(len(bootstrap), 100_000)
         self.assertGreater(len(snapshot_body), 100_000)
         self.assertLess(elapsed, 0.75)
 
         reader.now_provider = lambda: NOW + timedelta(seconds=5)
-        health = projection.health(reader)
-        self.assertEqual(health.status, "degraded")
-        self.assertIn("stale_book_state", health.reason_codes)
+        with self.assertRaises(PolymarketLiveReadError) as stale_health:
+            projection.health(reader, scope)
+        self.assertEqual(
+            stale_health.exception.code,
+            "polymarket_snapshot_freshness_budget_exhausted",
+        )
 
     async def test_100_market_memory_page_is_ordered_bounded_and_has_no_disk_phase(self):
         projection = PolymarketLiveProjection(replay_capacity=2000)
@@ -441,6 +455,58 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not worker.is_alive() for worker in workers))
         self.assertEqual(projection.latest_cursor, store.cursor + 100)
         self.assertLess(elapsed, 0.5)
+
+    def test_full_sync_scoped_health_covers_relation_books_without_duplicates(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "relation"
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("a", "b"), neg_risk=True),
+            gamma_row("m2", "0x" + "2" * 64, ("c", "d"), neg_risk=True),
+        ]
+        store = LiveStateStore(root, now_provider=lambda: NOW)
+        store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        for token, bid, ask in (
+            ("a", "0.40", "0.42"), ("b", "0.58", "0.60"),
+            ("c", "0.30", "0.32"), ("d", "0.68", "0.70"),
+        ):
+            store.apply_snapshot(snapshot(token, bid, ask), received_at=NOW)
+        projection = PolymarketLiveProjection(replay_capacity=100)
+        projection.install_state({
+            "schema_version": "marketcow.polymarket.live-stream.v1",
+            "type": "state",
+            "catalog_revision": store.catalog_revision,
+            "catalog_source": store.catalog_source,
+            "latest_cursor": store.cursor,
+            "persisted_cursor": store.cursor,
+            "active_recovery_id": None,
+            "markets": [
+                market.model_dump(mode="json") for market in store.catalog.values()
+            ],
+            "books": [book.model_dump(mode="json") for book in store.books.values()],
+            "gaps": [],
+        })
+        projection.mark_ready({"latest_cursor": store.cursor})
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: NOW + timedelta(seconds=1),
+            stable_snapshot_max_book_age_seconds=5,
+            consumer_maximum_book_age_seconds=5,
+            minimum_delivery_headroom_seconds=1,
+        )
+
+        body, phases, full_sync = projection.full_sync_json(reader, ["m1"])
+
+        frame = full_sync.snapshot.items[0]
+        self.assertEqual(set(frame.token_ids), {"a", "b"})
+        self.assertEqual(set(frame.relation_token_ids), {"a", "c"})
+        self.assertEqual(set(full_sync.snapshot.books), {"a", "b", "c"})
+        self.assertEqual(full_sync.health.token_count, 3)
+        self.assertEqual(full_sync.health.book_token_count, 3)
+        payload = json.loads(body)
+        self.assertEqual(len(payload["snapshot"]["books"]), 3)
+        self.assertNotIn("tokens", payload["snapshot"]["items"][0])
+        self.assertEqual(phases["scope_count"], 1)
 
     async def test_cursor_gap_fails_closed_without_advancing_projection(self):
         projection = PolymarketLiveProjection(replay_capacity=10)

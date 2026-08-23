@@ -118,6 +118,33 @@ class SettingsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "loopback"):
                 replace(settings, clickhouse_host="example.com").validate_preflight()
 
+    def test_polymarket_freshness_budget_is_explicit_and_validated(self):
+        with tempfile.TemporaryDirectory(suffix="-test") as folder:
+            root = Path(folder)
+            env = {
+                "MARKETCOW_PROFILE": "test", "MARKETCOW_HOME": str(root),
+                "MARKETCOW_ALLOWED_ROOT": str(root.parent),
+                "MARKETCOW_POSTGRES_DSN":
+                    "postgresql://user:password@127.0.0.1/marketcow_test",
+                "MARKETCOW_CLICKHOUSE_PASSWORD": "secret",
+                "MARKETCOW_POLYMARKET_CONSUMER_MAXIMUM_BOOK_AGE_SECONDS": "4.5",
+                "MARKETCOW_POLYMARKET_MINIMUM_DELIVERY_HEADROOM_SECONDS": "0.75",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                settings = Settings.from_env()
+            settings.validate_preflight()
+            self.assertEqual(
+                settings.polymarket_consumer_maximum_book_age_seconds, 4.5,
+            )
+            self.assertEqual(
+                settings.polymarket_minimum_delivery_headroom_seconds, 0.75,
+            )
+            with self.assertRaisesRegex(ValueError, "delivery headroom"):
+                replace(
+                    settings,
+                    polymarket_minimum_delivery_headroom_seconds=4.5,
+                ).validate_preflight()
+
     def test_public_read_configuration_loads_and_fails_closed(self):
         with tempfile.TemporaryDirectory(suffix="-test") as folder:
             root = Path(folder)

@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Callable, NoReturn, TypeVar
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from starlette.responses import FileResponse, Response
 
 from .polymarket_live import (
@@ -18,6 +19,7 @@ from .polymarket_live import (
     LiveBootstrapResponse,
     LiveCheckpoint,
     LiveEventPage,
+    LiveFullSyncResponse,
     LiveGapPage,
     LiveReadHealth,
     LiveSnapshotPage,
@@ -29,6 +31,7 @@ from .polymarket_live_stream import (
     PolymarketLiveProjection,
     PolymarketLiveStreamClient,
 )
+from .polymarket_events_observability import PolymarketReadTraceMiddleware
 
 T = TypeVar("T")
 
@@ -42,6 +45,8 @@ def create_polymarket_live_read_app(
     executor_workers: int,
     live_stream_uri: str = "",
     live_stream_replay_capacity: int = 10_000,
+    consumer_maximum_book_age_seconds: float | None = None,
+    minimum_delivery_headroom_seconds: float = 0.0,
 ) -> FastAPI:
     if not root.is_absolute():
         raise ValueError("Polymarket live read root must be absolute")
@@ -61,6 +66,12 @@ def create_polymarket_live_read_app(
         ),
         stable_read_wait_seconds=stable_read_wait_seconds,
         stable_read_poll_seconds=stable_read_poll_seconds,
+        consumer_maximum_book_age_seconds=(
+            consumer_maximum_book_age_seconds
+            if consumer_maximum_book_age_seconds is not None
+            else stable_snapshot_max_book_age_seconds
+        ),
+        minimum_delivery_headroom_seconds=minimum_delivery_headroom_seconds,
     )
     executor = ThreadPoolExecutor(
         max_workers=executor_workers,
@@ -114,6 +125,7 @@ def create_polymarket_live_read_app(
         title="MarketCow Polymarket Live Read API",
         lifespan=lifespan,
     )
+    app.add_middleware(PolymarketReadTraceMiddleware)
     app.state.polymarket_live_read = reader
     app.state.polymarket_live_read_executor = executor
     app.state.polymarket_live_projection = projection
@@ -128,18 +140,45 @@ def create_polymarket_live_read_app(
             partial(action, *args, **kwargs),
         )
 
+    async def run_hot_json(
+        action: Callable[..., T], scope: list[str], trace: dict[str, object],
+    ) -> tuple[T, dict[str, float]]:
+        submitted = time.perf_counter()
+        phases: dict[str, float] = {}
+
+        def execute() -> T:
+            phases["executor_queue_ms"] = (
+                time.perf_counter() - submitted
+            ) * 1000
+            return action(reader, scope, _phase_ms=phases)
+
+        try:
+            result = await run_read(execute)
+        finally:
+            trace.update(phases)
+        return result, phases
+
     @app.get(
         "/v1/prediction-markets/polymarket/live/bootstrap",
         response_model=LiveBootstrapResponse,
     )
-    async def bootstrap(market_id: list[str] | None = Query(default=None)):
+    async def bootstrap(
+        request: Request, market_id: list[str] | None = Query(default=None),
+    ):
         try:
             scope = _require_scope(market_id)
             if stream_client is not None:
-                body = await run_read(projection.bootstrap_json, reader, scope)
+                body, phases = await run_hot_json(
+                    projection.bootstrap_json, scope,
+                    request.scope["polymarket_read_trace"],
+                )
             else:
                 body = await run_read(reader.bootstrap_json, scope)
-            return Response(content=body, media_type="application/json")
+                phases = {"response_body_bytes": float(len(body))}
+            return Response(
+                content=body, media_type="application/json",
+                headers={"Server-Timing": _server_timing(phases)},
+            )
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
 
@@ -147,14 +186,49 @@ def create_polymarket_live_read_app(
         "/v1/prediction-markets/polymarket/live/snapshot",
         response_model=LiveSnapshotPage,
     )
-    async def snapshot(market_id: list[str] | None = Query(default=None)):
+    async def snapshot(
+        request: Request, market_id: list[str] | None = Query(default=None),
+    ):
         try:
             scope = _require_scope(market_id)
             if stream_client is not None:
-                body = await run_read(projection.snapshot_json, reader, scope)
+                body, phases = await run_hot_json(
+                    projection.snapshot_json, scope,
+                    request.scope["polymarket_read_trace"],
+                )
             else:
                 body = await run_read(reader.snapshot_json, scope)
-            return Response(content=body, media_type="application/json")
+                phases = {"response_body_bytes": float(len(body))}
+            return Response(
+                content=body, media_type="application/json",
+                headers={"Server-Timing": _server_timing(phases)},
+            )
+        except PolymarketLiveReadError as exc:
+            _raise_read_error(exc)
+
+    @app.get(
+        "/v1/prediction-markets/polymarket/live/full-sync",
+        response_model=LiveFullSyncResponse,
+    )
+    async def full_sync(
+        request: Request, market_id: list[str] | None = Query(default=None),
+    ):
+        try:
+            if stream_client is None:
+                raise PolymarketLiveReadError(
+                    "polymarket_live_stream_not_configured",
+                    "Atomic full-sync requires the in-memory live projection",
+                    503,
+                )
+            result, phases = await run_hot_json(
+                projection.full_sync_json, _require_scope(market_id),
+                request.scope["polymarket_read_trace"],
+            )
+            body = result[0] if isinstance(result, tuple) else result
+            return Response(
+                content=body, media_type="application/json",
+                headers={"Server-Timing": _server_timing(phases)},
+            )
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
 
@@ -215,14 +289,21 @@ def create_polymarket_live_read_app(
         "/v1/prediction-markets/polymarket/live/health",
         response_model=LiveReadHealth,
     )
-    async def health():
+    async def health(
+        request: Request, market_id: list[str] | None = Query(default=None),
+    ):
         try:
             if stream_client is not None:
-                health = projection.health(reader)
+                body, phases = await run_hot_json(
+                    projection.health_json,
+                    market_id or projection.market_ids(),
+                    request.scope["polymarket_read_trace"],
+                )
                 return Response(
-                    content=health.model_dump_json(),
+                    content=body,
                     media_type="application/json",
-                    status_code=200 if health.latest_state_ready else 503,
+                    status_code=200,
+                    headers={"Server-Timing": _server_timing(phases)},
                 )
             return await run_read(reader.health)
         except PolymarketLiveReadError as exc:
@@ -329,14 +410,29 @@ def _require_scope(market_id: list[str] | None) -> list[str]:
 def _raise_read_error(exc: PolymarketLiveReadError) -> NoReturn:
     headers = (
         {"Retry-After": "1"}
-        if exc.code == "polymarket_state_index_lagging"
+        if exc.code in {
+            "polymarket_state_index_lagging",
+            "polymarket_snapshot_freshness_budget_exhausted",
+        }
         else None
     )
     raise HTTPException(
         status_code=exc.status_code,
-        detail={"code": exc.code, "message": str(exc)},
+        detail={
+            "code": exc.code,
+            "message": str(exc),
+            "retryable": exc.status_code == 503,
+        },
         headers=headers,
     ) from exc
+
+
+def _server_timing(phases: dict[str, float]) -> str:
+    return ", ".join(
+        f'{name.removesuffix("_ms")};dur={float(value):.3f}'
+        for name, value in phases.items()
+        if name.endswith("_ms")
+    )
 
 
 def _read_public_data(root: Path, kind: str) -> dict[str, object]:

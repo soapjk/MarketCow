@@ -16,6 +16,12 @@ from urllib.parse import parse_qs
 # Uvicorn's logging configuration.
 LOGGER = logging.getLogger("uvicorn.error")
 EVENTS_PATH = "/v1/prediction-markets/polymarket/live/events"
+READ_PATHS = frozenset({
+    "/v1/prediction-markets/polymarket/live/health",
+    "/v1/prediction-markets/polymarket/live/bootstrap",
+    "/v1/prediction-markets/polymarket/live/snapshot",
+    "/v1/prediction-markets/polymarket/live/full-sync",
+})
 PHASES = (
     "executor_queue",
     "scope_bootstrap",
@@ -187,6 +193,57 @@ class PolymarketEventsTraceMiddleware:
             self.metrics.observe(trace)
             LOGGER.info(
                 "polymarket_events_request %s",
+                json.dumps(trace, sort_keys=True, separators=(",", ":")),
+            )
+
+
+class PolymarketReadTraceMiddleware:
+    """Record scoped hot-read phases and ASGI transport backpressure."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("path") not in READ_PATHS:
+            await self.app(scope, receive, send)
+            return
+        started = time.perf_counter()
+        query = parse_qs(
+            bytes(scope.get("query_string", b"")).decode("utf-8", "replace"),
+            keep_blank_values=True,
+        )
+        trace: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "path": scope["path"],
+            "scope_count": len(query.get("market_id", [])),
+            "status": 500,
+            "response_body_bytes": 0,
+        }
+        scope["polymarket_read_trace"] = trace
+        write_seconds = 0.0
+        wire_bytes = 0
+
+        async def capture(message: dict[str, Any]) -> None:
+            nonlocal wire_bytes, write_seconds
+            if message["type"] == "http.response.start":
+                trace["status"] = int(message["status"])
+            elif message["type"] == "http.response.body":
+                wire_bytes += len(message.get("body", b""))
+            write_started = time.perf_counter()
+            await send(message)
+            write_seconds += time.perf_counter() - write_started
+
+        try:
+            await self.app(scope, receive, capture)
+        except BaseException as exc:
+            trace.setdefault("error_code", type(exc).__name__)
+            raise
+        finally:
+            trace["response_body_bytes"] = wire_bytes
+            trace["asgi_response_write_ms"] = write_seconds * 1000
+            trace["total_ms"] = (time.perf_counter() - started) * 1000
+            LOGGER.info(
+                "polymarket_scoped_read %s",
                 json.dumps(trace, sort_keys=True, separators=(",", ":")),
             )
 

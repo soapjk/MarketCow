@@ -1,0 +1,1220 @@
+{
+  "client_timeout_counts": {
+    "bootstrap": 0,
+    "events": 0,
+    "full_sync": 0,
+    "health": 0,
+    "rejected_candidate_probe": 0,
+    "snapshot": 0
+  },
+  "config": {
+    "base_url": "http://127.0.0.1:8795",
+    "config_path": "/Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332/artifacts/polymarket-full-sync-acceptance-20260823/unified-shadow.yaml",
+    "config_sha256": "e70e56032660ec9cdba5f7c3577bc5e5cbb37996508db496e4272c52bb753fec",
+    "configured_base_url": "http://127.0.0.1:8790",
+    "configured_duration_seconds": 3600.0,
+    "event_limit": 1000,
+    "market_ids": [
+      "2118801",
+      "2118802",
+      "2118805",
+      "2244712",
+      "2244713",
+      "2244714",
+      "2661522",
+      "2661523",
+      "2661524",
+      "2784676",
+      "2784678",
+      "2784681",
+      "2821918",
+      "2821919",
+      "2821920",
+      "2865875",
+      "2865876",
+      "2865877",
+      "3026124",
+      "3026125",
+      "3026126",
+      "3073397",
+      "3073398",
+      "3073399",
+      "3141922",
+      "3141923",
+      "3141924",
+      "3212408",
+      "3212409",
+      "3212410",
+      "3212454",
+      "3212455",
+      "3212456",
+      "3471397",
+      "3471401",
+      "3471405",
+      "3522210",
+      "3522213",
+      "3522216",
+      "3471469",
+      "3471470",
+      "3471471",
+      "3471487",
+      "3471495",
+      "3471500",
+      "3474251",
+      "3474252",
+      "3474256",
+      "3474257",
+      "3474261",
+      "3474262",
+      "3474281",
+      "3474282",
+      "3474284",
+      "3474285",
+      "3474286",
+      "3474288",
+      "3474300",
+      "3474304",
+      "3474305",
+      "3474309",
+      "3474310",
+      "3474314",
+      "3476543",
+      "3476544",
+      "3476546",
+      "3476557",
+      "3476558",
+      "3476559",
+      "3478615",
+      "3478616",
+      "3478617",
+      "3479078",
+      "3479079",
+      "3479080",
+      "3502235",
+      "3502245",
+      "3502251",
+      "3502254",
+      "3502255",
+      "3502256",
+      "3505968",
+      "3505978",
+      "3505990",
+      "3507994",
+      "3507996",
+      "3507999",
+      "3535881",
+      "3535882",
+      "3535883",
+      "634891",
+      "634892",
+      "634893",
+      "665374",
+      "907436",
+      "907437",
+      "907438",
+      "950852",
+      "950853",
+      "950854"
+    ],
+    "maximum_book_age_seconds": 5.0,
+    "maximum_consecutive_unavailable_seconds": 30.0,
+    "mode": "shadow",
+    "poll_interval_seconds": 0.5,
+    "real_order_submission_enabled": false,
+    "timeout_seconds": 10.0
+  },
+  "criteria": {
+    "all_routes_healthy": true,
+    "books_complete_and_fresh": true,
+    "cursor_and_integrity_complete": true,
+    "duration_at_least_one_hour": true,
+    "events_client_timeouts_zero": true,
+    "events_no_30_second_unavailability": true,
+    "events_p99_at_most_3_seconds": true,
+    "persistence_queue_and_lag_bounded": true,
+    "processes_survived": true,
+    "realtime_sqlite_queries_zero": true,
+    "server_timing_complete": true,
+    "shadow_and_orders_disabled": true,
+    "unresolved_gaps_zero": true,
+    "websocket_disconnects_zero": true
+  },
+  "disconnected_health_samples": 0,
+  "duration_seconds": 3600.3196161250817,
+  "environment": {
+    "api_alive_at_finish": true,
+    "api_pid": 78043,
+    "base_url": "http://127.0.0.1:8795",
+    "collector_alive_at_finish": true,
+    "collector_pid": 99524,
+    "git_commit": "d141ec7797d8d616cce42ef19c26584ce3d43197",
+    "host": "androidjkdeMac-mini.local",
+    "platform": "macOS-26.6-arm64-arm-64bit",
+    "python": "3.11.14 (main, Dec  9 2025, 19:11:45) [Clang 21.1.4 ]"
+  },
+  "errors": [
+    {
+      "at": "2026-08-23T04:54:57.451910+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:55:30.868462+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:55:56.982569+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:56:18.646083+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:56:36.029845+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:56:49.443206+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:58:10.155053+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:58:10.158325+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:58:10.162892+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:58:10.164990+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:58:42.791923+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:59:31.230722+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T04:59:50.350337+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:00:02.639072+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:00:20.486264+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:00:20.486366+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:00:20.491626+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:00:20.491744+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:00:40.058280+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:00:47.441458+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:00:48.793626+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:01:21.103055+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:01:40.303836+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:02:24.474276+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:03:04.574900+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:03:21.641203+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:28.384812+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:53.207847+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:53.212059+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:53.214886+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:53.240810+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:54.577374+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:54.579106+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:54.580717+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:54.582566+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:04:54.582663+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:05:04.111758+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:05:41.611777+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:06:10.280821+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:07:40.942324+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:07:50.755947+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:08:13.802765+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:08:42.805810+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:08:54.910228+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:09:37.911996+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:09:42.719674+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:11:23.256761+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:12:19.616258+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:12:43.084529+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:13:45.855200+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:15:05.844313+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:16:00.577545+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:16:15.995215+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:16:36.534254+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:16:39.055715+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:19:51.292618+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:20:02.311696+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:20:50.506706+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:21:09.990034+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:21:27.023264+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:22:04.057418+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:22:06.340841+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:22:18.524578+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:22:30.761626+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:23:03.420588+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:23:17.810240+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:25:19.781194+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:25:30.673909+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:25:57.657132+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:29:53.472685+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:30:47.444189+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:30:53.383796+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:31:18.459314+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:33:27.533329+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:33:45.427409+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:34:11.629398+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:35:32.186900+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:35:44.516166+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:37:18.143392+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:37:27.763860+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:37:41.514706+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:37:43.763003+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:37:53.737713+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:39:35.204133+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:40:06.781508+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:40:18.673924+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:40:50.621878+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:41:15.090873+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:41:53.885500+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:19.494925+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:19.496857+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:19.498526+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:19.500454+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:20.712810+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:20.714629+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "rejected_candidate_probe",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:20.714737+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:20.716938+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "full_sync",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:20.718844+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:21.787693+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-23T05:42:21.789506+00:00",
+      "detail": {
+        "code": "polymarket_snapshot_freshness_budget_exhausted",
+        "message": "The scoped in-memory snapshot cannot retain the required delivery headroom",
+        "retryable": true
+      },
+      "route": "snapshot",
+      "status": 503
+    }
+  ],
+  "events": {
+    "after_cursor_start": 19183238,
+    "client_timeout_count": 0,
+    "cursor_gap_count": 0,
+    "duplicate_event_count": 0,
+    "latency_seconds": {
+      "max": 0.9555056659737602,
+      "p50": 0.016826790990307927,
+      "p95": 0.14281262492295355,
+      "p99": 0.21988124994095415
+    },
+    "maximum_unavailable_seconds": 0.0,
+    "next_cursor_finish": 19456226,
+    "sample_count": 5950
+  },
+  "fail_closed_frame_count": 0,
+  "finished_at": "2026-08-23T05:54:40.807435+00:00",
+  "integrity_failure_count": 0,
+  "live_stream_disconnect_count_delta": 0,
+  "maximum_book_age_seconds": 4.68554,
+  "maximum_persistence_lag_events": 2197,
+  "maximum_persistence_queue_depth": 4293,
+  "maximum_unresolved_gap_count": 0,
+  "passed": true,
+  "read_sources": [
+    "memory_projection"
+  ],
+  "realtime_sqlite_query_ms_max": 0.0,
+  "response_body_bytes_maximum": {
+    "bootstrap": 1054428,
+    "events": 1048892,
+    "full_sync": 2042241,
+    "health": 1882,
+    "rejected_candidate_probe": 64576,
+    "snapshot": 984441
+  },
+  "route_failure_counts": {
+    "bootstrap": 11,
+    "events": 0,
+    "full_sync": 99,
+    "health": 9,
+    "rejected_candidate_probe": 12,
+    "snapshot": 9
+  },
+  "route_maximum_unavailable_seconds": {
+    "bootstrap": 3.4660217920318246,
+    "events": 0.0,
+    "full_sync": 3.475852750008926,
+    "health": 3.467282040975988,
+    "rejected_candidate_probe": 1.373643207945861,
+    "snapshot": 3.4611648749560118
+  },
+  "route_sample_counts": {
+    "bootstrap": 2977,
+    "events": 5950,
+    "full_sync": 2977,
+    "health": 2977,
+    "rejected_candidate_probe": 2977,
+    "snapshot": 2978
+  },
+  "schema_version": "marketcow.polymarket.shared-events-soak.v1",
+  "server_timing_failure_count": 0,
+  "started_at": "2026-08-23T04:54:40.451617+00:00"
+}
