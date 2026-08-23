@@ -17,6 +17,33 @@ from marketcow.polymarket_live import (
 from marketcow.polymarket_live_stream import PolymarketLiveStreamServer
 
 
+LOGGER = logging.getLogger(__name__)
+
+
+async def bootstrap_books_until_ready(
+    collector: PolymarketLiveCollector,
+    *,
+    retry_seconds: float = 1.0,
+) -> str:
+    """Keep the in-memory service alive across incomplete provider snapshots."""
+    attempts = 0
+    while True:
+        try:
+            return await collector.bootstrap_books(
+                "startup" if attempts == 0 else f"startup_retry:{attempts}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            attempts += 1
+            LOGGER.warning(
+                "polymarket_bootstrap_retry attempt=%d retry_seconds=%.3f "
+                "error=%s detail=%s",
+                attempts, retry_seconds, type(exc).__name__, str(exc)[:500],
+            )
+            await asyncio.sleep(retry_seconds)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Capture free official Polymarket full-market live data locally"
@@ -109,7 +136,7 @@ def main() -> None:
             )
             await stream.start()
             try:
-                await collector.bootstrap_books()
+                await bootstrap_books_until_ready(collector)
                 print(store.health().model_dump(mode="json"))
                 if not arguments.bootstrap_only:
                     await collector.run()
