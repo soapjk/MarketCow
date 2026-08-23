@@ -1223,7 +1223,7 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(health.book_token_count, 0)
         self.assertEqual(health.missing_book_token_count, 4)
         self.assertEqual(health.ready_market_count, 0)
-        self.assertIsNotNone(store.active_recovery_id)
+        self.assertIsNone(store.active_recovery_id)
         self.assertEqual(store.frame("m1", now=NOW).status, "fail_closed")
         self.assertEqual(store.frame("m2", now=NOW).status, "fail_closed")
 
@@ -1251,7 +1251,7 @@ class PolymarketLiveTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
             asyncio.run(collector.bootstrap_books())
         self.assertEqual(store.books, {})
-        self.assertIsNotNone(store.active_recovery_id)
+        self.assertIsNone(store.active_recovery_id)
 
         collector.books_client = ClobBooksClient(
             requester=lambda *_args, **_kwargs: Response([
