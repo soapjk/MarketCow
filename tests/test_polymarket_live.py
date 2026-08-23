@@ -3296,7 +3296,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
             self.assertEqual(store.frame("m1", now=current[0]).status, "ready")
 
-    def test_periodic_empty_book_retains_previous_stable_boundary(self):
+    def test_periodic_empty_book_replaces_stale_liquidity(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
             current = [NOW]
@@ -3327,11 +3327,11 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             )
             current[0] = NOW + timedelta(seconds=2)
 
-            with self.assertRaisesRegex(RuntimeError, "empty-sided"):
-                asyncio.run(collector.refresh_books())
+            asyncio.run(collector.refresh_books())
 
-            self.assertEqual(store.cursor, cursor)
-            self.assertEqual(store.books["yes-1"].received_at, NOW)
+            self.assertGreater(store.cursor, cursor)
+            self.assertEqual(store.books["yes-1"].received_at, current[0])
+            self.assertEqual(store.books["yes-1"].asks, [])
             self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
 
     def test_failed_refresh_restores_memory_and_next_cursor_is_contiguous(self):

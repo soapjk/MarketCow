@@ -6746,19 +6746,6 @@ class PolymarketLiveCollector:
         )
         return result
 
-    @staticmethod
-    def _require_usable_book_rows(rows: list[dict[str, Any]]) -> None:
-        unusable = sorted(
-            str(row.get("asset_id") or row.get("token_id") or "")
-            for row in rows
-            if not row.get("bids") or not row.get("asks")
-        )
-        if unusable:
-            raise RuntimeError(
-                "CLOB /books returned empty-sided books; stable boundary retained: "
-                + ",".join(unusable)
-            )
-
     async def bootstrap_books(self, reason: str = "startup") -> str:
         token_ids = sorted(self.store.token_to_market)
         if len(token_ids) <= self.books_client.batch_size:
@@ -6771,7 +6758,6 @@ class PolymarketLiveCollector:
                 token_ids,
                 require_complete_batches=True,
             )
-            self._require_usable_book_rows(rows)
             with self.store._sync_lock:
                 recovery_started_at = self.store.now_provider()
                 recovery_id = self.store.mark_recovery_started(reason)
@@ -6896,7 +6882,6 @@ class PolymarketLiveCollector:
                     refresh_token_ids,
                     require_complete_batches=True,
                 )
-                self._require_usable_book_rows(rows)
                 self._commit_recovery_rows(
                     rows,
                     recovery_id,
