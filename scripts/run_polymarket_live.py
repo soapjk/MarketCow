@@ -14,6 +14,7 @@ from marketcow.polymarket_live import (
     live_collector_lease,
     load_scoped_live_store,
 )
+from marketcow.polymarket_live_stream import PolymarketLiveStreamServer
 
 
 def main() -> None:
@@ -46,6 +47,9 @@ def main() -> None:
             "bounded scopes that require freshness during quiet markets."
         ),
     )
+    parser.add_argument("--live-stream-host", default="127.0.0.1")
+    parser.add_argument("--live-stream-port", type=int, default=8794)
+    parser.add_argument("--live-stream-replay-capacity", type=int, default=10_000)
     arguments = parser.parse_args()
 
     logging.basicConfig(
@@ -95,10 +99,25 @@ def main() -> None:
             print(evidence)
         if arguments.catalog_only:
             return
-        asyncio.run(collector.bootstrap_books())
-        print(store.health().model_dump(mode="json"))
-        if not arguments.bootstrap_only:
-            asyncio.run(collector.run())
+        async def run() -> None:
+            store.enable_async_persistence()
+            stream = PolymarketLiveStreamServer(
+                store,
+                host=arguments.live_stream_host,
+                port=arguments.live_stream_port,
+                replay_capacity=arguments.live_stream_replay_capacity,
+            )
+            await stream.start()
+            try:
+                await collector.bootstrap_books()
+                print(store.health().model_dump(mode="json"))
+                if not arguments.bootstrap_only:
+                    await collector.run()
+            finally:
+                await stream.close()
+                await asyncio.to_thread(store.close_async_persistence)
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

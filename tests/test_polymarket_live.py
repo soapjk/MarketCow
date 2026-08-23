@@ -1223,6 +1223,90 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(store.frame("m1", now=NOW).status, "ready")
         self.assertEqual(store.frame("m2", now=NOW).status, "ready")
 
+    def test_reconnect_recovery_confirms_unchanged_books_without_reemitting(self):
+        with TemporaryDirectory() as folder:
+            current = [NOW]
+            rows = [gamma_row()]
+            store = LiveStateStore(
+                Path(folder), now_provider=lambda: current[0],
+            )
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            books = ClobBooksClient(
+                requester=lambda *_args, **_kwargs: Response([
+                    snapshot("yes-1", "0.40", "0.42"),
+                    snapshot("no-1", "0.58", "0.60"),
+                ])
+            )
+            collector = PolymarketLiveCollector(
+                store,
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                books,
+                publish_checkpoints=False,
+            )
+            asyncio.run(collector.bootstrap_books("startup"))
+            cursor_before_reconnect = store.cursor
+            current[0] = NOW + timedelta(seconds=2)
+
+            asyncio.run(collector.bootstrap_books("websocket_reconnect:2"))
+
+            new_events = [
+                event for event in store.events
+                if event.cursor > cursor_before_reconnect
+            ]
+            self.assertEqual(
+                [event.event_type for event in new_events],
+                ["recovery_started", "recovery_completed"],
+            )
+            self.assertTrue(all(
+                book.received_at == current[0] for book in store.books.values()
+            ))
+
+    def test_rest_refresh_does_not_overwrite_newer_websocket_generation(self):
+        with TemporaryDirectory() as folder:
+            rows = [gamma_row()]
+            store = LiveStateStore(Path(folder), now_provider=lambda: NOW)
+            store.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+            store.apply_snapshot(
+                snapshot("yes-1", "0.40", "0.42"), received_at=NOW,
+            )
+            store.apply_snapshot(
+                snapshot("no-1", "0.58", "0.60"), received_at=NOW,
+            )
+            refresh_started = NOW + timedelta(seconds=1)
+            websocket_received = NOW + timedelta(seconds=2)
+            store.apply_websocket({
+                "event_type": "price_change",
+                "timestamp": "1785739202000",
+                "price_changes": [{
+                    "asset_id": "yes-1", "side": "BUY",
+                    "price": "0.40", "size": "12",
+                }],
+            }, received_at=websocket_received)
+            websocket_book = store.books["yes-1"].model_copy(deep=True)
+            cursor_after_websocket = store.cursor
+            tracker = store.new_book_recovery_tracker()
+
+            store.recover_book_batch(
+                [
+                    snapshot("yes-1", "0.40", "0.42"),
+                    snapshot("no-1", "0.58", "0.60"),
+                ],
+                "periodic-refresh",
+                tracker,
+                refresh_started_at=refresh_started,
+                received_at=NOW + timedelta(seconds=3),
+            )
+            coverage = store.complete_book_recovery(
+                "periodic-refresh", tracker,
+                write_checkpoint=False, publish_completion_event=False,
+            )
+
+            self.assertEqual(store.books["yes-1"], websocket_book)
+            self.assertEqual(store.books["no-1"].received_at, NOW + timedelta(seconds=3))
+            self.assertEqual(store.cursor, cursor_after_websocket)
+            self.assertEqual(coverage["superseded_token_count"], 1)
+            self.assertEqual(tracker["superseded"], {"yes-1"})
+
     def test_empty_rest_last_trade_price_is_normalized_as_unavailable(self):
         store = self.store()
         without_trade = snapshot("yes-1", "0.40", "0.42")
@@ -2670,7 +2754,7 @@ class PolymarketLiveTest(unittest.TestCase):
 
         def delayed_dump(page, *args, **kwargs):
             payload = original_dump(page, *args, **kwargs)
-            current[0] = NOW + timedelta(seconds=3.51)
+            current[0] = NOW + timedelta(seconds=4.91)
             return payload
 
         with patch.object(
@@ -3447,8 +3531,59 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 recovery_attempts,
                 ["websocket_reconnect:2", "websocket_reconnect:3"],
             )
-            self.assertIn(
-                "websocket_reconnect_recovery_failed", captured.output[0]
+            self.assertTrue(any(
+                "websocket_reconnect_recovery_failed" in line
+                for line in captured.output
+            ))
+            self.assertTrue(any(
+                "websocket_disconnected attempt=1" in line
+                for line in captured.output
+            ))
+
+    def test_reconnect_recovery_waits_for_periodic_snapshot_operation(self):
+        with TemporaryDirectory() as folder:
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(
+                    requester=lambda *_args, **_kwargs: Response({"markets": []})
+                ),
+                ClobBooksClient(
+                    requester=lambda *_args, **_kwargs: Response([])
+                ),
+                snapshot_refresh_seconds=0.1,
+                reconnect_seconds=0.15,
+            )
+            timeline = []
+            connection_attempts = 0
+
+            async def refresh(*_args, **_kwargs):
+                timeline.append("refresh_start")
+                await asyncio.sleep(0.1)
+                timeline.append("refresh_end")
+                return "refresh"
+
+            async def run_once():
+                nonlocal connection_attempts
+                connection_attempts += 1
+                if connection_attempts == 1:
+                    raise ConnectionError("simulated websocket disconnect")
+
+            async def bootstrap(_reason="startup"):
+                timeline.append("recovery_start")
+                return "recovery"
+
+            collector.refresh_books = refresh
+            collector.run_once = run_once
+            collector.bootstrap_books = bootstrap
+
+            with self.assertLogs(
+                "marketcow.polymarket_live", level="ERROR"
+            ):
+                asyncio.run(collector.run(max_connections=2))
+
+            self.assertEqual(
+                timeline[:3],
+                ["refresh_start", "refresh_end", "recovery_start"],
             )
 
     def test_websocket_publication_does_not_starve_periodic_refresh(self):
@@ -3694,6 +3829,48 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             asyncio.run(collector._consume(["yes-1"], message_limit=5))
 
             self.assertIn("PING", socket.sent)
+
+    def test_public_websocket_array_is_split_into_bounded_durable_batches(self):
+        with TemporaryDirectory() as folder:
+            socket = FakeSocket([json.dumps([
+                {"event_type": "test", "index": index} for index in range(5)
+            ])])
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+                connector=lambda _url: SocketContext(socket),
+                websocket_flush_seconds=0,
+                max_websocket_batch_items=2,
+            )
+            batches = []
+            collector._apply_websocket_batch = lambda items: batches.append(items)
+
+            asyncio.run(collector._consume(["yes-1"], message_limit=5))
+
+            self.assertEqual([len(batch) for batch in batches], [2, 2, 1])
+            self.assertEqual(
+                [item["index"] for batch in batches for item in batch],
+                [str(index) for index in range(5)],
+            )
+
+    def test_default_websocket_keeps_liveness_with_load_tolerant_timeout(self):
+        with TemporaryDirectory() as folder:
+            socket = FakeSocket([])
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+                ClobBooksClient(requester=lambda *_args, **_kwargs: None),
+            )
+            with patch.object(
+                polymarket_live_module.websockets,
+                "connect",
+                return_value=SocketContext(socket),
+            ) as connect:
+                asyncio.run(collector._consume(["yes-1"], message_limit=0))
+
+            self.assertEqual(connect.call_args.kwargs["ping_interval"], 20)
+            self.assertEqual(connect.call_args.kwargs["ping_timeout"], 60)
 
 
 if __name__ == "__main__":

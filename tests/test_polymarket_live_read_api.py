@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -26,6 +26,7 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
         self.temporary = TemporaryDirectory()
         self.root = Path(self.temporary.name) / "live"
         writer = LiveStateStore(self.root, now_provider=lambda: NOW)
+        self.writer = writer
         rows = [gamma_row()]
         writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
         writer.apply_snapshot(
@@ -125,6 +126,52 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
         self.assertLess(elapsed, 1)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].status_code, 200)
+
+    def test_stream_health_returns_503_when_projected_books_are_stale(self):
+        app = create_polymarket_live_read_app(
+            root=self.root,
+            stable_snapshot_max_book_age_seconds=3.5,
+            stable_read_wait_seconds=6,
+            stable_read_poll_seconds=0.025,
+            executor_workers=4,
+            live_stream_uri="ws://127.0.0.1:1",
+        )
+        reader = app.state.polymarket_live_read
+        reader.now_provider = lambda: NOW + timedelta(seconds=4)
+        projection = app.state.polymarket_live_projection
+        projection.install_state({
+            "schema_version": "marketcow.polymarket.live-stream.v1",
+            "type": "state",
+            "catalog_revision": self.writer.catalog_revision,
+            "catalog_source": self.writer.catalog_source,
+            "latest_cursor": self.writer.cursor,
+            "persisted_cursor": self.writer.cursor,
+            "active_recovery_id": None,
+            "markets": [
+                market.model_dump(mode="json")
+                for market in self.writer.catalog.values()
+            ],
+            "books": [
+                book.model_dump(mode="json")
+                for book in self.writer.books.values()
+            ],
+            "gaps": [],
+        })
+        projection.mark_ready({"latest_cursor": self.writer.cursor})
+
+        client = TestClient(app)
+        response = client.get(
+            "/v1/prediction-markets/polymarket/live/health"
+        )
+        app.state.polymarket_live_read_executor.shutdown(
+            wait=True, cancel_futures=True
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["detail"]["code"],
+            "polymarket_state_index_lagging",
+        )
 
 
 if __name__ == "__main__":

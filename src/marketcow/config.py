@@ -74,6 +74,8 @@ class Settings:
     realtime_queue_capacity: int = 256
     realtime_replay_capacity: int = 4096
     realtime_heartbeat_seconds: float = 15.0
+    polymarket_live_stream_uri: str = ""
+    polymarket_live_stream_replay_capacity: int = 10_000
     sec_user_agent: str = "MarketCow toczx@outlook.com"
     dividend_cache_ttl_seconds: int = 21600
     dividend_empty_cache_ttl_seconds: int = 900
@@ -224,6 +226,13 @@ class Settings:
             )),
             realtime_heartbeat_seconds=float(os.getenv(
                 "MARKETCOW_REALTIME_HEARTBEAT_SECONDS", "15"
+            )),
+            polymarket_live_stream_uri=os.getenv(
+                "MARKETCOW_POLYMARKET_LIVE_STREAM_URI",
+                "ws://127.0.0.1:8794" if profile == "production" else "",
+            ).strip(),
+            polymarket_live_stream_replay_capacity=int(os.getenv(
+                "MARKETCOW_POLYMARKET_LIVE_STREAM_REPLAY_CAPACITY", "10000"
             )),
             sec_user_agent=os.getenv(
                 "MARKETCOW_SEC_USER_AGENT", "MarketCow toczx@outlook.com"
@@ -425,6 +434,18 @@ class Settings:
             raise ValueError("realtime replay capacity must be between 1 and 100000")
         if not 0.1 <= self.realtime_heartbeat_seconds <= 60:
             raise ValueError("realtime heartbeat must be between 0.1 and 60 seconds")
+        if not 1 <= self.polymarket_live_stream_replay_capacity <= 100000:
+            raise ValueError(
+                "Polymarket live stream replay capacity must be between 1 and 100000"
+            )
+        if self.polymarket_live_stream_uri:
+            parsed_stream = urlsplit(self.polymarket_live_stream_uri)
+            if (
+                parsed_stream.scheme not in {"ws", "wss"}
+                or not parsed_stream.hostname
+                or not self._loopback(parsed_stream.hostname)
+            ):
+                raise ValueError("Polymarket live stream must use a loopback WebSocket URI")
         if self.public_read_enabled:
             from .public_access import JwtPolicy, PublicAccessConfig, parse_key_set
 

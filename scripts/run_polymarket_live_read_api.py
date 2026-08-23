@@ -29,6 +29,10 @@ def main() -> None:
     parser.add_argument("--stable-read-wait-seconds", required=True, type=float)
     parser.add_argument("--stable-read-poll-seconds", required=True, type=float)
     parser.add_argument("--executor-workers", required=True, type=int)
+    parser.add_argument(
+        "--live-stream-uri", default="ws://127.0.0.1:8794"
+    )
+    parser.add_argument("--live-stream-replay-capacity", type=int, default=10_000)
     arguments = parser.parse_args()
     if not arguments.root.is_absolute():
         parser.error("--root must be absolute")
@@ -43,6 +47,8 @@ def main() -> None:
         stable_read_wait_seconds=arguments.stable_read_wait_seconds,
         stable_read_poll_seconds=arguments.stable_read_poll_seconds,
         executor_workers=arguments.executor_workers,
+        live_stream_uri=arguments.live_stream_uri,
+        live_stream_replay_capacity=arguments.live_stream_replay_capacity,
     )
     uvicorn.run(app, host=arguments.host, port=arguments.port)
 

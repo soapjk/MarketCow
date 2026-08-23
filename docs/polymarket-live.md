@@ -175,14 +175,17 @@ GET /v1/prediction-markets/polymarket/live/checkpoint?market_id=m1&market_id=m2
 GET /v1/prediction-markets/polymarket/live/health
 GET /v1/prediction-markets/polymarket/live/gaps?market_id=m1&unresolved_only=true
 GET /v1/prediction-markets/polymarket/live/public-data/{kind}
+WS  /v1/prediction-markets/polymarket/live/stream?market_id=m1&after_cursor=123
 ```
 
 Bootstrap requires 1–100 explicit `market_id` values and returns those canonical
 markets, typed instrument/fee facts, relations/pairs, catalog revision, active tokens,
 sequence semantics, and recovery contract. An unscoped request returns
 `polymarket_full_universe_disabled`; missing/legacy indexes return a machine-readable
-503 and index/row integrity failures return 409. Snapshot, events, checkpoint, and gaps
-use the durable latest-state/event-offset index and require the same 1–100 market scope.
+503 and index/row integrity failures return 409. The production snapshot and events hot
+path uses the process-local live projection and requires the same 1–100 market scope.
+Checkpoint, gaps, cold-start recovery, audit, and history remain durable-index
+responsibilities.
 They return `polymarket_latest_state_index_unavailable` before migration,
 `polymarket_state_index_lagging` when the event log is ahead, and
 `polymarket_state_integrity_failed` for an index/log/revision/hash disagreement. A
@@ -209,21 +212,31 @@ without loading the full catalog or replaying the log.
 
 ### Producer/consumer synchronization
 
-The collector is the single writer. The FastAPI process is an indexed read-side consumer;
-both must use the exact same local root:
+The collector owns the ordered real-time state. Each FastAPI process is a loopback
+WebSocket consumer with its own bounded in-memory replay ring and book projection. All
+processes also use the exact same local root for asynchronous durability and cold-start
+recovery:
 
 ```text
 <MarketCow storage_root>/prediction-markets/polymarket-live
 ```
 
-FastAPI construction and lightweight live health never deserialize the full catalog or
-replay the event log. Scoped bootstrap opens the immutable catalog index read-only and
-performs bounded offset reads. Snapshot/checkpoint/gaps use one SQLite read transaction;
-events seek only indexed byte ranges in the authoritative append-only log. The collector
-durably appends each event before updating the derived WAL index. A crash between those
-steps is visible as `polymarket_state_index_lagging`, never as a ready frame; explicit
-recovery deterministically rebuilds the index. Multiple concurrent collector writers
-are not supported.
+FastAPI construction never replays the multi-gigabyte event log. Scoped immutable
+instrument facts may be read from the catalog index, while health, snapshot, and events
+are served from the live projection. The collector assigns the canonical cursor, updates
+its memory state, and publishes to the loopback WebSocket queue before any filesystem or
+SQLite operation. One independent serial persistence worker batches JSONL fsync and WAL
+updates in cursor order. `published_cursor` may therefore lead `persisted_cursor` without
+delaying the real-time API.
+
+Slow WebSocket consumers have independent bounded queues and are disconnected rather
+than blocking global publication. A reconnect resumes from the in-memory replay ring.
+Cursor gaps, replay-window expiry, incomplete bootstrap, or projection disconnects are
+explicit fail-closed responses; MarketCow never fabricates an empty page or substitutes
+durable stale state. Persistence failure is logged and exposed separately so it cannot
+silently corrupt auditability or apply backpressure to the real-time path. On restart,
+the durable log and derived index remain the cold-start authority. Multiple concurrent
+collector writers are not supported.
 
 Every event ID covers the entire envelope, including applied/failure semantics and gap
 facts. Recovery separately recomputes canonical and raw payload hashes, enforces a

@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Literal, Optional
 from zoneinfo import ZoneInfo
@@ -94,6 +96,15 @@ from .polymarket_live import (
 from .dashboard_registry import load_dashboard_registry, registry_document
 from .admin_control import AdminAuditService
 from .http_metrics import RequestMetrics, RequestMetricsMiddleware
+from .polymarket_events_observability import (
+    PolymarketEventMetrics,
+    PolymarketEventsTraceMiddleware,
+    server_timing,
+)
+from .polymarket_live_stream import (
+    PolymarketLiveProjection,
+    PolymarketLiveStreamClient,
+)
 from .admin_events import ALLOWED_EVENT_TYPES, AdminEventHub, encode_sse
 from .admin_auth import (
     CSRF_COOKIE, SESSION_COOKIE, AdminAuth, AdminSecurityMiddleware,
@@ -590,15 +601,48 @@ def create_app(
     polymarket_live_read = PolymarketLiveReadStore(
         polymarket_live.root,
         # The strict live consumer evaluates at a five-second maximum age.
-        # Reserve at least 1.5 seconds of transport/projection headroom while
-        # allowing one ordinary two-second REST cadence to bridge a transient
-        # empty-sided upstream response. The consumer's five-second limit is
-        # unchanged and remains the final fail-closed boundary.
-        stable_snapshot_max_book_age_seconds=3.5,
+        # The 100-market collector can spend roughly four seconds between its
+        # common REST receive timestamp and the atomic 200-book publication.
+        # The optimized response path normally projects and writes in well
+        # directly from memory, and snapshot_json rechecks the exact serialized
+        # page at the response edge. Keep a measured 100ms loopback transport
+        # margin inside Tradude's unchanged five-second fail-closed boundary.
+        stable_snapshot_max_book_age_seconds=4.9,
     )
     app.state.polymarket_live_read = polymarket_live_read
+    polymarket_live_projection = PolymarketLiveProjection(
+        replay_capacity=settings.polymarket_live_stream_replay_capacity
+    )
+    polymarket_live_stream_client = (
+        PolymarketLiveStreamClient(
+            settings.polymarket_live_stream_uri,
+            polymarket_live_projection,
+        )
+        if settings.polymarket_live_stream_uri else None
+    )
+    polymarket_live_stream_stop = asyncio.Event()
+    polymarket_live_stream_task: asyncio.Task[None] | None = None
+    app.state.polymarket_live_projection = polymarket_live_projection
+    polymarket_event_executor = ThreadPoolExecutor(
+        max_workers=4,
+        thread_name_prefix="marketcow-polymarket-events",
+    )
+    polymarket_frame_executor = ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="marketcow-polymarket-frames",
+    )
+    polymarket_event_metrics = PolymarketEventMetrics()
+    app.add_middleware(
+        PolymarketEventsTraceMiddleware,
+        metrics=polymarket_event_metrics,
+    )
+    app.state.polymarket_event_executor = polymarket_event_executor
+    app.state.polymarket_frame_executor = polymarket_frame_executor
+    app.state.polymarket_event_metrics = polymarket_event_metrics
 
     async def read_polymarket_live_health():
+        if polymarket_live_stream_client is not None:
+            return polymarket_live_projection.health(polymarket_live_read)
         return await asyncio.get_running_loop().run_in_executor(
             _POLYMARKET_LIVE_HEALTH_EXECUTOR,
             polymarket_live_read.health,
@@ -765,7 +809,13 @@ def create_app(
                 pass
 
     async def startup() -> None:
-        nonlocal projection_task
+        nonlocal projection_task, polymarket_live_stream_task
+        if polymarket_live_stream_client is not None:
+            polymarket_live_stream_task = asyncio.create_task(
+                polymarket_live_stream_client.run(polymarket_live_stream_stop),
+                name="polymarket-live-stream-client",
+            )
+            app.state.polymarket_live_stream_task = polymarket_live_stream_task
         if metadata_repository is not None and hasattr(
             metadata_repository, "upsert_prediction_market_live_observation"
         ):
@@ -781,6 +831,12 @@ def create_app(
             app.state.polymarket_dashboard_projection_task = projection_task
 
     async def shutdown() -> None:
+        polymarket_live_stream_stop.set()
+        if polymarket_live_stream_task is not None:
+            polymarket_live_stream_task.cancel()
+            await asyncio.gather(
+                polymarket_live_stream_task, return_exceptions=True
+            )
         projection_stop.set()
         if projection_task is not None:
             await projection_task
@@ -793,6 +849,12 @@ def create_app(
                 csv_import_service.close()
             if owned_mcp_client is not None:
                 owned_mcp_client.close()
+            polymarket_event_executor.shutdown(
+                wait=False, cancel_futures=True,
+            )
+            polymarket_frame_executor.shutdown(
+                wait=False, cancel_futures=True,
+            )
             service.close()
 
     app.add_event_handler("startup", startup)
@@ -1076,7 +1138,7 @@ def create_app(
     @app.get("/metrics", include_in_schema=False)
     def prometheus_metrics():
         return Response(
-            request_metrics.render(),
+            request_metrics.render() + polymarket_event_metrics.render(),
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
 
@@ -1413,13 +1475,23 @@ def create_app(
         response_model=LiveBootstrapResponse,
         summary="Read the provider-neutral Polymarket live catalog and resume contract",
     )
-    def polymarket_live_bootstrap(
+    async def polymarket_live_bootstrap(
         market_id: list[str] | None = Query(default=None),
     ):
         try:
-            return polymarket_live_read.bootstrap(
-                _require_polymarket_scope(market_id)
+            scope = _require_polymarket_scope(market_id)
+            if polymarket_live_stream_client is not None:
+                action = partial(
+                    polymarket_live_projection.bootstrap_json,
+                    polymarket_live_read,
+                    scope,
+                )
+            else:
+                action = partial(polymarket_live_read.bootstrap_json, scope)
+            body = await asyncio.get_running_loop().run_in_executor(
+                polymarket_frame_executor, action,
             )
+            return Response(content=body, media_type="application/json")
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1428,16 +1500,23 @@ def create_app(
         response_model=LiveSnapshotPage,
         summary="Read consistent fail-closed market frames",
     )
-    def polymarket_live_snapshot(
+    async def polymarket_live_snapshot(
         market_id: list[str] | None = Query(default=None),
     ):
         try:
-            return Response(
-                content=polymarket_live_read.snapshot_json(
-                    _require_polymarket_scope(market_id)
-                ),
-                media_type="application/json",
+            scope = _require_polymarket_scope(market_id)
+            if polymarket_live_stream_client is not None:
+                action = partial(
+                    polymarket_live_projection.snapshot_json,
+                    polymarket_live_read,
+                    scope,
+                )
+            else:
+                action = partial(polymarket_live_read.snapshot_json, scope)
+            body = await asyncio.get_running_loop().run_in_executor(
+                polymarket_frame_executor, action,
             )
+            return Response(content=body, media_type="application/json")
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1470,17 +1549,116 @@ def create_app(
         response_model=LiveEventPage,
         summary="Resume provider-neutral Polymarket live events after a cursor",
     )
-    def polymarket_live_events(
+    async def polymarket_live_events(
+        request: Request,
         after_cursor: int = Query(0, ge=0),
         limit: int = Query(1000, ge=1, le=10000),
         market_id: list[str] | None = Query(default=None),
     ):
-        try:
-            return polymarket_live_read.events_after(
+        trace = request.scope["polymarket_events_trace"]
+        submitted = time.perf_counter()
+        phases: dict[str, float] = {}
+
+        def read_and_serialize_events():
+            queue_ms = (time.perf_counter() - submitted) * 1000
+            trace["executor_queue_ms"] = queue_ms
+            event_source = (
+                polymarket_live_projection
+                if polymarket_live_stream_client is not None
+                else polymarket_live_read
+            )
+            payload, _, page = event_source.events_json(
                 _require_polymarket_scope(market_id), after_cursor, limit,
+                _phase_ms=phases,
+            )
+            return queue_ms, payload, phases, page
+
+        try:
+            queue_ms, payload, phases, page = await (
+                asyncio.get_running_loop().run_in_executor(
+                    polymarket_event_executor,
+                    read_and_serialize_events,
+                )
+            )
+            trace.update(phases)
+            trace.update({
+                "executor_queue_ms": queue_ms,
+                "next_cursor": page.next_cursor,
+                "event_count": len(page.items),
+                "has_more": page.has_more,
+            })
+            if polymarket_live_stream_client is not None:
+                trace.update(polymarket_live_projection.watermarks())
+                trace["read_source"] = "memory_projection"
+            return Response(
+                content=payload,
+                media_type="application/json",
+                headers={"Server-Timing": server_timing(phases, queue_ms)},
             )
         except PolymarketLiveReadError as exc:
+            trace.update(phases)
+            trace["error_code"] = exc.code
+            trace["timed_out"] = exc.code == "polymarket_state_index_lagging"
             _raise_polymarket_read_error(exc)
+
+    @app.websocket("/v1/prediction-markets/polymarket/live/stream")
+    async def polymarket_live_stream(
+        websocket: WebSocket,
+        after_cursor: int = Query(0, ge=0),
+        market_id: list[str] | None = Query(default=None),
+    ):
+        await websocket.accept()
+        if polymarket_live_stream_client is None:
+            await websocket.send_json({
+                "type": "error",
+                "code": "polymarket_live_stream_not_configured",
+                "retryable": False,
+            })
+            await websocket.close(code=1013)
+            return
+        queue = polymarket_live_projection.subscribe(capacity=2048)
+        cursor = after_cursor
+        try:
+            scope = _require_polymarket_scope(market_id)
+            while True:
+                page = polymarket_live_projection.events_after(scope, cursor, 1000)
+                for event in page.items:
+                    await websocket.send_json({
+                        "type": "event",
+                        "cursor": event.cursor,
+                        "event": event.model_dump(mode="json"),
+                    })
+                    cursor = event.cursor
+                if not page.has_more:
+                    break
+            await websocket.send_json({
+                "type": "ready",
+                "cursor": polymarket_live_projection.latest_cursor,
+            })
+            while True:
+                event = await queue.get()
+                if event.cursor <= cursor:
+                    continue
+                if event.market_id is not None and event.market_id not in scope:
+                    continue
+                await websocket.send_json({
+                    "type": "event",
+                    "cursor": event.cursor,
+                    "event": event.model_dump(mode="json"),
+                })
+                cursor = event.cursor
+        except PolymarketLiveReadError as exc:
+            await websocket.send_json({
+                "type": "error",
+                "code": exc.code,
+                "message": str(exc),
+                "retryable": exc.status_code == 503,
+            })
+            await websocket.close(code=1013)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        finally:
+            polymarket_live_projection.unsubscribe(queue)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/checkpoint",

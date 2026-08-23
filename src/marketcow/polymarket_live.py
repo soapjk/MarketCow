@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -1601,6 +1602,10 @@ class LiveReadHealth(BaseModel):
     book_complete_market_count: int = Field(default=0, ge=0)
     unresolved_gap_count: int = Field(default=0, ge=0)
     latest_cursor: int = Field(default=0, ge=0)
+    persisted_cursor: int = Field(default=0, ge=0)
+    persistence_lag_events: int = Field(default=0, ge=0)
+    persistence_queue_depth: int = Field(default=0, ge=0)
+    live_stream_connected: bool = False
     reason_codes: list[str] = Field(default_factory=list)
     source_policy: Literal["official_free_only"] = "official_free_only"
 
@@ -1975,6 +1980,10 @@ class PolymarketLiveReadStore:
             if _bind_live_books else response
         )
 
+    def bootstrap_json(self, market_ids: Iterable[str]) -> bytes:
+        """Construct and encode bootstrap away from the ASGI event loop."""
+        return self.bootstrap(market_ids).model_dump_json().encode("utf-8")
+
     def _state_path(self) -> Path:
         _, path = self._state_manifest()
         return path
@@ -2072,7 +2081,11 @@ class PolymarketLiveReadStore:
             cached[2].close()
         connection = _readonly_state_sqlite(path)
         connection.execute("PRAGMA query_only=ON")
-        connection.execute("PRAGMA busy_timeout=20000")
+        # A loopback consumer times out after ten seconds. WAL readers should
+        # not ordinarily wait for the writer at all; bound an exceptional lock
+        # wait well below that transport deadline so the API can return its
+        # explicit fail-closed 503 instead of abandoning a worker for 20s.
+        connection.execute("PRAGMA busy_timeout=500")
         connection.execute("PRAGMA cache_size=-32768")
         connection.execute("PRAGMA mmap_size=268435456")
         self._state_reader.binding = (path, signature, connection)
@@ -2111,6 +2124,12 @@ class PolymarketLiveReadStore:
                 finally:
                     connection.rollback()
                 return
+            except sqlite3.OperationalError as exc:
+                connection.rollback()
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    self._discard_state_reader(connection)
+                    raise self._stable_boundary_unavailable("SQLite read") from exc
+                raise
             except BaseException:
                 connection.rollback()
                 raise
@@ -2460,14 +2479,33 @@ class PolymarketLiveReadStore:
         return payload
 
     def events_after(
-        self, market_ids: Iterable[str], after_cursor: int, limit: int,
+        self,
+        market_ids: Iterable[str],
+        after_cursor: int,
+        limit: int,
+        *,
+        _phase_ms: dict[str, float] | None = None,
     ) -> LiveEventPage:
+        phases = _phase_ms if _phase_ms is not None else {}
+        scope_started = time.perf_counter()
         selected_ids = self._scope(market_ids)
         bootstrap = self.bootstrap(selected_ids, _bind_live_books=False)
+        phases["scope_bootstrap_ms"] = (
+            time.perf_counter() - scope_started
+        ) * 1000
         placeholders = ",".join("?" for _ in selected_ids)
+        # For broad scopes, walking the cursor primary key naturally returns
+        # the first page in order. The (market_id,cursor) index makes SQLite
+        # merge and temp-sort one range per market, which has measurable tail
+        # cost for the 100-market production scope. Narrow scopes retain that
+        # selective index so sparse-market catch-up does not scan the universe.
+        event_table_hint = " NOT INDEXED" if len(selected_ids) >= 8 else ""
         page_limit = min(limit, self.max_event_page_items)
         deadline = time.monotonic() + self._stable_read_wait_seconds
+        sqlite_seconds = 0.0
+        stable_wait_seconds = 0.0
         while True:
+            query_started = time.perf_counter()
             with self._state_snapshot() as (_, connection, metadata):
                 if metadata["catalog_revision"] != bootstrap.catalog_revision:
                     raise PolymarketLiveReadError(
@@ -2482,46 +2520,36 @@ class PolymarketLiveReadStore:
                 ).fetchone()[0])
                 stable = not metadata.get("active_recovery_id") and gap_count == 0
                 if stable:
-                    if after_cursor > 0:
-                        transition_rows = list(connection.execute(
+                    transition_rows = (
+                        list(connection.execute(
                             """SELECT cursor, byte_offset, byte_length, line_sha256
                                FROM event_offsets
                                WHERE market_id IS NULL AND cursor > ?
                                ORDER BY cursor""",
                             (after_cursor,),
                         ))
-                        with self.event_path.open("rb") as stream:
-                            for row in transition_rows:
-                                stream.seek(int(row["byte_offset"]))
-                                line = stream.read(int(row["byte_length"]))
-                                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
-                                    raise PolymarketLiveReadError(
-                                        "polymarket_state_integrity_failed",
-                                        "Catalog transition event hash mismatch",
-                                        409,
-                                    )
-                                event = LiveEventEnvelope.model_validate_json(line)
-                                if event.event_type == "catalog_revision":
-                                    raise PolymarketLiveReadError(
-                                        "resume_cursor_expired",
-                                        (
-                                            "Resume cursor predates the current catalog; "
-                                            "perform a fresh scoped snapshot"
-                                        ),
-                                        409,
-                                    )
+                        if after_cursor > 0 else []
+                    )
                     rows = list(connection.execute(
-                        f"""SELECT * FROM event_offsets
+                        f"""SELECT * FROM event_offsets{event_table_hint}
                             WHERE market_id IN ({placeholders}) AND cursor > ?
                             ORDER BY cursor LIMIT ?""",
                         [*selected_ids, after_cursor, page_limit + 1],
                     ))
+            sqlite_seconds += time.perf_counter() - query_started
             if stable:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                phases["sqlite_query_ms"] = sqlite_seconds * 1000
+                phases["stable_boundary_wait_ms"] = stable_wait_seconds * 1000
                 raise self._stable_boundary_unavailable("events")
-            time.sleep(min(self._stable_read_poll_seconds, remaining))
+            sleep_seconds = min(self._stable_read_poll_seconds, remaining)
+            wait_started = time.perf_counter()
+            time.sleep(sleep_seconds)
+            stable_wait_seconds += time.perf_counter() - wait_started
+        phases["sqlite_query_ms"] = sqlite_seconds * 1000
+        phases["stable_boundary_wait_ms"] = stable_wait_seconds * 1000
         has_more = len(rows) > page_limit
         rows = rows[:page_limit]
         bounded_rows = []
@@ -2534,6 +2562,27 @@ class PolymarketLiveReadStore:
             bounded_rows.append(row)
             bounded_bytes += row_bytes
         rows = bounded_rows
+        model_started = time.perf_counter()
+        with self.event_path.open("rb") as stream:
+            for row in transition_rows:
+                stream.seek(int(row["byte_offset"]))
+                line = stream.read(int(row["byte_length"]))
+                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
+                    raise PolymarketLiveReadError(
+                        "polymarket_state_integrity_failed",
+                        "Catalog transition event hash mismatch",
+                        409,
+                    )
+                event = LiveEventEnvelope.model_validate_json(line)
+                if event.event_type == "catalog_revision":
+                    raise PolymarketLiveReadError(
+                        "resume_cursor_expired",
+                        (
+                            "Resume cursor predates the current catalog; "
+                            "perform a fresh scoped snapshot"
+                        ),
+                        409,
+                    )
         items = []
         with self.event_path.open("rb") as stream:
             for row in rows:
@@ -2558,10 +2607,45 @@ class PolymarketLiveReadStore:
                     )
                 items.append(event)
         next_cursor = items[-1].cursor if items else after_cursor
-        return LiveEventPage(
+        page = LiveEventPage(
             after_cursor=after_cursor, next_cursor=next_cursor,
             has_more=has_more, items=items,
         )
+        phases["model_construction_ms"] = (
+            time.perf_counter() - model_started
+        ) * 1000
+        phases["selected_event_bytes"] = float(bounded_bytes)
+        return page
+
+    def events_json(
+        self,
+        market_ids: Iterable[str],
+        after_cursor: int,
+        limit: int,
+        *,
+        _phase_ms: dict[str, float] | None = None,
+    ) -> tuple[bytes, dict[str, float], LiveEventPage]:
+        """Build and serialize a verified event page exactly once.
+
+        The shared API runs this whole operation on its dedicated event-read
+        executor. Returning immutable JSON bytes prevents FastAPI from doing a
+        second response-model conversion and serialization pass on the event
+        loop for responses near the one MiB transport bound.
+        """
+        phases = _phase_ms if _phase_ms is not None else {}
+        page = self.events_after(
+            market_ids, after_cursor, limit, _phase_ms=phases,
+        )
+        serialization_started = time.perf_counter()
+        payload = page.model_dump_json().encode("utf-8")
+        phases["json_serialization_ms"] = (
+            time.perf_counter() - serialization_started
+        ) * 1000
+        # The ASGI middleware records bytes actually handed to the transport.
+        # Keep the pre-send size under a distinct diagnostic name so it is not
+        # added to the emitted body size a second time.
+        phases["serialized_response_bytes"] = float(len(payload))
+        return payload, phases, page
 
     def gaps(
         self, market_ids: Iterable[str], *, unresolved_only: bool,
@@ -4479,6 +4563,17 @@ class LiveStateStore:
         self._last_log_cursor = 0
         self._sync_lock = threading.RLock()
         self._event_batch_state = threading.local()
+        # The collector may attach a loopback live-stream sink. Publication to
+        # that sink happens immediately after the canonical in-memory event is
+        # committed and before any JSONL/SQLite persistence work begins.
+        self.live_event_sink: Callable[[LiveEventEnvelope], None] | None = None
+        self.live_book_sink: Callable[[LiveBook], None] | None = None
+        self._async_persistence = False
+        self._persistence_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._persistence_thread: threading.Thread | None = None
+        self._persistence_condition = threading.Condition()
+        self.persisted_cursor = 0
+        self.persistence_error: str | None = None
         # API construction must not deserialize the multi-GB catalog or replay the
         # event log. Stateful operations retain compatibility through _ensure_loaded.
         self._recovered = False
@@ -4523,6 +4618,191 @@ class LiveStateStore:
             del self._event_batch_state.stream
             stream.close()
 
+    def enable_async_persistence(self) -> None:
+        """Move JSONL/SQLite writes off the collector's real-time path."""
+        self._ensure_loaded()
+        if self._async_persistence:
+            return
+        self.persisted_cursor = self.cursor
+        self.persistence_error = None
+        self._async_persistence = True
+        self._persistence_thread = threading.Thread(
+            target=self._persistence_loop,
+            name="marketcow-polymarket-persistence",
+            daemon=True,
+        )
+        self._persistence_thread.start()
+
+    def close_async_persistence(self, *, timeout: float = 30.0) -> None:
+        if not self._async_persistence:
+            return
+        target = self.cursor
+        self.flush_async_persistence(target_cursor=target, timeout=timeout)
+        self._persistence_queue.put(None)
+        thread = self._persistence_thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise TimeoutError("Polymarket persistence worker did not stop")
+        self._async_persistence = False
+        self._persistence_thread = None
+
+    def flush_async_persistence(
+        self, *, target_cursor: int | None = None, timeout: float = 30.0,
+    ) -> None:
+        if not self._async_persistence:
+            return
+        target = self.cursor if target_cursor is None else target_cursor
+        deadline = time.monotonic() + timeout
+        with self._persistence_condition:
+            while self.persisted_cursor < target and self.persistence_error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Polymarket asynchronous persistence did not reach target cursor"
+                    )
+                self._persistence_condition.wait(timeout=remaining)
+            if self.persistence_error is not None:
+                raise RuntimeError(
+                    "Polymarket asynchronous persistence failed: "
+                    + self.persistence_error
+                )
+
+    def _persistence_record(
+        self,
+        envelope: LiveEventEnvelope,
+        index_gaps: list[GapEntry],
+    ) -> dict[str, Any]:
+        return {
+            "kind": "event",
+            "event": envelope.model_copy(deep=True),
+            "book": (
+                self.books[envelope.token_id].model_copy(deep=True)
+                if envelope.applied and envelope.token_id in self.books else None
+            ),
+            "gaps": [gap.model_copy(deep=True) for gap in index_gaps],
+            "catalog_revision": self.catalog_revision,
+            "token_to_market": dict(self.token_to_market),
+            "active_recovery_id": self.active_recovery_id,
+            "book_token_count": len(self.books),
+            "book_complete_market_count": sum(
+                all(
+                    outcome.token_id in self.books
+                    and self.books[outcome.token_id].bids
+                    and self.books[outcome.token_id].asks
+                    for outcome in market.identity.outcomes
+                )
+                for market in self.catalog.values()
+                if market.active and not market.closed
+            ),
+            "unresolved_gap_count": sum(not gap.resolved for gap in self.gaps),
+            "oldest_book_received_at": (
+                min(book.received_at for book in self.books.values()).isoformat()
+                if self.books else ""
+            ),
+        }
+
+    def _persistence_loop(self) -> None:
+        try:
+            while True:
+                first = self._persistence_queue.get()
+                if first is None:
+                    return
+                records = [first]
+                deadline = time.monotonic() + 0.02
+                while len(records) < 256:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        candidate = self._persistence_queue.get(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    if candidate is None:
+                        self._persistence_queue.put(None)
+                        break
+                    records.append(candidate)
+                self._persist_records(records)
+        except BaseException as exc:
+            LOGGER.exception("polymarket_async_persistence_failed")
+            with self._persistence_condition:
+                self.persistence_error = f"{type(exc).__name__}:{exc}"
+                self._persistence_condition.notify_all()
+
+    def _persist_records(self, records: list[dict[str, Any]]) -> None:
+        started = time.monotonic()
+        event_records = [item for item in records if item["kind"] == "event"]
+        with _publication_lock(self.root, exclusive=True):
+            self.event_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.event_path.open("a+b") as stream:
+                stream.seek(0, os.SEEK_END)
+                initial_offset = stream.tell()
+                last_offset = initial_offset
+                try:
+                    with self.state_index.batch():
+                        for record in records:
+                            if record["kind"] == "confirmation":
+                                self.state_index.confirm_book(
+                                    record["book"],
+                                    oldest_book_received_at=record[
+                                        "oldest_book_received_at"
+                                    ],
+                                )
+                                continue
+                            event = record["event"]
+                            body = canonical_json(
+                                event.model_dump(mode="json")
+                            ) + b"\n"
+                            byte_offset = stream.tell()
+                            stream.write(body)
+                            last_offset = stream.tell()
+                            self.state_index.append(
+                                event,
+                                byte_offset=byte_offset,
+                                byte_length=len(body),
+                                line_sha256=hashlib.sha256(body).hexdigest(),
+                                book=record["book"],
+                                gaps=record["gaps"],
+                                catalog_revision=record["catalog_revision"],
+                                event_log_size=last_offset,
+                                token_to_market=record["token_to_market"],
+                                active_recovery_id=record["active_recovery_id"],
+                                book_token_count=record["book_token_count"],
+                                book_complete_market_count=record[
+                                    "book_complete_market_count"
+                                ],
+                                unresolved_gap_count=record[
+                                    "unresolved_gap_count"
+                                ],
+                                oldest_book_received_at=record[
+                                    "oldest_book_received_at"
+                                ],
+                            )
+                        if last_offset != initial_offset:
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                except BaseException:
+                    stream.seek(initial_offset)
+                    stream.truncate()
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    raise
+        if event_records:
+            last_event = event_records[-1]["event"]
+            with self._persistence_condition:
+                self.persisted_cursor = last_event.cursor
+                self._event_offset = last_offset
+                self._last_log_cursor = last_event.cursor
+                self._persistence_condition.notify_all()
+        elapsed = time.monotonic() - started
+        if elapsed >= 0.25:
+            LOGGER.info(
+                "polymarket_async_persistence_batch records=%d events=%d "
+                "elapsed_seconds=%.6f persisted_cursor=%d queue_depth=%d",
+                len(records), len(event_records), elapsed, self.persisted_cursor,
+                self._persistence_queue.qsize(),
+            )
+
     @contextmanager
     def memory_state_batch(self):
         """Restore mutable writer state when a durable batch rolls back.
@@ -4531,6 +4811,9 @@ class LiveStateStore:
         matching in-memory rollback, the next retry starts from a skipped
         cursor and can append a permanently discontinuous log tail.
         """
+        if self._async_persistence:
+            yield
+            return
         snapshot = {
             "books": self.books.copy(),
             "rest_refresh_generation": self._rest_refresh_generation.copy(),
@@ -4557,6 +4840,21 @@ class LiveStateStore:
             self._event_offset = snapshot["event_offset"]
             self._last_log_cursor = snapshot["last_log_cursor"]
             raise
+
+    @contextmanager
+    def event_publication_batch(self):
+        """Group synchronous durability, or only memory mutation in hot mode."""
+        if self._async_persistence:
+            with self.memory_state_batch():
+                yield
+            return
+        with (
+            _publication_lock(self.root, exclusive=True),
+            self.memory_state_batch(),
+            self.state_index.batch(),
+            self.durable_event_batch(),
+        ):
+            yield
 
     def _append(self, value: dict[str, Any]) -> tuple[int, int, str]:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4671,7 +4969,14 @@ class LiveStateStore:
         gaps: list[GapEntry] | None = None,
         _publication_locked: bool = False,
     ) -> LiveEventEnvelope:
-        if not _publication_locked:
+        # In streaming mode the collector's in-memory state is the canonical
+        # real-time publication boundary.  The persistence worker owns the
+        # cross-process file/index lock and may hold it for seconds while an
+        # external volume pages in SQLite data or fsyncs JSONL.  Reacquiring
+        # that lock here would put the disk stall straight back onto WebSocket
+        # ingestion even though the actual writes are queued asynchronously.
+        # Collector mutations are already serialized by _sync_lock.
+        if not _publication_locked and not self._async_persistence:
             with _publication_lock(self.root, exclusive=True):
                 return self._emit(
                     event_type, canonical_payload, raw_payload,
@@ -4699,11 +5004,8 @@ class LiveStateStore:
         )
         envelope.event_id = live_event_identity(envelope)
         self.events.append(envelope)
-        byte_offset, byte_length, line_sha256 = self._append(
-            envelope.model_dump(mode="json")
-        )
-        self._event_offset = byte_offset + byte_length
-        self._last_log_cursor = envelope.cursor
+        if self.live_event_sink is not None:
+            self.live_event_sink(envelope)
         self._remember_raw_hash(raw_hash)
         index_gaps = list(gaps or [])
         if event_type == "recovery_completed" and applied:
@@ -4715,6 +5017,16 @@ class LiveStateStore:
                 gap for gap in self.gaps
                 if gap.token_id in recovered and gap not in index_gaps
             )
+        if self._async_persistence:
+            self._persistence_queue.put(
+                self._persistence_record(envelope, index_gaps)
+            )
+            return envelope
+        byte_offset, byte_length, line_sha256 = self._append(
+            envelope.model_dump(mode="json")
+        )
+        self._event_offset = byte_offset + byte_length
+        self._last_log_cursor = envelope.cursor
         self.state_index.append(
             envelope,
             byte_offset=byte_offset,
@@ -4743,6 +5055,7 @@ class LiveStateStore:
                 if self.books else ""
             ),
         )
+        self.persisted_cursor = envelope.cursor
         return envelope
 
     def _market_for_token(self, token_id: str) -> LiveMarket:
@@ -4798,12 +5111,19 @@ class LiveStateStore:
                 "source_hash": source_hash,
             })
             self.books[token_id] = confirmed
-            self.state_index.confirm_book(
-                confirmed,
-                oldest_book_received_at=min(
-                    book.received_at for book in self.books.values()
-                ),
-            )
+            oldest = min(book.received_at for book in self.books.values())
+            if self.live_book_sink is not None:
+                self.live_book_sink(confirmed)
+            if self._async_persistence:
+                self._persistence_queue.put({
+                    "kind": "confirmation",
+                    "book": confirmed.model_copy(deep=True),
+                    "oldest_book_received_at": oldest,
+                })
+            else:
+                self.state_index.confirm_book(
+                    confirmed, oldest_book_received_at=oldest,
+                )
             return None
         book = LiveBook(
             token_id=token_id, condition_id=market.identity.condition_id,
@@ -5036,6 +5356,7 @@ class LiveStateStore:
         return {
             "expected": set(self.token_to_market),
             "recovered": set(),
+            "superseded": set(),
             "invalid": {},
             "duplicate_response_count": 0,
             "unknown_response_count": 0,
@@ -5065,12 +5386,23 @@ class LiveStateStore:
             previous = self.books.get(token_id)
             if (
                 refresh_started_at is not None
-                and refresh_started_at
-                < self._rest_refresh_generation.get(token_id, datetime.min.replace(
-                    tzinfo=timezone.utc
-                ))
+                and (
+                    refresh_started_at
+                    < self._rest_refresh_generation.get(
+                        token_id, datetime.min.replace(tzinfo=timezone.utc),
+                    )
+                    or (
+                        previous is not None
+                        and refresh_started_at < previous.received_at
+                    )
+                )
             ):
+                # The REST request was in flight while a newer WebSocket or
+                # refresh generation updated this token.  Publishing its older
+                # snapshot would regress freshness, amplify the event log, and
+                # make the queued WebSocket delta apply a second time.
                 recovered.add(token_id)
+                tracker["superseded"].add(token_id)
                 continue
             market_id = self.token_to_market.get(token_id)
             market_token_ids = [
@@ -5157,6 +5489,10 @@ class LiveStateStore:
             "requested_token_count": len(tracker["expected"]),
             "recovered_token_count": len(recovered),
             "recovered_token_sha256": content_sha256(sorted(recovered)),
+            "superseded_token_count": len(tracker["superseded"]),
+            "superseded_token_sha256": content_sha256(
+                sorted(tracker["superseded"])
+            ),
             "missing_token_count": len(missing),
             "missing_token_sha256": content_sha256(sorted(missing)),
             "invalid_book_token_count": len(invalid),
@@ -5292,6 +5628,8 @@ class LiveStateStore:
 
     def checkpoint(self) -> LiveCheckpoint:
         self._ensure_loaded()
+        if self._async_persistence:
+            self.flush_async_persistence(target_cursor=self.cursor)
         checkpoint = self.checkpoint_payload()
         body = canonical_json(checkpoint.model_dump(mode="json"))
         _atomic_write(self.checkpoint_path, body)
@@ -5502,6 +5840,7 @@ class LiveStateStore:
         events, offset = self._read_all_events()
         self._rebuild_from_checkpoint(checkpoint, events)
         self._event_offset = offset
+        self.persisted_cursor = self.cursor
         self.state_index.rebuild(
             event_path=self.event_path,
             books=self.books,
@@ -5814,6 +6153,7 @@ def load_scoped_live_store(
     store.active_recovery_id = state_metadata.get("active_recovery_id") or None
     store._event_offset = int(state_metadata["event_log_size"])
     store._last_log_cursor = store.cursor
+    store.persisted_cursor = store.cursor
     store._catalog_file_sha256 = _file_sha256(store.catalog_path)
     checkpoint_path = root / "checkpoint.json"
     if checkpoint_path.exists():
@@ -5922,7 +6262,7 @@ class PolymarketLiveCollector:
         catalog: GammaKeysetCatalog,
         books: ClobBooksClient,
         *,
-        connector: Callable[..., Any] = websockets.connect,
+        connector: Callable[..., Any] | None = None,
         shard_size: int = 500,
         max_websocket_connections: int = 32,
         heartbeat_seconds: float = 10,
@@ -5934,6 +6274,7 @@ class PolymarketLiveCollector:
         max_concurrent_snapshot_refreshes: int = 1,
         websocket_flush_seconds: float = 0.1,
         max_websocket_batch_messages: int = 256,
+        max_websocket_batch_items: int = 32,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -5959,8 +6300,14 @@ class PolymarketLiveCollector:
         )
         self.websocket_flush_seconds = max(0, websocket_flush_seconds)
         self.max_websocket_batch_messages = max(1, max_websocket_batch_messages)
+        self.max_websocket_batch_items = max(1, max_websocket_batch_items)
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
+        # Periodic REST refreshes and reconnect recovery both fetch the same
+        # books and publish through one durable boundary.  Letting their fetches
+        # overlap only creates a publication backlog whose snapshots are stale
+        # by the time they acquire the writer lock.
+        self._snapshot_operation_lock = asyncio.Lock()
 
     def _coherent_refresh_groups(self) -> list[tuple[str, ...]]:
         """Return stable refresh units without splitting relation members.
@@ -6049,29 +6396,38 @@ class PolymarketLiveCollector:
         publish_completion_event: bool,
     ) -> dict[str, Any] | None:
         """Publish recovered books and their completion in one durable flush."""
-        with (
-            self.store._sync_lock,
-            _publication_lock(self.store.root, exclusive=True),
-            self.store.memory_state_batch(),
-            self.store.state_index.batch(),
-            self.store.durable_event_batch(),
-        ):
-            if rows:
-                self.store.recover_book_batch(
-                    rows,
-                    recovery_id,
-                    tracker,
-                    refresh_started_at=refresh_started_at,
-                    received_at=received_at,
+        wait_started = time.monotonic()
+        with self.store._sync_lock:
+            sync_wait_seconds = time.monotonic() - wait_started
+            publication_wait_seconds = 0.0
+            publish_started = time.monotonic()
+            with self.store.event_publication_batch():
+                if rows:
+                    self.store.recover_book_batch(
+                        rows,
+                        recovery_id,
+                        tracker,
+                        refresh_started_at=refresh_started_at,
+                        received_at=received_at,
+                    )
+                result = (
+                    self.store.complete_book_recovery(
+                        recovery_id,
+                        tracker,
+                        write_checkpoint=write_checkpoint,
+                        publish_completion_event=publish_completion_event,
+                    )
+                    if complete else None
                 )
-            if complete:
-                return self.store.complete_book_recovery(
-                    recovery_id,
-                    tracker,
-                    write_checkpoint=write_checkpoint,
-                    publish_completion_event=publish_completion_event,
-                )
-        return None
+            publish_seconds = time.monotonic() - publish_started
+        LOGGER.info(
+            "clob_books_publish_phase recovery_id=%s rows=%d complete=%s "
+            "sync_wait_seconds=%.6f publication_wait_seconds=%.6f "
+            "publish_seconds=%.6f cursor=%d",
+            recovery_id, len(rows), complete, sync_wait_seconds,
+            publication_wait_seconds, publish_seconds, self.store.cursor,
+        )
+        return result
 
     @staticmethod
     def _require_usable_book_rows(rows: list[dict[str, Any]]) -> None:
@@ -6088,6 +6444,7 @@ class PolymarketLiveCollector:
 
     async def bootstrap_books(self, reason: str = "startup") -> str:
         with self.store._sync_lock:
+            recovery_started_at = self.store.now_provider()
             recovery_id = self.store.mark_recovery_started(reason)
             tracker = self.store.new_book_recovery_tracker()
 
@@ -6097,6 +6454,7 @@ class PolymarketLiveCollector:
                 recovery_id,
                 tracker,
                 complete=False,
+                refresh_started_at=recovery_started_at,
                 received_at=self.store.now_provider(),
                 write_checkpoint=False,
                 publish_completion_event=False,
@@ -6115,6 +6473,7 @@ class PolymarketLiveCollector:
                 recovery_id,
                 tracker,
                 complete=True,
+                refresh_started_at=recovery_started_at,
                 received_at=self.store.now_provider(),
                 write_checkpoint=self.publish_checkpoints,
                 publish_completion_event=True,
@@ -6131,6 +6490,7 @@ class PolymarketLiveCollector:
                 recovery_id,
                 tracker,
                 complete=True,
+                refresh_started_at=recovery_started_at,
                 write_checkpoint=self.publish_checkpoints,
                 publish_completion_event=True,
             )
@@ -6275,7 +6635,19 @@ class PolymarketLiveCollector:
         return messages
 
     async def _consume(self, tokens: list[str], *, message_limit: int | None = None) -> None:
-        async with self.connector(self.endpoint) as socket:
+        socket_context = (
+            self.connector(self.endpoint)
+            if self.connector is not None
+            else websockets.connect(
+                self.endpoint,
+                ping_interval=20,
+                # Durable publication can briefly saturate an older multi-GB
+                # index.  Keep protocol liveness detection, but do not turn a
+                # transient local scheduling delay into a recovery feedback loop.
+                ping_timeout=max(60, self.heartbeat_seconds * 6),
+            )
+        )
+        async with socket_context as socket:
             self.sockets.append(socket)
             self.socket_tokens[socket] = set(tokens)
             try:
@@ -6327,7 +6699,15 @@ class PolymarketLiveCollector:
                         items.extend(
                             payload if isinstance(payload, list) else [payload]
                         )
-                    await asyncio.to_thread(self._apply_websocket_batch, items)
+                    for offset in range(0, len(items), self.max_websocket_batch_items):
+                        await asyncio.to_thread(
+                            self._apply_websocket_batch,
+                            items[offset:offset + self.max_websocket_batch_items],
+                        )
+                        # Give protocol keepalive, REST freshness publication,
+                        # and the next socket read a scheduling point between
+                        # bounded durable transactions.
+                        await asyncio.sleep(0)
                     consumed += len(items)
                     if (
                         self.catalog_refresh_on_lifecycle_events
@@ -6347,20 +6727,28 @@ class PolymarketLiveCollector:
         self._apply_websocket_batch([item])
 
     def _apply_websocket_batch(self, items: list[dict[str, Any]]) -> None:
-        with (
-            self.store._sync_lock,
-            _publication_lock(self.store.root, exclusive=True),
-            self.store.memory_state_batch(),
-            self.store.state_index.batch(),
-            self.store.durable_event_batch(),
-        ):
-            for item in items:
-                self.store.apply_websocket(
-                    item,
-                    stale_events_are_resolved=(
-                        self.snapshot_refresh_seconds is not None
-                    ),
-                )
+        wait_started = time.monotonic()
+        with self.store._sync_lock:
+            sync_wait_seconds = time.monotonic() - wait_started
+            publish_started = time.monotonic()
+            cursor_started = self.store.cursor
+            with self.store.event_publication_batch():
+                for item in items:
+                    self.store.apply_websocket(
+                        item,
+                        stale_events_are_resolved=(
+                            self.snapshot_refresh_seconds is not None
+                        ),
+                    )
+            publish_seconds = time.monotonic() - publish_started
+            cursor_finished = self.store.cursor
+        if sync_wait_seconds >= 0.25 or publish_seconds >= 0.25:
+            LOGGER.info(
+                "websocket_publish_phase items=%d emitted_events=%d "
+                "sync_wait_seconds=%.6f publish_seconds=%.6f cursor=%d",
+                len(items), cursor_finished - cursor_started,
+                sync_wait_seconds, publish_seconds, cursor_finished,
+            )
 
     async def run_once(self, *, message_limit: int | None = None) -> None:
         groups = self.planner.connection_groups(
@@ -6381,11 +6769,21 @@ class PolymarketLiveCollector:
             while True:
                 refresh_started = time.monotonic()
                 try:
-                    await self.refresh_books(
-                        "periodic_snapshot_refresh",
-                        partition_index=partition_index,
-                        partition_count=self.max_concurrent_snapshot_refreshes,
-                    )
+                    async with self._snapshot_operation_lock:
+                        queued_seconds = time.monotonic() - refresh_started
+                        if queued_seconds >= self.snapshot_refresh_seconds:
+                            LOGGER.info(
+                                "periodic_snapshot_refresh_superseded "
+                                "partition=%d queued_seconds=%.6f interval_seconds=%.6f",
+                                partition_index, queued_seconds,
+                                self.snapshot_refresh_seconds,
+                            )
+                        else:
+                            await self.refresh_books(
+                                "periodic_snapshot_refresh",
+                                partition_index=partition_index,
+                                partition_count=self.max_concurrent_snapshot_refreshes,
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -6420,9 +6818,10 @@ class PolymarketLiveCollector:
                 attempts += 1
                 if attempts > 1:
                     try:
-                        await self.bootstrap_books(
-                            f"websocket_reconnect:{attempts}"
-                        )
+                        async with self._snapshot_operation_lock:
+                            await self.bootstrap_books(
+                                f"websocket_reconnect:{attempts}"
+                            )
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -6446,6 +6845,11 @@ class PolymarketLiveCollector:
                 except Exception:
                     if max_connections is not None and attempts >= max_connections:
                         raise
+                    LOGGER.exception(
+                        "websocket_disconnected attempt=%d; reconnecting after "
+                        "%.3f seconds",
+                        attempts, self.reconnect_seconds,
+                    )
                     await asyncio.sleep(self.reconnect_seconds)
         finally:
             if refresh_task is not None:
