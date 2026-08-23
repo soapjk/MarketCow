@@ -579,10 +579,7 @@ class PolymarketLiveProjection:
                 or generation < 1
                 or not required_token_ids
                 or unresolved
-                or any(
-                    book is None or not book.bids or not book.asks
-                    for book in source_books.values()
-                )
+                or any(book is None for book in source_books.values())
             ):
                 raise PolymarketLiveReadStore._stable_boundary_unavailable("full-sync")
             # The immutable copy is part of the atomic boundary: none of the

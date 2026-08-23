@@ -194,6 +194,20 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([event.cursor for event in page.items], [after + 1])
             self.assertEqual(page.next_cursor, after + 1)
             self.assertFalse(page.has_more)
+
+            empty_ask = snapshot(
+                "yes-1", "0.39", "0.41", "1785739211000",
+            )
+            empty_ask["asks"] = []
+            await asyncio.to_thread(
+                store.apply_snapshot, empty_ask, received_at=NOW,
+            )
+            for _ in range(200):
+                if projection.latest_cursor == store.cursor:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(projection.latest_cursor, after + 2)
+
             health = projection.health(
                 PolymarketLiveReadStore(
                     store.root,
@@ -209,6 +223,7 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(health.latest_state_ready)
             self.assertEqual(health.book_complete_market_count, 1)
+            self.assertEqual(projection._books["yes-1"].asks, [])
             reader = PolymarketLiveReadStore(
                 store.root,
                 now_provider=lambda: NOW,
