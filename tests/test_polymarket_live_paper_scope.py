@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -41,6 +43,40 @@ class PolymarketLivePaperScopeTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "100 unique"):
                 MODULE.load_market_ids(path)
+
+    def test_loads_exact_100_market_scope_manifest(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            document = {
+                "schema": "tradude.prediction_market.scope_manifest.v1",
+                "market_ids": [str(index) for index in range(100)],
+            }
+            document["scope_id"] = hashlib.sha256(
+                json.dumps(
+                    document, sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8"),
+            ).hexdigest()
+            path.write_text(json.dumps(document), encoding="utf-8")
+
+            self.assertEqual(
+                MODULE.load_scope_manifest_market_ids(path),
+                [str(index) for index in range(100)],
+            )
+
+    def test_rejects_modified_scope_manifest(self) -> None:
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            path.write_text(
+                json.dumps({
+                    "schema": "tradude.prediction_market.scope_manifest.v1",
+                    "scope_id": "0" * 64,
+                    "market_ids": [str(index) for index in range(100)],
+                }),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                MODULE.load_scope_manifest_market_ids(path)
 
 
 class PolymarketLiveBootstrapRetryTest(unittest.IsolatedAsyncioTestCase):
