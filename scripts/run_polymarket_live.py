@@ -29,9 +29,12 @@ async def bootstrap_books_until_ready(
     attempts = 0
     while True:
         try:
-            return await collector.bootstrap_books(
-                "startup" if attempts == 0 else f"startup_retry:{attempts}"
-            )
+            reason = "startup" if attempts == 0 else f"startup_retry:{attempts}"
+            lock = getattr(collector, "_snapshot_operation_lock", None)
+            if lock is None:
+                return await collector.bootstrap_books(reason)
+            async with lock:
+                return await collector.bootstrap_books(reason)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -135,12 +138,21 @@ def main() -> None:
                 replay_capacity=arguments.live_stream_replay_capacity,
             )
             await stream.start()
+            collector_task = (
+                asyncio.create_task(
+                    collector.run(), name="polymarket-upstream-websocket",
+                )
+                if not arguments.bootstrap_only else None
+            )
             try:
                 await bootstrap_books_until_ready(collector)
                 print(store.health().model_dump(mode="json"))
-                if not arguments.bootstrap_only:
-                    await collector.run()
+                if collector_task is not None:
+                    await collector_task
             finally:
+                if collector_task is not None:
+                    collector_task.cancel()
+                    await asyncio.gather(collector_task, return_exceptions=True)
                 await stream.close()
                 await asyncio.to_thread(store.close_async_persistence)
 
