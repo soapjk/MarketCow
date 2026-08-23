@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from marketcow.polymarket_live import (
     GammaLiveNormalizer,
+    LiveSnapshotPage,
     LiveStateStore,
     PolymarketLiveReadError,
     PolymarketLiveReadStore,
@@ -169,8 +170,11 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(frame.items[0].status, "ready")
 
             reader.now_provider = lambda: NOW + timedelta(seconds=5)
+            stale_health = projection.health(reader)
+            self.assertEqual(stale_health.status, "degraded")
+            self.assertFalse(stale_health.latest_state_ready)
+            self.assertIn("stale_book_state", stale_health.reason_codes)
             for action in (
-                lambda: projection.health(reader),
                 lambda: projection.bootstrap_json(reader, ["m1"]),
                 lambda: projection.snapshot_json(reader, ["m1"]),
             ):
@@ -185,6 +189,77 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
             await server.close()
             await asyncio.to_thread(store.close_async_persistence, timeout=5)
+
+    async def test_100_market_frames_drop_resolved_gap_history_from_hot_projection(self):
+        rows = [
+            gamma_row(
+                f"m{index}",
+                condition_id="0x" + f"{index + 1:064x}",
+                tokens=(f"yes-{index}", f"no-{index}"),
+            )
+            for index in range(100)
+        ]
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        template_store = populated_store(Path(temporary.name) / "template")
+        templates = list(template_store.books.values())
+        reader = PolymarketLiveReadStore(
+            Path(temporary.name) / "read-root",
+            now_provider=lambda: NOW,
+            stable_snapshot_max_book_age_seconds=5,
+        )
+        books = []
+        for index, market in enumerate(markets):
+            for offset, outcome in enumerate(market.identity.outcomes):
+                books.append(templates[offset].model_copy(update={
+                    "token_id": outcome.token_id,
+                    "condition_id": market.identity.condition_id,
+                }).model_dump(mode="json"))
+        resolved_gaps = [
+            {
+                "code": "coverage_gap",
+                "token_id": f"historic-{index}",
+                "detected_at": NOW.isoformat(),
+                "resolved": True,
+                "resolution": "snapshot_recovered",
+            }
+            for index in range(5_000)
+        ]
+        projection = PolymarketLiveProjection(replay_capacity=100)
+        projection.install_state({
+            "schema_version": "marketcow.polymarket.live-stream.v1",
+            "type": "state",
+            "catalog_revision": "a" * 64,
+            "catalog_source": {"source": "test"},
+            "latest_cursor": 0,
+            "persisted_cursor": 0,
+            "active_recovery_id": None,
+            "markets": [market.model_dump(mode="json") for market in markets],
+            "books": books,
+            "gaps": resolved_gaps,
+        })
+        projection.mark_ready({"latest_cursor": 0})
+        scope = [f"m{index}" for index in range(100)]
+
+        started = time.perf_counter()
+        with patch(
+            "sqlite3.connect", side_effect=AssertionError("SQLite hot query")
+        ):
+            bootstrap = projection.bootstrap_json(reader, scope)
+            snapshot_body = projection.snapshot_json(reader, scope)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(projection.health(reader).unresolved_gap_count, 0)
+        self.assertEqual(projection._gaps, [])
+        self.assertGreater(len(bootstrap), 100_000)
+        self.assertGreater(len(snapshot_body), 100_000)
+        self.assertLess(elapsed, 0.75)
+
+        reader.now_provider = lambda: NOW + timedelta(seconds=5)
+        health = projection.health(reader)
+        self.assertEqual(health.status, "degraded")
+        self.assertIn("stale_book_state", health.reason_codes)
 
     async def test_100_market_memory_page_is_ordered_bounded_and_has_no_disk_phase(self):
         projection = PolymarketLiveProjection(replay_capacity=2000)
@@ -294,6 +369,78 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(len(result), 1)
         self.assertEqual(projection.latest_cursor, 2)
+
+    async def test_event_burst_advances_during_two_concurrent_snapshot_serializations(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = populated_store(Path(temporary.name) / "live")
+        projection = PolymarketLiveProjection(replay_capacity=500)
+        projection.install_state({
+            "schema_version": "marketcow.polymarket.live-stream.v1",
+            "type": "state",
+            "catalog_revision": store.catalog_revision,
+            "catalog_source": store.catalog_source,
+            "latest_cursor": store.cursor,
+            "persisted_cursor": store.cursor,
+            "active_recovery_id": None,
+            "markets": [
+                market.model_dump(mode="json")
+                for market in store.catalog.values()
+            ],
+            "books": [book.model_dump(mode="json") for book in store.books.values()],
+            "gaps": [],
+        })
+        projection.mark_ready({"latest_cursor": store.cursor})
+        reader = PolymarketLiveReadStore(
+            store.root,
+            now_provider=lambda: NOW,
+            stable_snapshot_max_book_age_seconds=5,
+        )
+        serialization_started = threading.Barrier(3)
+        release_serialization = threading.Event()
+        original = LiveSnapshotPage.model_dump_json
+
+        def blocked_serialization(page, *args, **kwargs):
+            serialization_started.wait(timeout=5)
+            release_serialization.wait(timeout=5)
+            return original(page, *args, **kwargs)
+
+        results: list[bytes] = []
+        with patch.object(
+            LiveSnapshotPage, "model_dump_json", blocked_serialization
+        ):
+            workers = [
+                threading.Thread(
+                    target=lambda: results.append(
+                        projection.snapshot_json(reader, ["m1"])
+                    )
+                )
+                for _ in range(2)
+            ]
+            for worker in workers:
+                worker.start()
+            await asyncio.to_thread(serialization_started.wait, 5)
+
+            template = store.events[-1]
+            started = time.perf_counter()
+            for offset in range(1, 101):
+                event = template.model_copy(update={
+                    "cursor": projection.latest_cursor + 1,
+                    "event_id": "0" * 64,
+                    "event_type": "last_trade_price",
+                    "canonical_payload": template.canonical_payload,
+                })
+                event.event_id = live_event_identity(event)
+                projection.apply_live(event.model_dump(mode="json"))
+            elapsed = time.perf_counter() - started
+            release_serialization.set()
+            for worker in workers:
+                worker.join(timeout=5)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(projection.latest_cursor, store.cursor + 100)
+        self.assertLess(elapsed, 0.5)
 
     async def test_cursor_gap_fails_closed_without_advancing_projection(self):
         projection = PolymarketLiveProjection(replay_capacity=10)

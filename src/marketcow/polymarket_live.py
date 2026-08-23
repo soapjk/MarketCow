@@ -1606,6 +1606,12 @@ class LiveReadHealth(BaseModel):
     persistence_lag_events: int = Field(default=0, ge=0)
     persistence_queue_depth: int = Field(default=0, ge=0)
     live_stream_connected: bool = False
+    live_stream_disconnect_count: int = Field(default=0, ge=0)
+    event_loop_stall_max_ms: float = Field(default=0, ge=0)
+    events_read_source: Literal["memory_projection", "durable_index"] = (
+        "durable_index"
+    )
+    realtime_sqlite_query_ms: float = Field(default=0, ge=0)
     reason_codes: list[str] = Field(default_factory=list)
     source_policy: Literal["official_free_only"] = "official_free_only"
 
@@ -2312,7 +2318,7 @@ class PolymarketLiveReadStore:
                         row["confirmed_received_at"] or row["book_received_at"]
                     )
                 ).total_seconds()
-                <= maximum_age
+                < maximum_age
                 for row in materialized
             )
         )
@@ -2472,7 +2478,7 @@ class PolymarketLiveReadStore:
             for book in (*frame.tokens, *frame.relation_tokens)
         }
         if not books or any(
-            not 0 <= (observed_at - book.received_at).total_seconds() <= maximum_age
+            not 0 <= (observed_at - book.received_at).total_seconds() < maximum_age
             for book in books.values()
         ):
             raise self._stable_boundary_unavailable("snapshot response")
@@ -5000,7 +5006,15 @@ class LiveStateStore:
             canonical_payload_sha256=canonical_hash,
             raw_payload=raw_payload, raw_payload_sha256=raw_hash,
             applied=applied, fail_closed_reason=reason,
-            gaps=gaps or [],
+            # A later REST recovery mutates the store's gap ledger in place.
+            # The event envelope is an immutable audit/publication record: if
+            # it retained those same model objects, an async stream sender
+            # could serialize the resolved form after event_id was computed
+            # from the unresolved form and force every client to disconnect on
+            # an identity mismatch.  Gap lists are tiny and exceptional, so
+            # copy only this mutable edge rather than deep-copying the common
+            # event/book hot path.
+            gaps=[gap.model_copy(deep=True) for gap in gaps or []],
         )
         envelope.event_id = live_event_identity(envelope)
         self.events.append(envelope)
@@ -5220,19 +5234,21 @@ class LiveStateStore:
             reason=(None if affected is not None else "catalog_refresh_required"))]
         if event_type == "price_change":
             changes = raw.get("price_changes") or raw.get("changes") or []
-            envelopes = []
+            changes_by_token: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for change in changes:
                 token_id = str(change.get("asset_id") or change.get("token_id") or "")
-                envelopes.append(self._apply_token_event(
-                    event_type,
+                changes_by_token[token_id].append(change)
+            return [
+                self._apply_price_changes(
                     token_id,
-                    change,
+                    token_changes,
                     raw,
                     exchange,
                     received,
                     stale_events_are_resolved=stale_events_are_resolved,
-                ))
-            return envelopes
+                )
+                for token_id, token_changes in changes_by_token.items()
+            ]
         token_id = str(raw.get("asset_id") or raw.get("token_id") or "")
         return [self._apply_token_event(
             event_type,
@@ -5243,6 +5259,118 @@ class LiveStateStore:
             received,
             stale_events_are_resolved=stale_events_are_resolved,
         )]
+
+    def _apply_price_changes(
+        self,
+        token_id: str,
+        changes: list[dict[str, Any]],
+        raw: dict[str, Any],
+        exchange: datetime,
+        received: datetime,
+        *,
+        stale_events_are_resolved: bool = False,
+    ) -> LiveEventEnvelope:
+        """Apply one exchange price-change message as one atomic token delta.
+
+        Polymarket may include both sides of a token in one message.  Validating
+        after each individual level change exposes an intermediate crossed book
+        and creates a false unresolved gap even though the complete exchange
+        message restores a valid spread.  Grouping by token preserves the
+        upstream message boundary while still emitting a deterministic event
+        for every affected token.
+        """
+        market = self._market_for_token(token_id)
+        previous = self.books.get(token_id)
+        if previous is None:
+            gap = GapEntry(
+                code="missing_snapshot", token_id=token_id,
+                observed=content_sha256(raw), event_at=exchange,
+                detected_at=received,
+            )
+            self.gaps.append(gap)
+            return self._emit(
+                "price_change", {"requires_snapshot_recovery": True}, raw,
+                applied=False, market_id=market.identity.market_id,
+                condition_id=market.identity.condition_id, token_id=token_id,
+                exchange_at=exchange, received_at=received,
+                reason="missing_snapshot", gaps=[gap],
+            )
+        if exchange < previous.exchange_at:
+            gap = GapEntry(
+                code="out_of_order", token_id=token_id,
+                expected=previous.exchange_at.isoformat(),
+                observed=exchange.isoformat(), event_at=exchange,
+                detected_at=received, resolved=stale_events_are_resolved,
+                resolution=(
+                    "superseded_by_newer_snapshot"
+                    if stale_events_are_resolved else None
+                ),
+            )
+            self.gaps.append(gap)
+            return self._emit(
+                "price_change", {"ignored": "out_of_order"}, raw,
+                applied=False, market_id=market.identity.market_id,
+                condition_id=market.identity.condition_id, token_id=token_id,
+                book_epoch=previous.book_epoch, sequence=previous.sequence,
+                exchange_at=exchange, received_at=received,
+                reason="out_of_order", gaps=[gap],
+            )
+        book = previous.model_copy(deep=True)
+        book.sequence += 1
+        book.exchange_at = exchange
+        book.received_at = received
+        for change in changes:
+            side = str(change.get("side") or "").upper()
+            side_name = (
+                "bids" if side in {"BUY", "BID"}
+                else "asks" if side in {"SELL", "ASK"} else ""
+            )
+            if not side_name:
+                raise ValueError("price_change side must be BUY/SELL")
+            price = decimal_text(change.get("price"), "price_change.price")
+            size = decimal_text(change.get("size"), "price_change.size")
+            levels = {
+                item["price"]: item["size"] for item in getattr(book, side_name)
+            }
+            if Decimal(size) == 0:
+                levels.pop(price, None)
+            else:
+                levels[price] = size
+            setattr(book, side_name, [
+                {"price": item, "size": levels[item]}
+                for item in sorted(
+                    levels, key=Decimal, reverse=side_name == "bids"
+                )
+            ])
+        bids = {item["price"]: item["size"] for item in book.bids}
+        asks = {item["price"]: item["size"] for item in book.asks}
+        try:
+            _validate_book({"tick_size": book.tick_size, "bids": bids, "asks": asks})
+        except ValueError as exc:
+            gap = GapEntry(
+                code="source_mismatch", token_id=token_id,
+                observed=str(exc), event_at=exchange, detected_at=received,
+            )
+            self.gaps.append(gap)
+            return self._emit(
+                "price_change", {"requires_snapshot_recovery": True}, raw,
+                applied=False, market_id=market.identity.market_id,
+                condition_id=market.identity.condition_id, token_id=token_id,
+                book_epoch=previous.book_epoch, sequence=previous.sequence,
+                exchange_at=exchange, received_at=received,
+                reason="invalid_book_update", gaps=[gap],
+            )
+        book.state_checksum = _state_checksum(
+            token_id, book.tick_size, bids, asks
+        )
+        self.books[token_id] = book
+        return self._emit(
+            "price_change", book.model_dump(mode="json"), raw, applied=True,
+            market_id=market.identity.market_id,
+            condition_id=market.identity.condition_id, token_id=token_id,
+            book_epoch=book.book_epoch, sequence=book.sequence,
+            exchange_at=exchange, received_at=received,
+        )
 
     def _apply_token_event(
         self,

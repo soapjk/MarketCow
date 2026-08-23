@@ -75,14 +75,28 @@ def create_polymarket_live_read_app(
     )
     stream_stop = asyncio.Event()
     stream_task: asyncio.Task[None] | None = None
+    loop_monitor_task: asyncio.Task[None] | None = None
+
+    async def monitor_event_loop() -> None:
+        interval = 0.05
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + interval
+        while not stream_stop.is_set():
+            await asyncio.sleep(interval)
+            observed = loop.time()
+            projection.observe_event_loop_stall((observed - expected) * 1000)
+            expected = observed + interval
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        nonlocal stream_task
+        nonlocal stream_task, loop_monitor_task
         if stream_client is not None:
             stream_task = asyncio.create_task(
                 stream_client.run(stream_stop),
                 name="polymarket-live-stream-client",
+            )
+            loop_monitor_task = asyncio.create_task(
+                monitor_event_loop(), name="polymarket-event-loop-stall-monitor"
             )
         try:
             yield
@@ -91,6 +105,9 @@ def create_polymarket_live_read_app(
             if stream_task is not None:
                 stream_task.cancel()
                 await asyncio.gather(stream_task, return_exceptions=True)
+            if loop_monitor_task is not None:
+                loop_monitor_task.cancel()
+                await asyncio.gather(loop_monitor_task, return_exceptions=True)
             executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(
@@ -201,7 +218,12 @@ def create_polymarket_live_read_app(
     async def health():
         try:
             if stream_client is not None:
-                return projection.health(reader)
+                health = projection.health(reader)
+                return Response(
+                    content=health.model_dump_json(),
+                    media_type="application/json",
+                    status_code=200 if health.latest_state_ready else 503,
+                )
             return await run_read(reader.health)
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)

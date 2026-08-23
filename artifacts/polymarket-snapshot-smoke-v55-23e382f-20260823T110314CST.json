@@ -1,0 +1,784 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8790",
+    "config_path": "/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v55-memory-stream-contract-20260823T081306CST/unified-shadow.yaml",
+    "config_sha256": "8b2d4156a6b48a4496cd324e04b14f7554fe5a9ec351658881ca60d78657c542",
+    "configured_duration_seconds": 3600.0,
+    "event_limit": 1000,
+    "market_ids": [
+      "2118801",
+      "2118802",
+      "2118805",
+      "2244712",
+      "2244713",
+      "2244714",
+      "2661522",
+      "2661523",
+      "2661524",
+      "2784676",
+      "2784678",
+      "2784681",
+      "2821918",
+      "2821919",
+      "2821920",
+      "2865875",
+      "2865876",
+      "2865877",
+      "3026124",
+      "3026125",
+      "3026126",
+      "3073397",
+      "3073398",
+      "3073399",
+      "3141922",
+      "3141923",
+      "3141924",
+      "3212408",
+      "3212409",
+      "3212410",
+      "3212454",
+      "3212455",
+      "3212456",
+      "3471397",
+      "3471401",
+      "3471405",
+      "3471436",
+      "3471444",
+      "3471447",
+      "3471469",
+      "3471470",
+      "3471471",
+      "3471487",
+      "3471495",
+      "3471500",
+      "3474251",
+      "3474252",
+      "3474256",
+      "3474257",
+      "3474261",
+      "3474262",
+      "3474281",
+      "3474282",
+      "3474284",
+      "3474285",
+      "3474286",
+      "3474288",
+      "3474300",
+      "3474304",
+      "3474305",
+      "3474309",
+      "3474310",
+      "3474314",
+      "3476543",
+      "3476544",
+      "3476546",
+      "3476557",
+      "3476558",
+      "3476559",
+      "3478615",
+      "3478616",
+      "3478617",
+      "3479078",
+      "3479079",
+      "3479080",
+      "3502235",
+      "3502245",
+      "3502251",
+      "3502254",
+      "3502255",
+      "3502256",
+      "3505968",
+      "3505978",
+      "3505990",
+      "3507994",
+      "3507996",
+      "3507999",
+      "3535881",
+      "3535882",
+      "3535883",
+      "634891",
+      "634892",
+      "634893",
+      "665374",
+      "907436",
+      "907437",
+      "907438",
+      "950852",
+      "950853",
+      "950854"
+    ],
+    "maximum_book_age_seconds": 5.0,
+    "maximum_consecutive_unavailable_seconds": 30.0,
+    "mode": "shadow",
+    "poll_interval_seconds": 0.5,
+    "real_order_submission_enabled": false,
+    "timeout_seconds": 10.0
+  },
+  "criteria": {
+    "all_10_second_timeouts_zero": true,
+    "all_route_failures_zero": false,
+    "duration_at_least_10_minutes": true,
+    "event_cursor_advanced_without_gap_or_duplicate": true,
+    "events_read_from_memory_projection": true,
+    "health_never_ready_with_stale_readable_book": true,
+    "integrity_failures_zero": false,
+    "processes_survived": true,
+    "real_orders_disabled": true,
+    "realtime_sqlite_queries_zero": true,
+    "successful_books_always_younger_than_5_seconds": true,
+    "unresolved_gaps_zero": true,
+    "websocket_disconnects_zero": true
+  },
+  "cursor_gap_count": 0,
+  "duplicate_event_count": 0,
+  "duration_seconds": 600.1475889580324,
+  "errors": [
+    {
+      "at": "2026-08-23T03:04:06.981600+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18647669,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18647667,
+        "persistence_lag_events": 2,
+        "persistence_queue_depth": 0,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:04:06.992367+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:04:07.001586+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:05:21.874761+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:09:04.586677+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18666429,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18666421,
+        "persistence_lag_events": 8,
+        "persistence_queue_depth": 146,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:09:04.609344+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:09:04.618681+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:09:08.093146+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:09:11.081559+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap response wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:09:11.121724+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:09:44.410755+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap response wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:09:44.484510+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:09:46.728873+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18668922,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18668917,
+        "persistence_lag_events": 5,
+        "persistence_queue_depth": 0,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:09:46.730931+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:09:46.733457+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:09:47.741841+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18668964,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18668962,
+        "persistence_lag_events": 2,
+        "persistence_queue_depth": 0,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:09:47.743933+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:09:47.746280+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:09:48.815598+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18669000,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18668990,
+        "persistence_lag_events": 10,
+        "persistence_queue_depth": 0,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:09:48.818435+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:09:48.820387+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:09:52.283507+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18669301,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18669290,
+        "persistence_lag_events": 11,
+        "persistence_queue_depth": 0,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:09:52.285692+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:09:52.288010+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:11:50.951230+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18676495,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18676468,
+        "persistence_lag_events": 27,
+        "persistence_queue_depth": 5,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:11:50.953906+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:11:50.956777+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:11:52.093332+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18676575,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18676542,
+        "persistence_lag_events": 33,
+        "persistence_queue_depth": 0,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:11:52.096468+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:11:52.098617+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    },
+    {
+      "at": "2026-08-23T03:11:53.204323+00:00",
+      "detail": {
+        "book_complete_market_count": 100,
+        "book_token_count": 200,
+        "catalog_index_ready": true,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "event_loop_stall_max_ms": 2345.530583988875,
+        "events_read_source": "memory_projection",
+        "latest_cursor": 18676640,
+        "latest_state_ready": false,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "market_count": 100,
+        "persisted_cursor": 18676625,
+        "persistence_lag_events": 15,
+        "persistence_queue_depth": 21,
+        "realtime_sqlite_query_ms": 0.0,
+        "reason_codes": [
+          "stale_book_state"
+        ],
+        "schema_version": "marketcow.polymarket.live-read-health.v1",
+        "source_policy": "official_free_only",
+        "status": "degraded",
+        "token_count": 200,
+        "unresolved_gap_count": 0
+      },
+      "exception": null,
+      "message": null,
+      "route": "health"
+    },
+    {
+      "at": "2026-08-23T03:11:53.207798+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "bootstrap"
+    },
+    {
+      "at": "2026-08-23T03:11:53.211062+00:00",
+      "detail": {
+        "detail": {
+          "code": "polymarket_state_index_lagging",
+          "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+        }
+      },
+      "exception": null,
+      "message": null,
+      "route": "snapshot"
+    }
+  ],
+  "event_cursor_finish": 18682859,
+  "event_cursor_start": 18644656,
+  "event_loop_stall_max_ms": 2345.530583988875,
+  "events_read_sources": [
+    "memory_projection"
+  ],
+  "events_sqlite_query_ms": {
+    "count": 1007,
+    "max": 0.0,
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "finished_at": "2026-08-23T03:13:14.841269+00:00",
+  "git_commit": "23e382ff7f94ef72add19afc5b91e299cdd036f3",
+  "health_index_ready_with_stale_snapshot_count": 0,
+  "health_realtime_sqlite_query_ms": {
+    "count": 468,
+    "max": 0.0,
+    "p50": 0.0,
+    "p95": 0.0,
+    "p99": 0.0
+  },
+  "integrity_failure_count": 37,
+  "live_stream_disconnect_count_delta": 0,
+  "maximum_book_age_seconds": 3.971684,
+  "maximum_persistence_lag_events": 98,
+  "maximum_persistence_queue_depth": 269,
+  "maximum_unresolved_gap_count": 0,
+  "passed": false,
+  "process_alive": {
+    "api": true,
+    "collector": true
+  },
+  "route_failure_counts": {
+    "bootstrap": 11,
+    "events": 0,
+    "health": 9,
+    "snapshot": 13
+  },
+  "route_latency_seconds": {
+    "bootstrap": {
+      "count": 468,
+      "max": 1.8557378340046853,
+      "p50": 0.05768479104153812,
+      "p95": 0.2919220000039786,
+      "p99": 0.6147750830277801
+    },
+    "events": {
+      "count": 1007,
+      "max": 3.730204167077318,
+      "p50": 0.021234041079878807,
+      "p95": 0.18166395893786103,
+      "p99": 0.3369015840580687
+    },
+    "health": {
+      "count": 468,
+      "max": 3.0201184999896213,
+      "p50": 0.002677624928764999,
+      "p95": 0.023376207915134728,
+      "p99": 0.0887143750442192
+    },
+    "snapshot": {
+      "count": 469,
+      "max": 0.782650624983944,
+      "p50": 0.08105129201430827,
+      "p95": 0.3046591250458732,
+      "p99": 0.4436610830016434
+    }
+  },
+  "route_timeout_counts": {
+    "bootstrap": 0,
+    "events": 0,
+    "health": 0,
+    "snapshot": 0
+  },
+  "schema_version": "marketcow.polymarket.snapshot-smoke.v1",
+  "started_at": "2026-08-23T03:03:14.712734+00:00",
+  "successful_stale_snapshot_count": 0,
+  "websocket_disconnected_observations": 0
+}

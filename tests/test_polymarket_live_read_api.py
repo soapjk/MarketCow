@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 import unittest
@@ -168,10 +169,97 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(
-            response.json()["detail"]["code"],
-            "polymarket_state_index_lagging",
+        self.assertEqual(response.json()["status"], "degraded")
+        self.assertFalse(response.json()["latest_state_ready"])
+        self.assertIn("stale_book_state", response.json()["reason_codes"])
+
+    def test_slow_snapshot_client_write_does_not_block_projection_ingestion(self):
+        app = create_polymarket_live_read_app(
+            root=self.root,
+            stable_snapshot_max_book_age_seconds=5,
+            stable_read_wait_seconds=6,
+            stable_read_poll_seconds=0.025,
+            executor_workers=4,
+            live_stream_uri="ws://127.0.0.1:1",
         )
+        reader = app.state.polymarket_live_read
+        reader.now_provider = lambda: NOW
+        projection = app.state.polymarket_live_projection
+        projection.install_state({
+            "schema_version": "marketcow.polymarket.live-stream.v1",
+            "type": "state",
+            "catalog_revision": self.writer.catalog_revision,
+            "catalog_source": self.writer.catalog_source,
+            "latest_cursor": self.writer.cursor,
+            "persisted_cursor": self.writer.cursor,
+            "active_recovery_id": None,
+            "markets": [
+                market.model_dump(mode="json")
+                for market in self.writer.catalog.values()
+            ],
+            "books": [
+                book.model_dump(mode="json")
+                for book in self.writer.books.values()
+            ],
+            "gaps": [],
+        })
+        projection.mark_ready({"latest_cursor": self.writer.cursor})
+
+        async def exercise():
+            body_write_started = asyncio.Event()
+            release_body_write = asyncio.Event()
+            messages = []
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def slow_send(message):
+                messages.append(message)
+                if message["type"] == "http.response.body":
+                    body_write_started.set()
+                    await release_body_write.wait()
+
+            request = asyncio.create_task(app({
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/v1/prediction-markets/polymarket/live/snapshot",
+                "raw_path": b"/v1/prediction-markets/polymarket/live/snapshot",
+                "query_string": b"market_id=m1",
+                "root_path": "",
+                "headers": [],
+                "client": ("127.0.0.1", 1),
+                "server": ("127.0.0.1", 8790),
+            }, receive, slow_send))
+            await asyncio.wait_for(body_write_started.wait(), timeout=2)
+            previous = projection.latest_cursor
+            event = await asyncio.to_thread(
+                self.writer.apply_snapshot,
+                snapshot("yes-1", "0.39", "0.41", "1785739201000"),
+                received_at=NOW,
+            )
+            started = time.perf_counter()
+            projection.apply_live(event.model_dump(mode="json"))
+            elapsed = time.perf_counter() - started
+            self.assertEqual(projection.latest_cursor, previous + 1)
+            release_body_write.set()
+            await asyncio.wait_for(request, timeout=2)
+            return elapsed, messages
+
+        try:
+            elapsed, messages = asyncio.run(exercise())
+        finally:
+            app.state.polymarket_live_read_executor.shutdown(
+                wait=True, cancel_futures=True
+            )
+
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(messages[0]["status"], 200)
+        self.assertTrue(any(
+            message["type"] == "http.response.body" for message in messages
+        ))
 
 
 if __name__ == "__main__":
