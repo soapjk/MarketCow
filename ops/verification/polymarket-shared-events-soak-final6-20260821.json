@@ -1,0 +1,1088 @@
+{
+  "client_timeout_counts": {
+    "bootstrap": 0,
+    "events": 0,
+    "health": 0,
+    "snapshot": 0
+  },
+  "config": {
+    "base_url": "http://127.0.0.1:8790",
+    "config_path": "/Volumes/T9/projects/trade/tradude/.tradude-local/polymarket-live/supervised-shadow-v48-shared-api-config-20260820T140927CST/unified-shadow.yaml",
+    "config_sha256": "3e5b5bc8ea2db89233a7b3495e808ae8faeb711e198668d0853ab083e1d87661",
+    "configured_duration_seconds": 3600.0,
+    "event_limit": 1000,
+    "market_ids": [
+      "2118801",
+      "2118802",
+      "2118805",
+      "2244712",
+      "2244713",
+      "2244714",
+      "2661522",
+      "2661523",
+      "2661524",
+      "2784676",
+      "2784678",
+      "2784681",
+      "2821918",
+      "2821919",
+      "2821920",
+      "2865875",
+      "2865876",
+      "2865877",
+      "3026124",
+      "3026125",
+      "3026126",
+      "3073397",
+      "3073398",
+      "3073399",
+      "3141922",
+      "3141923",
+      "3141924",
+      "3212408",
+      "3212409",
+      "3212410",
+      "3212454",
+      "3212455",
+      "3212456",
+      "3471397",
+      "3471401",
+      "3471405",
+      "3471436",
+      "3471444",
+      "3471447",
+      "3471469",
+      "3471470",
+      "3471471",
+      "3471487",
+      "3471495",
+      "3471500",
+      "3474251",
+      "3474252",
+      "3474256",
+      "3474257",
+      "3474261",
+      "3474262",
+      "3474281",
+      "3474282",
+      "3474284",
+      "3474285",
+      "3474286",
+      "3474288",
+      "3474300",
+      "3474304",
+      "3474305",
+      "3474309",
+      "3474310",
+      "3474314",
+      "3476543",
+      "3476544",
+      "3476546",
+      "3476557",
+      "3476558",
+      "3476559",
+      "3478615",
+      "3478616",
+      "3478617",
+      "3479078",
+      "3479079",
+      "3479080",
+      "3502235",
+      "3502245",
+      "3502251",
+      "3502254",
+      "3502255",
+      "3502256",
+      "3505968",
+      "3505978",
+      "3505990",
+      "3507994",
+      "3507996",
+      "3507999",
+      "3535881",
+      "3535882",
+      "3535883",
+      "634891",
+      "634892",
+      "634893",
+      "665374",
+      "907436",
+      "907437",
+      "907438",
+      "950852",
+      "950853",
+      "950854"
+    ],
+    "maximum_book_age_seconds": 5.0,
+    "maximum_consecutive_unavailable_seconds": 30.0,
+    "mode": "shadow",
+    "poll_interval_seconds": 0.5,
+    "real_order_submission_enabled": false,
+    "timeout_seconds": 10.0
+  },
+  "criteria": {
+    "all_routes_healthy": true,
+    "books_complete_and_fresh": true,
+    "cursor_and_integrity_complete": true,
+    "duration_at_least_one_hour": true,
+    "events_client_timeouts_zero": true,
+    "events_p99_at_most_3_seconds": true,
+    "no_30_second_unavailability": false,
+    "processes_survived": true,
+    "shadow_and_orders_disabled": true
+  },
+  "duration_seconds": 3600.8045745409327,
+  "environment": {
+    "api_alive_at_finish": true,
+    "api_pid": 69675,
+    "base_url": "http://127.0.0.1:8790",
+    "collector_alive_at_finish": true,
+    "collector_pid": 18847,
+    "git_commit": "4b1c53e3566fabb6088c9fe8aed609510443293e",
+    "host": "androidjkdeMac-mini.local",
+    "platform": "macOS-26.6-arm64-arm-64bit",
+    "python": "3.11.14 (main, Dec  9 2025, 19:11:45) [Clang 21.1.4 ]"
+  },
+  "errors": [
+    {
+      "at": "2026-08-20T15:46:03.150505+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:09.308158+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:15.442349+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:15.500188+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:15.523412+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:21.587065+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:21.649349+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:21.726444+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:27.044326+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:27.776374+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:27.902830+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:33.997044+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:34.007193+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:34.116952+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:40.167210+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:40.186889+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:40.268351+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:46.436056+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:46.436761+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:46.449983+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:52.511836+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:52.598307+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:46:52.611478+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:07.067892+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:22.212323+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:41.869683+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:47.922675+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:47.971360+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:48.040280+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:54.094840+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:54.124151+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:47:54.247149+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:00.419864+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:00.420118+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:00.420197+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:06.466131+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:06.516444+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:06.626398+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:12.687664+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:12.712971+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:12.839418+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:18.885452+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:18.906925+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:18.975368+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:24.996054+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:25.050729+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:25.093906+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:31.132111+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:31.137848+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:31.207981+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:37.331993+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:37.355762+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:37.413348+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:48:57.307596+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:09.194620+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:42.186336+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:42.205515+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:48.230493+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:48.321222+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:48.404862+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:54.505488+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:54.506429+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:49:54.540130+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:08.148376+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:15.471063+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:15.517724+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:21.562511+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:21.568053+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:21.747935+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:27.780113+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:27.798411+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:33.873176+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:33.889841+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:33.913741+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:39.969466+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:39.990406+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:40.150021+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:46.241012+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:46.279673+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:46.324996+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:52.418200+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:52.435697+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:50:52.478352+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:51:08.925183+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:51:50.411323+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:51:50.430734+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:51:56.446801+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:51:56.494741+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:51:56.592363+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:02.618216+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:02.731967+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:02.786935+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:08.951979+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:08.967146+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:08.984071+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:15.073620+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:15.112056+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded bootstrap wait; retry the request"
+      },
+      "route": "bootstrap",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:15.174452+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded health wait; retry the request"
+      },
+      "route": "health",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:21.576588+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot response wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    },
+    {
+      "at": "2026-08-20T15:52:32.662989+00:00",
+      "detail": {
+        "code": "polymarket_state_index_lagging",
+        "message": "Polymarket live state did not reach a complete stable boundary within the bounded snapshot wait; retry the request"
+      },
+      "route": "snapshot",
+      "status": 503
+    }
+  ],
+  "events": {
+    "after_cursor_start": 10912764,
+    "client_timeout_count": 0,
+    "cursor_gap_count": 0,
+    "duplicate_event_count": 0,
+    "latency_seconds": {
+      "max": 6.202112708007917,
+      "p50": 0.014627499971538782,
+      "p95": 0.30447791691403836,
+      "p99": 1.0265047919237986
+    },
+    "maximum_unavailable_seconds": 1.3062006250256673,
+    "next_cursor_finish": 11034593,
+    "sample_count": 1798
+  },
+  "fail_closed_frame_count": 0,
+  "finished_at": "2026-08-20T16:45:14.990244+00:00",
+  "integrity_failure_count": 0,
+  "maximum_book_age_seconds": 4.610974,
+  "passed": false,
+  "route_failure_counts": {
+    "bootstrap": 240,
+    "events": 3,
+    "health": 244,
+    "snapshot": 324
+  },
+  "route_maximum_unavailable_seconds": {
+    "bootstrap": 145.81563424994238,
+    "events": 1.3062006250256673,
+    "health": 135.24535375006963,
+    "snapshot": 157.80299762496725
+  },
+  "route_sample_counts": {
+    "bootstrap": 575,
+    "events": 1798,
+    "health": 865,
+    "snapshot": 1179
+  },
+  "schema_version": "marketcow.polymarket.shared-events-soak.v1",
+  "started_at": "2026-08-20T15:45:14.480726+00:00"
+}
