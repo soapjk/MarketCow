@@ -84,6 +84,7 @@ from .polymarket_live import (
     LiveBootstrapResponse,
     LiveCheckpoint,
     LiveEventPage,
+    LiveFullSyncResponse,
     LiveGapPage,
     LiveReadHealth,
     LiveSnapshotPage,
@@ -99,6 +100,7 @@ from .http_metrics import RequestMetrics, RequestMetricsMiddleware
 from .polymarket_events_observability import (
     PolymarketEventMetrics,
     PolymarketEventsTraceMiddleware,
+    PolymarketReadTraceMiddleware,
     server_timing,
 )
 from .polymarket_live_stream import (
@@ -600,11 +602,15 @@ def create_app(
     app.state.polymarket_live = polymarket_live
     polymarket_live_read = PolymarketLiveReadStore(
         polymarket_live.root,
-        # Tradude's fail-closed boundary remains exactly five seconds.  Reserve
-        # one second for loopback response writing and client JSON decoding so
-        # a successful frame cannot cross that unchanged consumer boundary in
-        # transit.  This is deliberately stricter, never a threshold increase.
-        stable_snapshot_max_book_age_seconds=4.0,
+        stable_snapshot_max_book_age_seconds=(
+            settings.polymarket_consumer_maximum_book_age_seconds
+        ),
+        consumer_maximum_book_age_seconds=(
+            settings.polymarket_consumer_maximum_book_age_seconds
+        ),
+        minimum_delivery_headroom_seconds=(
+            settings.polymarket_minimum_delivery_headroom_seconds
+        ),
     )
     app.state.polymarket_live_read = polymarket_live_read
     polymarket_live_projection = PolymarketLiveProjection(
@@ -634,13 +640,21 @@ def create_app(
         PolymarketEventsTraceMiddleware,
         metrics=polymarket_event_metrics,
     )
+    app.add_middleware(PolymarketReadTraceMiddleware)
     app.state.polymarket_event_executor = polymarket_event_executor
     app.state.polymarket_frame_executor = polymarket_frame_executor
     app.state.polymarket_event_metrics = polymarket_event_metrics
 
     async def read_polymarket_live_health():
         if polymarket_live_stream_client is not None:
-            return polymarket_live_projection.health(polymarket_live_read)
+            return await asyncio.get_running_loop().run_in_executor(
+                polymarket_frame_executor,
+                partial(
+                    polymarket_live_projection.health,
+                    polymarket_live_read,
+                    polymarket_live_projection.market_ids(),
+                ),
+            )
         return await asyncio.get_running_loop().run_in_executor(
             _POLYMARKET_LIVE_HEALTH_EXECUTOR,
             polymarket_live_read.health,
@@ -1421,14 +1435,43 @@ def create_app(
     def _raise_polymarket_read_error(exc: PolymarketLiveReadError) -> None:
         headers = (
             {"Retry-After": "1"}
-            if exc.code == "polymarket_state_index_lagging"
+            if exc.code in {
+                "polymarket_state_index_lagging",
+                "polymarket_snapshot_freshness_budget_exhausted",
+            }
             else None
         )
         raise HTTPException(
             status_code=exc.status_code,
-            detail={"code": exc.code, "message": str(exc)},
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                "retryable": exc.status_code == 503,
+            },
             headers=headers,
         ) from exc
+
+    async def _run_polymarket_hot_json(
+        action: Callable[..., Any], scope: list[str], trace: dict[str, Any],
+    ) -> tuple[bytes, dict[str, float], float]:
+        submitted = time.perf_counter()
+        phases: dict[str, float] = {}
+
+        def execute() -> bytes:
+            queue_ms = (time.perf_counter() - submitted) * 1000
+            phases["executor_queue_ms"] = queue_ms
+            result = action(
+                polymarket_live_read, scope, _phase_ms=phases,
+            )
+            return result[0] if isinstance(result, tuple) else result
+
+        try:
+            body = await asyncio.get_running_loop().run_in_executor(
+                polymarket_frame_executor, execute,
+            )
+        finally:
+            trace.update(phases)
+        return body, phases, float(phases.get("executor_queue_ms", 0))
 
     def _require_polymarket_scope(market_id: list[str] | None) -> list[str]:
         if not market_id:
@@ -1499,22 +1542,28 @@ def create_app(
         summary="Read the provider-neutral Polymarket live catalog and resume contract",
     )
     async def polymarket_live_bootstrap(
+        request: Request,
         market_id: list[str] | None = Query(default=None),
     ):
         try:
             scope = _require_polymarket_scope(market_id)
             if polymarket_live_stream_client is not None:
-                action = partial(
-                    polymarket_live_projection.bootstrap_json,
-                    polymarket_live_read,
-                    scope,
+                body, phases, queue_ms = await _run_polymarket_hot_json(
+                    polymarket_live_projection.bootstrap_json, scope,
+                    request.scope["polymarket_read_trace"],
                 )
             else:
                 action = partial(polymarket_live_read.bootstrap_json, scope)
-            body = await asyncio.get_running_loop().run_in_executor(
-                polymarket_frame_executor, action,
+                body = await asyncio.get_running_loop().run_in_executor(
+                    polymarket_frame_executor, action,
+                )
+                queue_ms = 0.0
+                phases = {"executor_queue_ms": 0.0,
+                          "response_body_bytes": float(len(body))}
+            return Response(
+                content=body, media_type="application/json",
+                headers={"Server-Timing": server_timing(phases, queue_ms)},
             )
-            return Response(content=body, media_type="application/json")
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1524,22 +1573,56 @@ def create_app(
         summary="Read consistent fail-closed market frames",
     )
     async def polymarket_live_snapshot(
+        request: Request,
         market_id: list[str] | None = Query(default=None),
     ):
         try:
             scope = _require_polymarket_scope(market_id)
             if polymarket_live_stream_client is not None:
-                action = partial(
-                    polymarket_live_projection.snapshot_json,
-                    polymarket_live_read,
-                    scope,
+                body, phases, queue_ms = await _run_polymarket_hot_json(
+                    polymarket_live_projection.snapshot_json, scope,
+                    request.scope["polymarket_read_trace"],
                 )
             else:
                 action = partial(polymarket_live_read.snapshot_json, scope)
-            body = await asyncio.get_running_loop().run_in_executor(
-                polymarket_frame_executor, action,
+                body = await asyncio.get_running_loop().run_in_executor(
+                    polymarket_frame_executor, action,
+                )
+                queue_ms = 0.0
+                phases = {"executor_queue_ms": 0.0,
+                          "response_body_bytes": float(len(body))}
+            return Response(
+                content=body, media_type="application/json",
+                headers={"Server-Timing": server_timing(phases, queue_ms)},
             )
-            return Response(content=body, media_type="application/json")
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
+
+    @app.get(
+        "/v1/prediction-markets/polymarket/live/full-sync",
+        response_model=LiveFullSyncResponse,
+        summary="Atomically read scoped health, bootstrap, and snapshot",
+    )
+    async def polymarket_live_full_sync(
+        request: Request,
+        market_id: list[str] | None = Query(default=None),
+    ):
+        try:
+            if polymarket_live_stream_client is None:
+                raise PolymarketLiveReadError(
+                    "polymarket_live_stream_not_configured",
+                    "Atomic full-sync requires the in-memory live projection",
+                    503,
+                )
+            body, phases, queue_ms = await _run_polymarket_hot_json(
+                polymarket_live_projection.full_sync_json,
+                _require_polymarket_scope(market_id),
+                request.scope["polymarket_read_trace"],
+            )
+            return Response(
+                content=body, media_type="application/json",
+                headers={"Server-Timing": server_timing(phases, queue_ms)},
+            )
         except PolymarketLiveReadError as exc:
             _raise_polymarket_read_error(exc)
 
@@ -1703,8 +1786,23 @@ def create_app(
         response_model=LiveReadHealth,
         summary="Read live source coverage, lag, and gap health",
     )
-    async def polymarket_live_health():
+    async def polymarket_live_health(
+        request: Request,
+        market_id: list[str] | None = Query(default=None),
+    ):
         try:
+            if polymarket_live_stream_client is not None:
+                scope = market_id or polymarket_live_projection.market_ids()
+                body, phases, queue_ms = await _run_polymarket_hot_json(
+                    polymarket_live_projection.health_json, scope,
+                    request.scope["polymarket_read_trace"],
+                )
+                return Response(
+                    content=body,
+                    media_type="application/json",
+                    status_code=200,
+                    headers={"Server-Timing": server_timing(phases, queue_ms)},
+                )
             health = await read_polymarket_live_health()
             return Response(
                 content=health.model_dump_json(),

@@ -76,6 +76,8 @@ class Settings:
     realtime_heartbeat_seconds: float = 15.0
     polymarket_live_stream_uri: str = ""
     polymarket_live_stream_replay_capacity: int = 10_000
+    polymarket_consumer_maximum_book_age_seconds: float = 5.0
+    polymarket_minimum_delivery_headroom_seconds: float = 1.0
     sec_user_agent: str = "MarketCow toczx@outlook.com"
     dividend_cache_ttl_seconds: int = 21600
     dividend_empty_cache_ttl_seconds: int = 900
@@ -233,6 +235,12 @@ class Settings:
             ).strip(),
             polymarket_live_stream_replay_capacity=int(os.getenv(
                 "MARKETCOW_POLYMARKET_LIVE_STREAM_REPLAY_CAPACITY", "10000"
+            )),
+            polymarket_consumer_maximum_book_age_seconds=float(os.getenv(
+                "MARKETCOW_POLYMARKET_CONSUMER_MAXIMUM_BOOK_AGE_SECONDS", "5.0"
+            )),
+            polymarket_minimum_delivery_headroom_seconds=float(os.getenv(
+                "MARKETCOW_POLYMARKET_MINIMUM_DELIVERY_HEADROOM_SECONDS", "1.0"
             )),
             sec_user_agent=os.getenv(
                 "MARKETCOW_SEC_USER_AGENT", "MarketCow toczx@outlook.com"
@@ -437,6 +445,17 @@ class Settings:
         if not 1 <= self.polymarket_live_stream_replay_capacity <= 100000:
             raise ValueError(
                 "Polymarket live stream replay capacity must be between 1 and 100000"
+            )
+        if not 0.1 <= self.polymarket_consumer_maximum_book_age_seconds <= 60:
+            raise ValueError(
+                "Polymarket consumer maximum book age must be between 0.1 and 60 seconds"
+            )
+        if not (
+            0 <= self.polymarket_minimum_delivery_headroom_seconds
+            < self.polymarket_consumer_maximum_book_age_seconds
+        ):
+            raise ValueError(
+                "Polymarket delivery headroom must be non-negative and smaller than maximum book age"
             )
         if self.polymarket_live_stream_uri:
             parsed_stream = urlsplit(self.polymarket_live_stream_uri)

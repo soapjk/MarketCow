@@ -24,6 +24,8 @@ ROUTES = {
     "health": "health",
     "bootstrap": "bootstrap",
     "snapshot": "snapshot",
+    "full_sync": "full-sync",
+    "rejected_candidate_probe": "full-sync",
 }
 
 
@@ -120,12 +122,21 @@ def main() -> None:
     parser.add_argument("--duration-seconds", type=float, default=3600)
     parser.add_argument("--api-pid", type=int)
     parser.add_argument("--collector-pid", type=int)
+    parser.add_argument(
+        "--base-url",
+        help="Loopback API override used to isolate an acceptance worktree service",
+    )
     args = parser.parse_args()
     config = load_v48_config(args.v48_config.resolve())
     if args.duration_seconds < 3600:
         raise SystemExit("formal acceptance requires --duration-seconds >= 3600")
-    if config["base_url"] != "http://127.0.0.1:8790":
-        raise SystemExit("formal acceptance must target shared API 127.0.0.1:8790")
+    if args.base_url:
+        if not re.fullmatch(r"http://127\.0\.0\.1:\d{1,5}", args.base_url):
+            raise SystemExit("--base-url must be an explicit loopback HTTP endpoint")
+        config["configured_base_url"] = config["base_url"]
+        config["base_url"] = args.base_url
+    if not re.fullmatch(r"http://127\.0\.0\.1:\d{1,5}", config["base_url"]):
+        raise SystemExit("formal acceptance must target a loopback MarketCow API")
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     market_params = [("market_id", item) for item in config["market_ids"]]
@@ -140,6 +151,17 @@ def main() -> None:
     duplicate_event_count = 0
     fail_closed_frames = 0
     maximum_book_age_seconds = 0.0
+    maximum_unresolved_gap_count = 0
+    maximum_persistence_queue_depth = 0
+    maximum_persistence_lag_events = 0
+    disconnect_counts: list[int] = []
+    realtime_sqlite_query_ms: list[float] = []
+    read_sources: set[str] = set()
+    disconnected_health_samples = 0
+    server_timing_failures = 0
+    response_body_bytes_maximum: dict[str, int] = {
+        name: 0 for name in ROUTES
+    }
     maximum_unavailable_seconds: dict[str, float] = {
         name: 0.0 for name in ROUTES
     }
@@ -155,9 +177,15 @@ def main() -> None:
     next_bootstrap = started
     next_snapshot = started
     next_health = started
+    next_full_sync = started
+    next_probe = started
 
     def request(client: httpx.Client, name: str, cursor: int) -> tuple[str, Any]:
-        params = list(market_params) if name != "health" else []
+        params = (
+            market_params[:3]
+            if name == "rejected_candidate_probe"
+            else list(market_params)
+        )
         if name == "events":
             params.extend([("after_cursor", str(cursor)), ("limit", "1000")])
         request_started = time.perf_counter()
@@ -169,7 +197,13 @@ def main() -> None:
                 headers={"Accept": "application/json"},
             )
             elapsed = time.perf_counter() - request_started
-            return name, (elapsed, response.status_code, response.json())
+            return name, (
+                elapsed,
+                response.status_code,
+                response.json(),
+                response.headers.get("server-timing", ""),
+                len(response.content),
+            )
         except Exception as exc:
             elapsed = time.perf_counter() - request_started
             return name, (elapsed, exc)
@@ -189,7 +223,7 @@ def main() -> None:
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=8)
     with (
         httpx.Client(timeout=10.0, limits=limits, trust_env=False) as client,
-        ThreadPoolExecutor(max_workers=4) as executor,
+        ThreadPoolExecutor(max_workers=6) as executor,
     ):
         preflight_deadline = time.monotonic() + float(
             config["maximum_consecutive_unavailable_seconds"]
@@ -234,13 +268,19 @@ def main() -> None:
             due = ["events"]
             if now >= next_health:
                 due.append("health")
-                next_health = now + 2
+                next_health = now + 1
             if now >= next_bootstrap:
                 due.append("bootstrap")
-                next_bootstrap = now + 5
+                next_bootstrap = now + 1
             if now >= next_snapshot:
                 due.append("snapshot")
                 next_snapshot = now + 1
+            if now >= next_full_sync:
+                due.append("full_sync")
+                next_full_sync = now + 1
+            if now >= next_probe:
+                due.append("rejected_candidate_probe")
+                next_probe = now + 1
             futures = [executor.submit(request, client, name, after_cursor) for name in due]
             for future in as_completed(futures):
                 name, result = future.result()
@@ -259,7 +299,10 @@ def main() -> None:
                             "message": str(result[1])[:300],
                         })
                     continue
-                _, status, payload = result
+                _, status, payload, timing_header, body_bytes = result
+                response_body_bytes_maximum[name] = max(
+                    response_body_bytes_maximum[name], int(body_bytes)
+                )
                 if status != 200:
                     failures[name] += 1
                     observe_availability(name, False)
@@ -271,6 +314,18 @@ def main() -> None:
                         })
                     continue
                 observe_availability(name, True)
+                if name != "events":
+                    required_timings = {
+                        "executor_queue", "lock_wait", "projection_copy",
+                        "frame_build", "json_serialize", "freshness_check",
+                        "maximum_book_age", "freshness_headroom",
+                    }
+                    exposed_timings = {
+                        item.split(";", 1)[0].strip()
+                        for item in timing_header.split(",") if item.strip()
+                    }
+                    if not required_timings <= exposed_timings:
+                        server_timing_failures += 1
                 if name == "events":
                     if int(payload.get("after_cursor", -1)) != after_cursor:
                         integrity_failures += 1
@@ -293,6 +348,27 @@ def main() -> None:
                 elif name == "health":
                     if payload.get("status") != "index_ready":
                         integrity_failures += 1
+                    maximum_unresolved_gap_count = max(
+                        maximum_unresolved_gap_count,
+                        int(payload.get("unresolved_gap_count", 0)),
+                    )
+                    maximum_persistence_queue_depth = max(
+                        maximum_persistence_queue_depth,
+                        int(payload.get("persistence_queue_depth", 0)),
+                    )
+                    maximum_persistence_lag_events = max(
+                        maximum_persistence_lag_events,
+                        int(payload.get("persistence_lag_events", 0)),
+                    )
+                    disconnect_counts.append(int(
+                        payload.get("live_stream_disconnect_count", 0)
+                    ))
+                    realtime_sqlite_query_ms.append(float(
+                        payload.get("realtime_sqlite_query_ms", -1)
+                    ))
+                    read_sources.add(str(payload.get("events_read_source")))
+                    if not payload.get("live_stream_connected", False):
+                        disconnected_health_samples += 1
                 elif name == "bootstrap":
                     returned = {
                         str(item["identity"]["market_id"])
@@ -302,6 +378,7 @@ def main() -> None:
                         integrity_failures += 1
                 elif name == "snapshot":
                     items = payload.get("items") or []
+                    book_map = payload.get("books") or {}
                     returned = {str(item["market_id"]) for item in items}
                     if returned != set(config["market_ids"]):
                         integrity_failures += 1
@@ -309,16 +386,63 @@ def main() -> None:
                     for frame in items:
                         if frame.get("status") != "ready":
                             fail_closed_frames += 1
-                        books = frame.get("tokens") or []
-                        if len(books) != 2:
+                        token_ids = frame.get("token_ids") or []
+                        if len(token_ids) != 2:
                             integrity_failures += 1
-                        for book in books:
+                        for token_id in token_ids:
+                            book = book_map.get(str(token_id))
+                            if not book:
+                                integrity_failures += 1
+                                continue
                             if not book.get("bids") or not book.get("asks"):
                                 integrity_failures += 1
                             age = (observed - instant(book["received_at"])).total_seconds()
                             maximum_book_age_seconds = max(maximum_book_age_seconds, age)
                             if age < 0 or age >= config["maximum_book_age_seconds"]:
                                 integrity_failures += 1
+                elif name in {"full_sync", "rejected_candidate_probe"}:
+                    expected_scope = (
+                        config["market_ids"][:3]
+                        if name == "rejected_candidate_probe"
+                        else config["market_ids"]
+                    )
+                    boundary = (
+                        payload.get("catalog_revision"), payload.get("cursor"),
+                        payload.get("projection_generation"),
+                        payload.get("scope_market_ids"),
+                        payload.get("freshness_checked_at"),
+                    )
+                    for component_name in ("health", "bootstrap", "snapshot"):
+                        component = payload.get(component_name) or {}
+                        component_cursor = component.get(
+                            "latest_cursor", component.get("cursor")
+                        )
+                        if (
+                            component.get("catalog_revision"), component_cursor,
+                            component.get("projection_generation"),
+                            component.get("scope_market_ids"),
+                            component.get("freshness_checked_at"),
+                        ) != boundary:
+                            integrity_failures += 1
+                    full_snapshot = payload.get("snapshot") or {}
+                    returned = {
+                        str(item["market_id"])
+                        for item in full_snapshot.get("items") or []
+                    }
+                    if returned != set(expected_scope):
+                        integrity_failures += 1
+                    observed = datetime.now(timezone.utc)
+                    for book in (full_snapshot.get("books") or {}).values():
+                        age = (
+                            observed - instant(book["received_at"])
+                        ).total_seconds()
+                        maximum_book_age_seconds = max(maximum_book_age_seconds, age)
+                        if age < 0 or age >= config["maximum_book_age_seconds"]:
+                            integrity_failures += 1
+                    if float(payload.get("freshness_budget_remaining_ms", -1)) < float(
+                        payload.get("minimum_delivery_headroom_ms", 0)
+                    ):
+                        integrity_failures += 1
             sleep_for = config["poll_interval_seconds"] - (time.monotonic() - now)
             if sleep_for > 0:
                 time.sleep(sleep_for)
@@ -334,6 +458,10 @@ def main() -> None:
         ["git", "rev-parse", "HEAD"], check=False, capture_output=True, text=True,
     ).stdout.strip()
     events_p99 = percentile(latencies["events"], 0.99)
+    disconnect_delta = (
+        max(disconnect_counts) - min(disconnect_counts)
+        if disconnect_counts else -1
+    )
     criteria = {
         "duration_at_least_one_hour": time.monotonic() - started >= 3600,
         "events_client_timeouts_zero": client_timeouts_by_route["events"] == 0,
@@ -353,6 +481,20 @@ def main() -> None:
             fail_closed_frames == 0
             and maximum_book_age_seconds < config["maximum_book_age_seconds"]
         ),
+        "unresolved_gaps_zero": maximum_unresolved_gap_count == 0,
+        "websocket_disconnects_zero": (
+            disconnect_delta == 0 and disconnected_health_samples == 0
+        ),
+        "realtime_sqlite_queries_zero": (
+            bool(realtime_sqlite_query_ms)
+            and max(realtime_sqlite_query_ms) == 0
+            and read_sources == {"memory_projection"}
+        ),
+        "persistence_queue_and_lag_bounded": (
+            maximum_persistence_queue_depth < 10_000
+            and maximum_persistence_lag_events < 10_000
+        ),
+        "server_timing_complete": server_timing_failures == 0,
         "processes_survived": all(
             value is not False for value in (
                 process_alive(args.api_pid), process_alive(args.collector_pid),
@@ -404,6 +546,15 @@ def main() -> None:
         "integrity_failure_count": integrity_failures,
         "fail_closed_frame_count": fail_closed_frames,
         "maximum_book_age_seconds": maximum_book_age_seconds,
+        "maximum_unresolved_gap_count": maximum_unresolved_gap_count,
+        "maximum_persistence_queue_depth": maximum_persistence_queue_depth,
+        "maximum_persistence_lag_events": maximum_persistence_lag_events,
+        "live_stream_disconnect_count_delta": disconnect_delta,
+        "disconnected_health_samples": disconnected_health_samples,
+        "realtime_sqlite_query_ms_max": max(realtime_sqlite_query_ms, default=None),
+        "read_sources": sorted(read_sources),
+        "server_timing_failure_count": server_timing_failures,
+        "response_body_bytes_maximum": response_body_bytes_maximum,
         "errors": errors,
     }
     args.output.write_text(

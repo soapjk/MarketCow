@@ -1510,9 +1510,9 @@ class MarketFrame(BaseModel):
     cursor: int
     status: Literal["ready", "fail_closed"]
     reason_codes: list[str]
-    tokens: list[LiveBook]
+    token_ids: list[str]
     relation_ids: list[str]
-    relation_tokens: list[LiveBook]
+    relation_token_ids: list[str]
     relation_pairs: list[LiveOutcomePair]
     instrument_revision: str
     fee_schedule_id: str
@@ -1546,6 +1546,9 @@ class LiveBootstrapResponse(BaseModel):
     sequence_semantics: Literal["deterministic_normalized"]
     recovery: dict[str, str]
     source_policy: Literal["official_free_only"]
+    projection_generation: int = Field(default=0, ge=0)
+    scope_market_ids: list[str] = Field(default_factory=list)
+    freshness_checked_at: datetime | None = None
 
 
 class LiveSnapshotPage(BaseModel):
@@ -1555,7 +1558,52 @@ class LiveSnapshotPage(BaseModel):
     catalog_revision: str | None
     cursor: int = Field(ge=0)
     count: int = Field(ge=0)
+    books: dict[str, LiveBook] = Field(default_factory=dict)
     items: list[MarketFrame]
+    projection_generation: int = Field(default=0, ge=0)
+    scope_market_ids: list[str] = Field(default_factory=list)
+    freshness_checked_at: datetime | None = None
+
+
+class LiveFullSyncResponse(BaseModel):
+    schema_version: Literal["marketcow.polymarket.live-full-sync.v1"] = (
+        "marketcow.polymarket.live-full-sync.v1"
+    )
+    catalog_revision: str
+    cursor: int = Field(ge=0)
+    projection_generation: int = Field(ge=1)
+    scope_market_ids: list[str] = Field(min_length=1)
+    freshness_checked_at: datetime
+    oldest_book_received_at: datetime
+    maximum_book_age_ms: float = Field(ge=0)
+    consumer_maximum_book_age_ms: float = Field(gt=0)
+    minimum_delivery_headroom_ms: float = Field(ge=0)
+    freshness_budget_remaining_ms: float
+    health: "LiveReadHealth"
+    bootstrap: LiveBootstrapResponse
+    snapshot: LiveSnapshotPage
+
+    @model_validator(mode="after")
+    def atomic_boundary_matches(self):
+        expected = (
+            self.catalog_revision,
+            self.cursor,
+            self.projection_generation,
+            self.scope_market_ids,
+            self.freshness_checked_at,
+        )
+        for component in (self.health, self.bootstrap, self.snapshot):
+            observed = (
+                component.catalog_revision,
+                component.latest_cursor if isinstance(component, LiveReadHealth)
+                else component.cursor,
+                component.projection_generation,
+                component.scope_market_ids,
+                component.freshness_checked_at,
+            )
+            if observed != expected:
+                raise ValueError("full-sync components disagree on atomic boundary")
+        return self
 
 
 class LiveEventPage(BaseModel):
@@ -1614,6 +1662,14 @@ class LiveReadHealth(BaseModel):
     realtime_sqlite_query_ms: float = Field(default=0, ge=0)
     reason_codes: list[str] = Field(default_factory=list)
     source_policy: Literal["official_free_only"] = "official_free_only"
+    projection_generation: int = Field(default=0, ge=0)
+    scope_market_ids: list[str] = Field(default_factory=list)
+    freshness_checked_at: datetime | None = None
+    oldest_book_received_at: datetime | None = None
+    maximum_book_age_ms: float | None = Field(default=None, ge=0)
+
+
+LiveFullSyncResponse.model_rebuild()
 
 
 class PolymarketLiveReadError(RuntimeError):
@@ -1665,6 +1721,8 @@ class PolymarketLiveReadStore:
         stable_read_wait_seconds: float | None = None,
         stable_read_poll_seconds: float | None = None,
         stable_snapshot_max_book_age_seconds: float | None = None,
+        consumer_maximum_book_age_seconds: float | None = None,
+        minimum_delivery_headroom_seconds: float = 0.0,
     ):
         self.root = root.resolve()
         self.now_provider = now_provider
@@ -1683,6 +1741,22 @@ class PolymarketLiveReadStore:
             if stable_snapshot_max_book_age_seconds is None
             else max(0.001, stable_snapshot_max_book_age_seconds)
         )
+        self.consumer_maximum_book_age_seconds = (
+            self._stable_snapshot_max_book_age_seconds
+            if consumer_maximum_book_age_seconds is None
+            else max(0.001, consumer_maximum_book_age_seconds)
+        )
+        self.minimum_delivery_headroom_seconds = max(
+            0.0, minimum_delivery_headroom_seconds,
+        )
+        if (
+            self.consumer_maximum_book_age_seconds is not None
+            and self.minimum_delivery_headroom_seconds
+            >= self.consumer_maximum_book_age_seconds
+        ):
+            raise ValueError(
+                "minimum delivery headroom must be smaller than consumer maximum book age"
+            )
         self.catalog_path = self.root / "catalog.json"
         self.normalized_catalog_root = self.root / "catalogs"
         self.catalog_index_root = self.root / "catalog-indexes"
@@ -2448,11 +2522,22 @@ class PolymarketLiveReadStore:
         transient.active_recovery_id = metadata.get("active_recovery_id") or None
         transient.books = books
         transient.gaps = gaps
+        frames = [transient.frame(market_id) for market_id in selected_ids]
+        referenced_token_ids = {
+            token_id
+            for frame in frames
+            for token_id in (*frame.token_ids, *frame.relation_token_ids)
+        }
         return LiveSnapshotPage(
             catalog_revision=transient.catalog_revision,
             cursor=transient.cursor,
             count=len(selected_ids),
-            items=[transient.frame(market_id) for market_id in selected_ids],
+            books={
+                token_id: transient.books[token_id]
+                for token_id in sorted(referenced_token_ids)
+                if token_id in transient.books
+            },
+            items=frames,
         )
 
     def snapshot_json(self, market_ids: Iterable[str]) -> bytes:
@@ -2468,20 +2553,26 @@ class PolymarketLiveReadStore:
         """
         page = self.snapshot(market_ids)
         payload = page.model_dump_json().encode("utf-8")
-        maximum_age = self._stable_snapshot_max_book_age_seconds
+        maximum_age = self.consumer_maximum_book_age_seconds
         if maximum_age is None:
             return payload
         observed_at = self.now_provider()
-        books = {
-            book.token_id: book
-            for frame in page.items
-            for book in (*frame.tokens, *frame.relation_tokens)
-        }
-        if not books or any(
-            not 0 <= (observed_at - book.received_at).total_seconds() < maximum_age
+        books = page.books
+        observed_ages = [
+            (observed_at - book.received_at).total_seconds()
             for book in books.values()
+        ]
+        remaining = maximum_age - max(observed_ages, default=maximum_age)
+        if (
+            not books
+            or any(age < 0 for age in observed_ages)
+            or remaining <= self.minimum_delivery_headroom_seconds
         ):
-            raise self._stable_boundary_unavailable("snapshot response")
+            raise PolymarketLiveReadError(
+                "polymarket_snapshot_freshness_budget_exhausted",
+                "The scoped snapshot cannot retain the required delivery headroom",
+                503,
+            )
         return payload
 
     def events_after(
@@ -5735,8 +5826,10 @@ class LiveStateStore:
             market_id=market_id, condition_id=market.identity.condition_id,
             frame_at=current, cursor=self.cursor,
             status="fail_closed" if reasons else "ready",
-            reason_codes=sorted(set(reasons)), tokens=books,
-            relation_ids=relation_ids, relation_tokens=relation_books,
+            reason_codes=sorted(set(reasons)),
+            token_ids=[book.token_id for book in books],
+            relation_ids=relation_ids,
+            relation_token_ids=[book.token_id for book in relation_books],
             relation_pairs=relation_pairs,
             instrument_revision=market.rules.instrument.revision,
             fee_schedule_id=market.rules.fee_schedule.schedule_id,
@@ -6269,11 +6362,7 @@ def load_scoped_live_store(
         for market in bootstrap.markets if market.active and not market.closed
         for outcome in market.identity.outcomes
     }
-    store.books = {
-        book.token_id: book
-        for frame in snapshot.items
-        for book in frame.tokens
-    }
+    store.books = dict(snapshot.books)
     store.gaps = [gap.model_copy(deep=True) for gap in gaps.items]
     store.cursor = int(state_metadata["latest_cursor"])
     store.catalog_revision = bootstrap.catalog_revision

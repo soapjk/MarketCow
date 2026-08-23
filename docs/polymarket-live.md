@@ -170,9 +170,10 @@ All endpoints are local MarketCow reads and appear in OpenAPI:
 ```text
 GET /v1/prediction-markets/polymarket/live/bootstrap?market_id=m1&market_id=m2
 GET /v1/prediction-markets/polymarket/live/snapshot?market_id=m1&market_id=m2
+GET /v1/prediction-markets/polymarket/live/full-sync?market_id=m1&market_id=m2
 GET /v1/prediction-markets/polymarket/live/events?market_id=m1&after_cursor=123&limit=1000
 GET /v1/prediction-markets/polymarket/live/checkpoint?market_id=m1&market_id=m2
-GET /v1/prediction-markets/polymarket/live/health
+GET /v1/prediction-markets/polymarket/live/health?market_id=m1&market_id=m2
 GET /v1/prediction-markets/polymarket/live/gaps?market_id=m1&unresolved_only=true
 GET /v1/prediction-markets/polymarket/live/public-data/{kind}
 WS  /v1/prediction-markets/polymarket/live/stream?market_id=m1&after_cursor=123
@@ -184,12 +185,32 @@ sequence semantics, and recovery contract. An unscoped request returns
 `polymarket_full_universe_disabled`; missing/legacy indexes return a machine-readable
 503 and index/row integrity failures return 409. The production snapshot and events hot
 path uses the process-local live projection and requires the same 1–100 market scope.
+`full-sync` is the preferred startup and recovery read. One in-memory lock boundary
+captures health, bootstrap, snapshot, catalog revision, cursor, exact scope,
+projection generation, and `freshness_checked_at`. The response also carries
+`oldest_book_received_at`, `maximum_book_age_ms`,
+`consumer_maximum_book_age_ms`, `minimum_delivery_headroom_ms`, and
+`freshness_budget_remaining_ms`. If construction and JSON serialization leave no
+strict delivery budget, the service returns retryable HTTP 503 with
+`polymarket_snapshot_freshness_budget_exhausted`; it never emits a borderline 200.
+
+Snapshot books are serialized once in the top-level `books` map. Each frame contains
+only `token_ids` and `relation_token_ids` references. Scoped health evaluates that
+same union, including Standard Negative Risk relation books, so health cannot be ready
+while the corresponding scoped snapshot is stale or incomplete.
+
+The budget controls are configured with
+`MARKETCOW_POLYMARKET_CONSUMER_MAXIMUM_BOOK_AGE_SECONDS` and
+`MARKETCOW_POLYMARKET_MINIMUM_DELIVERY_HEADROOM_SECONDS`. Hot-read phases are exposed
+in `Server-Timing`; structured telemetry separately records response bytes,
+cursor/status and ASGI response-write time.
+
 Checkpoint, gaps, cold-start recovery, audit, and history remain durable-index
 responsibilities.
 They return `polymarket_latest_state_index_unavailable` before migration,
 `polymarket_state_index_lagging` when the event log is ahead, and
 `polymarket_state_integrity_failed` for an index/log/revision/hash disagreement. A
-standard negative-risk frame additionally returns every YES-member book and the exact
+standard negative-risk frame additionally references every YES-member book and the exact
 pair metadata needed to verify its corresponding NO instrument. Frame revisions bind
 the instrument facts and fee schedule.
 
