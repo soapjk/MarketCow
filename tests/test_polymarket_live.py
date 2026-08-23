@@ -590,6 +590,30 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(len(frame.tokens), 2)
         self.assertNotEqual(frame.tokens[0].book_epoch, "")
 
+    def test_price_change_message_validates_all_token_levels_atomically(self):
+        store = self.store()
+        store.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+
+        events = store.apply_websocket({
+            "event_type": "price_change",
+            "market": "0x" + "1" * 64,
+            "timestamp": "1785739201000",
+            "price_changes": [
+                # Applying this first level alone would cross the old ask.
+                {"asset_id": "yes-1", "side": "BUY", "price": "0.43", "size": "1"},
+                # The same upstream message removes that ask and publishes a
+                # valid final spread, so no recovery gap should be exposed.
+                {"asset_id": "yes-1", "side": "SELL", "price": "0.42", "size": "0"},
+                {"asset_id": "yes-1", "side": "SELL", "price": "0.44", "size": "2"},
+            ],
+        }, received_at=NOW + timedelta(seconds=1))
+
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].applied)
+        self.assertEqual(store.books["yes-1"].bids[0]["price"], "0.43")
+        self.assertEqual(store.books["yes-1"].asks[0]["price"], "0.44")
+        self.assertEqual(sum(not item.resolved for item in store.gaps), 0)
+
     def test_live_snapshot_levels_are_canonical_best_price_first(self):
         store = self.store()
         raw = snapshot("yes-1", "0.40", "0.42")
