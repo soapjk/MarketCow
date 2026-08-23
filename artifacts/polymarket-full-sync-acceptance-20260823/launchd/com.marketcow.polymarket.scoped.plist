@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.marketcow.polymarket.scoped</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/androidjk/Library/Application Support/MarketCow/atomic-freshness-venv/bin/python</string>
+    <string>/Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332/scripts/run_polymarket_live_paper_scope.py</string>
+    <string>--root</string><string>/Volumes/T9/data/marketcow/production/prediction-markets/polymarket-live</string>
+    <string>--config</string><string>/Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332/artifacts/polymarket-full-sync-acceptance-20260823/live-paper.yaml</string>
+    <string>--snapshot-refresh-seconds</string><string>2.0</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PYTHONPATH</key><string>/Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332/src</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>WorkingDirectory</key><string>/Volumes/T9/projects/marketcow-workitem-ff65fa86-9f6f-4f7a-948d-633270887332</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/androidjk/Library/Logs/MarketCow/polymarket-scoped.log</string>
+  <key>StandardErrorPath</key><string>/Users/androidjk/Library/Logs/MarketCow/polymarket-scoped.error.log</string>
+</dict></plist>
