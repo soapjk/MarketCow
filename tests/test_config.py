@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -116,6 +117,37 @@ class SettingsTest(unittest.TestCase):
                 replace(settings, raw_path=root.parent / "outside").validate_preflight()
             with self.assertRaisesRegex(ValueError, "loopback"):
                 replace(settings, clickhouse_host="example.com").validate_preflight()
+
+    def test_public_read_configuration_loads_and_fails_closed(self):
+        with tempfile.TemporaryDirectory(suffix="-test") as folder:
+            root = Path(folder)
+            env = {
+                "MARKETCOW_PROFILE": "test", "MARKETCOW_HOME": str(root),
+                "MARKETCOW_ALLOWED_ROOT": str(root.parent),
+                "MARKETCOW_POSTGRES_DSN":
+                    "postgresql://user:password@127.0.0.1/marketcow_test",
+                "MARKETCOW_CLICKHOUSE_PASSWORD": "secret",
+                "MARKETCOW_PUBLIC_READ_ENABLED": "true",
+                "MARKETCOW_PUBLIC_READ_ALLOWLIST_JSON": '["/v1/health"]',
+                "MARKETCOW_INVESTRACE_JWT_ISSUER": "https://auth.investrace.test",
+                "MARKETCOW_INVESTRACE_JWT_KEYS_JSON": json.dumps({
+                    "active": "investrace-signing-key-00000000000000000000"
+                }),
+                "MARKETCOW_PUBLIC_JWT_KEYS_JSON": json.dumps({
+                    "active": "marketcow-signing-key-000000000000000000000"
+                }),
+            }
+            with patch.dict(os.environ, env, clear=True):
+                settings = Settings.from_env()
+            settings.validate_preflight()
+            self.assertTrue(settings.public_read_enabled)
+            self.assertEqual(settings.public_read_allowlist, ("/v1/health",))
+            with self.assertRaisesRegex(ValueError, "allowlist"):
+                replace(settings, public_read_allowlist=()).validate_preflight()
+            with self.assertRaisesRegex(ValueError, "key declaration"):
+                replace(
+                    settings, marketcow_jwt_keys_json='{"active":"too-short"}'
+                ).validate_preflight()
 
 
 if __name__ == "__main__":
