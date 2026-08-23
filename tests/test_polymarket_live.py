@@ -2135,6 +2135,33 @@ class PolymarketLiveTest(unittest.TestCase):
             4,
         )
 
+    def test_scoped_writer_starts_from_log_tail_when_derived_index_is_malformed(self):
+        root = self.root / "live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        durable_size = writer.event_path.stat().st_size
+
+        with patch.object(
+            polymarket_live_module.LiveStateIndex,
+            "ensure_runtime_schema",
+            side_effect=sqlite3.DatabaseError("database disk image is malformed"),
+        ):
+            scoped = load_scoped_live_store(
+                root, ["m1"], now_provider=lambda: NOW,
+            )
+
+        self.assertEqual(scoped.cursor, writer.cursor)
+        self.assertEqual(scoped.persisted_cursor, writer.cursor)
+        self.assertEqual(scoped._event_offset, durable_size)
+        self.assertEqual(set(scoped.catalog), {"m1"})
+        self.assertEqual(set(scoped.token_to_market), {"yes-1", "no-1"})
+        self.assertEqual(scoped.books, {})
+        self.assertFalse(scoped._state_index_available)
+        self.assertIn("database disk image is malformed", scoped.derived_index_error)
+
     def test_state_index_rebuild_resumes_from_committed_event_boundary(self):
         root = self.root / "live"
         writer = LiveStateStore(root, now_provider=lambda: NOW)

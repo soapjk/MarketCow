@@ -75,6 +75,7 @@ class PolymarketLiveProjection:
         self._persisted_cursor = 0
         self._persistence_queue_depth = 0
         self._persistence_error: str | None = None
+        self._derived_index_error: str | None = None
         self._connected = False
         self._disconnect_count = 0
         self._event_loop_stall_max_ms = 0.0
@@ -157,6 +158,9 @@ class PolymarketLiveProjection:
                 payload.get("persistence_queue_depth", 0)
             )
             self._persistence_error = payload.get("persistence_error") or None
+            self._derived_index_error = (
+                payload.get("derived_index_error") or None
+            )
             self._connected = True
             self._ready = False
             self._error_code = None
@@ -223,6 +227,7 @@ class PolymarketLiveProjection:
 
     def update_persistence(
         self, cursor: int, *, queue_depth: int = 0, error: str | None = None,
+        derived_index_error: str | None = None,
     ) -> None:
         with self._lock:
             # The persistence worker and each WebSocket sender are independent
@@ -236,6 +241,7 @@ class PolymarketLiveProjection:
             self._persisted_cursor = cursor
             self._persistence_queue_depth = max(0, queue_depth)
             self._persistence_error = error or None
+            self._derived_index_error = derived_index_error or None
             self._generation += 1
 
     def watermarks(self) -> dict[str, int | bool | str | None]:
@@ -251,6 +257,7 @@ class PolymarketLiveProjection:
                 "live_stream_disconnect_count": self._disconnect_count,
                 "event_loop_stall_max_ms": self._event_loop_stall_max_ms,
                 "persistence_error": self._persistence_error,
+                "derived_index_error": self._derived_index_error,
             }
 
     def observe_event_loop_stall(self, milliseconds: float) -> None:
@@ -563,6 +570,7 @@ class PolymarketLiveProjection:
             catalog_source = self._catalog_source
             persisted_cursor = self._persisted_cursor
             persistence_queue_depth = self._persistence_queue_depth
+            derived_index_error = self._derived_index_error
             connected = self._connected
             disconnect_count = self._disconnect_count
             event_loop_stall_max_ms = self._event_loop_stall_max_ms
@@ -616,6 +624,7 @@ class PolymarketLiveProjection:
             "catalog_source": catalog_source,
             "persisted_cursor": persisted_cursor,
             "persistence_queue_depth": persistence_queue_depth,
+            "derived_index_error": derived_index_error,
             "connected": connected,
             "disconnect_count": disconnect_count,
             "event_loop_stall_max_ms": event_loop_stall_max_ms,
@@ -685,6 +694,7 @@ class PolymarketLiveProjection:
                 0, capture["cursor"] - capture["persisted_cursor"],
             ),
             persistence_queue_depth=capture["persistence_queue_depth"],
+            derived_index_error=capture["derived_index_error"],
             live_stream_connected=capture["connected"],
             live_stream_disconnect_count=capture["disconnect_count"],
             event_loop_stall_max_ms=capture["event_loop_stall_max_ms"],
@@ -966,6 +976,7 @@ class PolymarketLiveStreamServer:
                 ),
                 "persistence_queue_depth": self.store._persistence_queue.qsize(),
                 "persistence_error": self.store.persistence_error,
+                "derived_index_error": self.store.derived_index_error,
                 "active_recovery_id": self.store.active_recovery_id,
                 "history_oldest_cursor": (
                     history[0].cursor if history else self.store.cursor + 1
@@ -1022,6 +1033,7 @@ class PolymarketLiveStreamServer:
                             self.store._persistence_queue.qsize()
                         ),
                         "persistence_error": self.store.persistence_error,
+                        "derived_index_error": self.store.derived_index_error,
                     }, separators=(",", ":")))
                     continue
                 if message["type"] == "close":
@@ -1039,6 +1051,7 @@ class PolymarketLiveStreamServer:
                             self.store._persistence_queue.qsize()
                         ),
                         "persistence_error": self.store.persistence_error,
+                        "derived_index_error": self.store.derived_index_error,
                     }
                 else:
                     payload = {
@@ -1050,6 +1063,7 @@ class PolymarketLiveStreamServer:
                             self.store._persistence_queue.qsize()
                         ),
                         "persistence_error": self.store.persistence_error,
+                        "derived_index_error": self.store.derived_index_error,
                     }
                 await websocket.send(json.dumps(payload, separators=(",", ":")))
         except (asyncio.CancelledError, websockets.ConnectionClosed):
@@ -1112,6 +1126,9 @@ class PolymarketLiveStreamClient:
                                     message.get("persistence_queue_depth", 0)
                                 ),
                                 error=message.get("persistence_error"),
+                                derived_index_error=message.get(
+                                    "derived_index_error"
+                                ),
                             )
                         elif kind == "book_confirmation":
                             if not isinstance(validated, LiveBook):
@@ -1126,6 +1143,9 @@ class PolymarketLiveStreamClient:
                                     message.get("persistence_queue_depth", 0)
                                 ),
                                 error=message.get("persistence_error"),
+                                derived_index_error=message.get(
+                                    "derived_index_error"
+                                ),
                             )
                         elif kind == "persisted":
                             self.projection.update_persistence(
@@ -1138,6 +1158,9 @@ class PolymarketLiveStreamClient:
                                     message.get("persistence_queue_depth", 0)
                                 ),
                                 error=message.get("persistence_error"),
+                                derived_index_error=message.get(
+                                    "derived_index_error"
+                                ),
                             )
                         else:
                             raise ValueError("unsupported Polymarket stream frame")

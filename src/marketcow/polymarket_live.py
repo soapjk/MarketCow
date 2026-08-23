@@ -1653,6 +1653,7 @@ class LiveReadHealth(BaseModel):
     persisted_cursor: int = Field(default=0, ge=0)
     persistence_lag_events: int = Field(default=0, ge=0)
     persistence_queue_depth: int = Field(default=0, ge=0)
+    derived_index_error: str | None = None
     live_stream_connected: bool = False
     live_stream_disconnect_count: int = Field(default=0, ge=0)
     event_loop_stall_max_ms: float = Field(default=0, ge=0)
@@ -4671,6 +4672,11 @@ class LiveStateStore:
         self._persistence_condition = threading.Condition()
         self.persisted_cursor = 0
         self.persistence_error: str | None = None
+        # The append-only event log and the mutable SQLite index are separate
+        # failure domains. A broken derived index is observable, but must never
+        # stop real-time publication or durable event-log appends.
+        self.derived_index_error: str | None = None
+        self._state_index_available = True
         # API construction must not deserialize the multi-GB catalog or replay the
         # event log. Stateful operations retain compatibility through _ensure_loaded.
         self._recovered = False
@@ -4829,13 +4835,42 @@ class LiveStateStore:
     def _persist_records(self, records: list[dict[str, Any]]) -> None:
         started = time.monotonic()
         event_records = [item for item in records if item["kind"] == "event"]
+        indexed_events: list[tuple[dict[str, Any], int, int, str]] = []
         with _publication_lock(self.root, exclusive=True):
             self.event_path.parent.mkdir(parents=True, exist_ok=True)
             with self.event_path.open("a+b") as stream:
                 stream.seek(0, os.SEEK_END)
-                initial_offset = stream.tell()
-                last_offset = initial_offset
+                last_offset = stream.tell()
+                for record in event_records:
+                    event = record["event"]
+                    body = canonical_json(event.model_dump(mode="json")) + b"\n"
+                    byte_offset = stream.tell()
+                    stream.write(body)
+                    last_offset = stream.tell()
+                    indexed_events.append((
+                        record, byte_offset, len(body),
+                        hashlib.sha256(body).hexdigest(),
+                    ))
+                if indexed_events:
+                    # This is the authoritative durability boundary. It is
+                    # intentionally committed before touching derived SQLite.
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            if event_records:
+                last_event = event_records[-1]["event"]
+                with self._persistence_condition:
+                    self.persisted_cursor = last_event.cursor
+                    self._event_offset = last_offset
+                    self._last_log_cursor = last_event.cursor
+                    self._persistence_condition.notify_all()
+
+            if self._state_index_available:
                 try:
+                    event_positions = {
+                        id(record): (byte_offset, byte_length, line_sha256)
+                        for record, byte_offset, byte_length, line_sha256
+                        in indexed_events
+                    }
                     with self.state_index.batch():
                         for record in records:
                             if record["kind"] == "confirmation":
@@ -4847,17 +4882,14 @@ class LiveStateStore:
                                 )
                                 continue
                             event = record["event"]
-                            body = canonical_json(
-                                event.model_dump(mode="json")
-                            ) + b"\n"
-                            byte_offset = stream.tell()
-                            stream.write(body)
-                            last_offset = stream.tell()
+                            byte_offset, byte_length, line_sha256 = (
+                                event_positions[id(record)]
+                            )
                             self.state_index.append(
                                 event,
                                 byte_offset=byte_offset,
-                                byte_length=len(body),
-                                line_sha256=hashlib.sha256(body).hexdigest(),
+                                byte_length=byte_length,
+                                line_sha256=line_sha256,
                                 book=record["book"],
                                 gaps=record["gaps"],
                                 catalog_revision=record["catalog_revision"],
@@ -4875,22 +4907,17 @@ class LiveStateStore:
                                     "oldest_book_received_at"
                                 ],
                             )
-                        if last_offset != initial_offset:
-                            stream.flush()
-                            os.fsync(stream.fileno())
-                except BaseException:
-                    stream.seek(initial_offset)
-                    stream.truncate()
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                    raise
-        if event_records:
-            last_event = event_records[-1]["event"]
-            with self._persistence_condition:
-                self.persisted_cursor = last_event.cursor
-                self._event_offset = last_offset
-                self._last_log_cursor = last_event.cursor
-                self._persistence_condition.notify_all()
+                except BaseException as exc:
+                    self._state_index_available = False
+                    self.derived_index_error = (
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    self.state_index.close()
+                    LOGGER.exception(
+                        "polymarket_derived_index_isolated "
+                        "durable_cursor=%d durable_event_log_size=%d",
+                        self.persisted_cursor, last_offset,
+                    )
         elapsed = time.monotonic() - started
         if elapsed >= 0.25:
             LOGGER.info(
@@ -6326,6 +6353,43 @@ def catch_up_live_state_index(root: Path) -> dict[str, int]:
         }
 
 
+def _durable_event_log_tail(
+    event_path: Path,
+) -> tuple[LiveEventEnvelope | None, int]:
+    """Read and authenticate only the final append-only event-log record."""
+    if not event_path.is_file():
+        return None, 0
+    with event_path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        if size == 0:
+            return None, 0
+        stream.seek(size - 1)
+        if stream.read(1) != b"\n":
+            raise RuntimeError("durable live event log ends with a partial row")
+        end = size - 1
+        position = end
+        start = 0
+        chunk_size = 64 * 1024
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            stream.seek(position)
+            chunk = stream.read(read_size)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                start = position + newline + 1
+                break
+        stream.seek(start)
+        line = stream.read(end - start)
+    try:
+        event = LiveEventEnvelope.model_validate_json(line)
+        LiveStateStore._validate_event(event, event.cursor)
+    except ValueError as exc:
+        raise RuntimeError("durable live event log tail is invalid") from exc
+    return event, size
+
+
 def load_scoped_live_store(
     root: Path,
     market_ids: Iterable[str],
@@ -6334,21 +6398,55 @@ def load_scoped_live_store(
 ) -> LiveStateStore:
     """Hydrate a bounded writer from published indexes without full recovery."""
     root = root.resolve()
-    LiveStateIndex(root).ensure_runtime_schema()
-    recovery = catch_up_live_state_index(root)
-    if recovery["replayed_events"]:
-        LOGGER.warning("live_state_index_tail_recovered %s", recovery)
     reader = PolymarketLiveReadStore(root, now_provider=now_provider)
     selected_ids = reader._scope(market_ids)
+    # Catalog rows are immutable and independently hashed. They are sufficient
+    # to subscribe and REST-bootstrap the scoped in-memory projection even when
+    # the mutable latest-state index is unavailable.
+    bootstrap = reader.bootstrap(selected_ids, _bind_live_books=False)
+    derived_index_error: str | None = None
+    state_index_available = True
     # Writer hydration must preserve an interrupted recovery marker so the
     # restarted collector can finish it. Consumer reads use the public defaults
     # above and never observe this intentionally unstable internal boundary.
-    bootstrap = reader.bootstrap(selected_ids, _bind_live_books=False)
-    snapshot = reader.snapshot(
-        selected_ids, _wait_for_stable_boundary=False,
-    )
-    gaps = reader.gaps(selected_ids, unresolved_only=True)
-    _, state_metadata = reader._state_binding()
+    try:
+        LiveStateIndex(root).ensure_runtime_schema()
+        recovery = catch_up_live_state_index(root)
+        if recovery["replayed_events"]:
+            LOGGER.warning("live_state_index_tail_recovered %s", recovery)
+        snapshot = reader.snapshot(
+            selected_ids, _wait_for_stable_boundary=False,
+        )
+        gaps = reader.gaps(selected_ids, unresolved_only=True)
+        _, state_metadata = reader._state_binding()
+        books = dict(snapshot.books)
+        unresolved_gaps = [gap.model_copy(deep=True) for gap in gaps.items]
+    except (sqlite3.DatabaseError, PolymarketLiveReadError, RuntimeError) as exc:
+        if (
+            isinstance(exc, PolymarketLiveReadError)
+            and exc.code not in {
+                "polymarket_latest_state_index_unavailable",
+                "polymarket_state_integrity_failed",
+                "polymarket_state_index_lagging",
+            }
+        ):
+            raise
+        tail, event_log_size = _durable_event_log_tail(root / "events.jsonl")
+        state_metadata = {
+            "latest_cursor": str(tail.cursor if tail is not None else 0),
+            "event_log_size": str(event_log_size),
+            "active_recovery_id": "",
+        }
+        books = {}
+        unresolved_gaps = []
+        state_index_available = False
+        derived_index_error = f"{type(exc).__name__}:{exc}"
+        LOGGER.error(
+            "polymarket_derived_index_startup_isolated error=%s "
+            "durable_cursor=%s durable_event_log_size=%s",
+            derived_index_error, state_metadata["latest_cursor"],
+            state_metadata["event_log_size"],
+        )
 
     # Scoped collectors publish through the durable event/state indexes; they
     # do not serve in-process replay. Keep only a small duplicate-detection
@@ -6362,8 +6460,8 @@ def load_scoped_live_store(
         for market in bootstrap.markets if market.active and not market.closed
         for outcome in market.identity.outcomes
     }
-    store.books = dict(snapshot.books)
-    store.gaps = [gap.model_copy(deep=True) for gap in gaps.items]
+    store.books = books
+    store.gaps = unresolved_gaps
     store.cursor = int(state_metadata["latest_cursor"])
     store.catalog_revision = bootstrap.catalog_revision
     store.catalog_source = bootstrap.catalog_source
@@ -6371,6 +6469,8 @@ def load_scoped_live_store(
     store._event_offset = int(state_metadata["event_log_size"])
     store._last_log_cursor = store.cursor
     store.persisted_cursor = store.cursor
+    store.derived_index_error = derived_index_error
+    store._state_index_available = state_index_available
     store._catalog_file_sha256 = _file_sha256(store.catalog_path)
     checkpoint_path = root / "checkpoint.json"
     if checkpoint_path.exists():
