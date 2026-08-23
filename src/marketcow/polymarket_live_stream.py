@@ -40,6 +40,21 @@ def _validate_event(event: LiveEventEnvelope) -> None:
         raise ValueError("live stream event identity mismatch")
 
 
+def _decode_stream_message(
+    raw: str | bytes,
+) -> tuple[dict[str, Any], LiveEventEnvelope | LiveBook | None]:
+    """Decode and authenticate one frame in one worker scheduling hop."""
+    message = json.loads(raw)
+    kind = message.get("type")
+    if kind == "event":
+        event = LiveEventEnvelope.model_validate(message["event"])
+        _validate_event(event)
+        return message, event
+    if kind == "book_confirmation":
+        return message, LiveBook.model_validate(message["book"])
+    return message, None
+
+
 class PolymarketLiveProjection:
     """Process-local hot projection populated exclusively by the live stream."""
 
@@ -893,7 +908,9 @@ class PolymarketLiveStreamClient:
                         # verification are CPU-bound.  Keeping them off the API
                         # event loop prevents broad frame serialization or a
                         # slow HTTP writer from starving WebSocket receive.
-                        message = await asyncio.to_thread(json.loads, raw)
+                        message, validated = await asyncio.to_thread(
+                            _decode_stream_message, raw
+                        )
                         kind = message.get("type")
                         if kind == "state":
                             await asyncio.to_thread(
@@ -907,11 +924,9 @@ class PolymarketLiveStreamClient:
                         elif kind == "ready":
                             self.projection.mark_ready(message)
                         elif kind == "event":
-                            event = await asyncio.to_thread(
-                                LiveEventEnvelope.model_validate,
-                                message["event"],
-                            )
-                            await asyncio.to_thread(_validate_event, event)
+                            if not isinstance(validated, LiveEventEnvelope):
+                                raise ValueError("validated event frame is missing")
+                            event = validated
                             self.projection.apply_validated_live(event)
                             self.projection.update_persistence(
                                 int(message.get("persisted_cursor", 0)),
@@ -921,9 +936,11 @@ class PolymarketLiveStreamClient:
                                 error=message.get("persistence_error"),
                             )
                         elif kind == "book_confirmation":
-                            book = await asyncio.to_thread(
-                                LiveBook.model_validate, message["book"]
-                            )
+                            if not isinstance(validated, LiveBook):
+                                raise ValueError(
+                                    "validated book confirmation is missing"
+                                )
+                            book = validated
                             self.projection.confirm_validated_book(book)
                             self.projection.update_persistence(
                                 int(message.get("persisted_cursor", 0)),

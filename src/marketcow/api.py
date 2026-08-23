@@ -600,14 +600,11 @@ def create_app(
     app.state.polymarket_live = polymarket_live
     polymarket_live_read = PolymarketLiveReadStore(
         polymarket_live.root,
-        # The strict live consumer evaluates at a five-second maximum age.
-        # The 100-market collector can spend roughly four seconds between its
-        # common REST receive timestamp and the atomic 200-book publication.
-        # The optimized response path normally projects and writes in well
-        # directly from memory, and snapshot_json rechecks the exact serialized
-        # page at the response edge. Keep a measured 100ms loopback transport
-        # margin inside Tradude's unchanged five-second fail-closed boundary.
-        stable_snapshot_max_book_age_seconds=4.9,
+        # Tradude's fail-closed boundary remains exactly five seconds.  Reserve
+        # one second for loopback response writing and client JSON decoding so
+        # a successful frame cannot cross that unchanged consumer boundary in
+        # transit.  This is deliberately stricter, never a threshold increase.
+        stable_snapshot_max_book_age_seconds=4.0,
     )
     app.state.polymarket_live_read = polymarket_live_read
     polymarket_live_projection = PolymarketLiveProjection(
