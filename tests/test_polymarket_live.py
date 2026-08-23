@@ -40,6 +40,7 @@ from marketcow.polymarket_live import (
     build_live_candidate_snapshot,
     build_live_state_index,
     catch_up_live_state_index,
+    live_event_identity,
     load_scoped_live_store,
 )
 from tests.test_market_data_api import Service
@@ -688,6 +689,31 @@ class PolymarketLiveTest(unittest.TestCase):
             rejected.gaps[0].resolution, "superseded_by_newer_snapshot"
         )
         self.assertEqual(sum(not item.resolved for item in store.gaps), 0)
+
+    def test_recovery_does_not_mutate_published_gap_event_identity(self):
+        store = self.store()
+        store.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        event = store.apply_websocket({
+            "event_type": "price_change",
+            "timestamp": "1785739202000",
+            "price_changes": [{
+                "asset_id": "yes-1", "side": "BUY",
+                "price": "0.43", "size": "1",
+            }],
+        }, received_at=NOW)[0]
+        event_json_before_recovery = event.model_dump_json()
+
+        recovery_id = store.mark_recovery_started("identity-regression")
+        tracker = store.new_book_recovery_tracker()
+        tracker["recovered"].update(tracker["expected"])
+        store.complete_book_recovery(
+            recovery_id, tracker, write_checkpoint=False
+        )
+
+        self.assertTrue(store.gaps[0].resolved)
+        self.assertFalse(event.gaps[0].resolved)
+        self.assertEqual(event.model_dump_json(), event_json_before_recovery)
+        self.assertEqual(live_event_identity(event), event.event_id)
 
     def test_market_resolved_updates_lifecycle_and_is_retained_after_active_refresh(self):
         store = self.store()

@@ -5006,7 +5006,15 @@ class LiveStateStore:
             canonical_payload_sha256=canonical_hash,
             raw_payload=raw_payload, raw_payload_sha256=raw_hash,
             applied=applied, fail_closed_reason=reason,
-            gaps=gaps or [],
+            # A later REST recovery mutates the store's gap ledger in place.
+            # The event envelope is an immutable audit/publication record: if
+            # it retained those same model objects, an async stream sender
+            # could serialize the resolved form after event_id was computed
+            # from the unresolved form and force every client to disconnect on
+            # an identity mismatch.  Gap lists are tiny and exceptional, so
+            # copy only this mutable edge rather than deep-copying the common
+            # event/book hot path.
+            gaps=[gap.model_copy(deep=True) for gap in gaps or []],
         )
         envelope.event_id = live_event_identity(envelope)
         self.events.append(envelope)
