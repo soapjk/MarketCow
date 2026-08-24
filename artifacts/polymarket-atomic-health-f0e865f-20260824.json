@@ -1,0 +1,69 @@
+{
+  "commit": "f0e865fdee42810bc897777b4786fd28629e9462",
+  "failures": [],
+  "finished_at": "2026-08-24T06:26:40.773551+00:00",
+  "interval_seconds": 0.25,
+  "market_count": 100,
+  "passed": true,
+  "ports": [
+    8790,
+    8791
+  ],
+  "results": {
+    "8790": {
+      "all_lag_exact": true,
+      "all_persisted_lte_latest": true,
+      "duration_seconds": 49.8231106250023,
+      "first": {
+        "index": 0,
+        "latest_cursor": 22252772,
+        "persisted_cursor": 22252770,
+        "persistence_lag_events": 2,
+        "projection_generation": 1741,
+        "requested_at": "2026-08-24T06:25:50.854578+00:00"
+      },
+      "last": {
+        "index": 199,
+        "latest_cursor": 22253456,
+        "persisted_cursor": 22253451,
+        "persistence_lag_events": 5,
+        "projection_generation": 12866,
+        "requested_at": "2026-08-24T06:26:40.614243+00:00"
+      },
+      "maximum_latest_cursor": 22253456,
+      "maximum_persistence_lag_events": 16,
+      "minimum_latest_cursor": 22252772,
+      "sample_count": 200
+    },
+    "8791": {
+      "all_lag_exact": true,
+      "all_persisted_lte_latest": true,
+      "duration_seconds": 49.924793082995166,
+      "first": {
+        "index": 0,
+        "latest_cursor": 22252772,
+        "persisted_cursor": 22252770,
+        "persistence_lag_events": 2,
+        "projection_generation": 1797,
+        "requested_at": "2026-08-24T06:25:50.853895+00:00"
+      },
+      "last": {
+        "index": 199,
+        "latest_cursor": 22253466,
+        "persisted_cursor": 22253461,
+        "persistence_lag_events": 5,
+        "projection_generation": 12942,
+        "requested_at": "2026-08-24T06:26:40.670464+00:00"
+      },
+      "maximum_latest_cursor": 22253466,
+      "maximum_persistence_lag_events": 16,
+      "minimum_latest_cursor": 22252772,
+      "sample_count": 200
+    }
+  },
+  "samples_per_port": 200,
+  "schema": "marketcow.polymarket.atomic-health-verification.v1",
+  "scope_id": "57bac2e63ea3015df414f874385f1080176cd771b047cb82e73b14e7cb6b45ef",
+  "scope_manifest": "/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/v69-two-sided-scope-20260824T082100CST/scopes/57bac2e63ea3015df414f874385f1080176cd771b047cb82e73b14e7cb6b45ef/manifest.json",
+  "started_at": "2026-08-24T06:25:50.848366+00:00"
+}
