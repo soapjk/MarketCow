@@ -50,6 +50,9 @@ SIZE_INCREMENT_SOURCE_URL = (
     "b076b04d61135657e25dccc1bbd6866a96bd8c6e/"
     "py_clob_client/order_builder/constants.py"
 )
+CLOB_MARKET_STREAM_SOURCE_URL = (
+    "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+)
 
 
 _PUBLICATION_LOCKS = threading.local()
@@ -1121,12 +1124,19 @@ def build_live_candidate_snapshot(root: Path) -> dict[str, Any]:
 
 
 class LiveFactProvenance(BaseModel):
-    source: Literal["polymarket_gamma", "polymarket_docs", "polymarket_sdk"]
+    source: Literal[
+        "polymarket_gamma", "polymarket_docs", "polymarket_sdk",
+        "polymarket_clob",
+    ]
     revision: str
     source_url: str
     observed_at: datetime
     payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     field_paths: list[str] = Field(min_length=1)
+    boundary_cursor: int | None = Field(default=None, ge=1)
+    projection_generation: int | None = Field(default=None, ge=1)
+    tick_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    token_ids: list[str] = Field(default_factory=list)
 
 
 class LiveInstrumentFacts(BaseModel):
@@ -1457,6 +1467,100 @@ class LiveBook(BaseModel):
     last_trade_price: str | None = None
     state_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_hash: str | None = None
+
+
+def bind_market_instrument_to_books(
+    market: LiveMarket,
+    books: dict[str, LiveBook],
+    *,
+    boundary_cursor: int,
+    projection_generation: int | None,
+    observed_at: datetime,
+) -> LiveMarket:
+    """Return facts bound to one complete, uniform book-tick boundary.
+
+    A two-outcome tick transition is temporarily mixed while its per-token
+    events arrive.  That intermediate state deliberately leaves the prior
+    instrument facts in place so scoped reads fail closed.  Once every outcome
+    book exposes one tick version, the replacement market and all books can be
+    captured atomically under the caller's state lock.
+    """
+    token_ids = sorted(outcome.token_id for outcome in market.identity.outcomes)
+    market_books = [books.get(token_id) for token_id in token_ids]
+    if any(book is None for book in market_books):
+        return market
+    complete_books = [book for book in market_books if book is not None]
+    ticks = {book.tick_size for book in complete_books}
+    tick_versions = {book.tick_version for book in complete_books}
+    if len(ticks) != 1 or len(tick_versions) != 1:
+        return market
+    tick = next(iter(ticks))
+    tick_version = next(iter(tick_versions))
+    boundary = {
+        "binding": "polymarket_clob_book_tick_v2",
+        "market_id": market.identity.market_id,
+        "token_ids": token_ids,
+        "price_increment": tick,
+        "tick_version": tick_version,
+        "cursor": boundary_cursor,
+        "projection_generation": projection_generation,
+    }
+    instrument = market.rules.instrument
+    has_dynamic_binding = any(
+        item.source == "polymarket_clob" for item in instrument.provenance
+    )
+    if instrument.price_increment == tick and not has_dynamic_binding:
+        return market
+    if instrument.price_increment == tick and (
+        projection_generation is None
+        or any(
+            item.source == "polymarket_clob"
+            and item.projection_generation is not None
+            and item.tick_version == tick_version
+            for item in instrument.provenance
+        )
+    ):
+        return market
+    result = market.model_copy(deep=True)
+    result_instrument = result.rules.instrument
+    provenance_revision = content_sha256(boundary)
+    result_instrument.price_increment = tick
+    result_instrument.provenance.append(LiveFactProvenance(
+        source="polymarket_clob",
+        revision=provenance_revision,
+        source_url=CLOB_MARKET_STREAM_SOURCE_URL,
+        observed_at=observed_at,
+        payload_sha256=content_sha256({
+            **boundary,
+            "books": {
+                book.token_id: {
+                    "tick_size": book.tick_size,
+                    "tick_version": book.tick_version,
+                    "state_checksum": book.state_checksum,
+                }
+                for book in complete_books
+            },
+        }),
+        field_paths=[
+            "event_type", "new_tick_size", "asset_id",
+            "book.tick_size", "book.tick_version",
+        ],
+        boundary_cursor=boundary_cursor,
+        projection_generation=projection_generation,
+        tick_version=tick_version,
+        token_ids=token_ids,
+    ))
+    result_instrument.revision = content_sha256({
+        "previous_revision": instrument.revision,
+        "dynamic_tick_boundary": boundary,
+        "provenance_revision": provenance_revision,
+    })
+    result.metadata_revision = content_sha256({
+        "previous_revision": market.metadata_revision,
+        "instrument_revision": result_instrument.revision,
+        "dynamic_tick_boundary": boundary,
+    })
+    return result
 
 
 class LiveEventEnvelope(BaseModel):
@@ -2334,7 +2438,7 @@ class PolymarketLiveReadStore:
             raise RuntimeError("live book binding requires state metadata")
         result = response.model_copy(deep=True)
         result.cursor = int(metadata["latest_cursor"])
-        for market in result.markets:
+        for market_index, market in enumerate(result.markets):
             books = books_by_market.get(market.identity.market_id, [])
             expected_tokens = {outcome.token_id for outcome in market.identity.outcomes}
             if {book.token_id for book in books} != expected_tokens:
@@ -2353,20 +2457,14 @@ class PolymarketLiveReadStore:
                     503,
                 )
             tick = next(iter(ticks))
-            instrument = market.rules.instrument
-            if instrument.price_increment == tick:
-                continue
-            base_revision = instrument.revision
-            instrument.price_increment = tick
-            instrument.revision = content_sha256({
-                "base_revision": base_revision,
-                "live_price_increment": tick,
-                "binding": "polymarket_clob_book_tick_v1",
-            })
-            market.metadata_revision = content_sha256({
-                "base_revision": market.metadata_revision,
-                "instrument_revision": instrument.revision,
-            })
+            if market.rules.instrument.price_increment != tick:
+                result.markets[market_index] = bind_market_instrument_to_books(
+                    market,
+                    {book.token_id: book for book in books},
+                    boundary_cursor=int(metadata["latest_cursor"]),
+                    projection_generation=None,
+                    observed_at=max(book.received_at for book in books),
+                )
         return result
 
     def _book_rows_form_fresh_boundary(
@@ -5267,6 +5365,13 @@ class LiveStateStore:
             state_checksum=checksum, source_hash=source_hash,
         )
         self.books[token_id] = book
+        self.catalog[market.identity.market_id] = bind_market_instrument_to_books(
+            market,
+            self.books,
+            boundary_cursor=self.cursor + 1,
+            projection_generation=None,
+            observed_at=received,
+        )
         return self._emit(
             "book", book.model_dump(mode="json"), raw, applied=True,
             market_id=market.identity.market_id, condition_id=market.identity.condition_id,
@@ -5581,6 +5686,13 @@ class LiveStateStore:
             )
         book.state_checksum = _state_checksum(token_id, book.tick_size, bids, asks)
         self.books[token_id] = book
+        self.catalog[market.identity.market_id] = bind_market_instrument_to_books(
+            market,
+            self.books,
+            boundary_cursor=self.cursor + 1,
+            projection_generation=None,
+            observed_at=received,
+        )
         return self._emit(
             event_type, book.model_dump(mode="json"), raw, applied=True,
             market_id=market.identity.market_id, condition_id=market.identity.condition_id,
@@ -5983,6 +6095,15 @@ class LiveStateStore:
             self.books[event.token_id] = LiveBook.model_validate(
                 event.canonical_payload
             )
+            market_id = self.token_to_market.get(event.token_id)
+            if market_id and market_id in self.catalog:
+                self.catalog[market_id] = bind_market_instrument_to_books(
+                    self.catalog[market_id],
+                    self.books,
+                    boundary_cursor=event.cursor,
+                    projection_generation=None,
+                    observed_at=event.received_at,
+                )
         if event.event_type == "recovery_completed" and event.applied:
             recovered = set(
                 event.canonical_payload.get("resolved_gap_token_ids")

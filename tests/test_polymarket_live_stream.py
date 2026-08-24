@@ -568,6 +568,80 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tokens", payload["snapshot"]["items"][0])
         self.assertEqual(phases["scope_count"], 1)
 
+    def test_dynamic_tick_full_sync_fails_mixed_then_publishes_audited_boundary(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "dynamic-tick"
+        store = populated_store(root)
+        projection = PolymarketLiveProjection(replay_capacity=100)
+        projection.install_state({
+            "schema_version": "marketcow.polymarket.live-stream.v1",
+            "type": "state",
+            "catalog_revision": store.catalog_revision,
+            "catalog_source": store.catalog_source,
+            "latest_cursor": store.cursor,
+            "persisted_cursor": store.cursor,
+            "active_recovery_id": None,
+            "markets": [
+                market.model_dump(mode="json") for market in store.catalog.values()
+            ],
+            "books": [book.model_dump(mode="json") for book in store.books.values()],
+            "gaps": [],
+        })
+        projection.mark_ready({"latest_cursor": store.cursor})
+        reader = PolymarketLiveReadStore(
+            root,
+            now_provider=lambda: NOW,
+            stable_snapshot_max_book_age_seconds=5,
+            consumer_maximum_book_age_seconds=5,
+            minimum_delivery_headroom_seconds=1,
+        )
+        original_revision = store.catalog["m1"].rules.instrument.revision
+
+        yes_event = store.apply_websocket({
+            "event_type": "tick_size_change",
+            "asset_id": "yes-1",
+            "new_tick_size": "0.001",
+            "timestamp": "1785739201000",
+        }, received_at=NOW)[0]
+        projection.apply_live(yes_event.model_dump(mode="json"))
+
+        with self.assertRaises(PolymarketLiveReadError) as mixed:
+            projection.full_sync_json(reader, ["m1"])
+        self.assertEqual(
+            mixed.exception.code,
+            "polymarket_instrument_book_binding_incomplete",
+        )
+
+        no_event = store.apply_websocket({
+            "event_type": "tick_size_change",
+            "asset_id": "no-1",
+            "new_tick_size": "0.001",
+            "timestamp": "1785739201001",
+        }, received_at=NOW)[0]
+        projection.apply_live(no_event.model_dump(mode="json"))
+        _, _, full_sync = projection.full_sync_json(reader, ["m1"])
+
+        market = full_sync.bootstrap.markets[0]
+        instrument = market.rules.instrument
+        books = full_sync.snapshot.books
+        self.assertEqual(instrument.price_increment, "0.001")
+        self.assertEqual({book.tick_size for book in books.values()}, {"0.001"})
+        self.assertNotEqual(instrument.revision, original_revision)
+        provenance = instrument.provenance[-1]
+        self.assertEqual(provenance.source, "polymarket_clob")
+        self.assertEqual(provenance.boundary_cursor, no_event.cursor)
+        self.assertEqual(
+            provenance.projection_generation,
+            full_sync.projection_generation,
+        )
+        self.assertEqual(
+            {book.tick_version for book in books.values()},
+            {provenance.tick_version},
+        )
+        self.assertEqual(set(provenance.token_ids), set(books))
+        self.assertEqual(store.events[-1].cursor, provenance.boundary_cursor)
+
     async def test_cursor_gap_fails_closed_without_advancing_projection(self):
         projection = PolymarketLiveProjection(replay_capacity=10)
         projection.install_state({
