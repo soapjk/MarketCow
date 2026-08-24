@@ -73,6 +73,12 @@ class PolymarketLiveProjection:
         self._active_recovery_id: str | None = None
         self._latest_cursor = 0
         self._persisted_cursor = 0
+        # The collector can report durability ahead of the last event decoded
+        # by this API process.  Keep that source watermark private until the
+        # corresponding event has joined the local projection.  The public
+        # persisted cursor is therefore the durable boundary of this exact
+        # projection generation, rather than a watermark from a future one.
+        self._source_persisted_cursor = 0
         self._persistence_queue_depth = 0
         self._persistence_error: str | None = None
         self._connected = False
@@ -153,6 +159,7 @@ class PolymarketLiveProjection:
             self._active_recovery_id = payload.get("active_recovery_id") or None
             self._latest_cursor = latest_cursor
             self._persisted_cursor = persisted_cursor
+            self._source_persisted_cursor = persisted_cursor
             self._persistence_queue_depth = int(
                 payload.get("persistence_queue_depth", 0)
             )
@@ -210,6 +217,7 @@ class PolymarketLiveProjection:
                     f"expected {self._latest_cursor + 1}, observed {event.cursor}"
                 )
             self._latest_cursor = event.cursor
+            self._advance_persisted_cursor_locked()
             self._events.append(event)
             self._apply_event_state(event)
             self._last_message_at = datetime.now(timezone.utc)
@@ -230,13 +238,24 @@ class PolymarketLiveProjection:
             # a durable watermark a few events ahead of the last event this API
             # process has decoded. Only regression is invalid; the local event
             # projection will deterministically catch up to the global durable
-            # watermark.
-            if cursor < self._persisted_cursor:
+            # watermark.  A future source watermark is retained but is not
+            # exposed as part of the current projection generation.
+            if cursor < self._source_persisted_cursor:
                 raise ValueError("Polymarket persisted cursor watermark is invalid")
-            self._persisted_cursor = cursor
+            self._source_persisted_cursor = cursor
+            self._advance_persisted_cursor_locked()
             self._persistence_queue_depth = max(0, queue_depth)
             self._persistence_error = error or None
             self._generation += 1
+
+    def _advance_persisted_cursor_locked(self) -> None:
+        """Publish durability only for events present in this lock generation."""
+        if self._persisted_cursor > self._latest_cursor:
+            raise RuntimeError("Polymarket projection cursor invariant is invalid")
+        if self._source_persisted_cursor >= self._latest_cursor:
+            self._persisted_cursor = self._latest_cursor
+        elif self._source_persisted_cursor > self._persisted_cursor:
+            self._persisted_cursor = self._source_persisted_cursor
 
     def watermarks(self) -> dict[str, int | bool | str | None]:
         with self._lock:
@@ -244,7 +263,7 @@ class PolymarketLiveProjection:
                 "published_cursor": self._latest_cursor,
                 "persisted_cursor": self._persisted_cursor,
                 "persistence_lag_events": (
-                    max(0, self._latest_cursor - self._persisted_cursor)
+                    self._latest_cursor - self._persisted_cursor
                 ),
                 "persistence_queue_depth": self._persistence_queue_depth,
                 "live_stream_connected": self._connected,
@@ -562,6 +581,10 @@ class PolymarketLiveProjection:
             cursor = self._latest_cursor
             catalog_source = self._catalog_source
             persisted_cursor = self._persisted_cursor
+            if persisted_cursor > cursor:
+                raise PolymarketLiveReadStore._stable_boundary_unavailable(
+                    "full-sync"
+                )
             persistence_queue_depth = self._persistence_queue_depth
             connected = self._connected
             disconnect_count = self._disconnect_count
@@ -681,8 +704,8 @@ class PolymarketLiveProjection:
             unresolved_gap_count=0,
             latest_cursor=capture["cursor"],
             persisted_cursor=capture["persisted_cursor"],
-            persistence_lag_events=max(
-                0, capture["cursor"] - capture["persisted_cursor"],
+            persistence_lag_events=(
+                capture["cursor"] - capture["persisted_cursor"]
             ),
             persistence_queue_depth=capture["persistence_queue_depth"],
             live_stream_connected=capture["connected"],

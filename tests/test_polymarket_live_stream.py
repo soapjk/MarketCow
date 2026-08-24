@@ -534,7 +534,7 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(projection.ready)
         self.assertEqual(projection.latest_cursor, 0)
 
-    async def test_persistence_watermark_may_lead_local_websocket_decode(self):
+    async def test_future_persistence_watermark_waits_for_atomic_projection(self):
         projection = PolymarketLiveProjection(replay_capacity=10)
         projection.install_state({
             "schema_version": "marketcow.polymarket.live-stream.v1",
@@ -548,8 +548,71 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
         })
         projection.mark_ready({"latest_cursor": 10})
         projection.update_persistence(12, queue_depth=0)
-        self.assertEqual(projection.watermarks()["persisted_cursor"], 12)
-        self.assertEqual(projection.watermarks()["persistence_lag_events"], 0)
+        first = projection.watermarks()
+        self.assertEqual(first["published_cursor"], 10)
+        self.assertEqual(first["persisted_cursor"], 10)
+        self.assertEqual(
+            first["persistence_lag_events"],
+            first["published_cursor"] - first["persisted_cursor"],
+        )
+
+        with TemporaryDirectory() as temporary:
+            template = populated_store(Path(temporary) / "template").events[-1]
+        for cursor in (11, 12):
+            event = template.model_copy(update={
+                "cursor": cursor,
+                "event_id": "0" * 64,
+                "event_type": "last_trade_price",
+            })
+            event.event_id = live_event_identity(event)
+            projection.apply_live(event.model_dump(mode="json"))
+            watermarks = projection.watermarks()
+            self.assertEqual(watermarks["published_cursor"], cursor)
+            self.assertEqual(watermarks["persisted_cursor"], cursor)
+            self.assertEqual(
+                watermarks["persistence_lag_events"],
+                watermarks["published_cursor"] - watermarks["persisted_cursor"],
+            )
+
+    def test_scoped_health_never_combines_future_persistence_generation(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            projection = PolymarketLiveProjection(replay_capacity=100)
+            projection.install_state({
+                "schema_version": "marketcow.polymarket.live-stream.v1",
+                "type": "state",
+                "catalog_revision": store.catalog_revision,
+                "catalog_source": store.catalog_source,
+                "latest_cursor": store.cursor,
+                "persisted_cursor": store.cursor,
+                "active_recovery_id": None,
+                "markets": [
+                    market.model_dump(mode="json")
+                    for market in store.catalog.values()
+                ],
+                "books": [
+                    book.model_dump(mode="json")
+                    for book in store.books.values()
+                ],
+                "gaps": [],
+            })
+            projection.mark_ready({"latest_cursor": store.cursor})
+            projection.update_persistence(store.cursor + 2, queue_depth=0)
+            reader = PolymarketLiveReadStore(
+                store.root,
+                now_provider=lambda: NOW,
+                stable_snapshot_max_book_age_seconds=5,
+                consumer_maximum_book_age_seconds=5,
+                minimum_delivery_headroom_seconds=1,
+            )
+
+            for _ in range(200):
+                health = projection.health(reader, ["m1"])
+                self.assertLessEqual(health.persisted_cursor, health.latest_cursor)
+                self.assertEqual(
+                    health.persistence_lag_events,
+                    health.latest_cursor - health.persisted_cursor,
+                )
 
 
 if __name__ == "__main__":
