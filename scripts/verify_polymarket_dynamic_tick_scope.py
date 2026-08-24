@@ -61,6 +61,7 @@ def main() -> None:
                     }
                     books = payload["snapshot"]["books"]
                     tick_mismatches = []
+                    empty_side_token_ids = []
                     for market_id, market in bootstrap_by_market.items():
                         instrument = market["rules"]["instrument"]
                         token_ids = [
@@ -70,6 +71,10 @@ def main() -> None:
                         book_ticks = {books[token_id]["tick_size"] for token_id in token_ids}
                         if book_ticks != {instrument["price_increment"]}:
                             tick_mismatches.append(market_id)
+                        for token_id in token_ids:
+                            book = books[token_id]
+                            if not book["bids"] or not book["asks"]:
+                                empty_side_token_ids.append(token_id)
                     affected = []
                     for market_id in sorted(AFFECTED_MARKETS):
                         market = bootstrap_by_market[market_id]
@@ -92,6 +97,7 @@ def main() -> None:
                     observation = {
                         "observed_at": observed_at,
                         "http_status": response.status_code,
+                        "health_status": health["status"],
                         "cursor": payload["cursor"],
                         "projection_generation": payload["projection_generation"],
                         "scope_market_count": len(payload["scope_market_ids"]),
@@ -108,6 +114,7 @@ def main() -> None:
                         ],
                         "derived_index_error": health.get("derived_index_error"),
                         "tick_mismatch_market_ids": tick_mismatches,
+                        "empty_side_token_ids": empty_side_token_ids,
                         "affected": affected,
                     }
                     observations[str(port)].append(observation)
@@ -127,6 +134,7 @@ def main() -> None:
         )
         criteria[f"port_{port}_all_boundaries_valid"] = bool(samples) and all(
             sample["http_status"] == 200
+            and sample["health_status"] == "index_ready"
             and sample["scope_market_count"] == 100
             and sample["book_count"] == 200
             and sample["complete_market_count"] == 100
@@ -136,6 +144,7 @@ def main() -> None:
             and sample["events_read_source"] == "memory_projection"
             and sample["realtime_sqlite_query_ms"] == 0
             and not sample["tick_mismatch_market_ids"]
+            and not sample["empty_side_token_ids"]
             for sample in samples
         )
     result = {

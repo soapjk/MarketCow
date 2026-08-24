@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.marketcow.polymarket.read-api</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/androidjk/Library/Application Support/MarketCow/atomic-freshness-venv/bin/python</string>
+    <string>/Volumes/T9/projects/marketcow-workitem-collaboration-81987e95-5beb-4740-9326-6d072362b1/scripts/run_polymarket_live_read_api.py</string>
+    <string>--root</string><string>/Volumes/T9/data/marketcow/production/prediction-markets/polymarket-live</string>
+    <string>--host</string><string>127.0.0.1</string><string>--port</string><string>8791</string>
+    <string>--stable-snapshot-max-book-age-seconds</string><string>5</string>
+    <string>--consumer-maximum-book-age-seconds</string><string>5</string>
+    <string>--minimum-delivery-headroom-seconds</string><string>1</string>
+    <string>--stable-read-wait-seconds</string><string>6</string>
+    <string>--stable-read-poll-seconds</string><string>0.025</string>
+    <string>--executor-workers</string><string>6</string>
+    <string>--live-stream-uri</string><string>ws://127.0.0.1:8794</string>
+    <string>--live-stream-replay-capacity</string><string>10000</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>NO_PROXY</key><string>127.0.0.1,localhost</string>
+    <key>no_proxy</key><string>127.0.0.1,localhost</string>
+    <key>PYTHONPATH</key><string>/Volumes/T9/projects/marketcow-workitem-collaboration-81987e95-5beb-4740-9326-6d072362b1/src</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>WorkingDirectory</key><string>/Volumes/T9/projects/marketcow-workitem-collaboration-81987e95-5beb-4740-9326-6d072362b1</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/androidjk/Library/Logs/MarketCow/polymarket-read-api.log</string>
+  <key>StandardErrorPath</key><string>/Users/androidjk/Library/Logs/MarketCow/polymarket-read-api.error.log</string>
+</dict></plist>
