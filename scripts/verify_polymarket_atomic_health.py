@@ -13,21 +13,14 @@ from typing import Any
 import httpx
 
 
-EXPECTED_SCOPE_ID = "57bac2e63ea3015df414f874385f1080176cd771b047cb82e73b14e7cb6b45ef"
-
-
 def _validate_health(payload: dict[str, Any], market_ids: list[str]) -> None:
     latest_cursor = int(payload["latest_cursor"])
     persisted_cursor = int(payload["persisted_cursor"])
     lag = int(payload["persistence_lag_events"])
     if persisted_cursor > latest_cursor:
-        raise ValueError(
-            f"persisted_cursor {persisted_cursor} exceeds latest_cursor {latest_cursor}"
-        )
+        raise ValueError(f"persisted_cursor {persisted_cursor} exceeds latest_cursor {latest_cursor}")
     if lag != latest_cursor - persisted_cursor:
-        raise ValueError(
-            f"persistence lag {lag} does not equal {latest_cursor - persisted_cursor}"
-        )
+        raise ValueError(f"persistence lag {lag} does not equal {latest_cursor - persisted_cursor}")
     expected = {
         "status": "index_ready",
         "market_count": 100,
@@ -77,14 +70,16 @@ def _sample_port(
             response.raise_for_status()
             payload = response.json()
             _validate_health(payload, market_ids)
-            samples.append({
-                "index": index,
-                "requested_at": requested_at.isoformat(),
-                "latest_cursor": payload["latest_cursor"],
-                "persisted_cursor": payload["persisted_cursor"],
-                "persistence_lag_events": payload["persistence_lag_events"],
-                "projection_generation": payload["projection_generation"],
-            })
+            samples.append(
+                {
+                    "index": index,
+                    "requested_at": requested_at.isoformat(),
+                    "latest_cursor": payload["latest_cursor"],
+                    "persisted_cursor": payload["persisted_cursor"],
+                    "persistence_lag_events": payload["persistence_lag_events"],
+                    "projection_generation": payload["projection_generation"],
+                }
+            )
             deadline = started + ((index + 1) * interval_seconds)
             remaining = deadline - time.monotonic()
             if remaining > 0 and index + 1 < sample_count:
@@ -96,16 +91,10 @@ def _sample_port(
         "last": samples[-1],
         "minimum_latest_cursor": min(row["latest_cursor"] for row in samples),
         "maximum_latest_cursor": max(row["latest_cursor"] for row in samples),
-        "maximum_persistence_lag_events": max(
-            row["persistence_lag_events"] for row in samples
-        ),
-        "all_persisted_lte_latest": all(
-            row["persisted_cursor"] <= row["latest_cursor"] for row in samples
-        ),
+        "maximum_persistence_lag_events": max(row["persistence_lag_events"] for row in samples),
+        "all_persisted_lte_latest": all(row["persisted_cursor"] <= row["latest_cursor"] for row in samples),
         "all_lag_exact": all(
-            row["persistence_lag_events"]
-            == row["latest_cursor"] - row["persisted_cursor"]
-            for row in samples
+            row["persistence_lag_events"] == row["latest_cursor"] - row["persisted_cursor"] for row in samples
         ),
     }
 
@@ -115,6 +104,7 @@ def main() -> None:
         description="Verify atomic MarketCow scoped-health cursor snapshots",
     )
     parser.add_argument("--scope-manifest", required=True, type=Path)
+    parser.add_argument("--expected-scope-id", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--interval-seconds", type=float, default=0.25)
@@ -126,7 +116,7 @@ def main() -> None:
         parser.error("sample interval must be positive")
     ports = arguments.port or [8790, 8791]
     manifest = json.loads(arguments.scope_manifest.resolve().read_bytes())
-    if manifest.get("scope_id") != EXPECTED_SCOPE_ID:
+    if manifest.get("scope_id") != arguments.expected_scope_id:
         parser.error("scope manifest does not identify the exact acceptance scope")
     market_ids = [str(item) for item in manifest.get("market_ids") or []]
     if len(market_ids) != 100 or len(set(market_ids)) != 100:
@@ -157,7 +147,7 @@ def main() -> None:
     report = {
         "schema": "marketcow.polymarket.atomic-health-verification.v1",
         "passed": not failures and len(results) == len(ports),
-        "scope_id": EXPECTED_SCOPE_ID,
+        "scope_id": arguments.expected_scope_id,
         "scope_manifest": str(arguments.scope_manifest.resolve()),
         "market_count": len(market_ids),
         "ports": ports,
@@ -165,9 +155,7 @@ def main() -> None:
         "interval_seconds": arguments.interval_seconds,
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
-        "commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "results": {str(port): results[port] for port in sorted(results)},
         "failures": failures,
     }
