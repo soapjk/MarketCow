@@ -50,6 +50,9 @@ SIZE_INCREMENT_SOURCE_URL = (
     "b076b04d61135657e25dccc1bbd6866a96bd8c6e/"
     "py_clob_client/order_builder/constants.py"
 )
+CLOB_MARKET_STREAM_SOURCE_URL = (
+    "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+)
 
 
 _PUBLICATION_LOCKS = threading.local()
@@ -1121,12 +1124,19 @@ def build_live_candidate_snapshot(root: Path) -> dict[str, Any]:
 
 
 class LiveFactProvenance(BaseModel):
-    source: Literal["polymarket_gamma", "polymarket_docs", "polymarket_sdk"]
+    source: Literal[
+        "polymarket_gamma", "polymarket_docs", "polymarket_sdk",
+        "polymarket_clob",
+    ]
     revision: str
     source_url: str
     observed_at: datetime
     payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     field_paths: list[str] = Field(min_length=1)
+    boundary_cursor: int | None = Field(default=None, ge=1)
+    projection_generation: int | None = Field(default=None, ge=1)
+    tick_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    token_ids: list[str] = Field(default_factory=list)
 
 
 class LiveInstrumentFacts(BaseModel):
@@ -1459,6 +1469,100 @@ class LiveBook(BaseModel):
     source_hash: str | None = None
 
 
+def bind_market_instrument_to_books(
+    market: LiveMarket,
+    books: dict[str, LiveBook],
+    *,
+    boundary_cursor: int,
+    projection_generation: int | None,
+    observed_at: datetime,
+) -> LiveMarket:
+    """Return facts bound to one complete, uniform book-tick boundary.
+
+    A two-outcome tick transition is temporarily mixed while its per-token
+    events arrive.  That intermediate state deliberately leaves the prior
+    instrument facts in place so scoped reads fail closed.  Once every outcome
+    book exposes one tick version, the replacement market and all books can be
+    captured atomically under the caller's state lock.
+    """
+    token_ids = sorted(outcome.token_id for outcome in market.identity.outcomes)
+    market_books = [books.get(token_id) for token_id in token_ids]
+    if any(book is None for book in market_books):
+        return market
+    complete_books = [book for book in market_books if book is not None]
+    ticks = {book.tick_size for book in complete_books}
+    tick_versions = {book.tick_version for book in complete_books}
+    if len(ticks) != 1 or len(tick_versions) != 1:
+        return market
+    tick = next(iter(ticks))
+    tick_version = next(iter(tick_versions))
+    boundary = {
+        "binding": "polymarket_clob_book_tick_v2",
+        "market_id": market.identity.market_id,
+        "token_ids": token_ids,
+        "price_increment": tick,
+        "tick_version": tick_version,
+        "cursor": boundary_cursor,
+        "projection_generation": projection_generation,
+    }
+    instrument = market.rules.instrument
+    has_dynamic_binding = any(
+        item.source == "polymarket_clob" for item in instrument.provenance
+    )
+    if instrument.price_increment == tick and not has_dynamic_binding:
+        return market
+    if instrument.price_increment == tick and (
+        projection_generation is None
+        or any(
+            item.source == "polymarket_clob"
+            and item.projection_generation is not None
+            and item.tick_version == tick_version
+            for item in instrument.provenance
+        )
+    ):
+        return market
+    result = market.model_copy(deep=True)
+    result_instrument = result.rules.instrument
+    provenance_revision = content_sha256(boundary)
+    result_instrument.price_increment = tick
+    result_instrument.provenance.append(LiveFactProvenance(
+        source="polymarket_clob",
+        revision=provenance_revision,
+        source_url=CLOB_MARKET_STREAM_SOURCE_URL,
+        observed_at=observed_at,
+        payload_sha256=content_sha256({
+            **boundary,
+            "books": {
+                book.token_id: {
+                    "tick_size": book.tick_size,
+                    "tick_version": book.tick_version,
+                    "state_checksum": book.state_checksum,
+                }
+                for book in complete_books
+            },
+        }),
+        field_paths=[
+            "event_type", "new_tick_size", "asset_id",
+            "book.tick_size", "book.tick_version",
+        ],
+        boundary_cursor=boundary_cursor,
+        projection_generation=projection_generation,
+        tick_version=tick_version,
+        token_ids=token_ids,
+    ))
+    result_instrument.revision = content_sha256({
+        "previous_revision": instrument.revision,
+        "dynamic_tick_boundary": boundary,
+        "provenance_revision": provenance_revision,
+    })
+    result.metadata_revision = content_sha256({
+        "previous_revision": market.metadata_revision,
+        "instrument_revision": result_instrument.revision,
+        "dynamic_tick_boundary": boundary,
+    })
+    return result
+
+
 class LiveEventEnvelope(BaseModel):
     contract_version: Literal["marketcow.prediction_market.v1"] = CONTRACT_VERSION
     schema_version: Literal["marketcow.polymarket.live.v2"] = LIVE_SCHEMA_VERSION
@@ -1653,6 +1757,7 @@ class LiveReadHealth(BaseModel):
     persisted_cursor: int = Field(default=0, ge=0)
     persistence_lag_events: int = Field(default=0, ge=0)
     persistence_queue_depth: int = Field(default=0, ge=0)
+    derived_index_error: str | None = None
     live_stream_connected: bool = False
     live_stream_disconnect_count: int = Field(default=0, ge=0)
     event_loop_stall_max_ms: float = Field(default=0, ge=0)
@@ -2333,7 +2438,7 @@ class PolymarketLiveReadStore:
             raise RuntimeError("live book binding requires state metadata")
         result = response.model_copy(deep=True)
         result.cursor = int(metadata["latest_cursor"])
-        for market in result.markets:
+        for market_index, market in enumerate(result.markets):
             books = books_by_market.get(market.identity.market_id, [])
             expected_tokens = {outcome.token_id for outcome in market.identity.outcomes}
             if {book.token_id for book in books} != expected_tokens:
@@ -2352,20 +2457,14 @@ class PolymarketLiveReadStore:
                     503,
                 )
             tick = next(iter(ticks))
-            instrument = market.rules.instrument
-            if instrument.price_increment == tick:
-                continue
-            base_revision = instrument.revision
-            instrument.price_increment = tick
-            instrument.revision = content_sha256({
-                "base_revision": base_revision,
-                "live_price_increment": tick,
-                "binding": "polymarket_clob_book_tick_v1",
-            })
-            market.metadata_revision = content_sha256({
-                "base_revision": market.metadata_revision,
-                "instrument_revision": instrument.revision,
-            })
+            if market.rules.instrument.price_increment != tick:
+                result.markets[market_index] = bind_market_instrument_to_books(
+                    market,
+                    {book.token_id: book for book in books},
+                    boundary_cursor=int(metadata["latest_cursor"]),
+                    projection_generation=None,
+                    observed_at=max(book.received_at for book in books),
+                )
         return result
 
     def _book_rows_form_fresh_boundary(
@@ -4671,6 +4770,11 @@ class LiveStateStore:
         self._persistence_condition = threading.Condition()
         self.persisted_cursor = 0
         self.persistence_error: str | None = None
+        # The append-only event log and the mutable SQLite index are separate
+        # failure domains. A broken derived index is observable, but must never
+        # stop real-time publication or durable event-log appends.
+        self.derived_index_error: str | None = None
+        self._state_index_available = True
         # API construction must not deserialize the multi-GB catalog or replay the
         # event log. Stateful operations retain compatibility through _ensure_loaded.
         self._recovered = False
@@ -4829,13 +4933,42 @@ class LiveStateStore:
     def _persist_records(self, records: list[dict[str, Any]]) -> None:
         started = time.monotonic()
         event_records = [item for item in records if item["kind"] == "event"]
+        indexed_events: list[tuple[dict[str, Any], int, int, str]] = []
         with _publication_lock(self.root, exclusive=True):
             self.event_path.parent.mkdir(parents=True, exist_ok=True)
             with self.event_path.open("a+b") as stream:
                 stream.seek(0, os.SEEK_END)
-                initial_offset = stream.tell()
-                last_offset = initial_offset
+                last_offset = stream.tell()
+                for record in event_records:
+                    event = record["event"]
+                    body = canonical_json(event.model_dump(mode="json")) + b"\n"
+                    byte_offset = stream.tell()
+                    stream.write(body)
+                    last_offset = stream.tell()
+                    indexed_events.append((
+                        record, byte_offset, len(body),
+                        hashlib.sha256(body).hexdigest(),
+                    ))
+                if indexed_events:
+                    # This is the authoritative durability boundary. It is
+                    # intentionally committed before touching derived SQLite.
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            if event_records:
+                last_event = event_records[-1]["event"]
+                with self._persistence_condition:
+                    self.persisted_cursor = last_event.cursor
+                    self._event_offset = last_offset
+                    self._last_log_cursor = last_event.cursor
+                    self._persistence_condition.notify_all()
+
+            if self._state_index_available:
                 try:
+                    event_positions = {
+                        id(record): (byte_offset, byte_length, line_sha256)
+                        for record, byte_offset, byte_length, line_sha256
+                        in indexed_events
+                    }
                     with self.state_index.batch():
                         for record in records:
                             if record["kind"] == "confirmation":
@@ -4847,17 +4980,14 @@ class LiveStateStore:
                                 )
                                 continue
                             event = record["event"]
-                            body = canonical_json(
-                                event.model_dump(mode="json")
-                            ) + b"\n"
-                            byte_offset = stream.tell()
-                            stream.write(body)
-                            last_offset = stream.tell()
+                            byte_offset, byte_length, line_sha256 = (
+                                event_positions[id(record)]
+                            )
                             self.state_index.append(
                                 event,
                                 byte_offset=byte_offset,
-                                byte_length=len(body),
-                                line_sha256=hashlib.sha256(body).hexdigest(),
+                                byte_length=byte_length,
+                                line_sha256=line_sha256,
                                 book=record["book"],
                                 gaps=record["gaps"],
                                 catalog_revision=record["catalog_revision"],
@@ -4875,22 +5005,17 @@ class LiveStateStore:
                                     "oldest_book_received_at"
                                 ],
                             )
-                        if last_offset != initial_offset:
-                            stream.flush()
-                            os.fsync(stream.fileno())
-                except BaseException:
-                    stream.seek(initial_offset)
-                    stream.truncate()
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                    raise
-        if event_records:
-            last_event = event_records[-1]["event"]
-            with self._persistence_condition:
-                self.persisted_cursor = last_event.cursor
-                self._event_offset = last_offset
-                self._last_log_cursor = last_event.cursor
-                self._persistence_condition.notify_all()
+                except BaseException as exc:
+                    self._state_index_available = False
+                    self.derived_index_error = (
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    self.state_index.close()
+                    LOGGER.exception(
+                        "polymarket_derived_index_isolated "
+                        "durable_cursor=%d durable_event_log_size=%d",
+                        self.persisted_cursor, last_offset,
+                    )
         elapsed = time.monotonic() - started
         if elapsed >= 0.25:
             LOGGER.info(
@@ -5240,6 +5365,13 @@ class LiveStateStore:
             state_checksum=checksum, source_hash=source_hash,
         )
         self.books[token_id] = book
+        self.catalog[market.identity.market_id] = bind_market_instrument_to_books(
+            market,
+            self.books,
+            boundary_cursor=self.cursor + 1,
+            projection_generation=None,
+            observed_at=received,
+        )
         return self._emit(
             "book", book.model_dump(mode="json"), raw, applied=True,
             market_id=market.identity.market_id, condition_id=market.identity.condition_id,
@@ -5554,6 +5686,13 @@ class LiveStateStore:
             )
         book.state_checksum = _state_checksum(token_id, book.tick_size, bids, asks)
         self.books[token_id] = book
+        self.catalog[market.identity.market_id] = bind_market_instrument_to_books(
+            market,
+            self.books,
+            boundary_cursor=self.cursor + 1,
+            projection_generation=None,
+            observed_at=received,
+        )
         return self._emit(
             event_type, book.model_dump(mode="json"), raw, applied=True,
             market_id=market.identity.market_id, condition_id=market.identity.condition_id,
@@ -5956,6 +6095,15 @@ class LiveStateStore:
             self.books[event.token_id] = LiveBook.model_validate(
                 event.canonical_payload
             )
+            market_id = self.token_to_market.get(event.token_id)
+            if market_id and market_id in self.catalog:
+                self.catalog[market_id] = bind_market_instrument_to_books(
+                    self.catalog[market_id],
+                    self.books,
+                    boundary_cursor=event.cursor,
+                    projection_generation=None,
+                    observed_at=event.received_at,
+                )
         if event.event_type == "recovery_completed" and event.applied:
             recovered = set(
                 event.canonical_payload.get("resolved_gap_token_ids")
@@ -6326,6 +6474,43 @@ def catch_up_live_state_index(root: Path) -> dict[str, int]:
         }
 
 
+def _durable_event_log_tail(
+    event_path: Path,
+) -> tuple[LiveEventEnvelope | None, int]:
+    """Read and authenticate only the final append-only event-log record."""
+    if not event_path.is_file():
+        return None, 0
+    with event_path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        if size == 0:
+            return None, 0
+        stream.seek(size - 1)
+        if stream.read(1) != b"\n":
+            raise RuntimeError("durable live event log ends with a partial row")
+        end = size - 1
+        position = end
+        start = 0
+        chunk_size = 64 * 1024
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            stream.seek(position)
+            chunk = stream.read(read_size)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                start = position + newline + 1
+                break
+        stream.seek(start)
+        line = stream.read(end - start)
+    try:
+        event = LiveEventEnvelope.model_validate_json(line)
+        LiveStateStore._validate_event(event, event.cursor)
+    except ValueError as exc:
+        raise RuntimeError("durable live event log tail is invalid") from exc
+    return event, size
+
+
 def load_scoped_live_store(
     root: Path,
     market_ids: Iterable[str],
@@ -6334,21 +6519,55 @@ def load_scoped_live_store(
 ) -> LiveStateStore:
     """Hydrate a bounded writer from published indexes without full recovery."""
     root = root.resolve()
-    LiveStateIndex(root).ensure_runtime_schema()
-    recovery = catch_up_live_state_index(root)
-    if recovery["replayed_events"]:
-        LOGGER.warning("live_state_index_tail_recovered %s", recovery)
     reader = PolymarketLiveReadStore(root, now_provider=now_provider)
     selected_ids = reader._scope(market_ids)
+    # Catalog rows are immutable and independently hashed. They are sufficient
+    # to subscribe and REST-bootstrap the scoped in-memory projection even when
+    # the mutable latest-state index is unavailable.
+    bootstrap = reader.bootstrap(selected_ids, _bind_live_books=False)
+    derived_index_error: str | None = None
+    state_index_available = True
     # Writer hydration must preserve an interrupted recovery marker so the
     # restarted collector can finish it. Consumer reads use the public defaults
     # above and never observe this intentionally unstable internal boundary.
-    bootstrap = reader.bootstrap(selected_ids, _bind_live_books=False)
-    snapshot = reader.snapshot(
-        selected_ids, _wait_for_stable_boundary=False,
-    )
-    gaps = reader.gaps(selected_ids, unresolved_only=True)
-    _, state_metadata = reader._state_binding()
+    try:
+        LiveStateIndex(root).ensure_runtime_schema()
+        recovery = catch_up_live_state_index(root)
+        if recovery["replayed_events"]:
+            LOGGER.warning("live_state_index_tail_recovered %s", recovery)
+        snapshot = reader.snapshot(
+            selected_ids, _wait_for_stable_boundary=False,
+        )
+        gaps = reader.gaps(selected_ids, unresolved_only=True)
+        _, state_metadata = reader._state_binding()
+        books = dict(snapshot.books)
+        unresolved_gaps = [gap.model_copy(deep=True) for gap in gaps.items]
+    except (sqlite3.DatabaseError, PolymarketLiveReadError, RuntimeError) as exc:
+        if (
+            isinstance(exc, PolymarketLiveReadError)
+            and exc.code not in {
+                "polymarket_latest_state_index_unavailable",
+                "polymarket_state_integrity_failed",
+                "polymarket_state_index_lagging",
+            }
+        ):
+            raise
+        tail, event_log_size = _durable_event_log_tail(root / "events.jsonl")
+        state_metadata = {
+            "latest_cursor": str(tail.cursor if tail is not None else 0),
+            "event_log_size": str(event_log_size),
+            "active_recovery_id": "",
+        }
+        books = {}
+        unresolved_gaps = []
+        state_index_available = False
+        derived_index_error = f"{type(exc).__name__}:{exc}"
+        LOGGER.error(
+            "polymarket_derived_index_startup_isolated error=%s "
+            "durable_cursor=%s durable_event_log_size=%s",
+            derived_index_error, state_metadata["latest_cursor"],
+            state_metadata["event_log_size"],
+        )
 
     # Scoped collectors publish through the durable event/state indexes; they
     # do not serve in-process replay. Keep only a small duplicate-detection
@@ -6362,8 +6581,8 @@ def load_scoped_live_store(
         for market in bootstrap.markets if market.active and not market.closed
         for outcome in market.identity.outcomes
     }
-    store.books = dict(snapshot.books)
-    store.gaps = [gap.model_copy(deep=True) for gap in gaps.items]
+    store.books = books
+    store.gaps = unresolved_gaps
     store.cursor = int(state_metadata["latest_cursor"])
     store.catalog_revision = bootstrap.catalog_revision
     store.catalog_source = bootstrap.catalog_source
@@ -6371,6 +6590,8 @@ def load_scoped_live_store(
     store._event_offset = int(state_metadata["event_log_size"])
     store._last_log_cursor = store.cursor
     store.persisted_cursor = store.cursor
+    store.derived_index_error = derived_index_error
+    store._state_index_available = state_index_available
     store._catalog_file_sha256 = _file_sha256(store.catalog_path)
     checkpoint_path = root / "checkpoint.json"
     if checkpoint_path.exists():
@@ -6646,45 +6867,22 @@ class PolymarketLiveCollector:
         )
         return result
 
-    @staticmethod
-    def _require_usable_book_rows(rows: list[dict[str, Any]]) -> None:
-        unusable = sorted(
-            str(row.get("asset_id") or row.get("token_id") or "")
-            for row in rows
-            if not row.get("bids") or not row.get("asks")
-        )
-        if unusable:
-            raise RuntimeError(
-                "CLOB /books returned empty-sided books; stable boundary retained: "
-                + ",".join(unusable)
-            )
-
     async def bootstrap_books(self, reason: str = "startup") -> str:
-        with self.store._sync_lock:
-            recovery_started_at = self.store.now_provider()
-            recovery_id = self.store.mark_recovery_started(reason)
-            tracker = self.store.new_book_recovery_tracker()
-
-        def consume(rows: list[dict[str, Any]]) -> None:
-            self._commit_recovery_rows(
-                rows,
-                recovery_id,
-                tracker,
-                complete=False,
-                refresh_started_at=recovery_started_at,
-                received_at=self.store.now_provider(),
-                write_checkpoint=False,
-                publish_completion_event=False,
-            )
-
         token_ids = sorted(self.store.token_to_market)
         if len(token_ids) <= self.books_client.batch_size:
+            # A bounded scope fits in one atomic publication. Do not publish a
+            # recovery_started event until the provider has returned complete,
+            # usable coverage; otherwise an upstream omission retry would grow
+            # the authoritative log while no market state changed.
             rows = await asyncio.to_thread(
                 self.books_client.fetch_stream,
                 token_ids,
                 require_complete_batches=True,
             )
-            self._require_usable_book_rows(rows)
+            with self.store._sync_lock:
+                recovery_started_at = self.store.now_provider()
+                recovery_id = self.store.mark_recovery_started(reason)
+                tracker = self.store.new_book_recovery_tracker()
             coverage = self._commit_recovery_rows(
                 rows,
                 recovery_id,
@@ -6696,6 +6894,23 @@ class PolymarketLiveCollector:
                 publish_completion_event=True,
             )
         else:
+            with self.store._sync_lock:
+                recovery_started_at = self.store.now_provider()
+                recovery_id = self.store.mark_recovery_started(reason)
+                tracker = self.store.new_book_recovery_tracker()
+
+            def consume(rows: list[dict[str, Any]]) -> None:
+                self._commit_recovery_rows(
+                    rows,
+                    recovery_id,
+                    tracker,
+                    complete=False,
+                    refresh_started_at=recovery_started_at,
+                    received_at=self.store.now_provider(),
+                    write_checkpoint=False,
+                    publish_completion_event=False,
+                )
+
             await asyncio.to_thread(
                 self.books_client.fetch_stream,
                 token_ids,
@@ -6788,7 +7003,6 @@ class PolymarketLiveCollector:
                     refresh_token_ids,
                     require_complete_batches=True,
                 )
-                self._require_usable_book_rows(rows)
                 self._commit_recovery_rows(
                     rows,
                     recovery_id,

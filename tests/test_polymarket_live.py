@@ -1223,7 +1223,7 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(health.book_token_count, 0)
         self.assertEqual(health.missing_book_token_count, 4)
         self.assertEqual(health.ready_market_count, 0)
-        self.assertIsNotNone(store.active_recovery_id)
+        self.assertIsNone(store.active_recovery_id)
         self.assertEqual(store.frame("m1", now=NOW).status, "fail_closed")
         self.assertEqual(store.frame("m2", now=NOW).status, "fail_closed")
 
@@ -1251,7 +1251,7 @@ class PolymarketLiveTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
             asyncio.run(collector.bootstrap_books())
         self.assertEqual(store.books, {})
-        self.assertIsNotNone(store.active_recovery_id)
+        self.assertIsNone(store.active_recovery_id)
 
         collector.books_client = ClobBooksClient(
             requester=lambda *_args, **_kwargs: Response([
@@ -1788,6 +1788,7 @@ class PolymarketLiveTest(unittest.TestCase):
         writer = LiveStateStore(root, now_provider=lambda: NOW)
         rows = [gamma_row()]
         writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        original_revision = writer.catalog["m1"].rules.instrument.revision
         for token, bid, ask in (
             ("yes-1", "0.400", "0.420"),
             ("no-1", "0.580", "0.600"),
@@ -1813,6 +1814,17 @@ class PolymarketLiveTest(unittest.TestCase):
             bootstrap.markets[0].rules.instrument.price_increment,
             page.books[page.items[0].token_ids[0]].tick_size,
         )
+        instrument = bootstrap.markets[0].rules.instrument
+        self.assertNotEqual(instrument.revision, original_revision)
+        provenance = instrument.provenance[-1]
+        self.assertEqual(provenance.source, "polymarket_clob")
+        self.assertEqual(provenance.boundary_cursor, writer.cursor)
+        self.assertIsNone(provenance.projection_generation)
+        self.assertEqual(
+            provenance.tick_version,
+            page.books[page.items[0].token_ids[0]].tick_version,
+        )
+        self.assertEqual(set(provenance.token_ids), {"yes-1", "no-1"})
 
     def test_raw_hash_deduplication_memory_is_bounded_by_replay_capacity(self):
         store = LiveStateStore(self.root / "bounded-hashes", replay_capacity=2)
@@ -2134,6 +2146,33 @@ class PolymarketLiveTest(unittest.TestCase):
             .snapshot(["m1"]).items[0].cursor,
             4,
         )
+
+    def test_scoped_writer_starts_from_log_tail_when_derived_index_is_malformed(self):
+        root = self.root / "live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        durable_size = writer.event_path.stat().st_size
+
+        with patch.object(
+            polymarket_live_module.LiveStateIndex,
+            "ensure_runtime_schema",
+            side_effect=sqlite3.DatabaseError("database disk image is malformed"),
+        ):
+            scoped = load_scoped_live_store(
+                root, ["m1"], now_provider=lambda: NOW,
+            )
+
+        self.assertEqual(scoped.cursor, writer.cursor)
+        self.assertEqual(scoped.persisted_cursor, writer.cursor)
+        self.assertEqual(scoped._event_offset, durable_size)
+        self.assertEqual(set(scoped.catalog), {"m1"})
+        self.assertEqual(set(scoped.token_to_market), {"yes-1", "no-1"})
+        self.assertEqual(scoped.books, {})
+        self.assertFalse(scoped._state_index_available)
+        self.assertIn("database disk image is malformed", scoped.derived_index_error)
 
     def test_state_index_rebuild_resumes_from_committed_event_boundary(self):
         root = self.root / "live"
@@ -3269,7 +3308,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
             self.assertEqual(store.frame("m1", now=current[0]).status, "ready")
 
-    def test_periodic_empty_book_retains_previous_stable_boundary(self):
+    def test_periodic_empty_book_replaces_stale_liquidity(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
             current = [NOW]
@@ -3300,11 +3339,11 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             )
             current[0] = NOW + timedelta(seconds=2)
 
-            with self.assertRaisesRegex(RuntimeError, "empty-sided"):
-                asyncio.run(collector.refresh_books())
+            asyncio.run(collector.refresh_books())
 
-            self.assertEqual(store.cursor, cursor)
-            self.assertEqual(store.books["yes-1"].received_at, NOW)
+            self.assertGreater(store.cursor, cursor)
+            self.assertEqual(store.books["yes-1"].received_at, current[0])
+            self.assertEqual(store.books["yes-1"].asks, [])
             self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
 
     def test_failed_refresh_restores_memory_and_next_cursor_is_contiguous(self):
