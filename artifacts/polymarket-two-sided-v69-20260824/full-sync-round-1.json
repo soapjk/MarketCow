@@ -1,0 +1,3585 @@
+{
+  "criteria": {
+    "port_8790_all_boundaries_valid": false,
+    "port_8790_cursor_advanced": true,
+    "port_8790_sampled": true,
+    "port_8791_all_boundaries_valid": false,
+    "port_8791_cursor_advanced": true,
+    "port_8791_sampled": true
+  },
+  "duration_seconds": 15.0,
+  "failures": [],
+  "generated_at": "2026-08-24T00:36:37.020393+00:00",
+  "market_count": 100,
+  "observations": {
+    "8790": [
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751416,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:21.956875+00:00",
+        "projection_generation": 5628,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751434,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:23.174884+00:00",
+        "projection_generation": 6048,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751450,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:24.401514+00:00",
+        "projection_generation": 6080,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751480,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:25.552094+00:00",
+        "projection_generation": 6536,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751518,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:26.745282+00:00",
+        "projection_generation": 6612,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751532,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:28.002186+00:00",
+        "projection_generation": 7032,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751584,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:29.229605+00:00",
+        "projection_generation": 7528,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751636,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:30.411324+00:00",
+        "projection_generation": 7632,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751660,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:31.616492+00:00",
+        "projection_generation": 8052,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751672,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:32.804914+00:00",
+        "projection_generation": 8077,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751716,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:33.943748+00:00",
+        "projection_generation": 8561,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751746,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:35.120716+00:00",
+        "projection_generation": 9005,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751756,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:36.290713+00:00",
+        "projection_generation": 9025,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      }
+    ],
+    "8791": [
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751416,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:22.040235+00:00",
+        "projection_generation": 5736,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751440,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:23.254202+00:00",
+        "projection_generation": 6168,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751450,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:24.464402+00:00",
+        "projection_generation": 6188,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751480,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:25.620373+00:00",
+        "projection_generation": 6644,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751518,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:26.861715+00:00",
+        "projection_generation": 6720,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751548,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:28.121752+00:00",
+        "projection_generation": 7172,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751584,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:29.299034+00:00",
+        "projection_generation": 7636,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751650,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:30.479019+00:00",
+        "projection_generation": 7768,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751660,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:31.711964+00:00",
+        "projection_generation": 8160,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751672,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:32.874407+00:00",
+        "projection_generation": 8185,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751720,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:34.007441+00:00",
+        "projection_generation": 8677,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751750,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:35.200177+00:00",
+        "projection_generation": 9121,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      },
+      {
+        "affected": [
+          {
+            "instrument_revision": "217dafe70634838cdaff05b23b8d8496cba4fae1c00d9079b0be5ff987823ce0",
+            "market_id": "1296001",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750610,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "aff8463ce8de4d451edcae0f696de4e99d78137d8d07948910e3b29e8d94f870",
+              "projection_generation": 2,
+              "revision": "15844bbb0d4827e65b2540aec1b2c337306c32e5aa72df36ae384610385ee601",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "45129981312896806901985343654296891267756583650275648804422462955120827172683",
+                "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "68519237279292220069356156291996044633800525462872032508288857056550349639187"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "45129981312896806901985343654296891267756583650275648804422462955120827172683"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "ebe65c248b07380617d614a11591d4d0eb7eac97ae53f8f3ad5957af27d3a553",
+            "market_id": "1296002",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750665,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "25f869c76ddca4c0dfac3765f9c86483063302aeaf0eafba20b83950fb025e13",
+              "projection_generation": 2,
+              "revision": "caa4f8e35fa5fd6a48497cb1d925d5fdeb9d2b9f27bbd1e9b33b31832a76c01a",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "111011294361108381744511259855209402156581207695741323949109691732786684870759",
+                "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "15116343258088196031077477650167489666459211737590626288285445066100067245354"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "111011294361108381744511259855209402156581207695741323949109691732786684870759"
+              }
+            ]
+          },
+          {
+            "instrument_revision": "bccd16462ffb6adec7ba3fc23e61d0193bf5f868cf8a7b3772bd6e74d80f8a53",
+            "market_id": "1296004",
+            "price_increment": "0.001",
+            "provenance": {
+              "boundary_cursor": 21750604,
+              "field_paths": [
+                "event_type",
+                "new_tick_size",
+                "asset_id",
+                "book.tick_size",
+                "book.tick_version"
+              ],
+              "observed_at": "2026-08-24T00:35:56.883842Z",
+              "payload_sha256": "1b65ef7f5fe70de4cd829f3f52e8b7f5af54796f3edb2aea7519a500b2f1355d",
+              "projection_generation": 2,
+              "revision": "e583b47d66c0eede61573158cab13b723cdbd56982b83b95be3cb2c3ebc12233",
+              "source": "polymarket_clob",
+              "source_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+              "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+              "token_ids": [
+                "56104238209907772067473235904153967417058741477409002879269558097952887280360",
+                "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              ]
+            },
+            "tokens": [
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "56104238209907772067473235904153967417058741477409002879269558097952887280360"
+              },
+              {
+                "tick_size": "0.001",
+                "tick_version": "34198d786c5ff128135dfebceb9132fad93b90368cc4e11da1ae74913069a823",
+                "token_id": "65357296882115419880190792373458307233048908675400663095349378649166285298250"
+              }
+            ]
+          }
+        ],
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursor": 21751756,
+        "derived_index_error": "DatabaseError:database disk image is malformed",
+        "empty_side_token_ids": [
+          "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+          "37606853418932932759060473129164976508355428434577578775575804628708166416855"
+        ],
+        "events_read_source": "memory_projection",
+        "health_status": "index_ready",
+        "http_status": 200,
+        "live_stream_connected": true,
+        "live_stream_disconnect_count": 0,
+        "observed_at": "2026-08-24T00:36:36.360918+00:00",
+        "projection_generation": 9133,
+        "realtime_sqlite_query_ms": 0.0,
+        "scope_market_count": 100,
+        "tick_mismatch_market_ids": [],
+        "unresolved_gap_count": 0
+      }
+    ]
+  },
+  "passed": false,
+  "schema_version": "marketcow.polymarket.dynamic-tick-verification.v1",
+  "scope_id": "57bac2e63ea3015df414f874385f1080176cd771b047cb82e73b14e7cb6b45ef"
+}
