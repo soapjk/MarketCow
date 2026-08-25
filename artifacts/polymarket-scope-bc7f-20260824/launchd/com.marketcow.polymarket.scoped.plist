@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.marketcow.polymarket.scoped</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/androidjk/Library/Application Support/MarketCow/atomic-freshness-venv/bin/python</string>
+    <string>/Volumes/T9/projects/marketcow-workitem-f515d3fb-8ba7-49e7-85fb-2c1e5c16c2f9/scripts/run_polymarket_live_paper_scope.py</string>
+    <string>--root</string><string>/Volumes/T9/data/marketcow/production/prediction-markets/polymarket-live</string>
+    <string>--scope-manifest</string><string>/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/v81-thirty-day-capital-lock-20260824T193000CST/scopes/bc7f527f6ac04b7ef6a5c53aba2b592c01a49b50cdc3164c0aa0e4389585ff0a/manifest.json</string>
+    <string>--selection-report</string><string>/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/v81-thirty-day-capital-lock-20260824T193000CST/scopes/bc7f527f6ac04b7ef6a5c53aba2b592c01a49b50cdc3164c0aa0e4389585ff0a/selection-report.json</string>
+    <string>--candidate-snapshot</string><string>/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/v81-thirty-day-capital-lock-20260824T193000CST/candidates/28b5d1a51b5de922933b130a5e9ce93bba86606c5193c94b8caaad5edb7a71c1/candidates.json</string>
+    <string>--tradude-worktree</string><string>/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract</string>
+    <string>--snapshot-refresh-seconds</string><string>2.0</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Volumes/T9/projects/marketcow-workitem-f515d3fb-8ba7-49e7-85fb-2c1e5c16c2f9</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key><string>/Volumes/T9/projects/marketcow-workitem-f515d3fb-8ba7-49e7-85fb-2c1e5c16c2f9/src</string>
+    <key>PYTHONUNBUFFERED</key><string>1</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/androidjk/Library/Logs/MarketCow/polymarket-scoped.log</string>
+  <key>StandardErrorPath</key><string>/Users/androidjk/Library/Logs/MarketCow/polymarket-scoped.error.log</string>
+</dict>
+</plist>
