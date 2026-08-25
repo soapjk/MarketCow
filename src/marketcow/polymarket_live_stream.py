@@ -23,6 +23,7 @@ from .polymarket_live import (
     LiveStateStore,
     PolymarketLiveReadError,
     PolymarketLiveReadStore,
+    bind_market_instrument_to_books,
     content_sha256,
     live_event_identity,
 )
@@ -165,7 +166,33 @@ class PolymarketLiveProjection:
             self._ready = False
             self._error_code = None
             self._last_message_at = datetime.now(timezone.utc)
-            self._generation += 1
+            next_generation = self._generation + 1
+            for market_id, market in tuple(self._markets.items()):
+                dynamic_boundaries = [
+                    item.boundary_cursor
+                    for item in market.rules.instrument.provenance
+                    if item.source == "polymarket_clob"
+                    and item.boundary_cursor is not None
+                ]
+                observed_at = max(
+                    (
+                        book.received_at
+                        for outcome in market.identity.outcomes
+                        if (book := self._books.get(outcome.token_id)) is not None
+                    ),
+                    default=self._last_message_at,
+                )
+                self._markets[market_id] = bind_market_instrument_to_books(
+                    market,
+                    self._books,
+                    boundary_cursor=(
+                        dynamic_boundaries[-1]
+                        if dynamic_boundaries else latest_cursor
+                    ),
+                    projection_generation=next_generation,
+                    observed_at=observed_at,
+                )
+            self._generation = next_generation
 
     def add_history(self, raw_events: Iterable[dict[str, Any]]) -> None:
         events = [LiveEventEnvelope.model_validate(item) for item in raw_events]
@@ -301,6 +328,15 @@ class PolymarketLiveProjection:
             self._books[event.token_id] = LiveBook.model_validate(
                 event.canonical_payload
             )
+            market_id = event.market_id
+            if market_id and market_id in self._markets:
+                self._markets[market_id] = bind_market_instrument_to_books(
+                    self._markets[market_id],
+                    self._books,
+                    boundary_cursor=event.cursor,
+                    projection_generation=self._generation + 1,
+                    observed_at=event.received_at,
+                )
         if event.event_type == "recovery_started" and event.applied:
             self._active_recovery_id = str(
                 event.canonical_payload.get("recovery_id") or ""
@@ -426,10 +462,12 @@ class PolymarketLiveProjection:
                 )
             source_markets = [self._markets[item] for item in market_ids]
             books = dict(self._books)
+            cursor = self._latest_cursor
+            generation = self._generation
         # Deep-copying the 100-market catalog is response construction, not an
         # atomic projection operation.  Do it outside the ingestion lock.
         markets = [market.model_copy(deep=True) for market in source_markets]
-        for market in markets:
+        for market_index, market in enumerate(markets):
             expected = {outcome.token_id for outcome in market.identity.outcomes}
             live_books = [books[token] for token in expected if token in books]
             if len(live_books) != len(expected):
@@ -442,20 +480,21 @@ class PolymarketLiveProjection:
                     503,
                 )
             tick = next(iter(ticks))
-            instrument = market.rules.instrument
-            if instrument.price_increment == tick:
-                continue
-            base_revision = instrument.revision
-            instrument.price_increment = tick
-            instrument.revision = content_sha256({
-                "base_revision": base_revision,
-                "live_price_increment": tick,
-                "binding": "polymarket_clob_book_tick_v1",
-            })
-            market.metadata_revision = content_sha256({
-                "base_revision": market.metadata_revision,
-                "instrument_revision": instrument.revision,
-            })
+            if market.rules.instrument.price_increment != tick:
+                market = bind_market_instrument_to_books(
+                    market,
+                    books,
+                    boundary_cursor=cursor,
+                    projection_generation=generation,
+                    observed_at=max(book.received_at for book in live_books),
+                )
+                if market.rules.instrument.price_increment != tick:
+                    raise PolymarketLiveReadError(
+                        "polymarket_instrument_book_binding_incomplete",
+                        "Live book tick differs from atomic instrument facts",
+                        503,
+                    )
+                markets[market_index] = market
         return markets
 
     def _transient(
@@ -582,6 +621,45 @@ class PolymarketLiveProjection:
                 or any(book is None for book in source_books.values())
             ):
                 raise PolymarketLiveReadStore._stable_boundary_unavailable("full-sync")
+            for market in selected_markets:
+                if market is None:
+                    continue
+                expected = sorted(
+                    outcome.token_id for outcome in market.identity.outcomes
+                )
+                market_books = [source_books.get(token_id) for token_id in expected]
+                observed_ticks = {
+                    book.tick_size for book in market_books if book is not None
+                }
+                observed_tick_versions = {
+                    book.tick_version for book in market_books if book is not None
+                }
+                dynamic_provenance = [
+                    item for item in market.rules.instrument.provenance
+                    if item.source == "polymarket_clob"
+                ]
+                dynamic_binding_invalid = bool(dynamic_provenance) and not any(
+                    item.tick_version in observed_tick_versions
+                    and item.boundary_cursor is not None
+                    and item.boundary_cursor <= cursor
+                    and item.projection_generation is not None
+                    and item.projection_generation <= generation
+                    and set(item.token_ids) == set(expected)
+                    for item in dynamic_provenance
+                )
+                if (
+                    any(book is None for book in market_books)
+                    or len(observed_ticks) != 1
+                    or len(observed_tick_versions) != 1
+                    or dynamic_binding_invalid
+                    or market.rules.instrument.price_increment
+                    != market_books[0].tick_size
+                ):
+                    raise PolymarketLiveReadError(
+                        "polymarket_instrument_book_binding_incomplete",
+                        "Live book tick differs from atomic instrument facts",
+                        503,
+                    )
             # The immutable copy is part of the atomic boundary: none of the
             # objects used to build health/bootstrap/snapshot may be observed
             # from a later projection generation.

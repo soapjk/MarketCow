@@ -1788,6 +1788,7 @@ class PolymarketLiveTest(unittest.TestCase):
         writer = LiveStateStore(root, now_provider=lambda: NOW)
         rows = [gamma_row()]
         writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        original_revision = writer.catalog["m1"].rules.instrument.revision
         for token, bid, ask in (
             ("yes-1", "0.400", "0.420"),
             ("no-1", "0.580", "0.600"),
@@ -1813,6 +1814,17 @@ class PolymarketLiveTest(unittest.TestCase):
             bootstrap.markets[0].rules.instrument.price_increment,
             page.books[page.items[0].token_ids[0]].tick_size,
         )
+        instrument = bootstrap.markets[0].rules.instrument
+        self.assertNotEqual(instrument.revision, original_revision)
+        provenance = instrument.provenance[-1]
+        self.assertEqual(provenance.source, "polymarket_clob")
+        self.assertEqual(provenance.boundary_cursor, writer.cursor)
+        self.assertIsNone(provenance.projection_generation)
+        self.assertEqual(
+            provenance.tick_version,
+            page.books[page.items[0].token_ids[0]].tick_version,
+        )
+        self.assertEqual(set(provenance.token_ids), {"yes-1", "no-1"})
 
     def test_raw_hash_deduplication_memory_is_bounded_by_replay_capacity(self):
         store = LiveStateStore(self.root / "bounded-hashes", replay_capacity=2)
