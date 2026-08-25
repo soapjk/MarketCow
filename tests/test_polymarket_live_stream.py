@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import sqlite3
 import threading
 import time
 import unittest
@@ -17,6 +18,7 @@ from marketcow.polymarket_live import (
     LiveStateStore,
     PolymarketLiveReadError,
     PolymarketLiveReadStore,
+    _durable_event_log_tail,
 )
 from marketcow.polymarket_live import content_sha256, live_event_identity
 from marketcow.polymarket_live_stream import (
@@ -111,12 +113,51 @@ class PolymarketAsyncPersistenceTest(unittest.TestCase):
                 [previous_cursor, previous_cursor + 1, previous_cursor + 2],
             )
 
+    def test_broken_derived_index_does_not_stop_authoritative_log_appends(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            previous_cursor = store.cursor
+            previous_size = store.event_path.stat().st_size
+            store.enable_async_persistence()
+            with patch.object(
+                store.state_index, "batch",
+                side_effect=sqlite3.DatabaseError("database disk image is malformed"),
+            ):
+                first = store.apply_snapshot(
+                    snapshot("yes-1", "0.39", "0.41", "1785739210000"),
+                    received_at=NOW,
+                )
+                store.flush_async_persistence(
+                    target_cursor=previous_cursor + 1, timeout=5,
+                )
+            self.assertIsNotNone(first)
+            self.assertIsNone(store.persistence_error)
+            self.assertIn("database disk image is malformed", store.derived_index_error)
+            self.assertFalse(store._state_index_available)
+
+            second = store.apply_snapshot(
+                snapshot("no-1", "0.57", "0.59", "1785739211000"),
+                received_at=NOW,
+            )
+            store.flush_async_persistence(
+                target_cursor=previous_cursor + 2, timeout=5,
+            )
+            store.close_async_persistence(timeout=5)
+
+            self.assertIsNotNone(second)
+            self.assertGreater(store.event_path.stat().st_size, previous_size)
+            tail, size = _durable_event_log_tail(store.event_path)
+            self.assertIsNotNone(tail)
+            self.assertEqual(tail.cursor, previous_cursor + 2)
+            self.assertEqual(size, store.event_path.stat().st_size)
+
 
 class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
     async def test_loopback_stream_builds_projection_and_advances_without_sqlite(self):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         store = populated_store(Path(temporary.name) / "live")
+        store.derived_index_error = "DatabaseError:isolated derived index"
         store.enable_async_persistence()
         port = free_port()
         server = PolymarketLiveStreamServer(
@@ -153,6 +194,20 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([event.cursor for event in page.items], [after + 1])
             self.assertEqual(page.next_cursor, after + 1)
             self.assertFalse(page.has_more)
+
+            empty_ask = snapshot(
+                "yes-1", "0.39", "0.41", "1785739211000",
+            )
+            empty_ask["asks"] = []
+            await asyncio.to_thread(
+                store.apply_snapshot, empty_ask, received_at=NOW,
+            )
+            for _ in range(200):
+                if projection.latest_cursor == store.cursor:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(projection.latest_cursor, after + 2)
+
             health = projection.health(
                 PolymarketLiveReadStore(
                     store.root,
@@ -162,8 +217,13 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
                 ["m1"],
             )
             self.assertEqual(health.status, "index_ready")
+            self.assertEqual(
+                health.derived_index_error,
+                "DatabaseError:isolated derived index",
+            )
             self.assertTrue(health.latest_state_ready)
             self.assertEqual(health.book_complete_market_count, 1)
+            self.assertEqual(projection._books["yes-1"].asks, [])
             reader = PolymarketLiveReadStore(
                 store.root,
                 now_provider=lambda: NOW,
