@@ -1,0 +1,27 @@
+{
+  "schema_version": "marketcow.polymarket.official-clob-blocker.v1",
+  "observed_at": "2026-08-24T00:37:02.927129Z",
+  "source": "https://clob.polymarket.com/books",
+  "scope_id": "57bac2e63ea3015df414f874385f1080176cd771b047cb82e73b14e7cb6b45ef",
+  "market_id": "3026106",
+  "books": [
+    {
+      "token_id": "38397261780750134814668660348836100671025190311337650359817872432381006185184",
+      "outcome": "Yes",
+      "bid_count": 0,
+      "ask_count": 4,
+      "tick_size": "0.01",
+      "source_hash": "f85bd63c265bc0c464f27af621e72e0a85c59970"
+    },
+    {
+      "token_id": "37606853418932932759060473129164976508355428434577578775575804628708166416855",
+      "outcome": "No",
+      "bid_count": 4,
+      "ask_count": 0,
+      "tick_size": "0.01",
+      "source_hash": "3066047de391c7a8ae63524b68a9663571ec1673"
+    }
+  ],
+  "projection_matches_official": true,
+  "acceptance_blocker": "Both tokens must have non-empty bids and asks; official CLOB and both MarketCow endpoints expose the same empty sides."
+}
