@@ -8,4 +8,14 @@ export MARKETCOW_ENV_FILE="$env_file"
 
 "$script_dir/ensure-production-storage.sh"
 
-exec "$project_dir/.venv/bin/python" "$script_dir/run-production.py"
+python="${MARKETCOW_PYTHON:-$project_dir/.venv/bin/python}"
+if [ ! -x "$python" ]; then
+    managed_python="$script_dir/atomic-freshness-venv/bin/python"
+    [ -x "$managed_python" ] || {
+        echo "Missing production Python executable: $python" >&2
+        exit 1
+    }
+    python="$managed_python"
+fi
+
+exec "$python" "$script_dir/run-production.py"

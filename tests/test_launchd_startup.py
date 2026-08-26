@@ -1,5 +1,7 @@
 import os
+import importlib.util
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -8,6 +10,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHD = ROOT / "ops" / "launchd"
+RUNNER_SPEC = importlib.util.spec_from_file_location("marketcow_production_runner", LAUNCHD / "run-production.py")
+assert RUNNER_SPEC is not None and RUNNER_SPEC.loader is not None
+RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
+sys.modules[RUNNER_SPEC.name] = RUNNER
+RUNNER_SPEC.loader.exec_module(RUNNER)
 
 
 class LaunchdStartupTest(unittest.TestCase):
@@ -34,9 +41,7 @@ class LaunchdStartupTest(unittest.TestCase):
             log = root / "order.log"
             support.mkdir()
             python.parent.mkdir(parents=True)
-            (support / "start-production.sh").write_bytes(
-                (LAUNCHD / "start-production.sh").read_bytes()
-            )
+            (support / "start-production.sh").write_bytes((LAUNCHD / "start-production.sh").read_bytes())
             self._write_executable(
                 support / "ensure-production-storage.sh",
                 f"#!/bin/sh\necho storage >> {log!s}\n",
@@ -69,8 +74,7 @@ class LaunchdStartupTest(unittest.TestCase):
             # Application secrets may legally contain shell metacharacters. The
             # storage bootstrap validates this file exists but never sources it.
             (project / ".env.production").write_text(
-                "MARKETCOW_CLICKHOUSE_USERNAME=marketcow\n"
-                "MARKETCOW_CLICKHOUSE_PASSWORD='$1$literal'\n"
+                "MARKETCOW_CLICKHOUSE_USERNAME=marketcow\nMARKETCOW_CLICKHOUSE_PASSWORD='$1$literal'\n"
             )
             (root / "clickhouse.xml").write_text("<clickhouse/>\n")
 
@@ -142,6 +146,70 @@ class LaunchdStartupTest(unittest.TestCase):
         self.assertIn('cp "$script_dir/run-production.py" "$target_runner"', installer)
         self.assertIn('until launchctl bootstrap "$domain" "$target_plist"', installer)
 
+    def test_production_runner_builds_complete_polymarket_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project = root / "project"
+            project.mkdir()
+            manifest = root / "manifest.json"
+            report = root / "selection-report.json"
+            candidates = root / "candidates.json"
+            tradude = root / "tradude"
+            tradude.mkdir()
+            for path in (manifest, report, candidates):
+                path.write_text("{}")
+            environment = {
+                "MARKETCOW_HOME": str(root / "data"),
+                "MARKETCOW_POLYMARKET_SCOPE_MANIFEST": str(manifest),
+                "MARKETCOW_POLYMARKET_SELECTION_REPORT": str(report),
+                "MARKETCOW_POLYMARKET_CANDIDATE_SNAPSHOT": str(candidates),
+                "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE": str(tradude),
+            }
+
+            services = RUNNER.build_services(
+                project,
+                environment,
+                python="/production/python",
+            )
+
+            self.assertEqual(
+                [service.name for service in services],
+                ["polymarket-collector", "shared-api", "polymarket-read-api"],
+            )
+            commands = {service.name: service.command for service in services}
+            self.assertIn(
+                str(project.resolve() / "scripts" / "run_polymarket_live_paper_scope.py"),
+                commands["polymarket-collector"],
+            )
+            self.assertIn("8794", commands["polymarket-read-api"][-1])
+            self.assertIn("8790", commands["shared-api"])
+            self.assertIn("8791", commands["polymarket-read-api"])
+            self.assertNotIn("0.0.0.0", " ".join(sum(commands.values(), ())))
+
+    def test_production_runner_fails_closed_without_polymarket_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            with self.assertRaisesRegex(ValueError, "MARKETCOW_POLYMARKET_SCOPE_MANIFEST is required"):
+                RUNNER.build_services(project, {}, python="/production/python")
+
+    def test_required_child_exit_stops_production_stack(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            services = (
+                RUNNER.Service("long-running", ("/bin/sh", "-c", "sleep 60")),
+                RUNNER.Service("failed", ("/bin/sh", "-c", "exit 7")),
+            )
+
+            result = RUNNER.supervise(
+                services,
+                project_dir=project,
+                environment=os.environ,
+                poll_seconds=0.01,
+                shutdown_seconds=1,
+            )
+
+            self.assertEqual(result, 7)
+
     def test_production_storage_defaults_live_outside_source_checkout(self) -> None:
         storage_script = (LAUNCHD / "ensure-production-storage.sh").read_text()
         clickhouse_config = (LAUNCHD / "clickhouse-production.xml").read_text()
@@ -149,9 +217,7 @@ class LaunchdStartupTest(unittest.TestCase):
 
         self.assertIn(f"{expected_root}/runtime", storage_script)
         self.assertIn(f"{expected_root}/runtime/clickhouse/data/", clickhouse_config)
-        self.assertIn(
-            f"{expected_root}/runtime/clickhouse/access/", clickhouse_config
-        )
+        self.assertIn(f"{expected_root}/runtime/clickhouse/access/", clickhouse_config)
         self.assertIn("<local_directory>", clickhouse_config)
         self.assertIn('"$clickhouse_dir/access"', storage_script)
         self.assertNotIn("/Volumes/T9/projects/marketcow/data-production", storage_script)

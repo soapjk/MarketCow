@@ -15,10 +15,16 @@ target_env="$support_dir/production.env"
 target_runner="$support_dir/run-production.py"
 domain="gui/$(id -u)"
 
-if [ ! -x "$project_dir/.venv/bin/marketcow" ]; then
-    echo "Missing executable: $project_dir/.venv/bin/marketcow" >&2
-    exit 1
+production_python="${MARKETCOW_PYTHON:-$project_dir/.venv/bin/python}"
+if [ ! -x "$production_python" ]; then
+    managed_python="$support_dir/atomic-freshness-venv/bin/python"
+    [ -x "$managed_python" ] || {
+        echo "Missing MarketCow production Python executable" >&2
+        exit 1
+    }
+    production_python="$managed_python"
 fi
+PYTHONPATH="$project_dir/src" "$production_python" -c 'import marketcow'
 if [ ! -f "$project_dir/.env.production" ]; then
     echo "Missing production configuration: $project_dir/.env.production" >&2
     exit 1
