@@ -21,6 +21,8 @@
         <string>true</string>
         <key>LC_ALL</key>
         <string>C</string>
+        <key>PYTHONPATH</key>
+        <string>/Volumes/T9/projects/marketcow/src</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
     </dict>

@@ -200,6 +200,10 @@ def main() -> None:
     env_file = Path(os.environ["MARKETCOW_ENV_FILE"])
     load_dotenv(env_file, override=False)
     environment = dict(os.environ)
+    # A managed virtualenv may contain an editable install left by an older
+    # worktree. Production children must always import the selected main
+    # checkout, independent of site-packages state.
+    environment["PYTHONPATH"] = str(project_dir.resolve(strict=True) / "src")
     services = build_services(project_dir, environment)
     raise SystemExit(supervise(services, project_dir=project_dir, environment=environment))
 

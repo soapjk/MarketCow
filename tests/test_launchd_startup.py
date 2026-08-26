@@ -232,6 +232,8 @@ class LaunchdStartupTest(unittest.TestCase):
         )
         self.assertIn("<key>LC_ALL</key>", plist)
         self.assertIn("<string>C</string>", plist)
+        self.assertIn("<key>PYTHONPATH</key>", plist)
+        self.assertIn("/Volumes/T9/projects/marketcow/src", plist)
 
     @staticmethod
     def _write_executable(path: Path, content: str) -> None:
