@@ -110,6 +110,33 @@ def test_elapsed_gamma_end_time_is_auditable_terminal_evidence() -> None:
     assert market.lifecycle_evidence_sha256
 
 
+def test_startup_reconciles_elapsed_pinned_market_without_clob_omission() -> None:
+    with TemporaryDirectory() as folder:
+        earlier = NOW - timedelta(hours=2)
+        row = gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1"))
+        row["endDate"] = (NOW - timedelta(hours=1)).isoformat()
+        store = LiveStateStore(Path(folder), now_provider=lambda: NOW)
+        store.replace_catalog(GammaLiveNormalizer.normalize([row], earlier), [row])
+        catalog = CatalogClient([row])
+        collector = PolymarketLiveCollector(
+            store,
+            catalog,
+            ClobBooksClient(requester=lambda *_args, **_kwargs: Response([])),
+        )
+
+        reconciled = collector.reconcile_elapsed_markets(
+            reason="startup:elapsed_end"
+        )
+
+        assert reconciled == {"m1"}
+        assert catalog.exact_requests == [{"m1"}]
+        assert store.catalog["m1"].lifecycle_state == "closed"
+        assert store.catalog["m1"].terminal_at == NOW - timedelta(hours=1)
+        assert store.catalog["m1"].lifecycle_source == "polymarket_gamma"
+        assert store.catalog["m1"].lifecycle_evidence_sha256
+        assert "yes-1" not in store.token_to_market
+
+
 def test_terminal_omission_is_isolated_and_retains_audit_and_last_books() -> None:
     with TemporaryDirectory() as folder:
         root = Path(folder)

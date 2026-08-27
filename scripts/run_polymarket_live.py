@@ -131,6 +131,11 @@ def main() -> None:
             return
         async def run() -> None:
             store.enable_async_persistence()
+            if arguments.market_id:
+                await asyncio.to_thread(
+                    collector.reconcile_elapsed_markets,
+                    reason="startup:elapsed_end",
+                )
             stream = PolymarketLiveStreamServer(
                 store,
                 host=arguments.live_stream_host,
