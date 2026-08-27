@@ -153,6 +153,23 @@ class PolymarketLivePaperScopeTest(unittest.TestCase):
             self.assertEqual(evidence["market_ids"], [str(i) for i in range(100)])
             self.assertEqual(evidence["token_count"], 200)
 
+    def test_restart_accepts_scope_that_expired_after_valid_selection(self) -> None:
+        with TemporaryDirectory() as temporary:
+            manifest, report, candidate = self._bound_scope(temporary)
+
+            evidence = MODULE.validate_scope_selection(
+                manifest,
+                report,
+                candidate,
+                now_ns=10 * 3_600 * 1_000_000_000,
+            )
+
+            self.assertEqual(
+                evidence["required_valid_until_ns"],
+                1_000_000_000 + MODULE.MINIMUM_RUNTIME_LIFETIME_SECONDS * 1_000_000_000,
+            )
+            self.assertEqual(evidence["validated_at_ns"], 10 * 3_600 * 1_000_000_000)
+
     def test_rejects_selection_report_not_bound_to_manifest(self) -> None:
         with TemporaryDirectory() as temporary:
             manifest, report, candidate = self._bound_scope(temporary)
