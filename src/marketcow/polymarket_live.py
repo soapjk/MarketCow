@@ -4955,6 +4955,16 @@ class LiveStateStore:
         self._persistence_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._persistence_thread: threading.Thread | None = None
         self._persistence_condition = threading.Condition()
+        # The append-only log is the authority; SQLite is a rebuildable index.
+        # Keep their workers and queues separate so a large/fragmented derived
+        # index cannot hold up authoritative fsyncs or grow the collector's hot
+        # persistence queue without bound.
+        self._index_queue: queue.Queue[list[dict[str, Any]] | None] = queue.Queue(
+            maxsize=4,
+        )
+        self._index_thread: threading.Thread | None = None
+        self._index_condition = threading.Condition()
+        self.indexed_cursor = 0
         self.persisted_cursor = 0
         self.persistence_error: str | None = None
         # The append-only event log and the mutable SQLite index are separate
@@ -5012,8 +5022,15 @@ class LiveStateStore:
         if self._async_persistence:
             return
         self.persisted_cursor = self.cursor
+        self.indexed_cursor = self.cursor
         self.persistence_error = None
         self._async_persistence = True
+        self._index_thread = threading.Thread(
+            target=self._index_loop,
+            name="marketcow-polymarket-derived-index",
+            daemon=True,
+        )
+        self._index_thread.start()
         self._persistence_thread = threading.Thread(
             target=self._persistence_loop,
             name="marketcow-polymarket-persistence",
@@ -5032,8 +5049,16 @@ class LiveStateStore:
             thread.join(timeout=timeout)
             if thread.is_alive():
                 raise TimeoutError("Polymarket persistence worker did not stop")
+        self.flush_async_index(target_cursor=target, timeout=timeout)
+        self._index_queue.put(None)
+        index_thread = self._index_thread
+        if index_thread is not None:
+            index_thread.join(timeout=timeout)
+            if index_thread.is_alive():
+                raise TimeoutError("Polymarket derived-index worker did not stop")
         self._async_persistence = False
         self._persistence_thread = None
+        self._index_thread = None
 
     def flush_async_persistence(
         self, *, target_cursor: int | None = None, timeout: float = 30.0,
@@ -5056,16 +5081,40 @@ class LiveStateStore:
                     + self.persistence_error
                 )
 
+    def flush_async_index(
+        self, *, target_cursor: int | None = None, timeout: float = 30.0,
+    ) -> None:
+        """Wait for the rebuildable index without redefining log durability."""
+        if not self._async_persistence or not self._state_index_available:
+            return
+        target = self.cursor if target_cursor is None else target_cursor
+        deadline = time.monotonic() + timeout
+        with self._index_condition:
+            while self.indexed_cursor < target and self._state_index_available:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Polymarket derived index did not reach target cursor"
+                    )
+                self._index_condition.wait(timeout=remaining)
+
     def _persistence_record(
         self,
         envelope: LiveEventEnvelope,
         index_gaps: list[GapEntry],
     ) -> dict[str, Any]:
-        return {
+        # Event and book models are replaced rather than mutated after
+        # publication, so the authoritative writer can safely retain their
+        # references.  Deep-copy only mutable gap state needed by SQLite.
+        record: dict[str, Any] = {
             "kind": "event",
-            "event": envelope.model_copy(deep=True),
+            "event": envelope,
+        }
+        if not self._state_index_available:
+            return record
+        record.update({
             "book": (
-                self.books[envelope.token_id].model_copy(deep=True)
+                self.books[envelope.token_id]
                 if envelope.applied and envelope.token_id in self.books else None
             ),
             "gaps": [gap.model_copy(deep=True) for gap in index_gaps],
@@ -5088,7 +5137,8 @@ class LiveStateStore:
                 min(book.received_at for book in self.books.values()).isoformat()
                 if self.books else ""
             ),
-        }
+        })
+        return record
 
     def _persistence_loop(self) -> None:
         try:
@@ -5116,6 +5166,77 @@ class LiveStateStore:
             with self._persistence_condition:
                 self.persistence_error = f"{type(exc).__name__}:{exc}"
                 self._persistence_condition.notify_all()
+
+    def _isolate_derived_index(self, exc: BaseException) -> None:
+        self._state_index_available = False
+        self.derived_index_error = f"{type(exc).__name__}:{exc}"
+        LOGGER.error(
+            "polymarket_derived_index_isolated durable_cursor=%d reason=%s",
+            self.persisted_cursor, self.derived_index_error,
+        )
+        with self._index_condition:
+            self._index_condition.notify_all()
+
+    def _index_loop(self) -> None:
+        while True:
+            records = self._index_queue.get()
+            if records is None:
+                return
+            if not self._state_index_available:
+                continue
+            try:
+                self._persist_index_records(records)
+            except BaseException as exc:
+                LOGGER.exception("polymarket_derived_index_update_failed")
+                self._isolate_derived_index(exc)
+
+    def _persist_index_records(self, records: list[dict[str, Any]]) -> None:
+        event_records = [item for item in records if item["kind"] == "event"]
+        event_positions = {
+            id(record): (
+                record["byte_offset"], record["byte_length"],
+                record["line_sha256"],
+            )
+            for record in event_records
+        }
+        with self.state_index.batch():
+            for record in records:
+                if record["kind"] == "confirmation":
+                    self.state_index.confirm_book(
+                        record["book"],
+                        oldest_book_received_at=record[
+                            "oldest_book_received_at"
+                        ],
+                    )
+                    continue
+                event = record["event"]
+                byte_offset, byte_length, line_sha256 = event_positions[
+                    id(record)
+                ]
+                self.state_index.append(
+                    event,
+                    byte_offset=byte_offset,
+                    byte_length=byte_length,
+                    line_sha256=line_sha256,
+                    book=record["book"],
+                    gaps=record["gaps"],
+                    catalog_revision=record["catalog_revision"],
+                    event_log_size=record["event_log_size"],
+                    token_to_market=record["token_to_market"],
+                    active_recovery_id=record["active_recovery_id"],
+                    book_token_count=record["book_token_count"],
+                    book_complete_market_count=record[
+                        "book_complete_market_count"
+                    ],
+                    unresolved_gap_count=record["unresolved_gap_count"],
+                    oldest_book_received_at=record[
+                        "oldest_book_received_at"
+                    ],
+                )
+        if event_records:
+            with self._index_condition:
+                self.indexed_cursor = event_records[-1]["event"].cursor
+                self._index_condition.notify_all()
 
     def _persist_records(self, records: list[dict[str, Any]]) -> None:
         started = time.monotonic()
@@ -5148,61 +5269,28 @@ class LiveStateStore:
                     self._event_offset = last_offset
                     self._last_log_cursor = last_event.cursor
                     self._persistence_condition.notify_all()
-
-            if self._state_index_available:
-                try:
-                    event_positions = {
-                        id(record): (byte_offset, byte_length, line_sha256)
-                        for record, byte_offset, byte_length, line_sha256
-                        in indexed_events
-                    }
-                    with self.state_index.batch():
-                        for record in records:
-                            if record["kind"] == "confirmation":
-                                self.state_index.confirm_book(
-                                    record["book"],
-                                    oldest_book_received_at=record[
-                                        "oldest_book_received_at"
-                                    ],
-                                )
-                                continue
-                            event = record["event"]
-                            byte_offset, byte_length, line_sha256 = (
-                                event_positions[id(record)]
-                            )
-                            self.state_index.append(
-                                event,
-                                byte_offset=byte_offset,
-                                byte_length=byte_length,
-                                line_sha256=line_sha256,
-                                book=record["book"],
-                                gaps=record["gaps"],
-                                catalog_revision=record["catalog_revision"],
-                                event_log_size=last_offset,
-                                token_to_market=record["token_to_market"],
-                                active_recovery_id=record["active_recovery_id"],
-                                book_token_count=record["book_token_count"],
-                                book_complete_market_count=record[
-                                    "book_complete_market_count"
-                                ],
-                                unresolved_gap_count=record[
-                                    "unresolved_gap_count"
-                                ],
-                                oldest_book_received_at=record[
-                                    "oldest_book_received_at"
-                                ],
-                            )
-                except BaseException as exc:
-                    self._state_index_available = False
-                    self.derived_index_error = (
-                        f"{type(exc).__name__}:{exc}"
-                    )
-                    self.state_index.close()
-                    LOGGER.exception(
-                        "polymarket_derived_index_isolated "
-                        "durable_cursor=%d durable_event_log_size=%d",
-                        self.persisted_cursor, last_offset,
-                    )
+        if self._state_index_available:
+            positions = {
+                id(record): (byte_offset, byte_length, line_sha256)
+                for record, byte_offset, byte_length, line_sha256
+                in indexed_events
+            }
+            for record in records:
+                if record["kind"] != "event":
+                    continue
+                byte_offset, byte_length, line_sha256 = positions[id(record)]
+                record.update({
+                    "byte_offset": byte_offset,
+                    "byte_length": byte_length,
+                    "line_sha256": line_sha256,
+                    "event_log_size": last_offset,
+                })
+            try:
+                self._index_queue.put_nowait(records)
+            except queue.Full:
+                self._isolate_derived_index(RuntimeError(
+                    "derived index backlog exceeded 4 durable batches"
+                ))
         elapsed = time.monotonic() - started
         if elapsed >= 0.25:
             LOGGER.info(
@@ -5532,11 +5620,12 @@ class LiveStateStore:
             if self.live_book_sink is not None:
                 self.live_book_sink(confirmed)
             if self._async_persistence:
-                self._persistence_queue.put({
-                    "kind": "confirmation",
-                    "book": confirmed.model_copy(deep=True),
-                    "oldest_book_received_at": oldest,
-                })
+                if self._state_index_available:
+                    self._persistence_queue.put({
+                        "kind": "confirmation",
+                        "book": confirmed,
+                        "oldest_book_received_at": oldest,
+                    })
             else:
                 self.state_index.confirm_book(
                     confirmed, oldest_book_received_at=oldest,
