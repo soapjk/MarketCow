@@ -3642,9 +3642,11 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 snapshot_refresh_seconds=0.01,
             )
             attempts = []
+            attempt_times = []
 
             async def refresh(reason="startup", **_partition):
                 attempts.append(reason)
+                attempt_times.append(time.monotonic())
                 if len(attempts) == 1:
                     raise RuntimeError("transient CLOB failure")
                 return "recovery"
@@ -3670,6 +3672,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 attempts,
                 ["periodic_snapshot_refresh", "periodic_snapshot_refresh"],
             )
+            self.assertLess(attempt_times[1] - attempt_times[0], 0.09)
             self.assertIn("periodic_snapshot_refresh_failed", captured.output[0])
 
     def test_websocket_reconnect_retries_transient_book_recovery_failure(self):

@@ -7730,6 +7730,7 @@ class PolymarketLiveCollector:
             await asyncio.sleep(self.snapshot_refresh_seconds + initial_delay)
             while True:
                 refresh_started = time.monotonic()
+                failed = False
                 try:
                     # Periodic partitions contain complete market/relation
                     # groups and publish through the store's short writer
@@ -7753,16 +7754,21 @@ class PolymarketLiveCollector:
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    failed = True
                     LOGGER.exception(
                         "periodic_snapshot_refresh_failed; retrying after %.3f seconds",
-                        self.snapshot_refresh_seconds,
+                        min(0.05, self.snapshot_refresh_seconds),
                     )
                 elapsed = time.monotonic() - refresh_started
                 # Keep a start-to-start cadence. Sleeping the full interval
                 # after a slow upstream request made a configured two-second
                 # refresh silently drift to four seconds or more, leaving too
                 # little room for a strict consumer's bounded read latency.
-                await asyncio.sleep(max(0, self.snapshot_refresh_seconds - elapsed))
+                await asyncio.sleep(
+                    min(0.05, self.snapshot_refresh_seconds)
+                    if failed
+                    else max(0, self.snapshot_refresh_seconds - elapsed)
+                )
 
         await asyncio.gather(*(
             worker(
