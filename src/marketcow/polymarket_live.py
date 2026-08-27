@@ -4717,8 +4717,9 @@ class ClobBooksClient:
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self.session = session or requests.Session()
-        self.requester = requester or self.session.post
+        self.session = session
+        self.requester = requester
+        self._thread_sessions = threading.local()
         self.timeout = timeout
         self.batch_size = min(500, max(1, batch_size))
         self.max_retries_per_batch = max(0, max_retries_per_batch)
@@ -4727,6 +4728,20 @@ class ClobBooksClient:
         self.sleeper = sleeper
         self.clock = clock
         self.last_evidence: dict[str, Any] | None = None
+
+    def _post(self, *args: Any, **kwargs: Any) -> Any:
+        if self.requester is not None:
+            return self.requester(*args, **kwargs)
+        if self.session is not None:
+            return self.session.post(*args, **kwargs)
+        # Periodic partitions run in separate worker threads. requests.Session
+        # mutates connection-pool state and is not a documented thread-safe
+        # boundary, so retain pooling without sharing a Session across them.
+        session = getattr(self._thread_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._thread_sessions.session = session
+        return session.post(*args, **kwargs)
 
     @staticmethod
     def _log_progress(evidence: dict[str, Any]) -> None:
@@ -4746,8 +4761,16 @@ class ClobBooksClient:
         *,
         batch_consumer: Callable[[list[dict[str, Any]]], None] | None = None,
         require_complete_batches: bool = False,
+        request_timeout: float | tuple[float, float] | None = None,
+        max_retries_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         tokens = list(dict.fromkeys(str(item) for item in token_ids))
+        timeout = self.timeout if request_timeout is None else request_timeout
+        retry_limit = (
+            self.max_retries_per_batch
+            if max_retries_per_batch is None
+            else max(0, max_retries_per_batch)
+        )
         rows = []
         received_book_count = 0
         batch_count = (len(tokens) + self.batch_size - 1) // self.batch_size
@@ -4766,22 +4789,22 @@ class ClobBooksClient:
                 attempts = 0
                 while True:
                     try:
-                        response = self.requester(
-                            self.endpoint, json=request_body, timeout=self.timeout,
+                        response = self._post(
+                            self.endpoint, json=request_body, timeout=timeout,
                             headers={
                                 "Content-Type": "application/json",
                                 "User-Agent": "MarketCow/0.2",
                             },
                         )
                     except requests.RequestException:
-                        if attempts >= self.max_retries_per_batch:
+                        if attempts >= retry_limit:
                             raise
                         attempts += 1
                         retry_count += 1
                         continue
                     if response.status_code != 429 and response.status_code < 500:
                         break
-                    if attempts >= self.max_retries_per_batch:
+                    if attempts >= retry_limit:
                         response.raise_for_status()
                     attempts += 1
                     retry_count += 1
@@ -4815,7 +4838,7 @@ class ClobBooksClient:
                 missing = requested - received
                 if not missing:
                     break
-                if coverage_attempts >= self.max_retries_per_batch:
+                if coverage_attempts >= retry_limit:
                     raise ClobBooksCoverageError(missing)
                 coverage_attempts += 1
                 retry_count += 1
@@ -7081,6 +7104,10 @@ class PolymarketLiveCollector:
         publish_checkpoints: bool = True,
         minimum_snapshot_refresh_age_seconds: float = 0,
         max_concurrent_snapshot_refreshes: int = 1,
+        periodic_snapshot_request_timeout: (
+            float | tuple[float, float] | None
+        ) = None,
+        periodic_snapshot_max_retries: int | None = None,
         websocket_flush_seconds: float = 0.1,
         max_websocket_batch_messages: int = 256,
         max_websocket_batch_items: int = 32,
@@ -7107,16 +7134,20 @@ class PolymarketLiveCollector:
         self.max_concurrent_snapshot_refreshes = max(
             1, max_concurrent_snapshot_refreshes,
         )
+        self.periodic_snapshot_request_timeout = periodic_snapshot_request_timeout
+        self.periodic_snapshot_max_retries = periodic_snapshot_max_retries
         self.websocket_flush_seconds = max(0, websocket_flush_seconds)
         self.max_websocket_batch_messages = max(1, max_websocket_batch_messages)
         self.max_websocket_batch_items = max(1, max_websocket_batch_items)
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
-        # Periodic REST refreshes and reconnect recovery both fetch the same
-        # books and publish through one durable boundary.  Letting their fetches
-        # overlap only creates a publication backlog whose snapshots are stale
-        # by the time they acquire the writer lock.
+        # Independent periodic partitions may fetch concurrently, but a full
+        # reconnect recovery must wait for them and prevent new registrations.
+        # Publication remains serialized by the store's short writer boundary.
         self._snapshot_operation_lock = asyncio.Lock()
+        self._active_periodic_snapshot_operations = 0
+        self._periodic_snapshot_operations_idle = asyncio.Event()
+        self._periodic_snapshot_operations_idle.set()
 
     def reconcile_terminal_tokens(
         self, missing_token_ids: Iterable[str], *, reason: str,
@@ -7210,7 +7241,12 @@ class PolymarketLiveCollector:
         return terminal_market_ids
 
     async def _fetch_complete_books(
-        self, token_ids: Iterable[str], *, reason: str,
+        self,
+        token_ids: Iterable[str],
+        *,
+        reason: str,
+        request_timeout: float | tuple[float, float] | None = None,
+        max_retries_per_batch: int | None = None,
     ) -> tuple[list[dict[str, Any]], set[str]]:
         requested = sorted(set(token_ids))
         try:
@@ -7218,6 +7254,8 @@ class PolymarketLiveCollector:
                 self.books_client.fetch_stream,
                 requested,
                 require_complete_batches=True,
+                request_timeout=request_timeout,
+                max_retries_per_batch=max_retries_per_batch,
             )
             return rows, set()
         except ClobBooksCoverageError as exc:
@@ -7232,6 +7270,8 @@ class PolymarketLiveCollector:
                     self.books_client.fetch_stream,
                     remaining,
                     require_complete_batches=True,
+                    request_timeout=request_timeout,
+                    max_retries_per_batch=max_retries_per_batch,
                 )
                 if remaining else []
             )
@@ -7488,6 +7528,8 @@ class PolymarketLiveCollector:
             if len(refresh_token_ids) <= self.books_client.batch_size:
                 rows, retired = await self._fetch_complete_books(
                     refresh_token_ids, reason=f"{reason}:clob_omission",
+                    request_timeout=self.periodic_snapshot_request_timeout,
+                    max_retries_per_batch=self.periodic_snapshot_max_retries,
                 )
                 tracker["expected"].difference_update(retired)
                 self._commit_recovery_rows(
@@ -7506,6 +7548,8 @@ class PolymarketLiveCollector:
                 refresh_token_ids,
                 batch_consumer=consume,
                 require_complete_batches=True,
+                request_timeout=self.periodic_snapshot_request_timeout,
+                max_retries_per_batch=self.periodic_snapshot_max_retries,
             )
         self._commit_recovery_rows(
             [],
@@ -7687,21 +7731,25 @@ class PolymarketLiveCollector:
             while True:
                 refresh_started = time.monotonic()
                 try:
+                    # Periodic partitions contain complete market/relation
+                    # groups and publish through the store's short writer
+                    # boundary. Fetch them concurrently so a slow CLOB shard
+                    # cannot age every otherwise independent market. A full
+                    # reconnect recovery keeps precedence and suppresses new
+                    # periodic work while it owns the operation lock.
                     async with self._snapshot_operation_lock:
-                        queued_seconds = time.monotonic() - refresh_started
-                        if queued_seconds >= self.snapshot_refresh_seconds:
-                            LOGGER.info(
-                                "periodic_snapshot_refresh_superseded "
-                                "partition=%d queued_seconds=%.6f interval_seconds=%.6f",
-                                partition_index, queued_seconds,
-                                self.snapshot_refresh_seconds,
-                            )
-                        else:
-                            await self.refresh_books(
-                                "periodic_snapshot_refresh",
-                                partition_index=partition_index,
-                                partition_count=self.max_concurrent_snapshot_refreshes,
-                            )
+                        self._active_periodic_snapshot_operations += 1
+                        self._periodic_snapshot_operations_idle.clear()
+                    try:
+                        await self.refresh_books(
+                            "periodic_snapshot_refresh",
+                            partition_index=partition_index,
+                            partition_count=self.max_concurrent_snapshot_refreshes,
+                        )
+                    finally:
+                        self._active_periodic_snapshot_operations -= 1
+                        if self._active_periodic_snapshot_operations == 0:
+                            self._periodic_snapshot_operations_idle.set()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -7737,6 +7785,7 @@ class PolymarketLiveCollector:
                 if attempts > 1:
                     try:
                         async with self._snapshot_operation_lock:
+                            await self._periodic_snapshot_operations_idle.wait()
                             await self.bootstrap_books(
                                 f"websocket_reconnect:{attempts}"
                             )

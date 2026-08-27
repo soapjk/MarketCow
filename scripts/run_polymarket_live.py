@@ -110,12 +110,15 @@ def main() -> None:
             catalog_refresh_on_lifecycle_events=not bool(arguments.market_id),
             publish_checkpoints=not bool(arguments.market_id),
             minimum_snapshot_refresh_age_seconds=(0.25 if arguments.market_id else 0),
-            # A bounded scope has at most 200 tokens, so /books can refresh it
-            # in one request.  Parallel workers share one requests.Session and
-            # serialize on the same durable publication boundary; under load
-            # they create overlapping TLS requests and an unbounded commit
-            # backlog that makes the resulting state older, not fresher.
-            max_concurrent_snapshot_refreshes=1,
+            # Keep complete market/negative-risk groups together, but do not
+            # let one slow 200-token CLOB request age the entire exact scope.
+            # Periodic attempts are bounded and retry on their next cadence;
+            # startup/reconnect recovery retains the stronger retry policy.
+            max_concurrent_snapshot_refreshes=(4 if arguments.market_id else 1),
+            periodic_snapshot_request_timeout=(
+                (0.75, 0.75) if arguments.market_id else None
+            ),
+            periodic_snapshot_max_retries=(0 if arguments.market_id else None),
         )
         if arguments.market_id:
             print({
