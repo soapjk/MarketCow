@@ -191,6 +191,33 @@ class PolymarketAsyncPersistenceTest(unittest.TestCase):
 
 
 class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
+    async def test_book_confirmations_coalesce_into_one_latest_per_token_batch(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = populated_store(Path(temporary.name) / "live")
+        server = PolymarketLiveStreamServer(store, port=free_port())
+        server._loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=10)
+        server._clients.add(queue)
+        yes = store.books["yes-1"]
+        no = store.books["no-1"]
+        later = NOW + timedelta(seconds=1)
+
+        server.publish_book_confirmation(yes)
+        server.publish_book_confirmation(no)
+        server.publish_book_confirmation(yes.model_copy(update={
+            "received_at": later,
+        }))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        message = queue.get_nowait()
+        self.assertEqual(message["type"], "book_confirmations")
+        books = {book.token_id: book for book in message["books"]}
+        self.assertEqual(set(books), {"yes-1", "no-1"})
+        self.assertEqual(books["yes-1"].received_at, later)
+        self.assertTrue(queue.empty())
+
     async def test_loopback_stream_builds_projection_and_advances_without_sqlite(self):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
