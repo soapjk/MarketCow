@@ -5639,20 +5639,22 @@ class LiveStateStore:
                 "source_hash": source_hash,
             })
             self.books[token_id] = confirmed
-            oldest = min(book.received_at for book in self.books.values())
             if self.live_book_sink is not None:
                 self.live_book_sink(confirmed)
-            if self._async_persistence:
-                if self._state_index_available:
-                    self._persistence_queue.put({
-                        "kind": "confirmation",
-                        "book": confirmed,
-                        "oldest_book_received_at": oldest,
-                    })
-            else:
+            if not self._async_persistence:
                 self.state_index.confirm_book(
-                    confirmed, oldest_book_received_at=oldest,
+                    confirmed,
+                    oldest_book_received_at=min(
+                        book.received_at for book in self.books.values()
+                    ),
                 )
+            # In async live mode this is only a freshness proof for the hot
+            # memory projection; it is not an authoritative event. Sending
+            # hundreds of confirmations per second through the append queue
+            # lets rebuildable SQLite work backpressure event-log fsyncs. A
+            # restart always performs a complete CLOB bootstrap before 8794
+            # becomes ready, so the derived index need not persist these
+            # transient confirmations between authoritative events.
             return None
         book = LiveBook(
             token_id=token_id, condition_id=market.identity.condition_id,

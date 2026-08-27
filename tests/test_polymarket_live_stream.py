@@ -50,6 +50,27 @@ def populated_store(root: Path) -> LiveStateStore:
 
 
 class PolymarketAsyncPersistenceTest(unittest.TestCase):
+    def test_freshness_confirmations_never_enter_authoritative_append_queue(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            published = []
+            store.live_book_sink = published.append
+            store.enable_async_persistence()
+            try:
+                confirmed_at = NOW + timedelta(seconds=1)
+                result = store.apply_snapshot(
+                    snapshot("yes-1", "0.40", "0.42"),
+                    received_at=confirmed_at,
+                    allow_freshness_confirmation=True,
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(store._persistence_queue.qsize(), 0)
+                self.assertEqual(published[0].received_at, confirmed_at)
+                self.assertEqual(store.persisted_cursor, store.cursor)
+            finally:
+                store.close_async_persistence(timeout=5)
+
     def test_live_sink_precedes_blocked_persistence_and_durable_tail_catches_up(self):
         with TemporaryDirectory() as temporary:
             store = populated_store(Path(temporary) / "live")
