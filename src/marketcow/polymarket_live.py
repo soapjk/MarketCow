@@ -4973,6 +4973,9 @@ class LiveStateStore:
         # that sink happens immediately after the canonical in-memory event is
         # committed and before any JSONL/SQLite persistence work begins.
         self.live_event_sink: Callable[[LiveEventEnvelope], None] | None = None
+        self.live_event_batch_sink: (
+            Callable[[list[LiveEventEnvelope]], None] | None
+        ) = None
         self.live_book_sink: Callable[[LiveBook], None] | None = None
         self._async_persistence = False
         self._persistence_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -5364,17 +5367,31 @@ class LiveStateStore:
     @contextmanager
     def event_publication_batch(self):
         """Group synchronous durability, or only memory mutation in hot mode."""
-        if self._async_persistence:
-            with self.memory_state_batch():
-                yield
-            return
-        with (
-            _publication_lock(self.root, exclusive=True),
-            self.memory_state_batch(),
-            self.state_index.batch(),
-            self.durable_event_batch(),
-        ):
-            yield
+        outermost = not hasattr(self._event_batch_state, "published_events")
+        if outermost:
+            self._event_batch_state.published_events = []
+        try:
+            if self._async_persistence:
+                with self.memory_state_batch():
+                    yield
+            else:
+                with (
+                    _publication_lock(self.root, exclusive=True),
+                    self.memory_state_batch(),
+                    self.state_index.batch(),
+                    self.durable_event_batch(),
+                ):
+                    yield
+            if outermost:
+                events = self._event_batch_state.published_events
+                if events and self.live_event_batch_sink is not None:
+                    self.live_event_batch_sink(events)
+                elif self.live_event_sink is not None:
+                    for event in events:
+                        self.live_event_sink(event)
+        finally:
+            if outermost:
+                del self._event_batch_state.published_events
 
     def _append(self, value: dict[str, Any]) -> tuple[int, int, str]:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5532,7 +5549,12 @@ class LiveStateStore:
         )
         envelope.event_id = live_event_identity(envelope)
         self.events.append(envelope)
-        if self.live_event_sink is not None:
+        publication_events = getattr(
+            self._event_batch_state, "published_events", None
+        )
+        if publication_events is not None:
+            publication_events.append(envelope)
+        elif self.live_event_sink is not None:
             self.live_event_sink(envelope)
         self._remember_raw_hash(raw_hash)
         index_gaps = list(gaps or [])
@@ -6241,6 +6263,41 @@ class LiveStateStore:
         if write_checkpoint:
             self.checkpoint()
         return coverage
+
+    def resolve_gaps_from_authoritative_books(
+        self, token_ids: Iterable[str], *, reason: str
+    ) -> LiveEventEnvelope | None:
+        """Close token gaps when a later validated full book is authoritative."""
+        authoritative = set(token_ids)
+        resolved_token_ids = sorted({
+            gap.token_id
+            for gap in self.gaps
+            if not gap.resolved and gap.token_id in authoritative
+        })
+        if not resolved_token_ids:
+            return None
+        recovery_id = content_sha256({
+            "reason": reason,
+            "boundary_cursor": self.cursor,
+            "resolved_gap_token_ids": resolved_token_ids,
+        })
+        resolved = set(resolved_token_ids)
+        for gap in self.gaps:
+            if not gap.resolved and gap.token_id in resolved:
+                gap.resolved = True
+                gap.resolution = f"{reason}:{recovery_id}"
+        return self._emit(
+            "recovery_completed",
+            {
+                "recovery_id": recovery_id,
+                "reason": reason,
+                "resolved_gap_token_ids": resolved_token_ids,
+                "recovered_token_count": len(resolved_token_ids),
+                "recovered_token_sha256": content_sha256(resolved_token_ids),
+            },
+            {},
+            applied=True,
+        )
 
     def recover_from_books(
         self, rows: list[dict[str, Any]], recovery_id: str,
@@ -7697,13 +7754,26 @@ class PolymarketLiveCollector:
             publish_started = time.monotonic()
             cursor_started = self.store.cursor
             with self.store.event_publication_batch():
+                authoritative_book_token_ids: set[str] = set()
                 for item in items:
-                    self.store.apply_websocket(
+                    events = self.store.apply_websocket(
                         item,
                         stale_events_are_resolved=(
                             self.snapshot_refresh_seconds is not None
                         ),
                     )
+                    if events:
+                        authoritative_book_token_ids.update(
+                            event.token_id
+                            for event in events
+                            if event.applied
+                            and event.event_type == "book"
+                            and event.token_id is not None
+                        )
+                self.store.resolve_gaps_from_authoritative_books(
+                    authoritative_book_token_ids,
+                    reason="websocket_full_book",
+                )
             publish_seconds = time.monotonic() - publish_started
             cursor_finished = self.store.cursor
         if sync_wait_seconds >= 0.25 or publish_seconds >= 0.25:

@@ -18,6 +18,7 @@ from marketcow.polymarket_live import (
     LiveMarket,
     LiveSnapshotPage,
     LiveStateStore,
+    PolymarketLiveCollector,
     PolymarketLiveReadError,
     PolymarketLiveReadStore,
     _durable_event_log_tail,
@@ -50,6 +51,70 @@ def populated_store(root: Path) -> LiveStateStore:
 
 
 class PolymarketAsyncPersistenceTest(unittest.TestCase):
+    def test_websocket_full_book_resolves_invalid_delta_in_atomic_batch(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            initial_books = [
+                book.model_copy(deep=True) for book in store.books.values()
+            ]
+            published_batches = []
+            store.live_event_batch_sink = published_batches.append
+            collector = PolymarketLiveCollector(
+                store,
+                unittest.mock.Mock(),
+                unittest.mock.Mock(),
+                snapshot_refresh_seconds=1,
+            )
+            crossed = {
+                "event_type": "price_change",
+                "timestamp": "1785739202000",
+                "price_changes": [{
+                    "asset_id": "yes-1",
+                    "side": "BUY",
+                    "price": "0.43",
+                    "size": "1",
+                }],
+            }
+            authoritative = snapshot(
+                "yes-1", "0.41", "0.44", "1785739202001"
+            )
+
+            collector._apply_websocket_batch([crossed, authoritative])
+
+            self.assertEqual(len(published_batches), 1)
+            events = published_batches[0]
+            self.assertEqual(
+                [event.event_type for event in events],
+                ["price_change", "book", "recovery_completed"],
+            )
+            self.assertFalse(events[0].applied)
+            self.assertEqual(
+                events[-1].canonical_payload["resolved_gap_token_ids"],
+                ["yes-1"],
+            )
+            self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
+
+            projection = PolymarketLiveProjection(replay_capacity=100)
+            projection.install_state({
+                "schema_version": "marketcow.polymarket.live-stream.v1",
+                "type": "state",
+                "catalog_revision": store.catalog_revision,
+                "catalog_source": store.catalog_source,
+                "latest_cursor": events[0].cursor - 1,
+                "persisted_cursor": events[0].cursor - 1,
+                "active_recovery_id": None,
+                "markets": [
+                    market.model_dump(mode="json")
+                    for market in store.catalog.values()
+                ],
+                "books": [book.model_dump(mode="json") for book in initial_books],
+                "gaps": [],
+            })
+            projection.mark_ready({"latest_cursor": events[0].cursor - 1})
+            projection.apply_validated_lives(events)
+            self.assertEqual(projection.latest_cursor, events[-1].cursor)
+            self.assertEqual(sum(not gap.resolved for gap in projection._gaps), 0)
+
     def test_freshness_confirmations_never_enter_authoritative_append_queue(self):
         with TemporaryDirectory() as temporary:
             store = populated_store(Path(temporary) / "live")
