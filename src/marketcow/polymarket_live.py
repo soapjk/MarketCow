@@ -7084,6 +7084,42 @@ class PolymarketLiveCollector:
         )
         return retired_tokens
 
+    def reconcile_elapsed_markets(self, *, reason: str) -> set[str]:
+        """Refresh only pinned markets whose recorded end time has elapsed."""
+        observed_at = self.store.now_provider()
+        affected_market_ids = {
+            market_id
+            for market_id, market in self.store.catalog.items()
+            if market.lifecycle_state == "active"
+            and market.end_at is not None
+            and market.end_at <= observed_at
+        }
+        if not affected_market_ids:
+            return set()
+        exact_fetch = getattr(self.catalog_client, "fetch_market_ids", None)
+        if not callable(exact_fetch):
+            return set()
+        rows, _ = exact_fetch(affected_market_ids)
+        observed_markets = GammaLiveNormalizer.normalize(rows, observed_at)
+        by_id = {
+            market.identity.market_id: market for market in observed_markets
+        }
+        terminal_market_ids = {
+            market_id for market_id in affected_market_ids
+            if (market := by_id.get(market_id)) is not None
+            and market.lifecycle_state in {"closed", "resolved", "invalid"}
+        }
+        with self.store._sync_lock, self.store.event_publication_batch():
+            for market_id in sorted(terminal_market_ids):
+                self.store.mark_market_terminal(by_id[market_id], reason=reason)
+        LOGGER.info(
+            "polymarket_elapsed_markets_reconciled markets=%s unresolved=%s reason=%s",
+            sorted(terminal_market_ids),
+            sorted(affected_market_ids - terminal_market_ids),
+            reason,
+        )
+        return terminal_market_ids
+
     async def _fetch_complete_books(
         self, token_ids: Iterable[str], *, reason: str,
     ) -> tuple[list[dict[str, Any]], set[str]]:
