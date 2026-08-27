@@ -131,12 +131,31 @@ pub enum EventKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceEvidence {
+    pub source: String,
+    pub source_url: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub responded_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+    pub raw_sha256: String,
+    pub update_frequency: String,
+    pub revision: String,
+    pub missing: bool,
+    pub delayed: bool,
+    pub duplicate: bool,
+    pub revised: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalEvent {
     pub schema_version: String,
     pub cursor: u64,
     pub event_id: String,
     pub scope_id: String,
     pub source_observed_at: DateTime<Utc>,
+    pub normalizer_version: String,
+    pub config_revision: String,
+    pub source: SourceEvidence,
     pub kind: EventKind,
 }
 
@@ -250,6 +269,18 @@ impl<L: DurableLog> SingleWriter<L> {
         }
         if event.scope_id != previous.scope_id {
             return Err(CoreError::ScopeMismatch);
+        }
+        if event.normalizer_version.is_empty()
+            || event.config_revision.is_empty()
+            || event.source.responded_at < event.source.requested_at
+            || event.source.raw_sha256.len() != 64
+            || !event
+                .source
+                .raw_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CoreError::InvalidSourceEvidence);
         }
         if previous.recent_event_ids.contains(&event.event_id) {
             return Err(CoreError::DuplicateEvent(event.event_id));
@@ -501,6 +532,8 @@ pub enum CoreError {
     SchemaMismatch,
     #[error("scope mismatch")]
     ScopeMismatch,
+    #[error("source evidence is incomplete or invalid")]
+    InvalidSourceEvidence,
     #[error("duplicate event: {0}")]
     DuplicateEvent(String),
     #[error("cursor gap expected {expected} got {actual}")]
@@ -537,12 +570,29 @@ mod tests {
     use tempfile::tempdir;
 
     fn event(cursor: u64, kind: EventKind) -> CanonicalEvent {
+        let at = Utc::now();
         CanonicalEvent {
             schema_version: CONTRACT_VERSION.into(),
             cursor,
             event_id: format!("e-{cursor}"),
             scope_id: "scope".into(),
-            source_observed_at: Utc::now(),
+            source_observed_at: at,
+            normalizer_version: "test-v1".into(),
+            config_revision: "config-v1".into(),
+            source: SourceEvidence {
+                source: "polymarket-clob".into(),
+                source_url: Some("https://clob.polymarket.com".into()),
+                requested_at: at,
+                responded_at: at,
+                observed_at: at,
+                raw_sha256: "a".repeat(64),
+                update_frequency: "realtime".into(),
+                revision: "fixture-v1".into(),
+                missing: false,
+                delayed: false,
+                duplicate: false,
+                revised: false,
+            },
             kind,
         }
     }

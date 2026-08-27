@@ -146,11 +146,11 @@ impl AuditLog {
         })
     }
     fn record(&self, value: serde_json::Value) {
-        if let Ok(mut file) = self.file.lock() {
-            if let Ok(line) = serde_json::to_vec(&value) {
-                let _ = file.write_all(&line);
-                let _ = file.write_all(b"\n");
-            }
+        if let Ok(mut file) = self.file.lock()
+            && let Ok(line) = serde_json::to_vec(&value)
+        {
+            let _ = file.write_all(&line);
+            let _ = file.write_all(b"\n");
         }
     }
 }
