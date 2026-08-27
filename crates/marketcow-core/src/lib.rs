@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -148,6 +148,7 @@ pub struct Projection {
     pub scope_id: String,
     pub books: BTreeMap<String, Book>,
     pub unresolved_gaps: BTreeSet<String>,
+    pub recent_event_ids: VecDeque<String>,
     pub ready: bool,
     pub fail_closed_reason: Option<String>,
     pub published_at: DateTime<Utc>,
@@ -163,6 +164,7 @@ impl Projection {
             "scope_id": self.scope_id,
             "books": self.books,
             "unresolved_gaps": self.unresolved_gaps,
+            "recent_event_ids": self.recent_event_ids,
             "ready": self.ready,
             "fail_closed_reason": self.fail_closed_reason,
         });
@@ -217,6 +219,7 @@ impl<L: DurableLog> SingleWriter<L> {
                 scope_id,
                 books: BTreeMap::new(),
                 unresolved_gaps: BTreeSet::new(),
+                recent_event_ids: VecDeque::new(),
                 ready: false,
                 fail_closed_reason: Some("bootstrap_required".into()),
                 published_at: Utc::now(),
@@ -247,6 +250,9 @@ impl<L: DurableLog> SingleWriter<L> {
         }
         if event.scope_id != previous.scope_id {
             return Err(CoreError::ScopeMismatch);
+        }
+        if previous.recent_event_ids.contains(&event.event_id) {
+            return Err(CoreError::DuplicateEvent(event.event_id));
         }
         if event.cursor != previous.cursor + 1 {
             return Err(CoreError::CursorGap {
@@ -298,6 +304,10 @@ impl<L: DurableLog> SingleWriter<L> {
         next.fail_closed_reason = (!next.ready).then(|| "unresolved_gap".into());
         self.log.append(&event)?;
         next.persisted_cursor = event.cursor;
+        next.recent_event_ids.push_back(event.event_id);
+        if next.recent_event_ids.len() > 10_000 {
+            next.recent_event_ids.pop_front();
+        }
         let published = Arc::new(next);
         self.current.store(published.clone());
         Ok(published)
@@ -491,6 +501,8 @@ pub enum CoreError {
     SchemaMismatch,
     #[error("scope mismatch")]
     ScopeMismatch,
+    #[error("duplicate event: {0}")]
+    DuplicateEvent(String),
     #[error("cursor gap expected {expected} got {actual}")]
     CursorGap { expected: u64, actual: u64 },
     #[error("crossed or locked book: {0}")]
@@ -733,5 +745,89 @@ mod tests {
             Err(CoreError::SlowConsumer { close_code: 1013 })
         ));
         assert_eq!(receiver.recv().unwrap(), 1);
+    }
+
+    #[test]
+    fn duplicate_event_is_auditable_and_does_not_advance() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+        let mut state = SingleWriter::new("scope".into(), MemoryLog);
+        let first = event(
+            1,
+            EventKind::FullBook {
+                token_id: "t".into(),
+                bids: levels("0.2", "1"),
+                asks: levels("0.8", "1"),
+                tick_version: 1,
+            },
+        );
+        state.apply(first.clone()).unwrap();
+        let mut duplicate = first;
+        duplicate.cursor = 2;
+        assert!(matches!(
+            state.apply(duplicate),
+            Err(CoreError::DuplicateEvent(_))
+        ));
+        assert_eq!(state.projection().cursor, 1);
+    }
+
+    #[test]
+    fn wal_chain_and_corruption_are_verified() {
+        let dir = tempdir().unwrap();
+        let mut wal = SegmentedWal::open(dir.path(), "chain", 1024).unwrap();
+        for cursor in 1..=8 {
+            wal.append(&event(
+                cursor,
+                EventKind::FullBook {
+                    token_id: format!("token-{cursor}"),
+                    bids: levels("0.2", "123456789.123456789"),
+                    asks: levels("0.8", "987654321.987654321"),
+                    tick_version: 1,
+                },
+            ))
+            .unwrap();
+        }
+        drop(wal);
+        assert_eq!(SegmentedWal::verify(dir.path()).unwrap().len(), 8);
+        let mut paths: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        paths.sort();
+        OpenOptions::new()
+            .append(true)
+            .open(paths.last().unwrap())
+            .unwrap()
+            .write_all(b"{corrupt}\n")
+            .unwrap();
+        assert!(SegmentedWal::verify(dir.path()).is_err());
+    }
+
+    #[test]
+    fn checkpoint_corruption_is_rejected() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+        let dir = tempdir().unwrap();
+        let state = SingleWriter::new("scope".into(), MemoryLog);
+        let path = dir.path().join("checkpoint.json");
+        let hash = write_checkpoint(&path, &state.projection()).unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"corrupt")
+            .unwrap();
+        assert!(matches!(
+            read_checkpoint(&path, &hash),
+            Err(CoreError::CheckpointHash)
+        ));
     }
 }

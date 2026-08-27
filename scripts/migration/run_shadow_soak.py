@@ -32,7 +32,6 @@ def main() -> None:
     binary = root / "target/debug/marketcow"
     if not binary.is_file():
         raise SystemExit("build target/debug/marketcow first")
-    started_at = datetime.now(UTC)
     latencies: list[float] = []
     failures: list[dict[str, object]] = []
     max_rss_kb = 0
@@ -42,6 +41,21 @@ def main() -> None:
                "MARKETCOW_REAL_ORDER_SUBMISSION_ENABLED": "false"}
         process = subprocess.Popen([binary, "serve"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
+            startup_deadline = time.monotonic() + 10
+            while True:
+                if process.poll() is not None:
+                    stderr = process.stderr.read().decode(errors="replace") if process.stderr else ""
+                    raise SystemExit(f"shadow process exited during startup: {stderr[-2000:]}")
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{args.port}/v1/readiness", timeout=1) as response:
+                        if response.status == 200 and json.load(response).get("ready") is True:
+                            break
+                except Exception:  # noqa: BLE001 - expected until the socket is bound
+                    pass
+                if time.monotonic() >= startup_deadline:
+                    raise SystemExit("shadow process did not become ready within 10 seconds")
+                time.sleep(0.05)
+            started_at = datetime.now(UTC)
             deadline = time.monotonic() + args.duration_seconds
             while time.monotonic() < deadline:
                 before = time.perf_counter()

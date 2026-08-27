@@ -1,0 +1,18 @@
+{
+  "elapsed_seconds": 10.057084,
+  "failures": [],
+  "finished_at": "2026-08-27T15:10:21.615153+00:00",
+  "health_latency_ms": {
+    "max": 7.511624979088083,
+    "p50": 2.5028329982887954,
+    "p95": 4.19895799132064,
+    "p99": 7.511624979088083
+  },
+  "max_rss_kb": 11344,
+  "passed": true,
+  "real_order_submission_enabled": false,
+  "requested_duration_seconds": 10,
+  "samples": 58,
+  "schema_version": "marketcow.shadow-soak.v1",
+  "started_at": "2026-08-27T15:10:11.557987+00:00"
+}
