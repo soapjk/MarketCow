@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from marketcow.polymarket_scopes import write_scope_runtime
+
 
 MINIMUM_SAFE_REFRESH_SECONDS = 1.0
 MAXIMUM_SAFE_REFRESH_SECONDS = 2.0
@@ -173,6 +175,11 @@ def main() -> None:
         "scope_id": arguments.scope_id,
         "scope_lifetime": scope_lifetime,
     }, sort_keys=True), flush=True)
+    write_scope_runtime(
+        arguments.root,
+        scope_id=arguments.scope_id,
+        manifest_sha256=observed_sha256,
+    )
     os.execv(sys.executable, command)
 
 

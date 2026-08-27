@@ -130,6 +130,24 @@ def create_polymarket_live_read_app(
     app.state.polymarket_live_read_executor = executor
     app.state.polymarket_live_projection = projection
 
+    def require_scope_identity(requested_scope_id: str | None) -> None:
+        current_scope_id = projection.scope_id or reader.scope_id
+        if requested_scope_id and requested_scope_id != current_scope_id:
+            raise PolymarketLiveReadError(
+                "polymarket_scope_retired",
+                "Requested scope is no longer active; discover scope_id and re-bootstrap",
+                410,
+            )
+
+    @app.get("/v1/prediction-markets/polymarket/live/scope")
+    async def scope_discovery():
+        return {
+            "schema_version": "marketcow.polymarket.scope-discovery.v1",
+            "active_scope_id": projection.scope_id or reader.scope_id,
+            "scope_status": "active" if (projection.scope_id or reader.scope_id) else "unscoped",
+            "real_order_submission_enabled": False,
+        }
+
     async def run_read(
         action: Callable[..., T],
         *args: object,
@@ -163,9 +181,12 @@ def create_polymarket_live_read_app(
         response_model=LiveBootstrapResponse,
     )
     async def bootstrap(
-        request: Request, market_id: list[str] | None = Query(default=None),
+        request: Request,
+        market_id: list[str] | None = Query(default=None),
+        scope_id: str | None = Query(default=None),
     ):
         try:
+            require_scope_identity(scope_id)
             scope = _require_scope(market_id)
             if stream_client is not None:
                 body, phases = await run_hot_json(
@@ -187,9 +208,12 @@ def create_polymarket_live_read_app(
         response_model=LiveSnapshotPage,
     )
     async def snapshot(
-        request: Request, market_id: list[str] | None = Query(default=None),
+        request: Request,
+        market_id: list[str] | None = Query(default=None),
+        scope_id: str | None = Query(default=None),
     ):
         try:
+            require_scope_identity(scope_id)
             scope = _require_scope(market_id)
             if stream_client is not None:
                 body, phases = await run_hot_json(
@@ -211,9 +235,12 @@ def create_polymarket_live_read_app(
         response_model=LiveFullSyncResponse,
     )
     async def full_sync(
-        request: Request, market_id: list[str] | None = Query(default=None),
+        request: Request,
+        market_id: list[str] | None = Query(default=None),
+        scope_id: str | None = Query(default=None),
     ):
         try:
+            require_scope_identity(scope_id)
             if stream_client is None:
                 raise PolymarketLiveReadError(
                     "polymarket_live_stream_not_configured",
@@ -290,9 +317,12 @@ def create_polymarket_live_read_app(
         response_model=LiveReadHealth,
     )
     async def health(
-        request: Request, market_id: list[str] | None = Query(default=None),
+        request: Request,
+        market_id: list[str] | None = Query(default=None),
+        scope_id: str | None = Query(default=None),
     ):
         try:
+            require_scope_identity(scope_id)
             if stream_client is not None:
                 body, phases = await run_hot_json(
                     projection.health_json,
