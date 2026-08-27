@@ -39,9 +39,17 @@ class CatalogRows(list):
 class CatalogClient:
     def __init__(self, rows: list[dict]):
         self.rows = rows
+        self.exact_requests: list[set[str]] = []
 
     def fetch_all(self):
         return CatalogRows(self.rows), {"source": "test"}
+
+    def fetch_market_ids(self, market_ids):
+        requested = set(market_ids)
+        self.exact_requests.append(requested)
+        return CatalogRows([
+            row for row in self.rows if str(row.get("id")) in requested
+        ]), {"source": "test-exact"}
 
 
 def terminal_row(market_id: str, condition: str, tokens: tuple[str, str]) -> dict:

@@ -241,6 +241,27 @@ class PolymarketLiveTest(unittest.TestCase):
         default_catalog = GammaKeysetCatalog()
         self.assertIs(default_catalog.requester.__self__, default_catalog.session)
 
+    def test_gamma_exact_market_fetch_includes_closed_or_elapsed_records(self):
+        calls = []
+        elapsed = gamma_row("3055019")
+        elapsed["endDate"] = "2026-08-26T23:59:00Z"
+
+        def requester(url, **kwargs):
+            calls.append((url, kwargs))
+            return Response(elapsed)
+
+        rows, evidence = GammaKeysetCatalog(requester=requester).fetch_market_ids(
+            ["3055019"]
+        )
+
+        self.assertEqual([row["id"] for row in rows], ["3055019"])
+        self.assertEqual(
+            calls[0][0], "https://gamma-api.polymarket.com/markets/3055019"
+        )
+        self.assertNotIn("params", calls[0][1])
+        self.assertTrue(evidence["complete"])
+        self.assertEqual(evidence["missing_market_ids"], [])
+
     def test_gamma_cursor_loop_fails_instead_of_publishing_partial_catalog(self):
         def requester(_url, **_kwargs):
             return Response({"markets": [gamma_row()], "next_cursor": "same"})
@@ -1209,9 +1230,10 @@ class PolymarketLiveTest(unittest.TestCase):
         )
         collector = PolymarketLiveCollector(
             store,
-            GammaKeysetCatalog(requester=lambda *_args, **_kwargs: Response({
-                "markets": rows,
-            })),
+            GammaKeysetCatalog(requester=lambda url, **_kwargs: (
+                Response(rows[1]) if url.endswith("/m2")
+                else Response({"markets": rows})
+            )),
             books,
         )
 
@@ -1242,9 +1264,10 @@ class PolymarketLiveTest(unittest.TestCase):
         )
         collector = PolymarketLiveCollector(
             store,
-            GammaKeysetCatalog(requester=lambda *_args, **_kwargs: Response({
-                "markets": rows,
-            })),
+            GammaKeysetCatalog(requester=lambda url, **_kwargs: (
+                Response(rows[1]) if url.endswith("/m2")
+                else Response({"markets": rows})
+            )),
             partial,
         )
 

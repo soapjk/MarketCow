@@ -4154,6 +4154,56 @@ class GammaKeysetCatalog:
             evidence["retry_count"], evidence["last_cursor"],
         )
 
+    def fetch_market_ids(
+        self, market_ids: Iterable[str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Fetch exact markets, including records no longer in the active keyset."""
+        requested = sorted(set(str(value) for value in market_ids))
+        rows: list[dict[str, Any]] = []
+        retry_count = 0
+        started = self.clock()
+        for market_id in requested:
+            attempts = 0
+            while True:
+                response = self.requester(
+                    f"https://gamma-api.polymarket.com/markets/{requests.utils.quote(market_id, safe='')}",
+                    timeout=self.timeout,
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "MarketCow/0.2",
+                    },
+                )
+                if response.status_code != 429 and response.status_code < 500:
+                    break
+                if attempts >= self.max_retries_per_page:
+                    response.raise_for_status()
+                attempts += 1
+                retry_count += 1
+                retry_after = min(
+                    8.0,
+                    float(response.headers.get("Retry-After") or 2 ** (attempts - 1)),
+                )
+                self.sleeper(retry_after)
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            payload = json.loads(response.text, parse_float=str, parse_int=str)
+            if not isinstance(payload, dict):
+                raise RuntimeError("Gamma exact-market response must be an object")
+            if str(payload.get("id") or "") != market_id:
+                raise RuntimeError("Gamma exact-market response ID mismatch")
+            rows.append(payload)
+        received = sorted(str(row["id"]) for row in rows)
+        return rows, {
+            "endpoint": "https://gamma-api.polymarket.com/markets/{market_id}",
+            "requested_market_ids": requested,
+            "received_market_ids": received,
+            "missing_market_ids": sorted(set(requested) - set(received)),
+            "retry_count": retry_count,
+            "elapsed_seconds": self.clock() - started,
+            "complete": len(received) == len(requested),
+        }
+
     def fetch_all(self) -> tuple[GammaCatalogRows, dict[str, Any]]:
         if self.spool_root:
             self.spool_root.mkdir(parents=True, exist_ok=True)
@@ -6990,13 +7040,20 @@ class PolymarketLiveCollector:
         }
         if not affected_market_ids:
             return set()
-        rows, _ = self.catalog_client.fetch_all()
+        exact_fetch = getattr(self.catalog_client, "fetch_market_ids", None)
+        rows, _ = (
+            exact_fetch(affected_market_ids)
+            if callable(exact_fetch)
+            else self.catalog_client.fetch_all()
+        )
         try:
             observed_markets = GammaLiveNormalizer.normalize(
                 rows, self.store.now_provider(),
             )
         finally:
-            rows.cleanup()
+            cleanup = getattr(rows, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
         by_id = {
             market.identity.market_id: market for market in observed_markets
         }
