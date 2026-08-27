@@ -116,7 +116,13 @@ def validate_scope_selection(
     if isinstance(generated_at_ns, bool) or not isinstance(generated_at_ns, int):
         raise ValueError("scope manifest generated_at_ns must be an integer")
     observed_now_ns = time.time_ns() if now_ns is None else now_ns
-    required_valid_until_ns = observed_now_ns + MINIMUM_RUNTIME_LIFETIME_SECONDS * 1_000_000_000
+    # This validates the immutable selection evidence, not current liveness.
+    # A pinned market may legitimately expire after selection; the collector
+    # must start so it can reconcile that market into an auditable terminal
+    # state without taking the remaining scope offline.
+    required_valid_until_ns = (
+        generated_at_ns + MINIMUM_RUNTIME_LIFETIME_SECONDS * 1_000_000_000
+    )
     durations: dict[str, int] = {}
     token_ids: set[str] = set()
     for market_id in market_ids:
@@ -169,6 +175,7 @@ def validate_scope_selection(
         "token_count": len(token_ids),
         "maximum_capital_lock_duration_ns": max(durations.values()),
         "required_valid_until_ns": required_valid_until_ns,
+        "validated_at_ns": observed_now_ns,
         "final_clob_checked_at_ns": final_attempt.get("checked_at_ns"),
     }
 
