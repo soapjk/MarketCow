@@ -130,6 +130,10 @@ class PolymarketAsyncPersistenceTest(unittest.TestCase):
                 store.flush_async_persistence(
                     target_cursor=previous_cursor + 1, timeout=5,
                 )
+                for _ in range(100):
+                    if store.derived_index_error:
+                        break
+                    time.sleep(0.01)
             self.assertIsNotNone(first)
             self.assertIsNone(store.persistence_error)
             self.assertIn("database disk image is malformed", store.derived_index_error)
@@ -150,6 +154,38 @@ class PolymarketAsyncPersistenceTest(unittest.TestCase):
             self.assertIsNotNone(tail)
             self.assertEqual(tail.cursor, previous_cursor + 2)
             self.assertEqual(size, store.event_path.stat().st_size)
+
+    def test_slow_derived_index_cannot_delay_authoritative_log_fsync(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            previous_cursor = store.cursor
+            index_started = threading.Event()
+            release_index = threading.Event()
+            original = store._persist_index_records
+
+            def blocked(records):
+                index_started.set()
+                release_index.wait(timeout=5)
+                return original(records)
+
+            with patch.object(store, "_persist_index_records", side_effect=blocked):
+                store.enable_async_persistence()
+                emitted = store.apply_snapshot(
+                    snapshot("yes-1", "0.39", "0.41", "1785739210000"),
+                    received_at=NOW,
+                )
+                self.assertIsNotNone(emitted)
+                self.assertTrue(index_started.wait(timeout=2))
+                started = time.perf_counter()
+                store.flush_async_persistence(
+                    target_cursor=previous_cursor + 1, timeout=2,
+                )
+                self.assertLess(time.perf_counter() - started, 0.5)
+                tail, _size = _durable_event_log_tail(store.event_path)
+                self.assertIsNotNone(tail)
+                self.assertEqual(tail.cursor, previous_cursor + 1)
+                release_index.set()
+                store.close_async_persistence(timeout=5)
 
 
 class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
