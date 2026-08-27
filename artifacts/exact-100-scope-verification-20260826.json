@@ -1,0 +1,58 @@
+{
+  "commit": "384490691456487959306fd26646735a7415033c",
+  "criteria": {
+    "port_8790_all_rounds_passed": false,
+    "port_8790_cursor_advanced": false,
+    "port_8791_all_rounds_passed": false,
+    "port_8791_cursor_advanced": false
+  },
+  "cursor_ranges": {
+    "8790": {
+      "finish": null,
+      "start": null
+    },
+    "8791": {
+      "finish": null,
+      "start": null
+    }
+  },
+  "failures": [
+    {
+      "error": "ReadError: [Errno 54] Connection reset by peer",
+      "port": 8790,
+      "round": 1
+    },
+    {
+      "error": "ConnectError: [Errno 61] Connection refused",
+      "port": 8791,
+      "round": 1
+    },
+    {
+      "error": "ConnectError: [Errno 61] Connection refused",
+      "port": 8790,
+      "round": 2
+    },
+    {
+      "error": "ConnectError: [Errno 61] Connection refused",
+      "port": 8791,
+      "round": 2
+    }
+  ],
+  "finished_at": "2026-08-26T11:25:54.767275+00:00",
+  "market_count": 100,
+  "observations": {
+    "8790": [],
+    "8791": []
+  },
+  "passed": false,
+  "ports": [
+    8790,
+    8791
+  ],
+  "round_interval_seconds": 5.0,
+  "rounds": 2,
+  "schema": "marketcow.polymarket.exact-scope-verification.v1",
+  "scope_id": "6ca68c0247985abc6db39048dedc1d2944231dab03dba393aec214e3d1e7db6b",
+  "scope_manifest": "/Volumes/T9/data/marketcow/production/prediction-markets/polymarket-live/scope-artifacts-864000s/scopes/6ca68c0247985abc6db39048dedc1d2944231dab03dba393aec214e3d1e7db6b/manifest.json",
+  "started_at": "2026-08-26T11:25:49.426641+00:00"
+}
