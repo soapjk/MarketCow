@@ -1,0 +1,34 @@
+schema_version: marketcow.domain-ownership.v1
+revision: phase0-shadow
+domains:
+  public_gateway:
+    current_owner: python
+    shadow_owner: rust
+    writer: none
+  polymarket_realtime:
+    current_owner: python
+    shadow_owner: rust
+    writer_gate: single_writer_required
+    rust_write_enabled: false
+    real_order_submission_enabled: false
+  authoritative_wal:
+    current_owner: python
+    shadow_owner: rust
+    append_only: true
+  postgresql:
+    current_owner: python
+    shadow_owner: rust
+    rust_write_enabled: false
+  clickhouse:
+    current_owner: python
+    shadow_owner: rust
+    rust_write_enabled: false
+  python_provider_worker:
+    current_owner: python
+    transport: uds_only
+    public_listener_allowed: false
+    database_credentials_allowed: false
+lifecycle:
+  marketcow_owner: marketcow
+  tradude_may_manage_marketcow: false
+

@@ -1,0 +1,20 @@
+{
+  "schema_version": "marketcow.migration-baseline.v1",
+  "source_commit": "6041e230ce1b325268ac25f2f00f47ad6c5bcd9c",
+  "existing_exact_scope_evidence": "artifacts/exact-100-scope-verification-7073-20260826.json",
+  "observed": {
+    "market_count": 100,
+    "book_count": 200,
+    "complete_market_count": 100,
+    "gap_count": 0,
+    "disconnect_delta": 0,
+    "hot_sqlite_query_ms": 0,
+    "http_status": 200
+  },
+  "new_shadow_slos": {
+    "publish_p99_ms_max": 20,
+    "wal_p99_ms_max": 20,
+    "health_p99_ms_max": 50,
+    "minimum_soak_seconds": 2700
+  }
+}

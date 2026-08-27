@@ -1,0 +1,21 @@
+{
+  "schema_version": "marketcow.replay-corpus.v1",
+  "created_at": "2026-08-27T00:00:00Z",
+  "authoritative_plan_sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4",
+  "exact_scope": {
+    "scope_id": "7073f089a3e110b95dd46e8434571d7a9347d2d9ea1c1571eb27e890c8f7b722",
+    "market_count": 100,
+    "book_count": 200,
+    "source": "artifacts/exact-100-scope-verification-7073-20260826.json"
+  },
+  "r2_cursor_range": {"first": 24906390, "last": 25040506, "availability": "not-present-in-repository"},
+  "b16f_regression_classes": [
+    "crossed_or_locked_delta_then_full_book", "disconnect_reconnect",
+    "derived_sqlite_backlog", "large_response_serialization"
+  ],
+  "fixtures": [
+    "tests/fixtures/polymarket-live-provider-neutral-v2.json",
+    "artifacts/exact-100-scope-verification-7073-20260826.json"
+  ],
+  "note": "The exact r2 raw event window is referenced by contract but is absent locally; synthetic minimal reproductions cover its named boundaries and must not be described as the raw r2 corpus."
+}

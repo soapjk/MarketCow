@@ -1,0 +1,831 @@
+{
+  "clickhouse": {
+    "migrations": [
+      {
+        "description": "raw and canonical market bar foundations",
+        "statement_sha256": [
+          "d780cf16484ace2cb376ab9ebc135f3b7b3f44896c2420bc24404b5636f80b97",
+          "496ee29797a6256305995c52683a8f08b48d7686f3e8d8bff27ea0a977b5c8b3"
+        ],
+        "version": 1
+      },
+      {
+        "description": "canonical input fingerprint",
+        "statement_sha256": [
+          "0865b522b6c50dbf8c5455dcd63190c069918fd2bf8c56a65b58f60de8f2fd20"
+        ],
+        "version": 2
+      },
+      {
+        "description": "history adjustment contract fields",
+        "statement_sha256": [
+          "e9ef40d01bc2faa7421ef17dadedd8dadcf249d4b15107e0d1582cc00a7486a0",
+          "9b28ca90709148506d838c0f88f71a971942663da19845a3e1417932e261f99a",
+          "c48abc7242a9f52af93ff1280bcd82ad1ecff96dff2b3b6ed5dd3689773507d6",
+          "4c4d4e9ea1d5828406d720f1b65a05688691d01fa447e6e87740e2e8cc3320f5"
+        ],
+        "version": 3
+      },
+      {
+        "description": "deterministic raw equal-ingestion content rank",
+        "statement_sha256": [
+          "e5c66615f5c020ab9a6fdddeb973d3a546d900c56d672a31631eb5184ef06810",
+          "d7a0b367f9b853d8adc9a92a40a56fe37637bc656f97e8ce2add5c6fda743cde",
+          "18de63cdf452a13235509403c4b5304a0b5cc5d6614d9bdf9011c19f1324d633",
+          "9165ce26ea39a0b5cb5c2b422d92d53c3e2b2884746bbf6c2c87d0241473e87a",
+          "dec7110ed8c52920b9ddef90c147053fa3afa7f0b0014be7cee71f1950a0ec12",
+          "8750bcb583d4ebbcc54177c18141b1176e76a0ffc365746c0a7de7bcc27a72a2"
+        ],
+        "version": 4
+      },
+      {
+        "description": "direct latest quote contract",
+        "statement_sha256": [
+          "b9329311f1f374cdfed6604e59668b25f46598bfe07ee09ffda84bdfd6c34399"
+        ],
+        "version": 5
+      },
+      {
+        "description": "raw history ingestion identity",
+        "statement_sha256": [
+          "cfa73d6fee7af869cd6978c9bac3b2eadd58491ae9e14b8b7341530e7cd6314d"
+        ],
+        "version": 6
+      },
+      {
+        "description": "daily market adjustment factors",
+        "statement_sha256": [
+          "b9e8ab864877313c4aca1d02c3370dd43660cddaa5a82ccd21e4e09601e917e1"
+        ],
+        "version": 7
+      },
+      {
+        "description": "explicit price adjustment contract fields",
+        "statement_sha256": [
+          "3a48b89bff813715fd81d66ff4f9245c0f4512144122de704e5a603f81411e16",
+          "1abd774b7e7e9571ad16335257ef1a63a4b8fe8e5a8bfad669fefb8b9a8d9d24",
+          "9586a4ff33b57dc91afe298563e9131eb495df781ccb084dd0b6726c530380fc",
+          "ddb1abc5499c49f52af5f00601e9d9fffed6c842e9c5cf9ac02b8ff7a71f2a6e",
+          "d92eb8eba39680578d45c4e6a48600a962184dfb9ecfb2df671cdba6c2fd5b87",
+          "d3ca663a6d9bc6833d489593dd89ec3421092a0ceb6b7c127b054db1be7cbc92",
+          "74fd1559c989b3b048baee00319547e0fd609f5cad17b7364366afb1ea1e8e0e",
+          "8440926fa272579fdbe464130832effd0ff3bcb4d2ffe8222a3830ce6c6b4405",
+          "c4f73156d023f233cf797558c8517ebd723f3ea01b6ba1f16a1f5bf8ff5416f3",
+          "d9219328fc901c812c71310e74077accd96ff1cd1c112ce6b7505e959c6dffc5",
+          "9ba0474d6f1b5c925fccbd590e334826f321370f1fb67ff1865cdc399a385884",
+          "2524bd72796a8f60ba39b22fe4858f5b6857a18272c5af206287d7f61a21eb3b",
+          "6651ba6f2985340d96a42fd5d7423807c00efe1249d5ee3f97de41f17e29e079",
+          "4516609448372ccc1376cdcf3e21cace1a0bd5dcf8cbed057f906e2441f97801",
+          "3c28cc01af3b9c1a8e5ef4a6608c6a25e39092fd6a5a2bc24e6b2fee231cb440",
+          "ac087f70e6f1335ae0e5411fd1436ed76a00ef3071a6e5bd6f958af54bc29b21"
+        ],
+        "version": 8
+      }
+    ]
+  },
+  "generated_at": "2026-08-27T15:08:01.350101+00:00",
+  "postgres": {
+    "domains": [
+      "ingestion_runs",
+      "provider_health",
+      "raw_artifact_manifest",
+      "economic_calendar_event",
+      "economic_indicator_latest",
+      "earnings_calendar_event",
+      "tushare_request",
+      "tushare_data_row",
+      "fundamental_snapshot",
+      "fundamental_snapshot_history",
+      "financial_statement_rows",
+      "baostock_snapshot",
+      "tdx_financial_snapshot",
+      "tdx_financial_snapshot_history",
+      "validation_result",
+      "funnel_metrics",
+      "dividend_announcement",
+      "dividend_refresh_state",
+      "instrument_master",
+      "instrument_relationship",
+      "admin_audit_event",
+      "csv_import_job",
+      "csv_import_shard",
+      "prediction_market_live_observation",
+      "runtime_config_version",
+      "migration_checkpoint"
+    ],
+    "migrations": [
+      {
+        "description": "control plane, calendars, Tushare rows, and artifact manifests",
+        "sha256": "995e884075a64af10659ce09dff0f05766aa201b849ebcd88bf99be246977370",
+        "version": 1
+      },
+      {
+        "description": "fundamental snapshots, immutable history, and financial statement rows",
+        "sha256": "9633665fbe535e842a034722079b41cd7f4d0d3465bfcf2e28e0d4409b2b6c72",
+        "version": 2
+      },
+      {
+        "description": "BaoStock snapshots and immutable TDX financial history",
+        "sha256": "586d43e637f90505b4ba7ae9c1522e4f85b04a9f32a4c6b5013237e407041b81",
+        "version": 3
+      },
+      {
+        "description": "cross-source validation results and fundamental funnel metrics",
+        "sha256": "f4a26c288bce4c4d3f3649c7c12101ce476d2b909d779ba9ad66aa6c0539d457",
+        "version": 4
+      },
+      {
+        "description": "current runtime configuration versions and migration checkpoints",
+        "sha256": "5abfe5af7542a50a865efc13c0820fd202f5311253fc94f4c688a5a8e36b03f8",
+        "version": 5
+      },
+      {
+        "description": "source-qualified dividend announcements",
+        "sha256": "5c5dda33202fcb7f65ea5dfe0bbfb4606c46bae6a2a64a0c2ae02bc9b9f6dde5",
+        "version": 6
+      },
+      {
+        "description": "durable dividend refresh state",
+        "sha256": "499614f2ad38c434e161f7d693b12c94dbecf96ad24896655243921c6723968b",
+        "version": 7
+      },
+      {
+        "description": "version dividend refresh strategies",
+        "sha256": "7630dda3fc8e556d836f19b3dfef6fcb54f5872c57c9dfd80cc71c2dc78eb8d5",
+        "version": 8
+      },
+      {
+        "description": "dividend entitlement and actual payment dates",
+        "sha256": "5b692163b33766c2079bf90a5f91ed1f863ac39351c2b0ef6bf109923197eb2b",
+        "version": 9
+      },
+      {
+        "description": "versioned dividend cache completion states",
+        "sha256": "bd499941201e798e083dd18eef185ad38229cd65c45149eb64067fc60ac41bd2",
+        "version": 10
+      },
+      {
+        "description": "provider-neutral instrument master",
+        "sha256": "b6a836980f4b615d72d678883ccfa996798c89a2c41427e9e9fb86bbf5c178d0",
+        "version": 11
+      },
+      {
+        "description": "durable market history jobs",
+        "sha256": "085e4b2ea08b0bde2fcd32e35400dc6cb3d2e14fe029b312564a8ce24d320ad6",
+        "version": 12
+      },
+      {
+        "description": "crypto instruments",
+        "sha256": "14edf4796c773884db508410944aec9be1077f75a4bd53f224eeb0556b8ee269",
+        "version": 13
+      },
+      {
+        "description": "HIP-3 derivatives and instrument relationships",
+        "sha256": "4107a3f057917c446e89fd8b0e746ef29548284f074bf72a1656595085384251",
+        "version": 14
+      },
+      {
+        "description": "history job worker leases",
+        "sha256": "f50eab2a04b5d56f7a656eb8f0f6fe69e63ac8eb992694e4c39adf180a7cf6e0",
+        "version": 15
+      },
+      {
+        "description": "history fetch shard checkpoints",
+        "sha256": "0bab565d47b7432b7fab98aed0a4d4feff3c6eecdeb285c9a55fcea145619e8f",
+        "version": 16
+      },
+      {
+        "description": "history shard ingestion identities",
+        "sha256": "e7d4ef478150d7247b96d47408dda7ef437c1b09216a1e311ada315b00cc784b",
+        "version": 17
+      },
+      {
+        "description": "history canonical verification queue",
+        "sha256": "c719d92c5eaae5f031053c690e7939987552611788569f35d654da6b66e8565e",
+        "version": 18
+      },
+      {
+        "description": "append-only administration audit events",
+        "sha256": "4dd6618f9da17b883acc24b7973f54f2495ace2247d4c43de0cb96360327a7e2",
+        "version": 19
+      },
+      {
+        "description": "recoverable CSV market bar imports",
+        "sha256": "2e4ceceed774c8db428a0194427f475fa31ac564d653a3c2caf5ced120caa2ba",
+        "version": 20
+      },
+      {
+        "description": "allow CSV retry jobs to reuse stable shard ingestion identities",
+        "sha256": "7cea10e5a3c44f857cace7dcc1c2022f8196ab4aa75cebb9334c6080e714f197",
+        "version": 21
+      },
+      {
+        "description": "convertible bond instruments",
+        "sha256": "f21394ba67166eb3177b327baeeb9828bee6338a398f14296a87ca2b3f26673f",
+        "version": 22
+      },
+      {
+        "description": "hard migrate CSV import declarations to explicit adjustment v2",
+        "sha256": "fceaf3a3040da4f3ec3acda6f9f35ed4eefd5bddc2c7e2e4447d55751bc4bf29",
+        "version": 23
+      },
+      {
+        "description": "current Polymarket live dashboard observation",
+        "sha256": "977052b9de96cabac6367634c978245ea6fa8d125cc31039885031ed801b430f",
+        "version": 24
+      }
+    ]
+  },
+  "public_contracts": {
+    "route_count": 117,
+    "routes": [
+      {
+        "method": "POST",
+        "path": "/mcp",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/metrics",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/artifacts",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/audit",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/baostock/{symbol}/refresh",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/capabilities",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/csv-imports",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/csv-imports",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/csv-imports-ui",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/csv-imports/dry-run",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/csv-imports/infer",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/csv-imports/upload",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/csv-imports/{job_id}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/csv-imports/{job_id}/cancel",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/csv-imports/{job_id}/errors",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/csv-imports/{job_id}/manifest",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/csv-imports/{job_id}/quality-report",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/csv-imports/{job_id}/retry",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/dashboards",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/dividends/ingest",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/dividends/{symbol}/discover",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/dividends/{symbol}/refresh",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/earnings-calendar/refresh",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/economic-calendar/refresh",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/economic-indicators/refresh",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/events",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/financials/{symbol}/refresh",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/fundamentals/refresh",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/funnel/metrics/rebuild",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/history-consistency",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/history-health",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/history-jobs",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/history-jobs",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/history-jobs-ui",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/history-jobs/{job_id}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/history-jobs/{job_id}/cancel",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/history-jobs/{job_id}/reconcile",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/history-jobs/{job_id}/retry-failed",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/instruments/hyperliquid/refresh",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "PUT",
+        "path": "/v1/admin/instruments/{instrument_id}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/instruments/{symbol}/coverage",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/jobs",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/overview",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/admin/providers",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/tdx/financials/sync",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/admin/validation/rebuild",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "DELETE",
+        "path": "/v1/auth/session",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/auth/session",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/auth/session",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/canonical-bars/{instrument_id}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/cross-market/snapshots/query",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/dividends/query",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/dividends/{symbol}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/earnings-calendar",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/economic-calendar",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/economic-indicators",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/exposure-facts/{symbol}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/financials/{symbol}/statements",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/fundamentals",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/fundamentals/{symbol}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/fundamentals/{symbol}/history",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/funds/{symbol}/dividends",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/funnel/metrics",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/fx",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/health",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/hyperliquid/{symbol}/funding-history",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/instrument-relationships",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/instruments/search",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/instruments/{instrument_id}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/instruments:resolve",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/instruments:resolve/query",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/market-bars/query",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "WEBSOCKET",
+        "path": "/v1/market-data/stream",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/datasets/{dataset_id}/bootstrap",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/datasets/{dataset_id}/manifest",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/datasets/{dataset_id}/parts/{table}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/bootstrap",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/bootstrap",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/candidates",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/candidates",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/checkpoint",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/checkpoint",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/events",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/events",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/full-sync",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/full-sync",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/gaps",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/gaps",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/health",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/health",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/public-data/{kind}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/public-data/{kind}",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/scope",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/scope",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/snapshot",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/prediction-markets/polymarket/live/snapshot",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "WEBSOCKET",
+        "path": "/v1/prediction-markets/polymarket/live/stream",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "WEBSOCKET",
+        "path": "/v1/prediction-markets/polymarket/live/stream",
+        "source": "src/marketcow/polymarket_live_read_api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes/cross-section",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes/cross-section/as-of",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes/cross-section/matrix",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/quotes/query",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes/{symbol}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes/{symbol}/as-of",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes/{symbol}/history",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes/{symbol}/raw-history",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/quotes/{symbol}/spread",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/readiness",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/schemas/{contract_name}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/snapshot",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/sources/health",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/sources/tdx/coverage",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/tushare/realtime-quote",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/tushare/{api_name}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/validation/{symbol}",
+        "source": "src/marketcow/api.py"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/validation/{symbol}/results",
+        "source": "src/marketcow/api.py"
+      }
+    ]
+  },
+  "schema_version": "marketcow.phase0-inventory.v1",
+  "source_commit": "6041e230ce1b325268ac25f2f00f47ad6c5bcd9c"
+}
