@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 from marketcow.polymarket_live import (
     GammaLiveNormalizer,
+    LiveBook,
+    LiveMarket,
     LiveSnapshotPage,
     LiveStateStore,
     PolymarketLiveReadError,
@@ -551,6 +553,53 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not worker.is_alive() for worker in workers))
         self.assertEqual(projection.latest_cursor, store.cursor + 100)
         self.assertLess(elapsed, 0.5)
+
+    def test_broad_scope_capture_reuses_immutable_projection_models(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            projection = PolymarketLiveProjection(replay_capacity=100)
+            projection.install_state({
+                "schema_version": "marketcow.polymarket.live-stream.v1",
+                "type": "state",
+                "catalog_revision": store.catalog_revision,
+                "catalog_source": store.catalog_source,
+                "latest_cursor": store.cursor,
+                "persisted_cursor": store.cursor,
+                "active_recovery_id": None,
+                "markets": [
+                    market.model_dump(mode="json")
+                    for market in store.catalog.values()
+                ],
+                "books": [
+                    book.model_dump(mode="json")
+                    for book in store.books.values()
+                ],
+                "gaps": [],
+            })
+            projection.mark_ready({"latest_cursor": store.cursor})
+            reader = PolymarketLiveReadStore(
+                store.root,
+                now_provider=lambda: NOW,
+                stable_snapshot_max_book_age_seconds=5,
+            )
+
+            with (
+                patch.object(
+                    LiveMarket,
+                    "model_copy",
+                    side_effect=AssertionError("market copied under capture lock"),
+                ),
+                patch.object(
+                    LiveBook,
+                    "model_copy",
+                    side_effect=AssertionError("book copied under capture lock"),
+                ),
+            ):
+                body = projection.snapshot_json(reader, ["m1"])
+
+            payload = json.loads(body)
+            self.assertEqual(payload["cursor"], store.cursor)
+            self.assertEqual(set(payload["books"]), {"yes-1", "no-1"})
 
     def test_full_sync_scoped_health_covers_relation_books_without_duplicates(self):
         temporary = TemporaryDirectory()

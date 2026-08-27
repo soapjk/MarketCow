@@ -714,17 +714,23 @@ class PolymarketLiveProjection:
                         "Live book tick differs from atomic instrument facts",
                         503,
                     )
-            # The immutable copy is part of the atomic boundary: none of the
-            # objects used to build health/bootstrap/snapshot may be observed
-            # from a later projection generation.
+            # Projection models are publication snapshots: ingestion replaces
+            # market/book/gap instances and never mutates an instance after it
+            # becomes visible.  Capture their references while holding the
+            # generation lock, then build and serialize the response after
+            # releasing it.  Deep-copying 100 markets and 200 books here used
+            # to hold the ingestion lock for hundreds of milliseconds per
+            # broad read; sustained health/bootstrap traffic could therefore
+            # starve the WebSocket consumer long enough for every book to age
+            # beyond the fail-closed freshness budget.
             copy_started = time.perf_counter()
-            markets = [market.model_copy(deep=True) for market in all_markets]
+            markets = tuple(all_markets)
             books = {
-                token_id: book.model_copy(deep=True)
+                token_id: book
                 for token_id, book in source_books.items()
                 if book is not None
             }
-            gaps = [gap.model_copy(deep=True) for gap in unresolved]
+            gaps = tuple(unresolved)
             phases["projection_copy_ms"] = (
                 time.perf_counter() - copy_started
             ) * 1000
