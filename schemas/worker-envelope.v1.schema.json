@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "marketcow.worker.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "message_type", "worker_revision", "nonce"],
+  "properties": {
+    "protocol_version": {"const": "marketcow.worker.v1"},
+    "message_type": {"enum": ["hello", "hello_ack"]},
+    "worker_revision": {"type": "string", "minLength": 1, "maxLength": 128},
+    "nonce": {"type": "string", "minLength": 16, "maxLength": 128}
+  }
+}
+

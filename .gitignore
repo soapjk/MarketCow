@@ -9,6 +9,7 @@
 __pycache__/
 *.egg-info/
 build/
+target/
 dist/
 node_modules/
 *.whl

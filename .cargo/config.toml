@@ -1,0 +1,7 @@
+# Repository-local override for the unavailable global git mirror. This does not mutate
+# Corptie's authoritative Provider configuration and uses an accessible sparse mirror.
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
