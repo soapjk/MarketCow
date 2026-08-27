@@ -12,9 +12,7 @@ from typing import Any
 import httpx
 
 
-def validate_full_sync(
-    payload: dict[str, Any], market_ids: list[str], expected_scope_id: str,
-) -> dict[str, Any]:
+def validate_full_sync(payload: dict[str, Any], market_ids: list[str]) -> dict[str, Any]:
     boundary = (
         payload.get("catalog_revision"),
         payload.get("cursor"),
@@ -79,12 +77,6 @@ def validate_full_sync(
         "token_count": 200,
         "book_token_count": 200,
         "book_complete_market_count": 100,
-        "active_market_count": 100,
-        "terminal_market_count": 0,
-        "complete_market_count": 100,
-        "missing_market_count": 0,
-        "scope_status": "exact_ready",
-        "scope_id": expected_scope_id,
         "unresolved_gap_count": 0,
         "live_stream_connected": True,
         "live_stream_disconnect_count": 0,
@@ -102,7 +94,6 @@ def validate_full_sync(
         and len(markets) == 100
         and len(books) == 200
         and len(seen_tokens) == 200
-        and payload.get("scope_id") == expected_scope_id
     )
     passed = (
         not any(
@@ -174,9 +165,7 @@ def main() -> None:
                         params=params,
                     )
                     response.raise_for_status()
-                    evidence = validate_full_sync(
-                        response.json(), market_ids, arguments.expected_scope_id,
-                    )
+                    evidence = validate_full_sync(response.json(), market_ids)
                     evidence.update(
                         {
                             "round": round_index + 1,
@@ -233,24 +222,6 @@ def main() -> None:
         "cursor_ranges": cursor_ranges,
         "failures": failures,
         "observations": observations,
-        "activation_evidence": {
-            "real_order_submission_enabled": False,
-            "endpoints": {
-                str(port): {
-                    "http_status": samples[-1]["http_status"],
-                    "status": "index_ready",
-                    "market_count": samples[-1]["market_count"],
-                    "book_count": samples[-1]["book_count"],
-                    "complete_market_count": samples[-1]["complete_market_count"],
-                    "tick_consistent_token_count": samples[-1]["tick_consistent_token_count"],
-                    "gap_count": samples[-1]["gap_count"],
-                    "disconnect_count": samples[-1]["disconnect_count"],
-                    "cursors": [sample["cursor"] for sample in samples],
-                }
-                for port in arguments.port
-                if (samples := observations[str(port)])
-            },
-        },
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(

@@ -1305,12 +1305,6 @@ class LiveMarket(BaseModel):
     accepting_orders: bool
     lifecycle_state: Literal["active", "closed", "resolved", "invalid"]
     resolution: str | None = None
-    terminal_at: datetime | None = None
-    lifecycle_source: Literal["polymarket_gamma", "polymarket_clob_ws"] | None = None
-    lifecycle_source_url: str | None = None
-    lifecycle_evidence_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$",
-    )
     start_at: datetime | None = None
     end_at: datetime | None = None
     metadata_revision: str
@@ -1329,15 +1323,6 @@ class LiveMarket(BaseModel):
             raise ValueError("negative-risk market requires source-backed relation")
         if self.lifecycle_state == "resolved" and not self.resolution:
             raise ValueError("resolved live market requires a resolution")
-        terminal = self.lifecycle_state in {"closed", "resolved", "invalid"}
-        if terminal != (self.terminal_at is not None):
-            raise ValueError("terminal lifecycle state requires terminal_at")
-        if terminal and not all((
-            self.lifecycle_source,
-            self.lifecycle_source_url,
-            self.lifecycle_evidence_sha256,
-        )):
-            raise ValueError("terminal lifecycle state requires audit evidence")
         return self
 
 
@@ -1587,7 +1572,6 @@ class LiveEventEnvelope(BaseModel):
         "book", "price_change", "best_bid_ask", "last_trade_price",
         "tick_size_change", "new_market", "market_resolved", "catalog_revision",
         "recovery_started", "recovery_completed", "subscription_change",
-        "market_terminal",
     ]
     market_id: str | None = None
     condition_id: str | None = None
@@ -1628,7 +1612,7 @@ class MarketFrame(BaseModel):
     condition_id: str
     frame_at: datetime
     cursor: int
-    status: Literal["ready", "terminal", "fail_closed"]
+    status: Literal["ready", "fail_closed"]
     reason_codes: list[str]
     token_ids: list[str]
     relation_ids: list[str]
@@ -1636,68 +1620,6 @@ class MarketFrame(BaseModel):
     relation_pairs: list[LiveOutcomePair]
     instrument_revision: str
     fee_schedule_id: str
-    open_position_allowed: bool = False
-    open_position_error_code: str | None = None
-
-
-class PolymarketOpenPositionError(RuntimeError):
-    def __init__(self, code: str, audit_id: str):
-        self.code = code
-        self.audit_id = audit_id
-        super().__init__(code)
-
-
-class PolymarketOpenPositionGuard:
-    """Pure pre-trade gate; it never submits or mutates an order."""
-
-    def __init__(
-        self, audit_path: Path,
-        *,
-        now_provider: Callable[[], datetime] = utc_now,
-    ) -> None:
-        self.audit_path = audit_path.resolve()
-        self.now_provider = now_provider
-
-    def require_eligible(
-        self,
-        market: LiveMarket,
-        frame: MarketFrame,
-        *,
-        request_id: str,
-    ) -> dict[str, Any]:
-        if market.lifecycle_state == "resolved":
-            code = "polymarket_open_position_market_resolved"
-        elif market.lifecycle_state in {"closed", "invalid"} or market.closed:
-            code = "polymarket_open_position_market_terminal"
-        elif not market.accepting_orders:
-            code = "polymarket_open_position_orders_not_accepted"
-        elif frame.status != "ready":
-            code = "polymarket_open_position_fresh_book_required"
-        else:
-            code = "polymarket_open_position_eligible"
-        evidence = {
-            "schema_version": "marketcow.polymarket.pretrade-audit.v1",
-            "request_id": request_id,
-            "market_id": market.identity.market_id,
-            "lifecycle_state": market.lifecycle_state,
-            "market_metadata_revision": market.metadata_revision,
-            "frame_cursor": frame.cursor,
-            "frame_status": frame.status,
-            "frame_reason_codes": frame.reason_codes,
-            "decision_code": code,
-            "real_order_submission_enabled": False,
-            "decided_at": self.now_provider().isoformat(),
-        }
-        audit_id = content_sha256(evidence)
-        record = canonical_json({**evidence, "audit_id": audit_id}) + b"\n"
-        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.audit_path.open("ab") as stream:
-            stream.write(record)
-            stream.flush()
-            os.fsync(stream.fileno())
-        if code != "polymarket_open_position_eligible":
-            raise PolymarketOpenPositionError(code, audit_id)
-        return {**evidence, "audit_id": audit_id}
 
 
 class LiveHealth(BaseModel):
@@ -1731,7 +1653,6 @@ class LiveBootstrapResponse(BaseModel):
     projection_generation: int = Field(default=0, ge=0)
     scope_market_ids: list[str] = Field(default_factory=list)
     freshness_checked_at: datetime | None = None
-    scope_id: str | None = None
 
 
 class LiveSnapshotPage(BaseModel):
@@ -1746,7 +1667,6 @@ class LiveSnapshotPage(BaseModel):
     projection_generation: int = Field(default=0, ge=0)
     scope_market_ids: list[str] = Field(default_factory=list)
     freshness_checked_at: datetime | None = None
-    scope_id: str | None = None
 
 
 class LiveFullSyncResponse(BaseModel):
@@ -1758,7 +1678,6 @@ class LiveFullSyncResponse(BaseModel):
     projection_generation: int = Field(ge=1)
     scope_market_ids: list[str] = Field(min_length=1)
     freshness_checked_at: datetime
-    scope_id: str | None = None
     oldest_book_received_at: datetime
     maximum_book_age_ms: float = Field(ge=0)
     consumer_maximum_book_age_ms: float = Field(gt=0)
@@ -1776,7 +1695,6 @@ class LiveFullSyncResponse(BaseModel):
             self.projection_generation,
             self.scope_market_ids,
             self.freshness_checked_at,
-            self.scope_id,
         )
         for component in (self.health, self.bootstrap, self.snapshot):
             observed = (
@@ -1786,7 +1704,6 @@ class LiveFullSyncResponse(BaseModel):
                 component.projection_generation,
                 component.scope_market_ids,
                 component.freshness_checked_at,
-                component.scope_id,
             )
             if observed != expected:
                 raise ValueError("full-sync components disagree on atomic boundary")
@@ -1835,14 +1752,6 @@ class LiveReadHealth(BaseModel):
     token_count: int = Field(default=0, ge=0)
     book_token_count: int = Field(default=0, ge=0)
     book_complete_market_count: int = Field(default=0, ge=0)
-    active_market_count: int = Field(default=0, ge=0)
-    terminal_market_count: int = Field(default=0, ge=0)
-    complete_market_count: int = Field(default=0, ge=0)
-    missing_market_count: int = Field(default=0, ge=0)
-    scope_status: Literal[
-        "unscoped", "exact_ready", "terminal_degraded", "data_degraded",
-    ] = "unscoped"
-    scope_id: str | None = None
     unresolved_gap_count: int = Field(default=0, ge=0)
     latest_cursor: int = Field(default=0, ge=0)
     persisted_cursor: int = Field(default=0, ge=0)
@@ -1921,18 +1830,6 @@ class PolymarketLiveReadStore:
         minimum_delivery_headroom_seconds: float = 0.0,
     ):
         self.root = root.resolve()
-        self.scope_id: str | None = None
-        scope_runtime_path = self.root / "scope-runtime.json"
-        if scope_runtime_path.is_file():
-            try:
-                scope_runtime = json.loads(
-                    scope_runtime_path.read_text(encoding="utf-8")
-                )
-                candidate_scope_id = str(scope_runtime.get("scope_id") or "")
-                if re.fullmatch(r"[0-9a-f]{64}", candidate_scope_id):
-                    self.scope_id = candidate_scope_id
-            except (OSError, ValueError):
-                pass
         self.now_provider = now_provider
         self._stable_read_wait_seconds = (
             self.stable_read_wait_seconds
@@ -4506,30 +4403,16 @@ class GammaLiveNormalizer:
             )
             closed = bool(row.get("closed"))
             resolution = row.get("resolution")
-            expired = end_at is not None and end_at <= observed_at
-            lifecycle = (
-                "resolved" if resolution not in {None, ""}
-                else "closed" if closed or expired
-                else "active"
-            )
-            terminal = lifecycle in {"closed", "resolved", "invalid"}
+            lifecycle = "resolved" if resolution not in {None, ""} else "closed" if closed else "active"
             result.append(LiveMarket(
                 identity=identity,
                 question=str(row.get("question") or row.get("title") or market_id),
                 title=str(row.get("title") or row.get("question") or market_id),
-                active=False if terminal else bool(row.get("active", not closed)),
-                closed=terminal or closed,
-                accepting_orders=(
-                    False if terminal else bool(
-                        row.get("acceptingOrders", row.get("accepting_orders", False))
-                    )
-                ),
+                active=bool(row.get("active", not closed)),
+                closed=closed,
+                accepting_orders=bool(row.get("acceptingOrders", row.get("accepting_orders", False))),
                 lifecycle_state=lifecycle,
                 resolution=str(resolution) if resolution not in {None, ""} else None,
-                terminal_at=(end_at if expired and not resolution else observed_at) if terminal else None,
-                lifecycle_source="polymarket_gamma" if terminal else None,
-                lifecycle_source_url=GammaKeysetCatalog.endpoint if terminal else None,
-                lifecycle_evidence_sha256=raw_hash if terminal else None,
                 start_at=start_at,
                 end_at=end_at,
                 metadata_revision=revision,
@@ -4638,17 +4521,6 @@ class GammaLiveNormalizer:
                     complete=not missing_fields,
                 )
         return result
-
-
-class ClobBooksCoverageError(RuntimeError):
-    """CLOB omitted requested tokens after bounded retries."""
-
-    def __init__(self, missing_token_ids: Iterable[str]):
-        self.missing_token_ids = tuple(sorted(set(missing_token_ids)))
-        super().__init__(
-            "CLOB /books response omitted requested tokens after retries; "
-            "missing_token_ids=" + ",".join(self.missing_token_ids)
-        )
 
 
 class ClobBooksClient:
@@ -4766,7 +4638,10 @@ class ClobBooksClient:
                 if not missing:
                     break
                 if coverage_attempts >= self.max_retries_per_batch:
-                    raise ClobBooksCoverageError(missing)
+                    raise RuntimeError(
+                        "CLOB /books response omitted requested tokens after retries; "
+                        "missing_token_ids=" + ",".join(sorted(missing))
+                    )
                 coverage_attempts += 1
                 retry_count += 1
                 request_body = [
@@ -4877,18 +4752,6 @@ class LiveStateStore:
         self.cursor = 0
         self.catalog_revision: str | None = None
         self.catalog_source: dict[str, Any] | None = None
-        self.scope_id: str | None = None
-        scope_runtime_path = self.root / "scope-runtime.json"
-        if scope_runtime_path.is_file():
-            try:
-                scope_runtime = json.loads(
-                    scope_runtime_path.read_text(encoding="utf-8")
-                )
-                candidate_scope_id = str(scope_runtime.get("scope_id") or "")
-                if re.fullmatch(r"[0-9a-f]{64}", candidate_scope_id):
-                    self.scope_id = candidate_scope_id
-            except (OSError, ValueError):
-                pass
         self._catalog_file_sha256: str | None = None
         self._checkpoint_file_sha256: str | None = None
         self._checkpoint_cursor = 0
@@ -5564,10 +5427,6 @@ class LiveStateStore:
                 affected.resolution = str(
                     raw.get("winning_outcome") or raw.get("winning_asset_id") or ""
                 ) or "resolved"
-                affected.terminal_at = exchange
-                affected.lifecycle_source = "polymarket_clob_ws"
-                affected.lifecycle_source_url = CLOB_MARKET_STREAM_SOURCE_URL
-                affected.lifecycle_evidence_sha256 = raw_hash
                 affected.metadata_revision = content_sha256({
                     "previous_revision": affected.metadata_revision,
                     "market_resolved_raw_sha256": raw_hash,
@@ -5588,17 +5447,8 @@ class LiveStateStore:
                     "lifecycle_state": "resolved",
                     "resolution": affected.resolution,
                     "metadata_revision": affected.metadata_revision,
-                    "market": affected.model_dump(mode="json"),
-                    "retired_token_ids": sorted(
-                        outcome.token_id for outcome in affected.identity.outcomes
-                    ),
                 })
-            emitted_type = (
-                "market_terminal"
-                if event_type == "market_resolved" and affected is not None
-                else event_type
-            )
-            return [self._emit(emitted_type, {
+            return [self._emit(event_type, {
                 **canonical,
             }, raw, applied=affected is not None or event_type == "new_market",
             market_id=(affected.identity.market_id if affected else None),
@@ -5860,60 +5710,6 @@ class LiveStateStore:
         )
         return recovery_id
 
-    def mark_market_terminal(
-        self,
-        observed: LiveMarket,
-        *,
-        reason: str,
-    ) -> LiveEventEnvelope:
-        """Retire one market without changing the pinned scope membership."""
-        self._ensure_loaded()
-        market_id = observed.identity.market_id
-        current = self.catalog.get(market_id)
-        if current is None:
-            raise KeyError(market_id)
-        if observed.lifecycle_state not in {"closed", "resolved", "invalid"}:
-            raise ValueError("terminal reconciliation requires terminal evidence")
-        terminal = current.model_copy(deep=True)
-        terminal.active = False
-        terminal.closed = observed.closed or observed.lifecycle_state != "active"
-        terminal.accepting_orders = False
-        terminal.lifecycle_state = observed.lifecycle_state
-        terminal.resolution = observed.resolution
-        terminal.terminal_at = observed.terminal_at or self.now_provider()
-        terminal.lifecycle_source = observed.lifecycle_source
-        terminal.lifecycle_source_url = observed.lifecycle_source_url
-        terminal.lifecycle_evidence_sha256 = observed.lifecycle_evidence_sha256
-        terminal.observed_at = observed.observed_at
-        terminal.metadata_revision = content_sha256({
-            "previous_revision": current.metadata_revision,
-            "terminal_state": terminal.lifecycle_state,
-            "terminal_at": terminal.terminal_at.isoformat(),
-            "evidence_sha256": terminal.lifecycle_evidence_sha256,
-        })
-        self.catalog[market_id] = terminal
-        for outcome in current.identity.outcomes:
-            self.token_to_market.pop(outcome.token_id, None)
-        return self._emit(
-            "market_terminal",
-            {
-                "reason": reason,
-                "market": terminal.model_dump(mode="json"),
-                "retired_token_ids": sorted(
-                    outcome.token_id for outcome in current.identity.outcomes
-                ),
-            },
-            {
-                "source": terminal.lifecycle_source,
-                "source_url": terminal.lifecycle_source_url,
-                "evidence_sha256": terminal.lifecycle_evidence_sha256,
-            },
-            applied=True,
-            market_id=market_id,
-            condition_id=current.identity.condition_id,
-            received_at=terminal.observed_at,
-        )
-
     def new_book_recovery_tracker(self) -> dict[str, Any]:
         return {
             "expected": set(self.token_to_market),
@@ -6091,23 +5887,6 @@ class LiveStateStore:
         market = self.catalog.get(market_id)
         if market is None:
             raise KeyError(market_id)
-        if market.lifecycle_state in {"closed", "resolved", "invalid"}:
-            return MarketFrame(
-                market_id=market_id,
-                condition_id=market.identity.condition_id,
-                frame_at=now or self.now_provider(),
-                cursor=self.cursor,
-                status="terminal",
-                reason_codes=[f"market_{market.lifecycle_state}"],
-                token_ids=[],
-                relation_ids=[item.relation_id for item in market.relations],
-                relation_token_ids=[],
-                relation_pairs=[],
-                instrument_revision=market.rules.instrument.revision,
-                fee_schedule_id=market.rules.fee_schedule.schedule_id,
-                open_position_allowed=False,
-                open_position_error_code="polymarket_market_terminal",
-            )
         books = [self.books[token.token_id] for token in market.identity.outcomes if token.token_id in self.books]
         reasons = []
         if self.active_recovery_id is not None:
@@ -6193,10 +5972,6 @@ class LiveStateStore:
             relation_pairs=relation_pairs,
             instrument_revision=market.rules.instrument.revision,
             fee_schedule_id=market.rules.fee_schedule.schedule_id,
-            open_position_allowed=not reasons,
-            open_position_error_code=(
-                None if not reasons else "polymarket_fresh_book_required"
-            ),
         )
 
     def checkpoint_payload(self) -> LiveCheckpoint:
@@ -6329,13 +6104,6 @@ class LiveStateStore:
                     projection_generation=None,
                     observed_at=event.received_at,
                 )
-        if event.event_type == "market_terminal" and event.applied:
-            terminal = LiveMarket.model_validate(
-                event.canonical_payload.get("market")
-            )
-            self.catalog[terminal.identity.market_id] = terminal
-            for token_id in event.canonical_payload.get("retired_token_ids") or []:
-                self.token_to_market.pop(str(token_id), None)
         if event.event_type == "recovery_completed" and event.applied:
             recovered = set(
                 event.canonical_payload.get("resolved_gap_token_ids")
@@ -6979,82 +6747,6 @@ class PolymarketLiveCollector:
         # by the time they acquire the writer lock.
         self._snapshot_operation_lock = asyncio.Lock()
 
-    def reconcile_terminal_tokens(
-        self, missing_token_ids: Iterable[str], *, reason: str,
-    ) -> set[str]:
-        """Confirm omissions against Gamma before treating them as terminal."""
-        missing = set(missing_token_ids)
-        affected_market_ids = {
-            self.store.token_to_market[token_id]
-            for token_id in missing if token_id in self.store.token_to_market
-        }
-        if not affected_market_ids:
-            return set()
-        rows, _ = self.catalog_client.fetch_all()
-        try:
-            observed_markets = GammaLiveNormalizer.normalize(
-                rows, self.store.now_provider(),
-            )
-        finally:
-            rows.cleanup()
-        by_id = {
-            market.identity.market_id: market for market in observed_markets
-        }
-        terminal_market_ids = {
-            market_id for market_id in affected_market_ids
-            if (market := by_id.get(market_id)) is not None
-            and market.lifecycle_state in {"closed", "resolved", "invalid"}
-        }
-        if terminal_market_ids != affected_market_ids:
-            unresolved = sorted(affected_market_ids - terminal_market_ids)
-            raise ClobBooksCoverageError(
-                token_id for token_id in missing
-                if self.store.token_to_market.get(token_id) in unresolved
-            )
-        retired_tokens: set[str] = set()
-        with self.store._sync_lock, self.store.event_publication_batch():
-            for market_id in sorted(terminal_market_ids):
-                current = self.store.catalog[market_id]
-                retired_tokens.update(
-                    outcome.token_id for outcome in current.identity.outcomes
-                )
-                self.store.mark_market_terminal(
-                    by_id[market_id], reason=reason,
-                )
-        LOGGER.info(
-            "polymarket_terminal_markets_reconciled markets=%s tokens=%s reason=%s",
-            sorted(terminal_market_ids), sorted(retired_tokens), reason,
-        )
-        return retired_tokens
-
-    async def _fetch_complete_books(
-        self, token_ids: Iterable[str], *, reason: str,
-    ) -> tuple[list[dict[str, Any]], set[str]]:
-        requested = sorted(set(token_ids))
-        try:
-            rows = await asyncio.to_thread(
-                self.books_client.fetch_stream,
-                requested,
-                require_complete_batches=True,
-            )
-            return rows, set()
-        except ClobBooksCoverageError as exc:
-            retired = await asyncio.to_thread(
-                self.reconcile_terminal_tokens,
-                exc.missing_token_ids,
-                reason=reason,
-            )
-            remaining = sorted(set(requested) - retired)
-            rows = (
-                await asyncio.to_thread(
-                    self.books_client.fetch_stream,
-                    remaining,
-                    require_complete_batches=True,
-                )
-                if remaining else []
-            )
-            return rows, retired
-
     def _coherent_refresh_groups(self) -> list[tuple[str, ...]]:
         """Return stable refresh units without splitting relation members.
 
@@ -7182,8 +6874,10 @@ class PolymarketLiveCollector:
             # recovery_started event until the provider has returned complete,
             # usable coverage; otherwise an upstream omission retry would grow
             # the authoritative log while no market state changed.
-            rows, _ = await self._fetch_complete_books(
-                token_ids, reason=f"{reason}:clob_omission",
+            rows = await asyncio.to_thread(
+                self.books_client.fetch_stream,
+                token_ids,
+                require_complete_batches=True,
             )
             with self.store._sync_lock:
                 recovery_started_at = self.store.now_provider()
@@ -7304,10 +6998,11 @@ class PolymarketLiveCollector:
 
         if refresh_token_ids:
             if len(refresh_token_ids) <= self.books_client.batch_size:
-                rows, retired = await self._fetch_complete_books(
-                    refresh_token_ids, reason=f"{reason}:clob_omission",
+                rows = await asyncio.to_thread(
+                    self.books_client.fetch_stream,
+                    refresh_token_ids,
+                    require_complete_batches=True,
                 )
-                tracker["expected"].difference_update(retired)
                 self._commit_recovery_rows(
                     rows,
                     recovery_id,
