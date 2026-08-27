@@ -339,12 +339,10 @@ class PolymarketLiveProjection:
         if not books:
             raise ValueError("Polymarket live book confirmation batch is empty")
         with self._lock:
+            applicable = []
             for book in books:
                 previous = self._books.get(book.token_id)
-                if (
-                    previous is None
-                    or previous.state_checksum != book.state_checksum
-                ):
+                if previous is None:
                     self._ready = False
                     self._error_code = (
                         "polymarket_live_stream_confirmation_mismatch"
@@ -352,9 +350,26 @@ class PolymarketLiveProjection:
                     raise ValueError(
                         "Polymarket live book confirmation mismatches state"
                     )
-            self._books.update({book.token_id: book for book in books})
-            self._last_message_at = datetime.now(timezone.utc)
-            self._generation += 1
+                if previous.state_checksum != book.state_checksum:
+                    if book.received_at < previous.received_at:
+                        # A WebSocket delta published after this REST
+                        # confirmation can cross it between collector worker
+                        # threads and the loopback event loop. Its later
+                        # received_at proves the confirmation is superseded;
+                        # an equal/newer mismatch remains a hard divergence.
+                        continue
+                    self._ready = False
+                    self._error_code = (
+                        "polymarket_live_stream_confirmation_mismatch"
+                    )
+                    raise ValueError(
+                        "Polymarket live book confirmation mismatches state"
+                    )
+                applicable.append(book)
+            if applicable:
+                self._books.update({book.token_id: book for book in applicable})
+                self._last_message_at = datetime.now(timezone.utc)
+                self._generation += 1
 
     def _apply_event_state(self, event: LiveEventEnvelope) -> None:
         for gap in event.gaps:

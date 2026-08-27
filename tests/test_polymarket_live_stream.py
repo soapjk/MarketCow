@@ -191,6 +191,40 @@ class PolymarketAsyncPersistenceTest(unittest.TestCase):
 
 
 class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
+    async def test_superseded_confirmation_cannot_regress_newer_book(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = populated_store(Path(temporary.name) / "live")
+        projection = PolymarketLiveProjection()
+        current = store.books["yes-1"].model_copy(update={
+            "received_at": NOW + timedelta(seconds=2),
+            "state_checksum": "newer-websocket-checksum",
+        })
+        projection._books[current.token_id] = current
+        older = current.model_copy(update={
+            "received_at": NOW + timedelta(seconds=1),
+            "state_checksum": "older-rest-checksum",
+        })
+
+        projection.confirm_validated_books([older])
+
+        self.assertIs(projection._books[current.token_id], current)
+
+    async def test_newer_mismatched_confirmation_still_fails_closed(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = populated_store(Path(temporary.name) / "live")
+        projection = PolymarketLiveProjection()
+        current = store.books["yes-1"]
+        projection._books[current.token_id] = current
+        divergent = current.model_copy(update={
+            "received_at": NOW + timedelta(seconds=1),
+            "state_checksum": "divergent-newer-checksum",
+        })
+
+        with self.assertRaisesRegex(ValueError, "mismatches state"):
+            projection.confirm_validated_books([divergent])
+
     async def test_book_confirmations_coalesce_into_one_latest_per_token_batch(self):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
