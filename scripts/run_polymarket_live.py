@@ -20,6 +20,15 @@ from marketcow.polymarket_live_stream import PolymarketLiveStreamServer
 LOGGER = logging.getLogger(__name__)
 
 
+def effective_snapshot_refresh_seconds(
+    requested: float | None, *, bounded_scope: bool,
+) -> float | None:
+    """Keep exact-scope freshness inside the strict delivery budget."""
+    if requested is None or not bounded_scope:
+        return requested
+    return min(requested, 1.0)
+
+
 async def bootstrap_books_until_ready(
     collector: PolymarketLiveCollector,
     *,
@@ -106,7 +115,10 @@ def main() -> None:
             ),
             shard_size=arguments.shard_size,
             max_websocket_connections=arguments.max_websocket_connections,
-            snapshot_refresh_seconds=arguments.snapshot_refresh_seconds,
+            snapshot_refresh_seconds=effective_snapshot_refresh_seconds(
+                arguments.snapshot_refresh_seconds,
+                bounded_scope=bool(arguments.market_id),
+            ),
             catalog_refresh_on_lifecycle_events=not bool(arguments.market_id),
             publish_checkpoints=not bool(arguments.market_id),
             minimum_snapshot_refresh_age_seconds=(0.25 if arguments.market_id else 0),

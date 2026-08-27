@@ -20,6 +20,7 @@ from scripts.run_polymarket_scoped_manifest import (
     validate_scope_lifetime,
     validate_snapshot_refresh_seconds,
 )
+from scripts.run_polymarket_live import effective_snapshot_refresh_seconds
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.polymarket_contracts import content_sha256
@@ -116,6 +117,20 @@ class Response:
 
 
 class PolymarketLiveTest(unittest.TestCase):
+    def test_bounded_scope_refresh_cadence_preserves_strict_headroom(self):
+        self.assertEqual(
+            effective_snapshot_refresh_seconds(2, bounded_scope=True), 1,
+        )
+        self.assertEqual(
+            effective_snapshot_refresh_seconds(0.5, bounded_scope=True), 0.5,
+        )
+        self.assertEqual(
+            effective_snapshot_refresh_seconds(2, bounded_scope=False), 2,
+        )
+        self.assertIsNone(
+            effective_snapshot_refresh_seconds(None, bounded_scope=True)
+        )
+
     def setUp(self):
         self.folder = TemporaryDirectory()
         self.root = Path(self.folder.name)
