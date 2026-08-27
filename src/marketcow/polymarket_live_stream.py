@@ -71,6 +71,7 @@ class PolymarketLiveProjection:
         self._markets: dict[str, Any] = {}
         self._catalog_source: dict[str, Any] | None = None
         self._catalog_revision: str | None = None
+        self._scope_id: str | None = None
         self._active_recovery_id: str | None = None
         self._latest_cursor = 0
         self._persisted_cursor = 0
@@ -101,6 +102,11 @@ class PolymarketLiveProjection:
     def latest_cursor(self) -> int:
         with self._lock:
             return self._latest_cursor
+
+    @property
+    def scope_id(self) -> str | None:
+        with self._lock:
+            return self._scope_id
 
     def market_ids(self) -> list[str]:
         with self._lock:
@@ -158,6 +164,7 @@ class PolymarketLiveProjection:
             self._gaps = validated_gaps
             self._catalog_source = payload.get("catalog_source")
             self._catalog_revision = payload.get("catalog_revision")
+            self._scope_id = payload.get("scope_id") or None
             self._active_recovery_id = payload.get("active_recovery_id") or None
             self._latest_cursor = latest_cursor
             self._persisted_cursor = persisted_cursor
@@ -356,6 +363,13 @@ class PolymarketLiveProjection:
                     projection_generation=self._generation + 1,
                     observed_at=event.received_at,
                 )
+        if event.event_type == "market_terminal" and event.applied:
+            from .polymarket_live import LiveMarket
+
+            terminal = LiveMarket.model_validate(
+                event.canonical_payload.get("market")
+            )
+            self._markets[terminal.identity.market_id] = terminal
         if event.event_type == "recovery_started" and event.applied:
             self._active_recovery_id = str(
                 event.canonical_payload.get("recovery_id") or ""
@@ -530,6 +544,7 @@ class PolymarketLiveProjection:
         markets = selected + self._selected_markets(related_ids)
         with self._lock:
             revision = self._catalog_revision
+            scope_id = self._scope_id
             source = self._catalog_source
             cursor = self._latest_cursor
             recovery_id = self._active_recovery_id
@@ -543,9 +558,12 @@ class PolymarketLiveProjection:
         }
         transient.token_to_market = {
             outcome.token_id: market.identity.market_id
-            for market in markets for outcome in market.identity.outcomes
+            for market in markets
+            if market.lifecycle_state == "active" and market.accepting_orders
+            for outcome in market.identity.outcomes
         }
         transient.catalog_revision = revision
+        transient.scope_id = scope_id
         transient.catalog_source = source
         transient.cursor = cursor
         transient.active_recovery_id = recovery_id
@@ -603,12 +621,16 @@ class PolymarketLiveProjection:
             ]
             own_token_ids = {
                 outcome.token_id
-                for market in selected_markets if market is not None
+                for market in selected_markets
+                if market is not None
+                and market.lifecycle_state == "active"
+                and market.accepting_orders
                 for outcome in market.identity.outcomes
             }
             relation_token_ids = {
                 pair.yes_token_id
                 for market in selected_markets if market is not None
+                and market.lifecycle_state == "active"
                 for relation in market.relations
                 for pair in relation.outcome_pairs
             }
@@ -624,6 +646,7 @@ class PolymarketLiveProjection:
             checked_at = reader.now_provider()
             generation = self._generation
             revision = self._catalog_revision
+            scope_id = self._scope_id
             cursor = self._latest_cursor
             catalog_source = self._catalog_source
             persisted_cursor = self._persisted_cursor
@@ -639,13 +662,21 @@ class PolymarketLiveProjection:
             if (
                 not revision
                 or generation < 1
-                or not required_token_ids
+                or (
+                    not required_token_ids
+                    and any(
+                        market is not None and market.lifecycle_state == "active"
+                        for market in selected_markets
+                    )
+                )
                 or unresolved
                 or any(book is None for book in source_books.values())
             ):
                 raise PolymarketLiveReadStore._stable_boundary_unavailable("full-sync")
             for market in selected_markets:
                 if market is None:
+                    continue
+                if market.lifecycle_state in {"closed", "resolved", "invalid"}:
                     continue
                 expected = sorted(
                     outcome.token_id for outcome in market.identity.outcomes
@@ -697,7 +728,10 @@ class PolymarketLiveProjection:
             phases["projection_copy_ms"] = (
                 time.perf_counter() - copy_started
             ) * 1000
-        oldest = min(book.received_at for book in books.values())
+        oldest = min(
+            (book.received_at for book in books.values()),
+            default=checked_at,
+        )
         maximum_age_ms = (checked_at - oldest).total_seconds() * 1000
         if maximum_age_ms < 0:
             raise self._freshness_budget_exhausted()
@@ -718,6 +752,7 @@ class PolymarketLiveProjection:
             "maximum_age_ms": maximum_age_ms,
             "generation": generation,
             "revision": revision,
+            "scope_id": scope_id,
             "cursor": cursor,
             "catalog_source": catalog_source,
             "persisted_cursor": persisted_cursor,
@@ -767,7 +802,19 @@ class PolymarketLiveProjection:
             for token_id in sorted(referenced_token_ids)
             if token_id in capture["books"]
         }
-        ready = all(frame.status == "ready" for frame in frames)
+        active_count = sum(
+            market.lifecycle_state == "active" for market in selected_markets
+        )
+        terminal_count = len(selected_markets) - active_count
+        complete_count = sum(frame.status == "ready" for frame in frames)
+        missing_count = sum(frame.status == "fail_closed" for frame in frames)
+        exact_ready = (
+            len(selected) == 100
+            and active_count == 100
+            and complete_count == 100
+            and missing_count == 0
+        )
+        ready = missing_count == 0
         reason_codes = sorted({
             reason for frame in frames for reason in frame.reason_codes
         })
@@ -775,16 +822,26 @@ class PolymarketLiveProjection:
             "projection_generation": capture["generation"],
             "scope_market_ids": selected,
             "freshness_checked_at": capture["checked_at"],
+            "scope_id": capture["scope_id"],
         }
         health = LiveReadHealth(
-            status="index_ready" if ready else "degraded",
+            status="index_ready" if ready and not terminal_count else "degraded",
             catalog_revision=capture["revision"],
             catalog_index_ready=True,
-            latest_state_ready=ready,
+            latest_state_ready=ready and not terminal_count,
             market_count=len(selected),
             token_count=len(referenced_token_ids),
             book_token_count=len(page_books),
             book_complete_market_count=sum(frame.status == "ready" for frame in frames),
+            active_market_count=active_count,
+            terminal_market_count=terminal_count,
+            complete_market_count=complete_count,
+            missing_market_count=missing_count,
+            scope_status=(
+                "exact_ready" if exact_ready
+                else "terminal_degraded" if terminal_count and not missing_count
+                else "data_degraded"
+            ),
             unresolved_gap_count=0,
             latest_cursor=capture["cursor"],
             persisted_cursor=capture["persisted_cursor"],
@@ -855,6 +912,7 @@ class PolymarketLiveProjection:
                 projection_generation=capture["generation"],
                 scope_market_ids=capture["selected"],
                 freshness_checked_at=capture["checked_at"],
+                scope_id=capture["scope_id"],
                 oldest_book_received_at=capture["oldest"],
                 maximum_book_age_ms=capture["maximum_age_ms"],
                 consumer_maximum_book_age_ms=maximum_seconds * 1000,
@@ -1067,6 +1125,7 @@ class PolymarketLiveStreamServer:
                 "schema_version": STREAM_SCHEMA,
                 "type": "state",
                 "catalog_revision": self.store.catalog_revision,
+                "scope_id": self.store.scope_id,
                 "catalog_source": self.store.catalog_source,
                 "latest_cursor": self.store.cursor,
                 "persisted_cursor": getattr(

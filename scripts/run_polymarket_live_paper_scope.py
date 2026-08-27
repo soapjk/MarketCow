@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from marketcow.polymarket_scopes import write_scope_runtime
+
 
 REQUIRED_TRADUDE_COMMIT = "1d509944134cf3e181782ff2acbe2d907ccdde1b"
 MAXIMUM_CAPITAL_LOCK_DURATION_NS = 30 * 86_400 * 1_000_000_000
@@ -256,6 +258,11 @@ def main() -> None:
             )
             print(json.dumps(provenance, sort_keys=True), flush=True)
             market_ids = provenance["market_ids"]
+            write_scope_runtime(
+                arguments.root,
+                scope_id=provenance["scope_id"],
+                manifest_sha256=provenance["manifest_sha256"],
+            )
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError) as exc:
         parser.error(str(exc))
     runner = Path(__file__).with_name("run_polymarket_live.py").resolve()
