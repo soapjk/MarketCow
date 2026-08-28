@@ -591,6 +591,13 @@ fn run_headless_shadow_soak(
     if duration_seconds == 0 || interval_millis == 0 || !output.is_absolute() {
         bail!("soak duration/interval must be positive and output must be absolute");
     }
+    let binary_commit = env::var("MARKETCOW_BINARY_COMMIT")
+        .context("MARKETCOW_BINARY_COMMIT is required for attributable soak evidence")?;
+    if binary_commit.is_empty() || binary_commit.len() > 128 {
+        bail!("MARKETCOW_BINARY_COMMIT must be present and at most 128 characters");
+    }
+    let binary_path = env::current_exe()?.canonicalize()?;
+    let binary_sha256 = hex::encode(Sha256::digest(fs::read(&binary_path)?));
     let mut runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(config))?;
     let started_at = Utc::now();
     let started = std::time::Instant::now();
@@ -691,18 +698,31 @@ fn run_headless_shadow_soak(
         apply_latency_us[index]
     };
     let max_rss_kb = maximum_resident_set_kb();
-    let passed = elapsed_seconds >= duration_seconds as f64
-        && rejected_count == 0
-        && projection.ready
-        && projection.unresolved_gaps.is_empty()
-        && projection.cursor == projection.persisted_cursor
-        && maximum_book_age_ms <= interval_millis.saturating_mul(2).max(5_000)
-        && percentile(0.99) <= 50_000
-        && maximum_persistence_latency_us <= 50_000
-        && maximum_publication_latency_us <= 5_000
-        && !config.real_order_submission_enabled;
+    let gate_verdicts = json!({
+        "duration_reached":elapsed_seconds >= duration_seconds as f64,
+        "rejected_events_zero":rejected_count == 0,
+        "projection_ready":projection.ready,
+        "unresolved_gap_count_zero":projection.unresolved_gaps.is_empty(),
+        "published_cursor_equals_persisted_cursor":projection.cursor == projection.persisted_cursor,
+        "maximum_book_age_within_limit":maximum_book_age_ms
+            <= interval_millis.saturating_mul(2).max(5_000),
+        "apply_latency_p99_us_lte_50000":percentile(0.99) <= 50_000,
+        "maximum_persistence_latency_us_lte_50000":maximum_persistence_latency_us <= 50_000,
+        "maximum_publication_latency_us_lte_5000":maximum_publication_latency_us <= 5_000,
+        "real_orders_disabled":!config.real_order_submission_enabled,
+        "tradude_does_not_manage_marketcow":true
+    });
+    let passed = gate_verdicts
+        .as_object()
+        .expect("gate verdicts are an object")
+        .values()
+        .all(|value| value == &serde_json::Value::Bool(true));
     let result = json!({
-        "schema_version":"marketcow.headless-shadow-soak.v1",
+        "schema_version":"marketcow.headless-shadow-soak.v2",
+        "binary_commit":binary_commit,
+        "binary_path":binary_path,
+        "binary_sha256":binary_sha256,
+        "storage_root":config.storage_root,
         "started_at":started_at,
         "finished_at":Utc::now(),
         "requested_duration_seconds":duration_seconds,
@@ -723,6 +743,7 @@ fn run_headless_shadow_soak(
         "maximum_persistence_latency_us":maximum_persistence_latency_us,
         "maximum_publication_latency_us":maximum_publication_latency_us,
         "max_rss_kb":max_rss_kb,
+        "gate_verdicts":gate_verdicts,
         "real_order_submission_enabled":false,
         "tradude_manages_marketcow":false,
         "passed":passed
