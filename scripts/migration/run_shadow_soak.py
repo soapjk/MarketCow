@@ -111,6 +111,7 @@ def main() -> None:
     reader_latencies: list[float] = []
     bootstrap_persistence_latencies_us: list[float] = []
     bootstrap_publication_latencies_us: list[float] = []
+    apply_latencies_us: list[float] = []
     persistence_latencies_us: list[float] = []
     publication_latencies_us: list[float] = []
     failures: list[dict[str, object]] = []
@@ -210,6 +211,7 @@ def main() -> None:
                             }, observed)
                             persistence_latencies_us.append(body["persistence_latency_us"])
                             publication_latencies_us.append(body["publication_latency_us"])
+                            apply_latencies_us.append(body["apply_latency_us"])
                             ingest_count += 1
                             canonical_event_count += body["events"]
                             sequence += 1
@@ -334,6 +336,9 @@ def main() -> None:
         "wal_persistence_latency_p99_us_lte_20000": (
             percentile(persistence_latencies_us, .99) <= 20_000
         ),
+        "upstream_receive_to_publish_p99_us_lte_20000": (
+            percentile(apply_latencies_us, .99) <= 20_000
+        ),
         "projection_publication_latency_p99_us_lte_5000": (
             percentile(publication_latencies_us, .99) <= 5_000
         ),
@@ -387,6 +392,12 @@ def main() -> None:
             "p95": percentile(persistence_latencies_us, .95),
             "p99": percentile(persistence_latencies_us, .99),
             "max": max(persistence_latencies_us, default=math.inf),
+        },
+        "apply_latency_us": {
+            "p50": percentile(apply_latencies_us, .50),
+            "p95": percentile(apply_latencies_us, .95),
+            "p99": percentile(apply_latencies_us, .99),
+            "max": max(apply_latencies_us, default=math.inf),
         },
         "publication_latency_us": {
             "p50": percentile(publication_latencies_us, .50),

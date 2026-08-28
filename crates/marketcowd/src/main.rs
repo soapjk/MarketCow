@@ -4990,8 +4990,10 @@ async fn admin_shadow_ingest(
     }
     let received_at = request.received_at.unwrap_or_else(Utc::now);
     let mut runtime = state.runtime.lock().await;
+    let apply_started = Instant::now();
     match runtime.apply_raw(request.raw_payload, received_at) {
         Ok(outcomes) => {
+            let apply_latency_us = apply_started.elapsed().as_micros() as u64;
             let rejected = outcomes
                 .iter()
                 .filter(|outcome| !outcome.persisted.applied)
@@ -5035,6 +5037,7 @@ async fn admin_shadow_ingest(
                 "published_cursor":projection.cursor,
                 "persisted_cursor":projection.persisted_cursor,
                 "ready":projection.ready,
+                "apply_latency_us":apply_latency_us,
                 "persistence_latency_us":persistence_latency_us,
                 "publication_latency_us":publication_latency_us,
                 "real_order_submission_enabled":false
@@ -7646,6 +7649,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), 16_384).await.unwrap()).unwrap();
         assert!(response["persistence_latency_us"].as_u64().is_some());
         assert!(response["publication_latency_us"].as_u64().is_some());
+        assert!(response["apply_latency_us"].as_u64().is_some());
         assert_eq!(state.projection.load().cursor, 1);
         assert!(state.projection.load().ready);
         assert_eq!(state.recent_events.load().len(), 1);

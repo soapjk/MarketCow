@@ -581,6 +581,19 @@ impl<L: DurableLog> SingleWriter<L> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        let frame_raw_payload = events[0].raw_payload.clone();
+        let frame_raw_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(
+            frame_raw_payload.as_ref(),
+        )?));
+        if events.iter().any(|event| {
+            event.raw_payload.as_ref() != frame_raw_payload.as_ref()
+                || !event
+                    .source
+                    .raw_sha256
+                    .eq_ignore_ascii_case(&frame_raw_sha256)
+        }) {
+            return Err(CoreError::InvalidSourceEvidence);
+        }
         struct CandidateLog;
         impl DurableLog for CandidateLog {
             fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
@@ -591,7 +604,7 @@ impl<L: DurableLog> SingleWriter<L> {
         let mut candidate = SingleWriter::resume(starting, CandidateLog)?;
         let mut persisted = Vec::with_capacity(events.len());
         for event in events {
-            persisted.push(candidate.apply(event)?.persisted);
+            persisted.push(candidate.apply_inner(event, false)?.persisted);
         }
         let persistence_started = std::time::Instant::now();
         self.log.append_outcomes(&persisted)?;
@@ -613,6 +626,14 @@ impl<L: DurableLog> SingleWriter<L> {
 
     /// Applies a candidate, validates it, durably appends, then atomically publishes it.
     pub fn apply(&mut self, event: CanonicalEvent) -> Result<ApplyOutcome, CoreError> {
+        self.apply_inner(event, true)
+    }
+
+    fn apply_inner(
+        &mut self,
+        event: CanonicalEvent,
+        validate_raw_payload: bool,
+    ) -> Result<ApplyOutcome, CoreError> {
         let previous = self.current.load_full();
         if event.schema_version != CONTRACT_VERSION {
             return Err(CoreError::SchemaMismatch);
@@ -629,8 +650,9 @@ impl<L: DurableLog> SingleWriter<L> {
                 .raw_sha256
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
-            || hex::encode(Sha256::digest(serde_json::to_vec(&event.raw_payload)?))
-                != event.source.raw_sha256.to_ascii_lowercase()
+            || validate_raw_payload
+                && hex::encode(Sha256::digest(serde_json::to_vec(&event.raw_payload)?))
+                    != event.source.raw_sha256.to_ascii_lowercase()
         {
             return Err(CoreError::InvalidSourceEvidence);
         }
@@ -1674,28 +1696,27 @@ mod tests {
             }
         }
         let mut state = SingleWriter::new("scope".into(), BatchLog::default());
-        let outcomes = state
-            .apply_batch(vec![
-                event(
-                    1,
-                    EventKind::FullBook {
-                        token_id: "t".into(),
-                        bids: levels("0.4", "1"),
-                        asks: levels("0.6", "1"),
-                        tick_size: Price::parse_tick("0.01").unwrap(),
-                        tick_version: "tick-v1".into(),
-                    },
-                ),
-                event(
-                    2,
-                    EventKind::Delta {
-                        token_id: "t".into(),
-                        side: Side::Bid,
-                        levels: levels("0.4", "2"),
-                    },
-                ),
-            ])
-            .unwrap();
+        let first = event(
+            1,
+            EventKind::FullBook {
+                token_id: "t".into(),
+                bids: levels("0.4", "1"),
+                asks: levels("0.6", "1"),
+                tick_size: Price::parse_tick("0.01").unwrap(),
+                tick_version: "tick-v1".into(),
+            },
+        );
+        let mut second = event(
+            2,
+            EventKind::Delta {
+                token_id: "t".into(),
+                side: Side::Bid,
+                levels: levels("0.4", "2"),
+            },
+        );
+        second.raw_payload = first.raw_payload.clone();
+        second.source.raw_sha256 = first.source.raw_sha256.clone();
+        let outcomes = state.apply_batch(vec![first, second]).unwrap();
         assert_eq!(outcomes.len(), 2);
         assert_eq!(state.log.batches, 1);
         assert_eq!(state.log.records.len(), 2);
@@ -1733,6 +1754,43 @@ mod tests {
         );
         assert_eq!(state.projection().cursor, 0);
         assert_eq!(state.projection().persisted_cursor, 0);
+    }
+
+    #[test]
+    fn grouped_frame_rejects_mixed_raw_evidence_before_persistence() {
+        #[derive(Default)]
+        struct BatchLog {
+            writes: usize,
+        }
+        impl DurableLog for BatchLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!("batch append is required")
+            }
+            fn append_outcomes(&mut self, _: &[PersistedEvent]) -> Result<(), CoreError> {
+                self.writes += 1;
+                Ok(())
+            }
+        }
+        let mut state = SingleWriter::new("scope".into(), BatchLog::default());
+        let result = state.apply_batch(vec![
+            event(
+                1,
+                EventKind::SourceGap {
+                    token_id: "a".into(),
+                    reason: "fixture".into(),
+                },
+            ),
+            event(
+                2,
+                EventKind::SourceGap {
+                    token_id: "b".into(),
+                    reason: "fixture".into(),
+                },
+            ),
+        ]);
+        assert!(matches!(result, Err(CoreError::InvalidSourceEvidence)));
+        assert_eq!(state.log.writes, 0);
+        assert_eq!(state.projection().cursor, 0);
     }
 
     #[test]
