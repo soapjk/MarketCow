@@ -20,6 +20,7 @@ hex.workspace = true
 libc.workspace = true
 marketcow-core = { path = "../marketcow-core" }
 marketcow-jobs = { path = "../marketcow-jobs" }
+marketcow-polymarket = { path = "../marketcow-polymarket" }
 marketcow-contracts = { path = "../marketcow-contracts" }
 marketcow-api = { path = "../marketcow-api" }
 marketcow-runtime = { path = "../marketcow-runtime" }

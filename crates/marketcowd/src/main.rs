@@ -38,7 +38,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     process::Command as ProcessCommand,
     signal,
-    sync::{Mutex as AsyncMutex, Notify, broadcast},
+    sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc, watch},
     task::JoinSet,
 };
 use tracing::{info, warn};
@@ -46,6 +46,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const STREAM_CHANNEL_CAPACITY: usize = 256;
+const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const STREAM_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_WORKER_RESULT_BYTES: u64 = 16 * 1024 * 1024;
@@ -124,7 +125,35 @@ struct Config {
     shadow_mode: bool,
     maximum_book_age_ms: u64,
     legacy_mcp_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    polymarket_live: Option<PolymarketLiveConfig>,
     python_workers: PythonWorkerConfig,
+}
+
+#[derive(Clone, Serialize)]
+struct PolymarketLiveConfig {
+    token_ids: Vec<String>,
+    market_count: Option<usize>,
+    scope_file_sha256: Option<String>,
+    source_manifest_sha256: Option<String>,
+    catalog_index_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PolymarketLiveScopeFile {
+    schema_version: String,
+    scope_id: String,
+    market_count: usize,
+    token_count: usize,
+    market_ids: Vec<String>,
+    token_ids: Vec<String>,
+    source: PolymarketLiveScopeSource,
+}
+
+#[derive(Deserialize)]
+struct PolymarketLiveScopeSource {
+    manifest_sha256: String,
+    catalog_index_sha256: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -339,6 +368,7 @@ impl Config {
             Err(env::VarError::NotPresent) => None,
             Err(error) => return Err(error.into()),
         };
+        let polymarket_live = load_polymarket_live_config(&scope_id)?;
         let python_workers = PythonWorkerConfig::load()?;
         if orders {
             bail!("real order submission is prohibited by the migration safety gate");
@@ -371,9 +401,104 @@ impl Config {
             shadow_mode,
             maximum_book_age_ms,
             legacy_mcp_url,
+            polymarket_live,
             python_workers,
         })
     }
+}
+
+fn load_polymarket_live_config(expected_scope_id: &str) -> Result<Option<PolymarketLiveConfig>> {
+    if env::var("MARKETCOW_POLYMARKET_LIVE_ENABLED").as_deref() != Ok("true") {
+        return Ok(None);
+    }
+    let encoded = env::var("MARKETCOW_POLYMARKET_TOKEN_IDS_JSON").ok();
+    let scope_path = env::var("MARKETCOW_POLYMARKET_SCOPE_FILE").ok();
+    match (encoded, scope_path) {
+        (Some(_), Some(_)) => bail!(
+            "Polymarket live requires exactly one of MARKETCOW_POLYMARKET_TOKEN_IDS_JSON or MARKETCOW_POLYMARKET_SCOPE_FILE"
+        ),
+        (Some(encoded), None) => {
+            let token_ids: Vec<String> = serde_json::from_str(&encoded)
+                .context("MARKETCOW_POLYMARKET_TOKEN_IDS_JSON must be a JSON array")?;
+            Ok(Some(PolymarketLiveConfig {
+                token_ids: validate_polymarket_token_ids(token_ids)?,
+                market_count: None,
+                scope_file_sha256: None,
+                source_manifest_sha256: None,
+                catalog_index_sha256: None,
+            }))
+        }
+        (None, Some(scope_path)) => load_polymarket_scope_file(expected_scope_id, &scope_path),
+        (None, None) => bail!(
+            "enabled Polymarket live requires MARKETCOW_POLYMARKET_TOKEN_IDS_JSON or MARKETCOW_POLYMARKET_SCOPE_FILE"
+        ),
+    }
+}
+
+fn validate_polymarket_token_ids(token_ids: Vec<String>) -> Result<Vec<String>> {
+    let unique = token_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if token_ids.is_empty()
+        || token_ids.len() > 500
+        || unique.len() != token_ids.len()
+        || token_ids.iter().any(|token| {
+            token.is_empty() || token.len() > 128 || !token.bytes().all(|b| b.is_ascii_digit())
+        })
+    {
+        bail!("Polymarket token scope must contain 1 to 500 unique decimal token identifiers");
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn load_polymarket_scope_file(
+    expected_scope_id: &str,
+    scope_path: &str,
+) -> Result<Option<PolymarketLiveConfig>> {
+    let path = Path::new(scope_path);
+    if !path.is_absolute() {
+        bail!("MARKETCOW_POLYMARKET_SCOPE_FILE must be an absolute path");
+    }
+    let encoded = fs::read(path).context("failed to read MARKETCOW_POLYMARKET_SCOPE_FILE")?;
+    let scope_file_sha256 = hex::encode(Sha256::digest(&encoded));
+    let scope: PolymarketLiveScopeFile = serde_json::from_slice(&encoded)
+        .context("MARKETCOW_POLYMARKET_SCOPE_FILE must be valid JSON")?;
+    if scope.schema_version != "marketcow.polymarket.rust-live-scope.v1" {
+        bail!("unsupported Polymarket Rust live scope schema");
+    }
+    if scope.scope_id != expected_scope_id {
+        bail!("Polymarket Rust live scope does not match MARKETCOW_RUST_SCOPE_ID");
+    }
+    let markets = scope.market_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if scope.market_count == 0
+        || scope.market_count > 250
+        || scope.market_count != scope.market_ids.len()
+        || markets.len() != scope.market_ids.len()
+        || scope.market_ids.iter().any(|market| {
+            market.is_empty() || market.len() > 32 || !market.bytes().all(|b| b.is_ascii_digit())
+        })
+    {
+        bail!("Polymarket Rust live scope market identity/count is invalid");
+    }
+    if scope.token_count != scope.token_ids.len()
+        || scope.token_count != scope.market_count.saturating_mul(2)
+    {
+        bail!("Polymarket Rust live scope must contain exactly two tokens per market");
+    }
+    let token_ids = validate_polymarket_token_ids(scope.token_ids)?;
+    for digest in [
+        &scope.source.manifest_sha256,
+        &scope.source.catalog_index_sha256,
+    ] {
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("Polymarket Rust live scope source hashes must be SHA-256 hex digests");
+        }
+    }
+    Ok(Some(PolymarketLiveConfig {
+        token_ids,
+        market_count: Some(scope.market_count),
+        scope_file_sha256: Some(scope_file_sha256),
+        source_manifest_sha256: Some(scope.source.manifest_sha256.to_ascii_lowercase()),
+        catalog_index_sha256: Some(scope.source.catalog_index_sha256.to_ascii_lowercase()),
+    }))
 }
 
 fn validate_legacy_mcp_url(value: &str, public_bind: SocketAddr) -> Result<()> {
@@ -2115,6 +2240,132 @@ async fn supervise_worker_pool(
     while slots.join_next().await.is_some() {}
 }
 
+fn start_polymarket_live(
+    state: AppState,
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let live = state.config.polymarket_live.clone()?;
+    Some(tokio::spawn(async move {
+        let (sender, mut receiver) = mpsc::channel(POLYMARKET_TRANSPORT_CHANNEL_CAPACITY);
+        let transport_shutdown = shutdown.clone();
+        let transport_tokens = live.token_ids.clone();
+        let transport = tokio::spawn(async move {
+            marketcow_polymarket::run_polymarket_transport(
+                marketcow_polymarket::PolymarketTransportConfig::production(),
+                transport_tokens,
+                sender,
+                transport_shutdown,
+            )
+            .await
+        });
+        let mut events_since_checkpoint = 0_usize;
+        let mut owner_failed = false;
+        while let Some(frames) = receiver.recv().await {
+            match apply_polymarket_transport_frames(&state, frames).await {
+                Ok(events) => {
+                    events_since_checkpoint += events;
+                    if events_since_checkpoint >= 1_000 {
+                        if checkpoint_polymarket_runtime(&state).await.is_err() {
+                            owner_failed = true;
+                            break;
+                        }
+                        events_since_checkpoint = 0;
+                    }
+                }
+                Err(error) => {
+                    warn!(error=%error, "polymarket_live_owner_failed_closed");
+                    owner_failed = true;
+                    break;
+                }
+            }
+        }
+        if owner_failed {
+            transport.abort();
+        }
+        let transport_result = transport.await;
+        let shutting_down = *shutdown.borrow();
+        if !shutting_down
+            && (owner_failed || !matches!(transport_result, Ok(Ok(()))))
+            && let Err(error) = apply_polymarket_terminal_gaps(&state, &live.token_ids).await
+        {
+            warn!(error=%error, "polymarket_terminal_gap_failed_closed");
+        }
+        if let Err(error) = checkpoint_polymarket_runtime(&state).await {
+            warn!(error=%error, "polymarket_shutdown_checkpoint_failed_closed");
+        }
+        let _ = shutdown.changed().await;
+    }))
+}
+
+async fn apply_polymarket_transport_frames(
+    state: &AppState,
+    frames: Vec<marketcow_polymarket::RawTransportFrame>,
+) -> Result<usize> {
+    if frames.is_empty() {
+        bail!("Polymarket transport emitted an empty frame batch");
+    }
+    let mut runtime = state.runtime.lock().await;
+    let mut published = Vec::new();
+    let mut failure = None;
+    for frame in frames {
+        match runtime.apply_raw(frame.raw_payload, frame.received_at) {
+            Ok(outcomes) => published.extend(outcomes),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    state.projection.store(runtime.projection());
+    state
+        .recent_events
+        .store(Arc::new(clone_polymarket_recent_events(&runtime)));
+    drop(runtime);
+    for outcome in &published {
+        let _ = state.stream.send(outcome.persisted.clone());
+    }
+    if let Some(error) = failure {
+        return Err(error.into());
+    }
+    Ok(published.len())
+}
+
+async fn apply_polymarket_terminal_gaps(state: &AppState, tokens: &[String]) -> Result<()> {
+    let received_at = Utc::now();
+    let timestamp = received_at.timestamp_millis().to_string();
+    let frames = tokens
+        .iter()
+        .map(|token_id| marketcow_polymarket::RawTransportFrame {
+            raw_payload: json!({
+                "event_type":"source_gap", "asset_id":token_id,
+                "reason":"rust_transport_terminal", "timestamp":timestamp,
+            }),
+            received_at,
+        })
+        .collect();
+    apply_polymarket_transport_frames(state, frames).await?;
+    Ok(())
+}
+
+async fn checkpoint_polymarket_runtime(state: &AppState) -> Result<()> {
+    let mut runtime = state.runtime.lock().await;
+    runtime.checkpoint()?;
+    state.projection.store(runtime.projection());
+    state
+        .recent_events
+        .store(Arc::new(clone_polymarket_recent_events(&runtime)));
+    Ok(())
+}
+
+// The pending bounded-buffer runtime returns VecDeque while the committed baseline returns a
+// slice. Iteration keeps this live-owner commit source-compatible with both representations.
+#[allow(clippy::iter_cloned_collect)]
+fn clone_polymarket_recent_events(
+    runtime: &marketcow_runtime::PolymarketRuntime,
+) -> Vec<marketcow_core::PersistedEvent> {
+    runtime.recent_events().iter().cloned().collect()
+}
+
 async fn serve() -> Result<()> {
     let config = Config::load()?;
     preflight(&config)?;
@@ -2136,6 +2387,7 @@ async fn serve() -> Result<()> {
     let instruments = Arc::new(InstrumentCoordinator::open(&config.profile).await?);
     let market_data = Arc::new(MarketDataCoordinator::open(&config.profile).await?);
     let canonical_cursor = Arc::new(CanonicalCursorSigner::open(&config.storage_root)?);
+    let (service_shutdown_tx, service_shutdown_rx) = watch::channel(false);
     let legacy_mcp = config
         .legacy_mcp_url
         .clone()
@@ -2158,6 +2410,7 @@ async fn serve() -> Result<()> {
         worker_status: Arc::new(PythonWorkerStatus::default()),
         legacy_mcp,
     };
+    let polymarket_live = start_polymarket_live(state.clone(), service_shutdown_rx);
     let worker_path = config.worker_socket.clone();
     let worker_jobs = state.jobs.clone();
     let worker_staging_root = config.storage_root.join("worker-staging");
@@ -2181,9 +2434,14 @@ async fn serve() -> Result<()> {
     let app = app(state);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     info!(bind=%config.bind, shadow=true, "marketcowd_ready");
+    let shutdown_sender = service_shutdown_tx.clone();
     let server_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(async move {
+            shutdown().await;
+            let _ = shutdown_sender.send(true);
+        })
         .await;
+    let _ = service_shutdown_tx.send(true);
     if let Some(worker_pool) = worker_pool {
         worker_pool.abort();
         let _ = worker_pool.await;
@@ -2191,6 +2449,9 @@ async fn serve() -> Result<()> {
     worker.abort();
     let _ = worker.await;
     let _ = fs::remove_file(&config.worker_socket);
+    if let Some(polymarket_live) = polymarket_live {
+        let _ = polymarket_live.await;
+    }
     info!("marketcowd_stopped");
     server_result?;
     Ok(())
@@ -4980,7 +5241,10 @@ async fn admin_shadow_ingest(
     Extension(request_id): Extension<String>,
     Json(request): Json<ShadowIngestRequest>,
 ) -> Response {
-    if !state.config.shadow_mode || state.config.real_order_submission_enabled {
+    if !state.config.shadow_mode
+        || state.config.real_order_submission_enabled
+        || state.config.polymarket_live.is_some()
+    {
         return error(
             StatusCode::FORBIDDEN,
             "shadow_ingest_disabled",
@@ -5879,6 +6143,7 @@ mod tests {
             shadow_mode: true,
             maximum_book_age_ms: 30_000,
             legacy_mcp_url: None,
+            polymarket_live: None,
             python_workers: PythonWorkerConfig::disabled(),
         };
         let runtime =
@@ -5913,6 +6178,55 @@ mod tests {
                 legacy_mcp: None,
             },
         )
+    }
+
+    #[test]
+    fn polymarket_live_token_scope_is_decimal_unique_and_deterministic() {
+        assert_eq!(
+            validate_polymarket_token_ids(vec!["20".into(), "10".into()]).unwrap(),
+            ["10", "20"]
+        );
+        assert!(validate_polymarket_token_ids(vec!["10".into(), "10".into()]).is_err());
+        assert!(validate_polymarket_token_ids(vec!["not-a-token".into()]).is_err());
+    }
+
+    #[test]
+    fn polymarket_live_scope_file_binds_counts_scope_and_source_hashes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("scope.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema_version":"marketcow.polymarket.rust-live-scope.v1",
+                "scope_id":"scope-100",
+                "market_count":2,
+                "token_count":4,
+                "market_ids":["2","1"],
+                "token_ids":["40","10","30","20"],
+                "source":{
+                    "manifest_sha256":"a".repeat(64),
+                    "catalog_index_sha256":"B".repeat(64)
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_polymarket_scope_file("scope-100", path.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.market_count, Some(2));
+        assert_eq!(loaded.token_ids, ["10", "20", "30", "40"]);
+        assert_eq!(
+            loaded.source_manifest_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            loaded.catalog_index_sha256.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        assert_eq!(loaded.scope_file_sha256.as_deref().map(str::len), Some(64));
+        assert!(load_polymarket_scope_file("wrong-scope", path.to_str().unwrap()).is_err());
     }
 
     fn instrument_fixture() -> marketcow_storage::InstrumentRecord {
@@ -7467,7 +7781,7 @@ mod tests {
         assert_eq!(migration["tradude_may_manage_marketcow"], false);
         assert_eq!(
             migration["ownership_registry"]["sha256"],
-            "c71864af6bc9227cf166d42dc3963da12261b8fe80cb1c1ce581f2695714bf5e"
+            "9c2345373563e1dae75543b6953695af85734678e16f0e4e610e7b983fc648e1"
         );
 
         let path = AxumPath((
@@ -7947,6 +8261,7 @@ mod tests {
             shadow_mode: true,
             maximum_book_age_ms: 30_000,
             legacy_mcp_url: None,
+            polymarket_live: None,
             python_workers: PythonWorkerConfig::disabled(),
         };
         preflight(&config).unwrap();

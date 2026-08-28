@@ -1037,6 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn rust_transport_subscribes_to_official_wire_shape_and_forwards_raw_book() {
         use tokio::net::TcpListener;
         use tokio_tungstenite::{
