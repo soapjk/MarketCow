@@ -1,0 +1,91 @@
+{
+  "schema_version": "marketcow.rust-polymarket-live-shadow.v1",
+  "recorded_at": "2026-08-28T12:00:10Z",
+  "overall_verdict": "passed_initial_live_shadow_gate",
+  "scope": {
+    "scope_id": "rust-live-m2232758",
+    "market_id": "2232758",
+    "token_ids": [
+      "73095220668613030583620679994396569312375065721675622279660918651295878251298",
+      "98634753760520652602855338153702224800892981059857642439641625861779476241220"
+    ],
+    "shadow_mode": true,
+    "real_order_submission_enabled": false,
+    "bind": "127.0.0.1:18872"
+  },
+  "failed_attempts": [
+    {
+      "attempt": "v1",
+      "pid": 87783,
+      "storage_root": "/tmp/marketcow-rust-polymarket-live.Mb8JhA/storage",
+      "process_log": "/tmp/marketcow-rust-polymarket-live.Mb8JhA/process.log",
+      "verdict": "failed",
+      "evidence": "background process exited; process.log is empty; later foreground diagnosis wrote four fail-closed gap records and a checkpoint; process exit was not treated as success"
+    },
+    {
+      "attempt": "v2",
+      "pid": 88428,
+      "storage_root": "/tmp/marketcow-rust-polymarket-live-v2.1dQfI1/storage",
+      "process_log": "/tmp/marketcow-rust-polymarket-live-v2.1dQfI1/process.log",
+      "verdict": "failed",
+      "evidence": "32 connect timeouts produced 64 reconnect-boundary gap records plus terminal gaps; full-sync remained HTTP 503"
+    },
+    {
+      "attempt": "v3",
+      "pid": 92554,
+      "storage_root": "/tmp/marketcow-rust-polymarket-live-v3.SRMhih/storage",
+      "process_log": "/tmp/marketcow-rust-polymarket-live-v3.SRMhih/process.log",
+      "verdict": "failed",
+      "evidence": "explicit IPv4 direct connection still timed out because this host requires its configured HTTP(S) proxy for the venue"
+    },
+    {
+      "attempt": "v4",
+      "pid": 93360,
+      "storage_root": "/tmp/marketcow-rust-polymarket-live-v4.e89b9E/storage",
+      "process_log": "/tmp/marketcow-rust-polymarket-live-v4.e89b9E/process.log",
+      "verdict": "failed",
+      "evidence": "HTTP CONNECT reached TLS, then rustls panicked because no process-level CryptoProvider was installed; daemon stayed fail-closed and HTTP full-sync returned 503"
+    },
+    {
+      "attempt": "v5",
+      "pid": 94811,
+      "storage_root": "/tmp/marketcow-rust-polymarket-live-v5.3Dv4Cs/storage",
+      "process_log": "/tmp/marketcow-rust-polymarket-live-v5.3Dv4Cs/process.log",
+      "verdict": "transport_passed_but_operational_freshness_gate_too_strict",
+      "evidence": "Rust received both official full books and persisted them, but the 5000 ms maximum book age made this quiet market HTTP 503 after the initial readiness window"
+    }
+  ],
+  "passing_attempt": {
+    "attempt": "v6",
+    "pid": 95392,
+    "binary_sha256": "45f369d71a2030047751b0e5cd54aa662df7fb991bb0f871136c6fbe8fc42928",
+    "storage_root": "/tmp/marketcow-rust-polymarket-live-v6.EbCIVO/storage",
+    "process_log": "/tmp/marketcow-rust-polymarket-live-v6.EbCIVO/process.log",
+    "maximum_book_age_ms": 300000,
+    "gates": {
+      "official_websocket_connected_via_explicit_https_proxy": "passed",
+      "scoped_subscription_only": "passed",
+      "http_full_sync_status_200": "passed",
+      "projection_ready": "passed",
+      "book_count_2": "passed",
+      "unresolved_gap_count_0": "passed",
+      "published_cursor_equals_persisted_cursor": "passed:6=6",
+      "wal_verify": "passed:records=6,last_cursor=6",
+      "shadow_mode": "passed:true",
+      "real_orders_disabled": "passed:false"
+    }
+  },
+  "verification": {
+    "tests": "cargo test -p marketcow-polymarket -p marketcow-runtime -p marketcowd --no-fail-fast",
+    "test_result": "passed:50,failed:0",
+    "wal_command": "./target/debug/marketcow wal verify /tmp/marketcow-rust-polymarket-live-v6.EbCIVO/storage/polymarket/wal",
+    "wal_result": {"status":"ok","records":6,"last_cursor":6},
+    "http_command": "curl http://127.0.0.1:18872/v1/prediction-markets/polymarket/live/full-sync",
+    "http_result": {"status":200,"ready":true,"book_count":2,"boundary_cursor":6,"persisted_cursor":6,"unresolved_gap_count":0}
+  },
+  "limitations": [
+    "This is an initial live shadow gate, not the required 45-minute HTTP/network soak.",
+    "Restart recovery against this retained storage has not yet been executed.",
+    "The running binary was built from the current worktree before the evidence commit; exact post-commit binary relaunch remains pending."
+  ]
+}
