@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -45,6 +45,13 @@ use uuid::Uuid;
 const STREAM_CHANNEL_CAPACITY: usize = 256;
 const STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const STREAM_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const MAX_WORKER_RESULT_BYTES: u64 = 16 * 1024 * 1024;
+const SEC_DIVIDEND_TASK: &str = "transform.sec_dividend_filing";
+const SEC_DIVIDEND_REQUEST_SCHEMA: &str = "marketcow.worker.transform.sec-dividend-filing.v1";
+const SEC_DIVIDEND_RESULT_SCHEMA: &str = "marketcow.worker.transform.sec-dividend-filing-result.v1";
+const CSV_INFERENCE_TASK: &str = "transform.csv_inference";
+const CSV_INFERENCE_REQUEST_SCHEMA: &str = "marketcow.worker.transform.csv-inference.v1";
+const CSV_INFERENCE_RESULT_SCHEMA: &str = "marketcow.worker.transform.csv-inference-result.v1";
 
 #[derive(Parser)]
 #[command(name = "marketcow", version, about = "MarketCow Rust shadow platform")]
@@ -490,6 +497,12 @@ impl DurableJobCoordinator {
             return Err(marketcow_storage::RepositoryError::InvalidInput.into());
         }
         let mut engine = self.engine.lock().await;
+        let current = engine
+            .get(job_id)
+            .ok_or(marketcow_jobs::JobEngineError::NotFound)?;
+        if artifact.dataset != current.job_type || artifact.revision != current.request_schema {
+            return Err(marketcow_storage::RepositoryError::InvalidInput.into());
+        }
         let before = engine.clone();
         let updated = engine.succeed(job_id, lease_token, result, now)?.clone();
         let expected_revision = before
@@ -2144,6 +2157,182 @@ async fn shutdown() {
     warn!("shutdown_draining");
 }
 
+fn validate_worker_result_artifact(
+    job_type: &str,
+    request_schema: &str,
+    path: &Path,
+    size_bytes: u64,
+    media_type: &str,
+) -> Result<()> {
+    if media_type != "application/json" || size_bytes == 0 || size_bytes > MAX_WORKER_RESULT_BYTES {
+        bail!("worker result media type or size is invalid");
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() as u64 != size_bytes {
+        bail!("worker result size changed before contract validation");
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    match (job_type, request_schema) {
+        (SEC_DIVIDEND_TASK, SEC_DIVIDEND_REQUEST_SCHEMA) => validate_sec_dividend_result(&value),
+        (CSV_INFERENCE_TASK, CSV_INFERENCE_REQUEST_SCHEMA) => validate_csv_inference_result(&value),
+        _ => bail!("worker result contract is not registered in Rust"),
+    }
+}
+
+fn exact_object_keys(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> bool {
+    object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+}
+
+fn nonempty_bounded_string(value: &serde_json::Value, maximum_bytes: usize) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|text| !text.is_empty() && text.len() <= maximum_bytes)
+}
+
+fn valid_iso_date(value: &serde_json::Value, optional: bool) -> bool {
+    if optional && value.is_null() {
+        return true;
+    }
+    value
+        .as_str()
+        .is_some_and(|text| chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok())
+}
+
+fn validate_sec_dividend_result(value: &serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("SEC worker result must be an object")?;
+    if !exact_object_keys(object, &["schema_version", "rows"])
+        || object["schema_version"] != SEC_DIVIDEND_RESULT_SCHEMA
+    {
+        bail!("SEC worker result schema is invalid");
+    }
+    let rows = object["rows"]
+        .as_array()
+        .context("SEC worker rows must be an array")?;
+    if rows.len() > 10_000 {
+        bail!("SEC worker row count exceeds limit");
+    }
+    let keys = [
+        "symbol",
+        "fiscal_year",
+        "amount_per_share",
+        "currency",
+        "announcement_date",
+        "record_date",
+        "ex_date",
+        "payment_date",
+        "expected_payment_date",
+        "confirmation_status",
+        "source_type",
+        "source_name",
+        "source_url",
+        "source_document_id",
+    ];
+    for row in rows {
+        let row = row
+            .as_object()
+            .context("SEC worker row must be an object")?;
+        if !exact_object_keys(row, &keys) {
+            bail!("SEC worker row shape is invalid");
+        }
+        let amount_text = nonempty_bounded_string(&row["amount_per_share"], 128)
+            .context("SEC amount must be an exact decimal string")?;
+        if !amount_text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            bail!("SEC amount uses unsupported numeric notation");
+        }
+        let amount = amount_text
+            .parse::<rust_decimal::Decimal>()
+            .context("SEC amount is not a decimal")?;
+        if amount <= rust_decimal::Decimal::ZERO || amount.scale() > 18 {
+            bail!("SEC amount precision or sign is invalid");
+        }
+        if nonempty_bounded_string(&row["symbol"], 128).is_none()
+            || row["fiscal_year"]
+                .as_u64()
+                .is_none_or(|year| !(1900..=3000).contains(&year))
+            || row["currency"] != "USD"
+            || !valid_iso_date(&row["announcement_date"], false)
+            || !valid_iso_date(&row["record_date"], true)
+            || !valid_iso_date(&row["ex_date"], true)
+            || !valid_iso_date(&row["payment_date"], false)
+            || !valid_iso_date(&row["expected_payment_date"], false)
+            || row["confirmation_status"] != "confirmed"
+            || row["source_type"] != "regulatory_filing"
+            || row["source_name"] != "SEC EDGAR"
+            || nonempty_bounded_string(&row["source_url"], 4096).is_none()
+            || nonempty_bounded_string(&row["source_document_id"], 512).is_none()
+        {
+            bail!("SEC worker financial or provenance field is invalid");
+        }
+    }
+    Ok(())
+}
+
+fn validate_csv_inference_result(value: &serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("CSV worker result must be an object")?;
+    let keys = [
+        "schema_version",
+        "source",
+        "observed_at",
+        "content_sha256",
+        "delimiter",
+        "columns",
+        "rows",
+        "row_count",
+    ];
+    if !exact_object_keys(object, &keys)
+        || object["schema_version"] != CSV_INFERENCE_RESULT_SCHEMA
+        || nonempty_bounded_string(&object["source"], 2048).is_none()
+        || object["observed_at"]
+            .as_str()
+            .is_none_or(|text| chrono::DateTime::parse_from_rfc3339(text).is_err())
+        || object["content_sha256"]
+            .as_str()
+            .is_none_or(|hash| hash.len() != 64 || hex::decode(hash).is_err())
+        || object["delimiter"]
+            .as_str()
+            .is_none_or(|delimiter| !matches!(delimiter, "," | "\t" | ";" | "|"))
+    {
+        bail!("CSV worker schema or provenance is invalid");
+    }
+    let columns = object["columns"]
+        .as_array()
+        .context("CSV columns must be an array")?;
+    if columns.is_empty() || columns.len() > 256 {
+        bail!("CSV column count is invalid");
+    }
+    let mut unique = BTreeSet::new();
+    for column in columns {
+        let column = nonempty_bounded_string(column, 512).context("CSV header is invalid")?;
+        if !unique.insert(column) {
+            bail!("CSV headers must be unique");
+        }
+    }
+    let rows = object["rows"]
+        .as_array()
+        .context("CSV rows must be an array")?;
+    if rows.len() > 10_000 || object["row_count"].as_u64() != Some(rows.len() as u64) {
+        bail!("CSV row count is invalid");
+    }
+    for row in rows {
+        let row = row.as_array().context("CSV row must be an array")?;
+        if row.len() != columns.len()
+            || row
+                .iter()
+                .any(|field| field.as_str().is_none_or(|text| text.len() > 1_048_576))
+        {
+            bail!("CSV row width or field type is invalid");
+        }
+    }
+    Ok(())
+}
+
 async fn worker_server(
     path: PathBuf,
     staging_root: PathBuf,
@@ -2294,8 +2483,8 @@ async fn handle_worker(
                 let promotion_revision = authorized.request_schema.clone();
                 let promotion_source = format!("python-worker:{worker_id}");
                 let promotion_result = result.clone();
-                let artifact = tokio::task::spawn_blocking(move || {
-                    marketcow_storage::promote_worker_artifact(
+                let artifact = tokio::task::spawn_blocking(move || -> Result<_> {
+                    let artifact = marketcow_storage::promote_worker_artifact(
                         marketcow_storage::WorkerArtifactPromotion {
                             staging_root: &promotion_staging_root,
                             artifact_root: &promotion_artifact_root,
@@ -2306,7 +2495,15 @@ async fn handle_worker(
                             result: &promotion_result,
                             ingested_at: now,
                         },
-                    )
+                    )?;
+                    validate_worker_result_artifact(
+                        &promotion_dataset,
+                        &promotion_revision,
+                        Path::new(&artifact.storage_path),
+                        artifact.byte_size,
+                        &artifact.media_type,
+                    )?;
+                    Ok(artifact)
                 })
                 .await
                 .context("artifact promotion task failed")??;
@@ -2543,12 +2740,129 @@ mod tests {
             jobs.get(&submitted.job_id).await.unwrap().status,
             marketcow_jobs::JobStatus::Running
         );
+        let mut wrong_contract = artifact.clone();
+        wrong_contract.dataset = "provider.other".into();
+        assert!(
+            jobs.succeed_with_artifact(
+                &submitted.job_id,
+                &lease_token,
+                result.clone(),
+                wrong_contract,
+                now,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            jobs.get(&submitted.job_id).await.unwrap().status,
+            marketcow_jobs::JobStatus::Running
+        );
         let completed = jobs
             .succeed_with_artifact(&submitted.job_id, &lease_token, result, artifact, now)
             .await
             .unwrap();
         assert_eq!(completed.status, marketcow_jobs::JobStatus::Succeeded);
         assert_eq!(jobs.memory_artifacts.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn rust_validates_worker_result_schema_before_registration() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("result.json");
+        let csv_result = json!({
+            "schema_version":CSV_INFERENCE_RESULT_SCHEMA,
+            "source":"fixture://dividend.csv",
+            "observed_at":"2026-08-28T00:00:00+00:00",
+            "content_sha256":"a".repeat(64),
+            "delimiter":",",
+            "columns":["symbol","amount","currency"],
+            "rows":[["AAPL.XNAS","0.250000000000000001","USD"]],
+            "row_count":1
+        });
+        let bytes = serde_json::to_vec(&csv_result).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        validate_worker_result_artifact(
+            CSV_INFERENCE_TASK,
+            CSV_INFERENCE_REQUEST_SCHEMA,
+            &path,
+            bytes.len() as u64,
+            "application/json",
+        )
+        .unwrap();
+        assert!(
+            validate_worker_result_artifact(
+                "provider.unknown",
+                "marketcow.worker.unknown.v1",
+                &path,
+                bytes.len() as u64,
+                "application/json",
+            )
+            .is_err()
+        );
+
+        let mut mismatched = csv_result;
+        mismatched["row_count"] = json!(2);
+        let bytes = serde_json::to_vec(&mismatched).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            validate_worker_result_artifact(
+                CSV_INFERENCE_TASK,
+                CSV_INFERENCE_REQUEST_SCHEMA,
+                &path,
+                bytes.len() as u64,
+                "application/json",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rust_requires_exact_decimal_strings_and_sec_provenance() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("result.json");
+        let mut result = json!({
+            "schema_version":SEC_DIVIDEND_RESULT_SCHEMA,
+            "rows":[{
+                "symbol":"AAPL.XNAS",
+                "fiscal_year":2026,
+                "amount_per_share":"0.250000000000000001",
+                "currency":"USD",
+                "announcement_date":"2026-08-28",
+                "record_date":"2026-09-10",
+                "ex_date":null,
+                "payment_date":"2026-09-30",
+                "expected_payment_date":"2026-09-30",
+                "confirmation_status":"confirmed",
+                "source_type":"regulatory_filing",
+                "source_name":"SEC EDGAR",
+                "source_url":"https://www.sec.gov/Archives/fixture.htm",
+                "source_document_id":"0000000000-26-000001#0"
+            }]
+        });
+        let bytes = serde_json::to_vec(&result).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        validate_worker_result_artifact(
+            SEC_DIVIDEND_TASK,
+            SEC_DIVIDEND_REQUEST_SCHEMA,
+            &path,
+            bytes.len() as u64,
+            "application/json",
+        )
+        .unwrap();
+
+        result["rows"][0]["amount_per_share"] = json!(0.25_f64);
+        let bytes = serde_json::to_vec(&result).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(
+            validate_worker_result_artifact(
+                SEC_DIVIDEND_TASK,
+                SEC_DIVIDEND_REQUEST_SCHEMA,
+                &path,
+                bytes.len() as u64,
+                "application/json",
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2564,9 +2878,9 @@ mod tests {
             .submit(
                 marketcow_jobs::SubmitJob {
                     idempotency_key: "worker-flow-1".into(),
-                    job_type: "provider.history".into(),
-                    request_schema: "marketcow.provider.history.v1".into(),
-                    request: json!({"symbol":"AAPL.XNAS"}),
+                    job_type: CSV_INFERENCE_TASK.into(),
+                    request_schema: CSV_INFERENCE_REQUEST_SCHEMA.into(),
+                    request: json!({"content":"symbol,amount\nAAPL.XNAS,0.125\n","source":"fixture://input.csv","observed_at":"2026-08-28T00:00:00Z"}),
                     deadline: now + chrono::Duration::minutes(5),
                     max_attempts: 2,
                     audit_actor: "test".into(),
@@ -2614,7 +2928,7 @@ mod tests {
                     worker_id: "python-test".into(),
                     worker_revision: "test-revision".into(),
                     nonce: "nonce-1".into(),
-                    capabilities: vec!["provider.history".into()],
+                    capabilities: vec![CSV_INFERENCE_TASK.into()],
                 },
             ),
         )
@@ -2665,10 +2979,20 @@ mod tests {
             WorkerMessage::JobState { ref status, .. } if status == "running"
         ));
 
-        let result_bytes = br#"{"rows":1}"#;
+        let result_bytes = serde_json::to_vec(&json!({
+            "schema_version":CSV_INFERENCE_RESULT_SCHEMA,
+            "source":"fixture://input.csv",
+            "observed_at":"2026-08-28T00:00:00+00:00",
+            "content_sha256":"a".repeat(64),
+            "delimiter":",",
+            "columns":["symbol","amount"],
+            "rows":[["AAPL.XNAS","0.125"]],
+            "row_count":1
+        }))
+        .unwrap();
         let result_path = PathBuf::from(staging_path).join("result.json");
-        fs::write(&result_path, result_bytes).unwrap();
-        let result_sha256 = hex::encode(Sha256::digest(result_bytes));
+        fs::write(&result_path, &result_bytes).unwrap();
+        let result_sha256 = hex::encode(Sha256::digest(&result_bytes));
         write_frame(
             &mut stream,
             &WorkerFrame::new(

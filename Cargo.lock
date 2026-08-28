@@ -1261,6 +1261,7 @@ dependencies = [
  "marketcow-jobs",
  "marketcow-runtime",
  "marketcow-storage",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.10.9",
