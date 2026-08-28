@@ -376,6 +376,13 @@ struct ClickHouseAdjustmentFactorTextRow {
     ingestion_id: String,
 }
 
+#[derive(clickhouse::Row, Deserialize)]
+struct ClickHouseCanonicalIdentityRow {
+    row_count: u64,
+    max_ingested_millis: i64,
+    content_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalBarRecord {
     pub symbol: String,
@@ -428,6 +435,20 @@ pub struct CanonicalPageQuery {
     pub end: DateTime<Utc>,
     pub page_size: u32,
     pub after: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalDatasetIdentity {
+    pub symbol: String,
+    pub interval: String,
+    pub adjustment: String,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub row_count: u64,
+    pub max_ingested_millis: i64,
+    pub content_hash: String,
+    pub canonical_version: String,
+    pub snapshot_id: String,
 }
 
 /// Official typed ClickHouse client for the existing `market_quote_latest` contract. The payload
@@ -721,6 +742,91 @@ impl ClickHouseQuoteRepository {
             .map(CanonicalBarRecord::try_from)
             .collect::<Result<Vec<_>, _>>()?;
         Ok((records, has_more))
+    }
+
+    pub async fn canonical_identity(
+        &self,
+        request: &CanonicalPageQuery,
+    ) -> Result<CanonicalDatasetIdentity, RepositoryError> {
+        if request.symbol.is_empty()
+            || !matches!(
+                request.interval.as_str(),
+                "1m" | "5m" | "15m" | "30m" | "1h" | "1d"
+            )
+            || !matches!(request.adjustment.as_str(), "raw" | "qfq" | "hfq")
+            || request.start > request.end
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let row = self
+            .client
+            .query(
+                "SELECT count() AS row_count, \
+                 ifNull(max(ingested_at_ms), 0) AS max_ingested_millis, \
+                 lower(hex(SHA256(arrayStringConcat(groupArray(row_text), '\\n')))) \
+                   AS content_sha256 \
+                 FROM (SELECT toUnixTimestamp64Milli(ingested_at) AS ingested_at_ms, \
+                   toJSONString(tuple( \
+                     toUnixTimestamp64Milli(bar_time), toString(open), toString(high), \
+                     toString(low), toString(close), ifNull(toString(raw_close), ''), \
+                     ifNull(toString(adjustment_factor), ''), factor_applicability, \
+                     ifNull(toDecimalString(corporate_action_factor, 18), ''), \
+                     ifNull(toDecimalString(applied_adjustment_multiplier, 18), ''), \
+                     ifNull(toString(adjustment_reference_date), ''), \
+                     ifNull(toDecimalString(reference_factor, 18), ''), \
+                     ifNull(factor_source, ''), ifNull(factor_artifact_id, ''), \
+                     ifNull(toUnixTimestamp64Milli(factor_as_of), -1), toString(volume), \
+                     ifNull(toString(amount), ''), selected_source, source_count, \
+                     quality_status, version, toUnixTimestamp64Milli(observed_at), \
+                     toUnixTimestamp64Milli(ingested_at), ifNull(raw_artifact_id, '') \
+                   )) AS row_text \
+                   FROM market_bar_canonical FINAL WHERE symbol = ? AND interval = ? \
+                   AND adjustment = ? \
+                   AND bar_time >= parseDateTime64BestEffort(?, 3, 'UTC') \
+                   AND bar_time <= parseDateTime64BestEffort(?, 3, 'UTC') \
+                   ORDER BY bar_time)",
+            )
+            .bind(&request.symbol)
+            .bind(&request.interval)
+            .bind(&request.adjustment)
+            .bind(request.start)
+            .bind(request.end)
+            .fetch_one::<ClickHouseCanonicalIdentityRow>()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if row.content_sha256.len() != 64
+            || !row
+                .content_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(RepositoryError::Unavailable);
+        }
+        let content_hash = format!("sha256:{}", row.content_sha256);
+        let identity_payload = serde_json::to_vec(&serde_json::json!({
+            "symbol":request.symbol,
+            "interval":request.interval,
+            "adjustment":request.adjustment,
+            "start":request.start,
+            "end":request.end,
+            "row_count":row.row_count,
+            "max_ingested_millis":row.max_ingested_millis,
+            "content_hash":content_hash
+        }))
+        .map_err(|_| RepositoryError::Unavailable)?;
+        let snapshot_id = hex::encode(Sha256::digest(identity_payload));
+        Ok(CanonicalDatasetIdentity {
+            symbol: request.symbol.clone(),
+            interval: request.interval.clone(),
+            adjustment: request.adjustment.clone(),
+            start: request.start,
+            end: request.end,
+            row_count: row.row_count,
+            max_ingested_millis: row.max_ingested_millis,
+            content_hash,
+            canonical_version: row.max_ingested_millis.to_string(),
+            snapshot_id: snapshot_id[..32].into(),
+        })
     }
 
     pub async fn adjustment_factors(
@@ -3354,18 +3460,20 @@ mod tests {
         let end = DateTime::parse_from_rfc3339("2026-08-28T00:01:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let (bars, more) = repository
-            .canonical_page(&CanonicalPageQuery {
-                symbol: bar_symbol.clone(),
-                interval: "1m".into(),
-                adjustment: "raw".into(),
-                start,
-                end,
-                page_size: 10,
-                after: None,
-            })
-            .await
-            .unwrap();
+        let page_query = CanonicalPageQuery {
+            symbol: bar_symbol.clone(),
+            interval: "1m".into(),
+            adjustment: "raw".into(),
+            start,
+            end,
+            page_size: 10,
+            after: None,
+        };
+        let identity = repository.canonical_identity(&page_query).await.unwrap();
+        assert_eq!(identity.row_count, 1);
+        assert_eq!(identity.content_hash.len(), 71);
+        assert_eq!(identity.snapshot_id.len(), 32);
+        let (bars, more) = repository.canonical_page(&page_query).await.unwrap();
         assert!(!more);
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].open, "10.125");
