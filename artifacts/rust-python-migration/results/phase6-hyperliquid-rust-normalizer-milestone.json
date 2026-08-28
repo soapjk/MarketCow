@@ -1,0 +1,65 @@
+{
+  "schema_version": "marketcow.migration-milestone.v1",
+  "phase": 6,
+  "status": "partial",
+  "milestone": "hyperliquid_rust_provider_neutral_normalizer_and_replay",
+  "finished_at": "2026-08-28T09:18:17Z",
+  "authoritative_plan": {
+    "path": "/Volumes/T9/projects/marketcow-workitem-collaboration-7424ef29-33e7-418f-8df0-83afc6caf0/artifacts/objective-marketcow-rust-python-migration-technical-plan.md",
+    "sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4"
+  },
+  "source_commit": "23ed6e04029884065aec890dd570f49092009a04",
+  "inputs": [
+    {
+      "path": "tests/fixtures/hyperliquid-realtime-normalizer-v1.json",
+      "sha256": "ef4bee9fc776c2c8793a88a25f6ece43cb0708b1e752cc18f96ad8ad9da98ec4"
+    },
+    {
+      "path": "tests/test_hyperliquid_realtime.py",
+      "sha256": "63e895b95d7ca346f69eeba513d310600eedc0f2ab20df1a21a6a066386b3c81"
+    }
+  ],
+  "implementation": {
+    "path": "crates/marketcow-realtime/src/lib.rs",
+    "sha256": "bac4771c2d3cbd27fc1ff61f85491f79d64a9f87c4a5dd8bf4484df863fcb97e",
+    "contract_version": "marketcow.realtime.provider-neutral.v1",
+    "normalizer_version": "marketcow.hyperliquid.normalizer.v1"
+  },
+  "verification": [
+    {
+      "command": "cargo test --workspace --all-targets",
+      "exit_code": 0,
+      "result": "100 passed; 5 environment-gated real-store tests ignored"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0,
+      "result": "passed with warnings denied"
+    },
+    {
+      "command": "uv run --isolated --frozen --with pytest python -m pytest -q tests/test_hyperliquid_realtime.py tests/test_realtime.py tests/test_market_data_contracts.py tests/test_rust_python_worker.py",
+      "exit_code": 0,
+      "result": "43 passed; 17 subtests passed"
+    }
+  ],
+  "gate_verdicts": {
+    "shared_rust_python_golden_equal": true,
+    "financial_decimals_are_exact_strings": true,
+    "unknown_instrument_fails_closed": true,
+    "stale_or_future_source_time_fails_closed": true,
+    "crossed_or_invalid_book_fails_closed": true,
+    "persistence_failure_does_not_publish_or_consume_sequence": true,
+    "duplicate_does_not_consume_sequence": true,
+    "bounded_replay_reports_expired_gap": true,
+    "filtered_replay_preserves_contiguous_watermarks": true,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow": false,
+    "phase6_complete": false
+  },
+  "remaining": [
+    "wire the Hyperliquid adapter into Rust-owned transport, durable WAL/checkpoint, subscriptions and public gateway",
+    "run network differential, reconnect, gap, backpressure and recovery fault injection",
+    "migrate generic RealtimeHub, LongPort and EastMoney/Sina polling quote",
+    "disable the corresponding Python realtime owners only after staged single-writer handoff"
+  ]
+}
