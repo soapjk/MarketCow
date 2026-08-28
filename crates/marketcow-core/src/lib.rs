@@ -152,10 +152,12 @@ pub struct CanonicalEvent {
     pub cursor: u64,
     pub event_id: String,
     pub scope_id: String,
+    pub received_at: DateTime<Utc>,
     pub source_observed_at: DateTime<Utc>,
     pub normalizer_version: String,
     pub config_revision: String,
     pub source: SourceEvidence,
+    pub raw_payload: serde_json::Value,
     pub kind: EventKind,
 }
 
@@ -217,6 +219,40 @@ pub trait DurableLog {
 pub struct BoundedClientQueue<T> {
     sender: SyncSender<T>,
     capacity: usize,
+}
+
+/// Bounded ingress queue for the authoritative single writer. A rejected value is returned to
+/// the caller so an upstream reconnect/recovery path cannot accidentally drop it.
+pub struct BoundedApplyQueue<T> {
+    sender: SyncSender<T>,
+    capacity: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApplyQueueError<T> {
+    Full(T),
+    Disconnected(T),
+}
+
+impl<T> BoundedApplyQueue<T> {
+    pub fn new(capacity: usize) -> Result<(Self, Receiver<T>), CoreError> {
+        if capacity == 0 {
+            return Err(CoreError::InvalidQueueCapacity);
+        }
+        let (sender, receiver) = sync_channel(capacity);
+        Ok((Self { sender, capacity }, receiver))
+    }
+
+    pub fn enqueue(&self, value: T) -> Result<(), ApplyQueueError<T>> {
+        self.sender.try_send(value).map_err(|error| match error {
+            TrySendError::Full(value) => ApplyQueueError::Full(value),
+            TrySendError::Disconnected(value) => ApplyQueueError::Disconnected(value),
+        })
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 impl<T> BoundedClientQueue<T> {
@@ -296,6 +332,8 @@ impl<L: DurableLog> SingleWriter<L> {
                 .raw_sha256
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
+            || hex::encode(Sha256::digest(serde_json::to_vec(&event.raw_payload)?))
+                != event.source.raw_sha256.to_ascii_lowercase()
         {
             return Err(CoreError::InvalidSourceEvidence);
         }
@@ -415,14 +453,33 @@ impl SegmentedWal {
             return Err(CoreError::SegmentTooSmall);
         }
         fs::create_dir_all(root)?;
+        let mut paths = wal_paths(root)?;
+        let (segment_first_cursor, current_path, file, bytes) = match paths.pop() {
+            Some(path) => {
+                // Refuse to append to an unverified chain or a different stream.
+                Self::verify(root)?;
+                let header = read_wal_header(&path)?;
+                if header.get("stream_id").and_then(|value| value.as_str()) != Some(stream_id) {
+                    return Err(CoreError::WalStreamMismatch);
+                }
+                let first_cursor = header
+                    .get("first_cursor")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or(CoreError::CorruptWal)?;
+                let bytes = fs::metadata(&path)?.len();
+                let file = OpenOptions::new().append(true).open(&path)?;
+                (Some(first_cursor), Some(path), Some(file), bytes)
+            }
+            None => (None, None, None, 0),
+        };
         Ok(Self {
             root: root.into(),
             stream_id: stream_id.into(),
             max_segment_bytes,
-            segment_first_cursor: None,
-            current_path: None,
-            file: None,
-            bytes: 0,
+            segment_first_cursor,
+            current_path,
+            file,
+            bytes,
         })
     }
 
@@ -456,20 +513,23 @@ impl SegmentedWal {
     }
 
     pub fn verify(root: impl AsRef<Path>) -> Result<Vec<PersistedEvent>, CoreError> {
-        let mut paths: Vec<_> = fs::read_dir(root)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("wal"))
-            .collect();
-        paths.sort();
+        let paths = wal_paths(root.as_ref())?;
         let mut output = Vec::new();
         let mut previous_segment_sha256: Option<String> = None;
+        let mut stream_id: Option<String> = None;
         for path in paths {
             let mut lines = BufReader::new(File::open(&path)?).lines();
             let header: serde_json::Value =
                 serde_json::from_str(&lines.next().ok_or(CoreError::CorruptWal)??)?;
             if header.get("magic").and_then(|x| x.as_str()) != Some("MCWAL1") {
                 return Err(CoreError::CorruptWal);
+            }
+            let actual_stream_id = header
+                .get("stream_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(CoreError::CorruptWal)?;
+            if stream_id.get_or_insert_with(|| actual_stream_id.to_owned()) != actual_stream_id {
+                return Err(CoreError::WalStreamMismatch);
             }
             let actual_previous = header
                 .get("previous_segment_sha256")
@@ -497,6 +557,25 @@ impl SegmentedWal {
         }
         Ok(output)
     }
+}
+
+fn wal_paths(root: &Path) -> Result<Vec<PathBuf>, CoreError> {
+    let mut paths: Vec<_> = fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("wal"))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+fn read_wal_header(path: &Path) -> Result<serde_json::Value, CoreError> {
+    let line = BufReader::new(File::open(path)?)
+        .lines()
+        .next()
+        .ok_or(CoreError::CorruptWal)??;
+    let header = serde_json::from_str(&line)?;
+    Ok(header)
 }
 
 impl DurableLog for SegmentedWal {
@@ -557,14 +636,36 @@ pub fn read_checkpoint(path: &Path, expected_hash: &str) -> Result<Projection, C
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-pub trait InstrumentRepository: Send + Sync {}
-pub trait JobRepository: Send + Sync {}
-pub trait AuditRepository: Send + Sync {}
-pub trait ArtifactManifestRepository: Send + Sync {}
-pub trait FundamentalRepository: Send + Sync {}
-pub trait MarketBarRepository: Send + Sync {}
-pub trait QuoteRepository: Send + Sync {}
-pub trait MigrationCheckpointRepository: Send + Sync {}
+/// Rebuilds canonical state strictly after a durable checkpoint and verifies that current code
+/// derives the same apply/reject decision recorded in the append-only log.
+pub fn replay_after_checkpoint(
+    checkpoint: Projection,
+    records: &[PersistedEvent],
+) -> Result<Projection, CoreError> {
+    struct ReplayLog;
+    impl DurableLog for ReplayLog {
+        fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    let checkpoint_cursor = checkpoint.cursor;
+    let mut writer = SingleWriter::resume(checkpoint, ReplayLog)?;
+    for persisted in records
+        .iter()
+        .filter(|record| record.event.cursor > checkpoint_cursor)
+    {
+        let replayed = writer.apply(persisted.event.clone())?.persisted;
+        if replayed.applied != persisted.applied
+            || replayed.fail_closed_reason != persisted.fail_closed_reason
+        {
+            return Err(CoreError::ReplayDivergence {
+                cursor: persisted.event.cursor,
+            });
+        }
+    }
+    Ok((*writer.projection()).clone())
+}
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -594,10 +695,14 @@ pub enum CoreError {
     SegmentTooSmall,
     #[error("corrupt WAL")]
     CorruptWal,
+    #[error("WAL contains a different stream")]
+    WalStreamMismatch,
     #[error("checkpoint hash mismatch")]
     CheckpointHash,
     #[error("published and persisted watermark mismatch")]
     PersistedWatermarkMismatch,
+    #[error("replay decision diverged at cursor {cursor}")]
+    ReplayDivergence { cursor: u64 },
     #[error("queue capacity must be positive")]
     InvalidQueueCapacity,
     #[error("slow consumer must close with {close_code}")]
@@ -617,11 +722,13 @@ mod tests {
 
     fn event(cursor: u64, kind: EventKind) -> CanonicalEvent {
         let at = Utc::now();
+        let raw_payload = serde_json::json!({"fixture_cursor": cursor});
         CanonicalEvent {
             schema_version: CONTRACT_VERSION.into(),
             cursor,
             event_id: format!("e-{cursor}"),
             scope_id: "scope".into(),
+            received_at: at,
             source_observed_at: at,
             normalizer_version: "test-v1".into(),
             config_revision: "config-v1".into(),
@@ -631,7 +738,7 @@ mod tests {
                 requested_at: at,
                 responded_at: at,
                 observed_at: at,
-                raw_sha256: "a".repeat(64),
+                raw_sha256: hex::encode(Sha256::digest(serde_json::to_vec(&raw_payload).unwrap())),
                 update_frequency: "realtime".into(),
                 revision: "fixture-v1".into(),
                 missing: false,
@@ -639,6 +746,7 @@ mod tests {
                 duplicate: false,
                 revised: false,
             },
+            raw_payload,
             kind,
         }
     }
@@ -834,6 +942,23 @@ mod tests {
     }
 
     #[test]
+    fn ingress_backpressure_returns_the_unqueued_event_without_loss() {
+        let (queue, receiver) = BoundedApplyQueue::new(1).unwrap();
+        assert_eq!(queue.capacity(), 1);
+        queue.enqueue("first").unwrap();
+        assert_eq!(
+            queue.enqueue("must-recover"),
+            Err(ApplyQueueError::Full("must-recover"))
+        );
+        assert_eq!(receiver.recv().unwrap(), "first");
+        drop(receiver);
+        assert_eq!(
+            queue.enqueue("disconnected"),
+            Err(ApplyQueueError::Disconnected("disconnected"))
+        );
+    }
+
+    #[test]
     fn duplicate_event_is_auditable_and_does_not_advance() {
         struct MemoryLog;
         impl DurableLog for MemoryLog {
@@ -891,6 +1016,99 @@ mod tests {
             .write_all(b"{corrupt}\n")
             .unwrap();
         assert!(SegmentedWal::verify(dir.path()).is_err());
+    }
+
+    #[test]
+    fn wal_restart_preserves_segment_hash_chain() {
+        let dir = tempdir().unwrap();
+        let mut first = SegmentedWal::open(dir.path(), "restart", 1024).unwrap();
+        first
+            .append(&event(
+                1,
+                EventKind::SourceGap {
+                    token_id: "t".into(),
+                    reason: "disconnect".into(),
+                },
+            ))
+            .unwrap();
+        drop(first);
+
+        let mut resumed = SegmentedWal::open(dir.path(), "restart", 1024).unwrap();
+        resumed
+            .append(&event(
+                2,
+                EventKind::SourceGap {
+                    token_id: "t".into(),
+                    reason: "reconnect_pending".into(),
+                },
+            ))
+            .unwrap();
+        drop(resumed);
+        let records = SegmentedWal::verify(dir.path()).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].event.cursor, 2);
+    }
+
+    #[test]
+    fn checkpoint_replay_skips_boundary_and_detects_decision_divergence() {
+        struct MemoryLog(Vec<PersistedEvent>);
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!("append_outcome is used")
+            }
+
+            fn append_outcome(&mut self, outcome: &PersistedEvent) -> Result<(), CoreError> {
+                self.0.push(outcome.clone());
+                Ok(())
+            }
+        }
+
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        let first = writer
+            .apply(event(
+                1,
+                EventKind::FullBook {
+                    token_id: "t".into(),
+                    bids: levels("0.2", "1"),
+                    asks: levels("0.8", "1"),
+                    tick_version: 1,
+                },
+            ))
+            .unwrap();
+        let checkpoint = (*first.projection).clone();
+        let rejected = writer
+            .apply(event(
+                2,
+                EventKind::Delta {
+                    token_id: "t".into(),
+                    side: Side::Bid,
+                    levels: levels("0.9", "1"),
+                },
+            ))
+            .unwrap();
+        let recovered = writer
+            .apply(event(
+                3,
+                EventKind::FullBook {
+                    token_id: "t".into(),
+                    bids: levels("0.3", "2"),
+                    asks: levels("0.7", "2"),
+                    tick_version: 2,
+                },
+            ))
+            .unwrap();
+        let records = vec![first.persisted, rejected.persisted, recovered.persisted];
+
+        let replayed = replay_after_checkpoint(checkpoint.clone(), &records).unwrap();
+        assert_eq!(replayed.hash(), writer.projection().hash());
+        assert_eq!(replayed.cursor, 3);
+
+        let mut divergent = records;
+        divergent[1].applied = true;
+        assert!(matches!(
+            replay_after_checkpoint(checkpoint, &divergent),
+            Err(CoreError::ReplayDivergence { cursor: 2 })
+        ));
     }
 
     #[test]

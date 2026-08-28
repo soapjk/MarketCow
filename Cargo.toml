@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/marketcow-api",
   "crates/marketcow-contracts",
   "crates/marketcow-core",
   "crates/marketcow-storage",

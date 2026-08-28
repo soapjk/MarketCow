@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwap;
 use axum::{
     Json, Router,
-    extract::{Request, State},
+    extract::{Extension, Query, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -12,6 +13,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -127,6 +129,8 @@ struct AppState {
     config: Config,
     audit: Arc<AuditLog>,
     metrics: Arc<Metrics>,
+    projection: Arc<ArcSwap<marketcow_core::Projection>>,
+    recent_events: Arc<ArcSwap<Vec<marketcow_core::PersistedEvent>>>,
 }
 
 #[derive(Default)]
@@ -209,6 +213,10 @@ async fn serve() -> Result<()> {
         config: config.clone(),
         audit,
         metrics: Arc::new(Metrics::default()),
+        projection: Arc::new(ArcSwap::from_pointee(bootstrap_projection(
+            config.scope_id.clone(),
+        ))),
+        recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
     };
     let worker_path = config.worker_socket.clone();
     let worker = tokio::spawn(async move { worker_server(worker_path).await });
@@ -229,6 +237,18 @@ fn app(state: AppState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/readiness", get(readiness))
         .route("/v1/prediction-markets/polymarket/live/scope", get(scope))
+        .route(
+            "/v1/prediction-markets/polymarket/live/snapshot",
+            get(live_snapshot),
+        )
+        .route(
+            "/v1/prediction-markets/polymarket/live/events",
+            get(live_events),
+        )
+        .route(
+            "/v1/prediction-markets/polymarket/live/checkpoint",
+            get(live_checkpoint),
+        )
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
         .layer(middleware::from_fn_with_state(
@@ -246,12 +266,23 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn readiness(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({
-        "ready":true, "mode":"shadow", "scope_id":state.config.scope_id,
-        "writer_enabled":false, "real_order_submission_enabled":false,
-        "ownership_registry":"docs/architecture/migration/domain-ownership.yaml"
-    }))
+async fn readiness(State(state): State<AppState>) -> Response {
+    let projection = state.projection.load_full();
+    let status = if projection.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "ready":projection.ready, "mode":"shadow", "scope_id":state.config.scope_id,
+            "writer_enabled":false, "real_order_submission_enabled":false,
+            "fail_closed_reason":projection.fail_closed_reason,
+            "ownership_registry":"docs/architecture/migration/domain-ownership.yaml"
+        })),
+    )
+        .into_response()
 }
 
 async fn scope(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -261,6 +292,99 @@ async fn scope(State(state): State<AppState>) -> Json<serde_json::Value> {
         ))
         .expect("scope contract is serializable"),
     )
+}
+
+async fn live_snapshot(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+) -> Response {
+    let projection = state.projection.load_full();
+    if !projection.ready {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_projection_unready",
+            true,
+            &request_id,
+        );
+    }
+    Json(marketcow_api::snapshot(&projection)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct EventQuery {
+    #[serde(default)]
+    after_cursor: u64,
+    #[serde(default = "default_event_limit")]
+    limit: usize,
+}
+
+fn default_event_limit() -> usize {
+    1_000
+}
+
+async fn live_events(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    Query(query): Query<EventQuery>,
+) -> Response {
+    if !state.projection.load().ready {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_projection_unready",
+            true,
+            &request_id,
+        );
+    }
+    let records = state.recent_events.load_full();
+    match marketcow_api::events_page(&records, query.after_cursor, query.limit) {
+        Ok(response) => Json(response).into_response(),
+        Err(marketcow_api::ReadApiError::InvalidLimit) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_event_page_limit",
+            false,
+            &request_id,
+        ),
+        Err(marketcow_api::ReadApiError::CursorExpired { .. }) => {
+            error(StatusCode::GONE, "event_cursor_expired", true, &request_id)
+        }
+        Err(marketcow_api::ReadApiError::Serialization) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "event_serialization_failed",
+            true,
+            &request_id,
+        ),
+    }
+}
+
+async fn live_checkpoint(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+) -> Response {
+    let projection = state.projection.load_full();
+    if !projection.ready {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_projection_unready",
+            true,
+            &request_id,
+        );
+    }
+    Json(marketcow_api::checkpoint(&projection)).into_response()
+}
+
+fn bootstrap_projection(scope_id: String) -> marketcow_core::Projection {
+    marketcow_core::Projection {
+        generation: 0,
+        cursor: 0,
+        persisted_cursor: 0,
+        scope_id,
+        books: BTreeMap::new(),
+        unresolved_gaps: BTreeSet::new(),
+        recent_event_ids: VecDeque::new(),
+        ready: false,
+        fail_closed_reason: Some("bootstrap_required".into()),
+        published_at: Utc::now(),
+    }
 }
 
 async fn admin_migration() -> Json<serde_json::Value> {
@@ -449,6 +573,8 @@ mod tests {
                 config,
                 audit,
                 metrics: Arc::new(Metrics::default()),
+                projection: Arc::new(ArcSwap::from_pointee(bootstrap_projection("s".into()))),
+                recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
             },
         )
     }
@@ -484,6 +610,74 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn realtime_routes_fail_closed_until_projection_is_ready() {
+        let (_dir, state) = test_state();
+        for uri in [
+            "/v1/readiness",
+            "/v1/prediction-markets/polymarket/live/snapshot",
+            "/v1/prediction-markets/polymarket/live/events",
+            "/v1/prediction-markets/polymarket/live/checkpoint",
+        ] {
+            let response = app(state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_projection_serves_snapshot_checkpoint_and_bounded_events() {
+        let (_dir, state) = test_state();
+        let mut projection = bootstrap_projection("s".into());
+        projection.generation = 1;
+        projection.cursor = 1;
+        projection.persisted_cursor = 1;
+        projection.ready = true;
+        projection.fail_closed_reason = None;
+        projection.books.insert(
+            "yes".into(),
+            marketcow_core::Book {
+                bids: [(
+                    marketcow_core::Price::parse("0.4").unwrap(),
+                    "2".parse().unwrap(),
+                )]
+                .into(),
+                asks: [(
+                    marketcow_core::Price::parse("0.6").unwrap(),
+                    "3".parse().unwrap(),
+                )]
+                .into(),
+                tick_version: 1,
+                source_observed_at: Some(Utc::now()),
+            },
+        );
+        state.projection.store(Arc::new(projection));
+        for uri in [
+            "/v1/readiness",
+            "/v1/prediction-markets/polymarket/live/snapshot",
+            "/v1/prediction-markets/polymarket/live/events?after_cursor=1&limit=10",
+            "/v1/prediction-markets/polymarket/live/checkpoint",
+        ] {
+            let response = app(state.clone())
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+        let invalid = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/events?limit=1001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
     #[test]
     fn equality_does_not_accept_prefixes() {

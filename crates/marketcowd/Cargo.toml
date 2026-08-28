@@ -10,12 +10,14 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+arc-swap.workspace = true
 axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 http.workspace = true
 marketcow-core = { path = "../marketcow-core" }
 marketcow-contracts = { path = "../marketcow-contracts" }
+marketcow-api = { path = "../marketcow-api" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
