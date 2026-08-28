@@ -594,22 +594,17 @@ impl<L: DurableLog> SingleWriter<L> {
         }) {
             return Err(CoreError::InvalidSourceEvidence);
         }
-        struct CandidateLog;
-        impl DurableLog for CandidateLog {
-            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
-                Ok(())
-            }
-        }
-        let starting = (*self.current.load_full()).clone();
-        let mut candidate = SingleWriter::resume(starting, CandidateLog)?;
+        let mut next = (*self.current.load_full()).clone();
         let mut persisted = Vec::with_capacity(events.len());
         for event in events {
-            persisted.push(candidate.apply_inner(event, false)?.persisted);
+            let (updated, outcome) = Self::evaluate_event(next, event, false)?;
+            next = updated;
+            persisted.push(outcome);
         }
         let persistence_started = std::time::Instant::now();
         self.log.append_outcomes(&persisted)?;
         let persistence_latency_us = persistence_started.elapsed().as_micros() as u64;
-        let final_projection = candidate.projection();
+        let final_projection = Arc::new(next);
         let publication_started = std::time::Instant::now();
         self.current.store(final_projection.clone());
         let publication_latency_us = publication_started.elapsed().as_micros() as u64;
@@ -629,16 +624,15 @@ impl<L: DurableLog> SingleWriter<L> {
         self.apply_inner(event, true)
     }
 
-    fn apply_inner(
-        &mut self,
+    fn evaluate_event(
+        mut next: Projection,
         event: CanonicalEvent,
         validate_raw_payload: bool,
-    ) -> Result<ApplyOutcome, CoreError> {
-        let previous = self.current.load_full();
+    ) -> Result<(Projection, PersistedEvent), CoreError> {
         if event.schema_version != CONTRACT_VERSION {
             return Err(CoreError::SchemaMismatch);
         }
-        if event.scope_id != previous.scope_id {
+        if event.scope_id != next.scope_id {
             return Err(CoreError::ScopeMismatch);
         }
         if event.normalizer_version.is_empty()
@@ -656,16 +650,15 @@ impl<L: DurableLog> SingleWriter<L> {
         {
             return Err(CoreError::InvalidSourceEvidence);
         }
-        if previous.recent_event_ids.contains(&event.event_id) {
+        if next.recent_event_ids.contains(&event.event_id) {
             return Err(CoreError::DuplicateEvent(event.event_id));
         }
-        if event.cursor != previous.cursor + 1 {
+        if event.cursor != next.cursor + 1 {
             return Err(CoreError::CursorGap {
-                expected: previous.cursor + 1,
+                expected: next.cursor + 1,
                 actual: event.cursor,
             });
         }
-        let mut next = (*previous).clone();
         next.generation += 1;
         next.cursor = event.cursor;
         next.published_at = Utc::now();
@@ -1017,14 +1010,24 @@ impl<L: DurableLog> SingleWriter<L> {
             applied,
             fail_closed_reason: rejected,
         };
-        let persistence_started = std::time::Instant::now();
-        self.log.append_outcome(&persisted)?;
-        let persistence_latency_us = persistence_started.elapsed().as_micros() as u64;
         next.persisted_cursor = event.cursor;
         next.recent_event_ids.push_back(event.event_id);
         if next.recent_event_ids.len() > 10_000 {
             next.recent_event_ids.pop_front();
         }
+        Ok((next, persisted))
+    }
+
+    fn apply_inner(
+        &mut self,
+        event: CanonicalEvent,
+        validate_raw_payload: bool,
+    ) -> Result<ApplyOutcome, CoreError> {
+        let previous = (*self.current.load_full()).clone();
+        let (next, persisted) = Self::evaluate_event(previous, event, validate_raw_payload)?;
+        let persistence_started = std::time::Instant::now();
+        self.log.append_outcome(&persisted)?;
+        let persistence_latency_us = persistence_started.elapsed().as_micros() as u64;
         let published = Arc::new(next);
         let publication_started = std::time::Instant::now();
         self.current.store(published.clone());
