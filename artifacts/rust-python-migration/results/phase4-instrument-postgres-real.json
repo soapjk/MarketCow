@@ -1,0 +1,20 @@
+{
+  "schema_version": "marketcow.instrument-postgres-integration.v1",
+  "git_commit": "33fff78c9e33b125ddfe247047e418dc26ff6719",
+  "passed": true,
+  "postgres": {
+    "version": "postgres (PostgreSQL) 17.10 (Homebrew)",
+    "test": "postgres_instrument_repository_round_trip_when_test_dsn_is_configured",
+    "passed": true,
+    "ephemeral_root": "/tmp/marketcow-instrument-pg.Xoy9EX",
+    "assertions": [
+      "safe_forward_migration_idempotent",
+      "exact_decimal_round_trip",
+      "provider_mapping_resolves",
+      "stale_mapping_removed",
+      "cross_instrument_mapping_conflict_rejected"
+    ]
+  },
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}
