@@ -1,0 +1,125 @@
+{
+  "apply_latency_us": {
+    "max": 36676,
+    "p50": 21233,
+    "p95": 31486,
+    "p99": 36676
+  },
+  "binary_commit": "d097e68e5062f1c7e423b82e2f1c21395674ff2c",
+  "binary_sha256": "b308cf523cb0542b455bf2710b86c264ffe4a43bc47f77b27181d319033e75ca",
+  "bootstrap_persistence_latency_us": {
+    "max": 10944,
+    "p50": 4014,
+    "p95": 5609,
+    "p99": 6747
+  },
+  "bootstrap_publication_latency_us": {
+    "max": 43,
+    "p50": 2,
+    "p95": 3,
+    "p99": 17
+  },
+  "canonical_event_count": 5800,
+  "checkpoint_count": 0,
+  "consumer_cursors": [
+    5800,
+    5800
+  ],
+  "consumer_request_count": 226,
+  "elapsed_seconds": 33.94308,
+  "failures": [],
+  "final_book_count": 200,
+  "final_metrics": {
+    "marketcow_book_count": 200.0,
+    "marketcow_disconnects_total": 0.0,
+    "marketcow_http_errors_total": 0.0,
+    "marketcow_http_requests_total": 1019.0,
+    "marketcow_ingress_queue_depth": 0.0,
+    "marketcow_maximum_book_age_ms": 103.0,
+    "marketcow_persistence_latency_us": 20884.0,
+    "marketcow_projection_persisted_cursor": 5800.0,
+    "marketcow_projection_published_cursor": 5800.0,
+    "marketcow_publication_latency_us": 43.0,
+    "marketcow_python_worker_cpu_limit_seconds": 900.0,
+    "marketcow_python_worker_memory_limit_kills_total": 0.0,
+    "marketcow_python_worker_memory_limit_mib": 2048.0,
+    "marketcow_python_worker_memory_monitor_failures_total": 0.0,
+    "marketcow_python_worker_restart_budget_exhaustions_total": 0.0,
+    "marketcow_python_worker_restarts_total": 0.0,
+    "marketcow_python_workers_configured": 0.0,
+    "marketcow_python_workers_live": 0.0,
+    "marketcow_real_order_submission_enabled": 0.0,
+    "marketcow_shadow_mode": 1.0,
+    "marketcow_stream_channel_capacity": 256.0,
+    "marketcow_stream_channel_depth": 0.0,
+    "marketcow_stream_clients": 0.0,
+    "marketcow_stream_disconnects_total": 0.0,
+    "marketcow_stream_slow_consumer_disconnects_total": 0.0,
+    "marketcow_unresolved_gaps": 0.0
+  },
+  "finished_at": "2026-08-28T08:57:56.897919+00:00",
+  "gate_verdicts": {
+    "book_age_ms_lte_5000": true,
+    "cursor_lag_zero": true,
+    "disconnect_delta_zero": true,
+    "duration_reached": true,
+    "exact_100_market_200_book_load": true,
+    "four_concurrent_scoped_readers": true,
+    "gap_count_zero": true,
+    "projection_publication_latency_p99_us_lte_5000": true,
+    "queue_depth_zero": true,
+    "readiness_p99_ms_lte_50": true,
+    "real_orders_disabled": true,
+    "runner_failures_zero": true,
+    "tradude_does_not_manage_marketcow": true,
+    "two_independent_consumers": true,
+    "upstream_receive_to_publish_p99_us_lte_20000": false,
+    "wal_persistence_latency_p99_us_lte_20000": false
+  },
+  "headless_substitutes_http_network_soak": false,
+  "ingest_count": 228,
+  "load_model": {
+    "books": 200,
+    "concurrent_scoped_readers": 4,
+    "independent_consumers": 2,
+    "markets": 100
+  },
+  "max_rss_kb": 192288,
+  "observed_maximums": {
+    "book_age_ms": 1002.0,
+    "cursor_lag": 0.0,
+    "disconnects": 0.0,
+    "gap_count": 0.0,
+    "persistence_latency_us": 20884.0,
+    "publication_latency_us": 43.0,
+    "queue_depth": 0.0
+  },
+  "passed": false,
+  "persistence_latency_us": {
+    "max": 20884,
+    "p50": 10957,
+    "p95": 17075,
+    "p99": 20884
+  },
+  "process_log_tail": "",
+  "publication_latency_us": {
+    "max": 6,
+    "p50": 2,
+    "p95": 4,
+    "p99": 6
+  },
+  "reader_request_count": 452,
+  "readiness_latency_ms": {
+    "max": 51.10058397985995,
+    "p50": 3.0455419910140336,
+    "p95": 6.402541999705136,
+    "p99": 16.119875013828278
+  },
+  "real_order_submission_enabled": false,
+  "requested_duration_seconds": 30,
+  "samples": 452,
+  "schema_version": "marketcow.shadow-soak.v4",
+  "started_at": "2026-08-28T08:57:22.954685+00:00",
+  "storage_root": "/private/tmp/marketcow-http-shadow-smoke-v7.wIRq4u/storage",
+  "tradude_manages_marketcow": false
+}
