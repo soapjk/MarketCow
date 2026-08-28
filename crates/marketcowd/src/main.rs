@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
             let events = marketcow_core::SegmentedWal::verify(path)?;
             println!(
                 "{}",
-                json!({"status":"ok","records":events.len(),"last_cursor":events.last().map(|x|x.cursor)})
+                json!({"status":"ok","records":events.len(),"last_cursor":events.last().map(|x|x.event.cursor)})
             );
         }
         Command::Serve => serve().await?,

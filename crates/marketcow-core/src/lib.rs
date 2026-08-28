@@ -160,6 +160,19 @@ pub struct CanonicalEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedEvent {
+    pub event: CanonicalEvent,
+    pub applied: bool,
+    pub fail_closed_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApplyOutcome {
+    pub projection: Arc<Projection>,
+    pub persisted: PersistedEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Projection {
     pub generation: u64,
     pub cursor: u64,
@@ -194,6 +207,10 @@ impl Projection {
 
 pub trait DurableLog {
     fn append(&mut self, event: &CanonicalEvent) -> Result<(), CoreError>;
+
+    fn append_outcome(&mut self, outcome: &PersistedEvent) -> Result<(), CoreError> {
+        self.append(&outcome.event)
+    }
 }
 
 /// Per-client bounded queue. A full queue closes only that consumer; it never blocks apply.
@@ -262,7 +279,7 @@ impl<L: DurableLog> SingleWriter<L> {
     }
 
     /// Applies a candidate, validates it, durably appends, then atomically publishes it.
-    pub fn apply(&mut self, event: CanonicalEvent) -> Result<Arc<Projection>, CoreError> {
+    pub fn apply(&mut self, event: CanonicalEvent) -> Result<ApplyOutcome, CoreError> {
         let previous = self.current.load_full();
         if event.schema_version != CONTRACT_VERSION {
             return Err(CoreError::SchemaMismatch);
@@ -295,9 +312,13 @@ impl<L: DurableLog> SingleWriter<L> {
         next.generation += 1;
         next.cursor = event.cursor;
         next.published_at = Utc::now();
+        let mut applied = true;
+        let mut rejected = None;
         match &event.kind {
-            EventKind::SourceGap { token_id, .. } => {
+            EventKind::SourceGap { token_id, reason } => {
                 next.unresolved_gaps.insert(token_id.clone());
+                applied = false;
+                rejected = Some(format!("source_gap:{reason}"));
             }
             EventKind::FullBook {
                 token_id,
@@ -308,32 +329,46 @@ impl<L: DurableLog> SingleWriter<L> {
                 let mut book = next.books.get(token_id).cloned().unwrap_or_default();
                 book.replace(bids, asks, *tick_version, event.source_observed_at);
                 if book.crossed_or_locked() {
-                    return Err(CoreError::CrossedBook(token_id.clone()));
+                    next.unresolved_gaps.insert(token_id.clone());
+                    applied = false;
+                    rejected = Some("crossed_or_locked_full_book".into());
+                } else {
+                    next.books.insert(token_id.clone(), book);
+                    next.unresolved_gaps.remove(token_id);
                 }
-                next.books.insert(token_id.clone(), book);
-                next.unresolved_gaps.remove(token_id);
             }
             EventKind::Delta {
                 token_id,
                 side,
                 levels,
             } => {
-                if next.unresolved_gaps.contains(token_id) {
-                    return Err(CoreError::RecoveryRequired(token_id.clone()));
-                }
-                let book = next
-                    .books
-                    .get_mut(token_id)
-                    .ok_or_else(|| CoreError::RecoveryRequired(token_id.clone()))?;
-                book.apply(*side, levels, event.source_observed_at);
-                if book.crossed_or_locked() {
-                    return Err(CoreError::CrossedBook(token_id.clone()));
+                if next.unresolved_gaps.contains(token_id) || !next.books.contains_key(token_id) {
+                    next.unresolved_gaps.insert(token_id.clone());
+                    applied = false;
+                    rejected = Some("full_book_recovery_required".into());
+                } else {
+                    let mut book = next.books[token_id].clone();
+                    book.apply(*side, levels, event.source_observed_at);
+                    if book.crossed_or_locked() {
+                        next.unresolved_gaps.insert(token_id.clone());
+                        applied = false;
+                        rejected = Some("crossed_or_locked_delta".into());
+                    } else {
+                        next.books.insert(token_id.clone(), book);
+                    }
                 }
             }
         }
         next.ready = next.unresolved_gaps.is_empty() && !next.books.is_empty();
-        next.fail_closed_reason = (!next.ready).then(|| "unresolved_gap".into());
-        self.log.append(&event)?;
+        next.fail_closed_reason = rejected
+            .clone()
+            .or_else(|| (!next.ready).then(|| "unresolved_gap".into()));
+        let persisted = PersistedEvent {
+            event: event.clone(),
+            applied,
+            fail_closed_reason: rejected,
+        };
+        self.log.append_outcome(&persisted)?;
         next.persisted_cursor = event.cursor;
         next.recent_event_ids.push_back(event.event_id);
         if next.recent_event_ids.len() > 10_000 {
@@ -341,7 +376,10 @@ impl<L: DurableLog> SingleWriter<L> {
         }
         let published = Arc::new(next);
         self.current.store(published.clone());
-        Ok(published)
+        Ok(ApplyOutcome {
+            projection: published,
+            persisted,
+        })
     }
 }
 
@@ -350,7 +388,7 @@ struct WalRecord {
     cursor: u64,
     crc32c: u32,
     payload_sha256: String,
-    payload: CanonicalEvent,
+    payload: PersistedEvent,
 }
 
 pub struct SegmentedWal {
@@ -417,7 +455,7 @@ impl SegmentedWal {
         Ok(())
     }
 
-    pub fn verify(root: impl AsRef<Path>) -> Result<Vec<CanonicalEvent>, CoreError> {
+    pub fn verify(root: impl AsRef<Path>) -> Result<Vec<PersistedEvent>, CoreError> {
         let mut paths: Vec<_> = fs::read_dir(root)?
             .filter_map(Result::ok)
             .map(|e| e.path())
@@ -448,7 +486,7 @@ impl SegmentedWal {
                 {
                     return Err(CoreError::CorruptWal);
                 }
-                if output.last().map(|e: &CanonicalEvent| e.cursor + 1) != Some(record.cursor)
+                if output.last().map(|e: &PersistedEvent| e.event.cursor + 1) != Some(record.cursor)
                     && !output.is_empty()
                 {
                     return Err(CoreError::CorruptWal);
@@ -463,16 +501,24 @@ impl SegmentedWal {
 
 impl DurableLog for SegmentedWal {
     fn append(&mut self, event: &CanonicalEvent) -> Result<(), CoreError> {
-        let payload = serde_json::to_vec(event)?;
+        self.append_outcome(&PersistedEvent {
+            event: event.clone(),
+            applied: true,
+            fail_closed_reason: None,
+        })
+    }
+
+    fn append_outcome(&mut self, outcome: &PersistedEvent) -> Result<(), CoreError> {
+        let payload = serde_json::to_vec(outcome)?;
         let record = WalRecord {
-            cursor: event.cursor,
+            cursor: outcome.event.cursor,
             crc32c: crc32c::crc32c(&payload),
             payload_sha256: hex::encode(Sha256::digest(&payload)),
-            payload: event.clone(),
+            payload: outcome.clone(),
         };
         let line = serde_json::to_vec(&record)?;
         if self.file.is_none() || self.bytes + line.len() as u64 + 1 > self.max_segment_bytes {
-            self.rotate(event.cursor)?;
+            self.rotate(outcome.event.cursor)?;
         }
         let file = self.file.as_mut().expect("rotated");
         file.write_all(&line)?;
@@ -611,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn gap_and_crossed_delta_fail_closed_without_advancing() {
+    fn rejected_delta_is_persisted_and_full_book_recovers_next_cursor() {
         let dir = tempdir().unwrap();
         let wal = SegmentedWal::open(dir.path(), "test", 4096).unwrap();
         let mut state = SingleWriter::new("scope".into(), wal);
@@ -626,39 +672,20 @@ mod tests {
                 },
             ))
             .unwrap();
-        assert!(
-            state
-                .apply(event(
-                    2,
-                    EventKind::Delta {
-                        token_id: "t".into(),
-                        side: Side::Bid,
-                        levels: levels("0.7", "1")
-                    }
-                ))
-                .is_err()
-        );
-        assert_eq!(state.projection().cursor, 1);
-        state
+        let rejected = state
             .apply(event(
                 2,
-                EventKind::SourceGap {
+                EventKind::Delta {
                     token_id: "t".into(),
-                    reason: "sequence".into(),
+                    side: Side::Bid,
+                    levels: levels("0.7", "1"),
                 },
             ))
             .unwrap();
-        assert!(
-            state
-                .apply(event(
-                    3,
-                    EventKind::Delta {
-                        token_id: "t".into(),
-                        side: Side::Bid,
-                        levels: levels("0.3", "1")
-                    }
-                ))
-                .is_err()
+        assert!(!rejected.persisted.applied);
+        assert_eq!(
+            rejected.persisted.fail_closed_reason.as_deref(),
+            Some("crossed_or_locked_delta")
         );
         assert_eq!(state.projection().cursor, 2);
         state
@@ -673,6 +700,15 @@ mod tests {
             ))
             .unwrap();
         assert!(state.projection().ready);
+        drop(state);
+        let persisted = SegmentedWal::verify(dir.path()).unwrap();
+        assert_eq!(persisted.len(), 3);
+        assert!(!persisted[1].applied);
+        assert_eq!(
+            persisted[1].fail_closed_reason.as_deref(),
+            Some("crossed_or_locked_delta")
+        );
+        assert!(persisted[2].applied);
     }
 
     #[test]
@@ -701,7 +737,7 @@ mod tests {
         );
         let replay = SegmentedWal::verify(&wal_dir).unwrap();
         assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].cursor, 1);
+        assert_eq!(replay[0].event.cursor, 1);
     }
 
     #[test]
