@@ -1,7 +1,7 @@
 //! Narrow repository ports and an explicit workload router.
 //! Realtime projection is always memory-owned and cannot route to SQLite or a remote DB.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -210,6 +210,37 @@ CREATE TABLE IF NOT EXISTS marketcow_rust_clickhouse_migration (
 ORDER BY version
 "#;
 
+pub const CLICKHOUSE_CANONICAL_READ_MIGRATION_VERSION: &str = "rust-canonical-adjustment-read-v1";
+pub const CLICKHOUSE_CANONICAL_READ_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS market_bar_canonical (
+    symbol String, market LowCardinality(String), interval LowCardinality(String),
+    adjustment LowCardinality(String), bar_time DateTime64(3, 'UTC'),
+    open Float64, high Float64, low Float64, close Float64,
+    raw_close Nullable(Float64), adjustment_factor Nullable(Float64),
+    factor_applicability LowCardinality(String) DEFAULT '',
+    corporate_action_factor Nullable(Decimal128(18)),
+    applied_adjustment_multiplier Nullable(Decimal128(18)),
+    adjustment_reference_date Nullable(Date), reference_factor Nullable(Decimal128(18)),
+    factor_source Nullable(String), factor_artifact_id Nullable(String),
+    factor_as_of Nullable(DateTime64(3, 'UTC')),
+    volume Float64, amount Nullable(Float64),
+    selected_source LowCardinality(String), source_count UInt16,
+    quality_status LowCardinality(String), input_fingerprint String DEFAULT '', version UInt64,
+    observed_at DateTime64(3, 'UTC'), ingested_at DateTime64(3, 'UTC'),
+    raw_artifact_id Nullable(String), updated_at DateTime64(3, 'UTC')
+) ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(bar_time)
+ORDER BY (symbol, interval, adjustment, bar_time);
+CREATE TABLE IF NOT EXISTS market_adjustment_factor (
+    symbol String, trade_date Date, adjustment_factor Decimal128(18),
+    source LowCardinality(String), observed_at DateTime64(3, 'UTC'),
+    ingested_at DateTime64(3, 'UTC'), raw_artifact_id Nullable(String),
+    ingestion_id String, content_rank String, content_version UInt256
+) ENGINE = ReplacingMergeTree(content_version)
+PARTITION BY toYYYYMM(trade_date)
+ORDER BY (symbol, source, trade_date)
+"#;
+
 pub struct ClickHouseConfig {
     url: String,
     database: String,
@@ -302,6 +333,103 @@ struct ClickHouseMigrationRow {
     safe_forward: bool,
 }
 
+#[derive(clickhouse::Row, Deserialize)]
+struct ClickHouseCanonicalBarTextRow {
+    symbol: String,
+    interval: String,
+    adjustment: String,
+    bar_time_ms: i64,
+    open_text: String,
+    high_text: String,
+    low_text: String,
+    close_text: String,
+    raw_close_text: String,
+    adjustment_factor_text: String,
+    factor_applicability: String,
+    corporate_action_factor_text: String,
+    applied_adjustment_multiplier_text: String,
+    adjustment_reference_date_text: String,
+    reference_factor_text: String,
+    factor_source: Option<String>,
+    factor_artifact_id: Option<String>,
+    factor_as_of_ms: i64,
+    volume_text: String,
+    amount_text: String,
+    selected_source: String,
+    source_count: u16,
+    quality_status: String,
+    version: u64,
+    observed_at_ms: i64,
+    ingested_at_ms: i64,
+    raw_artifact_id: Option<String>,
+}
+
+#[derive(clickhouse::Row, Deserialize)]
+struct ClickHouseAdjustmentFactorTextRow {
+    symbol: String,
+    trade_date_text: String,
+    adjustment_factor_text: String,
+    source: String,
+    observed_at_ms: i64,
+    ingested_at_ms: i64,
+    raw_artifact_id: Option<String>,
+    ingestion_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalBarRecord {
+    pub symbol: String,
+    pub interval: String,
+    pub adjustment: String,
+    pub bar_time: DateTime<Utc>,
+    pub open: String,
+    pub high: String,
+    pub low: String,
+    pub close: String,
+    pub raw_close: Option<String>,
+    pub adjustment_factor: Option<String>,
+    pub factor_applicability: Option<String>,
+    pub corporate_action_factor: Option<String>,
+    pub applied_adjustment_multiplier: Option<String>,
+    pub adjustment_reference_date: Option<NaiveDate>,
+    pub reference_factor: Option<String>,
+    pub factor_source: Option<String>,
+    pub factor_artifact_id: Option<String>,
+    pub factor_as_of: Option<DateTime<Utc>>,
+    pub volume: String,
+    pub amount: Option<String>,
+    pub selected_source: String,
+    pub source_count: u16,
+    pub quality_status: String,
+    pub version: u64,
+    pub observed_at: DateTime<Utc>,
+    pub ingested_at: DateTime<Utc>,
+    pub raw_artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdjustmentFactorRecord {
+    pub symbol: String,
+    pub trade_date: NaiveDate,
+    pub adjustment_factor: String,
+    pub source: String,
+    pub observed_at: DateTime<Utc>,
+    pub ingested_at: DateTime<Utc>,
+    pub raw_artifact_id: Option<String>,
+    pub ingestion_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalPageQuery {
+    pub symbol: String,
+    pub interval: String,
+    pub adjustment: String,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub page_size: u32,
+    pub after: Option<DateTime<Utc>>,
+}
+
 /// Official typed ClickHouse client for the existing `market_quote_latest` contract. The payload
 /// keeps decimal values as JSON strings and the deterministic UInt256 version matches Python's
 /// `raw_content_version` bit layout.
@@ -338,19 +466,39 @@ impl ClickHouseQuoteRepository {
             return Err(RepositoryError::InvalidInput);
         }
         let _guard = self.operation_lock.lock().await;
-        let checksum = hex::encode(Sha256::digest(CLICKHOUSE_QUOTE_MIGRATION_SQL.as_bytes()));
         self.client
             .query(CLICKHOUSE_RUST_MIGRATION_SQL)
             .execute()
             .await
             .map_err(|_| RepositoryError::Unavailable)?;
+        self.apply_safe_forward_migration(
+            CLICKHOUSE_QUOTE_MIGRATION_VERSION,
+            CLICKHOUSE_QUOTE_MIGRATION_SQL,
+            binary_commit,
+        )
+        .await?;
+        self.apply_safe_forward_migration(
+            CLICKHOUSE_CANONICAL_READ_MIGRATION_VERSION,
+            CLICKHOUSE_CANONICAL_READ_MIGRATION_SQL,
+            binary_commit,
+        )
+        .await
+    }
+
+    async fn apply_safe_forward_migration(
+        &self,
+        version: &str,
+        ddl: &str,
+        binary_commit: &str,
+    ) -> Result<(), RepositoryError> {
+        let checksum = hex::encode(Sha256::digest(ddl.as_bytes()));
         let existing = self
             .client
             .query(
                 "SELECT argMax(checksum, applied_at) AS checksum \
                  FROM marketcow_rust_clickhouse_migration WHERE version = ?",
             )
-            .bind(CLICKHOUSE_QUOTE_MIGRATION_VERSION)
+            .bind(version)
             .fetch_one::<ClickHouseMigrationChecksum>()
             .await
             .map_err(|_| RepositoryError::Unavailable)?;
@@ -361,11 +509,16 @@ impl ClickHouseQuoteRepository {
                 Err(RepositoryError::MigrationChecksumMismatch)
             };
         }
-        self.client
-            .query(CLICKHOUSE_QUOTE_MIGRATION_SQL)
-            .execute()
-            .await
-            .map_err(|_| RepositoryError::Unavailable)?;
+        for statement in ddl
+            .split(";\n")
+            .filter(|statement| !statement.trim().is_empty())
+        {
+            self.client
+                .query(statement)
+                .execute()
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+        }
         let mut insert = self
             .client
             .insert::<ClickHouseMigrationRow>("marketcow_rust_clickhouse_migration")
@@ -373,7 +526,7 @@ impl ClickHouseQuoteRepository {
             .map_err(|_| RepositoryError::Unavailable)?;
         insert
             .write(&ClickHouseMigrationRow {
-                version: CLICKHOUSE_QUOTE_MIGRATION_VERSION.into(),
+                version: version.into(),
                 checksum,
                 applied_at: Utc::now(),
                 binary_commit: binary_commit.into(),
@@ -496,6 +649,255 @@ impl ClickHouseQuoteRepository {
                     .map_err(|_| RepositoryError::Unavailable)
             })
             .collect()
+    }
+
+    pub async fn canonical_page(
+        &self,
+        request: &CanonicalPageQuery,
+    ) -> Result<(Vec<CanonicalBarRecord>, bool), RepositoryError> {
+        if request.symbol.is_empty()
+            || !matches!(
+                request.interval.as_str(),
+                "1m" | "5m" | "15m" | "30m" | "1h" | "1d"
+            )
+            || !matches!(request.adjustment.as_str(), "raw" | "qfq" | "hfq")
+            || request.start > request.end
+            || !(1..=5_000).contains(&request.page_size)
+            || request
+                .after
+                .is_some_and(|value| value < request.start || value > request.end)
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let after_clause = if request.after.is_some() {
+            " AND bar_time > ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT symbol, interval, adjustment, \
+             toUnixTimestamp64Milli(bar_time) AS bar_time_ms, \
+             toString(open) AS open_text, toString(high) AS high_text, \
+             toString(low) AS low_text, toString(close) AS close_text, \
+             ifNull(toString(raw_close), '') AS raw_close_text, \
+             ifNull(toString(adjustment_factor), '') AS adjustment_factor_text, \
+             factor_applicability, \
+             ifNull(toString(corporate_action_factor), '') AS corporate_action_factor_text, \
+             ifNull(toString(applied_adjustment_multiplier), '') AS applied_adjustment_multiplier_text, \
+             ifNull(toString(adjustment_reference_date), '') AS adjustment_reference_date_text, \
+             ifNull(toString(reference_factor), '') AS reference_factor_text, \
+             factor_source, factor_artifact_id, \
+             ifNull(toUnixTimestamp64Milli(factor_as_of), -1) AS factor_as_of_ms, \
+             toString(volume) AS volume_text, ifNull(toString(amount), '') AS amount_text, \
+             selected_source, source_count, quality_status, version, \
+             toUnixTimestamp64Milli(observed_at) AS observed_at_ms, \
+             toUnixTimestamp64Milli(ingested_at) AS ingested_at_ms, raw_artifact_id \
+             FROM market_bar_canonical FINAL WHERE symbol = ? AND interval = ? \
+             AND adjustment = ? AND bar_time >= ? AND bar_time <= ?{after_clause} \
+             ORDER BY bar_time ASC LIMIT ?"
+        );
+        let mut query = self
+            .client
+            .query(&sql)
+            .bind(&request.symbol)
+            .bind(&request.interval)
+            .bind(&request.adjustment)
+            .bind(request.start)
+            .bind(request.end);
+        if let Some(after) = request.after {
+            query = query.bind(after);
+        }
+        let rows = query
+            .bind(request.page_size.saturating_add(1))
+            .fetch_all::<ClickHouseCanonicalBarTextRow>()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let has_more = rows.len() > request.page_size as usize;
+        let records = rows
+            .into_iter()
+            .take(request.page_size as usize)
+            .map(CanonicalBarRecord::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((records, has_more))
+    }
+
+    pub async fn adjustment_factors(
+        &self,
+        symbol: &str,
+        start: NaiveDate,
+        end: NaiveDate,
+        source: Option<&str>,
+    ) -> Result<Vec<AdjustmentFactorRecord>, RepositoryError> {
+        if symbol.is_empty()
+            || start > end
+            || source.is_some_and(|value| value.is_empty() || value.len() > 128)
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let source_clause = if source.is_some() {
+            " AND source = ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT symbol, toString(trade_date) AS trade_date_text, \
+             toString(adjustment_factor) AS adjustment_factor_text, source, \
+             toUnixTimestamp64Milli(observed_at) AS observed_at_ms, \
+             toUnixTimestamp64Milli(ingested_at) AS ingested_at_ms, \
+             raw_artifact_id, ingestion_id FROM market_adjustment_factor FINAL \
+             WHERE symbol = ? AND trade_date >= ? AND trade_date <= ?{source_clause} \
+             ORDER BY trade_date, source"
+        );
+        let mut query = self.client.query(&sql).bind(symbol).bind(start).bind(end);
+        if let Some(source) = source {
+            query = query.bind(source);
+        }
+        query
+            .fetch_all::<ClickHouseAdjustmentFactorTextRow>()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?
+            .into_iter()
+            .map(AdjustmentFactorRecord::try_from)
+            .collect()
+    }
+}
+
+fn timestamp_from_millis(value: i64) -> Result<DateTime<Utc>, RepositoryError> {
+    DateTime::from_timestamp_millis(value).ok_or(RepositoryError::Unavailable)
+}
+
+fn optional_text(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn normalized_legacy_decimal(value: String) -> Result<String, RepositoryError> {
+    let parsed = value
+        .parse::<Decimal>()
+        .or_else(|_| Decimal::from_scientific(&value))
+        .map_err(|_| RepositoryError::Unavailable)?;
+    Ok(parsed.normalize().to_string())
+}
+
+impl TryFrom<ClickHouseCanonicalBarTextRow> for CanonicalBarRecord {
+    type Error = RepositoryError;
+
+    fn try_from(row: ClickHouseCanonicalBarTextRow) -> Result<Self, Self::Error> {
+        let record = Self {
+            symbol: row.symbol,
+            interval: row.interval,
+            adjustment: row.adjustment,
+            bar_time: timestamp_from_millis(row.bar_time_ms)?,
+            open: normalized_legacy_decimal(row.open_text)?,
+            high: normalized_legacy_decimal(row.high_text)?,
+            low: normalized_legacy_decimal(row.low_text)?,
+            close: normalized_legacy_decimal(row.close_text)?,
+            raw_close: optional_text(row.raw_close_text)
+                .map(normalized_legacy_decimal)
+                .transpose()?,
+            adjustment_factor: optional_text(row.adjustment_factor_text)
+                .map(normalized_legacy_decimal)
+                .transpose()?,
+            factor_applicability: optional_text(row.factor_applicability),
+            corporate_action_factor: optional_text(row.corporate_action_factor_text),
+            applied_adjustment_multiplier: optional_text(row.applied_adjustment_multiplier_text),
+            adjustment_reference_date: optional_text(row.adjustment_reference_date_text)
+                .map(|value| {
+                    NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+                        .map_err(|_| RepositoryError::Unavailable)
+                })
+                .transpose()?,
+            reference_factor: optional_text(row.reference_factor_text),
+            factor_source: row.factor_source,
+            factor_artifact_id: row.factor_artifact_id,
+            factor_as_of: (row.factor_as_of_ms >= 0)
+                .then(|| timestamp_from_millis(row.factor_as_of_ms))
+                .transpose()?,
+            volume: normalized_legacy_decimal(row.volume_text)?,
+            amount: optional_text(row.amount_text)
+                .map(normalized_legacy_decimal)
+                .transpose()?,
+            selected_source: row.selected_source,
+            source_count: row.source_count,
+            quality_status: row.quality_status,
+            version: row.version,
+            observed_at: timestamp_from_millis(row.observed_at_ms)?,
+            ingested_at: timestamp_from_millis(row.ingested_at_ms)?,
+            raw_artifact_id: row.raw_artifact_id,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+impl CanonicalBarRecord {
+    fn validate(&self) -> Result<(), RepositoryError> {
+        let open = self
+            .open
+            .parse::<Decimal>()
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let high = self
+            .high
+            .parse::<Decimal>()
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let low = self
+            .low
+            .parse::<Decimal>()
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let close = self
+            .close
+            .parse::<Decimal>()
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let volume = self
+            .volume
+            .parse::<Decimal>()
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if self.symbol.is_empty()
+            || !matches!(
+                self.interval.as_str(),
+                "1m" | "5m" | "15m" | "30m" | "1h" | "1d"
+            )
+            || !matches!(self.adjustment.as_str(), "raw" | "qfq" | "hfq")
+            || self.selected_source.is_empty()
+            || self.quality_status.is_empty()
+            || self.source_count == 0
+            || self.version == 0
+            || self.observed_at > self.ingested_at
+            || open <= Decimal::ZERO
+            || high < open.max(close)
+            || low > open.min(close)
+            || low <= Decimal::ZERO
+            || low > high
+            || volume < Decimal::ZERO
+        {
+            return Err(RepositoryError::Unavailable);
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<ClickHouseAdjustmentFactorTextRow> for AdjustmentFactorRecord {
+    type Error = RepositoryError;
+
+    fn try_from(row: ClickHouseAdjustmentFactorTextRow) -> Result<Self, Self::Error> {
+        let trade_date = NaiveDate::parse_from_str(&row.trade_date_text, "%Y-%m-%d")
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let factor = row
+            .adjustment_factor_text
+            .parse::<Decimal>()
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if factor <= Decimal::ZERO || row.symbol.is_empty() || row.source.is_empty() {
+            return Err(RepositoryError::Unavailable);
+        }
+        Ok(Self {
+            symbol: row.symbol,
+            trade_date,
+            adjustment_factor: row.adjustment_factor_text,
+            source: row.source,
+            observed_at: timestamp_from_millis(row.observed_at_ms)?,
+            ingested_at: timestamp_from_millis(row.ingested_at_ms)?,
+            raw_artifact_id: row.raw_artifact_id,
+            ingestion_id: row.ingestion_id,
+        })
     }
 }
 
@@ -2828,6 +3230,53 @@ mod tests {
         assert!(CLICKHOUSE_RUST_MIGRATION_SQL.contains("binary_commit String"));
     }
 
+    #[test]
+    fn canonical_bar_text_mapping_is_decimal_and_financially_validated() {
+        let fixture = ClickHouseCanonicalBarTextRow {
+            symbol: "AAPL".into(),
+            interval: "1m".into(),
+            adjustment: "raw".into(),
+            bar_time_ms: 1_777_334_400_000,
+            open_text: "1.2500000000000000".into(),
+            high_text: "1.5000000000000000".into(),
+            low_text: "1.2000000000000000".into(),
+            close_text: "1.4000000000000000".into(),
+            raw_close_text: "".into(),
+            adjustment_factor_text: "".into(),
+            factor_applicability: "not_applicable".into(),
+            corporate_action_factor_text: "".into(),
+            applied_adjustment_multiplier_text: "1.000000000000000000".into(),
+            adjustment_reference_date_text: "".into(),
+            reference_factor_text: "".into(),
+            factor_source: None,
+            factor_artifact_id: None,
+            factor_as_of_ms: -1,
+            volume_text: "100.12500000000000".into(),
+            amount_text: "".into(),
+            selected_source: "fixture".into(),
+            source_count: 1,
+            quality_status: "single_source".into(),
+            version: 1,
+            observed_at_ms: 1_777_334_400_001,
+            ingested_at_ms: 1_777_334_400_002,
+            raw_artifact_id: Some("artifact".into()),
+        };
+        let record = CanonicalBarRecord::try_from(fixture).unwrap();
+        assert_eq!(record.open, "1.25");
+        assert_eq!(record.volume, "100.125");
+        assert_eq!(
+            record.applied_adjustment_multiplier.as_deref(),
+            Some("1.000000000000000000")
+        );
+
+        let mut invalid = record;
+        invalid.high = "1.3".into();
+        assert!(matches!(
+            invalid.validate(),
+            Err(RepositoryError::Unavailable)
+        ));
+    }
+
     #[tokio::test]
     #[ignore = "requires MARKETCOW_TEST_CLICKHOUSE_URL and MARKETCOW_TEST_CLICKHOUSE_DATABASE"]
     async fn clickhouse_quote_round_trip_when_test_endpoint_is_configured() {
@@ -2871,6 +3320,85 @@ mod tests {
             "0.100000000000000001"
         );
         assert_eq!(payloads[&quote.instrument_id]["currency"], quote.currency);
+
+        let bar_symbol = format!("BAR.TEST.{}", uuid::Uuid::new_v4());
+        repository
+            .client
+            .query(
+                "INSERT INTO market_bar_canonical \
+                 (symbol,market,interval,adjustment,bar_time,open,high,low,close, \
+                  raw_close,adjustment_factor,factor_applicability,corporate_action_factor, \
+                  applied_adjustment_multiplier,adjustment_reference_date,reference_factor, \
+                  factor_source,factor_artifact_id,factor_as_of,volume,amount,selected_source, \
+                  source_count,quality_status,input_fingerprint,version,observed_at,ingested_at, \
+                  raw_artifact_id,updated_at) \
+                 SELECT ?, 'US', '1m', 'raw', toDateTime64('2026-08-28 00:00:00',3,'UTC'), \
+                  10.125, 10.5, 10.0, 10.25, NULL, NULL, 'applicable', \
+                  toDecimal128('12.345678901234567890',18), toDecimal128('1',18), NULL, NULL, \
+                  'fixture', 'factor-artifact', toDateTime64('2026-08-28 00:00:01',3,'UTC'), \
+                  100.125, NULL, 'fixture', 1, 'single_source', 'fingerprint', 1, \
+                  toDateTime64('2026-08-28 00:00:01',3,'UTC'), \
+                  toDateTime64('2026-08-28 00:00:02',3,'UTC'), 'raw-artifact', \
+                  toDateTime64('2026-08-28 00:00:02',3,'UTC')",
+            )
+            .bind(&bar_symbol)
+            .execute()
+            .await
+            .unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-08-28T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2026-08-28T00:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (bars, more) = repository
+            .canonical_page(&CanonicalPageQuery {
+                symbol: bar_symbol.clone(),
+                interval: "1m".into(),
+                adjustment: "raw".into(),
+                start,
+                end,
+                page_size: 10,
+                after: None,
+            })
+            .await
+            .unwrap();
+        assert!(!more);
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].open, "10.125");
+        assert_eq!(bars[0].volume, "100.125");
+        assert_eq!(
+            bars[0].corporate_action_factor.as_deref(),
+            Some("12.345678901234567890")
+        );
+        assert_eq!(
+            bars[0].factor_artifact_id.as_deref(),
+            Some("factor-artifact")
+        );
+
+        repository
+            .client
+            .query(
+                "INSERT INTO market_adjustment_factor \
+                 (symbol,trade_date,adjustment_factor,source,observed_at,ingested_at, \
+                  raw_artifact_id,ingestion_id,content_rank,content_version) \
+                 SELECT ?, toDate('2026-08-28'), toDecimal128('12.345678901234567890',18), \
+                  'fixture', toDateTime64('2026-08-28 00:00:01',3,'UTC'), \
+                  toDateTime64('2026-08-28 00:00:02',3,'UTC'), 'factor-artifact', \
+                  'factor-ingestion', 'rank', toUInt256(1)",
+            )
+            .bind(&bar_symbol)
+            .execute()
+            .await
+            .unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        let factors = repository
+            .adjustment_factors(&bar_symbol, day, day, Some("fixture"))
+            .await
+            .unwrap();
+        assert_eq!(factors.len(), 1);
+        assert_eq!(factors[0].adjustment_factor, "12.345678901234567890");
+        assert_eq!(factors[0].ingestion_id, "factor-ingestion");
     }
 
     #[tokio::test]
