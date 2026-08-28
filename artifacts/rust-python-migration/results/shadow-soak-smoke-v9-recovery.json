@@ -1,0 +1,35 @@
+{
+  "binary_sha256": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "checks": {
+    "checkpoint_manifest_loaded": false,
+    "full_sync_available": false,
+    "full_sync_cursor_matches_manifest": false,
+    "published_cursor_equals_persisted_cursor": false,
+    "real_orders_disabled": false,
+    "recovered_daemon_ready": false,
+    "tradude_does_not_manage_marketcow": true,
+    "unresolved_gap_count_zero": false,
+    "wal_cursor_matches_manifest": false,
+    "wal_verified": false
+  },
+  "failure": "FileNotFoundError: [Errno 2] No such file or directory: '/private/tmp/marketcow-http-shadow-smoke-v9.gaF2Wm/storage/polymarket/checkpoint-manifest.json'",
+  "full_sync": {
+    "book_count": null,
+    "boundary_cursor": null,
+    "persisted_cursor": null,
+    "published_cursor": null,
+    "unresolved_gap_count": null
+  },
+  "manifest_cursor": null,
+  "passed": false,
+  "process_exit_code": null,
+  "process_stderr_tail": "",
+  "readiness": {},
+  "real_order_submission_enabled": false,
+  "recovery_used_isolated_copy": true,
+  "schema_version": "marketcow.soak-recovery-check.v2",
+  "scope_id": null,
+  "source_storage_root": "/private/tmp/marketcow-http-shadow-smoke-v9.gaF2Wm/storage",
+  "tradude_manages_marketcow": false,
+  "wal": {}
+}

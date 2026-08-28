@@ -300,6 +300,18 @@ def main() -> None:
                             failures.append({"kind": "process_exit", "code": process.returncode})
                             break
                         time.sleep(args.interval_seconds)
+                status, final_checkpoint = request_json(
+                    f"{base}/v1/admin/polymarket/checkpoint", payload={}, admin=True,
+                )
+                if (
+                    status != 200
+                    or final_checkpoint.get("real_order_submission_enabled") is not False
+                ):
+                    failures.append({
+                        "kind": "final_checkpoint", "status": status, "body": final_checkpoint,
+                    })
+                else:
+                    checkpoint_count += 1
                 status, final_sync = request_json(
                     f"{base}/v1/prediction-markets/polymarket/live/full-sync"
                 )

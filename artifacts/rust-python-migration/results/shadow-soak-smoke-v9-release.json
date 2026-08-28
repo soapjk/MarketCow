@@ -1,0 +1,128 @@
+{
+  "apply_latency_us": {
+    "max": 9862,
+    "p50": 7643,
+    "p95": 8922,
+    "p99": 9862
+  },
+  "binary_commit": "cac1451c7eb0bd0046ff69ccde7440626279e9b5",
+  "binary_sha256": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "bootstrap_persistence_latency_us": {
+    "max": 11399,
+    "p50": 3754,
+    "p95": 5617,
+    "p99": 10137
+  },
+  "bootstrap_publication_latency_us": {
+    "max": 268,
+    "p50": 1,
+    "p95": 2,
+    "p99": 3
+  },
+  "canonical_event_count": 5050,
+  "checkpoint_count": 0,
+  "consumer_cursors": [
+    5050,
+    5050
+  ],
+  "consumer_request_count": 224,
+  "elapsed_seconds": 33.302137,
+  "failures": [],
+  "final_book_count": 200,
+  "final_metrics": {
+    "marketcow_book_count": 200.0,
+    "marketcow_disconnects_total": 0.0,
+    "marketcow_http_errors_total": 0.0,
+    "marketcow_http_requests_total": 1078.0,
+    "marketcow_ingress_queue_depth": 0.0,
+    "marketcow_maximum_book_age_ms": 1082.0,
+    "marketcow_persistence_latency_us": 11399.0,
+    "marketcow_projection_persisted_cursor": 5050.0,
+    "marketcow_projection_published_cursor": 5050.0,
+    "marketcow_publication_latency_us": 268.0,
+    "marketcow_python_worker_cpu_limit_seconds": 900.0,
+    "marketcow_python_worker_memory_limit_kills_total": 0.0,
+    "marketcow_python_worker_memory_limit_mib": 2048.0,
+    "marketcow_python_worker_memory_monitor_failures_total": 0.0,
+    "marketcow_python_worker_restart_budget_exhaustions_total": 0.0,
+    "marketcow_python_worker_restarts_total": 0.0,
+    "marketcow_python_workers_configured": 0.0,
+    "marketcow_python_workers_live": 0.0,
+    "marketcow_real_order_submission_enabled": 0.0,
+    "marketcow_shadow_mode": 1.0,
+    "marketcow_stream_channel_capacity": 256.0,
+    "marketcow_stream_channel_depth": 0.0,
+    "marketcow_stream_clients": 0.0,
+    "marketcow_stream_disconnects_total": 0.0,
+    "marketcow_stream_slow_consumer_disconnects_total": 0.0,
+    "marketcow_unresolved_gaps": 0.0
+  },
+  "finished_at": "2026-08-28T09:02:06.976334+00:00",
+  "gate_verdicts": {
+    "book_age_ms_lte_5000": true,
+    "cursor_lag_zero": true,
+    "disconnect_delta_zero": true,
+    "duration_reached": true,
+    "exact_100_market_200_book_load": true,
+    "four_concurrent_scoped_readers": true,
+    "gap_count_zero": true,
+    "projection_publication_latency_p99_us_lte_5000": true,
+    "queue_depth_zero": true,
+    "readiness_p99_ms_lte_50": true,
+    "real_orders_disabled": true,
+    "runner_failures_zero": true,
+    "tradude_does_not_manage_marketcow": true,
+    "two_independent_consumers": true,
+    "upstream_receive_to_publish_p99_us_lte_20000": true,
+    "wal_persistence_latency_p99_us_lte_20000": true
+  },
+  "headless_substitutes_http_network_soak": false,
+  "ingest_count": 294,
+  "load_model": {
+    "books": 200,
+    "concurrent_scoped_readers": 4,
+    "frames_per_second": 4,
+    "independent_consumers": 2,
+    "markets": 100,
+    "token_updates_per_second": 200,
+    "updates_per_frame": 50
+  },
+  "max_rss_kb": 139072,
+  "observed_maximums": {
+    "book_age_ms": 1529.0,
+    "cursor_lag": 0.0,
+    "disconnects": 0.0,
+    "gap_count": 0.0,
+    "persistence_latency_us": 11399.0,
+    "publication_latency_us": 268.0,
+    "queue_depth": 0.0
+  },
+  "passed": true,
+  "persistence_latency_us": {
+    "max": 7008,
+    "p50": 5085,
+    "p95": 6228,
+    "p99": 7008
+  },
+  "process_log_tail": "",
+  "publication_latency_us": {
+    "max": 2,
+    "p50": 2,
+    "p95": 2,
+    "p99": 2
+  },
+  "reader_request_count": 448,
+  "readiness_latency_ms": {
+    "max": 14.111416996456683,
+    "p50": 2.810416975989938,
+    "p95": 4.8629160155542195,
+    "p99": 10.83270797971636
+  },
+  "real_order_submission_enabled": false,
+  "requested_duration_seconds": 30,
+  "samples": 448,
+  "schema_version": "marketcow.shadow-soak.v4",
+  "started_at": "2026-08-28T09:01:33.673996+00:00",
+  "storage_root": "/private/tmp/marketcow-http-shadow-smoke-v9.gaF2Wm/storage",
+  "tradude_manages_marketcow": false
+}
