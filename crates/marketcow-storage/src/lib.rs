@@ -670,7 +670,7 @@ impl ClickHouseQuoteRepository {
             return Err(RepositoryError::InvalidInput);
         }
         let after_clause = if request.after.is_some() {
-            " AND bar_time > ?"
+            " AND bar_time > parseDateTime64BestEffort(?, 3, 'UTC')"
         } else {
             ""
         };
@@ -682,10 +682,10 @@ impl ClickHouseQuoteRepository {
              ifNull(toString(raw_close), '') AS raw_close_text, \
              ifNull(toString(adjustment_factor), '') AS adjustment_factor_text, \
              factor_applicability, \
-             ifNull(toString(corporate_action_factor), '') AS corporate_action_factor_text, \
-             ifNull(toString(applied_adjustment_multiplier), '') AS applied_adjustment_multiplier_text, \
+             ifNull(toDecimalString(corporate_action_factor, 18), '') AS corporate_action_factor_text, \
+             ifNull(toDecimalString(applied_adjustment_multiplier, 18), '') AS applied_adjustment_multiplier_text, \
              ifNull(toString(adjustment_reference_date), '') AS adjustment_reference_date_text, \
-             ifNull(toString(reference_factor), '') AS reference_factor_text, \
+             ifNull(toDecimalString(reference_factor, 18), '') AS reference_factor_text, \
              factor_source, factor_artifact_id, \
              ifNull(toUnixTimestamp64Milli(factor_as_of), -1) AS factor_as_of_ms, \
              toString(volume) AS volume_text, ifNull(toString(amount), '') AS amount_text, \
@@ -693,7 +693,9 @@ impl ClickHouseQuoteRepository {
              toUnixTimestamp64Milli(observed_at) AS observed_at_ms, \
              toUnixTimestamp64Milli(ingested_at) AS ingested_at_ms, raw_artifact_id \
              FROM market_bar_canonical FINAL WHERE symbol = ? AND interval = ? \
-             AND adjustment = ? AND bar_time >= ? AND bar_time <= ?{after_clause} \
+             AND adjustment = ? \
+             AND bar_time >= parseDateTime64BestEffort(?, 3, 'UTC') \
+             AND bar_time <= parseDateTime64BestEffort(?, 3, 'UTC'){after_clause} \
              ORDER BY bar_time ASC LIMIT ?"
         );
         let mut query = self
@@ -741,11 +743,12 @@ impl ClickHouseQuoteRepository {
         };
         let sql = format!(
             "SELECT symbol, toString(trade_date) AS trade_date_text, \
-             toString(adjustment_factor) AS adjustment_factor_text, source, \
+             toDecimalString(adjustment_factor, 18) AS adjustment_factor_text, source, \
              toUnixTimestamp64Milli(observed_at) AS observed_at_ms, \
              toUnixTimestamp64Milli(ingested_at) AS ingested_at_ms, \
              raw_artifact_id, ingestion_id FROM market_adjustment_factor FINAL \
-             WHERE symbol = ? AND trade_date >= ? AND trade_date <= ?{source_clause} \
+             WHERE symbol = ? AND trade_date >= toDate(?) AND trade_date <= toDate(?) \
+             {source_clause} \
              ORDER BY trade_date, source"
         );
         let mut query = self.client.query(&sql).bind(symbol).bind(start).bind(end);
