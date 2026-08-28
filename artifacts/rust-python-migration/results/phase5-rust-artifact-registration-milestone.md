@@ -44,10 +44,12 @@ PYTHONPATH=src python3 -m ruff check tests/test_rust_migration_architecture.py
 # passed
 ```
 
-The external PostgreSQL transaction test remains ignored unless `MARKETCOW_TEST_POSTGRES_DSN` is
-provided. It now exercises the safe-forward migration followed by the atomic
-`compare_and_swap_with_artifact` transition. The ClickHouse external-instance test remains similarly
-environment-gated.
+Both external-instance tests were subsequently run through
+`scripts/migration/verify_storage_integrations.sh` at commit
+`cb8b5b16c69143fb3fed8503d00ab35a9f0c87b2`. PostgreSQL 17.10 verified the safe-forward migration
+and atomic `compare_and_swap_with_artifact` transition. ClickHouse 25.8 verified its migration,
+insert idempotency and typed latest read. Machine-readable result:
+`phase4-storage-real-instances.json`.
 
 ## HTTP soak result handled in the same continuation
 
@@ -63,7 +65,6 @@ It is not replaced by, or conflated with, the independently scheduled headless s
 
 ## Remaining gates
 
-- Run the PostgreSQL real-instance transaction test and inspect the committed manifest/job rows.
 - Implement actual Python Provider handlers and worker supervision; remove Python production DB
   credentials and public API dependency.
 - Continue the remaining Phase 0–7 gates. No acceptance criterion is reported passed by this file.
