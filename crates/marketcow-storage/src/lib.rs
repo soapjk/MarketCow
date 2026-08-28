@@ -65,6 +65,48 @@ CREATE INDEX IF NOT EXISTS raw_artifact_dataset_ingested_idx
     ON raw_artifact_manifest (dataset, ingested_at DESC);
 "#;
 
+pub const INSTRUMENT_MASTER_MIGRATION_VERSION: &str = "rust-instrument-master-v1";
+pub const INSTRUMENT_MASTER_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS instrument_master (
+    instrument_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    instrument_type TEXT NOT NULL CHECK (instrument_type IN (
+        'equity', 'convertible_bond', 'crypto_spot', 'crypto_perpetual',
+        'equity_perpetual', 'index_perpetual', 'hip3_perpetual'
+    )),
+    asset_class TEXT NOT NULL CHECK (asset_class IN (
+        'equity', 'fixed_income', 'crypto', 'equity_derivative',
+        'index_derivative', 'other_derivative'
+    )),
+    symbol TEXT NOT NULL,
+    market TEXT NOT NULL CHECK (market IN ('US', 'HK', 'CN', 'CRYPTO')),
+    mic TEXT NOT NULL CHECK (mic ~ '^[A-Z0-9]{4}$'),
+    currency TEXT NOT NULL CHECK (currency ~ '^[A-Z0-9]{2,12}$'),
+    price_precision INTEGER NOT NULL CHECK (price_precision BETWEEN 0 AND 18),
+    size_precision INTEGER NOT NULL CHECK (size_precision BETWEEN 0 AND 18),
+    tick_size NUMERIC NOT NULL CHECK (tick_size > 0),
+    size_increment NUMERIC NOT NULL CHECK (size_increment > 0),
+    lot_size NUMERIC NOT NULL CHECK (lot_size > 0),
+    ts_event TIMESTAMPTZ NOT NULL,
+    ts_init TIMESTAMPTZ NOT NULL,
+    provider_symbols JSONB NOT NULL,
+    broker_symbols JSONB NOT NULL,
+    content_hash TEXT NOT NULL CHECK (content_hash ~ '^sha256:[0-9a-f]{64}$'),
+    updated_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (symbol, mic)
+);
+CREATE TABLE IF NOT EXISTS instrument_symbol_mapping (
+    namespace TEXT NOT NULL,
+    external_symbol TEXT NOT NULL,
+    instrument_id TEXT NOT NULL REFERENCES instrument_master(instrument_id)
+        ON DELETE CASCADE,
+    PRIMARY KEY (namespace, external_symbol)
+);
+CREATE INDEX IF NOT EXISTS instrument_symbol_mapping_instrument_idx
+    ON instrument_symbol_mapping (instrument_id);
+"#;
+const INSTRUMENT_MASTER_MIGRATION_LOCK: i64 = 0x4d_43_49_4e_53;
+
 pub const CLICKHOUSE_QUOTE_MIGRATION_VERSION: &str = "rust-quote-latest-v1";
 pub const CLICKHOUSE_QUOTE_MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS market_quote_latest (
@@ -803,6 +845,406 @@ pub enum RepositoryError {
     MigrationChecksumMismatch,
     #[error("artifact verification failed")]
     ArtifactVerificationFailed,
+    #[error("instrument identity or symbol mapping conflict")]
+    InstrumentConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstrumentRecord {
+    pub schema_version: u8,
+    pub instrument_id: String,
+    pub instrument_type: String,
+    pub asset_class: String,
+    pub symbol: String,
+    pub market: String,
+    pub mic: String,
+    pub currency: String,
+    pub price_precision: u8,
+    pub size_precision: u8,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub tick_size: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub size_increment: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub lot_size: Decimal,
+    pub ts_event: DateTime<Utc>,
+    pub ts_init: DateTime<Utc>,
+    pub provider_symbols: std::collections::BTreeMap<String, String>,
+    pub broker_symbols: std::collections::BTreeMap<String, String>,
+    pub content_hash: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub struct PostgresInstrumentRepository {
+    client: tokio::sync::Mutex<tokio_postgres::Client>,
+}
+
+impl PostgresInstrumentRepository {
+    pub async fn connect(dsn: &str) -> Result<Self, RepositoryError> {
+        if dsn.trim().is_empty() {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::error!(error = %error, "postgres_instrument_repository_connection_failed");
+            }
+        });
+        Ok(Self {
+            client: tokio::sync::Mutex::new(client),
+        })
+    }
+
+    pub async fn migrate_safe_forward(&self, binary_commit: &str) -> Result<(), RepositoryError> {
+        if binary_commit.is_empty() || binary_commit.len() > 128 {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let checksum = hex::encode(Sha256::digest(INSTRUMENT_MASTER_MIGRATION_SQL.as_bytes()));
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&INSTRUMENT_MASTER_MIGRATION_LOCK],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        transaction
+            .batch_execute(RUST_MIGRATION_TABLE_SQL)
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let existing = transaction
+            .query_opt(
+                "SELECT checksum FROM marketcow_rust_migration WHERE version = $1",
+                &[&INSTRUMENT_MASTER_MIGRATION_VERSION],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if let Some(row) = existing {
+            let recorded: String = row.get(0);
+            if recorded != checksum {
+                return Err(RepositoryError::MigrationChecksumMismatch);
+            }
+        } else {
+            transaction
+                .batch_execute(INSTRUMENT_MASTER_MIGRATION_SQL)
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+            transaction
+                .execute(
+                    "INSERT INTO marketcow_rust_migration \
+                     (version, checksum, applied_at, binary_commit, safe_forward) \
+                     VALUES ($1, $2, NOW(), $3, TRUE)",
+                    &[
+                        &INSTRUMENT_MASTER_MIGRATION_VERSION,
+                        &checksum,
+                        &binary_commit,
+                    ],
+                )
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)
+    }
+
+    pub async fn upsert(&self, instrument: &InstrumentRecord) -> Result<(), RepositoryError> {
+        validate_instrument(instrument)?;
+        let provider_symbols = serde_json::to_value(&instrument.provider_symbols)
+            .map_err(|_| RepositoryError::InvalidInput)?;
+        let broker_symbols = serde_json::to_value(&instrument.broker_symbols)
+            .map_err(|_| RepositoryError::InvalidInput)?;
+        let mappings = instrument
+            .provider_symbols
+            .iter()
+            .map(|(provider, symbol)| (format!("provider:{provider}"), symbol))
+            .chain(
+                instrument
+                    .broker_symbols
+                    .iter()
+                    .map(|(broker, symbol)| (format!("broker:{broker}"), symbol)),
+            )
+            .collect::<Vec<_>>();
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        for (namespace, external_symbol) in &mappings {
+            let conflict = transaction
+                .query_opt(
+                    "SELECT instrument_id FROM instrument_symbol_mapping \
+                     WHERE namespace = $1 AND external_symbol = $2",
+                    &[namespace, external_symbol],
+                )
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+            if conflict.is_some_and(|row| row.get::<_, String>(0) != instrument.instrument_id) {
+                return Err(RepositoryError::InstrumentConflict);
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO instrument_master \
+                 (instrument_id,schema_version,instrument_type,asset_class,symbol,market,mic,\
+                  currency,price_precision,size_precision,tick_size,size_increment,lot_size,\
+                  ts_event,ts_init,provider_symbols,broker_symbols,content_hash,updated_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::TEXT::NUMERIC,\
+                         $12::TEXT::NUMERIC,$13::TEXT::NUMERIC,$14,$15,$16,$17,$18,$19) \
+                 ON CONFLICT (instrument_id) DO UPDATE SET \
+                  schema_version=EXCLUDED.schema_version,instrument_type=EXCLUDED.instrument_type,\
+                  asset_class=EXCLUDED.asset_class,symbol=EXCLUDED.symbol,market=EXCLUDED.market,\
+                  mic=EXCLUDED.mic,currency=EXCLUDED.currency,\
+                  price_precision=EXCLUDED.price_precision,size_precision=EXCLUDED.size_precision,\
+                  tick_size=EXCLUDED.tick_size,size_increment=EXCLUDED.size_increment,\
+                  lot_size=EXCLUDED.lot_size,ts_event=EXCLUDED.ts_event,ts_init=EXCLUDED.ts_init,\
+                  provider_symbols=EXCLUDED.provider_symbols,broker_symbols=EXCLUDED.broker_symbols,\
+                  content_hash=EXCLUDED.content_hash,updated_at=EXCLUDED.updated_at",
+                &[
+                    &instrument.instrument_id,
+                    &i32::from(instrument.schema_version),
+                    &instrument.instrument_type,
+                    &instrument.asset_class,
+                    &instrument.symbol,
+                    &instrument.market,
+                    &instrument.mic,
+                    &instrument.currency,
+                    &i32::from(instrument.price_precision),
+                    &i32::from(instrument.size_precision),
+                    &instrument.tick_size.to_string(),
+                    &instrument.size_increment.to_string(),
+                    &instrument.lot_size.to_string(),
+                    &instrument.ts_event,
+                    &instrument.ts_init,
+                    &provider_symbols,
+                    &broker_symbols,
+                    &instrument.content_hash,
+                    &instrument.updated_at,
+                ],
+            )
+            .await
+            .map_err(map_instrument_write_error)?;
+        transaction
+            .execute(
+                "DELETE FROM instrument_symbol_mapping WHERE instrument_id = $1",
+                &[&instrument.instrument_id],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        for (namespace, external_symbol) in mappings {
+            transaction
+                .execute(
+                    "INSERT INTO instrument_symbol_mapping \
+                     (namespace,external_symbol,instrument_id) VALUES ($1,$2,$3)",
+                    &[&namespace, external_symbol, &instrument.instrument_id],
+                )
+                .await
+                .map_err(map_instrument_write_error)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(map_instrument_write_error)?;
+        Ok(())
+    }
+
+    pub async fn get(
+        &self,
+        instrument_id: &str,
+    ) -> Result<Option<InstrumentRecord>, RepositoryError> {
+        if !valid_instrument_id(instrument_id) {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let query = instrument_select("WHERE instrument_id = $1");
+        let client = self.client.lock().await;
+        client
+            .query_opt(&query, &[&instrument_id])
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?
+            .map(decode_instrument)
+            .transpose()
+    }
+
+    pub async fn resolve(
+        &self,
+        namespace: &str,
+        external_symbol: &str,
+    ) -> Result<Option<InstrumentRecord>, RepositoryError> {
+        if !valid_namespace(namespace) || external_symbol.is_empty() || external_symbol.len() > 128
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let query = instrument_select(
+            "JOIN instrument_symbol_mapping m USING (instrument_id) \
+             WHERE m.namespace = $1 AND m.external_symbol = $2",
+        );
+        let client = self.client.lock().await;
+        client
+            .query_opt(&query, &[&namespace, &external_symbol])
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?
+            .map(decode_instrument)
+            .transpose()
+    }
+}
+
+fn instrument_select(suffix: &str) -> String {
+    format!(
+        "SELECT instrument_id,schema_version,instrument_type,asset_class,symbol,market,mic,\
+         currency,price_precision,size_precision,tick_size::TEXT,size_increment::TEXT,\
+         lot_size::TEXT,ts_event,ts_init,provider_symbols,broker_symbols,content_hash,updated_at \
+         FROM instrument_master {suffix}"
+    )
+}
+
+fn decode_instrument(row: tokio_postgres::Row) -> Result<InstrumentRecord, RepositoryError> {
+    let provider_symbols =
+        serde_json::from_value(row.get(15)).map_err(|_| RepositoryError::Unavailable)?;
+    let broker_symbols =
+        serde_json::from_value(row.get(16)).map_err(|_| RepositoryError::Unavailable)?;
+    let instrument = InstrumentRecord {
+        instrument_id: row.get(0),
+        schema_version: u8::try_from(row.get::<_, i32>(1))
+            .map_err(|_| RepositoryError::Unavailable)?,
+        instrument_type: row.get(2),
+        asset_class: row.get(3),
+        symbol: row.get(4),
+        market: row.get(5),
+        mic: row.get(6),
+        currency: row.get(7),
+        price_precision: u8::try_from(row.get::<_, i32>(8))
+            .map_err(|_| RepositoryError::Unavailable)?,
+        size_precision: u8::try_from(row.get::<_, i32>(9))
+            .map_err(|_| RepositoryError::Unavailable)?,
+        tick_size: row
+            .get::<_, String>(10)
+            .parse()
+            .map_err(|_| RepositoryError::Unavailable)?,
+        size_increment: row
+            .get::<_, String>(11)
+            .parse()
+            .map_err(|_| RepositoryError::Unavailable)?,
+        lot_size: row
+            .get::<_, String>(12)
+            .parse()
+            .map_err(|_| RepositoryError::Unavailable)?,
+        ts_event: row.get(13),
+        ts_init: row.get(14),
+        provider_symbols,
+        broker_symbols,
+        content_hash: row.get(17),
+        updated_at: row.get(18),
+    };
+    validate_instrument(&instrument).map_err(|_| RepositoryError::Unavailable)?;
+    Ok(instrument)
+}
+
+fn map_instrument_write_error(error: tokio_postgres::Error) -> RepositoryError {
+    if error.as_db_error().is_some_and(|database| {
+        database.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+    }) {
+        RepositoryError::InstrumentConflict
+    } else {
+        RepositoryError::Unavailable
+    }
+}
+
+fn validate_instrument(instrument: &InstrumentRecord) -> Result<(), RepositoryError> {
+    const TYPES: &[&str] = &[
+        "equity",
+        "convertible_bond",
+        "crypto_spot",
+        "crypto_perpetual",
+        "equity_perpetual",
+        "index_perpetual",
+        "hip3_perpetual",
+    ];
+    const ASSET_CLASSES: &[&str] = &[
+        "equity",
+        "fixed_income",
+        "crypto",
+        "equity_derivative",
+        "index_derivative",
+        "other_derivative",
+    ];
+    if instrument.schema_version != 1
+        || !valid_instrument_id(&instrument.instrument_id)
+        || instrument.instrument_id != format!("{}.{}", instrument.symbol, instrument.mic)
+        || !TYPES.contains(&instrument.instrument_type.as_str())
+        || !ASSET_CLASSES.contains(&instrument.asset_class.as_str())
+        || !matches!(instrument.market.as_str(), "US" | "HK" | "CN" | "CRYPTO")
+        || instrument.mic.len() != 4
+        || !instrument
+            .mic
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        || !(2..=12).contains(&instrument.currency.len())
+        || !instrument
+            .currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        || instrument.price_precision > 18
+        || instrument.size_precision > 18
+        || instrument.tick_size <= Decimal::ZERO
+        || instrument.size_increment <= Decimal::ZERO
+        || instrument.lot_size <= Decimal::ZERO
+        || instrument.ts_event > instrument.ts_init
+        || instrument.provider_symbols.is_empty()
+        || !valid_symbol_map(&instrument.provider_symbols)
+        || !valid_symbol_map(&instrument.broker_symbols)
+        || instrument.content_hash.len() != 71
+        || !instrument.content_hash.starts_with("sha256:")
+        || !instrument.content_hash[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(RepositoryError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn valid_instrument_id(value: &str) -> bool {
+    let Some((symbol, mic)) = value.rsplit_once('.') else {
+        return false;
+    };
+    !symbol.is_empty()
+        && symbol.len() <= 32
+        && symbol.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_uppercase()
+                || byte.is_ascii_digit()
+                || index > 0 && matches!(byte, b'.' | b'-')
+        })
+        && mic.len() == 4
+        && mic
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn valid_namespace(value: &str) -> bool {
+    let Some((kind, name)) = value.split_once(':') else {
+        return false;
+    };
+    matches!(kind, "provider" | "broker")
+        && !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn valid_symbol_map(symbols: &std::collections::BTreeMap<String, String>) -> bool {
+    symbols.iter().all(|(namespace, symbol)| {
+        valid_namespace(&format!("provider:{namespace}"))
+            && !symbol.is_empty()
+            && symbol.len() <= 128
+    })
 }
 
 pub struct PostgresJobRepository {
@@ -1263,6 +1705,39 @@ mod tests {
     use super::*;
     use chrono::Duration;
 
+    fn instrument_fixture(symbol: &str, provider_symbol: &str) -> InstrumentRecord {
+        InstrumentRecord {
+            schema_version: 1,
+            instrument_id: format!("{symbol}.XNAS"),
+            instrument_type: "equity".into(),
+            asset_class: "equity".into(),
+            symbol: symbol.into(),
+            market: "US".into(),
+            mic: "XNAS".into(),
+            currency: "USD".into(),
+            price_precision: 8,
+            size_precision: 0,
+            tick_size: "0.00000001".parse().unwrap(),
+            size_increment: "1".parse().unwrap(),
+            lot_size: "1".parse().unwrap(),
+            ts_event: DateTime::parse_from_rfc3339("2026-08-28T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ts_init: DateTime::parse_from_rfc3339("2026-08-28T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            provider_symbols: std::collections::BTreeMap::from([(
+                "longport".into(),
+                provider_symbol.into(),
+            )]),
+            broker_symbols: std::collections::BTreeMap::new(),
+            content_hash: format!("sha256:{}", "a".repeat(64)),
+            updated_at: DateTime::parse_from_rfc3339("2026-08-28T00:00:02Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
+
     #[test]
     fn every_workload_has_one_owner_and_hot_path_is_memory_only() {
         assert_eq!(
@@ -1322,6 +1797,39 @@ mod tests {
         );
         assert!(ARTIFACT_MANIFEST_MIGRATION_SQL.contains("raw_artifact_manifest"));
         assert!(ARTIFACT_MANIFEST_MIGRATION_SQL.contains("byte_size >= 0"));
+    }
+
+    #[test]
+    fn instrument_contract_is_exact_validated_and_migration_compatible() {
+        let instrument = instrument_fixture("RUSTTEST", "RUSTTEST.US");
+        validate_instrument(&instrument).unwrap();
+        let value = serde_json::to_value(&instrument).unwrap();
+        assert_eq!(value["tick_size"], "0.00000001");
+        assert_eq!(value["currency"], "USD");
+        assert_eq!(
+            serde_json::from_value::<InstrumentRecord>(value).unwrap(),
+            instrument
+        );
+        let mut invalid = instrument.clone();
+        invalid.ts_event = invalid.ts_init + Duration::seconds(1);
+        assert!(matches!(
+            validate_instrument(&invalid),
+            Err(RepositoryError::InvalidInput)
+        ));
+        let mut invalid = instrument;
+        invalid
+            .provider_symbols
+            .insert("Bad Namespace".into(), "x".into());
+        assert!(matches!(
+            validate_instrument(&invalid),
+            Err(RepositoryError::InvalidInput)
+        ));
+        assert!(INSTRUMENT_MASTER_MIGRATION_SQL.contains("provider_symbols JSONB NOT NULL"));
+        assert!(INSTRUMENT_MASTER_MIGRATION_SQL.contains("UNIQUE (symbol, mic)"));
+        assert_eq!(
+            INSTRUMENT_MASTER_MIGRATION_VERSION,
+            "rust-instrument-master-v1"
+        );
     }
 
     #[test]
@@ -1641,5 +2149,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repository.get(&job.job_id).await.unwrap(), Some(completed));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MARKETCOW_TEST_POSTGRES_DSN"]
+    async fn postgres_instrument_repository_round_trip_when_test_dsn_is_configured() {
+        let dsn = std::env::var("MARKETCOW_TEST_POSTGRES_DSN")
+            .expect("set MARKETCOW_TEST_POSTGRES_DSN for the ignored integration test");
+        let repository = PostgresInstrumentRepository::connect(&dsn).await.unwrap();
+        repository
+            .migrate_safe_forward("test-binary-commit")
+            .await
+            .unwrap();
+        repository
+            .migrate_safe_forward("test-binary-commit")
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string()[..8].to_ascii_uppercase();
+        let symbol = format!("R{suffix}");
+        let provider_symbol = format!("{symbol}.US");
+        let mut instrument = instrument_fixture(&symbol, &provider_symbol);
+        repository.upsert(&instrument).await.unwrap();
+        assert_eq!(
+            repository.get(&instrument.instrument_id).await.unwrap(),
+            Some(instrument.clone())
+        );
+        assert_eq!(
+            repository
+                .resolve("provider:longport", &provider_symbol)
+                .await
+                .unwrap(),
+            Some(instrument.clone())
+        );
+
+        let replacement_symbol = format!("{symbol}.REVISED.US");
+        instrument
+            .provider_symbols
+            .insert("longport".into(), replacement_symbol.clone());
+        instrument.content_hash = format!("sha256:{}", "b".repeat(64));
+        repository.upsert(&instrument).await.unwrap();
+        assert_eq!(
+            repository
+                .resolve("provider:longport", &provider_symbol)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            repository
+                .resolve("provider:longport", &replacement_symbol)
+                .await
+                .unwrap(),
+            Some(instrument.clone())
+        );
+
+        let other_symbol = format!("X{suffix}");
+        let conflicting = instrument_fixture(&other_symbol, &replacement_symbol);
+        assert!(matches!(
+            repository.upsert(&conflicting).await,
+            Err(RepositoryError::InstrumentConflict)
+        ));
     }
 }
