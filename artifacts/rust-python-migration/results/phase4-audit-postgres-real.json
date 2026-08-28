@@ -1,0 +1,26 @@
+{
+  "schema_version": "marketcow.audit-postgres-integration.v1",
+  "git_commit": "19ef1c23d01759ad2bf201eb1e79b939f0400221",
+  "passed": true,
+  "postgres": {
+    "version": "postgres (PostgreSQL) 17.10 (Homebrew)",
+    "test": "postgres_audit_repository_is_append_only_when_test_dsn_is_configured",
+    "passed": true,
+    "ephemeral_root": "/tmp/marketcow-audit-pg.ZVmkNW",
+    "assertions": [
+      "safe_forward_migration_idempotent",
+      "schema_v1_round_trip",
+      "unicode_and_decimal_string_preserved",
+      "exact_duplicate_idempotent",
+      "conflicting_duplicate_rejected",
+      "action_and_outcome_filter",
+      "bounded_pagination",
+      "update_rejected_by_trigger",
+      "delete_rejected_by_trigger",
+      "original_event_retained"
+    ]
+  },
+  "local_authoritative_audit_copy_retained": true,
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}
