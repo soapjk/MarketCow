@@ -1,6 +1,6 @@
 {
   "binary_path": "/Volumes/T9/projects/marketcow-workitem-b8ffd893-5dfd-4894-8a17-7e759ca0495f/target/debug/marketcow",
-  "binary_sha256": "c4e51c9b3050fa3d7bb9ed52b81ac196b1b6b80093d2664430af86d71ec53885",
+  "binary_sha256": "ffb4fbc2bd1f86e401a2637292ad67678332669d9ba1ef4841ea678f90eb2484",
   "checks": {
     "admin_audit_query_matches_python_contract": true,
     "admin_put_200": true,
@@ -8,6 +8,10 @@
     "admin_put_requires_bearer": true,
     "all_five_rust_migrations_recorded_once": true,
     "audit_persistence_healthy": true,
+    "checkpoint_cas_advances_to_revision_two": true,
+    "checkpoint_create_is_revision_one_and_shadow_only": true,
+    "checkpoint_get_returns_exact_revision_two": true,
+    "checkpoint_stale_revision_is_conflict": true,
     "config_revision_is_sha256": true,
     "control_plane_persistence_healthy": true,
     "http_exact_record": true,
@@ -21,11 +25,13 @@
     "mcp_get_definition_matches_python": true,
     "mcp_list_http_200": true,
     "mcp_result_matches_python": true,
+    "migration_control_is_shadow_only_and_registry_hashed": true,
     "postgres_audit_has_rejected_accepted_and_succeeded": true,
     "real_orders_disabled": true,
     "restart_does_not_duplicate_runtime_config": true,
     "restart_health_200": true,
     "restart_reads_same_postgres_record": true,
+    "restart_recovers_exact_migration_checkpoint": true,
     "restart_resolves_same_mapping": true,
     "two_native_tools_reported": true
   },
@@ -41,6 +47,6 @@
   "process_log_tail": "",
   "real_order_submission_enabled": false,
   "schema_version": "marketcow.native-instrument-differential.v1",
-  "source_commit": "6f98b230cc437d32483313ce48fdf024667f626d",
+  "source_commit": "5b4dd798ef28acd0470c69beceda1dff31e0cd7f",
   "tradude_manages_marketcow": false
 }

@@ -26,10 +26,10 @@ Reproducible results:
   exact retry idempotency, conflicting identity rejection, bounded filtering/pagination, and
   database-enforced append-only update/delete rejection.
 - `phase4-native-instrument-api-differential.json`, SHA-256
-  `204a9753e4509dc60622e3f37b8f635e6d818877edf8d1c5636865f88ddefd95`.
+  `06f258cd20c6c992949b940156b7f7873548ccf492fa0f1d38749300c614c20d`.
   Exact binary SHA-256
-  `c4e51c9b3050fa3d7bb9ed52b81ac196b1b6b80093d2664430af86d71ec53885`
-  from source commit `6f98b230cc437d32483313ce48fdf024667f626d` passed all 26 real-process
+  `ffb4fbc2bd1f86e401a2637292ad67678332669d9ba1ef4841ea678f90eb2484`
+  from source commit `5b4dd798ef28acd0470c69beceda1dff31e0cd7f` passed all 32 real-process
   PostgreSQL/HTTP/MCP/restart gates. The audit-specific gates prove healthy PostgreSQL audit,
   rejected/accepted/succeeded events, exact equality of local and PostgreSQL admin audit IDs,
   and the native read model's compatibility with the Python contract.
@@ -43,8 +43,8 @@ scripts/migration/verify_audit_postgres.sh \
 cargo build -p marketcowd
 PYTHONPATH=src python3 scripts/migration/verify_native_instrument_api.py \
   --binary "$PWD/target/debug/marketcow" \
-  --expected-binary-sha256 c4e51c9b3050fa3d7bb9ed52b81ac196b1b6b80093d2664430af86d71ec53885 \
-  --source-commit 6f98b230cc437d32483313ce48fdf024667f626d \
+  --expected-binary-sha256 ffb4fbc2bd1f86e401a2637292ad67678332669d9ba1ef4841ea678f90eb2484 \
+  --source-commit 5b4dd798ef28acd0470c69beceda1dff31e0cd7f \
   --output "$PWD/artifacts/rust-python-migration/results/phase4-native-instrument-api-differential.json"
 
 cargo test --workspace
@@ -53,7 +53,7 @@ uv run --isolated --frozen python -m unittest \
   tests.test_postgres_repositories tests.test_mcp_server
 ```
 
-Regression verdicts: Rust workspace 86 passed, 0 failed, with 5 explicitly external-instance
+Regression verdicts: Rust workspace 87 passed, 0 failed, with 5 explicitly external-instance
 tests ignored; Clippy passed with warnings denied; Python 27 passed, 0 failed, with 18
 environment-gated skips. The repository `.venv` symlink is currently self-referential, so the
 first system-Python attempt failed before test execution due to missing `psycopg` and `pypdf`;
