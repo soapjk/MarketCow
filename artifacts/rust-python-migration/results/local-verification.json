@@ -9,10 +9,10 @@
         "--check"
       ],
       "exit_code": 0,
-      "finished_at": "2026-08-27T15:15:38.214545+00:00",
+      "finished_at": "2026-08-28T01:51:42.430596+00:00",
       "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "output_tail": "",
-      "started_at": "2026-08-27T15:15:37.851277+00:00"
+      "started_at": "2026-08-28T01:51:42.016206+00:00"
     },
     {
       "command": [
@@ -21,10 +21,10 @@
         "--workspace"
       ],
       "exit_code": 0,
-      "finished_at": "2026-08-27T15:15:41.226593+00:00",
-      "output_sha256": "2a0b4d06d95b5cab19295e50008acf0e0f47c3ec619a7124e12ad188a05fb9d0",
-      "output_tail": "\nrunning 9 tests\ntest tests::decimal_is_exact_and_rejects_float_semantics ... ok\ntest tests::slow_consumer_is_isolated_by_bounded_queue ... ok\ntest tests::persistence_failure_never_publishes_candidate ... ok\ntest tests::duplicate_event_is_auditable_and_does_not_advance ... ok\ntest tests::online_and_replay_projection_hashes_match ... ok\ntest tests::checkpoint_corruption_is_rejected ... ok\ntest tests::gap_and_crossed_delta_fail_closed_without_advancing ... ok\ntest tests::wal_checkpoint_and_replay_are_deterministic ... ok\ntest tests::wal_chain_and_corruption_are_verified ... ok\n\ntest result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n\n\nrunning 3 tests\ntest tests::equality_does_not_accept_prefixes ... ok\ntest tests::admin_is_fail_closed_without_token ... ok\ntest tests::public_health_and_scope_preserve_safety_flags ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Compiling marketcowd v0.1.0 (/Volumes/T9/projects/marketcow-workitem-b8ffd893-5dfd-4894-8a17-7e759ca0495f/crates/marketcowd)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.91s\n     Running unittests src/lib.rs (target/debug/deps/marketcow_core-ef88a27eac30b80d)\n     Running unittests src/main.rs (target/debug/deps/marketcow-b152e16153e55dc3)\n   Doc-tests marketcow_core\n",
-      "started_at": "2026-08-27T15:15:38.214635+00:00"
+      "finished_at": "2026-08-28T01:51:43.676868+00:00",
+      "output_sha256": "80921bb1b5204be2eec6b62dc8f7f034ee8a80c40f75d437abc10555e67a1e09",
+      "output_tail": "\nrunning 3 tests\ntest tests::rejected_event_is_returned_as_auditable_gap ... ok\ntest tests::event_pages_are_bounded_contiguous_and_preserve_raw_evidence ... ok\ntest tests::snapshot_and_checkpoint_expose_both_watermarks_and_exact_decimals ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\ntest tests::scope_and_error_shapes_are_stable_and_orders_are_disabled ... ok\ntest tests::python_provider_neutral_golden_contract_is_accepted ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 12 tests\ntest tests::decimal_is_exact_and_rejects_float_semantics ... ok\ntest tests::ingress_backpressure_returns_the_unqueued_event_without_loss ... ok\ntest tests::slow_consumer_is_isolated_by_bounded_queue ... ok\ntest tests::persistence_failure_never_publishes_candidate ... ok\ntest tests::duplicate_event_is_auditable_and_does_not_advance ... ok\ntest tests::online_and_replay_projection_hashes_match ... ok\ntest tests::checkpoint_replay_skips_boundary_and_detects_decision_divergence ... ok\ntest tests::checkpoint_corruption_is_rejected ... ok\ntest tests::wal_restart_preserves_segment_hash_chain ... ok\ntest tests::rejected_delta_is_persisted_and_full_book_recovers_next_cursor ... ok\ntest tests::wal_checkpoint_and_replay_are_deterministic ... ok\ntest tests::wal_chain_and_corruption_are_verified ... ok\n\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s\n\n\nrunning 2 tests\ntest tests::every_workload_has_one_owner_and_hot_path_is_memory_only ... ok\ntest tests::quote_decimal_json_round_trip_preserves_precision_and_currency ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 5 tests\ntest tests::equality_does_not_accept_prefixes ... ok\ntest tests::public_health_and_scope_preserve_safety_flags ... ok\ntest tests::admin_is_fail_closed_without_token ... ok\ntest tests::realtime_routes_fail_closed_until_projection_is_ready ... ok\ntest tests::ready_projection_serves_snapshot_checkpoint_and_bounded_events ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.42s\n     Running unittests src/lib.rs (target/debug/deps/marketcow_api-f8bb0ebbeeee7601)\n     Running unittests src/lib.rs (target/debug/deps/marketcow_contracts-4be508fc1cd8614c)\n     Running unittests src/lib.rs (target/debug/deps/marketcow_core-ef88a27eac30b80d)\n     Running unittests src/lib.rs (target/debug/deps/marketcow_storage-b90fe015471d4866)\n     Running unittests src/main.rs (target/debug/deps/marketcow-a59f84203e8f3494)\n   Doc-tests marketcow_api\n   Doc-tests marketcow_contracts\n   Doc-tests marketcow_core\n   Doc-tests marketcow_storage\n",
+      "started_at": "2026-08-28T01:51:42.430719+00:00"
     },
     {
       "command": [
@@ -37,10 +37,10 @@
         "warnings"
       ],
       "exit_code": 0,
-      "finished_at": "2026-08-27T15:15:41.408981+00:00",
-      "output_sha256": "a41051563a4cb5fc1b1bcdd9aa0ba28ca80f7736d629d90cc138218756e8e3a9",
-      "output_tail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s\n",
-      "started_at": "2026-08-27T15:15:41.226640+00:00"
+      "finished_at": "2026-08-28T01:51:43.890849+00:00",
+      "output_sha256": "2b34696728dc82b03cbf6311d7e3a6a41658bbde097834c3010a78bc82842c1a",
+      "output_tail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.16s\n",
+      "started_at": "2026-08-28T01:51:43.676926+00:00"
     },
     {
       "command": [
@@ -52,10 +52,10 @@
         "tests/test_rust_migration_architecture.py"
       ],
       "exit_code": 0,
-      "finished_at": "2026-08-27T15:15:42.142966+00:00",
-      "output_sha256": "f83d9d610e658c2588951f9d5fcf5eb6869412bb3ff4984e533ea0cdb5fce58f",
-      "output_tail": "........                                                                 [100%]\n8 passed in 0.12s\n",
-      "started_at": "2026-08-27T15:15:41.409019+00:00"
+      "finished_at": "2026-08-28T01:51:44.838489+00:00",
+      "output_sha256": "54dbfec11e7faf703fad2a78ddcc7c5a48d8b50115e9cf9df7f1177b60ddde98",
+      "output_tail": "........                                                                 [100%]\n8 passed in 0.19s\n",
+      "started_at": "2026-08-28T01:51:43.890886+00:00"
     },
     {
       "command": [
@@ -63,14 +63,14 @@
         "scripts/migration/verify_phase0.py"
       ],
       "exit_code": 0,
-      "finished_at": "2026-08-27T15:15:42.165621+00:00",
+      "finished_at": "2026-08-28T01:51:44.862752+00:00",
       "output_sha256": "bdf8886382abc6bdd6dec3a4eb419929351c0c7ae7f970c654de9d8f548756ac",
       "output_tail": "{\n  \"missing\": [],\n  \"passed\": true,\n  \"plan_sha256\": \"62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4\",\n  \"raw_r2_available\": false,\n  \"raw_r2_is_acceptance_blocker\": true,\n  \"schema_version\": \"marketcow.phase0-verification.v1\"\n}\n",
-      "started_at": "2026-08-27T15:15:42.143006+00:00"
+      "started_at": "2026-08-28T01:51:44.838533+00:00"
     }
   ],
-  "commit": "f4b13cdea3d39ede53e3cdedf9ccd0e94818506e",
-  "generated_at": "2026-08-27T15:15:42.177892+00:00",
+  "commit": "dc87cf931a34349352dba6a4ccbf95dc95826903",
+  "generated_at": "2026-08-28T01:51:44.884113+00:00",
   "incomplete_reason": "Raw r2 corpus, full public API/storage cutover, production shadow, 24-hour and 7-day gates are not available or executed.",
   "local_checks_passed": true,
   "overall_work_item_complete": false,
