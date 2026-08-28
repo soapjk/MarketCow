@@ -1,0 +1,63 @@
+{
+  "schema_version": "marketcow.migration-milestone.v1",
+  "milestone": "phase4-native-canonical-api-and-repository-boundary",
+  "implementation_commit": "8dba94fadb6e8ec255124199b93febd304bd477a",
+  "passed": true,
+  "commands": [
+    {
+      "command": "cargo test --workspace --all-targets",
+      "passed": true,
+      "passed_tests": 94,
+      "ignored_external_integration_tests": 5
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "passed": true
+    },
+    {
+      "command": "uv run --isolated --frozen --with pytest python -m pytest -q tests/test_mcp_server.py",
+      "passed": true,
+      "passed_tests": 17
+    },
+    {
+      "command": "scripts/migration/verify_storage_integrations.sh $PWD/artifacts/rust-python-migration/results/phase4-canonical-adjustment-storage-real.json",
+      "passed": true
+    },
+    {
+      "command": "scripts/migration/verify_native_canonical_api.py --binary target/debug/marketcow --expected-binary-sha256 688151e6d9c36c53d7e51224c590cdb665220af2bffa455aa9819be237e35aa2 --source-commit 8dba94fadb6e8ec255124199b93febd304bd477a --output artifacts/rust-python-migration/results/phase4-native-canonical-api-real.json",
+      "passed": true
+    }
+  ],
+  "evidence": {
+    "storage_result": {
+      "path": "artifacts/rust-python-migration/results/phase4-canonical-adjustment-storage-real.json",
+      "sha256": "6016af94548bcf2797aa08971258c242f616233f706ce4dd9d8b774dbc53d077"
+    },
+    "network_result": {
+      "path": "artifacts/rust-python-migration/results/phase4-native-canonical-api-real.json",
+      "sha256": "89100cae5bfb6d184d8fb2597ef528182d33f7b836961a8efc4d6a73db79ecef"
+    },
+    "preserved_failed_attempt": {
+      "path": "artifacts/rust-python-migration/results/phase4-native-canonical-api-real-attempt1-failed.json",
+      "sha256": "79c7bd43e9bd637d2e4ab4cf33d6ee340faca4be6d24398a56d516987ef13637",
+      "passed": false,
+      "reason": "Verifier used a non-canonical lowercase instrument path and an incorrect expected migration version; service failures were not suppressed."
+    }
+  },
+  "gates": {
+    "typed_postgresql_clickhouse_sqlite_repository_boundary": true,
+    "canonical_bar_exact_decimal_strings": true,
+    "adjustment_factor_decimal128_scale_18": true,
+    "snapshot_bound_signed_cursor": true,
+    "tampered_cursor_rejected": true,
+    "http_mcp_structured_content_identical": true,
+    "python_rust_tool_definition_golden": true,
+    "safe_forward_clickhouse_migrations": true,
+    "restart_recovers_exact_clickhouse_snapshot": true,
+    "realtime_hot_path_queries_sqlite": false,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow": false,
+    "headless_substitutes_http_network_soak": false
+  },
+  "scope_note": "This milestone supplies Phase 4 API/repository compatibility evidence. It does not replace or claim the separately required 45-minute HTTP/network soak."
+}

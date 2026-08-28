@@ -1,0 +1,27 @@
+{
+  "schema_version": "marketcow.storage-integration.v1",
+  "git_commit": "8dba94fadb6e8ec255124199b93febd304bd477a",
+  "passed": true,
+  "postgres": {
+    "version": "postgres (PostgreSQL) 17.10 (Homebrew)",
+    "test": "postgres_job_repository_round_trip_when_test_dsn_is_configured",
+    "passed": true,
+    "ephemeral_root": "/tmp/marketcow-storage-pg.sXwvkk"
+  },
+  "clickhouse": {
+    "image": "clickhouse/clickhouse-server:25.8-alpine",
+    "image_id": "sha256:87e0a5b72f5465b18eacca7c76850e7ff551c9795c50e451f5646299e5e24146",
+    "test": "clickhouse_market_data_round_trip_when_test_endpoint_is_configured",
+    "gates": {
+      "safe_forward_migrations": true,
+      "quote_exact_decimal_and_idempotency": true,
+      "canonical_page_order_and_ohlcv_validation": true,
+      "adjustment_factor_decimal128_scale_18": true,
+      "factor_provenance_round_trip": true
+    },
+    "passed": true
+  },
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false,
+  "headless_substitutes_http_network_soak": false
+}
