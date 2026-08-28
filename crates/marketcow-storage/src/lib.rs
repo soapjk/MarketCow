@@ -2870,7 +2870,7 @@ mod tests {
             payloads[&quote.instrument_id]["bid"],
             "0.100000000000000001"
         );
-        assert_eq!(payloads[&quote.instrument_id]["currency"], "USD");
+        assert_eq!(payloads[&quote.instrument_id]["currency"], quote.currency);
     }
 
     #[tokio::test]
