@@ -54,6 +54,19 @@ const SEC_DIVIDEND_RESULT_SCHEMA: &str = "marketcow.worker.transform.sec-dividen
 const CSV_INFERENCE_TASK: &str = "transform.csv_inference";
 const CSV_INFERENCE_REQUEST_SCHEMA: &str = "marketcow.worker.transform.csv-inference.v1";
 const CSV_INFERENCE_RESULT_SCHEMA: &str = "marketcow.worker.transform.csv-inference-result.v1";
+const DOMAIN_OWNERSHIP_REGISTRY: &[u8] =
+    include_bytes!("../../../docs/architecture/migration/domain-ownership.yaml");
+const MIGRATION_CHECKPOINT_DOMAINS: &[&str] = &[
+    "instrument_master",
+    "runtime_config",
+    "provider_jobs",
+    "admin_audit",
+    "artifact_manifest",
+    "polymarket_realtime",
+    "authoritative_wal",
+    "postgresql",
+    "clickhouse",
+];
 
 #[derive(Parser)]
 #[command(name = "marketcow", version, about = "MarketCow Rust shadow platform")]
@@ -531,6 +544,12 @@ struct InstrumentCoordinator {
 struct ControlPlaneCoordinator {
     repository: Option<Arc<marketcow_storage::PostgresControlPlaneRepository>>,
     config_revision: String,
+    #[cfg(test)]
+    checkpoints: AsyncMutex<
+        BTreeMap<(String, String, String), marketcow_storage::MigrationCheckpointRecord>,
+    >,
+    #[cfg(test)]
+    memory_enabled: bool,
 }
 
 impl ControlPlaneCoordinator {
@@ -549,6 +568,10 @@ impl ControlPlaneCoordinator {
             return Ok(Self {
                 repository: None,
                 config_revision,
+                #[cfg(test)]
+                checkpoints: AsyncMutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                memory_enabled: false,
             });
         };
         let binary_commit = env::var("MARKETCOW_BINARY_COMMIT").unwrap_or_default();
@@ -596,6 +619,10 @@ impl ControlPlaneCoordinator {
         Ok(Self {
             repository: Some(repository),
             config_revision,
+            #[cfg(test)]
+            checkpoints: AsyncMutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            memory_enabled: false,
         })
     }
 
@@ -604,11 +631,75 @@ impl ControlPlaneCoordinator {
         Self {
             repository: None,
             config_revision: config_revision.into(),
+            checkpoints: AsyncMutex::new(BTreeMap::new()),
+            memory_enabled: true,
         }
     }
 
     fn persistence_enabled(&self) -> bool {
         self.repository.is_some()
+    }
+
+    async fn get_checkpoint(
+        &self,
+        run_id: &str,
+        domain: &str,
+        shard: &str,
+    ) -> std::result::Result<
+        Option<marketcow_storage::MigrationCheckpointRecord>,
+        marketcow_storage::RepositoryError,
+    > {
+        if let Some(repository) = &self.repository {
+            return repository
+                .get_migration_checkpoint(run_id, domain, shard)
+                .await;
+        }
+        #[cfg(test)]
+        if self.memory_enabled {
+            return Ok(self
+                .checkpoints
+                .lock()
+                .await
+                .get(&(run_id.into(), domain.into(), shard.into()))
+                .cloned());
+        }
+        Err(marketcow_storage::RepositoryError::Unavailable)
+    }
+
+    async fn upsert_checkpoint(
+        &self,
+        record: &marketcow_storage::MigrationCheckpointRecord,
+        expected_revision: u64,
+    ) -> std::result::Result<
+        marketcow_storage::MigrationCheckpointRecord,
+        marketcow_storage::RepositoryError,
+    > {
+        record.validate()?;
+        if let Some(repository) = &self.repository {
+            return repository
+                .upsert_migration_checkpoint(record, expected_revision)
+                .await;
+        }
+        #[cfg(test)]
+        if self.memory_enabled {
+            let key = (
+                record.run_id.clone(),
+                record.domain.clone(),
+                record.shard.clone(),
+            );
+            let mut checkpoints = self.checkpoints.lock().await;
+            let revision = checkpoints.get(&key).map_or(0, |current| current.revision);
+            if revision != expected_revision {
+                return Err(marketcow_storage::RepositoryError::RevisionConflict);
+            }
+            let mut stored = record.clone();
+            stored.revision = expected_revision
+                .checked_add(1)
+                .ok_or(marketcow_storage::RepositoryError::InvalidInput)?;
+            checkpoints.insert(key, stored.clone());
+            return Ok(stored);
+        }
+        Err(marketcow_storage::RepositoryError::Unavailable)
     }
 }
 
@@ -1971,6 +2062,10 @@ fn app(state: AppState) -> Router {
         .route("/mcp", post(mcp))
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
+        .route(
+            "/v1/admin/migration/checkpoints/{run_id}/{domain}/{shard}",
+            get(admin_get_migration_checkpoint).put(admin_put_migration_checkpoint),
+        )
         .route("/v1/admin/audit", get(admin_audit_events))
         .route(
             "/v1/admin/polymarket/checkpoint",
@@ -2978,10 +3073,163 @@ fn bootstrap_projection(scope_id: String) -> marketcow_core::Projection {
     marketcow_core::Projection::bootstrap(scope_id)
 }
 
-async fn admin_migration() -> Json<serde_json::Value> {
+async fn admin_migration(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
-        "phase":"shadow", "cutover_allowed":false, "tradude_may_manage_marketcow":false
+        "schema":"marketcow.migration-control.v1",
+        "phase":"shadow",
+        "cutover_allowed":false,
+        "checkpoint_persistence":if state.control_plane.persistence_enabled() {
+            "healthy"
+        } else {
+            "degraded_development_only"
+        },
+        "ownership_registry":{
+            "schema":"marketcow.domain-ownership.v1",
+            "revision":"phase0-shadow",
+            "sha256":hex::encode(Sha256::digest(DOMAIN_OWNERSHIP_REGISTRY))
+        },
+        "real_order_submission_enabled":false,
+        "tradude_may_manage_marketcow":false
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationCheckpointInput {
+    expected_revision: u64,
+    status: String,
+    #[serde(default)]
+    source_watermark: Option<String>,
+    #[serde(default)]
+    target_watermark: Option<String>,
+    #[serde(default = "empty_json_object")]
+    cursor_json: serde_json::Value,
+    #[serde(default = "empty_json_object")]
+    evidence_json: serde_json::Value,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn empty_json_object() -> serde_json::Value {
+    json!({})
+}
+
+fn valid_migration_checkpoint_domain(domain: &str) -> bool {
+    MIGRATION_CHECKPOINT_DOMAINS.contains(&domain)
+}
+
+async fn admin_get_migration_checkpoint(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    AxumPath((run_id, domain, shard)): AxumPath<(String, String, String)>,
+) -> Response {
+    if !valid_migration_checkpoint_domain(&domain) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_migration_checkpoint_domain",
+            false,
+            &request_id,
+        );
+    }
+    match state
+        .control_plane
+        .get_checkpoint(&run_id, &domain, &shard)
+        .await
+    {
+        Ok(Some(record)) => Json(json!({
+            "schema":"marketcow.migration-checkpoint.v1",
+            "checkpoint":record,
+            "cutover_allowed":false,
+            "real_order_submission_enabled":false
+        }))
+        .into_response(),
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "migration_checkpoint_not_found",
+            false,
+            &request_id,
+        ),
+        Err(repository_error) => {
+            warn!(error=%repository_error, request_id, "migration_checkpoint_read_failed_closed");
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "control_plane_unavailable",
+                true,
+                &request_id,
+            )
+        }
+    }
+}
+
+async fn admin_put_migration_checkpoint(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    AxumPath((run_id, domain, shard)): AxumPath<(String, String, String)>,
+    Json(input): Json<MigrationCheckpointInput>,
+) -> Response {
+    if !valid_migration_checkpoint_domain(&domain) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_migration_checkpoint_domain",
+            false,
+            &request_id,
+        );
+    }
+    let record = marketcow_storage::MigrationCheckpointRecord {
+        run_id,
+        domain,
+        shard,
+        revision: input.expected_revision,
+        status: input.status,
+        source_watermark: input.source_watermark,
+        target_watermark: input.target_watermark,
+        cursor_json: input.cursor_json,
+        evidence_json: input.evidence_json,
+        error: input.error,
+        updated_at: Utc::now(),
+    };
+    if record.validate().is_err() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_migration_checkpoint",
+            false,
+            &request_id,
+        );
+    }
+    match state
+        .control_plane
+        .upsert_checkpoint(&record, input.expected_revision)
+        .await
+    {
+        Ok(stored) => Json(json!({
+            "schema":"marketcow.migration-checkpoint.v1",
+            "checkpoint":stored,
+            "cutover_allowed":false,
+            "real_order_submission_enabled":false
+        }))
+        .into_response(),
+        Err(marketcow_storage::RepositoryError::RevisionConflict) => error(
+            StatusCode::CONFLICT,
+            "migration_checkpoint_revision_conflict",
+            false,
+            &request_id,
+        ),
+        Err(marketcow_storage::RepositoryError::InvalidInput) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_migration_checkpoint",
+            false,
+            &request_id,
+        ),
+        Err(repository_error) => {
+            warn!(error=%repository_error, request_id, "migration_checkpoint_write_failed_closed");
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "control_plane_unavailable",
+                true,
+                &request_id,
+            )
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5169,6 +5417,102 @@ mod tests {
         )
         .await;
         assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn shadow_migration_checkpoint_is_cas_fenced_and_never_enables_cutover() {
+        let (_dir, state) = test_state();
+        let migration = admin_migration(State(state.clone())).await.0;
+        assert_eq!(migration["schema"], "marketcow.migration-control.v1");
+        assert_eq!(migration["cutover_allowed"], false);
+        assert_eq!(migration["real_order_submission_enabled"], false);
+        assert_eq!(migration["tradude_may_manage_marketcow"], false);
+        assert_eq!(
+            migration["ownership_registry"]["sha256"],
+            "c71864af6bc9227cf166d42dc3963da12261b8fe80cb1c1ce581f2695714bf5e"
+        );
+
+        let path = AxumPath((
+            "shadow-instrument-1".into(),
+            "instrument_master".into(),
+            "all".into(),
+        ));
+        let created = admin_put_migration_checkpoint(
+            State(state.clone()),
+            Extension("checkpoint-create".into()),
+            path,
+            Json(MigrationCheckpointInput {
+                expected_revision: 0,
+                status: "running".into(),
+                source_watermark: Some("python:100".into()),
+                target_watermark: Some("rust:99".into()),
+                cursor_json: json!({"after":"AAPL.XNAS"}),
+                evidence_json: json!({"diff_count":0}),
+                error: None,
+            }),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created: serde_json::Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(created["checkpoint"]["revision"], 1);
+        assert_eq!(created["cutover_allowed"], false);
+
+        let completed_input = || MigrationCheckpointInput {
+            expected_revision: 1,
+            status: "completed".into(),
+            source_watermark: Some("python:100".into()),
+            target_watermark: Some("rust:100".into()),
+            cursor_json: json!({"after":"AAPL.XNAS"}),
+            evidence_json: json!({"diff_count":0,"shadow_only":true}),
+            error: None,
+        };
+        let completed = admin_put_migration_checkpoint(
+            State(state.clone()),
+            Extension("checkpoint-complete".into()),
+            AxumPath((
+                "shadow-instrument-1".into(),
+                "instrument_master".into(),
+                "all".into(),
+            )),
+            Json(completed_input()),
+        )
+        .await;
+        assert_eq!(completed.status(), StatusCode::OK);
+        let completed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(completed.into_body(), 16_384).await.unwrap())
+                .unwrap();
+        assert_eq!(completed["checkpoint"]["revision"], 2);
+        assert_eq!(completed["checkpoint"]["status"], "completed");
+
+        let stale = admin_put_migration_checkpoint(
+            State(state.clone()),
+            Extension("checkpoint-stale".into()),
+            AxumPath((
+                "shadow-instrument-1".into(),
+                "instrument_master".into(),
+                "all".into(),
+            )),
+            Json(completed_input()),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let fetched = admin_get_migration_checkpoint(
+            State(state),
+            Extension("checkpoint-get".into()),
+            AxumPath((
+                "shadow-instrument-1".into(),
+                "instrument_master".into(),
+                "all".into(),
+            )),
+        )
+        .await;
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let fetched: serde_json::Value =
+            serde_json::from_slice(&to_bytes(fetched.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(fetched["checkpoint"], completed["checkpoint"]);
+        assert_eq!(fetched["cutover_allowed"], false);
     }
 
     #[tokio::test]

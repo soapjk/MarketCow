@@ -251,6 +251,80 @@ def main() -> int:
                     and audit_outcomes.count("succeeded") == 1
                     and audit_outcomes.count("rejected") == 1
                 )
+                migration_status, migration = get_json(
+                    f"{base_url}/v1/admin/migration",
+                    "local-integration-admin-token",
+                )
+                checks["migration_control_is_shadow_only_and_registry_hashed"] = (
+                    migration_status == 200
+                    and migration.get("schema") == "marketcow.migration-control.v1"
+                    and migration.get("phase") == "shadow"
+                    and migration.get("cutover_allowed") is False
+                    and migration.get("real_order_submission_enabled") is False
+                    and migration.get("tradude_may_manage_marketcow") is False
+                    and migration.get("checkpoint_persistence") == "healthy"
+                    and migration.get("ownership_registry", {}).get("sha256")
+                    == "c71864af6bc9227cf166d42dc3963da12261b8fe80cb1c1ce581f2695714bf5e"
+                )
+                checkpoint_url = (
+                    f"{base_url}/v1/admin/migration/checkpoints/"
+                    "shadow-instrument-real/instrument_master/all"
+                )
+                checkpoint_running = {
+                    "expected_revision": 0,
+                    "status": "running",
+                    "source_watermark": "python:100",
+                    "target_watermark": "rust:99",
+                    "cursor_json": {"after": "AAPL.XNAS"},
+                    "evidence_json": {"diff_count": 0, "shadow_only": True},
+                }
+                checkpoint_status, checkpoint_created = put_json(
+                    checkpoint_url,
+                    checkpoint_running,
+                    "local-integration-admin-token",
+                )
+                checks["checkpoint_create_is_revision_one_and_shadow_only"] = (
+                    checkpoint_status == 200
+                    and checkpoint_created.get("checkpoint", {}).get("revision") == 1
+                    and checkpoint_created.get("checkpoint", {}).get("status") == "running"
+                    and checkpoint_created.get("cutover_allowed") is False
+                    and checkpoint_created.get("real_order_submission_enabled") is False
+                )
+                checkpoint_completed = dict(checkpoint_running)
+                checkpoint_completed.update({
+                    "expected_revision": 1,
+                    "status": "completed",
+                    "target_watermark": "rust:100",
+                })
+                checkpoint_status, checkpoint_saved = put_json(
+                    checkpoint_url,
+                    checkpoint_completed,
+                    "local-integration-admin-token",
+                )
+                checks["checkpoint_cas_advances_to_revision_two"] = (
+                    checkpoint_status == 200
+                    and checkpoint_saved.get("checkpoint", {}).get("revision") == 2
+                    and checkpoint_saved.get("checkpoint", {}).get("status") == "completed"
+                )
+                stale_status, stale = put_json(
+                    checkpoint_url,
+                    checkpoint_completed,
+                    "local-integration-admin-token",
+                )
+                checks["checkpoint_stale_revision_is_conflict"] = (
+                    stale_status == 409
+                    and stale.get("detail", {}).get("code")
+                    == "migration_checkpoint_revision_conflict"
+                )
+                checkpoint_get_status, checkpoint_get = get_json(
+                    checkpoint_url,
+                    "local-integration-admin-token",
+                )
+                checks["checkpoint_get_returns_exact_revision_two"] = (
+                    checkpoint_get_status == 200
+                    and checkpoint_get.get("checkpoint") == checkpoint_saved.get("checkpoint")
+                    and checkpoint_get.get("cutover_allowed") is False
+                )
 
                 status, actual = get_json(f"{base_url}/v1/instruments/AAPL.XNAS")
                 checks["http_get_200"] = status == 200
@@ -332,6 +406,15 @@ def main() -> int:
                 checks["restart_resolves_same_mapping"] = (
                     resolve_status == 200 and restarted_resolve == expected
                 )
+                restart_checkpoint_status, restart_checkpoint = get_json(
+                    checkpoint_url,
+                    "local-integration-admin-token",
+                )
+                checks["restart_recovers_exact_migration_checkpoint"] = (
+                    restart_checkpoint_status == 200
+                    and restart_checkpoint.get("checkpoint")
+                    == checkpoint_saved.get("checkpoint")
+                )
                 process_exit_codes.append(stop_process(process))
                 process = None
 
@@ -349,7 +432,7 @@ def main() -> int:
                 text=True,
             ).stdout.strip()
             checks["postgres_audit_has_rejected_accepted_and_succeeded"] = (
-                audit_summary == "5|2|2|1"
+                audit_summary == "17|8|7|2"
             )
             postgres_audit_ids = subprocess.run(
                 [
@@ -373,7 +456,7 @@ def main() -> int:
             )
             checks["local_and_postgres_admin_audit_ids_match"] = (
                 local_admin_audit_ids == postgres_audit_ids
-                and len(local_admin_audit_ids) == 5
+                and len(local_admin_audit_ids) == 17
             )
             migration_count = subprocess.run(
                 [

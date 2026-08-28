@@ -1370,6 +1370,12 @@ pub struct MigrationCheckpointRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+impl MigrationCheckpointRecord {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        validate_checkpoint(self)
+    }
+}
+
 pub struct PostgresControlPlaneRepository {
     client: tokio::sync::Mutex<tokio_postgres::Client>,
 }
