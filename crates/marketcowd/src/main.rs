@@ -37,7 +37,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     process::Command as ProcessCommand,
     signal,
-    sync::{Mutex as AsyncMutex, broadcast},
+    sync::{Mutex as AsyncMutex, Notify, broadcast},
     task::JoinSet,
 };
 use tracing::{info, warn};
@@ -54,6 +54,9 @@ const SEC_DIVIDEND_RESULT_SCHEMA: &str = "marketcow.worker.transform.sec-dividen
 const CSV_INFERENCE_TASK: &str = "transform.csv_inference";
 const CSV_INFERENCE_REQUEST_SCHEMA: &str = "marketcow.worker.transform.csv-inference.v1";
 const CSV_INFERENCE_RESULT_SCHEMA: &str = "marketcow.worker.transform.csv-inference-result.v1";
+const LONGPORT_RESOLVE_TASK: &str = "provider.longport.resolve_instruments";
+const LONGPORT_RESOLVE_REQUEST_SCHEMA: &str = "marketcow.worker.provider.longport-resolve.v1";
+const LONGPORT_RESOLVE_RESULT_SCHEMA: &str = "marketcow.worker.provider.longport-resolve-result.v1";
 const DOMAIN_OWNERSHIP_REGISTRY: &[u8] =
     include_bytes!("../../../docs/architecture/migration/domain-ownership.yaml");
 const MIGRATION_CHECKPOINT_DOMAINS: &[&str] = &[
@@ -283,7 +286,10 @@ fn validate_dispatch_policies(
         {
             bail!("Python dispatch policy capability is invalid");
         }
-        if !matches!(capability.as_str(), SEC_DIVIDEND_TASK | CSV_INFERENCE_TASK) {
+        if !matches!(
+            capability.as_str(),
+            SEC_DIVIDEND_TASK | CSV_INFERENCE_TASK | LONGPORT_RESOLVE_TASK
+        ) {
             bail!("Python dispatch policy capability has no registered handler");
         }
         policy
@@ -528,6 +534,7 @@ enum DurableJobError {
 
 struct DurableJobCoordinator {
     engine: AsyncMutex<marketcow_jobs::JobEngine>,
+    state_changed: Notify,
     repository: Option<Arc<marketcow_storage::PostgresJobRepository>>,
     memory_artifacts: AsyncMutex<BTreeMap<String, marketcow_storage::ArtifactManifestRecord>>,
     dispatch_policies: BTreeMap<String, marketcow_jobs::DispatchPolicy>,
@@ -861,6 +868,7 @@ impl DurableJobCoordinator {
     fn memory() -> Self {
         Self {
             engine: AsyncMutex::new(marketcow_jobs::JobEngine::default()),
+            state_changed: Notify::new(),
             repository: None,
             memory_artifacts: AsyncMutex::new(BTreeMap::new()),
             dispatch_policies: BTreeMap::new(),
@@ -872,6 +880,7 @@ impl DurableJobCoordinator {
     ) -> Self {
         Self {
             engine: AsyncMutex::new(marketcow_jobs::JobEngine::default()),
+            state_changed: Notify::new(),
             repository: None,
             memory_artifacts: AsyncMutex::new(BTreeMap::new()),
             dispatch_policies,
@@ -913,6 +922,7 @@ impl DurableJobCoordinator {
             .map_err(|error| anyhow::anyhow!("provider job recovery failed: {error}"))?;
         Ok(Self {
             engine: AsyncMutex::new(engine),
+            state_changed: Notify::new(),
             repository: Some(repository),
             memory_artifacts: AsyncMutex::new(BTreeMap::new()),
             dispatch_policies,
@@ -953,6 +963,33 @@ impl DurableJobCoordinator {
         self.engine.lock().await.get(job_id).cloned()
     }
 
+    async fn wait_terminal(
+        &self,
+        job_id: &str,
+        deadline: chrono::DateTime<Utc>,
+    ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
+        loop {
+            let notified = self.state_changed.notified();
+            let job = self
+                .get(job_id)
+                .await
+                .ok_or(marketcow_jobs::JobEngineError::NotFound)?;
+            if job.status.terminal() {
+                return Ok(job);
+            }
+            let remaining = deadline.signed_duration_since(Utc::now());
+            if remaining <= chrono::Duration::zero() {
+                return Err(marketcow_storage::RepositoryError::Timeout.into());
+            }
+            let timeout = remaining
+                .to_std()
+                .map_err(|_| marketcow_storage::RepositoryError::Timeout)?;
+            if tokio::time::timeout(timeout, notified).await.is_err() {
+                return Err(marketcow_storage::RepositoryError::Timeout.into());
+            }
+        }
+    }
+
     async fn cancel(
         &self,
         job_id: &str,
@@ -964,6 +1001,7 @@ impl DurableJobCoordinator {
         let updated = engine.cancel(job_id, actor, now)?.clone();
         self.persist_single_or_rollback(&mut engine, before, &updated)
             .await?;
+        self.state_changed.notify_waiters();
         Ok(updated)
     }
 
@@ -1080,6 +1118,7 @@ impl DurableJobCoordinator {
             }
             manifests.insert(artifact.artifact_id.clone(), artifact);
         }
+        self.state_changed.notify_waiters();
         Ok(updated)
     }
 
@@ -1098,6 +1137,7 @@ impl DurableJobCoordinator {
             .clone();
         self.persist_single_or_rollback(&mut engine, before, &updated)
             .await?;
+        self.state_changed.notify_waiters();
         Ok(updated)
     }
 
@@ -2058,6 +2098,10 @@ fn app(state: AppState) -> Router {
         )
         .route("/v1/market-data/stream", get(market_data_stream))
         .route("/v1/instruments:resolve", get(resolve_instrument))
+        .route(
+            "/v1/instruments:resolve/query",
+            post(resolve_instruments_batch),
+        )
         .route("/v1/instruments/{instrument_id}", get(get_instrument))
         .route("/mcp", post(mcp))
         .route("/metrics", get(metrics))
@@ -2174,6 +2218,252 @@ struct ResolveInstrumentQuery {
     external_symbol: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveInstrumentBatchRequest {
+    namespace: String,
+    symbols: Vec<String>,
+}
+
+fn instrument_resolution_error_item(
+    namespace: &str,
+    external_symbol: &str,
+    code: &str,
+    message: &str,
+) -> serde_json::Value {
+    json!({
+        "namespace":namespace,
+        "external_symbol":external_symbol,
+        "status":"error",
+        "instrument_id":null,
+        "symbol":null,
+        "mic":null,
+        "market":null,
+        "currency":null,
+        "source":null,
+        "source_exchange":null,
+        "observed_at":null,
+        "resolution":null,
+        "error":{"code":code,"message":message}
+    })
+}
+
+fn instrument_resolution_registry_item(
+    namespace: &str,
+    external_symbol: &str,
+    record: &marketcow_storage::InstrumentRecord,
+) -> serde_json::Value {
+    json!({
+        "namespace":namespace,
+        "external_symbol":external_symbol,
+        "status":"resolved",
+        "instrument_id":record.instrument_id,
+        "symbol":record.symbol,
+        "mic":record.mic,
+        "market":record.market,
+        "currency":record.currency,
+        "source":"instrument_mapping_registry",
+        "source_exchange":null,
+        "observed_at":record.updated_at,
+        "resolution":"registry",
+        "error":null
+    })
+}
+
+fn instrument_resolution_response(namespace: &str, items: Vec<serde_json::Value>) -> Response {
+    let resolved_count = items
+        .iter()
+        .filter(|item| item["status"] == "resolved")
+        .count();
+    Json(json!({
+        "namespace":namespace,
+        "count":items.len(),
+        "resolved_count":resolved_count,
+        "error_count":items.len() - resolved_count,
+        "items":items
+    }))
+    .into_response()
+}
+
+async fn resolve_instruments_batch(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    Json(request): Json<ResolveInstrumentBatchRequest>,
+) -> Response {
+    let namespace = request.namespace.trim().to_ascii_lowercase();
+    let valid_namespace = namespace.split_once(':').is_some_and(|(kind, name)| {
+        matches!(kind, "provider" | "broker")
+            && !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    });
+    let symbols = request
+        .symbols
+        .iter()
+        .map(|symbol| symbol.trim().to_ascii_uppercase().replace(' ', ""))
+        .collect::<Vec<_>>();
+    if !valid_namespace
+        || !(1..=20).contains(&symbols.len())
+        || symbols
+            .iter()
+            .any(|symbol| symbol.is_empty() || symbol.len() > 128)
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_instrument_resolution_request",
+            false,
+            &request_id,
+        );
+    }
+
+    let mut items = vec![serde_json::Value::Null; symbols.len()];
+    let mut missing = Vec::new();
+    for (position, symbol) in symbols.iter().enumerate() {
+        match state.instruments.resolve(&namespace, symbol).await {
+            Ok(Some(record)) => {
+                items[position] = instrument_resolution_registry_item(&namespace, symbol, &record);
+            }
+            Ok(None) => missing.push(position),
+            Err(marketcow_storage::RepositoryError::InvalidInput) => {
+                return error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_instrument_resolution_request",
+                    false,
+                    &request_id,
+                );
+            }
+            Err(_) => {
+                return instrument_resolution_response(
+                    &namespace,
+                    symbols
+                        .iter()
+                        .map(|symbol| {
+                            instrument_resolution_error_item(
+                                &namespace,
+                                symbol,
+                                "provider_unavailable",
+                                "instrument registry is unavailable",
+                            )
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+    if missing.is_empty() {
+        return instrument_resolution_response(&namespace, items);
+    }
+    if namespace != "provider:longport" {
+        for position in missing {
+            items[position] = instrument_resolution_error_item(
+                &namespace,
+                &symbols[position],
+                "provider_unavailable",
+                &format!("dynamic instrument resolution is unavailable for {namespace}"),
+            );
+        }
+        return instrument_resolution_response(&namespace, items);
+    }
+    if !state
+        .config
+        .python_workers
+        .dispatch_policies
+        .contains_key(LONGPORT_RESOLVE_TASK)
+        || !state
+            .config
+            .python_workers
+            .secret_references
+            .contains_key(LONGPORT_RESOLVE_TASK)
+        || state.worker_status.live.load(Ordering::Relaxed) == 0
+    {
+        for position in missing {
+            items[position] = instrument_resolution_error_item(
+                &namespace,
+                &symbols[position],
+                "provider_unavailable",
+                "LongPort credentials are not configured",
+            );
+        }
+        return instrument_resolution_response(&namespace, items);
+    }
+
+    let missing_symbols = missing
+        .iter()
+        .map(|position| symbols[*position].clone())
+        .collect::<Vec<_>>();
+    let now = Utc::now();
+    let deadline = now + chrono::Duration::seconds(20);
+    let job = match state
+        .jobs
+        .submit(
+            marketcow_jobs::SubmitJob {
+                idempotency_key: format!("instrument-resolve:{request_id}"),
+                job_type: LONGPORT_RESOLVE_TASK.into(),
+                request_schema: LONGPORT_RESOLVE_REQUEST_SCHEMA.into(),
+                request: json!({"namespace":namespace,"symbols":missing_symbols}),
+                deadline,
+                max_attempts: 1,
+                audit_actor: format!("public_request:{request_id}"),
+            },
+            now,
+        )
+        .await
+    {
+        Ok(job) => job,
+        Err(_) => {
+            for position in missing {
+                items[position] = instrument_resolution_error_item(
+                    &namespace,
+                    &symbols[position],
+                    "provider_unavailable",
+                    "LongPort resolution dispatch failed",
+                );
+            }
+            return instrument_resolution_response(&namespace, items);
+        }
+    };
+    let terminal = state.jobs.wait_terminal(&job.job_id, deadline).await;
+    let worker_items = terminal
+        .ok()
+        .filter(|job| job.status == marketcow_jobs::JobStatus::Succeeded)
+        .and_then(|job| read_longport_worker_result(&state.config, &job).ok());
+    let Some((observed_at, worker_items)) = worker_items else {
+        for position in missing {
+            items[position] = instrument_resolution_error_item(
+                &namespace,
+                &symbols[position],
+                "provider_unavailable",
+                "LongPort resolution worker is unavailable",
+            );
+        }
+        return instrument_resolution_response(&namespace, items);
+    };
+    if worker_items.len() != missing.len() {
+        for position in missing {
+            items[position] = instrument_resolution_error_item(
+                &namespace,
+                &symbols[position],
+                "provider_unavailable",
+                "LongPort returned an incomplete resolution batch",
+            );
+        }
+        return instrument_resolution_response(&namespace, items);
+    }
+    for (position, worker_item) in missing.into_iter().zip(worker_items) {
+        items[position] = persist_longport_resolution(
+            &state,
+            &namespace,
+            &symbols[position],
+            observed_at,
+            worker_item,
+        )
+        .await;
+    }
+    instrument_resolution_response(&namespace, items)
+}
+
 fn instrument_schema_version() -> u8 {
     1
 }
@@ -2228,6 +2518,189 @@ impl InstrumentInput {
             content_hash,
             updated_at: Utc::now(),
         }
+    }
+}
+
+fn instrument_record_input(record: marketcow_storage::InstrumentRecord) -> InstrumentInput {
+    InstrumentInput {
+        schema_version: record.schema_version,
+        instrument_id: record.instrument_id,
+        instrument_type: record.instrument_type,
+        asset_class: record.asset_class,
+        symbol: record.symbol,
+        market: record.market,
+        mic: record.mic,
+        currency: record.currency,
+        price_precision: record.price_precision,
+        size_precision: record.size_precision,
+        tick_size: record.tick_size,
+        size_increment: record.size_increment,
+        lot_size: record.lot_size,
+        ts_event: record.ts_event,
+        ts_init: record.ts_init,
+        provider_symbols: record.provider_symbols,
+        broker_symbols: record.broker_symbols,
+    }
+}
+
+fn read_longport_worker_result(
+    config: &Config,
+    job: &marketcow_jobs::ProviderJob,
+) -> Result<(chrono::DateTime<Utc>, Vec<serde_json::Value>)> {
+    let result = job.result.as_ref().context("worker job result is absent")?;
+    if result.sha256.len() != 64
+        || !result
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("worker result identity is invalid");
+    }
+    let expected_relative_path = PathBuf::from(&job.job_type)
+        .join(&job.request_schema)
+        .join(&result.sha256[..2])
+        .join(&result.sha256);
+    if Path::new(&result.relative_path) != expected_relative_path {
+        bail!("worker result content-addressed path is invalid");
+    }
+    let path = config
+        .storage_root
+        .join("artifacts")
+        .join(expected_relative_path);
+    validate_worker_result_artifact(
+        &job.job_type,
+        &job.request_schema,
+        &path,
+        result.size_bytes,
+        &result.media_type,
+    )?;
+    let bytes = fs::read(path)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    validate_longport_resolve_result(&value)?;
+    let observed_at = chrono::DateTime::parse_from_rfc3339(
+        value["observed_at"]
+            .as_str()
+            .context("worker observed_at is absent")?,
+    )?
+    .with_timezone(&Utc);
+    let items = value["items"]
+        .as_array()
+        .context("worker items are absent")?
+        .clone();
+    Ok((observed_at, items))
+}
+
+async fn persist_longport_resolution(
+    state: &AppState,
+    namespace: &str,
+    external_symbol: &str,
+    observed_at: chrono::DateTime<Utc>,
+    worker_item: serde_json::Value,
+) -> serde_json::Value {
+    if worker_item["external_symbol"].as_str() != Some(external_symbol) {
+        return instrument_resolution_error_item(
+            namespace,
+            external_symbol,
+            "provider_unavailable",
+            "LongPort resolution order or identity changed",
+        );
+    }
+    if worker_item["status"] == "error" {
+        return instrument_resolution_error_item(
+            namespace,
+            external_symbol,
+            worker_item["error"]["code"]
+                .as_str()
+                .unwrap_or("provider_unavailable"),
+            worker_item["error"]["message"]
+                .as_str()
+                .unwrap_or("LongPort resolution failed"),
+        );
+    }
+    let instrument_id = worker_item["instrument_id"].as_str().unwrap_or_default();
+    let source_exchange = worker_item["source_exchange"].as_str().unwrap_or_default();
+    let existing = match state.instruments.get(instrument_id).await {
+        Ok(record) => record,
+        Err(_) => {
+            return instrument_resolution_error_item(
+                namespace,
+                external_symbol,
+                "provider_unavailable",
+                "instrument registry is unavailable",
+            );
+        }
+    };
+    let mut input = if let Some(record) = existing {
+        instrument_record_input(record)
+    } else {
+        let Ok(lot_size) = worker_item["lot_size"]
+            .as_str()
+            .unwrap_or_default()
+            .parse::<rust_decimal::Decimal>()
+        else {
+            return instrument_resolution_error_item(
+                namespace,
+                external_symbol,
+                "ambiguous",
+                "LongPort lot size is invalid",
+            );
+        };
+        InstrumentInput {
+            schema_version: 1,
+            instrument_id: instrument_id.into(),
+            instrument_type: "equity".into(),
+            asset_class: "equity".into(),
+            symbol: worker_item["symbol"].as_str().unwrap_or_default().into(),
+            market: worker_item["market"].as_str().unwrap_or_default().into(),
+            mic: worker_item["mic"].as_str().unwrap_or_default().into(),
+            currency: worker_item["currency"].as_str().unwrap_or_default().into(),
+            price_precision: 2,
+            size_precision: 0,
+            tick_size: rust_decimal::Decimal::new(1, 2),
+            size_increment: rust_decimal::Decimal::ONE,
+            lot_size,
+            ts_event: observed_at,
+            ts_init: observed_at,
+            provider_symbols: BTreeMap::new(),
+            broker_symbols: BTreeMap::new(),
+        }
+    };
+    input
+        .provider_symbols
+        .insert("longport".into(), external_symbol.into());
+    let payload = serde_json::to_value(&input).expect("typed instrument input serializes");
+    let record = input.into_record(python_canonical_hash(&payload));
+    match state.instruments.upsert(&record).await {
+        Ok(()) => json!({
+            "namespace":namespace,
+            "external_symbol":external_symbol,
+            "status":"resolved",
+            "instrument_id":record.instrument_id,
+            "symbol":record.symbol,
+            "mic":record.mic,
+            "market":record.market,
+            "currency":record.currency,
+            "source":"longport.static_info",
+            "source_exchange":source_exchange,
+            "observed_at":observed_at,
+            "resolution":"upstream",
+            "error":null
+        }),
+        Err(
+            marketcow_storage::RepositoryError::InvalidInput
+            | marketcow_storage::RepositoryError::InstrumentConflict,
+        ) => instrument_resolution_error_item(
+            namespace,
+            external_symbol,
+            "ambiguous",
+            "LongPort metadata conflicts with the instrument registry",
+        ),
+        Err(_) => instrument_resolution_error_item(
+            namespace,
+            external_symbol,
+            "provider_unavailable",
+            "instrument registry write failed",
+        ),
     }
 }
 
@@ -3831,6 +4304,9 @@ fn validate_worker_result_artifact(
     match (job_type, request_schema) {
         (SEC_DIVIDEND_TASK, SEC_DIVIDEND_REQUEST_SCHEMA) => validate_sec_dividend_result(&value),
         (CSV_INFERENCE_TASK, CSV_INFERENCE_REQUEST_SCHEMA) => validate_csv_inference_result(&value),
+        (LONGPORT_RESOLVE_TASK, LONGPORT_RESOLVE_REQUEST_SCHEMA) => {
+            validate_longport_resolve_result(&value)
+        }
         _ => bail!("worker result contract is not registered in Rust"),
     }
 }
@@ -3984,6 +4460,100 @@ fn validate_csv_inference_result(value: &serde_json::Value) -> Result<()> {
                 .any(|field| field.as_str().is_none_or(|text| text.len() > 1_048_576))
         {
             bail!("CSV row width or field type is invalid");
+        }
+    }
+    Ok(())
+}
+
+fn validate_longport_resolve_result(value: &serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("LongPort worker result must be an object")?;
+    if !exact_object_keys(
+        object,
+        &["schema_version", "namespace", "observed_at", "items"],
+    ) || object["schema_version"] != LONGPORT_RESOLVE_RESULT_SCHEMA
+        || object["namespace"] != "provider:longport"
+        || object["observed_at"]
+            .as_str()
+            .is_none_or(|text| chrono::DateTime::parse_from_rfc3339(text).is_err())
+    {
+        bail!("LongPort worker result envelope is invalid");
+    }
+    let items = object["items"]
+        .as_array()
+        .context("LongPort worker items must be an array")?;
+    if items.is_empty() || items.len() > 20 {
+        bail!("LongPort worker result count is invalid");
+    }
+    for item in items {
+        let item = item
+            .as_object()
+            .context("LongPort worker item must be an object")?;
+        let external_symbol = item
+            .get("external_symbol")
+            .and_then(|value| nonempty_bounded_string(value, 128))
+            .context("LongPort external symbol is invalid")?;
+        if external_symbol != external_symbol.trim().to_ascii_uppercase().replace(' ', "") {
+            bail!("LongPort external symbol is not canonical");
+        }
+        match item.get("status").and_then(serde_json::Value::as_str) {
+            Some("error") => {
+                if !exact_object_keys(item, &["external_symbol", "status", "error"]) {
+                    bail!("LongPort error item contains unexpected fields");
+                }
+                let error = item["error"]
+                    .as_object()
+                    .context("LongPort item error must be an object")?;
+                if !exact_object_keys(error, &["code", "message"])
+                    || error["code"].as_str().is_none_or(|code| {
+                        !matches!(code, "not_found" | "ambiguous" | "provider_unavailable")
+                    })
+                    || nonempty_bounded_string(&error["message"], 1000).is_none()
+                {
+                    bail!("LongPort item error is invalid");
+                }
+            }
+            Some("resolved") => {
+                let keys = [
+                    "external_symbol",
+                    "status",
+                    "instrument_id",
+                    "symbol",
+                    "mic",
+                    "market",
+                    "currency",
+                    "lot_size",
+                    "source",
+                    "source_exchange",
+                ];
+                if !exact_object_keys(item, &keys)
+                    || nonempty_bounded_string(&item["instrument_id"], 128).is_none()
+                    || nonempty_bounded_string(&item["symbol"], 64).is_none()
+                    || nonempty_bounded_string(&item["mic"], 4).is_none()
+                    || item["mic"].as_str().is_none_or(|mic| {
+                        !mic.bytes()
+                            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                    })
+                    || item["market"]
+                        .as_str()
+                        .is_none_or(|market| !matches!(market, "US" | "CN" | "HK"))
+                    || nonempty_bounded_string(&item["currency"], 8).is_none()
+                    || item["source"] != "longport.static_info"
+                    || nonempty_bounded_string(&item["source_exchange"], 64).is_none()
+                {
+                    bail!("LongPort resolved item identity or provenance is invalid");
+                }
+                let lot_size = item["lot_size"]
+                    .as_str()
+                    .context("LongPort lot size must be an exact decimal string")?
+                    .parse::<rust_decimal::Decimal>()
+                    .context("LongPort lot size is invalid")?;
+                if lot_size <= rust_decimal::Decimal::ZERO || lot_size.scale() != 0 {
+                    bail!("LongPort lot size must be a positive integer decimal");
+                }
+            }
+            _ => bail!("LongPort worker item status is invalid"),
         }
     }
     Ok(())
@@ -4548,6 +5118,172 @@ mod tests {
         assert_eq!(
             invalid["result"]["structuredContent"]["error"],
             "invalid_tool_input"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_instrument_resolution_preserves_order_and_fails_closed_without_worker() {
+        let (_dir, state) = test_state();
+        state.instruments.insert_fixture(instrument_fixture()).await;
+        let response = resolve_instruments_batch(
+            State(state),
+            Extension("batch-registry-1".into()),
+            Json(ResolveInstrumentBatchRequest {
+                namespace: "provider:longport".into(),
+                symbols: vec![" AAPL.US ".into(), "missing.us".into()],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(body["count"], 2);
+        assert_eq!(body["resolved_count"], 1);
+        assert_eq!(body["error_count"], 1);
+        assert_eq!(body["items"][0]["external_symbol"], "AAPL.US");
+        assert_eq!(body["items"][0]["instrument_id"], "AAPL.XNAS");
+        assert_eq!(body["items"][0]["resolution"], "registry");
+        assert_eq!(body["items"][1]["external_symbol"], "MISSING.US");
+        assert_eq!(body["items"][1]["error"]["code"], "provider_unavailable");
+    }
+
+    #[tokio::test]
+    async fn batch_instrument_resolution_waits_for_verified_worker_artifact_and_persists_mapping() {
+        let (dir, mut state) = test_state();
+        let policy = marketcow_jobs::DispatchPolicy {
+            max_in_flight: 1,
+            minimum_interval_millis: 0,
+        };
+        state.config.python_workers.dispatch_policies =
+            BTreeMap::from([(LONGPORT_RESOLVE_TASK.into(), policy)]);
+        let secret = dir.path().join("longport-secret.json");
+        fs::write(
+            &secret,
+            br#"{"app_key":"fixture","app_secret":"fixture","access_token":"fixture"}"#,
+        )
+        .unwrap();
+        state
+            .config
+            .python_workers
+            .secret_references
+            .insert(LONGPORT_RESOLVE_TASK.into(), secret);
+        state.worker_status.live.store(1, Ordering::Relaxed);
+        state.jobs = Arc::new(DurableJobCoordinator::memory_with_policies(BTreeMap::from(
+            [(LONGPORT_RESOLVE_TASK.into(), policy)],
+        )));
+
+        let endpoint_state = state.clone();
+        let endpoint = tokio::spawn(async move {
+            resolve_instruments_batch(
+                State(endpoint_state),
+                Extension("batch-worker-1".into()),
+                Json(ResolveInstrumentBatchRequest {
+                    namespace: "provider:longport".into(),
+                    symbols: vec!["MU.US".into(), "MISSING.US".into()],
+                }),
+            )
+            .await
+        });
+        let capabilities = vec![LONGPORT_RESOLVE_TASK.into()];
+        let claimed = loop {
+            if let Some(job) = state
+                .jobs
+                .reconcile_and_claim(
+                    "python-longport-test",
+                    &capabilities,
+                    chrono::Duration::minutes(1),
+                    Utc::now(),
+                )
+                .await
+                .unwrap()
+            {
+                break job;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(claimed.job_type, LONGPORT_RESOLVE_TASK);
+        assert_eq!(
+            claimed.request,
+            json!({"namespace":"provider:longport","symbols":["MU.US","MISSING.US"]})
+        );
+        let lease = claimed.lease_token.clone().unwrap();
+        state
+            .jobs
+            .start(&claimed.job_id, &lease, Utc::now())
+            .await
+            .unwrap();
+        let payload = json!({
+            "schema_version":LONGPORT_RESOLVE_RESULT_SCHEMA,
+            "namespace":"provider:longport",
+            "observed_at":"2026-08-28T00:00:00Z",
+            "items":[
+                {"external_symbol":"MU.US","status":"resolved","instrument_id":"MU.XNAS",
+                 "symbol":"MU","mic":"XNAS","market":"US","currency":"USD",
+                 "lot_size":"1","source":"longport.static_info","source_exchange":"NASD"},
+                {"external_symbol":"MISSING.US","status":"error",
+                 "error":{"code":"not_found","message":"fixture missing"}}
+            ]
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        let staging_root = dir.path().join("worker-staging");
+        let task_root = staging_root.join(&claimed.job_id);
+        fs::create_dir_all(&task_root).unwrap();
+        fs::write(task_root.join("result.json"), &bytes).unwrap();
+        let result = marketcow_jobs::StagedResult {
+            relative_path: "result.json".into(),
+            sha256,
+            size_bytes: bytes.len() as u64,
+            media_type: "application/json".into(),
+        };
+        let artifact = marketcow_storage::promote_worker_artifact(
+            marketcow_storage::WorkerArtifactPromotion {
+                staging_root: &staging_root,
+                artifact_root: &dir.path().join("artifacts"),
+                job_id: &claimed.job_id,
+                dataset: LONGPORT_RESOLVE_TASK,
+                revision: LONGPORT_RESOLVE_REQUEST_SCHEMA,
+                source: "python-worker:test",
+                result: &result,
+                ingested_at: Utc::now(),
+            },
+        )
+        .unwrap();
+        let promoted_result = marketcow_jobs::StagedResult {
+            relative_path: artifact.relative_path.clone(),
+            sha256: artifact.sha256.clone(),
+            size_bytes: artifact.byte_size,
+            media_type: artifact.media_type.clone(),
+        };
+        state
+            .jobs
+            .succeed_with_artifact(
+                &claimed.job_id,
+                &lease,
+                promoted_result,
+                artifact,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        let response = endpoint.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(body["resolved_count"], 1);
+        assert_eq!(body["items"][0]["instrument_id"], "MU.XNAS");
+        assert_eq!(body["items"][0]["resolution"], "upstream");
+        assert_eq!(body["items"][1]["error"]["code"], "not_found");
+        assert_eq!(
+            state
+                .instruments
+                .resolve("provider:longport", "MU.US")
+                .await
+                .unwrap()
+                .unwrap()
+                .instrument_id,
+            "MU.XNAS"
         );
     }
 
@@ -5164,6 +5900,7 @@ mod tests {
             .clone();
         let jobs = Arc::new(DurableJobCoordinator {
             engine: AsyncMutex::new(engine),
+            state_changed: Notify::new(),
             repository: None,
             memory_artifacts: AsyncMutex::new(BTreeMap::new()),
             dispatch_policies: default_dispatch_policies(),

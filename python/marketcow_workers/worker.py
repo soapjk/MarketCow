@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import struct
+from functools import partial
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -23,6 +24,9 @@ SEC_DIVIDEND_RESULT_SCHEMA = "marketcow.worker.transform.sec-dividend-filing-res
 CSV_INFERENCE_TASK = "transform.csv_inference"
 CSV_INFERENCE_REQUEST_SCHEMA = "marketcow.worker.transform.csv-inference.v1"
 CSV_INFERENCE_RESULT_SCHEMA = "marketcow.worker.transform.csv-inference-result.v1"
+LONGPORT_RESOLVE_TASK = "provider.longport.resolve_instruments"
+LONGPORT_RESOLVE_REQUEST_SCHEMA = "marketcow.worker.provider.longport-resolve.v1"
+LONGPORT_RESOLVE_RESULT_SCHEMA = "marketcow.worker.provider.longport-resolve-result.v1"
 POLL_INTERVAL_SECONDS = 1.0
 MAX_CSV_ROWS = 10_000
 MAX_CSV_COLUMNS = 256
@@ -190,9 +194,116 @@ def handle_csv_inference(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_longport_resolution(request: dict[str, Any], *, provider: Any) -> dict[str, Any]:
+    if set(request) != {"namespace", "symbols"}:
+        raise ValueError("LongPort resolution request fields are invalid")
+    if request["namespace"] != "provider:longport":
+        raise ValueError("LongPort resolution namespace is invalid")
+    symbols = request["symbols"]
+    if (
+        not isinstance(symbols, list)
+        or not 1 <= len(symbols) <= 20
+        or any(
+            not isinstance(symbol, str)
+            or not symbol
+            or len(symbol) > 128
+            or symbol != symbol.strip().upper().replace(" ", "")
+            for symbol in symbols
+        )
+    ):
+        raise ValueError("LongPort resolution symbols are invalid")
+    raw_items = provider.resolve_instruments(symbols)
+    if not isinstance(raw_items, list) or len(raw_items) != len(symbols):
+        raise RuntimeError("LongPort returned an incomplete resolution batch")
+    items = []
+    for expected_symbol, raw in zip(symbols, raw_items, strict=True):
+        if not isinstance(raw, dict) or raw.get("external_symbol") != expected_symbol:
+            raise RuntimeError("LongPort resolution order or identity changed")
+        status = raw.get("status")
+        if status == "error":
+            error = raw.get("error")
+            if (
+                not isinstance(error, dict)
+                or error.get("code") not in {"not_found", "ambiguous", "provider_unavailable"}
+                or not isinstance(error.get("message"), str)
+                or not 1 <= len(error["message"]) <= 1000
+            ):
+                raise RuntimeError("LongPort resolution error contract is invalid")
+            items.append({
+                "external_symbol": expected_symbol,
+                "status": "error",
+                "error": {"code": error["code"], "message": error["message"]},
+            })
+            continue
+        required = {
+            "instrument_id", "symbol", "mic", "market", "currency", "lot_size",
+            "source", "source_exchange",
+        }
+        if status != "resolved" or any(key not in raw for key in required):
+            raise RuntimeError("LongPort resolved instrument contract is incomplete")
+        lot_size = str(raw["lot_size"])
+        if not lot_size.isdigit() or int(lot_size) <= 0:
+            raise RuntimeError("LongPort lot size is invalid")
+        item = {
+            "external_symbol": expected_symbol,
+            "status": "resolved",
+            "instrument_id": str(raw["instrument_id"]),
+            "symbol": str(raw["symbol"]),
+            "mic": str(raw["mic"]),
+            "market": str(raw["market"]),
+            "currency": str(raw["currency"]),
+            "lot_size": lot_size,
+            "source": str(raw["source"]),
+            "source_exchange": str(raw["source_exchange"]),
+        }
+        if any(not value or len(value) > 256 for key, value in item.items() if key != "status"):
+            raise RuntimeError("LongPort resolved instrument text is invalid")
+        items.append(item)
+    return {
+        "schema_version": LONGPORT_RESOLVE_RESULT_SCHEMA,
+        "namespace": "provider:longport",
+        "observed_at": datetime.now(UTC).isoformat(),
+        "items": items,
+    }
+
+
+def _longport_handler_from_secret_fd() -> Handler:
+    if os.environ.get("MARKETCOW_PROVIDER_SECRET_FD") != "3":
+        raise ValueError("LongPort provider secret descriptor is unavailable")
+    with os.fdopen(os.dup(3), "rb", closefd=True) as handle:
+        encoded = handle.read(65_537)
+    if not encoded or len(encoded) > 65_536:
+        raise ValueError("LongPort provider secret is invalid")
+    secret = json.loads(encoded)
+    required = {"app_key", "app_secret", "access_token"}
+    optional = {"enable_overnight"}
+    if (
+        not isinstance(secret, dict)
+        or not required.issubset(secret)
+        or not set(secret).issubset(required | optional)
+        or any(not isinstance(secret[key], str) or not secret[key] for key in required)
+        or not isinstance(secret.get("enable_overnight", False), bool)
+    ):
+        raise ValueError("LongPort provider secret fields are invalid")
+    from marketcow.providers.longport_quote import LongPortQuoteProvider
+
+    provider = LongPortQuoteProvider(
+        secret["app_key"],
+        secret["app_secret"],
+        secret["access_token"],
+        enable_overnight=secret.get("enable_overnight", False),
+    )
+    return partial(handle_longport_resolution, provider=provider)
+
+
 HANDLERS: dict[tuple[str, str], Handler] = {
     (SEC_DIVIDEND_TASK, SEC_DIVIDEND_REQUEST_SCHEMA): handle_sec_dividend_filing,
     (CSV_INFERENCE_TASK, CSV_INFERENCE_REQUEST_SCHEMA): handle_csv_inference,
+}
+REGISTERED_CAPABILITIES = {
+    SEC_DIVIDEND_TASK,
+    CSV_INFERENCE_TASK,
+    LONGPORT_RESOLVE_TASK,
 }
 
 
@@ -352,14 +463,24 @@ async def run_worker(
     *,
     once: bool = False,
     capabilities: list[str] | None = None,
+    handler_overrides: dict[tuple[str, str], Handler] | None = None,
 ) -> None:
-    available = {job_type for job_type, _ in HANDLERS}
-    selected = sorted(available if capabilities is None else set(capabilities))
-    if not selected or any(capability not in available for capability in selected):
+    selected = sorted(REGISTERED_CAPABILITIES if capabilities is None else set(capabilities))
+    if not selected or any(capability not in REGISTERED_CAPABILITIES for capability in selected):
         raise ValueError("configured worker capability is unsupported")
     handlers = {
         key: handler for key, handler in HANDLERS.items() if key[0] in selected
     }
+    overrides = {} if handler_overrides is None else dict(handler_overrides)
+    if any(
+        key[0] not in selected or key[0] not in REGISTERED_CAPABILITIES
+        for key in overrides
+    ):
+        raise ValueError("worker handler override capability is invalid")
+    handlers.update(overrides)
+    longport_key = (LONGPORT_RESOLVE_TASK, LONGPORT_RESOLVE_REQUEST_SCHEMA)
+    if LONGPORT_RESOLVE_TASK in selected and longport_key not in handlers:
+        handlers[longport_key] = _longport_handler_from_secret_fd()
     reader, writer, _ = await open_session(socket_path, revision, capabilities=selected)
     try:
         while True:

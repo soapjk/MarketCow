@@ -234,6 +234,31 @@ def main() -> int:
                     and expected.get("content_hash") == canonical_hash(instrument_input)
                     and str(expected.get("updated_at", "")).endswith("Z")
                 )
+                batch_status, batch = post_json(
+                    f"{base_url}/v1/instruments:resolve/query",
+                    {
+                        "namespace": "provider:longport",
+                        "symbols": [" AAPL.US ", "missing.us"],
+                    },
+                )
+                batch_items = batch.get("items", [])
+                checks["batch_resolve_registry_and_worker_unavailable_contract"] = (
+                    batch_status == 200
+                    and batch.get("namespace") == "provider:longport"
+                    and batch.get("count") == 2
+                    and batch.get("resolved_count") == 1
+                    and batch.get("error_count") == 1
+                    and len(batch_items) == 2
+                    and batch_items[0].get("external_symbol") == "AAPL.US"
+                    and batch_items[0].get("instrument_id") == "AAPL.XNAS"
+                    and batch_items[0].get("resolution") == "registry"
+                    and batch_items[0].get("error") is None
+                    and batch_items[1].get("external_symbol") == "MISSING.US"
+                    and batch_items[1].get("status") == "error"
+                    and batch_items[1].get("error", {}).get("code")
+                    == "provider_unavailable"
+                    and batch_items[1].get("instrument_id") is None
+                )
                 audit_status, audit_page = get_json(
                     f"{base_url}/v1/admin/audit?limit=10&offset=0",
                     "local-integration-admin-token",

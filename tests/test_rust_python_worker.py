@@ -12,15 +12,182 @@ from python.marketcow_workers.worker import (
     CSV_INFERENCE_REQUEST_SCHEMA,
     CSV_INFERENCE_RESULT_SCHEMA,
     CSV_INFERENCE_TASK,
+    LONGPORT_RESOLVE_REQUEST_SCHEMA,
+    LONGPORT_RESOLVE_RESULT_SCHEMA,
+    LONGPORT_RESOLVE_TASK,
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     SEC_DIVIDEND_RESULT_SCHEMA,
     handle_sec_dividend_filing,
     handle_csv_inference,
+    handle_longport_resolution,
     handshake,
     run_worker,
     safe_staging_path,
 )
+
+
+class StaticInfoProvider:
+    def resolve_instruments(self, symbols: list[str]) -> list[dict]:
+        assert symbols == ["MU.US", "MISSING.US"]
+        return [
+            {
+                "external_symbol": "MU.US",
+                "status": "resolved",
+                "instrument_id": "MU.XNAS",
+                "symbol": "MU",
+                "mic": "XNAS",
+                "market": "US",
+                "currency": "USD",
+                "lot_size": 1,
+                "name": "Micron Technology",
+                "source": "longport.static_info",
+                "source_exchange": "NASD",
+            },
+            {
+                "external_symbol": "MISSING.US",
+                "status": "error",
+                "error": {
+                    "code": "not_found",
+                    "message": "LongPort returned no static metadata for the symbol",
+                },
+            },
+        ]
+
+
+def test_longport_worker_handler_is_ordered_exact_and_database_agnostic() -> None:
+    result = handle_longport_resolution(
+        {"namespace": "provider:longport", "symbols": ["MU.US", "MISSING.US"]},
+        provider=StaticInfoProvider(),
+    )
+    assert result["schema_version"] == LONGPORT_RESOLVE_RESULT_SCHEMA
+    assert result["namespace"] == "provider:longport"
+    assert result["items"] == [
+        {
+            "external_symbol": "MU.US",
+            "status": "resolved",
+            "instrument_id": "MU.XNAS",
+            "symbol": "MU",
+            "mic": "XNAS",
+            "market": "US",
+            "currency": "USD",
+            "lot_size": "1",
+            "source": "longport.static_info",
+            "source_exchange": "NASD",
+        },
+        {
+            "external_symbol": "MISSING.US",
+            "status": "error",
+            "error": {
+                "code": "not_found",
+                "message": "LongPort returned no static metadata for the symbol",
+            },
+        },
+    ]
+    assert LONGPORT_RESOLVE_TASK == "provider.longport.resolve_instruments"
+    assert LONGPORT_RESOLVE_REQUEST_SCHEMA.endswith("longport-resolve.v1")
+
+
+def test_longport_provider_handler_runs_only_through_leased_uds_task() -> None:
+    async def scenario() -> None:
+        temporary = TemporaryDirectory(prefix="mc-longport-worker-", dir="/tmp")
+        root = Path(temporary.name)
+        socket_path = root / "worker.sock"
+        staging_path = root / "staging" / "job-longport-1"
+        staging_path.mkdir(parents=True)
+        request = {
+            "namespace": "provider:longport",
+            "symbols": ["MU.US", "MISSING.US"],
+        }
+        request_sha256 = hashlib.sha256(
+            json.dumps(request, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+
+        async def read_request(reader: asyncio.StreamReader) -> dict:
+            length = struct.unpack(">I", await reader.readexactly(4))[0]
+            return json.loads(await reader.readexactly(length))
+
+        async def respond(writer: asyncio.StreamWriter, frame: dict, **payload: object) -> None:
+            encoded = json.dumps({
+                "protocol_version": PROTOCOL_VERSION,
+                "message_id": frame["message_id"],
+                **payload,
+            }, separators=(",", ":")).encode()
+            writer.write(struct.pack(">I", len(encoded)) + encoded)
+            await writer.drain()
+
+        async def server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            hello = await read_request(reader)
+            assert hello["capabilities"] == [LONGPORT_RESOLVE_TASK]
+            await respond(
+                writer,
+                hello,
+                message_type="hello_ack",
+                daemon_revision="rust-test-v1",
+                nonce=hello["nonce"],
+                maximum_frame_bytes=MAX_FRAME_BYTES,
+            )
+            poll = await read_request(reader)
+            await respond(
+                writer,
+                poll,
+                message_type="task",
+                job_id="job-longport-1",
+                lease_token="lease-longport-1",
+                deadline=(datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
+                job_type=LONGPORT_RESOLVE_TASK,
+                request_schema=LONGPORT_RESOLVE_REQUEST_SCHEMA,
+                request_sha256=request_sha256,
+                request=request,
+                staging_path=str(staging_path),
+            )
+            start = await read_request(reader)
+            assert start["message_type"] == "start"
+            await respond(
+                writer,
+                start,
+                message_type="job_state",
+                job_id="job-longport-1",
+                status="running",
+                revision=3,
+            )
+            complete = await read_request(reader)
+            body = (staging_path / "result.json").read_bytes()
+            assert complete["sha256"] == hashlib.sha256(body).hexdigest()
+            payload = json.loads(body)
+            assert payload["schema_version"] == LONGPORT_RESOLVE_RESULT_SCHEMA
+            assert payload["items"][0]["instrument_id"] == "MU.XNAS"
+            assert payload["items"][1]["error"]["code"] == "not_found"
+            await respond(
+                writer,
+                complete,
+                message_type="job_state",
+                job_id="job-longport-1",
+                status="succeeded",
+                revision=4,
+            )
+            writer.close()
+            await writer.wait_closed()
+
+        listener = await asyncio.start_unix_server(server, socket_path)
+        try:
+            await run_worker(
+                socket_path,
+                "python-longport-test-v1",
+                once=True,
+                capabilities=[LONGPORT_RESOLVE_TASK],
+                handler_overrides={
+                    (LONGPORT_RESOLVE_TASK, LONGPORT_RESOLVE_REQUEST_SCHEMA): lambda value: (
+                        handle_longport_resolution(value, provider=StaticInfoProvider())
+                    )
+                },
+            )
+        finally:
+            listener.close()
+            await listener.wait_closed()
+            temporary.cleanup()
+
+    asyncio.run(scenario())
 
 
 def test_staging_path_is_contained(tmp_path: Path) -> None:

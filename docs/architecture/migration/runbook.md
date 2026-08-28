@@ -59,6 +59,24 @@ MARKETCOW_PYTHON_DISPATCH_POLICIES_JSON={"transform.sec_dividend_filing":{"max_i
 The last claim time is part of the authoritative job payload, so restart/recovery does not
 reset the interval. `/v1/health` reports the effective non-secret policy map.
 
+Dynamic LongPort instrument resolution is an opt-in third capability. It preserves the frozen
+synchronous `POST /v1/instruments:resolve/query` contract while executing provider I/O only in
+the isolated UDS worker. Rust checks registered mappings first, submits only missing symbols,
+waits on bounded job-state notification, validates the content-addressed result, and is the only
+process allowed to update Instrument Master. Enable it explicitly rather than adding it to the
+default policies:
+
+```text
+MARKETCOW_PYTHON_DISPATCH_POLICIES_JSON={"transform.sec_dividend_filing":{"max_in_flight":1,"minimum_interval_millis":1000},"transform.csv_inference":{"max_in_flight":2,"minimum_interval_millis":0},"provider.longport.resolve_instruments":{"max_in_flight":1,"minimum_interval_millis":250}}
+MARKETCOW_PYTHON_WORKER_POOL_SIZE=3
+MARKETCOW_PYTHON_SECRET_REFERENCES_JSON={"provider.longport.resolve_instruments":"/run/marketcow/secrets/longport-resolver.json"}
+```
+
+The owner-only secret file is JSON with exactly `app_key`, `app_secret`, `access_token`, and an
+optional boolean `enable_overnight`. Rust opens it with symlink following disabled and passes it
+only as FD 3 to the LongPort capability process. The public API never accepts credentials, and
+the worker never receives PostgreSQL, ClickHouse, admin-token, or other capability secrets.
+
 The supervisor deterministically assigns exactly one registered capability to each process
 and passes it as `--capability`. The Python worker rejects unknown capabilities before opening
 the UDS and advertises only its assigned capability during the nonce-bound handshake. Pool
