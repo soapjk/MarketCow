@@ -2379,7 +2379,20 @@ fn start_polymarket_live(
                             }
                             Err(error) => {
                                 let _ = response.send(Err(error));
-                                break 'service;
+                                match wait_for_polymarket_scope_recovery(
+                                    &state,
+                                    &live,
+                                    &mut shutdown,
+                                    &mut scope_switches,
+                                )
+                                .await
+                                {
+                                    Some(activated) => {
+                                        live = activated;
+                                        continue 'service;
+                                    }
+                                    None => break 'service,
+                                }
                             }
                         }
                     }
@@ -2388,8 +2401,22 @@ fn start_polymarket_live(
                             if let Err(error) = apply_polymarket_terminal_gaps(&state, &live.token_ids).await {
                                 warn!(error=%error, "polymarket_terminal_gap_failed_closed");
                             }
+                            let _ = (&mut transport).await;
                             let _ = checkpoint_polymarket_runtime(&state).await;
-                            break 'service;
+                            match wait_for_polymarket_scope_recovery(
+                                &state,
+                                &live,
+                                &mut shutdown,
+                                &mut scope_switches,
+                            )
+                            .await
+                            {
+                                Some(activated) => {
+                                    live = activated;
+                                    continue 'service;
+                                }
+                                None => break 'service,
+                            }
                         };
                         match apply_polymarket_transport_frames(&state, frames).await {
                             Ok(events) => {
@@ -2410,7 +2437,20 @@ fn start_polymarket_live(
                                 let _ = (&mut transport).await;
                                 let _ = apply_polymarket_terminal_gaps(&state, &live.token_ids).await;
                                 let _ = checkpoint_polymarket_runtime(&state).await;
-                                break 'service;
+                                match wait_for_polymarket_scope_recovery(
+                                    &state,
+                                    &live,
+                                    &mut shutdown,
+                                    &mut scope_switches,
+                                )
+                                .await
+                                {
+                                    Some(activated) => {
+                                        live = activated;
+                                        continue 'service;
+                                    }
+                                    None => break 'service,
+                                }
                             }
                         }
                     }
@@ -2553,6 +2593,36 @@ async fn apply_polymarket_terminal_gaps(state: &AppState, tokens: &[String]) -> 
         .collect();
     apply_polymarket_transport_frames(state, frames).await?;
     Ok(())
+}
+
+async fn wait_for_polymarket_scope_recovery(
+    state: &AppState,
+    current: &PolymarketLiveConfig,
+    shutdown: &mut watch::Receiver<bool>,
+    scope_switches: &mut mpsc::Receiver<PolymarketScopeSwitchRequest>,
+) -> Option<PolymarketLiveConfig> {
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return None;
+                }
+            }
+            request = scope_switches.recv() => {
+                let PolymarketScopeSwitchRequest { live, runtime, response } = request?;
+                match commit_polymarket_scope_switch(state, current, live, runtime).await {
+                    Ok((activated, receipt)) => {
+                        info!(scope_id=%activated.scope_id, boundary_cursor=receipt.boundary_cursor, "polymarket_scope_recovered");
+                        let _ = response.send(Ok(receipt));
+                        return Some(activated);
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn checkpoint_polymarket_runtime(state: &AppState) -> Result<()> {
