@@ -22,7 +22,8 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     net::SocketAddr,
-    os::unix::fs::PermissionsExt,
+    os::fd::AsRawFd,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -93,7 +94,7 @@ enum WalCommand {
     Verify { path: PathBuf },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 struct Config {
     profile: String,
     bind: SocketAddr,
@@ -107,7 +108,7 @@ struct Config {
     python_workers: PythonWorkerConfig,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 struct PythonWorkerConfig {
     executable: Option<PathBuf>,
     script: Option<PathBuf>,
@@ -119,6 +120,8 @@ struct PythonWorkerConfig {
     memory_limit_mib: u64,
     cpu_limit_seconds: u64,
     dispatch_policies: BTreeMap<String, marketcow_jobs::DispatchPolicy>,
+    #[serde(skip_serializing)]
+    secret_references: BTreeMap<String, PathBuf>,
 }
 
 impl PythonWorkerConfig {
@@ -184,6 +187,13 @@ impl PythonWorkerConfig {
             Err(error) => return Err(error.into()),
         };
         validate_dispatch_policies(&dispatch_policies)?;
+        let secret_references = match env::var("MARKETCOW_PYTHON_SECRET_REFERENCES_JSON") {
+            Ok(raw) => serde_json::from_str::<BTreeMap<String, PathBuf>>(&raw)
+                .context("Python secret reference JSON is invalid")?,
+            Err(env::VarError::NotPresent) => BTreeMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+        validate_secret_reference_config(&secret_references, &dispatch_policies)?;
         if enabled && pool_size < dispatch_policies.len() {
             bail!("Python worker pool must provide at least one process per capability");
         }
@@ -198,6 +208,7 @@ impl PythonWorkerConfig {
             memory_limit_mib,
             cpu_limit_seconds,
             dispatch_policies,
+            secret_references,
         })
     }
 
@@ -214,6 +225,7 @@ impl PythonWorkerConfig {
             memory_limit_mib: 2048,
             cpu_limit_seconds: 900,
             dispatch_policies: default_dispatch_policies(),
+            secret_references: BTreeMap::new(),
         }
     }
 
@@ -262,6 +274,21 @@ fn validate_dispatch_policies(
         policy
             .validate()
             .map_err(|error| anyhow::anyhow!("Python dispatch policy is invalid: {error}"))?;
+    }
+    Ok(())
+}
+
+fn validate_secret_reference_config(
+    references: &BTreeMap<String, PathBuf>,
+    policies: &BTreeMap<String, marketcow_jobs::DispatchPolicy>,
+) -> Result<()> {
+    for (capability, path) in references {
+        if !policies.contains_key(capability) {
+            bail!("Python secret reference capability has no dispatch policy");
+        }
+        if !path.is_absolute() {
+            bail!("Python secret reference path must be absolute");
+        }
     }
     Ok(())
 }
@@ -786,7 +813,37 @@ fn preflight(config: &Config) -> Result<()> {
             bail!("worker RSS monitor requires /bin/ps");
         }
     }
+    for (capability, path) in &config.python_workers.secret_references {
+        open_worker_secret(path).with_context(|| {
+            format!("worker secret reference is invalid for capability {capability}")
+        })?;
+    }
     Ok(())
+}
+
+fn open_worker_secret(path: &Path) -> Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .context("worker secret reference is unavailable")?;
+    let metadata = file
+        .metadata()
+        .context("worker secret metadata is unavailable")?;
+    if !metadata.is_file() {
+        bail!("worker secret reference must be a regular file");
+    }
+    // SAFETY: geteuid has no preconditions and does not mutate process state.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!("worker secret reference must be owned by the MarketCow user");
+    }
+    if metadata.mode() & 0o077 != 0 {
+        bail!("worker secret reference must not grant group or other permissions");
+    }
+    if metadata.len() == 0 || metadata.len() > 64 * 1024 {
+        bail!("worker secret reference size must be between 1 and 65536 bytes");
+    }
+    Ok(file)
 }
 
 fn sanitize_worker_command(
@@ -812,6 +869,35 @@ fn sanitize_worker_command(
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     apply_worker_resource_limits(command, config);
+}
+
+fn attach_worker_secret(
+    command: &mut ProcessCommand,
+    config: &PythonWorkerConfig,
+    capability: &str,
+) -> Result<()> {
+    let Some(path) = config.secret_references.get(capability) else {
+        return Ok(());
+    };
+    let secret_file = open_worker_secret(path)?;
+    command.env("MARKETCOW_PROVIDER_SECRET_FD", "3");
+    // SAFETY: the callback invokes only async-signal-safe fcntl/dup2 operations after fork. The
+    // captured File keeps the source descriptor open until spawning completes; its content and
+    // path are never placed in the child environment or command line.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            let source = secret_file.as_raw_fd();
+            if source == 3 {
+                if libc::fcntl(source, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else if libc::dup2(source, 3) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
 }
 
 fn apply_worker_resource_limits(command: &mut ProcessCommand, config: &PythonWorkerConfig) {
@@ -858,7 +944,11 @@ fn set_process_limit(resource: libc::c_int, value: libc::rlim_t) -> std::io::Res
     }
 }
 
-fn worker_command(config: &PythonWorkerConfig, socket: &Path, capability: &str) -> ProcessCommand {
+fn worker_command(
+    config: &PythonWorkerConfig,
+    socket: &Path,
+    capability: &str,
+) -> Result<ProcessCommand> {
     let mut command = ProcessCommand::new(
         config
             .executable
@@ -866,7 +956,8 @@ fn worker_command(config: &PythonWorkerConfig, socket: &Path, capability: &str) 
             .expect("enabled worker has executable"),
     );
     sanitize_worker_command(&mut command, config, socket, capability);
-    command
+    attach_worker_secret(&mut command, config, capability)?;
+    Ok(command)
 }
 
 fn consume_restart_budget(
@@ -983,7 +1074,13 @@ async fn supervise_worker_slot(
             tokio::time::sleep(backoff).await;
         }
         first_spawn = false;
-        let mut command = worker_command(&config, &socket, &capability);
+        let mut command = match worker_command(&config, &socket, &capability) {
+            Ok(command) => command,
+            Err(error) => {
+                warn!(slot, capability, error=%error, "python_worker_command_failed_closed");
+                continue;
+            }
+        };
         match command.spawn() {
             Ok(mut child) => {
                 status.live.fetch_add(1, Ordering::Relaxed);
@@ -3473,9 +3570,12 @@ mod tests {
     async fn supervised_worker_command_clears_credentials_and_applies_resource_limits() {
         let dir = tempdir().unwrap();
         let script = dir.path().join("credential-check.sh");
+        let secret = dir.path().join("provider-secret");
+        fs::write(&secret, b"capability-secret\n").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(
             &script,
-            b"#!/bin/sh\nif [ \"${MARKETCOW_POSTGRES_DSN+x}\" = x ] || [ \"${MARKETCOW_CLICKHOUSE_DSN+x}\" = x ] || [ \"${MARKETCOW_RUST_ADMIN_TOKEN+x}\" = x ]; then exit 42; fi\n[ \"$(ulimit -t)\" = 7 ] || exit 43\n[ \"$(ulimit -n)\" = 256 ] || exit 45\n[ \"$(ulimit -c)\" = 0 ] || exit 46\nexit 0\n",
+            b"#!/bin/sh\nif [ \"${MARKETCOW_POSTGRES_DSN+x}\" = x ] || [ \"${MARKETCOW_CLICKHOUSE_DSN+x}\" = x ] || [ \"${MARKETCOW_RUST_ADMIN_TOKEN+x}\" = x ]; then exit 42; fi\n[ \"${MARKETCOW_PROVIDER_SECRET_FD:-}\" = 3 ] || exit 47\nIFS= read -r provider_secret <&3 || exit 48\n[ \"$provider_secret\" = capability-secret ] || exit 49\n[ \"$(ulimit -t)\" = 7 ] || exit 43\n[ \"$(ulimit -n)\" = 256 ] || exit 45\n[ \"$(ulimit -c)\" = 0 ] || exit 46\nexit 0\n",
         )
         .unwrap();
         let config = PythonWorkerConfig {
@@ -3489,7 +3589,11 @@ mod tests {
             memory_limit_mib: 512,
             cpu_limit_seconds: 7,
             dispatch_policies: default_dispatch_policies(),
+            secret_references: BTreeMap::from([(CSV_INFERENCE_TASK.into(), secret)]),
         };
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("provider-secret"));
+        assert!(!serialized.contains("secret_references"));
         let mut command = ProcessCommand::new("/bin/sh");
         command
             .env("MARKETCOW_POSTGRES_DSN", "must-not-leak")
@@ -3501,7 +3605,22 @@ mod tests {
             &dir.path().join("worker.sock"),
             CSV_INFERENCE_TASK,
         );
+        attach_worker_secret(&mut command, &config, CSV_INFERENCE_TASK).unwrap();
         assert!(command.status().await.unwrap().success());
+    }
+
+    #[test]
+    fn worker_secret_reference_rejects_weak_permissions_and_symlinks() {
+        let dir = tempdir().unwrap();
+        let secret = dir.path().join("provider-secret");
+        fs::write(&secret, b"secret").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(open_worker_secret(&secret).is_err());
+
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("provider-secret-link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(open_worker_secret(&link).is_err());
     }
 
     #[tokio::test]

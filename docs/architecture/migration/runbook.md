@@ -65,6 +65,22 @@ the UDS and advertises only its assigned capability during the nonce-bound hands
 size must be at least the number of configured capabilities, ensuring every policy has an
 isolated executor. A restarted slot retains the same assignment.
 
+Provider secrets are optional capability-to-file references and are never accepted as secret
+values in configuration. Configure only absolute, owner-only regular files (1–65536 bytes):
+
+```text
+MARKETCOW_PYTHON_SECRET_REFERENCES_JSON={"transform.sec_dividend_filing":"/run/marketcow/secrets/sec-provider"}
+```
+
+At preflight and again before every spawn, Rust opens each reference with symlink following
+disabled, verifies that the file is owned by the MarketCow effective user and has no group or
+other permissions, then passes only the matching capability's already-open descriptor as FD 3.
+The child receives `MARKETCOW_PROVIDER_SECRET_FD=3`; neither secret content nor its path is
+placed in the environment, command line, health response or logs. Unmapped processes receive
+no secret descriptor. Rotate a secret by atomically replacing the owner-only file and allowing
+the affected slot to restart through the bounded supervisor policy; never restart MarketCow
+from Tradude.
+
 ## Cutover (future Phase 7 gate)
 
 Drain Rust and Python consumers; stop the Python writer; flush and hash legacy WAL; record a
