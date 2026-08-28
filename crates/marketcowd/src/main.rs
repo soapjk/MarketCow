@@ -133,10 +133,15 @@ struct Config {
 #[derive(Clone, Serialize)]
 struct PolymarketLiveConfig {
     token_ids: Vec<String>,
+    market_ids: Vec<String>,
     market_count: Option<usize>,
+    catalog_revision: Option<String>,
+    catalog_frame: Option<serde_json::Value>,
     scope_file_sha256: Option<String>,
     source_manifest_sha256: Option<String>,
     catalog_index_sha256: Option<String>,
+    catalog_sha256: Option<String>,
+    registry_sha256: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +152,8 @@ struct PolymarketLiveScopeFile {
     token_count: usize,
     market_ids: Vec<String>,
     token_ids: Vec<String>,
+    catalog_revision: String,
+    catalog_frame: serde_json::Value,
     source: PolymarketLiveScopeSource,
 }
 
@@ -154,6 +161,17 @@ struct PolymarketLiveScopeFile {
 struct PolymarketLiveScopeSource {
     manifest_sha256: String,
     catalog_index_sha256: String,
+    catalog_sha256: String,
+    registry_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct PolymarketCatalogFrame {
+    event_type: String,
+    catalog_revision: String,
+    markets: Vec<marketcow_core::MarketRecord>,
+    #[serde(default)]
+    negative_risk_relations: Vec<marketcow_core::NegativeRiskRelation>,
 }
 
 #[derive(Clone, Serialize)]
@@ -422,10 +440,15 @@ fn load_polymarket_live_config(expected_scope_id: &str) -> Result<Option<Polymar
                 .context("MARKETCOW_POLYMARKET_TOKEN_IDS_JSON must be a JSON array")?;
             Ok(Some(PolymarketLiveConfig {
                 token_ids: validate_polymarket_token_ids(token_ids)?,
+                market_ids: Vec::new(),
                 market_count: None,
+                catalog_revision: None,
+                catalog_frame: None,
                 scope_file_sha256: None,
                 source_manifest_sha256: None,
                 catalog_index_sha256: None,
+                catalog_sha256: None,
+                registry_sha256: None,
             }))
         }
         (None, Some(scope_path)) => load_polymarket_scope_file(expected_scope_id, &scope_path),
@@ -461,7 +484,7 @@ fn load_polymarket_scope_file(
     let scope_file_sha256 = hex::encode(Sha256::digest(&encoded));
     let scope: PolymarketLiveScopeFile = serde_json::from_slice(&encoded)
         .context("MARKETCOW_POLYMARKET_SCOPE_FILE must be valid JSON")?;
-    if scope.schema_version != "marketcow.polymarket.rust-live-scope.v1" {
+    if scope.schema_version != "marketcow.polymarket.rust-live-scope.v2" {
         bail!("unsupported Polymarket Rust live scope schema");
     }
     if scope.scope_id != expected_scope_id {
@@ -484,9 +507,47 @@ fn load_polymarket_scope_file(
         bail!("Polymarket Rust live scope must contain exactly two tokens per market");
     }
     let token_ids = validate_polymarket_token_ids(scope.token_ids)?;
+    let catalog: PolymarketCatalogFrame = serde_json::from_value(scope.catalog_frame.clone())
+        .context("Polymarket scope catalog_frame is invalid")?;
+    let catalog_markets = catalog
+        .markets
+        .iter()
+        .map(|market| market.market_id.clone())
+        .collect::<BTreeSet<_>>();
+    let catalog_tokens = catalog
+        .markets
+        .iter()
+        .flat_map(|market| {
+            market
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.token_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    if catalog.event_type != "catalog_revision"
+        || catalog.catalog_revision != scope.catalog_revision
+        || catalog_markets != markets
+        || catalog_tokens != token_ids.iter().cloned().collect()
+        || catalog
+            .markets
+            .iter()
+            .any(|market| market.instrument_facts.is_none())
+    {
+        bail!("Polymarket scope catalog frame does not exactly cover the declared scope");
+    }
+    let relation_markets = catalog
+        .negative_risk_relations
+        .iter()
+        .flat_map(|relation| relation.member_market_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if !relation_markets.is_subset(&markets) {
+        bail!("Polymarket scope relation crosses the declared scope boundary");
+    }
     for digest in [
         &scope.source.manifest_sha256,
         &scope.source.catalog_index_sha256,
+        &scope.source.catalog_sha256,
+        &scope.source.registry_sha256,
     ] {
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("Polymarket Rust live scope source hashes must be SHA-256 hex digests");
@@ -494,10 +555,15 @@ fn load_polymarket_scope_file(
     }
     Ok(Some(PolymarketLiveConfig {
         token_ids,
+        market_ids: markets.into_iter().collect(),
         market_count: Some(scope.market_count),
+        catalog_revision: Some(scope.catalog_revision),
+        catalog_frame: Some(scope.catalog_frame),
         scope_file_sha256: Some(scope_file_sha256),
         source_manifest_sha256: Some(scope.source.manifest_sha256.to_ascii_lowercase()),
         catalog_index_sha256: Some(scope.source.catalog_index_sha256.to_ascii_lowercase()),
+        catalog_sha256: Some(scope.source.catalog_sha256.to_ascii_lowercase()),
+        registry_sha256: Some(scope.source.registry_sha256.to_ascii_lowercase()),
     }))
 }
 
@@ -2297,6 +2363,61 @@ fn start_polymarket_live(
     }))
 }
 
+fn projection_matches_polymarket_scope(
+    live: &PolymarketLiveConfig,
+    projection: &marketcow_core::Projection,
+    require_books: bool,
+) -> bool {
+    let expected_markets = live.market_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let expected_tokens = live.token_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let actual_markets = projection.markets.keys().cloned().collect::<BTreeSet<_>>();
+    let catalog_tokens = projection
+        .markets
+        .values()
+        .flat_map(|market| {
+            market
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.token_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let books = projection.books.keys().cloned().collect::<BTreeSet<_>>();
+    live.catalog_revision.as_ref() == projection.catalog_revision.as_ref()
+        && expected_markets == actual_markets
+        && expected_tokens == catalog_tokens
+        && projection
+            .markets
+            .values()
+            .all(|market| market.instrument_facts.is_some())
+        && (!require_books || books == expected_tokens)
+}
+
+fn seed_polymarket_scope_catalog(
+    runtime: &mut marketcow_runtime::PolymarketRuntime,
+    config: &Config,
+) -> Result<()> {
+    let Some(live) = &config.polymarket_live else {
+        return Ok(());
+    };
+    let Some(catalog_frame) = &live.catalog_frame else {
+        return Ok(());
+    };
+    let projection = runtime.projection();
+    if projection_matches_polymarket_scope(live, &projection, false) {
+        return Ok(());
+    }
+    if projection.catalog_revision.is_some() {
+        bail!("persisted Polymarket catalog does not match configured exact scope");
+    }
+    runtime.apply_raw(catalog_frame.clone(), Utc::now())?;
+    let projection = runtime.projection();
+    if !projection_matches_polymarket_scope(live, &projection, false) {
+        bail!("Polymarket catalog seed failed exact-scope validation");
+    }
+    runtime.checkpoint()?;
+    Ok(())
+}
+
 async fn apply_polymarket_transport_frames(
     state: &AppState,
     frames: Vec<marketcow_polymarket::RawTransportFrame>,
@@ -2371,10 +2492,11 @@ async fn serve() -> Result<()> {
     preflight(&config)?;
     let audit = Arc::new(AuditCoordinator::open(&config).await?);
     let control_plane = Arc::new(ControlPlaneCoordinator::open(&config).await?);
-    let runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(
+    let mut runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(
         &config,
         &control_plane.config_revision,
     ))?;
+    seed_polymarket_scope_catalog(&mut runtime, &config)?;
     let projection = runtime.projection();
     let recent_events = runtime.recent_events().to_vec();
     let jobs = Arc::new(
@@ -4459,12 +4581,21 @@ async fn readiness(State(state): State<AppState>) -> Response {
 }
 
 async fn scope(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(
-        serde_json::to_value(marketcow_contracts::ScopeDiscovery::shadow(
-            state.config.scope_id,
-        ))
-        .expect("scope contract is serializable"),
-    )
+    let projection = state.projection.load_full();
+    let ready = polymarket_projection_ready(&state.config, &projection);
+    let live = state.config.polymarket_live.as_ref();
+    Json(json!({
+        "schema_version":"marketcow.polymarket.scope-discovery.v2",
+        "active_scope_id":state.config.scope_id,
+        "scope_status":if ready { "ready" } else { "unready" },
+        "mode":"shadow",
+        "ready":ready,
+        "market_count":live.and_then(|value| value.market_count),
+        "token_count":live.map(|value| value.token_ids.len()),
+        "catalog_revision":live.and_then(|value| value.catalog_revision.clone()),
+        "boundary_cursor":projection.cursor,
+        "real_order_submission_enabled":false,
+    }))
 }
 
 async fn live_snapshot(
@@ -4472,7 +4603,7 @@ async fn live_snapshot(
     Extension(request_id): Extension<String>,
 ) -> Response {
     let projection = state.projection.load_full();
-    if !projection.ready || !projection_fresh(&state.config, &projection) {
+    if !polymarket_projection_ready(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "polymarket_projection_unready_or_stale",
@@ -4501,7 +4632,7 @@ async fn live_events(
     Query(query): Query<EventQuery>,
 ) -> Response {
     let projection = state.projection.load_full();
-    if !projection.ready || !projection_fresh(&state.config, &projection) {
+    if !polymarket_projection_ready(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "polymarket_projection_unready_or_stale",
@@ -4535,7 +4666,7 @@ async fn live_checkpoint(
     Extension(request_id): Extension<String>,
 ) -> Response {
     let projection = state.projection.load_full();
-    if !projection.ready || !projection_fresh(&state.config, &projection) {
+    if !polymarket_projection_ready(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "polymarket_projection_unready_or_stale",
@@ -4551,7 +4682,7 @@ async fn live_full_sync(
     Extension(request_id): Extension<String>,
 ) -> Response {
     let projection = state.projection.load_full();
-    if !projection.ready || !projection_fresh(&state.config, &projection) {
+    if !polymarket_projection_ready(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "polymarket_projection_unready_or_stale",
@@ -4574,7 +4705,7 @@ async fn market_data_stream(
     Query(query): Query<StreamQuery>,
 ) -> Response {
     let projection = state.projection.load_full();
-    if !projection.ready || !projection_fresh(&state.config, &projection) {
+    if !polymarket_projection_ready(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "polymarket_projection_unready_or_stale",
@@ -4598,7 +4729,7 @@ async fn market_data_stream(
     let receiver = state.stream.subscribe();
     let records = state.recent_events.load_full();
     let projection = state.projection.load_full();
-    if !projection.ready || !projection_fresh(&state.config, &projection) {
+    if !polymarket_projection_ready(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "polymarket_projection_unready_or_stale",
@@ -4733,7 +4864,7 @@ async fn serve_market_data_stream(
                     }
                     last_cursor = record.event.cursor;
                     let current = state.projection.load_full();
-                    if !current.ready || !projection_fresh(&state.config, &current) {
+                    if !polymarket_projection_ready(&state.config, &current) {
                         send_resync_and_close(
                             &mut socket,
                             &state,
@@ -4760,7 +4891,7 @@ async fn serve_market_data_stream(
             },
             Next::FreshnessCheck => {
                 let current = state.projection.load_full();
-                if !current.ready || !projection_fresh(&state.config, &current) {
+                if !polymarket_projection_ready(&state.config, &current) {
                     send_resync_and_close(
                         &mut socket,
                         &state,
@@ -5337,6 +5468,15 @@ fn projection_maximum_book_age_ms(projection: &marketcow_core::Projection) -> u6
 
 fn projection_fresh(config: &Config, projection: &marketcow_core::Projection) -> bool {
     projection_maximum_book_age_ms(projection) <= config.maximum_book_age_ms
+}
+
+fn polymarket_projection_ready(config: &Config, projection: &marketcow_core::Projection) -> bool {
+    projection.ready
+        && projection_fresh(config, projection)
+        && config.polymarket_live.as_ref().is_none_or(|live| {
+            live.catalog_frame.is_none()
+                || projection_matches_polymarket_scope(live, projection, true)
+        })
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
@@ -6197,15 +6337,27 @@ mod tests {
         fs::write(
             &path,
             serde_json::to_vec(&json!({
-                "schema_version":"marketcow.polymarket.rust-live-scope.v1",
+                "schema_version":"marketcow.polymarket.rust-live-scope.v2",
                 "scope_id":"scope-100",
                 "market_count":2,
                 "token_count":4,
                 "market_ids":["2","1"],
                 "token_ids":["40","10","30","20"],
+                "catalog_revision":"catalog-v1",
+                "catalog_frame":{
+                    "event_type":"catalog_revision",
+                    "catalog_revision":"catalog-v1",
+                    "markets":[
+                        test_scope_market("1", "10", "20"),
+                        test_scope_market("2", "30", "40")
+                    ],
+                    "negative_risk_relations":[]
+                },
                 "source":{
                     "manifest_sha256":"a".repeat(64),
-                    "catalog_index_sha256":"B".repeat(64)
+                    "catalog_index_sha256":"B".repeat(64),
+                    "catalog_sha256":"c".repeat(64),
+                    "registry_sha256":"d".repeat(64)
                 }
             }))
             .unwrap(),
@@ -6227,6 +6379,32 @@ mod tests {
         );
         assert_eq!(loaded.scope_file_sha256.as_deref().map(str::len), Some(64));
         assert!(load_polymarket_scope_file("wrong-scope", path.to_str().unwrap()).is_err());
+    }
+
+    fn test_scope_market(market_id: &str, yes: &str, no: &str) -> serde_json::Value {
+        json!({
+            "market_id":market_id,
+            "condition_id":format!("condition-{market_id}"),
+            "outcomes":[
+                {"token_id":yes,"outcome":"Yes","instrument_id":format!("POLY:{market_id}:{yes}")},
+                {"token_id":no,"outcome":"No","instrument_id":format!("POLY:{market_id}:{no}")}
+            ],
+            "negative_risk_group":null,
+            "lifecycle_state":"active",
+            "resolution":null,
+            "metadata_revision":format!("metadata-{market_id}"),
+            "observed_at":"2026-08-28T00:00:00Z",
+            "terminal_at":null,
+            "instrument_facts":{
+                "price_increment":"0.01",
+                "size_increment":"0.01",
+                "minimum_order_size":"5",
+                "settlement_currency":"pUSD",
+                "start_at":"2026-01-01T00:00:00Z",
+                "end_at":"2027-01-01T00:00:00Z",
+                "revision":format!("instrument-{market_id}")
+            }
+        })
     }
 
     fn instrument_fixture() -> marketcow_storage::InstrumentRecord {

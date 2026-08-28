@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "marketcow.polymarket.rust-live-scope.v1"
+SCHEMA_VERSION = "marketcow.polymarket.rust-live-scope.v2"
 
 
 def sha256_file(path: Path) -> str:
@@ -44,6 +44,8 @@ def _decimal_ids(value: Any, name: str) -> list[str]:
 def build_scope(
     manifest_path: Path,
     catalog_index_path: Path,
+    catalog_path: Path,
+    registry_path: Path,
     *,
     expected_market_count: int,
     expected_token_count: int,
@@ -70,6 +72,11 @@ def build_scope(
         rows = connection.execute(
             f"SELECT market_id, token_id FROM tokens WHERE market_id IN ({placeholders}) "
             "ORDER BY market_id, token_id",
+            market_ids,
+        ).fetchall()
+        catalog_rows = connection.execute(
+            f"SELECT market_id, byte_offset, byte_length FROM markets "
+            f"WHERE market_id IN ({placeholders}) ORDER BY market_id",
             market_ids,
         ).fetchall()
 
@@ -100,6 +107,108 @@ def build_scope(
     if manifest_revision is not None and manifest_revision != catalog_revision:
         raise ValueError("manifest/catalog index revision mismatch")
     catalog_index_sha256 = sha256_file(catalog_index_path)
+    catalog_sha256 = sha256_file(catalog_path)
+    market_records: list[dict[str, Any]] = []
+    with catalog_path.open("rb") as catalog:
+        for market_id, byte_offset, byte_length in catalog_rows:
+            catalog.seek(byte_offset)
+            raw = catalog.read(byte_length)
+            row = json.loads(raw)
+            identity = row.get("identity") or {}
+            rules = row.get("rules") or {}
+            instrument = rules.get("instrument") or {}
+            outcomes = identity.get("outcomes")
+            if identity.get("market_id") != market_id or not isinstance(outcomes, list):
+                raise ValueError(f"catalog identity mismatch for market {market_id}")
+            if len(outcomes) != 2:
+                raise ValueError(f"catalog market {market_id} must have two outcomes")
+            required_facts = {
+                key: _required_string(instrument.get(key), f"{market_id}.instrument.{key}")
+                for key in (
+                    "price_increment",
+                    "size_increment",
+                    "minimum_order_size",
+                    "settlement_currency",
+                    "revision",
+                )
+            }
+            start_at = _required_string(row.get("start_at"), f"{market_id}.start_at")
+            end_at = _required_string(row.get("end_at"), f"{market_id}.end_at")
+            lifecycle = _required_string(row.get("lifecycle_state"), f"{market_id}.lifecycle_state")
+            if lifecycle != "active":
+                raise ValueError(f"exact live scope contains non-active market {market_id}")
+            market_records.append(
+                {
+                    "market_id": market_id,
+                    "condition_id": _required_string(
+                        identity.get("condition_id"), f"{market_id}.condition_id"
+                    ),
+                    "outcomes": [
+                        {
+                            "token_id": _required_string(value.get("token_id"), "token_id"),
+                            "outcome": _required_string(value.get("outcome"), "outcome"),
+                            "instrument_id": _required_string(
+                                value.get("instrument_id"), "instrument_id"
+                            ),
+                        }
+                        for value in outcomes
+                    ],
+                    "negative_risk_group": None,
+                    "lifecycle_state": lifecycle,
+                    "resolution": row.get("resolution"),
+                    "metadata_revision": _required_string(
+                        row.get("metadata_revision"), f"{market_id}.metadata_revision"
+                    ),
+                    "observed_at": _required_string(
+                        row.get("observed_at"), f"{market_id}.observed_at"
+                    ),
+                    "terminal_at": None,
+                    "instrument_facts": {
+                        **required_facts,
+                        "start_at": start_at,
+                        "end_at": end_at,
+                    },
+                }
+            )
+    if len(market_records) != len(market_ids):
+        raise ValueError("catalog index did not resolve every exact-scope market")
+
+    registry_bytes = registry_path.read_bytes()
+    registry = json.loads(registry_bytes)
+    relation_ids = manifest.get("negative_risk_relation_ids") or []
+    relation_by_id = {
+        relation.get("relation_id"): relation
+        for relation in registry.get("negative_risk_groups", [])
+    }
+    market_record_by_id = {record["market_id"]: record for record in market_records}
+    relations: list[dict[str, Any]] = []
+    for relation_id in relation_ids:
+        relation = relation_by_id.get(relation_id)
+        if not relation or not relation.get("complete"):
+            raise ValueError(f"missing or incomplete negative-risk relation {relation_id}")
+        members = relation.get("members") or []
+        member_ids = {str(member.get("market_id")) for member in members}
+        if not member_ids or not member_ids.issubset(market_record_by_id):
+            raise ValueError(f"negative-risk relation {relation_id} crosses scope boundary")
+        yes_tokens: set[str] = set()
+        for member in members:
+            market_id = str(member["market_id"])
+            market_record_by_id[market_id]["negative_risk_group"] = relation_id
+            instrument_id = _required_string(member.get("yes_outcome_id"), "yes_outcome_id")
+            yes_tokens.add(instrument_id.rsplit(":", 1)[-1])
+        relations.append(
+            {
+                "group_id": relation_id,
+                "member_market_ids": sorted(member_ids),
+                "yes_token_ids": sorted(yes_tokens),
+                "revision": _required_string(
+                    relation.get("relation_revision"), "relation_revision"
+                ),
+                "complete": True,
+                "valid_to": None,
+            }
+        )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "scope_id": scope_id,
@@ -107,12 +216,22 @@ def build_scope(
         "token_count": len(token_ids),
         "market_ids": sorted(market_ids),
         "token_ids": token_ids,
+        "catalog_revision": catalog_revision,
+        "catalog_frame": {
+            "event_type": "catalog_revision",
+            "catalog_revision": catalog_revision,
+            "markets": market_records,
+            "negative_risk_relations": relations,
+        },
         "source": {
             "manifest_path": str(manifest_path.resolve()),
             "manifest_sha256": manifest_sha256,
             "catalog_index_path": str(catalog_index_path.resolve()),
             "catalog_index_sha256": catalog_index_sha256,
-            "catalog_revision": catalog_revision,
+            "catalog_path": str(catalog_path.resolve()),
+            "catalog_sha256": catalog_sha256,
+            "registry_path": str(registry_path.resolve()),
+            "registry_sha256": hashlib.sha256(registry_bytes).hexdigest(),
         },
     }
 
@@ -141,6 +260,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--catalog-index", type=Path, required=True)
+    parser.add_argument("--catalog", type=Path, required=True)
+    parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-market-count", type=int, default=100)
     parser.add_argument("--expected-token-count", type=int, default=200)
@@ -149,6 +270,8 @@ def main() -> int:
     payload = build_scope(
         arguments.manifest,
         arguments.catalog_index,
+        arguments.catalog,
+        arguments.registry,
         expected_market_count=arguments.expected_market_count,
         expected_token_count=arguments.expected_token_count,
         expected_manifest_sha256=arguments.expected_manifest_sha256,

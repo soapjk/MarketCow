@@ -165,6 +165,34 @@ pub struct OutcomeToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Quantity(#[serde(with = "rust_decimal::serde::str")] pub Decimal);
+
+impl Quantity {
+    pub fn parse_positive(value: &str) -> Result<Self, CoreError> {
+        let parsed =
+            Decimal::from_str(value).map_err(|_| CoreError::InvalidDecimal(value.into()))?;
+        if parsed <= Decimal::ZERO {
+            return Err(CoreError::InvalidQuantity);
+        }
+        Ok(Self(parsed.normalize()))
+    }
+}
+
+/// Immutable strategy facts sourced from the hash-pinned catalog. These values travel in the
+/// same catalog event/cursor boundary as the market/outcome identity mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketInstrumentFacts {
+    pub price_increment: Price,
+    pub size_increment: Quantity,
+    pub minimum_order_size: Quantity,
+    pub settlement_currency: String,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarketRecord {
     pub market_id: String,
     pub condition_id: String,
@@ -175,6 +203,8 @@ pub struct MarketRecord {
     pub metadata_revision: String,
     pub observed_at: DateTime<Utc>,
     pub terminal_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instrument_facts: Option<MarketInstrumentFacts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2182,6 +2212,7 @@ mod tests {
             metadata_revision: format!("revision-{market_id}"),
             observed_at: Utc::now(),
             terminal_at: None,
+            instrument_facts: None,
         }
     }
 
