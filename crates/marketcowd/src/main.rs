@@ -160,7 +160,7 @@ struct AppState {
     projection: Arc<ArcSwap<marketcow_core::Projection>>,
     recent_events: Arc<ArcSwap<Vec<marketcow_core::PersistedEvent>>>,
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
-    jobs: Arc<AsyncMutex<marketcow_jobs::JobEngine>>,
+    jobs: Arc<DurableJobCoordinator>,
     stream: broadcast::Sender<marketcow_core::PersistedEvent>,
 }
 
@@ -174,6 +174,235 @@ struct Metrics {
     stream_clients: AtomicU64,
     stream_disconnects: AtomicU64,
     stream_slow_consumer_disconnects: AtomicU64,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DurableJobError {
+    #[error(transparent)]
+    Engine(#[from] marketcow_jobs::JobEngineError),
+    #[error("authoritative job persistence failed: {0}")]
+    Persistence(#[from] marketcow_storage::RepositoryError),
+}
+
+struct DurableJobCoordinator {
+    engine: AsyncMutex<marketcow_jobs::JobEngine>,
+    repository: Option<Arc<marketcow_storage::PostgresJobRepository>>,
+}
+
+impl DurableJobCoordinator {
+    fn memory() -> Self {
+        Self {
+            engine: AsyncMutex::new(marketcow_jobs::JobEngine::default()),
+            repository: None,
+        }
+    }
+
+    async fn open(profile: &str) -> Result<Self> {
+        let dsn = env::var("MARKETCOW_POSTGRES_DSN").ok();
+        let Some(dsn) = dsn else {
+            if profile == "production" {
+                bail!("MARKETCOW_POSTGRES_DSN is required in production");
+            }
+            return Ok(Self::memory());
+        };
+        let binary_commit = env::var("MARKETCOW_BINARY_COMMIT").unwrap_or_default();
+        if binary_commit.is_empty() {
+            bail!("MARKETCOW_BINARY_COMMIT is required when PostgreSQL jobs are enabled");
+        }
+        let repository = Arc::new(
+            marketcow_storage::PostgresJobRepository::connect(&dsn)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?,
+        );
+        repository
+            .migrate_safe_forward(&binary_commit)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let jobs = repository
+            .list_all(10_001)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if jobs.len() > 10_000 {
+            bail!("provider job recovery exceeds the bounded 10000-row startup limit");
+        }
+        let engine = marketcow_jobs::JobEngine::recover(jobs)
+            .map_err(|error| anyhow::anyhow!("provider job recovery failed: {error}"))?;
+        Ok(Self {
+            engine: AsyncMutex::new(engine),
+            repository: Some(repository),
+        })
+    }
+
+    fn persistence_enabled(&self) -> bool {
+        self.repository.is_some()
+    }
+
+    async fn submit(
+        &self,
+        input: marketcow_jobs::SubmitJob,
+        now: chrono::DateTime<Utc>,
+    ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
+        let mut engine = self.engine.lock().await;
+        let before = engine.clone();
+        let candidate = engine.submit(input, now)?.clone();
+        let Some(repository) = &self.repository else {
+            return Ok(candidate);
+        };
+        match repository.insert_or_get(&candidate).await {
+            Ok((stored, _)) => {
+                if let Err(error) = engine.replace_recovered(stored.clone()) {
+                    *engine = before;
+                    return Err(error.into());
+                }
+                Ok(stored)
+            }
+            Err(error) => {
+                *engine = before;
+                Err(error.into())
+            }
+        }
+    }
+
+    async fn get(&self, job_id: &str) -> Option<marketcow_jobs::ProviderJob> {
+        self.engine.lock().await.get(job_id).cloned()
+    }
+
+    async fn cancel(
+        &self,
+        job_id: &str,
+        actor: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
+        let mut engine = self.engine.lock().await;
+        let before = engine.clone();
+        let updated = engine.cancel(job_id, actor, now)?.clone();
+        self.persist_single_or_rollback(&mut engine, before, &updated)
+            .await?;
+        Ok(updated)
+    }
+
+    async fn reconcile_and_claim(
+        &self,
+        worker_id: &str,
+        capabilities: &[String],
+        lease_duration: chrono::Duration,
+        now: chrono::DateTime<Utc>,
+    ) -> std::result::Result<Option<marketcow_jobs::ProviderJob>, DurableJobError> {
+        let mut engine = self.engine.lock().await;
+        let before_expire = engine.clone();
+        engine.expire_leases(now);
+        self.persist_changes_or_rollback(&mut engine, before_expire)
+            .await?;
+
+        let before_requeue = engine.clone();
+        engine.requeue_retryable(now);
+        self.persist_changes_or_rollback(&mut engine, before_requeue)
+            .await?;
+
+        let before_claim = engine.clone();
+        let claimed = engine
+            .claim_next(worker_id, capabilities, lease_duration, now)?
+            .cloned();
+        if let Some(job) = &claimed {
+            self.persist_single_or_rollback(&mut engine, before_claim, job)
+                .await?;
+        }
+        Ok(claimed)
+    }
+
+    async fn start(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
+        let mut engine = self.engine.lock().await;
+        let before = engine.clone();
+        let updated = engine.start(job_id, lease_token, now)?.clone();
+        self.persist_single_or_rollback(&mut engine, before, &updated)
+            .await?;
+        Ok(updated)
+    }
+
+    async fn succeed(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        result: marketcow_jobs::StagedResult,
+        now: chrono::DateTime<Utc>,
+    ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
+        let mut engine = self.engine.lock().await;
+        let before = engine.clone();
+        let updated = engine.succeed(job_id, lease_token, result, now)?.clone();
+        self.persist_single_or_rollback(&mut engine, before, &updated)
+            .await?;
+        Ok(updated)
+    }
+
+    async fn fail(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        error: marketcow_jobs::JobError,
+        retryable: bool,
+        now: chrono::DateTime<Utc>,
+    ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
+        let mut engine = self.engine.lock().await;
+        let before = engine.clone();
+        let updated = engine
+            .fail(job_id, lease_token, error, retryable, now)?
+            .clone();
+        self.persist_single_or_rollback(&mut engine, before, &updated)
+            .await?;
+        Ok(updated)
+    }
+
+    async fn persist_single_or_rollback(
+        &self,
+        engine: &mut marketcow_jobs::JobEngine,
+        before: marketcow_jobs::JobEngine,
+        updated: &marketcow_jobs::ProviderJob,
+    ) -> std::result::Result<(), DurableJobError> {
+        let Some(repository) = &self.repository else {
+            return Ok(());
+        };
+        let expected_revision = before
+            .get(&updated.job_id)
+            .map(|job| job.revision)
+            .ok_or(marketcow_jobs::JobEngineError::NotFound)?;
+        if let Err(error) = repository
+            .compare_and_swap(updated, expected_revision)
+            .await
+        {
+            *engine = before;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    async fn persist_changes_or_rollback(
+        &self,
+        engine: &mut marketcow_jobs::JobEngine,
+        before: marketcow_jobs::JobEngine,
+    ) -> std::result::Result<(), DurableJobError> {
+        let Some(repository) = &self.repository else {
+            return Ok(());
+        };
+        let updates = engine
+            .snapshot()
+            .into_iter()
+            .filter_map(|job| {
+                before.get(&job.job_id).and_then(|previous| {
+                    (previous.revision != job.revision).then_some((job, previous.revision))
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = repository.compare_and_swap_many(&updates).await {
+            *engine = before;
+            return Err(error.into());
+        }
+        Ok(())
+    }
 }
 
 struct AuditLog {
@@ -269,6 +498,7 @@ async fn serve() -> Result<()> {
     let runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(&config))?;
     let projection = runtime.projection();
     let recent_events = runtime.recent_events().to_vec();
+    let jobs = Arc::new(DurableJobCoordinator::open(&config.profile).await?);
     let (stream, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
     let state = AppState {
         config: config.clone(),
@@ -277,7 +507,7 @@ async fn serve() -> Result<()> {
         projection: Arc::new(ArcSwap::from(projection)),
         recent_events: Arc::new(ArcSwap::from_pointee(recent_events)),
         runtime: Arc::new(AsyncMutex::new(runtime)),
-        jobs: Arc::new(AsyncMutex::new(marketcow_jobs::JobEngine::default())),
+        jobs,
         stream,
     };
     let worker_path = config.worker_socket.clone();
@@ -569,7 +799,10 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "status":"healthy", "service":"marketcowd", "profile":state.config.profile,
         "shadow_mode":true, "real_order_submission_enabled":false,
-        "components":{"api":"healthy","wal":"healthy","python_workers":"degraded_optional"}
+        "components":{
+            "api":"healthy","wal":"healthy","python_workers":"degraded_optional",
+            "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" }
+        }
     }))
 }
 
@@ -1015,27 +1248,36 @@ async fn admin_submit_job(
             &request_id,
         );
     };
-    let mut engine = state.jobs.lock().await;
-    match engine.submit(
-        marketcow_jobs::SubmitJob {
-            idempotency_key: idempotency_key.into(),
-            job_type: request.job_type,
-            request_schema: request.request_schema,
-            request: request.request,
-            deadline: request.deadline,
-            max_attempts: request.max_attempts,
-            audit_actor: format!("admin_request:{request_id}"),
-        },
-        Utc::now(),
-    ) {
-        Ok(job) => Json(admin_job_view(job)).into_response(),
-        Err(marketcow_jobs::JobEngineError::IdempotencyConflict) => error(
+    match state
+        .jobs
+        .submit(
+            marketcow_jobs::SubmitJob {
+                idempotency_key: idempotency_key.into(),
+                job_type: request.job_type,
+                request_schema: request.request_schema,
+                request: request.request,
+                deadline: request.deadline,
+                max_attempts: request.max_attempts,
+                audit_actor: format!("admin_request:{request_id}"),
+            },
+            Utc::now(),
+        )
+        .await
+    {
+        Ok(job) => Json(admin_job_view(&job)).into_response(),
+        Err(DurableJobError::Engine(marketcow_jobs::JobEngineError::IdempotencyConflict)) => error(
             StatusCode::CONFLICT,
             "idempotency_conflict",
             false,
             &request_id,
         ),
-        Err(_) => error(
+        Err(DurableJobError::Persistence(_)) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "job_persistence_unavailable",
+            true,
+            &request_id,
+        ),
+        Err(DurableJobError::Engine(_)) => error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_job_request",
             false,
@@ -1049,8 +1291,8 @@ async fn admin_get_job(
     Extension(request_id): Extension<String>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Response {
-    match state.jobs.lock().await.get(&job_id) {
-        Some(job) => Json(admin_job_view(job)).into_response(),
+    match state.jobs.get(&job_id).await {
+        Some(job) => Json(admin_job_view(&job)).into_response(),
         None => error(StatusCode::NOT_FOUND, "job_not_found", false, &request_id),
     }
 }
@@ -1060,19 +1302,28 @@ async fn admin_cancel_job(
     Extension(request_id): Extension<String>,
     AxumPath(job_id): AxumPath<String>,
 ) -> Response {
-    let mut engine = state.jobs.lock().await;
-    match engine.cancel(&job_id, &format!("admin_request:{request_id}"), Utc::now()) {
-        Ok(job) => Json(admin_job_view(job)).into_response(),
-        Err(marketcow_jobs::JobEngineError::NotFound) => {
+    match state
+        .jobs
+        .cancel(&job_id, &format!("admin_request:{request_id}"), Utc::now())
+        .await
+    {
+        Ok(job) => Json(admin_job_view(&job)).into_response(),
+        Err(DurableJobError::Engine(marketcow_jobs::JobEngineError::NotFound)) => {
             error(StatusCode::NOT_FOUND, "job_not_found", false, &request_id)
         }
-        Err(marketcow_jobs::JobEngineError::InvalidTransition) => error(
+        Err(DurableJobError::Engine(marketcow_jobs::JobEngineError::InvalidTransition)) => error(
             StatusCode::CONFLICT,
             "job_terminal_or_transition_conflict",
             false,
             &request_id,
         ),
-        Err(_) => error(
+        Err(DurableJobError::Persistence(_)) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "job_persistence_unavailable",
+            true,
+            &request_id,
+        ),
+        Err(DurableJobError::Engine(_)) => error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_job_cancel",
             false,
@@ -1365,7 +1616,7 @@ async fn shutdown() {
 async fn worker_server(
     path: PathBuf,
     staging_root: PathBuf,
-    jobs: Arc<AsyncMutex<marketcow_jobs::JobEngine>>,
+    jobs: Arc<DurableJobCoordinator>,
 ) -> Result<()> {
     let _ = fs::remove_file(&path);
     fs::create_dir_all(&staging_root)?;
@@ -1389,7 +1640,7 @@ async fn worker_server(
 async fn handle_worker(
     mut stream: UnixStream,
     staging_root: PathBuf,
-    jobs: Arc<AsyncMutex<marketcow_jobs::JobEngine>>,
+    jobs: Arc<DurableJobCoordinator>,
 ) -> Result<()> {
     use marketcow_contracts::{WORKER_PROTOCOL_VERSION, WorkerFrame, WorkerMessage};
 
@@ -1447,20 +1698,14 @@ async fn handle_worker(
         let response = match input.message {
             WorkerMessage::Poll => {
                 let now = Utc::now();
-                let claimed = {
-                    let mut engine = jobs.lock().await;
-                    engine.expire_leases(now);
-                    engine.requeue_retryable(now);
-                    engine
-                        .claim_next(
-                            &worker_id,
-                            &capabilities,
-                            chrono::Duration::seconds(60),
-                            now,
-                        )
-                        .map_err(anyhow::Error::msg)?
-                        .cloned()
-                };
+                let claimed = jobs
+                    .reconcile_and_claim(
+                        &worker_id,
+                        &capabilities,
+                        chrono::Duration::seconds(60),
+                        now,
+                    )
+                    .await?;
                 match claimed {
                     Some(job) => {
                         let task_staging = staging_root.join(&job.job_id);
@@ -1484,12 +1729,7 @@ async fn handle_worker(
                 job_id,
                 lease_token,
             } => {
-                let job = jobs
-                    .lock()
-                    .await
-                    .start(&job_id, &lease_token, Utc::now())
-                    .map_err(anyhow::Error::msg)?
-                    .clone();
+                let job = jobs.start(&job_id, &lease_token, Utc::now()).await?;
                 worker_job_state(&job)
             }
             WorkerMessage::Complete {
@@ -1508,11 +1748,8 @@ async fn handle_worker(
                 };
                 verify_staged_result(&staging_root, &job_id, &result)?;
                 let job = jobs
-                    .lock()
-                    .await
                     .succeed(&job_id, &lease_token, result, Utc::now())
-                    .map_err(anyhow::Error::msg)?
-                    .clone();
+                    .await?;
                 worker_job_state(&job)
             }
             WorkerMessage::Fail {
@@ -1524,8 +1761,6 @@ async fn handle_worker(
                 retryable,
             } => {
                 let job = jobs
-                    .lock()
-                    .await
                     .fail(
                         &job_id,
                         &lease_token,
@@ -1537,8 +1772,7 @@ async fn handle_worker(
                         retryable,
                         Utc::now(),
                     )
-                    .map_err(anyhow::Error::msg)?
-                    .clone();
+                    .await?;
                 worker_job_state(&job)
             }
             _ => WorkerMessage::Error {
@@ -1664,7 +1898,7 @@ mod tests {
                 projection: Arc::new(ArcSwap::from_pointee(bootstrap_projection("s".into()))),
                 recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
                 runtime: Arc::new(AsyncMutex::new(runtime)),
-                jobs: Arc::new(AsyncMutex::new(marketcow_jobs::JobEngine::default())),
+                jobs: Arc::new(DurableJobCoordinator::memory()),
                 stream,
             },
         )
@@ -1714,7 +1948,10 @@ mod tests {
             .unwrap()
             .job_id
             .clone();
-        let jobs = Arc::new(AsyncMutex::new(engine));
+        let jobs = Arc::new(DurableJobCoordinator {
+            engine: AsyncMutex::new(engine),
+            repository: None,
+        });
         let server_jobs = jobs.clone();
         let server_socket = socket.clone();
         let server_staging = staging.clone();
@@ -1822,7 +2059,7 @@ mod tests {
             WorkerMessage::JobState { ref status, .. } if status == "succeeded"
         ));
         assert_eq!(
-            jobs.lock().await.get(&job_id).unwrap().status,
+            jobs.get(&job_id).await.unwrap().status,
             marketcow_jobs::JobStatus::Succeeded
         );
         server.abort();

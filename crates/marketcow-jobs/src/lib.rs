@@ -100,13 +100,46 @@ pub enum JobEngineError {
     InvalidResult,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct JobEngine {
     jobs: BTreeMap<String, ProviderJob>,
     idempotency: HashMap<String, String>,
 }
 
 impl JobEngine {
+    /// Rebuilds the in-memory scheduling index from the authoritative PostgreSQL payloads.
+    /// Any malformed or duplicate row fails the whole recovery instead of partially starting.
+    pub fn recover(jobs: Vec<ProviderJob>) -> Result<Self, JobEngineError> {
+        let mut engine = Self::default();
+        for job in jobs {
+            engine.replace_recovered(job)?;
+        }
+        Ok(engine)
+    }
+
+    pub fn replace_recovered(&mut self, job: ProviderJob) -> Result<(), JobEngineError> {
+        validate_recovered_job(&job)?;
+        if self
+            .idempotency
+            .get(&job.idempotency_key)
+            .is_some_and(|job_id| job_id != &job.job_id)
+        {
+            return Err(JobEngineError::InvalidInput);
+        }
+        if let Some(previous) = self.jobs.get(&job.job_id) {
+            if job.revision < previous.revision {
+                return Err(JobEngineError::InvalidInput);
+            }
+            if previous.idempotency_key != job.idempotency_key {
+                self.idempotency.remove(&previous.idempotency_key);
+            }
+        }
+        self.idempotency
+            .insert(job.idempotency_key.clone(), job.job_id.clone());
+        self.jobs.insert(job.job_id.clone(), job);
+        Ok(())
+    }
+
     pub fn submit(
         &mut self,
         input: SubmitJob,
@@ -353,6 +386,10 @@ impl JobEngine {
         self.jobs.get(job_id)
     }
 
+    pub fn snapshot(&self) -> Vec<ProviderJob> {
+        self.jobs.values().cloned().collect()
+    }
+
     fn leased_job_mut(
         &mut self,
         job_id: &str,
@@ -381,6 +418,56 @@ fn validate_submit(input: &SubmitJob, now: DateTime<Utc>) -> Result<(), JobEngin
         || input.max_attempts == 0
         || input.max_attempts > 20
         || input.deadline <= now
+    {
+        return Err(JobEngineError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_recovered_job(job: &ProviderJob) -> Result<(), JobEngineError> {
+    let active_lease = matches!(job.status, JobStatus::Claimed | JobStatus::Running);
+    let lease_fields_valid = if active_lease {
+        job.owner_id.is_some() && job.lease_token.is_some() && job.lease_expires_at.is_some()
+    } else {
+        job.owner_id.is_none() && job.lease_token.is_none() && job.lease_expires_at.is_none()
+    };
+    let status_fields_valid = match job.status {
+        JobStatus::Pending => job.finished_at.is_none() && job.result.is_none(),
+        JobStatus::Claimed => job.attempt > 0 && job.finished_at.is_none() && job.result.is_none(),
+        JobStatus::Running => {
+            job.attempt > 0
+                && job.started_at.is_some()
+                && job.finished_at.is_none()
+                && job.result.is_none()
+        }
+        JobStatus::Succeeded => {
+            job.started_at.is_some()
+                && job.finished_at.is_some()
+                && job.result.is_some()
+                && job.error.is_none()
+        }
+        JobStatus::FailedRetryable => {
+            job.error.is_some() && job.finished_at.is_none() && job.result.is_none()
+        }
+        JobStatus::FailedTerminal => {
+            job.error.is_some() && job.finished_at.is_some() && job.result.is_none()
+        }
+        JobStatus::Canceled => job.finished_at.is_some() && job.result.is_none(),
+    };
+    if job.schema_version != JOB_SCHEMA_VERSION
+        || job.job_id.is_empty()
+        || job.idempotency_key.is_empty()
+        || job.job_type.is_empty()
+        || job.request_schema.is_empty()
+        || job.audit_actor.is_empty()
+        || job.revision == 0
+        || job.max_attempts == 0
+        || job.max_attempts > 20
+        || job.attempt > job.max_attempts
+        || job.deadline <= job.created_at
+        || sha256_json(&job.request)? != job.request_sha256
+        || !lease_fields_valid
+        || !status_fields_valid
     {
         return Err(JobEngineError::InvalidInput);
     }
@@ -587,5 +674,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claimed.job_id, job_id);
+    }
+
+    #[test]
+    fn recovery_rebuilds_idempotency_and_rejects_corrupt_or_duplicate_rows() {
+        let mut source = JobEngine::default();
+        let job = source.submit(submit(), now()).unwrap().clone();
+        let mut recovered = JobEngine::recover(vec![job.clone()]).unwrap();
+        assert_eq!(
+            recovered.submit(submit(), now()).unwrap().job_id,
+            job.job_id
+        );
+
+        let mut corrupt = job.clone();
+        corrupt.request = serde_json::json!({"symbol":"CORRUPT"});
+        assert_eq!(
+            JobEngine::recover(vec![corrupt]).unwrap_err(),
+            JobEngineError::InvalidInput
+        );
+
+        let mut duplicate = job.clone();
+        duplicate.job_id = "different-job-id".into();
+        assert_eq!(
+            JobEngine::recover(vec![job, duplicate]).unwrap_err(),
+            JobEngineError::InvalidInput
+        );
     }
 }

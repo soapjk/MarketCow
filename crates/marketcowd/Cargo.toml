@@ -22,6 +22,7 @@ marketcow-jobs = { path = "../marketcow-jobs" }
 marketcow-contracts = { path = "../marketcow-contracts" }
 marketcow-api = { path = "../marketcow-api" }
 marketcow-runtime = { path = "../marketcow-runtime" }
+marketcow-storage = { path = "../marketcow-storage" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -29,6 +30,7 @@ tokio.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

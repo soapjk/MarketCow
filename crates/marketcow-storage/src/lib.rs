@@ -764,6 +764,53 @@ impl PostgresJobRepository {
         }
     }
 
+    pub async fn compare_and_swap_many(
+        &self,
+        updates: &[(marketcow_jobs::ProviderJob, u64)],
+    ) -> Result<(), RepositoryError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut ordered = updates.to_vec();
+        ordered.sort_by(|left, right| left.0.job_id.cmp(&right.0.job_id));
+        for (index, (job, expected_revision)) in ordered.iter().enumerate() {
+            validate_job_for_storage(job)?;
+            if job.revision != expected_revision.saturating_add(1)
+                || index > 0 && ordered[index - 1].0.job_id == job.job_id
+            {
+                return Err(RepositoryError::InvalidInput);
+            }
+        }
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        for (job, expected_revision) in ordered {
+            let payload = serde_json::to_value(&job).map_err(|_| RepositoryError::InvalidInput)?;
+            let status = job_status_text(job.status);
+            let revision =
+                i64::try_from(job.revision).map_err(|_| RepositoryError::InvalidInput)?;
+            let expected =
+                i64::try_from(expected_revision).map_err(|_| RepositoryError::InvalidInput)?;
+            let affected = transaction
+                .execute(
+                    "UPDATE provider_job SET status=$2, revision=$3, deadline=$4, payload=$5, updated_at=NOW() \
+                     WHERE job_id=$1 AND revision=$6",
+                    &[&job.job_id, &status, &revision, &job.deadline, &payload, &expected],
+                )
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+            if affected != 1 {
+                return Err(RepositoryError::RevisionConflict);
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)
+    }
+
     pub async fn get(
         &self,
         job_id: &str,
@@ -798,6 +845,27 @@ impl PostgresJobRepository {
                 "SELECT payload FROM provider_job \
                  WHERE status IN ('pending','claimed','running','failed_retryable') \
                  ORDER BY created_at, job_id LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?
+            .into_iter()
+            .map(|row| decode_job(row.get(0)))
+            .collect()
+    }
+
+    pub async fn list_all(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<marketcow_jobs::ProviderJob>, RepositoryError> {
+        if !(1..=10_001).contains(&limit) {
+            return Err(RepositoryError::InvalidInput);
+        }
+        self.client
+            .lock()
+            .await
+            .query(
+                "SELECT payload FROM provider_job ORDER BY created_at, job_id LIMIT $1",
                 &[&limit],
             )
             .await
@@ -1039,9 +1107,32 @@ mod tests {
             .clone();
         repository.compare_and_swap(&claimed, 1).await.unwrap();
         assert_eq!(repository.get(&job.job_id).await.unwrap(), Some(claimed));
+        let lease_token = engine
+            .get(&job.job_id)
+            .unwrap()
+            .lease_token
+            .clone()
+            .unwrap();
+        let running = engine
+            .start(&job.job_id, &lease_token, now)
+            .unwrap()
+            .clone();
+        repository
+            .compare_and_swap_many(&[(running.clone(), 2)])
+            .await
+            .unwrap();
+        assert_eq!(repository.get(&job.job_id).await.unwrap(), Some(running));
         assert!(
             repository
                 .list_recoverable(100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.job_id == job.job_id)
+        );
+        assert!(
+            repository
+                .list_all(100)
                 .await
                 .unwrap()
                 .iter()
