@@ -1,0 +1,22 @@
+{
+  "schema_version": "marketcow.control-plane-postgres-integration.v1",
+  "git_commit": "b2c40a27f4ef53220c225cc4053fb17e4a4a716d",
+  "passed": true,
+  "postgres": {
+    "version": "postgres (PostgreSQL) 17.10 (Homebrew)",
+    "test": "postgres_control_plane_round_trip_when_test_dsn_is_configured",
+    "passed": true,
+    "ephemeral_root": "/tmp/marketcow-control-plane-pg.9aksWE",
+    "assertions": [
+      "safe_forward_migration_idempotent",
+      "runtime_config_hash_verified",
+      "runtime_config_append_only_idempotent",
+      "runtime_config_point_in_time",
+      "checkpoint_create_and_cas",
+      "checkpoint_stale_revision_rejected",
+      "checkpoint_concurrent_single_winner"
+    ]
+  },
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}

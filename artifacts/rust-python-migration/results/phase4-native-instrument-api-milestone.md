@@ -9,7 +9,9 @@ batch resolution/provider fallback and the other 12 legacy MCP tools are not mig
 Implementation commits: `d0f066ed3edf0504b624275f5d6888fd94138d1b`,
 `3edf374ab86b48bb3a00d10cc4f1eacd26854a3c`, and
 `7a3206aadf2f8c2c7a35939bfde53202f03a5d6d`, and
-`a14b98916176896cd39a40bbb03ccea70b75ef61`.
+`a14b98916176896cd39a40bbb03ccea70b75ef61`, plus control-plane integration commits
+`b2c40a27f4ef53220c225cc4053fb17e4a4a716d` and
+`b42d6862a1452cf9b5ff23e5ea7a390ba3b24512`.
 
 ## Boundary and compatibility
 
@@ -42,8 +44,8 @@ shasum -a 256 target/debug/marketcow
 uv run --isolated --frozen python scripts/migration/verify_native_instrument_api.py \
   --binary target/debug/marketcow \
   --expected-binary-sha256 \
-    674d197c57d7fc99c5947eaae7cf9a9566017c7c8ed2d95bc6633e836674b773 \
-  --source-commit a14b98916176896cd39a40bbb03ccea70b75ef61 \
+    d6ed3a9a52a868da08bf0f51ae2a54559cf72a590aacf2afe6ffbb2ce697af3d \
+  --source-commit b42d6862a1452cf9b5ff23e5ea7a390ba3b24512 \
   --output artifacts/rust-python-migration/results/phase4-native-instrument-api-differential.json
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -54,17 +56,18 @@ cargo fmt --all -- --check
 ```
 
 The differential started isolated PostgreSQL and two consecutive real MarketCow processes on
-loopback TCP. All 19 recorded gates passed: Bearer rejection and authenticated admin write with
+loopback TCP. All 22 recorded gates passed: Bearer rejection and authenticated admin write with
 Python-equal content hash, exact HTTP record, exact mapping resolution,
 machine-readable missing-ID and missing-mapping 404s, Python-equal MCP definition and result,
-persistence health, three unique Rust migrations, and same-record/mapping reads after restart.
-Both processes exited cleanly with code 0.
+persistence health, four unique Rust migrations, hashed config revision, idempotent runtime config
+registration, and same-record/mapping reads after restart. Both processes exited cleanly with code
+0.
 
-Workspace regression reported 82 passed, 0 failed and 3 explicit environment-gated storage tests
+Workspace regression reported 84 passed, 0 failed and 4 explicit environment-gated storage tests
 ignored. All 17 Python MCP tests, Clippy with warnings denied, Ruff and format checks passed.
 
 The checked binary SHA-256 is
-`674d197c57d7fc99c5947eaae7cf9a9566017c7c8ed2d95bc6633e836674b773`. The result JSON SHA-256
-is `c9267b12e6b669e1b3cc4211594e445fe640042c1032a6e2aa0ce5b57df37606`.
+`d6ed3a9a52a868da08bf0f51ae2a54559cf72a590aacf2afe6ffbb2ce697af3d`. The result JSON SHA-256
+is `d8ae0c1840a3af7f2d57c2f80311a9931cb166d0fa67d51ef02e9a24ed710ee0`.
 This short integration result is not a headless or HTTP/network soak and does not satisfy the
 remaining longevity gates.

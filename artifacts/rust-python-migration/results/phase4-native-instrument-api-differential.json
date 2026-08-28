@@ -1,11 +1,13 @@
 {
   "binary_path": "/Volumes/T9/projects/marketcow-workitem-b8ffd893-5dfd-4894-8a17-7e759ca0495f/target/debug/marketcow",
-  "binary_sha256": "674d197c57d7fc99c5947eaae7cf9a9566017c7c8ed2d95bc6633e836674b773",
+  "binary_sha256": "d6ed3a9a52a868da08bf0f51ae2a54559cf72a590aacf2afe6ffbb2ce697af3d",
   "checks": {
     "admin_put_200": true,
     "admin_put_exact_contract_and_hash": true,
     "admin_put_requires_bearer": true,
-    "all_three_rust_migrations_recorded_once": true,
+    "all_four_rust_migrations_recorded_once": true,
+    "config_revision_is_sha256": true,
+    "control_plane_persistence_healthy": true,
     "http_exact_record": true,
     "http_get_200": true,
     "http_mapping_missing_404_machine_detail": true,
@@ -17,6 +19,7 @@
     "mcp_list_http_200": true,
     "mcp_result_matches_python": true,
     "real_orders_disabled": true,
+    "restart_does_not_duplicate_runtime_config": true,
     "restart_health_200": true,
     "restart_reads_same_postgres_record": true,
     "restart_resolves_same_mapping": true,
@@ -34,6 +37,6 @@
   "process_log_tail": "",
   "real_order_submission_enabled": false,
   "schema_version": "marketcow.native-instrument-differential.v1",
-  "source_commit": "a14b98916176896cd39a40bbb03ccea70b75ef61",
+  "source_commit": "b42d6862a1452cf9b5ff23e5ea7a390ba3b24512",
   "tradude_manages_marketcow": false
 }
