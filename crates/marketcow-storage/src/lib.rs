@@ -41,6 +41,322 @@ CREATE TABLE IF NOT EXISTS marketcow_rust_migration (
 "#;
 const PROVIDER_JOB_MIGRATION_LOCK: i64 = 0x4d_43_4a_4f_42;
 
+pub const CLICKHOUSE_QUOTE_MIGRATION_VERSION: &str = "rust-quote-latest-v1";
+pub const CLICKHOUSE_QUOTE_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS market_quote_latest (
+    symbol String, payload_json String,
+    observed_at DateTime64(3, 'UTC'), ingested_at DateTime64(3, 'UTC'),
+    source LowCardinality(String), content_rank String, content_version UInt256
+) ENGINE = ReplacingMergeTree(content_version)
+ORDER BY symbol
+"#;
+const CLICKHOUSE_RUST_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS marketcow_rust_clickhouse_migration (
+    version String, checksum String,
+    applied_at DateTime64(3, 'UTC'), binary_commit String, safe_forward Bool
+) ENGINE = ReplacingMergeTree(applied_at)
+ORDER BY version
+"#;
+
+pub struct ClickHouseConfig {
+    url: String,
+    database: String,
+    username: String,
+    password: String,
+}
+
+impl ClickHouseConfig {
+    pub fn new(
+        url: impl Into<String>,
+        database: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self, RepositoryError> {
+        let url = url.into();
+        let parsed = url::Url::parse(&url).map_err(|_| RepositoryError::InvalidInput)?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            })
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let database = database.into();
+        if !database.ends_with("_production")
+            && !database.ends_with("_development")
+            && !database.ends_with("_test")
+            || database.is_empty()
+            || !database.bytes().enumerate().all(|(index, byte)| {
+                byte == b'_'
+                    || byte.is_ascii_alphanumeric() && (index > 0 || byte.is_ascii_alphabetic())
+            })
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        Ok(Self {
+            url,
+            database,
+            username: username.into(),
+            password: password.into(),
+        })
+    }
+}
+
+#[derive(clickhouse::Row, Serialize)]
+struct ClickHouseQuoteRow {
+    symbol: String,
+    payload_json: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    observed_at: DateTime<Utc>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    ingested_at: DateTime<Utc>,
+    source: String,
+    content_rank: String,
+    content_version: clickhouse::types::UInt256,
+}
+
+#[derive(clickhouse::Row, Deserialize)]
+struct ClickHouseCurrentQuote {
+    payload_json: String,
+    content_version: clickhouse::types::UInt256,
+}
+
+#[derive(clickhouse::Row, Deserialize)]
+struct ClickHousePayloadOnly {
+    payload_json: String,
+}
+
+#[derive(clickhouse::Row, Deserialize)]
+struct ClickHouseMigrationChecksum {
+    checksum: String,
+}
+
+#[derive(clickhouse::Row, Serialize)]
+struct ClickHouseMigrationRow {
+    version: String,
+    checksum: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    applied_at: DateTime<Utc>,
+    binary_commit: String,
+    safe_forward: bool,
+}
+
+/// Official typed ClickHouse client for the existing `market_quote_latest` contract. The payload
+/// keeps decimal values as JSON strings and the deterministic UInt256 version matches Python's
+/// `raw_content_version` bit layout.
+pub struct ClickHouseQuoteRepository {
+    client: clickhouse::Client,
+    operation_lock: tokio::sync::Mutex<()>,
+}
+
+impl ClickHouseQuoteRepository {
+    pub fn new(config: ClickHouseConfig) -> Self {
+        let client = clickhouse::Client::default()
+            .with_url(config.url)
+            .with_database(config.database)
+            .with_user(config.username)
+            .with_password(config.password)
+            .with_setting("max_execution_time", "5")
+            .with_setting("async_insert", "0");
+        Self {
+            client,
+            operation_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub async fn health_probe(&self) -> Result<(), RepositoryError> {
+        self.client
+            .query("SELECT 1")
+            .execute()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)
+    }
+
+    pub async fn migrate_safe_forward(&self, binary_commit: &str) -> Result<(), RepositoryError> {
+        if binary_commit.is_empty() || binary_commit.len() > 128 {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let _guard = self.operation_lock.lock().await;
+        let checksum = hex::encode(Sha256::digest(CLICKHOUSE_QUOTE_MIGRATION_SQL.as_bytes()));
+        self.client
+            .query(CLICKHOUSE_RUST_MIGRATION_SQL)
+            .execute()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let existing = self
+            .client
+            .query(
+                "SELECT argMax(checksum, applied_at) AS checksum \
+                 FROM marketcow_rust_clickhouse_migration WHERE version = ?",
+            )
+            .bind(CLICKHOUSE_QUOTE_MIGRATION_VERSION)
+            .fetch_one::<ClickHouseMigrationChecksum>()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if !existing.checksum.is_empty() {
+            return if existing.checksum == checksum {
+                Ok(())
+            } else {
+                Err(RepositoryError::MigrationChecksumMismatch)
+            };
+        }
+        self.client
+            .query(CLICKHOUSE_QUOTE_MIGRATION_SQL)
+            .execute()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let mut insert = self
+            .client
+            .insert::<ClickHouseMigrationRow>("marketcow_rust_clickhouse_migration")
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        insert
+            .write(&ClickHouseMigrationRow {
+                version: CLICKHOUSE_QUOTE_MIGRATION_VERSION.into(),
+                checksum,
+                applied_at: Utc::now(),
+                binary_commit: binary_commit.into(),
+                safe_forward: true,
+            })
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        insert.end().await.map_err(|_| RepositoryError::Unavailable)
+    }
+
+    pub async fn upsert_quote(
+        &self,
+        quote: &QuoteRecord,
+        ingested_at: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        validate_quote(quote)?;
+        let _guard = self.operation_lock.lock().await;
+        let payload_json =
+            serde_json::to_string(quote).map_err(|_| RepositoryError::InvalidInput)?;
+        let digest = Sha256::digest(payload_json.as_bytes());
+        let content_rank = hex::encode(&digest[..26]);
+        let computed = clickhouse_content_version(ingested_at, &content_rank)?;
+        let current = self
+            .client
+            .query(
+                "SELECT argMax(payload_json, content_version) AS payload_json, \
+                 max(content_version) AS content_version \
+                 FROM market_quote_latest WHERE symbol = ?",
+            )
+            .bind(&quote.instrument_id)
+            .fetch_one::<ClickHouseCurrentQuote>()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if current.payload_json == payload_json {
+            return Ok(false);
+        }
+        let version = if computed > current.content_version {
+            computed
+        } else {
+            increment_uint256(current.content_version).ok_or(RepositoryError::InvalidInput)?
+        };
+        let mut insert = self
+            .client
+            .insert::<ClickHouseQuoteRow>("market_quote_latest")
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        insert
+            .write(&ClickHouseQuoteRow {
+                symbol: quote.instrument_id.clone(),
+                payload_json,
+                observed_at: quote.observed_at,
+                ingested_at,
+                source: quote.source.clone(),
+                content_rank,
+                content_version: version,
+            })
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        insert
+            .end()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        Ok(true)
+    }
+
+    pub async fn latest(
+        &self,
+        instrument_id: &str,
+    ) -> Result<Option<QuoteRecord>, RepositoryError> {
+        if instrument_id.is_empty() {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let row = self
+            .client
+            .query(
+                "SELECT argMax(payload_json, content_version) AS payload_json \
+                 FROM market_quote_latest FINAL WHERE symbol = ?",
+            )
+            .bind(instrument_id)
+            .fetch_one::<ClickHousePayloadOnly>()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if row.payload_json.is_empty() {
+            Ok(None)
+        } else {
+            serde_json::from_str(&row.payload_json)
+                .map(Some)
+                .map_err(|_| RepositoryError::Unavailable)
+        }
+    }
+}
+
+fn validate_quote(quote: &QuoteRecord) -> Result<(), RepositoryError> {
+    if quote.instrument_id.is_empty()
+        || quote.currency.is_empty()
+        || quote.source.is_empty()
+        || quote.raw_sha256.len() != 64
+        || !quote
+            .raw_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || quote.bid > quote.ask
+    {
+        return Err(RepositoryError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn clickhouse_content_version(
+    ingested_at: DateTime<Utc>,
+    content_rank: &str,
+) -> Result<clickhouse::types::UInt256, RepositoryError> {
+    if content_rank.len() != 52 || !content_rank.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RepositoryError::InvalidInput);
+    }
+    let epoch_millis = ingested_at.timestamp_millis();
+    if !(0..(1_i64 << 48)).contains(&epoch_millis) {
+        return Err(RepositoryError::InvalidInput);
+    }
+    let rank = hex::decode(content_rank).map_err(|_| RepositoryError::InvalidInput)?;
+    let mut little_endian = [0_u8; 32];
+    for (target, source) in little_endian[..26].iter_mut().zip(rank.iter().rev()) {
+        *target = *source;
+    }
+    let timestamp = (epoch_millis as u64).to_le_bytes();
+    little_endian[26..].copy_from_slice(&timestamp[..6]);
+    Ok(clickhouse::types::UInt256::from_le_bytes(little_endian))
+}
+
+fn increment_uint256(value: clickhouse::types::UInt256) -> Option<clickhouse::types::UInt256> {
+    let mut bytes = value.to_le_bytes();
+    for byte in &mut bytes {
+        let (next, overflow) = byte.overflowing_add(1);
+        *byte = next;
+        if !overflow {
+            return Some(clickhouse::types::UInt256::from_le_bytes(bytes));
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     MemoryProjection,
@@ -616,6 +932,71 @@ mod tests {
             repository.put_quote(&crossed),
             Err(RepositoryError::InvalidInput)
         ));
+    }
+
+    #[test]
+    fn clickhouse_config_and_uint256_version_match_python_contract() {
+        assert!(
+            ClickHouseConfig::new("http://127.0.0.1:8123", "marketcow_test", "default", "").is_ok()
+        );
+        assert!(matches!(
+            ClickHouseConfig::new("http://example.com:8123", "marketcow_test", "default", ""),
+            Err(RepositoryError::InvalidInput)
+        ));
+        assert!(matches!(
+            ClickHouseConfig::new("http://127.0.0.1:8123", "marketcow", "default", ""),
+            Err(RepositoryError::InvalidInput)
+        ));
+        let at = DateTime::parse_from_rfc3339("2026-07-22T00:00:02Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let version = clickhouse_content_version(at, &"ab".repeat(26)).unwrap();
+        assert_eq!(
+            version.to_string(),
+            "734174110961207714005784373225550623274284546974944289204332051210571590571"
+        );
+        assert_eq!(
+            increment_uint256(version).unwrap().to_string(),
+            "734174110961207714005784373225550623274284546974944289204332051210571590572"
+        );
+        assert!(increment_uint256(clickhouse::types::UInt256::MAX).is_none());
+        assert!(CLICKHOUSE_QUOTE_MIGRATION_SQL.contains("ReplacingMergeTree(content_version)"));
+        assert!(CLICKHOUSE_RUST_MIGRATION_SQL.contains("binary_commit String"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MARKETCOW_TEST_CLICKHOUSE_URL and MARKETCOW_TEST_CLICKHOUSE_DATABASE"]
+    async fn clickhouse_quote_round_trip_when_test_endpoint_is_configured() {
+        let config = ClickHouseConfig::new(
+            std::env::var("MARKETCOW_TEST_CLICKHOUSE_URL").expect("test ClickHouse URL"),
+            std::env::var("MARKETCOW_TEST_CLICKHOUSE_DATABASE").expect("test ClickHouse database"),
+            std::env::var("MARKETCOW_TEST_CLICKHOUSE_USERNAME")
+                .unwrap_or_else(|_| "default".into()),
+            std::env::var("MARKETCOW_TEST_CLICKHOUSE_PASSWORD").unwrap_or_default(),
+        )
+        .unwrap();
+        let repository = ClickHouseQuoteRepository::new(config);
+        repository.health_probe().await.unwrap();
+        repository
+            .migrate_safe_forward("test-binary-commit")
+            .await
+            .unwrap();
+        let quote = QuoteRecord {
+            instrument_id: format!("CLICKHOUSE.TEST.{}", uuid::Uuid::new_v4()),
+            bid: "0.100000000000000001".parse().unwrap(),
+            ask: "0.200000000000000002".parse().unwrap(),
+            currency: "USDC".into(),
+            scale: 18,
+            observed_at: Utc::now(),
+            source: "integration-test".into(),
+            raw_sha256: "a".repeat(64),
+        };
+        assert!(repository.upsert_quote(&quote, Utc::now()).await.unwrap());
+        assert!(!repository.upsert_quote(&quote, Utc::now()).await.unwrap());
+        assert_eq!(
+            repository.latest(&quote.instrument_id).await.unwrap(),
+            Some(quote)
+        );
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+clickhouse.workspace = true
 hex.workspace = true
 marketcow-jobs = { path = "../marketcow-jobs" }
 rust_decimal.workspace = true
@@ -18,6 +19,7 @@ tokio.workspace = true
 tokio-postgres.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
