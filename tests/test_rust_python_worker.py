@@ -15,7 +15,6 @@ from python.marketcow_workers.worker import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     SEC_DIVIDEND_RESULT_SCHEMA,
-    SEC_DIVIDEND_TASK,
     handle_sec_dividend_filing,
     handle_csv_inference,
     handshake,
@@ -27,6 +26,18 @@ from python.marketcow_workers.worker import (
 def test_staging_path_is_contained(tmp_path: Path) -> None:
     path = safe_staging_path(tmp_path.resolve(), "task-123", "result.json")
     assert path == tmp_path.resolve() / "task-123" / "result.json"
+
+
+def test_worker_rejects_unimplemented_capability_before_connecting(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsupported"):
+        asyncio.run(
+            run_worker(
+                tmp_path / "missing.sock",
+                "python-test-v1",
+                once=True,
+                capabilities=["provider.unimplemented"],
+            )
+        )
 
 
 @pytest.mark.parametrize("filename", ["../secret", "/etc/passwd", "nested/file"])
@@ -163,7 +174,7 @@ def test_python_worker_executes_csv_task_only_through_leased_uds_protocol() -> N
         async def server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             hello = await read_request(reader)
             assert hello["message_type"] == "hello"
-            assert hello["capabilities"] == [CSV_INFERENCE_TASK, SEC_DIVIDEND_TASK]
+            assert hello["capabilities"] == [CSV_INFERENCE_TASK]
             await respond(
                 writer,
                 hello,
@@ -215,7 +226,12 @@ def test_python_worker_executes_csv_task_only_through_leased_uds_protocol() -> N
 
         listener = await asyncio.start_unix_server(server, socket_path)
         try:
-            await run_worker(socket_path, "python-test-v2", once=True)
+            await run_worker(
+                socket_path,
+                "python-test-v2",
+                once=True,
+                capabilities=[CSV_INFERENCE_TASK],
+            )
         finally:
             listener.close()
             await listener.wait_closed()

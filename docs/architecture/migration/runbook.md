@@ -59,6 +59,12 @@ MARKETCOW_PYTHON_DISPATCH_POLICIES_JSON={"transform.sec_dividend_filing":{"max_i
 The last claim time is part of the authoritative job payload, so restart/recovery does not
 reset the interval. `/v1/health` reports the effective non-secret policy map.
 
+The supervisor deterministically assigns exactly one registered capability to each process
+and passes it as `--capability`. The Python worker rejects unknown capabilities before opening
+the UDS and advertises only its assigned capability during the nonce-bound handshake. Pool
+size must be at least the number of configured capabilities, ensuring every policy has an
+isolated executor. A restarted slot retains the same assignment.
+
 ## Cutover (future Phase 7 gate)
 
 Drain Rust and Python consumers; stop the Python writer; flush and hash legacy WAL; record a

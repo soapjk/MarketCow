@@ -241,7 +241,7 @@ async def run_one_task(
     writer: asyncio.StreamWriter,
     handlers: dict[tuple[str, str], Handler] | None = None,
 ) -> bool:
-    handlers = handlers or HANDLERS
+    handlers = HANDLERS if handlers is None else handlers
     task = await exchange(reader, writer, "poll")
     if task.get("message_type") == "no_work":
         return False
@@ -346,12 +346,24 @@ async def run_one_task(
     return True
 
 
-async def run_worker(socket_path: Path, revision: str, *, once: bool = False) -> None:
-    capabilities = sorted({job_type for job_type, _ in HANDLERS})
-    reader, writer, _ = await open_session(socket_path, revision, capabilities=capabilities)
+async def run_worker(
+    socket_path: Path,
+    revision: str,
+    *,
+    once: bool = False,
+    capabilities: list[str] | None = None,
+) -> None:
+    available = {job_type for job_type, _ in HANDLERS}
+    selected = sorted(available if capabilities is None else set(capabilities))
+    if not selected or any(capability not in available for capability in selected):
+        raise ValueError("configured worker capability is unsupported")
+    handlers = {
+        key: handler for key, handler in HANDLERS.items() if key[0] in selected
+    }
+    reader, writer, _ = await open_session(socket_path, revision, capabilities=selected)
     try:
         while True:
-            handled = await run_one_task(reader, writer)
+            handled = await run_one_task(reader, writer, handlers)
             if once:
                 return
             if not handled:
@@ -365,9 +377,15 @@ async def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", type=Path, required=True)
     parser.add_argument("--revision", default=os.environ.get("MARKETCOW_WORKER_REVISION", "development"))
+    parser.add_argument("--capability", action="append", dest="capabilities")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
-    await run_worker(args.socket, args.revision, once=args.once)
+    await run_worker(
+        args.socket,
+        args.revision,
+        once=args.once,
+        capabilities=args.capabilities,
+    )
 
 
 if __name__ == "__main__":

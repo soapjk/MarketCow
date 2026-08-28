@@ -184,6 +184,9 @@ impl PythonWorkerConfig {
             Err(error) => return Err(error.into()),
         };
         validate_dispatch_policies(&dispatch_policies)?;
+        if enabled && pool_size < dispatch_policies.len() {
+            bail!("Python worker pool must provide at least one process per capability");
+        }
         Ok(Self {
             executable,
             script,
@@ -252,6 +255,9 @@ fn validate_dispatch_policies(
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         {
             bail!("Python dispatch policy capability is invalid");
+        }
+        if !matches!(capability.as_str(), SEC_DIVIDEND_TASK | CSV_INFERENCE_TASK) {
+            bail!("Python dispatch policy capability has no registered handler");
         }
         policy
             .validate()
@@ -787,6 +793,7 @@ fn sanitize_worker_command(
     command: &mut ProcessCommand,
     config: &PythonWorkerConfig,
     socket: &Path,
+    capability: &str,
 ) {
     command
         .env_clear()
@@ -798,6 +805,8 @@ fn sanitize_worker_command(
         .arg(socket)
         .arg("--revision")
         .arg(&config.revision)
+        .arg("--capability")
+        .arg(capability)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -849,14 +858,14 @@ fn set_process_limit(resource: libc::c_int, value: libc::rlim_t) -> std::io::Res
     }
 }
 
-fn worker_command(config: &PythonWorkerConfig, socket: &Path) -> ProcessCommand {
+fn worker_command(config: &PythonWorkerConfig, socket: &Path, capability: &str) -> ProcessCommand {
     let mut command = ProcessCommand::new(
         config
             .executable
             .as_ref()
             .expect("enabled worker has executable"),
     );
-    sanitize_worker_command(&mut command, config, socket);
+    sanitize_worker_command(&mut command, config, socket, capability);
     command
 }
 
@@ -946,6 +955,7 @@ async fn wait_for_worker(
 
 async fn supervise_worker_slot(
     slot: usize,
+    capability: String,
     config: PythonWorkerConfig,
     socket: PathBuf,
     status: Arc<PythonWorkerStatus>,
@@ -973,16 +983,16 @@ async fn supervise_worker_slot(
             tokio::time::sleep(backoff).await;
         }
         first_spawn = false;
-        let mut command = worker_command(&config, &socket);
+        let mut command = worker_command(&config, &socket, &capability);
         match command.spawn() {
             Ok(mut child) => {
                 status.live.fetch_add(1, Ordering::Relaxed);
-                info!(slot, pid=?child.id(), "python_worker_started");
+                info!(slot, capability, pid=?child.id(), "python_worker_started");
                 let result = wait_for_worker(&mut child, config.memory_limit_mib).await;
                 status.live.fetch_sub(1, Ordering::Relaxed);
                 match result {
                     Ok(WorkerExit::Exited(exit_status)) => {
-                        warn!(slot, status=?exit_status, "python_worker_exited");
+                        warn!(slot, capability, status=?exit_status, "python_worker_exited");
                     }
                     Ok(WorkerExit::MemoryLimitExceeded {
                         resident_kib,
@@ -991,18 +1001,21 @@ async fn supervise_worker_slot(
                         status.memory_limit_kills.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             slot,
-                            resident_kib, limit_kib, "python_worker_memory_limit_exceeded"
+                            capability,
+                            resident_kib,
+                            limit_kib,
+                            "python_worker_memory_limit_exceeded"
                         );
                     }
                     Err(error) => {
                         status
                             .memory_monitor_failures
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!(slot, error=%error, "python_worker_memory_monitor_failed_closed");
+                        warn!(slot, capability, error=%error, "python_worker_memory_monitor_failed_closed");
                     }
                 }
             }
-            Err(error) => warn!(slot, error=%error, "python_worker_spawn_failed"),
+            Err(error) => warn!(slot, capability, error=%error, "python_worker_spawn_failed"),
         }
     }
 }
@@ -1023,9 +1036,11 @@ async fn supervise_worker_pool(
         return;
     }
     let mut slots = JoinSet::new();
+    let capabilities = config.dispatch_policies.keys().cloned().collect::<Vec<_>>();
     for slot in 0..config.pool_size {
         slots.spawn(supervise_worker_slot(
             slot,
+            capabilities[slot % capabilities.len()].clone(),
             config.clone(),
             socket.clone(),
             status.clone(),
@@ -3480,7 +3495,12 @@ mod tests {
             .env("MARKETCOW_POSTGRES_DSN", "must-not-leak")
             .env("MARKETCOW_CLICKHOUSE_DSN", "must-not-leak")
             .env("MARKETCOW_RUST_ADMIN_TOKEN", "must-not-leak");
-        sanitize_worker_command(&mut command, &config, &dir.path().join("worker.sock"));
+        sanitize_worker_command(
+            &mut command,
+            &config,
+            &dir.path().join("worker.sock"),
+            CSV_INFERENCE_TASK,
+        );
         assert!(command.status().await.unwrap().success());
     }
 
