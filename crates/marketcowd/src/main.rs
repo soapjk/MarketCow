@@ -414,6 +414,7 @@ struct AppState {
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
     jobs: Arc<DurableJobCoordinator>,
     instruments: Arc<InstrumentCoordinator>,
+    control_plane: Arc<ControlPlaneCoordinator>,
     stream: broadcast::Sender<marketcow_core::PersistedEvent>,
     worker_status: Arc<PythonWorkerStatus>,
     legacy_mcp: Option<LegacyMcpProxy>,
@@ -525,6 +526,99 @@ struct InstrumentCoordinator {
     memory: AsyncMutex<BTreeMap<String, marketcow_storage::InstrumentRecord>>,
     #[cfg(test)]
     memory_enabled: bool,
+}
+
+struct ControlPlaneCoordinator {
+    repository: Option<Arc<marketcow_storage::PostgresControlPlaneRepository>>,
+    config_revision: String,
+}
+
+impl ControlPlaneCoordinator {
+    async fn open(config: &Config) -> Result<Self> {
+        let config_json = serde_json::to_value(config)?;
+        let config_revision = calculated_config_revision(config)?;
+        let config_sha256 = config_revision
+            .strip_prefix("sha256:")
+            .expect("calculated revision is sha256-prefixed")
+            .to_owned();
+        let dsn = env::var("MARKETCOW_POSTGRES_DSN").ok();
+        let Some(dsn) = dsn else {
+            if config.profile == "production" {
+                bail!("MARKETCOW_POSTGRES_DSN is required in production");
+            }
+            return Ok(Self {
+                repository: None,
+                config_revision,
+            });
+        };
+        let binary_commit = env::var("MARKETCOW_BINARY_COMMIT").unwrap_or_default();
+        if binary_commit.is_empty() {
+            bail!("MARKETCOW_BINARY_COMMIT is required when PostgreSQL control plane is enabled");
+        }
+        let repository = Arc::new(
+            marketcow_storage::PostgresControlPlaneRepository::connect(&dsn)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?,
+        );
+        repository
+            .migrate_safe_forward(&binary_commit)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let config_id = "marketcowd-runtime";
+        let latest = repository
+            .get_runtime_config_version(config_id, None)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        if latest
+            .as_ref()
+            .is_none_or(|record| record.config_sha256 != config_sha256)
+        {
+            let version = latest
+                .as_ref()
+                .map_or(1, |record| record.version.saturating_add(1));
+            if version == u64::MAX {
+                bail!("runtime configuration version space is exhausted");
+            }
+            repository
+                .save_runtime_config_version(&marketcow_storage::RuntimeConfigVersionRecord {
+                    config_id: config_id.into(),
+                    version,
+                    profile: config.profile.clone(),
+                    schema_version: "marketcow.runtime-config.v1".into(),
+                    config_json,
+                    config_sha256,
+                    observed_at: Utc::now(),
+                    actor: "marketcowd-startup".into(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        Ok(Self {
+            repository: Some(repository),
+            config_revision,
+        })
+    }
+
+    #[cfg(test)]
+    fn memory(config_revision: &str) -> Self {
+        Self {
+            repository: None,
+            config_revision: config_revision.into(),
+        }
+    }
+
+    fn persistence_enabled(&self) -> bool {
+        self.repository.is_some()
+    }
+}
+
+fn calculated_config_revision(config: &Config) -> Result<String> {
+    let config_json = serde_json::to_value(config)?;
+    let canonical = serde_json::to_vec(&config_json)?;
+    Ok(format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(&canonical))
+    ))
 }
 
 impl InstrumentCoordinator {
@@ -1404,7 +1498,11 @@ async fn serve() -> Result<()> {
     let config = Config::load()?;
     preflight(&config)?;
     let audit = Arc::new(AuditLog::open(&config.storage_root.join("audit.jsonl"))?);
-    let runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(&config))?;
+    let control_plane = Arc::new(ControlPlaneCoordinator::open(&config).await?);
+    let runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(
+        &config,
+        &control_plane.config_revision,
+    ))?;
     let projection = runtime.projection();
     let recent_events = runtime.recent_events().to_vec();
     let jobs = Arc::new(
@@ -1430,6 +1528,7 @@ async fn serve() -> Result<()> {
         runtime: Arc::new(AsyncMutex::new(runtime)),
         jobs,
         instruments,
+        control_plane,
         stream,
         worker_status: Arc::new(PythonWorkerStatus::default()),
         legacy_mcp,
@@ -1472,11 +1571,11 @@ async fn serve() -> Result<()> {
     Ok(())
 }
 
-fn runtime_config(config: &Config) -> marketcow_runtime::RuntimeConfig {
+fn runtime_config(config: &Config, config_revision: &str) -> marketcow_runtime::RuntimeConfig {
     marketcow_runtime::RuntimeConfig {
         root: config.storage_root.join("polymarket"),
         scope_id: config.scope_id.clone(),
-        config_revision: "marketcowd-config-v1".into(),
+        config_revision: config_revision.into(),
         wal_segment_bytes: 256 * 1024 * 1024,
         recent_event_capacity: 10_000,
     }
@@ -1491,7 +1590,9 @@ struct ReplayInput {
 fn replay_file(config: &Config, input: &Path, checkpoint: bool) -> Result<serde_json::Value> {
     use std::io::{BufRead, BufReader};
 
-    let mut runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(config))?;
+    let revision = calculated_config_revision(config)?;
+    let mut runtime =
+        marketcow_runtime::PolymarketRuntime::open(runtime_config(config, &revision))?;
     let mut input_count = 0_u64;
     let mut event_count = 0_u64;
     let mut rejected_count = 0_u64;
@@ -1541,7 +1642,9 @@ fn run_headless_shadow_soak(
     }
     let binary_path = env::current_exe()?.canonicalize()?;
     let binary_sha256 = hex::encode(Sha256::digest(fs::read(&binary_path)?));
-    let mut runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(config))?;
+    let revision = calculated_config_revision(config)?;
+    let mut runtime =
+        marketcow_runtime::PolymarketRuntime::open(runtime_config(config, &revision))?;
     let started_at = Utc::now();
     let started = std::time::Instant::now();
     let deadline = started + std::time::Duration::from_secs(duration_seconds);
@@ -1788,8 +1891,10 @@ fn health_payload(state: &AppState) -> serde_json::Value {
         "components":{
             "api":"healthy","wal":"healthy","python_workers":worker_health,
             "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" },
-            "instrument_persistence":if state.instruments.persistence_enabled() { "healthy" } else { "degraded_development_only" }
+            "instrument_persistence":if state.instruments.persistence_enabled() { "healthy" } else { "degraded_development_only" },
+            "control_plane_persistence":if state.control_plane.persistence_enabled() { "healthy" } else { "degraded_development_only" }
         },
+        "config_revision":state.control_plane.config_revision,
         "python_worker_pool":{
             "configured":configured_workers,
             "live":live_workers,
@@ -3646,6 +3751,7 @@ mod tests {
                 runtime: Arc::new(AsyncMutex::new(runtime)),
                 jobs: Arc::new(DurableJobCoordinator::memory()),
                 instruments: Arc::new(InstrumentCoordinator::memory()),
+                control_plane: Arc::new(ControlPlaneCoordinator::memory("test-config-v1")),
                 stream,
                 worker_status: Arc::new(PythonWorkerStatus::default()),
                 legacy_mcp: None,
@@ -3707,6 +3813,30 @@ mod tests {
             provider_symbols: BTreeMap::from([("longport".into(), "苹果😀.US".into())]),
             broker_symbols: BTreeMap::from([("ibkr".into(), "AAPL".into())]),
         }
+    }
+
+    #[test]
+    fn runtime_config_revision_is_deterministic_sensitive_and_secret_free() {
+        let (_dir, state) = test_state();
+        let config = state.config;
+        let revision = calculated_config_revision(&config).unwrap();
+        assert!(revision.starts_with("sha256:"));
+        assert_eq!(revision.len(), 71);
+        assert_eq!(calculated_config_revision(&config).unwrap(), revision);
+
+        let mut changed = config.clone();
+        changed.scope_id = "different-scope".into();
+        assert_ne!(calculated_config_revision(&changed).unwrap(), revision);
+
+        let mut secret_reference = config;
+        secret_reference.python_workers.secret_references.insert(
+            SEC_DIVIDEND_TASK.into(),
+            PathBuf::from("/private/provider-secret"),
+        );
+        assert_eq!(
+            calculated_config_revision(&secret_reference).unwrap(),
+            revision
+        );
     }
 
     #[test]
@@ -5092,8 +5222,9 @@ mod tests {
         assert_eq!(result["rejected_events"], 0);
         assert_eq!(result["ready"], true);
         assert_eq!(result["real_order_submission_enabled"], false);
+        let revision = calculated_config_revision(&config).unwrap();
         let recovered =
-            marketcow_runtime::PolymarketRuntime::open(runtime_config(&config)).unwrap();
+            marketcow_runtime::PolymarketRuntime::open(runtime_config(&config, &revision)).unwrap();
         assert_eq!(recovered.projection().cursor, 4);
         assert!(recovered.projection().ready);
     }

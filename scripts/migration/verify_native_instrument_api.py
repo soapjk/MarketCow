@@ -194,6 +194,15 @@ def main() -> int:
                 checks["instrument_persistence_healthy"] = (
                     health.get("components", {}).get("instrument_persistence") == "healthy"
                 )
+                checks["control_plane_persistence_healthy"] = (
+                    health.get("components", {}).get("control_plane_persistence")
+                    == "healthy"
+                )
+                checks["config_revision_is_sha256"] = (
+                    isinstance(health.get("config_revision"), str)
+                    and health["config_revision"].startswith("sha256:")
+                    and len(health["config_revision"]) == 71
+                )
                 checks["real_orders_disabled"] = (
                     health.get("real_order_submission_enabled") is False
                 )
@@ -308,13 +317,25 @@ def main() -> int:
                     "psql", dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c",
                     "SELECT COUNT(*) FROM marketcow_rust_migration "
                     "WHERE version IN ('rust-provider-job-v1',"
-                    "'rust-artifact-manifest-v1','rust-instrument-master-v1')",
+                    "'rust-artifact-manifest-v1','rust-instrument-master-v1',"
+                    "'rust-control-plane-v1')",
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            checks["all_three_rust_migrations_recorded_once"] = migration_count == "3"
+            checks["all_four_rust_migrations_recorded_once"] = migration_count == "4"
+            config_count = subprocess.run(
+                [
+                    "psql", dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c",
+                    "SELECT COUNT(*) FROM runtime_config_version "
+                    "WHERE config_id='marketcowd-runtime'",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            checks["restart_does_not_duplicate_runtime_config"] = config_count == "1"
         except Exception as error:  # preserve a bounded diagnostic in the result
             failure = f"{type(error).__name__}: {error}"
         finally:
