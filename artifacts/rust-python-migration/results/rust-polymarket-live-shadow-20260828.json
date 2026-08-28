@@ -81,11 +81,24 @@
     "wal_command": "./target/debug/marketcow wal verify /tmp/marketcow-rust-polymarket-live-v6.EbCIVO/storage/polymarket/wal",
     "wal_result": {"status":"ok","records":6,"last_cursor":6},
     "http_command": "curl http://127.0.0.1:18872/v1/prediction-markets/polymarket/live/full-sync",
-    "http_result": {"status":200,"ready":true,"book_count":2,"boundary_cursor":6,"persisted_cursor":6,"unresolved_gap_count":0}
+    "http_result": {"status":200,"ready":true,"book_count":2,"boundary_cursor":6,"persisted_cursor":6,"unresolved_gap_count":0},
+    "restart_recovery": {
+      "verdict": "passed",
+      "recovered_pid": 96328,
+      "restart_log": "/tmp/marketcow-rust-polymarket-live-v6.EbCIVO/restart.log",
+      "pre_restart_checkpoint_cursor": 10,
+      "post_restart_http_status": 200,
+      "post_restart_projection_ready": true,
+      "post_restart_book_count": 2,
+      "post_restart_unresolved_gap_count": 0,
+      "post_restart_published_cursor": 20,
+      "post_restart_persisted_cursor": 20,
+      "post_restart_wal_verify": {"status":"ok","records":20,"last_cursor":20}
+    }
   },
   "limitations": [
     "This is an initial live shadow gate, not the required 45-minute HTTP/network soak.",
-    "Restart recovery against this retained storage has not yet been executed.",
-    "The running binary was built from the current worktree before the evidence commit; exact post-commit binary relaunch remains pending."
+    "The daemon wiring shares an uncommitted file with pre-existing Phase 6 Hyperliquid work, so only the isolated Rust Polymarket transport was committed as a05e23d; unrelated worktree changes were deliberately not committed.",
+    "The 300000 ms quiet-book age is an operational strategy-development setting; disconnect and source-gap events still fail closed immediately."
   ]
 }
