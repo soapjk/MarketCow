@@ -6,6 +6,7 @@
 //! event cannot be published before its authoritative append succeeds.
 
 use chrono::{DateTime, TimeZone, Utc};
+use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -13,8 +14,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     str::FromStr,
+    time::Duration,
 };
 use thiserror::Error;
+use tokio::sync::{mpsc, watch};
+use tokio_tungstenite::tungstenite::Message;
+use url::Url;
 
 pub const REALTIME_CONTRACT_VERSION: &str = "marketcow.realtime.provider-neutral.v1";
 pub const HYPERLIQUID_NORMALIZER_VERSION: &str = "marketcow.hyperliquid.normalizer.v1";
@@ -183,7 +188,7 @@ impl HyperliquidNormalizer {
         for (instrument_id, coin) in mappings {
             let normalized = coin.trim().to_ascii_uppercase();
             if instrument_id.trim().is_empty()
-                || normalized.is_empty()
+                || !valid_coin(&normalized)
                 || instrument_by_coin
                     .insert(normalized, instrument_id)
                     .is_some()
@@ -205,13 +210,31 @@ impl HyperliquidNormalizer {
         raw: Value,
         received_at: DateTime<Utc>,
     ) -> Result<Vec<NormalizedProviderEvent>, RealtimeError> {
+        let raw_sha256 = sha256(&raw);
+        self.normalize_with_raw_sha256(raw, received_at, &raw_sha256)
+    }
+
+    /// Normalize a frame while retaining the SHA-256 of the exact UTF-8 WebSocket payload. The
+    /// transport uses this path; tests and offline semantic fixtures may use `normalize`.
+    pub fn normalize_with_raw_sha256(
+        &self,
+        raw: Value,
+        received_at: DateTime<Utc>,
+        raw_sha256: &str,
+    ) -> Result<Vec<NormalizedProviderEvent>, RealtimeError> {
+        if raw_sha256.len() != 64
+            || !raw_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(RealtimeError::InvalidRawEvidence);
+        }
         let object = raw.as_object().ok_or(RealtimeError::FrameNotObject)?;
         let channel = required_string(object, "channel")?;
-        let raw_sha256 = sha256(&raw);
         match channel {
-            "l2Book" | "bbo" => self.normalize_book(object, received_at, &raw_sha256),
-            "trades" => self.normalize_trades(object, received_at, &raw_sha256),
-            "activeAssetCtx" => self.normalize_context(object, received_at, &raw_sha256),
+            "l2Book" | "bbo" => self.normalize_book(object, received_at, raw_sha256),
+            "trades" => self.normalize_trades(object, received_at, raw_sha256),
+            "activeAssetCtx" => self.normalize_context(object, received_at, raw_sha256),
             value => Err(RealtimeError::UnsupportedChannel(value.into())),
         }
     }
@@ -225,16 +248,9 @@ impl HyperliquidNormalizer {
         let data = object_field(frame, "data")?;
         let instrument_id = self.instrument(data)?;
         let observed_at = self.observed_at(data, received_at)?;
-        let (bid_values, ask_values) = if let Some(levels) = data.get("levels") {
-            two_sides(levels)?
-        } else {
-            two_sides(
-                data.get("bbo")
-                    .ok_or(RealtimeError::MissingField("levels"))?,
-            )?
-        };
-        let bids = parse_levels(bid_values)?;
-        let asks = parse_levels(ask_values)?;
+        let (bid_values, ask_values) = book_sides(data)?;
+        let bids = parse_levels(&bid_values)?;
+        let asks = parse_levels(&ask_values)?;
         if !strictly_descending(&bids) || !strictly_ascending(&asks) {
             return Err(RealtimeError::InvalidPayload);
         }
@@ -410,6 +426,443 @@ impl HyperliquidNormalizer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HyperliquidSubscriptionKind {
+    L2Book,
+    Trades,
+    ActiveAssetCtx,
+}
+
+impl HyperliquidSubscriptionKind {
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::L2Book => "l2Book",
+            Self::Trades => "trades",
+            Self::ActiveAssetCtx => "activeAssetCtx",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyperliquidSubscription {
+    pub coin: String,
+    pub kind: HyperliquidSubscriptionKind,
+}
+
+impl HyperliquidSubscription {
+    fn wire_message(&self) -> Value {
+        serde_json::json!({
+            "method":"subscribe",
+            "subscription":{"type":self.kind.as_wire(),"coin":self.coin}
+        })
+    }
+}
+
+pub fn hyperliquid_subscriptions(
+    mappings: &BTreeMap<String, String>,
+    data_types: &BTreeSet<DataType>,
+) -> Result<Vec<HyperliquidSubscription>, RealtimeError> {
+    if mappings.is_empty() || data_types.is_empty() {
+        return Err(RealtimeError::InvalidConfig);
+    }
+    let wants_book =
+        data_types.contains(&DataType::Quote) || data_types.contains(&DataType::OrderBook);
+    let wants_trade = data_types.contains(&DataType::Trade);
+    let wants_context = data_types.contains(&DataType::AssetContext);
+    let mut unique = BTreeSet::new();
+    let mut instrument_by_coin = BTreeMap::new();
+    for (instrument, coin) in mappings {
+        let coin = coin.trim().to_ascii_uppercase();
+        if instrument.trim().is_empty()
+            || !valid_coin(&coin)
+            || instrument_by_coin
+                .insert(coin.clone(), instrument.as_str())
+                .is_some()
+        {
+            return Err(RealtimeError::InvalidConfig);
+        }
+        for (kind, wanted) in [
+            (HyperliquidSubscriptionKind::L2Book, wants_book),
+            (HyperliquidSubscriptionKind::Trades, wants_trade),
+            (HyperliquidSubscriptionKind::ActiveAssetCtx, wants_context),
+        ] {
+            if wanted {
+                unique.insert((coin.clone(), kind));
+            }
+        }
+    }
+    Ok(unique
+        .into_iter()
+        .map(|(coin, kind)| HyperliquidSubscription { coin, kind })
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+pub struct HyperliquidTransportConfig {
+    endpoint: Url,
+    connect_timeout: Duration,
+    reconnect_delay: Duration,
+    heartbeat_interval: Duration,
+    maximum_reconnect_attempts: u32,
+    maximum_frame_bytes: usize,
+}
+
+impl HyperliquidTransportConfig {
+    pub fn production() -> Self {
+        Self {
+            endpoint: Url::parse("wss://api.hyperliquid.xyz/ws")
+                .expect("the fixed Hyperliquid endpoint is valid"),
+            connect_timeout: Duration::from_secs(5),
+            reconnect_delay: Duration::from_millis(500),
+            heartbeat_interval: Duration::from_secs(30),
+            maximum_reconnect_attempts: 8,
+            maximum_frame_bytes: 1_048_576,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), TransportError> {
+        let valid_production = self.endpoint.scheme() == "wss"
+            && self.endpoint.host_str() == Some("api.hyperliquid.xyz")
+            && self.endpoint.port().is_none()
+            && self.endpoint.path() == "/ws"
+            && self.endpoint.query().is_none()
+            && self.endpoint.fragment().is_none()
+            && self.endpoint.username().is_empty()
+            && self.endpoint.password().is_none();
+        #[cfg(test)]
+        let valid_test = self.endpoint.scheme() == "ws"
+            && self
+                .endpoint
+                .host_str()
+                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|address| address.is_loopback())
+            && self.endpoint.port().is_some()
+            && self.endpoint.path() == "/ws"
+            && self.endpoint.query().is_none()
+            && self.endpoint.fragment().is_none()
+            && self.endpoint.username().is_empty()
+            && self.endpoint.password().is_none();
+        #[cfg(not(test))]
+        let valid_test = false;
+        if (!valid_production && !valid_test)
+            || self.connect_timeout.is_zero()
+            || self.reconnect_delay.is_zero()
+            || self.heartbeat_interval.is_zero()
+            || self.maximum_reconnect_attempts == 0
+            || !(1..=1_048_576).contains(&self.maximum_frame_bytes)
+        {
+            return Err(TransportError::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn loopback(endpoint: Url) -> Self {
+        Self {
+            endpoint,
+            connect_timeout: Duration::from_secs(2),
+            reconnect_delay: Duration::from_millis(10),
+            heartbeat_interval: Duration::from_secs(30),
+            maximum_reconnect_attempts: 2,
+            maximum_frame_bytes: 64 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TransportOutput {
+    Connected {
+        attempt: u32,
+    },
+    SubscriptionsReady {
+        attempt: u32,
+    },
+    Events {
+        attempt: u32,
+        events: Vec<NormalizedProviderEvent>,
+    },
+    Degraded {
+        attempt: u32,
+        reason: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionEnd {
+    Shutdown,
+    Disconnected,
+}
+
+/// Own the public Hyperliquid WebSocket in Rust. Any unprocessable frame closes the connection;
+/// no event is skipped and no unbounded queue is introduced. A supervisor performs only the
+/// configured bounded number of reconnects and replays the deterministic subscription set.
+pub async fn run_hyperliquid_transport(
+    config: HyperliquidTransportConfig,
+    normalizer: HyperliquidNormalizer,
+    subscriptions: Vec<HyperliquidSubscription>,
+    output: mpsc::Sender<TransportOutput>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), TransportError> {
+    config.validate()?;
+    if subscriptions.is_empty() || !valid_subscription_set(&subscriptions) {
+        return Err(TransportError::InvalidConfig);
+    }
+    for attempt in 1..=config.maximum_reconnect_attempts {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        match run_hyperliquid_connection(
+            &config,
+            &normalizer,
+            &subscriptions,
+            &output,
+            &mut shutdown,
+            attempt,
+        )
+        .await
+        {
+            Ok(ConnectionEnd::Shutdown) => return Ok(()),
+            Ok(ConnectionEnd::Disconnected) => {
+                try_output(
+                    &output,
+                    TransportOutput::Degraded {
+                        attempt,
+                        reason: "upstream_disconnected".into(),
+                        retryable: true,
+                    },
+                )?;
+            }
+            Err(TransportError::Backpressure) => return Err(TransportError::Backpressure),
+            Err(error) => {
+                try_output(
+                    &output,
+                    TransportOutput::Degraded {
+                        attempt,
+                        reason: error.reason_code().into(),
+                        retryable: attempt < config.maximum_reconnect_attempts,
+                    },
+                )?;
+            }
+        }
+        if attempt == config.maximum_reconnect_attempts {
+            return Err(TransportError::ReconnectExhausted);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(config.reconnect_delay) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Err(TransportError::ReconnectExhausted)
+}
+
+async fn run_hyperliquid_connection(
+    config: &HyperliquidTransportConfig,
+    normalizer: &HyperliquidNormalizer,
+    subscriptions: &[HyperliquidSubscription],
+    output: &mpsc::Sender<TransportOutput>,
+    shutdown: &mut watch::Receiver<bool>,
+    attempt: u32,
+) -> Result<ConnectionEnd, TransportError> {
+    let connect = tokio_tungstenite::connect_async(config.endpoint.as_str());
+    let (mut socket, response) = tokio::time::timeout(config.connect_timeout, connect)
+        .await
+        .map_err(|_| TransportError::ConnectTimeout)?
+        .map_err(|_| TransportError::ConnectFailed)?;
+    if response.status() != 101 {
+        return Err(TransportError::HandshakeRejected);
+    }
+    for subscription in subscriptions {
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&subscription.wire_message())
+                    .expect("subscription is serializable")
+                    .into(),
+            ))
+            .await
+            .map_err(|_| TransportError::SendFailed)?;
+    }
+    let mut pending_subscriptions = subscriptions
+        .iter()
+        .map(|subscription| (subscription.coin.clone(), subscription.kind))
+        .collect::<BTreeSet<_>>();
+    let mut subscriptions_ready_reported = false;
+    try_output(output, TransportOutput::Connected { attempt })?;
+    loop {
+        let heartbeat = tokio::time::sleep(config.heartbeat_interval);
+        tokio::pin!(heartbeat);
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    let _ = socket.close(None).await;
+                    return Ok(ConnectionEnd::Shutdown);
+                }
+            }
+            message = socket.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        if text.len() > config.maximum_frame_bytes {
+                            let _ = socket.close(None).await;
+                            return Err(TransportError::FrameTooLarge);
+                        }
+                        let received_at = Utc::now();
+                        let raw_sha256 = hex::encode(Sha256::digest(text.as_bytes()));
+                        let raw = serde_json::from_str::<Value>(&text)
+                            .map_err(|_| TransportError::InvalidJson)?;
+                        if handle_control_frame(&raw, &mut pending_subscriptions)? {
+                            if pending_subscriptions.is_empty() && !subscriptions_ready_reported {
+                                try_output(output, TransportOutput::SubscriptionsReady { attempt })?;
+                                subscriptions_ready_reported = true;
+                            }
+                            continue;
+                        }
+                        let events = normalizer
+                            .normalize_with_raw_sha256(raw, received_at, &raw_sha256)
+                            .map_err(TransportError::Normalization)?;
+                        try_output(output, TransportOutput::Events { attempt, events })?;
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        socket.send(Message::Pong(payload)).await
+                            .map_err(|_| TransportError::SendFailed)?;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => return Ok(ConnectionEnd::Disconnected),
+                    Some(Ok(Message::Binary(_))) => {
+                        let _ = socket.close(None).await;
+                        return Err(TransportError::UnexpectedBinaryFrame);
+                    }
+                    Some(Ok(Message::Frame(_))) => {
+                        let _ = socket.close(None).await;
+                        return Err(TransportError::InvalidFrame);
+                    }
+                    Some(Err(_)) => return Err(TransportError::ReadFailed),
+                }
+            }
+            _ = &mut heartbeat => {
+                socket.send(Message::Text(r#"{"method":"ping"}"#.into())).await
+                    .map_err(|_| TransportError::SendFailed)?;
+            }
+        }
+    }
+}
+
+fn try_output(
+    output: &mpsc::Sender<TransportOutput>,
+    message: TransportOutput,
+) -> Result<(), TransportError> {
+    output.try_send(message).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => TransportError::Backpressure,
+        mpsc::error::TrySendError::Closed(_) => TransportError::ConsumerClosed,
+    })
+}
+
+fn valid_subscription_set(subscriptions: &[HyperliquidSubscription]) -> bool {
+    let mut unique = BTreeSet::new();
+    subscriptions.iter().all(|subscription| {
+        valid_coin(&subscription.coin)
+            && subscription.coin == subscription.coin.to_ascii_uppercase()
+            && unique.insert((subscription.coin.clone(), subscription.kind))
+    })
+}
+
+fn handle_control_frame(
+    raw: &Value,
+    pending: &mut BTreeSet<(String, HyperliquidSubscriptionKind)>,
+) -> Result<bool, TransportError> {
+    let object = raw.as_object().ok_or(TransportError::InvalidControlFrame)?;
+    match object.get("channel").and_then(Value::as_str) {
+        Some("pong") => Ok(true),
+        Some("subscriptionResponse") => {
+            let data = object
+                .get("data")
+                .and_then(Value::as_object)
+                .ok_or(TransportError::InvalidControlFrame)?;
+            let subscription = data
+                .get("subscription")
+                .and_then(Value::as_object)
+                .unwrap_or(data);
+            let coin = subscription
+                .get("coin")
+                .and_then(Value::as_str)
+                .filter(|coin| valid_coin(coin) && *coin == coin.to_ascii_uppercase())
+                .ok_or(TransportError::InvalidControlFrame)?;
+            let kind = match subscription.get("type").and_then(Value::as_str) {
+                Some("l2Book") => HyperliquidSubscriptionKind::L2Book,
+                Some("trades") => HyperliquidSubscriptionKind::Trades,
+                Some("activeAssetCtx") => HyperliquidSubscriptionKind::ActiveAssetCtx,
+                _ => return Err(TransportError::InvalidControlFrame),
+            };
+            if !pending.remove(&(coin.into(), kind)) {
+                return Err(TransportError::InvalidControlFrame);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TransportError {
+    #[error("Hyperliquid transport configuration is invalid")]
+    InvalidConfig,
+    #[error("Hyperliquid connection timed out")]
+    ConnectTimeout,
+    #[error("Hyperliquid connection failed")]
+    ConnectFailed,
+    #[error("Hyperliquid handshake was rejected")]
+    HandshakeRejected,
+    #[error("Hyperliquid subscription send failed")]
+    SendFailed,
+    #[error("Hyperliquid read failed")]
+    ReadFailed,
+    #[error("Hyperliquid frame exceeds the configured bound")]
+    FrameTooLarge,
+    #[error("Hyperliquid returned invalid JSON")]
+    InvalidJson,
+    #[error("Hyperliquid returned an unexpected binary frame")]
+    UnexpectedBinaryFrame,
+    #[error("Hyperliquid returned an invalid frame")]
+    InvalidFrame,
+    #[error("Hyperliquid returned an invalid or duplicate control frame")]
+    InvalidControlFrame,
+    #[error("Hyperliquid normalization failed: {0}")]
+    Normalization(RealtimeError),
+    #[error("realtime consumer queue is full")]
+    Backpressure,
+    #[error("realtime consumer is closed")]
+    ConsumerClosed,
+    #[error("bounded Hyperliquid reconnect budget was exhausted")]
+    ReconnectExhausted,
+}
+
+impl TransportError {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig => "invalid_config",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::ConnectFailed => "connect_failed",
+            Self::HandshakeRejected => "handshake_rejected",
+            Self::SendFailed => "subscription_send_failed",
+            Self::ReadFailed => "read_failed",
+            Self::FrameTooLarge => "frame_too_large",
+            Self::InvalidJson => "invalid_json",
+            Self::UnexpectedBinaryFrame => "unexpected_binary_frame",
+            Self::InvalidFrame => "invalid_frame",
+            Self::InvalidControlFrame => "invalid_control_frame",
+            Self::Normalization(_) => "normalization_failed",
+            Self::Backpressure => "backpressure",
+            Self::ConsumerClosed => "consumer_closed",
+            Self::ReconnectExhausted => "reconnect_exhausted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataType {
     Quote,
@@ -564,6 +1017,8 @@ pub enum RealtimeError {
     MissingField(&'static str),
     #[error("provider payload is invalid")]
     InvalidPayload,
+    #[error("raw frame evidence hash is invalid")]
+    InvalidRawEvidence,
     #[error("financial decimals must be JSON strings")]
     FinancialDecimalMustBeString,
     #[error("financial decimal is invalid")]
@@ -631,6 +1086,32 @@ fn two_sides(value: &Value) -> Result<(&[Value], &[Value]), RealtimeError> {
         sides[0].as_array().ok_or(RealtimeError::InvalidPayload)?,
         sides[1].as_array().ok_or(RealtimeError::InvalidPayload)?,
     ))
+}
+
+fn book_sides(data: &Map<String, Value>) -> Result<(Vec<Value>, Vec<Value>), RealtimeError> {
+    if let Some(levels) = data.get("levels") {
+        let (bids, asks) = two_sides(levels)?;
+        return Ok((bids.to_vec(), asks.to_vec()));
+    }
+    let bbo = data
+        .get("bbo")
+        .and_then(Value::as_array)
+        .filter(|sides| sides.len() == 2)
+        .ok_or(RealtimeError::MissingField("levels/bbo"))?;
+    let side = |value: &Value| match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Object(_) => Ok(vec![value.clone()]),
+        _ => Err(RealtimeError::InvalidPayload),
+    };
+    Ok((side(&bbo[0])?, side(&bbo[1])?))
+}
+
+fn valid_coin(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'@' | b':' | b'/' | b'-' | b'_' | b'.')
+        })
 }
 
 fn parse_levels(values: &[Value]) -> Result<Vec<BookLevel>, RealtimeError> {
@@ -795,6 +1276,20 @@ mod tests {
         };
         assert_eq!(bid_price.0.to_string(), "64999.5");
         assert_eq!(ask_price.0.to_string(), "65000.5");
+        let bbo = normalizer()
+            .normalize(
+                json!({
+                    "channel":"bbo",
+                    "data":{"coin":"BTC","time":1700000000000_i64,"bbo":[
+                        {"px":"64999.5","sz":"1.2"},
+                        {"px":"65000.5","sz":"0.8"}
+                    ]}
+                }),
+                received(),
+            )
+            .unwrap();
+        assert_eq!(bbo.len(), 2);
+        assert_eq!(bbo[1].public_contract_value()["event_type"], "quote");
 
         let trade = normalizer()
             .normalize(
@@ -872,6 +1367,27 @@ mod tests {
             normalizer().normalize(unknown, received()).unwrap_err(),
             RealtimeError::UnknownInstrument
         );
+        assert_eq!(
+            normalizer()
+                .normalize_with_raw_sha256(json!({"channel":"pong"}), received(), "A")
+                .unwrap_err(),
+            RealtimeError::InvalidRawEvidence
+        );
+    }
+
+    #[test]
+    fn transport_supplied_hash_preserves_exact_wire_bytes() {
+        let wire = r#"{ "channel": "trades", "data": [{"coin":"BTC","time":1700000000001,"px":"65000","sz":"0.1","side":"B","tid":42}] }"#;
+        let expected = hex::encode(Sha256::digest(wire.as_bytes()));
+        let event = normalizer()
+            .normalize_with_raw_sha256(serde_json::from_str(wire).unwrap(), received(), &expected)
+            .unwrap()
+            .remove(0);
+        assert_eq!(event.raw_sha256, expected);
+        assert_ne!(
+            event.raw_sha256,
+            sha256(&serde_json::from_str(wire).unwrap())
+        );
     }
 
     #[test]
@@ -946,5 +1462,243 @@ mod tests {
             replay.replay_after("old-stream", 1, &filter).unwrap_err(),
             RealtimeError::StreamChanged
         );
+    }
+
+    #[test]
+    fn subscriptions_are_deterministic_unambiguous_and_read_only() {
+        let mappings = BTreeMap::from([
+            ("BTC-PERP.HYPL".into(), "btc".into()),
+            ("ETH-PERP.HYPL".into(), "ETH".into()),
+        ]);
+        let subscriptions = hyperliquid_subscriptions(
+            &mappings,
+            &BTreeSet::from([DataType::Quote, DataType::Trade, DataType::OrderBook]),
+        )
+        .unwrap();
+        assert_eq!(subscriptions.len(), 4);
+        assert_eq!(subscriptions[0].coin, "BTC");
+        assert_eq!(subscriptions[0].kind, HyperliquidSubscriptionKind::L2Book);
+        assert_eq!(subscriptions[1].kind, HyperliquidSubscriptionKind::Trades);
+        assert_eq!(subscriptions[2].coin, "ETH");
+        for subscription in subscriptions {
+            let wire = subscription.wire_message();
+            assert_eq!(wire["method"], "subscribe");
+            assert!(wire.get("order").is_none());
+            assert!(wire.get("signature").is_none());
+        }
+        assert!(HyperliquidTransportConfig::production().validate().is_ok());
+        let mut invalid = HyperliquidTransportConfig::production();
+        invalid.endpoint = Url::parse("wss://example.com/ws").unwrap();
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            TransportError::InvalidConfig
+        );
+        assert_eq!(
+            hyperliquid_subscriptions(
+                &BTreeMap::from([
+                    ("BTC-PERP.HYPL".into(), "BTC".into()),
+                    ("BTC-SPOT.HYPL".into(), "btc".into()),
+                ]),
+                &BTreeSet::from([DataType::Trade]),
+            )
+            .unwrap_err(),
+            RealtimeError::InvalidConfig
+        );
+    }
+
+    #[tokio::test]
+    async fn local_websocket_reconnects_resubscribes_and_fails_closed_on_bad_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 1..=2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let subscription = socket.next().await.unwrap().unwrap();
+                let Message::Text(text) = subscription else {
+                    panic!("expected text subscription")
+                };
+                let value: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["method"], "subscribe");
+                assert_eq!(value["subscription"]["type"], "trades");
+                assert_eq!(value["subscription"]["coin"], "BTC");
+                socket
+                    .send(Message::Text(
+                        r#"{"channel":"subscriptionResponse","data":{"type":"trades","coin":"BTC"}}"#
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let price = if attempt == 1 {
+                    Value::String("65000.1".into())
+                } else {
+                    serde_json::json!(65000.1)
+                };
+                socket
+                    .send(Message::Text(
+                        serde_json::to_string(&serde_json::json!({
+                            "channel":"trades",
+                            "data":[{"coin":"BTC","time":Utc::now().timestamp_millis(),
+                                "px":price,"sz":"0.1","side":"B","tid":attempt}]
+                        }))
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if attempt == 1 {
+                    socket.close(None).await.unwrap();
+                } else {
+                    let _ = socket.next().await;
+                }
+            }
+        });
+        let endpoint = Url::parse(&format!("ws://{address}/ws")).unwrap();
+        let config = HyperliquidTransportConfig::loopback(endpoint);
+        let normalizer =
+            HyperliquidNormalizer::new([("BTC-PERP.HYPL".into(), "BTC".into())], 5_000).unwrap();
+        let subscriptions = hyperliquid_subscriptions(
+            &BTreeMap::from([("BTC-PERP.HYPL".into(), "BTC".into())]),
+            &BTreeSet::from([DataType::Trade]),
+        )
+        .unwrap();
+        let (sender, mut receiver) = mpsc::channel(16);
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        assert_eq!(
+            run_hyperliquid_transport(config, normalizer, subscriptions, sender, shutdown)
+                .await
+                .unwrap_err(),
+            TransportError::ReconnectExhausted
+        );
+        server.await.unwrap();
+        let mut outputs = Vec::new();
+        while let Ok(output) = receiver.try_recv() {
+            outputs.push(output);
+        }
+        assert!(matches!(
+            outputs[0],
+            TransportOutput::Connected { attempt: 1 }
+        ));
+        assert!(matches!(
+            outputs[1],
+            TransportOutput::SubscriptionsReady { attempt: 1 }
+        ));
+        assert!(matches!(
+            outputs[2],
+            TransportOutput::Events { attempt: 1, .. }
+        ));
+        assert!(matches!(
+            outputs[3],
+            TransportOutput::Degraded {
+                attempt: 1,
+                ref reason,
+                retryable: true
+            } if reason == "upstream_disconnected"
+        ));
+        assert!(matches!(
+            outputs[4],
+            TransportOutput::Connected { attempt: 2 }
+        ));
+        assert!(matches!(
+            outputs[5],
+            TransportOutput::SubscriptionsReady { attempt: 2 }
+        ));
+        assert!(matches!(
+            outputs[6],
+            TransportOutput::Degraded {
+                attempt: 2,
+                ref reason,
+                retryable: false
+            } if reason == "normalization_failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_consumer_queue_stops_transport_without_reconnect_or_loss() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"channel":"subscriptionResponse","data":{"type":"trades","coin":"BTC"}}"#
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.next().await;
+        });
+        let config = HyperliquidTransportConfig::loopback(
+            Url::parse(&format!("ws://{address}/ws")).unwrap(),
+        );
+        let normalizer =
+            HyperliquidNormalizer::new([("BTC-PERP.HYPL".into(), "BTC".into())], 5_000).unwrap();
+        let subscriptions = hyperliquid_subscriptions(
+            &BTreeMap::from([("BTC-PERP.HYPL".into(), "BTC".into())]),
+            &BTreeSet::from([DataType::Trade]),
+        )
+        .unwrap();
+        let (sender, _receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        assert_eq!(
+            run_hyperliquid_transport(config, normalizer, subscriptions, sender, shutdown)
+                .await
+                .unwrap_err(),
+            TransportError::Backpressure
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn application_heartbeat_matches_official_ping_pong_contract() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            socket
+                .send(Message::Text(
+                    r#"{"channel":"subscriptionResponse","data":{"type":"trades","coin":"BTC"}}"#
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(ping) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected application heartbeat")
+            };
+            assert_eq!(
+                serde_json::from_str::<Value>(&ping).unwrap(),
+                json!({"method":"ping"})
+            );
+            socket
+                .send(Message::Text(r#"{"channel":"pong"}"#.into()))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let mut config = HyperliquidTransportConfig::loopback(
+            Url::parse(&format!("ws://{address}/ws")).unwrap(),
+        );
+        config.maximum_reconnect_attempts = 1;
+        config.heartbeat_interval = Duration::from_millis(10);
+        let normalizer =
+            HyperliquidNormalizer::new([("BTC-PERP.HYPL".into(), "BTC".into())], 5_000).unwrap();
+        let subscriptions = hyperliquid_subscriptions(
+            &BTreeMap::from([("BTC-PERP.HYPL".into(), "BTC".into())]),
+            &BTreeSet::from([DataType::Trade]),
+        )
+        .unwrap();
+        let (sender, _receiver) = mpsc::channel(8);
+        let (_shutdown_sender, shutdown) = watch::channel(false);
+        assert_eq!(
+            run_hyperliquid_transport(config, normalizer, subscriptions, sender, shutdown)
+                .await
+                .unwrap_err(),
+            TransportError::ReconnectExhausted
+        );
+        server.await.unwrap();
     }
 }
