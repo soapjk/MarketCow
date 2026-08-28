@@ -1075,6 +1075,8 @@ mod tests {
                 tick_size: Some(marketcow_core::Price::parse_tick("0.01").unwrap()),
                 tick_version: "tick-v1".into(),
                 source_observed_at: Some(Utc::now()),
+                last_trade_price: None,
+                last_trade_observed_at: None,
             },
         );
         state.projection.store(Arc::new(projection));
@@ -1159,6 +1161,8 @@ mod tests {
                 tick_size: Some(marketcow_core::Price::parse_tick("0.01").unwrap()),
                 tick_version: "tick-v1".into(),
                 source_observed_at: Some(Utc::now() - chrono::Duration::seconds(31)),
+                last_trade_price: None,
+                last_trade_observed_at: None,
             },
         );
         state.projection.store(Arc::new(projection));

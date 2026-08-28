@@ -170,7 +170,95 @@ pub fn normalize_frame(
                 })
                 .collect()
         }
+        "best_bid_ask" => {
+            let token_id = token_id(raw)?;
+            if !raw.contains_key("best_bid") || !raw.contains_key("best_ask") {
+                return Err(NormalizeError::MissingField("best_bid/best_ask"));
+            }
+            let best_bid = optional_price(raw.get("best_bid"))?;
+            let best_ask = optional_price(raw.get("best_ask"))?;
+            if best_bid
+                .as_ref()
+                .zip(best_ask.as_ref())
+                .is_some_and(|(bid, ask)| bid >= ask)
+            {
+                return Err(NormalizeError::InvalidLevels);
+            }
+            Ok(vec![build_event(
+                config,
+                &context,
+                first_cursor,
+                &token_id,
+                EventKind::BestBidAsk {
+                    token_id: token_id.clone(),
+                    best_bid,
+                    best_ask,
+                },
+            )])
+        }
+        "last_trade_price" => {
+            let token_id = token_id(raw)?;
+            let price = required_price(raw.get("price"), "price")?;
+            Ok(vec![build_event(
+                config,
+                &context,
+                first_cursor,
+                &token_id,
+                EventKind::LastTradePrice {
+                    token_id: token_id.clone(),
+                    price,
+                },
+            )])
+        }
+        "tick_size_change" => {
+            let token_id = token_id(raw)?;
+            let new_tick_size = required_tick(raw.get("new_tick_size"), "new_tick_size")?;
+            let old_tick_size = match raw.get("old_tick_size") {
+                None | Some(Value::Null) => None,
+                value => Some(required_tick(value, "old_tick_size")?),
+            };
+            let tick_version = content_sha256(&serde_json::json!({
+                "old_tick_size": old_tick_size,
+                "new_tick_size": new_tick_size,
+                "source_revision": context.raw_sha256,
+            }))?;
+            Ok(vec![build_event(
+                config,
+                &context,
+                first_cursor,
+                &token_id,
+                EventKind::TickSizeChange {
+                    token_id: token_id.clone(),
+                    old_tick_size,
+                    new_tick_size,
+                    tick_version,
+                },
+            )])
+        }
         other => Err(NormalizeError::UnsupportedEventType(other.into())),
+    }
+}
+
+fn token_id(raw: &serde_json::Map<String, Value>) -> Result<String, NormalizeError> {
+    string_alias(raw, &["asset_id", "token_id"])
+        .filter(|value| !value.is_empty())
+        .ok_or(NormalizeError::MissingField("asset_id"))
+}
+
+fn required_price(value: Option<&Value>, field: &'static str) -> Result<Price, NormalizeError> {
+    let text = value_text(value).ok_or(NormalizeError::MissingField(field))?;
+    Price::parse(&text).map_err(|_| NormalizeError::InvalidDecimal)
+}
+
+fn required_tick(value: Option<&Value>, field: &'static str) -> Result<Price, NormalizeError> {
+    let text = value_text(value).ok_or(NormalizeError::MissingField(field))?;
+    Price::parse_tick(&text).map_err(|_| NormalizeError::InvalidDecimal)
+}
+
+fn optional_price(value: Option<&Value>) -> Result<Option<Price>, NormalizeError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        value => required_price(value, "best_bid/best_ask").map(Some),
     }
 }
 
@@ -391,14 +479,95 @@ mod tests {
         assert_eq!(
             normalize_frame(
                 &config(),
-                serde_json::json!({"event_type":"last_trade_price"}),
+                serde_json::json!({"event_type":"new_market"}),
                 at(),
                 1,
             ),
-            Err(NormalizeError::UnsupportedEventType(
-                "last_trade_price".into()
-            ))
+            Err(NormalizeError::UnsupportedEventType("new_market".into()))
         );
+    }
+
+    #[test]
+    fn quote_trade_and_tick_events_preserve_exact_semantics() {
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        writer.apply(snapshot(1)).unwrap();
+
+        let quote = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"best_bid_ask", "asset_id":"yes-1",
+                "timestamp":"2026-08-03T04:00:01Z", "best_bid":"0.40", "best_ask":"0.42"
+            }),
+            at(),
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(writer.apply(quote).unwrap().persisted.applied);
+
+        let trade = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"last_trade_price", "asset_id":"yes-1",
+                "timestamp":"2026-08-03T04:00:02Z", "price":"0.41"
+            }),
+            at(),
+            3,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(writer.apply(trade).unwrap().persisted.applied);
+        assert_eq!(
+            writer.projection().books["yes-1"]
+                .last_trade_price
+                .as_ref()
+                .unwrap()
+                .0
+                .to_string(),
+            "0.41"
+        );
+
+        let tick = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"tick_size_change", "asset_id":"yes-1",
+                "timestamp":"2026-08-03T04:00:03Z", "old_tick_size":"0.01",
+                "new_tick_size":"0.01"
+            }),
+            at(),
+            4,
+        )
+        .unwrap()
+        .remove(0);
+        let EventKind::TickSizeChange { tick_version, .. } = &tick.kind else {
+            panic!("expected tick change")
+        };
+        assert_eq!(tick_version.len(), 64);
+        assert!(writer.apply(tick).unwrap().persisted.applied);
+    }
+
+    #[test]
+    fn source_quote_or_tick_mismatch_opens_durable_gap() {
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        writer.apply(snapshot(1)).unwrap();
+        let mismatch = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"best_bid_ask", "asset_id":"yes-1",
+                "best_bid":"0.39", "best_ask":"0.42"
+            }),
+            at(),
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        let outcome = writer.apply(mismatch).unwrap();
+        assert!(!outcome.persisted.applied);
+        assert_eq!(
+            outcome.persisted.fail_closed_reason.as_deref(),
+            Some("best_bid_ask_source_mismatch")
+        );
+        assert!(outcome.projection.unresolved_gaps.contains("yes-1"));
     }
 
     #[test]

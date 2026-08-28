@@ -22,6 +22,8 @@ pub struct BookView {
     pub tick_size: Option<marketcow_core::Price>,
     pub tick_version: String,
     pub source_observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_trade_price: Option<marketcow_core::Price>,
+    pub last_trade_observed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +113,8 @@ fn book_view(token_id: &str, book: &Book) -> BookView {
         tick_size: book.tick_size.clone(),
         tick_version: book.tick_version.clone(),
         source_observed_at: book.source_observed_at,
+        last_trade_price: book.last_trade_price.clone(),
+        last_trade_observed_at: book.last_trade_observed_at,
     }
 }
 
@@ -171,6 +175,9 @@ fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, ReadAp
             EventKind::FullBook { .. } => "full_book",
             EventKind::Delta { .. } => "delta",
             EventKind::AtomicDelta { .. } => "delta",
+            EventKind::BestBidAsk { .. } => "best_bid_ask",
+            EventKind::LastTradePrice { .. } => "last_trade_price",
+            EventKind::TickSizeChange { .. } => "tick_size_change",
             EventKind::SourceGap { .. } => "source_gap",
         }
         .into(),

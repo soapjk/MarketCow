@@ -71,6 +71,8 @@ pub struct Book {
     pub tick_size: Option<Price>,
     pub tick_version: String,
     pub source_observed_at: Option<DateTime<Utc>>,
+    pub last_trade_price: Option<Price>,
+    pub last_trade_observed_at: Option<DateTime<Utc>>,
 }
 
 impl Book {
@@ -165,6 +167,21 @@ pub enum EventKind {
         token_id: String,
         changes: Vec<SideLevels>,
     },
+    BestBidAsk {
+        token_id: String,
+        best_bid: Option<Price>,
+        best_ask: Option<Price>,
+    },
+    LastTradePrice {
+        token_id: String,
+        price: Price,
+    },
+    TickSizeChange {
+        token_id: String,
+        old_tick_size: Option<Price>,
+        new_tick_size: Price,
+        tick_version: String,
+    },
     SourceGap {
         token_id: String,
         reason: String,
@@ -177,6 +194,9 @@ impl EventKind {
             Self::FullBook { token_id, .. }
             | Self::Delta { token_id, .. }
             | Self::AtomicDelta { token_id, .. }
+            | Self::BestBidAsk { token_id, .. }
+            | Self::LastTradePrice { token_id, .. }
+            | Self::TickSizeChange { token_id, .. }
             | Self::SourceGap { token_id, .. } => token_id,
         }
     }
@@ -522,6 +542,90 @@ impl<L: DurableLog> SingleWriter<L> {
                             } else {
                                 next.books.insert(token_id.clone(), book);
                             }
+                        }
+                    }
+                }
+                EventKind::BestBidAsk {
+                    token_id,
+                    best_bid,
+                    best_ask,
+                } => {
+                    if next.unresolved_gaps.contains(token_id) || !next.books.contains_key(token_id)
+                    {
+                        next.unresolved_gaps.insert(token_id.clone());
+                        applied = false;
+                        rejected = Some("full_book_recovery_required".into());
+                    } else {
+                        let book = &mut next.books.get_mut(token_id).expect("book checked above");
+                        let projected_bid = book.bids.last_key_value().map(|(price, _)| price);
+                        let projected_ask = book.asks.first_key_value().map(|(price, _)| price);
+                        if projected_bid != best_bid.as_ref() || projected_ask != best_ask.as_ref()
+                        {
+                            next.unresolved_gaps.insert(token_id.clone());
+                            applied = false;
+                            rejected = Some("best_bid_ask_source_mismatch".into());
+                        } else {
+                            book.source_observed_at = Some(event.source_observed_at);
+                        }
+                    }
+                }
+                EventKind::LastTradePrice { token_id, price } => {
+                    if next.unresolved_gaps.contains(token_id) || !next.books.contains_key(token_id)
+                    {
+                        next.unresolved_gaps.insert(token_id.clone());
+                        applied = false;
+                        rejected = Some("full_book_recovery_required".into());
+                    } else {
+                        let book = &mut next.books.get_mut(token_id).expect("book checked above");
+                        let aligned = book
+                            .tick_size
+                            .as_ref()
+                            .is_some_and(|tick| (price.0 % tick.0).is_zero());
+                        if !aligned {
+                            next.unresolved_gaps.insert(token_id.clone());
+                            applied = false;
+                            rejected = Some("invalid_tick_last_trade".into());
+                        } else {
+                            book.last_trade_price = Some(price.clone());
+                            book.last_trade_observed_at = Some(event.source_observed_at);
+                        }
+                    }
+                }
+                EventKind::TickSizeChange {
+                    token_id,
+                    old_tick_size,
+                    new_tick_size,
+                    tick_version,
+                } => {
+                    if tick_version.is_empty()
+                        || next.unresolved_gaps.contains(token_id)
+                        || !next.books.contains_key(token_id)
+                    {
+                        next.unresolved_gaps.insert(token_id.clone());
+                        applied = false;
+                        rejected = Some("full_book_recovery_required".into());
+                    } else {
+                        let book = &mut next.books.get_mut(token_id).expect("book checked above");
+                        let old_matches = old_tick_size
+                            .as_ref()
+                            .is_none_or(|expected| book.tick_size.as_ref() == Some(expected));
+                        let levels_align = book
+                            .bids
+                            .keys()
+                            .chain(book.asks.keys())
+                            .all(|price| (price.0 % new_tick_size.0).is_zero());
+                        if !old_matches {
+                            next.unresolved_gaps.insert(token_id.clone());
+                            applied = false;
+                            rejected = Some("tick_size_source_mismatch".into());
+                        } else if !levels_align {
+                            next.unresolved_gaps.insert(token_id.clone());
+                            applied = false;
+                            rejected = Some("tick_size_recovery_required".into());
+                        } else {
+                            book.tick_size = Some(new_tick_size.clone());
+                            book.tick_version = tick_version.clone();
+                            book.source_observed_at = Some(event.source_observed_at);
                         }
                     }
                 }
