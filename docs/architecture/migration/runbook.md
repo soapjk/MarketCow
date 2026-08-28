@@ -81,6 +81,27 @@ no secret descriptor. Rotate a secret by atomically replacing the owner-only fil
 the affected slot to restart through the bounded supervisor policy; never restart MarketCow
 from Tradude.
 
+## Staged MCP compatibility proxy
+
+During Phase 2 shadow only, Rust may dispatch the 13 not-yet-native read-only MCP tools to the
+legacy Python MCP endpoint. This does not transfer transport ownership back to Python: clients
+connect only to Rust `/mcp`, and Rust performs the public boundary, protocol, size, Origin,
+audit and contract checks. Configure an explicit loopback IP and distinct port:
+
+```text
+MARKETCOW_LEGACY_MCP_URL=http://127.0.0.1:8791/mcp
+```
+
+The URL must use uncredentialed plain HTTP, an explicit loopback IP/port, exact `/mcp` path and
+must not point to the Rust listener. Rust disables environment proxies and redirects, uses a
+one-second connect timeout and 20-second total timeout, and caps the streamed response at 1 MiB.
+`tools/list` is accepted only when it contains exactly the frozen 14 names and every tool is
+read-only/non-destructive. Rust replaces `service_health` with its native definition; the other
+13 calls are response-envelope validated before returning. An unavailable, oversized or
+contract-divergent legacy endpoint fails closed. Phase 5/7 cannot complete until those 13 tools
+are native or worker-backed and this proxy setting is removed. Tradude must not start either
+service.
+
 ## Cutover (future Phase 7 gate)
 
 Drain Rust and Python consumers; stop the Python writer; flush and hash legacy WAL; record a

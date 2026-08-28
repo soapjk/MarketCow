@@ -16,6 +16,22 @@ pub const MCP_SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] = [
 ];
 pub const MCP_MAX_REQUEST_BYTES: usize = 1_048_576;
 pub const MCP_MAX_BATCH_MESSAGES: usize = 100;
+pub const MCP_LEGACY_TOOL_NAMES: [&str; 14] = [
+    "service_health",
+    "search_instruments",
+    "get_instrument",
+    "get_quotes",
+    "get_market_bars",
+    "get_canonical_bars",
+    "get_fundamental",
+    "get_financial_statements",
+    "get_dividends",
+    "get_fund_dividend_history",
+    "get_exposure_facts",
+    "search_convertible_bonds",
+    "get_convertible_bond",
+    "get_convertible_bond_market",
+];
 
 pub fn mcp_service_health_tool_definition() -> serde_json::Value {
     serde_json::json!({

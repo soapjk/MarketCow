@@ -106,6 +106,7 @@ struct Config {
     real_order_submission_enabled: bool,
     shadow_mode: bool,
     maximum_book_age_ms: u64,
+    legacy_mcp_url: Option<String>,
     python_workers: PythonWorkerConfig,
 }
 
@@ -310,6 +311,14 @@ impl Config {
         let maximum_book_age_ms = env::var("MARKETCOW_RUST_MAX_BOOK_AGE_MS")
             .unwrap_or_else(|_| "30000".into())
             .parse::<u64>()?;
+        let legacy_mcp_url = match env::var("MARKETCOW_LEGACY_MCP_URL") {
+            Ok(value) => {
+                validate_legacy_mcp_url(&value, bind)?;
+                Some(value)
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
+        };
         let python_workers = PythonWorkerConfig::load()?;
         if orders {
             bail!("real order submission is prohibited by the migration safety gate");
@@ -341,9 +350,35 @@ impl Config {
             real_order_submission_enabled: false,
             shadow_mode,
             maximum_book_age_ms,
+            legacy_mcp_url,
             python_workers,
         })
     }
+}
+
+fn validate_legacy_mcp_url(value: &str, public_bind: SocketAddr) -> Result<()> {
+    let parsed = url::Url::parse(value).context("MARKETCOW_LEGACY_MCP_URL must be a URL")?;
+    let host = parsed
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .filter(std::net::IpAddr::is_loopback)
+        .context("legacy MCP proxy must use an explicit loopback IP address")?;
+    let port = parsed
+        .port()
+        .context("legacy MCP proxy URL must include an explicit port")?;
+    if parsed.scheme() != "http"
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.path() != "/mcp"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("legacy MCP proxy URL must be an uncredentialed http://loopback:port/mcp URL");
+    }
+    if host == public_bind.ip() && port == public_bind.port() {
+        bail!("legacy MCP proxy URL cannot point to the Rust public listener");
+    }
+    Ok(())
 }
 
 fn optional_absolute_env(name: &str) -> Result<Option<PathBuf>> {
@@ -380,6 +415,71 @@ struct AppState {
     jobs: Arc<DurableJobCoordinator>,
     stream: broadcast::Sender<marketcow_core::PersistedEvent>,
     worker_status: Arc<PythonWorkerStatus>,
+    legacy_mcp: Option<LegacyMcpProxy>,
+}
+
+#[derive(Clone)]
+struct LegacyMcpProxy {
+    client: reqwest::Client,
+    url: String,
+}
+
+impl LegacyMcpProxy {
+    fn new(url: String) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(20))
+            .build()?;
+        Ok(Self { client, url })
+    }
+
+    async fn request(&self, message: &serde_json::Value) -> Result<Option<serde_json::Value>> {
+        let mut response = self
+            .client
+            .post(&self.url)
+            .header("content-type", "application/json")
+            .header(
+                "mcp-protocol-version",
+                marketcow_contracts::MCP_LATEST_PROTOCOL_VERSION,
+            )
+            .json(message)
+            .send()
+            .await
+            .context("legacy MCP request failed")?;
+        if response.status() == reqwest::StatusCode::ACCEPTED {
+            return Ok(None);
+        }
+        if response.status() != reqwest::StatusCode::OK {
+            bail!("legacy MCP returned a non-success status");
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .unwrap_or("");
+        if !content_type.eq_ignore_ascii_case("application/json") {
+            bail!("legacy MCP returned an invalid media type");
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > marketcow_contracts::MCP_MAX_REQUEST_BYTES as u64)
+        {
+            bail!("legacy MCP response exceeds 1 MiB");
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > marketcow_contracts::MCP_MAX_REQUEST_BYTES {
+                bail!("legacy MCP response exceeds 1 MiB");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Some(
+            serde_json::from_slice(&body).context("legacy MCP returned invalid JSON")?,
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -1161,6 +1261,11 @@ async fn serve() -> Result<()> {
         )
         .await?,
     );
+    let legacy_mcp = config
+        .legacy_mcp_url
+        .clone()
+        .map(LegacyMcpProxy::new)
+        .transpose()?;
     let (stream, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
     let state = AppState {
         config: config.clone(),
@@ -1172,6 +1277,7 @@ async fn serve() -> Result<()> {
         jobs,
         stream,
         worker_status: Arc::new(PythonWorkerStatus::default()),
+        legacy_mcp,
     };
     let worker_path = config.worker_socket.clone();
     let worker_jobs = state.jobs.clone();
@@ -1512,7 +1618,12 @@ fn health_payload(state: &AppState) -> serde_json::Value {
     json!({
         "status":"healthy", "service":"marketcowd", "profile":state.config.profile,
         "shadow_mode":true, "real_order_submission_enabled":false,
-        "mcp":{"enabled":true,"endpoint":"/mcp"},
+        "mcp":{
+            "enabled":true,
+            "endpoint":"/mcp",
+            "native_tools":1,
+            "legacy_proxy_configured":state.legacy_mcp.is_some()
+        },
         "components":{
             "api":"healthy","wal":"healthy","python_workers":worker_health,
             "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" }
@@ -1579,13 +1690,16 @@ async fn mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> 
             return Json(mcp_error(serde_json::Value::Null, -32700, "Parse error")).into_response();
         }
     };
-    match mcp_handle_message(&state, message) {
+    match mcp_handle_message(&state, message).await {
         Some(response) => Json(response).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
 }
 
-fn mcp_handle_message(state: &AppState, message: serde_json::Value) -> Option<serde_json::Value> {
+async fn mcp_handle_message(
+    state: &AppState,
+    message: serde_json::Value,
+) -> Option<serde_json::Value> {
     if let Some(messages) = message.as_array() {
         if messages.is_empty() || messages.len() > marketcow_contracts::MCP_MAX_BATCH_MESSAGES {
             return Some(mcp_error(
@@ -1598,16 +1712,21 @@ fn mcp_handle_message(state: &AppState, message: serde_json::Value) -> Option<se
                 },
             ));
         }
-        let responses = messages
-            .iter()
-            .filter_map(|message| mcp_handle_request(state, message))
-            .collect::<Vec<_>>();
+        let mut responses = Vec::with_capacity(messages.len());
+        for message in messages {
+            if let Some(response) = mcp_handle_request(state, message).await {
+                responses.push(response);
+            }
+        }
         return (!responses.is_empty()).then_some(serde_json::Value::Array(responses));
     }
-    mcp_handle_request(state, &message)
+    mcp_handle_request(state, &message).await
 }
 
-fn mcp_handle_request(state: &AppState, message: &serde_json::Value) -> Option<serde_json::Value> {
+async fn mcp_handle_request(
+    state: &AppState,
+    message: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let Some(request) = message.as_object() else {
         return Some(mcp_error(
             serde_json::Value::Null,
@@ -1650,19 +1769,67 @@ fn mcp_handle_request(state: &AppState, message: &serde_json::Value) -> Option<s
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({
-            "tools":[marketcow_contracts::mcp_service_health_tool_definition()]
-        }),
-        "tools/call" => return Some(mcp_tool_call(state, request_id, &params)),
+        "tools/list" => return Some(mcp_tools_list(state, request_id).await),
+        "tools/call" => return Some(mcp_tool_call(state, request_id, &params, message).await),
         _ => return Some(mcp_error(request_id, -32601, "Method not found")),
     };
     Some(json!({"jsonrpc":"2.0","id":request_id,"result":result}))
 }
 
-fn mcp_tool_call(
+async fn mcp_tools_list(state: &AppState, request_id: serde_json::Value) -> serde_json::Value {
+    let native = marketcow_contracts::mcp_service_health_tool_definition();
+    let Some(proxy) = &state.legacy_mcp else {
+        return mcp_result(request_id, json!({"tools":[native]}));
+    };
+    let proxy_request = json!({
+        "jsonrpc":"2.0",
+        "id":request_id,
+        "method":"tools/list",
+        "params":{}
+    });
+    let response = match proxy.request(&proxy_request).await {
+        Ok(Some(response)) => response,
+        Ok(None) | Err(_) => {
+            return mcp_error(request_id, -32603, "Legacy MCP proxy unavailable");
+        }
+    };
+    let Some(tools) = response
+        .pointer("/result/tools")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return mcp_error(request_id, -32603, "Legacy MCP tools contract is invalid");
+    };
+    let expected = marketcow_contracts::MCP_LEGACY_TOOL_NAMES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let observed = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let safe = tools.iter().all(|tool| {
+        tool.pointer("/annotations/readOnlyHint") == Some(&serde_json::Value::Bool(true))
+            && tool.pointer("/annotations/destructiveHint") == Some(&serde_json::Value::Bool(false))
+    });
+    if observed != expected || tools.len() != expected.len() || !safe {
+        return mcp_error(request_id, -32603, "Legacy MCP tools contract is invalid");
+    }
+    let mut merged = tools
+        .iter()
+        .filter(|tool| {
+            tool.get("name").and_then(serde_json::Value::as_str) != Some("service_health")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    merged.insert(0, native);
+    mcp_result(request_id, json!({"tools":merged}))
+}
+
+async fn mcp_tool_call(
     state: &AppState,
     request_id: serde_json::Value,
     params: &serde_json::Value,
+    message: &serde_json::Value,
 ) -> serde_json::Value {
     let name = params.get("name").and_then(|value| value.as_str());
     let arguments = params
@@ -1673,11 +1840,22 @@ fn mcp_tool_call(
         return mcp_error(request_id, -32602, "Invalid tool call parameters");
     }
     if name != Some("service_health") {
-        return mcp_error(
-            request_id,
-            -32602,
-            &format!("Unknown tool: {}", name.expect("name was validated")),
-        );
+        if !marketcow_contracts::MCP_LEGACY_TOOL_NAMES.contains(&name.expect("name was validated"))
+        {
+            return mcp_error(
+                request_id,
+                -32602,
+                &format!("Unknown tool: {}", name.expect("name was validated")),
+            );
+        }
+        let Some(proxy) = &state.legacy_mcp else {
+            return mcp_error(request_id, -32602, "Tool is not migrated or configured");
+        };
+        return match proxy.request(message).await {
+            Ok(Some(response)) if valid_legacy_mcp_response(&response, &request_id) => response,
+            Ok(Some(_)) => mcp_error(request_id, -32603, "Legacy MCP response is invalid"),
+            Ok(None) | Err(_) => mcp_error(request_id, -32603, "Legacy MCP proxy unavailable"),
+        };
     }
     if !arguments
         .as_object()
@@ -1688,6 +1866,21 @@ fn mcp_tool_call(
         return mcp_result(request_id, mcp_tool_result(error, true));
     }
     mcp_result(request_id, mcp_tool_result(health_payload(state), false))
+}
+
+fn valid_legacy_mcp_response(response: &serde_json::Value, request_id: &serde_json::Value) -> bool {
+    response.get("jsonrpc").and_then(serde_json::Value::as_str) == Some("2.0")
+        && response.get("id") == Some(request_id)
+        && (response.get("error").is_some()
+            || response.get("result").is_some_and(|result| {
+                result
+                    .get("content")
+                    .is_some_and(serde_json::Value::is_array)
+                    && result.get("structuredContent").is_some()
+                    && result
+                        .get("isError")
+                        .is_some_and(serde_json::Value::is_boolean)
+            }))
 }
 
 fn mcp_tool_result(payload: serde_json::Value, is_error: bool) -> serde_json::Value {
@@ -2988,6 +3181,7 @@ mod tests {
             real_order_submission_enabled: false,
             shadow_mode: true,
             maximum_book_age_ms: 30_000,
+            legacy_mcp_url: None,
             python_workers: PythonWorkerConfig::disabled(),
         };
         let runtime =
@@ -3012,8 +3206,36 @@ mod tests {
                 jobs: Arc::new(DurableJobCoordinator::memory()),
                 stream,
                 worker_status: Arc::new(PythonWorkerStatus::default()),
+                legacy_mcp: None,
             },
         )
+    }
+
+    async fn legacy_mcp_fixture(Json(message): Json<serde_json::Value>) -> Json<serde_json::Value> {
+        let id = message
+            .get("id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        match message.get("method").and_then(serde_json::Value::as_str) {
+            Some("tools/list") => Json(json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "result":{"tools":marketcow_contracts::MCP_LEGACY_TOOL_NAMES.iter().map(|name| json!({
+                    "name":name,
+                    "description":format!("fixture {name}"),
+                    "inputSchema":{"type":"object","properties":{},"required":[],"additionalProperties":false},
+                    "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
+                })).collect::<Vec<_>>()}
+            })),
+            Some("tools/call") => {
+                let name = message
+                    .pointer("/params/name")
+                    .and_then(serde_json::Value::as_str);
+                let payload = json!({"via":"legacy_fixture","tool":name});
+                Json(mcp_result(id, mcp_tool_result(payload, false)))
+            }
+            _ => Json(mcp_error(id, -32601, "Method not found")),
+        }
     }
     #[tokio::test]
     async fn public_health_and_scope_preserve_safety_flags() {
@@ -3235,6 +3457,90 @@ mod tests {
         );
         assert_eq!(payload["result"]["serverInfo"]["name"], "marketcow");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn rust_mcp_staged_proxy_is_loopback_bounded_and_preserves_tool_results() {
+        let legacy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let legacy_address = legacy_listener.local_addr().unwrap();
+        let legacy_server = tokio::spawn(async move {
+            axum::serve(
+                legacy_listener,
+                Router::new().route("/mcp", post(legacy_mcp_fixture)),
+            )
+            .await
+            .unwrap();
+        });
+        let (_dir, mut state) = test_state();
+        state.legacy_mcp =
+            Some(LegacyMcpProxy::new(format!("http://{legacy_address}/mcp")).unwrap());
+
+        let list = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(list.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 14);
+        assert_eq!(
+            listed["result"]["tools"][0],
+            marketcow_contracts::mcp_service_health_tool_definition()
+        );
+
+        let call = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"get_quotes","arguments":{"symbols":["AAPL.XNAS"]}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let called: serde_json::Value =
+            serde_json::from_slice(&to_bytes(call.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(called["id"], 8);
+        assert_eq!(called["result"]["isError"], false);
+        assert_eq!(
+            called["result"]["structuredContent"]["via"],
+            "legacy_fixture"
+        );
+        assert_eq!(called["result"]["structuredContent"]["tool"], "get_quotes");
+
+        assert!(
+            validate_legacy_mcp_url(
+                "https://127.0.0.1:8791/mcp",
+                "127.0.0.1:8790".parse().unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_legacy_mcp_url(
+                "http://example.com:8791/mcp",
+                "127.0.0.1:8790".parse().unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_legacy_mcp_url(
+                "http://127.0.0.1:8790/mcp",
+                "127.0.0.1:8790".parse().unwrap()
+            )
+            .is_err()
+        );
+        legacy_server.abort();
     }
 
     #[tokio::test]
@@ -4057,6 +4363,7 @@ mod tests {
             real_order_submission_enabled: false,
             shadow_mode: true,
             maximum_book_age_ms: 30_000,
+            legacy_mcp_url: None,
             python_workers: PythonWorkerConfig::disabled(),
         };
         preflight(&config).unwrap();
