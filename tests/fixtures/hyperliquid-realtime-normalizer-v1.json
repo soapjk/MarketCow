@@ -1,0 +1,100 @@
+{
+  "schema_version": "marketcow.hyperliquid.normalizer-golden.v1",
+  "received_at": "2023-11-14T22:13:20.100Z",
+  "mapping": {
+    "BTC-PERP.HYPL": "BTC"
+  },
+  "cases": [
+    {
+      "name": "l2_book_and_quote",
+      "raw": {
+        "channel": "l2Book",
+        "data": {
+          "coin": "BTC",
+          "time": 1700000000000,
+          "levels": [
+            [{"px": "64999.5", "sz": "1.2", "n": 2}],
+            [{"px": "65000.5", "sz": "0.8", "n": 1}]
+          ]
+        }
+      },
+      "expected": [
+        {
+          "event_type": "order_book_snapshot",
+          "instrument_id": "BTC-PERP.HYPL",
+          "source": "hyperliquid",
+          "ts_event": "2023-11-14T22:13:20Z",
+          "payload": {
+            "book_type": "L1_MBP",
+            "depth": 1,
+            "baseline_sequence": 0,
+            "bids": [{"price": "64999.5", "size": "1.2", "order_id": "0", "order_count": 2}],
+            "asks": [{"price": "65000.5", "size": "0.8", "order_id": "0", "order_count": 1}],
+            "ts_event_source": "provider"
+          }
+        },
+        {
+          "event_type": "quote",
+          "instrument_id": "BTC-PERP.HYPL",
+          "source": "hyperliquid",
+          "ts_event": "2023-11-14T22:13:20Z",
+          "payload": {
+            "bid_price": "64999.5",
+            "ask_price": "65000.5",
+            "bid_size": "1.2",
+            "ask_size": "0.8",
+            "ts_event_source": "provider"
+          }
+        }
+      ]
+    },
+    {
+      "name": "trade",
+      "raw": {
+        "channel": "trades",
+        "data": [{"coin": "BTC", "time": 1700000000001, "px": "65000", "sz": "0.1", "side": "B", "tid": 42}]
+      },
+      "expected": [{
+        "event_type": "trade",
+        "instrument_id": "BTC-PERP.HYPL",
+        "source": "hyperliquid",
+        "ts_event": "2023-11-14T22:13:20.001000Z",
+        "payload": {
+          "price": "65000",
+          "size": "0.1",
+          "trade_id": "42",
+          "aggressor_side": "BUYER",
+          "session": "regular"
+        }
+      }]
+    },
+    {
+      "name": "asset_context",
+      "raw": {
+        "channel": "activeAssetCtx",
+        "data": {
+          "coin": "BTC",
+          "time": 1700000000002,
+          "ctx": {"markPx": "65001", "oraclePx": "65000", "funding": "0.00001", "openInterest": "100"}
+        }
+      },
+      "expected": [{
+        "event_type": "asset_context",
+        "instrument_id": "BTC-PERP.HYPL",
+        "source": "hyperliquid",
+        "ts_event": "2023-11-14T22:13:20.002000Z",
+        "payload": {
+          "mark_price": "65001",
+          "oracle_price": "65000",
+          "external_oracle_price": null,
+          "mid_price": null,
+          "funding_rate": "0.00001",
+          "open_interest": "100",
+          "premium": null,
+          "market_status": "active",
+          "oracle_status": "internal_only"
+        }
+      }]
+    }
+  ]
+}

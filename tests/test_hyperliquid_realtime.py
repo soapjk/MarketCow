@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import threading
 import unittest
 
@@ -52,6 +53,20 @@ class FakeVenue:
 
 
 class HyperliquidRealtimeTest(unittest.TestCase):
+    def test_shared_rust_python_normalizer_golden(self):
+        fixture = json.loads(
+            (Path(__file__).parent / "fixtures" / "hyperliquid-realtime-normalizer-v1.json")
+            .read_text(encoding="utf-8")
+        )
+        provider = HyperliquidRealtimeProvider()
+        events = []
+        provider.set_sink(events.append)
+        provider._mapping["BTC"] = "BTC-PERP.HYPL"
+        for case in fixture["cases"]:
+            events.clear()
+            provider._on_message(None, json.dumps(case["raw"]))
+            self.assertEqual(events, case["expected"], case["name"])
+
     def test_bbo_and_trade_are_normalized_to_stream_contract(self):
         apps = []
 

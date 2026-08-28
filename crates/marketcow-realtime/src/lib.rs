@@ -1,0 +1,950 @@
+//! Provider-neutral realtime normalization and replay primitives.
+//!
+//! This crate deliberately has no HTTP, database, socket, or async-runtime dependency. Venue
+//! adapters provide raw frames; the Rust owner validates exact decimals and source time before a
+//! single writer assigns the public stream sequence. Persistence remains an outer concern so an
+//! event cannot be published before its authoritative append succeeds.
+
+use chrono::{DateTime, TimeZone, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    str::FromStr,
+};
+use thiserror::Error;
+
+pub const REALTIME_CONTRACT_VERSION: &str = "marketcow.realtime.provider-neutral.v1";
+pub const HYPERLIQUID_NORMALIZER_VERSION: &str = "marketcow.hyperliquid.normalizer.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactDecimal(#[serde(with = "rust_decimal::serde::str")] pub Decimal);
+
+impl ExactDecimal {
+    pub fn positive(value: &Value) -> Result<Self, RealtimeError> {
+        let text = value
+            .as_str()
+            .ok_or(RealtimeError::FinancialDecimalMustBeString)?;
+        let decimal = Decimal::from_str(text).map_err(|_| RealtimeError::InvalidDecimal)?;
+        if decimal <= Decimal::ZERO {
+            return Err(RealtimeError::InvalidDecimal);
+        }
+        Ok(Self(decimal.normalize()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AggressorSide {
+    Buyer,
+    Seller,
+    NoAggressor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookLevel {
+    pub price: ExactDecimal,
+    pub size: ExactDecimal,
+    pub order_id: String,
+    pub order_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event_type", content = "payload", rename_all = "snake_case")]
+pub enum ProviderPayload {
+    OrderBookSnapshot {
+        book_type: String,
+        depth: u8,
+        baseline_sequence: u64,
+        bids: Vec<BookLevel>,
+        asks: Vec<BookLevel>,
+        ts_event_source: String,
+    },
+    Quote {
+        bid_price: ExactDecimal,
+        ask_price: ExactDecimal,
+        bid_size: ExactDecimal,
+        ask_size: ExactDecimal,
+        ts_event_source: String,
+    },
+    Trade {
+        price: ExactDecimal,
+        size: ExactDecimal,
+        trade_id: String,
+        aggressor_side: AggressorSide,
+        session: String,
+    },
+    AssetContext {
+        mark_price: Option<ExactDecimal>,
+        oracle_price: Option<ExactDecimal>,
+        external_oracle_price: Option<ExactDecimal>,
+        mid_price: Option<ExactDecimal>,
+        funding_rate: Option<ExactDecimal>,
+        open_interest: Option<ExactDecimal>,
+        premium: Option<ExactDecimal>,
+        market_status: String,
+        oracle_status: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedProviderEvent {
+    pub contract_version: String,
+    pub normalizer_version: String,
+    pub instrument_id: String,
+    pub source: String,
+    pub source_observed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub raw_sha256: String,
+    pub event_id: String,
+    pub payload: ProviderPayload,
+}
+
+impl NormalizedProviderEvent {
+    fn new(
+        instrument_id: &str,
+        source_observed_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+        raw_sha256: &str,
+        ordinal: usize,
+        payload: ProviderPayload,
+    ) -> Self {
+        let event_id = sha256(&serde_json::json!({
+            "normalizer": HYPERLIQUID_NORMALIZER_VERSION,
+            "instrument_id": instrument_id,
+            "source_observed_at": source_observed_at,
+            "raw_sha256": raw_sha256,
+            "ordinal": ordinal,
+            "payload": payload,
+        }));
+        Self {
+            contract_version: REALTIME_CONTRACT_VERSION.into(),
+            normalizer_version: HYPERLIQUID_NORMALIZER_VERSION.into(),
+            instrument_id: instrument_id.into(),
+            source: "hyperliquid".into(),
+            source_observed_at,
+            received_at,
+            raw_sha256: raw_sha256.into(),
+            event_id,
+            payload,
+        }
+    }
+
+    pub fn data_type(&self) -> DataType {
+        match self.payload {
+            ProviderPayload::OrderBookSnapshot { .. } => DataType::OrderBook,
+            ProviderPayload::Quote { .. } => DataType::Quote,
+            ProviderPayload::Trade { .. } => DataType::Trade,
+            ProviderPayload::AssetContext { .. } => DataType::AssetContext,
+        }
+    }
+
+    /// Existing Python downstream event shape used by the cross-language golden comparator.
+    /// Source evidence remains on the typed envelope and is not discarded by the Rust owner.
+    pub fn public_contract_value(&self) -> Value {
+        let (event_type, payload) = match &self.payload {
+            ProviderPayload::OrderBookSnapshot { .. } => ("order_book_snapshot", &self.payload),
+            ProviderPayload::Quote { .. } => ("quote", &self.payload),
+            ProviderPayload::Trade { .. } => ("trade", &self.payload),
+            ProviderPayload::AssetContext { .. } => ("asset_context", &self.payload),
+        };
+        let serialized = serde_json::to_value(payload).expect("typed provider payload serializes");
+        let payload = serialized
+            .get("payload")
+            .cloned()
+            .expect("internally-tagged provider payload has content");
+        serde_json::json!({
+            "event_type":event_type,
+            "instrument_id":self.instrument_id,
+            "source":self.source,
+            "ts_event":python_iso(self.source_observed_at),
+            "payload":payload,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HyperliquidNormalizer {
+    instrument_by_coin: BTreeMap<String, String>,
+    maximum_source_delay_millis: i64,
+}
+
+impl HyperliquidNormalizer {
+    pub fn new(
+        mappings: impl IntoIterator<Item = (String, String)>,
+        maximum_source_delay_millis: i64,
+    ) -> Result<Self, RealtimeError> {
+        if maximum_source_delay_millis < 0 {
+            return Err(RealtimeError::InvalidConfig);
+        }
+        let mut instrument_by_coin = BTreeMap::new();
+        for (instrument_id, coin) in mappings {
+            let normalized = coin.trim().to_ascii_uppercase();
+            if instrument_id.trim().is_empty()
+                || normalized.is_empty()
+                || instrument_by_coin
+                    .insert(normalized, instrument_id)
+                    .is_some()
+            {
+                return Err(RealtimeError::InvalidConfig);
+            }
+        }
+        if instrument_by_coin.is_empty() {
+            return Err(RealtimeError::InvalidConfig);
+        }
+        Ok(Self {
+            instrument_by_coin,
+            maximum_source_delay_millis,
+        })
+    }
+
+    pub fn normalize(
+        &self,
+        raw: Value,
+        received_at: DateTime<Utc>,
+    ) -> Result<Vec<NormalizedProviderEvent>, RealtimeError> {
+        let object = raw.as_object().ok_or(RealtimeError::FrameNotObject)?;
+        let channel = required_string(object, "channel")?;
+        let raw_sha256 = sha256(&raw);
+        match channel {
+            "l2Book" | "bbo" => self.normalize_book(object, received_at, &raw_sha256),
+            "trades" => self.normalize_trades(object, received_at, &raw_sha256),
+            "activeAssetCtx" => self.normalize_context(object, received_at, &raw_sha256),
+            value => Err(RealtimeError::UnsupportedChannel(value.into())),
+        }
+    }
+
+    fn normalize_book(
+        &self,
+        frame: &Map<String, Value>,
+        received_at: DateTime<Utc>,
+        raw_sha256: &str,
+    ) -> Result<Vec<NormalizedProviderEvent>, RealtimeError> {
+        let data = object_field(frame, "data")?;
+        let instrument_id = self.instrument(data)?;
+        let observed_at = self.observed_at(data, received_at)?;
+        let (bid_values, ask_values) = if let Some(levels) = data.get("levels") {
+            two_sides(levels)?
+        } else {
+            two_sides(
+                data.get("bbo")
+                    .ok_or(RealtimeError::MissingField("levels"))?,
+            )?
+        };
+        let bids = parse_levels(bid_values)?;
+        let asks = parse_levels(ask_values)?;
+        if !strictly_descending(&bids) || !strictly_ascending(&asks) {
+            return Err(RealtimeError::InvalidPayload);
+        }
+        if bids
+            .first()
+            .zip(asks.first())
+            .is_some_and(|(bid, ask)| bid.price.0 >= ask.price.0)
+        {
+            return Err(RealtimeError::CrossedBook);
+        }
+        let maximum_depth = bids.len().max(asks.len());
+        let depth = [1_u8, 5, 10, 20]
+            .into_iter()
+            .find(|candidate| maximum_depth <= usize::from(*candidate))
+            .ok_or(RealtimeError::BookTooDeep)?;
+        let book_type = if maximum_depth > 1 {
+            "L2_MBP"
+        } else {
+            "L1_MBP"
+        };
+        let mut events = vec![NormalizedProviderEvent::new(
+            instrument_id,
+            observed_at,
+            received_at,
+            raw_sha256,
+            0,
+            ProviderPayload::OrderBookSnapshot {
+                book_type: book_type.into(),
+                depth,
+                baseline_sequence: 0,
+                bids: bids.clone(),
+                asks: asks.clone(),
+                ts_event_source: "provider".into(),
+            },
+        )];
+        if let Some((bid, ask)) = bids.first().zip(asks.first()) {
+            events.push(NormalizedProviderEvent::new(
+                instrument_id,
+                observed_at,
+                received_at,
+                raw_sha256,
+                1,
+                ProviderPayload::Quote {
+                    bid_price: bid.price.clone(),
+                    ask_price: ask.price.clone(),
+                    bid_size: bid.size.clone(),
+                    ask_size: ask.size.clone(),
+                    ts_event_source: "provider".into(),
+                },
+            ));
+        }
+        Ok(events)
+    }
+
+    fn normalize_trades(
+        &self,
+        frame: &Map<String, Value>,
+        received_at: DateTime<Utc>,
+        raw_sha256: &str,
+    ) -> Result<Vec<NormalizedProviderEvent>, RealtimeError> {
+        let trades = frame
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or(RealtimeError::MissingField("data"))?;
+        if trades.is_empty() {
+            return Err(RealtimeError::EmptyBatch);
+        }
+        trades
+            .iter()
+            .enumerate()
+            .map(|(ordinal, value)| {
+                let trade = value.as_object().ok_or(RealtimeError::InvalidPayload)?;
+                let instrument_id = self.instrument(trade)?;
+                let observed_at = self.observed_at(trade, received_at)?;
+                let trade_id = trade
+                    .get("tid")
+                    .or_else(|| trade.get("hash"))
+                    .map(value_identifier)
+                    .transpose()?
+                    .unwrap_or_else(|| observed_at.timestamp_millis().to_string());
+                if trade_id.is_empty() {
+                    return Err(RealtimeError::InvalidPayload);
+                }
+                let aggressor_side = match required_string(trade, "side")?
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "B" => AggressorSide::Buyer,
+                    "A" => AggressorSide::Seller,
+                    _ => return Err(RealtimeError::InvalidPayload),
+                };
+                Ok(NormalizedProviderEvent::new(
+                    instrument_id,
+                    observed_at,
+                    received_at,
+                    raw_sha256,
+                    ordinal,
+                    ProviderPayload::Trade {
+                        price: ExactDecimal::positive(required(trade, "px")?)?,
+                        size: ExactDecimal::positive(required(trade, "sz")?)?,
+                        trade_id,
+                        aggressor_side,
+                        session: "regular".into(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn normalize_context(
+        &self,
+        frame: &Map<String, Value>,
+        received_at: DateTime<Utc>,
+        raw_sha256: &str,
+    ) -> Result<Vec<NormalizedProviderEvent>, RealtimeError> {
+        let data = object_field(frame, "data")?;
+        let instrument_id = self.instrument(data)?;
+        let context = data.get("ctx").and_then(Value::as_object).unwrap_or(data);
+        let observed_at = data
+            .get("time")
+            .or_else(|| context.get("time"))
+            .map(|value| timestamp(value, received_at, self.maximum_source_delay_millis))
+            .transpose()?
+            .unwrap_or(received_at);
+        let oracle = optional_positive(context.get("oraclePx"))?;
+        let external = optional_positive(context.get("externalPerpPx"))?;
+        let oracle_status = if external.is_some() {
+            "external_live"
+        } else if oracle.is_some() {
+            "internal_only"
+        } else {
+            "unavailable"
+        };
+        Ok(vec![NormalizedProviderEvent::new(
+            instrument_id,
+            observed_at,
+            received_at,
+            raw_sha256,
+            0,
+            ProviderPayload::AssetContext {
+                mark_price: optional_positive(context.get("markPx"))?,
+                oracle_price: oracle,
+                external_oracle_price: external,
+                mid_price: optional_positive(context.get("midPx"))?,
+                funding_rate: optional_decimal(context.get("funding"))?,
+                open_interest: optional_positive(context.get("openInterest"))?,
+                premium: optional_decimal(context.get("premium"))?,
+                market_status: "active".into(),
+                oracle_status: oracle_status.into(),
+            },
+        )])
+    }
+
+    fn instrument<'a>(&'a self, data: &Map<String, Value>) -> Result<&'a str, RealtimeError> {
+        let coin = required_string(data, "coin")?.to_ascii_uppercase();
+        self.instrument_by_coin
+            .get(&coin)
+            .map(String::as_str)
+            .ok_or(RealtimeError::UnknownInstrument)
+    }
+
+    fn observed_at(
+        &self,
+        data: &Map<String, Value>,
+        received_at: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, RealtimeError> {
+        timestamp(
+            required(data, "time")?,
+            received_at,
+            self.maximum_source_delay_millis,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataType {
+    Quote,
+    Trade,
+    OrderBook,
+    AssetContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamEvent {
+    pub stream_id: String,
+    pub sequence: u64,
+    pub event: NormalizedProviderEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReplayFrame {
+    Event { stream: Box<StreamEvent> },
+    SequenceWatermark { stream_id: String, sequence: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionFilter {
+    pub instruments: BTreeSet<String>,
+    pub data_types: BTreeSet<DataType>,
+}
+
+impl SubscriptionFilter {
+    fn matches(&self, event: &NormalizedProviderEvent) -> bool {
+        self.instruments.contains(&event.instrument_id)
+            && self.data_types.contains(&event.data_type())
+    }
+}
+
+/// Single-writer sequence and bounded replay state. Callers must durably append the normalized
+/// event before `publish`; rejected/duplicate events never consume a public sequence.
+#[derive(Debug)]
+pub struct SequencedReplay {
+    stream_id: String,
+    replay_capacity: usize,
+    sequence: u64,
+    recent_event_ids: BTreeSet<String>,
+    recent_event_order: VecDeque<String>,
+    replay: VecDeque<StreamEvent>,
+}
+
+impl SequencedReplay {
+    pub fn new(
+        stream_id: impl Into<String>,
+        replay_capacity: usize,
+    ) -> Result<Self, RealtimeError> {
+        let stream_id = stream_id.into();
+        if stream_id.is_empty() || replay_capacity == 0 {
+            return Err(RealtimeError::InvalidConfig);
+        }
+        Ok(Self {
+            stream_id,
+            replay_capacity,
+            sequence: 0,
+            recent_event_ids: BTreeSet::new(),
+            recent_event_order: VecDeque::new(),
+            replay: VecDeque::new(),
+        })
+    }
+
+    pub fn publish(
+        &mut self,
+        event: NormalizedProviderEvent,
+        authoritative_append_succeeded: bool,
+    ) -> Result<Option<StreamEvent>, RealtimeError> {
+        if !authoritative_append_succeeded {
+            return Err(RealtimeError::PersistenceUnavailable);
+        }
+        if self.recent_event_ids.contains(&event.event_id) {
+            return Ok(None);
+        }
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(RealtimeError::SequenceOverflow)?;
+        let stream = StreamEvent {
+            stream_id: self.stream_id.clone(),
+            sequence,
+            event,
+        };
+        self.sequence = sequence;
+        self.recent_event_ids.insert(stream.event.event_id.clone());
+        self.recent_event_order
+            .push_back(stream.event.event_id.clone());
+        self.replay.push_back(stream.clone());
+        while self.replay.len() > self.replay_capacity {
+            self.replay.pop_front();
+            if let Some(event_id) = self.recent_event_order.pop_front() {
+                self.recent_event_ids.remove(&event_id);
+            }
+        }
+        Ok(Some(stream))
+    }
+
+    pub fn replay_after(
+        &self,
+        stream_id: &str,
+        after: u64,
+        filter: &SubscriptionFilter,
+    ) -> Result<Vec<ReplayFrame>, RealtimeError> {
+        if stream_id != self.stream_id {
+            return Err(RealtimeError::StreamChanged);
+        }
+        let earliest = self
+            .replay
+            .front()
+            .map_or(self.sequence.saturating_add(1), |event| event.sequence);
+        if after.saturating_add(1) < earliest {
+            return Err(RealtimeError::GapUnrecoverable {
+                earliest_sequence: earliest,
+            });
+        }
+        Ok(self
+            .replay
+            .iter()
+            .filter(|event| event.sequence > after)
+            .map(|event| {
+                if filter.matches(&event.event) {
+                    ReplayFrame::Event {
+                        stream: Box::new(event.clone()),
+                    }
+                } else {
+                    ReplayFrame::SequenceWatermark {
+                        stream_id: self.stream_id.clone(),
+                        sequence: event.sequence,
+                    }
+                }
+            })
+            .collect())
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RealtimeError {
+    #[error("realtime configuration is invalid")]
+    InvalidConfig,
+    #[error("raw frame must be an object")]
+    FrameNotObject,
+    #[error("unsupported Hyperliquid channel: {0}")]
+    UnsupportedChannel(String),
+    #[error("required field is missing: {0}")]
+    MissingField(&'static str),
+    #[error("provider payload is invalid")]
+    InvalidPayload,
+    #[error("financial decimals must be JSON strings")]
+    FinancialDecimalMustBeString,
+    #[error("financial decimal is invalid")]
+    InvalidDecimal,
+    #[error("source timestamp is invalid or outside the accepted delay window")]
+    InvalidTimestamp,
+    #[error("provider symbol has no canonical instrument mapping")]
+    UnknownInstrument,
+    #[error("order book is crossed or locked")]
+    CrossedBook,
+    #[error("order book exceeds the supported depth")]
+    BookTooDeep,
+    #[error("provider batch is empty")]
+    EmptyBatch,
+    #[error("authoritative event append failed")]
+    PersistenceUnavailable,
+    #[error("stream identity changed; full sync is required")]
+    StreamChanged,
+    #[error("replay gap is unrecoverable; earliest sequence is {earliest_sequence}")]
+    GapUnrecoverable { earliest_sequence: u64 },
+    #[error("stream sequence overflow")]
+    SequenceOverflow,
+}
+
+fn required<'a>(
+    object: &'a Map<String, Value>,
+    field: &'static str,
+) -> Result<&'a Value, RealtimeError> {
+    object.get(field).ok_or(RealtimeError::MissingField(field))
+}
+
+fn required_string<'a>(
+    object: &'a Map<String, Value>,
+    field: &'static str,
+) -> Result<&'a str, RealtimeError> {
+    required(object, field)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(RealtimeError::InvalidPayload)
+}
+
+fn object_field<'a>(
+    object: &'a Map<String, Value>,
+    field: &'static str,
+) -> Result<&'a Map<String, Value>, RealtimeError> {
+    required(object, field)?
+        .as_object()
+        .ok_or(RealtimeError::InvalidPayload)
+}
+
+fn value_identifier(value: &Value) -> Result<String, RealtimeError> {
+    match value {
+        Value::String(value) if !value.is_empty() => Ok(value.clone()),
+        Value::Number(value) => Ok(value.to_string()),
+        _ => Err(RealtimeError::InvalidPayload),
+    }
+}
+
+fn two_sides(value: &Value) -> Result<(&[Value], &[Value]), RealtimeError> {
+    let sides = value.as_array().ok_or(RealtimeError::InvalidPayload)?;
+    if sides.len() != 2 {
+        return Err(RealtimeError::InvalidPayload);
+    }
+    Ok((
+        sides[0].as_array().ok_or(RealtimeError::InvalidPayload)?,
+        sides[1].as_array().ok_or(RealtimeError::InvalidPayload)?,
+    ))
+}
+
+fn parse_levels(values: &[Value]) -> Result<Vec<BookLevel>, RealtimeError> {
+    if values.len() > 20 {
+        return Err(RealtimeError::BookTooDeep);
+    }
+    let mut levels = Vec::with_capacity(values.len());
+    let mut previous: Option<Decimal> = None;
+    for value in values {
+        let row = value.as_object().ok_or(RealtimeError::InvalidPayload)?;
+        let price = ExactDecimal::positive(required(row, "px")?)?;
+        let size = ExactDecimal::positive(required(row, "sz")?)?;
+        if previous == Some(price.0) {
+            return Err(RealtimeError::InvalidPayload);
+        }
+        previous = Some(price.0);
+        let order_count = match row.get("n") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|count| *count > 0)
+                    .ok_or(RealtimeError::InvalidPayload)?,
+            ),
+        };
+        levels.push(BookLevel {
+            price,
+            size,
+            order_id: "0".into(),
+            order_count,
+        });
+    }
+    Ok(levels)
+}
+
+fn strictly_descending(levels: &[BookLevel]) -> bool {
+    levels
+        .windows(2)
+        .all(|pair| pair[0].price.0 > pair[1].price.0)
+}
+
+fn strictly_ascending(levels: &[BookLevel]) -> bool {
+    levels
+        .windows(2)
+        .all(|pair| pair[0].price.0 < pair[1].price.0)
+}
+
+fn optional_positive(value: Option<&Value>) -> Result<Option<ExactDecimal>, RealtimeError> {
+    value
+        .filter(|value| !value.is_null())
+        .map(ExactDecimal::positive)
+        .transpose()
+}
+
+fn optional_decimal(value: Option<&Value>) -> Result<Option<ExactDecimal>, RealtimeError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let text = value
+        .as_str()
+        .ok_or(RealtimeError::FinancialDecimalMustBeString)?;
+    let decimal = Decimal::from_str(text).map_err(|_| RealtimeError::InvalidDecimal)?;
+    Ok(Some(ExactDecimal(decimal.normalize())))
+}
+
+fn timestamp(
+    value: &Value,
+    received_at: DateTime<Utc>,
+    maximum_delay: i64,
+) -> Result<DateTime<Utc>, RealtimeError> {
+    let milliseconds = value.as_i64().ok_or(RealtimeError::InvalidTimestamp)?;
+    let observed_at = Utc
+        .timestamp_millis_opt(milliseconds)
+        .single()
+        .ok_or(RealtimeError::InvalidTimestamp)?;
+    let delay = received_at
+        .signed_duration_since(observed_at)
+        .num_milliseconds();
+    if delay < 0 || delay > maximum_delay {
+        return Err(RealtimeError::InvalidTimestamp);
+    }
+    Ok(observed_at)
+}
+
+fn sha256(value: &Value) -> String {
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(value).expect("JSON values are serializable"),
+    ))
+}
+
+fn python_iso(value: DateTime<Utc>) -> String {
+    if value.timestamp_subsec_micros() == 0 {
+        value.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    } else {
+        value.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    fn received() -> DateTime<Utc> {
+        Utc.timestamp_millis_opt(1_700_000_000_100).unwrap()
+    }
+
+    fn normalizer() -> HyperliquidNormalizer {
+        HyperliquidNormalizer::new([("BTC-PERP.HYPL".into(), "BTC".into())], 1_000).unwrap()
+    }
+
+    #[test]
+    fn python_hyperliquid_golden_is_normalized_with_exact_decimals() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/hyperliquid-realtime-normalizer-v1.json"
+        ))
+        .unwrap();
+        let received_at = DateTime::parse_from_rfc3339(fixture["received_at"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+        for case in fixture["cases"].as_array().unwrap() {
+            let actual = normalizer()
+                .normalize(case["raw"].clone(), received_at)
+                .unwrap()
+                .iter()
+                .map(NormalizedProviderEvent::public_contract_value)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                Value::Array(actual),
+                case["expected"],
+                "case {}",
+                case["name"]
+            );
+        }
+
+        let book = normalizer()
+            .normalize(
+                json!({
+                    "channel":"l2Book",
+                    "data":{
+                        "coin":"BTC","time":1700000000000_i64,
+                        "levels":[
+                            [{"px":"64999.5","sz":"1.2","n":2}],
+                            [{"px":"65000.5","sz":"0.8","n":1}]
+                        ]
+                    }
+                }),
+                received(),
+            )
+            .unwrap();
+        assert_eq!(book.len(), 2);
+        assert_eq!(book[0].data_type(), DataType::OrderBook);
+        assert_eq!(book[1].data_type(), DataType::Quote);
+        let ProviderPayload::Quote {
+            bid_price,
+            ask_price,
+            ..
+        } = &book[1].payload
+        else {
+            panic!("expected quote")
+        };
+        assert_eq!(bid_price.0.to_string(), "64999.5");
+        assert_eq!(ask_price.0.to_string(), "65000.5");
+
+        let trade = normalizer()
+            .normalize(
+                json!({
+                    "channel":"trades",
+                    "data":[{"coin":"BTC","time":1700000000001_i64,
+                        "px":"65000","sz":"0.1","side":"B","tid":42}]
+                }),
+                received(),
+            )
+            .unwrap();
+        let ProviderPayload::Trade {
+            trade_id,
+            aggressor_side,
+            ..
+        } = &trade[0].payload
+        else {
+            panic!("expected trade")
+        };
+        assert_eq!(trade_id, "42");
+        assert_eq!(*aggressor_side, AggressorSide::Buyer);
+
+        let context = normalizer()
+            .normalize(
+                json!({
+                    "channel":"activeAssetCtx",
+                    "data":{"coin":"BTC","time":1700000000002_i64,"ctx":{
+                        "markPx":"65001","oraclePx":"65000",
+                        "funding":"0.00001","openInterest":"100"
+                    }}
+                }),
+                received(),
+            )
+            .unwrap();
+        let ProviderPayload::AssetContext {
+            oracle_status,
+            funding_rate,
+            ..
+        } = &context[0].payload
+        else {
+            panic!("expected context")
+        };
+        assert_eq!(oracle_status, "internal_only");
+        assert_eq!(funding_rate.as_ref().unwrap().0.to_string(), "0.00001");
+    }
+
+    #[test]
+    fn invalid_financial_or_identity_input_fails_closed() {
+        let numeric_decimal = json!({
+            "channel":"trades",
+            "data":[{"coin":"BTC","time":1700000000001_i64,
+                "px":65000.0,"sz":"0.1","side":"B","tid":42}]
+        });
+        assert_eq!(
+            normalizer()
+                .normalize(numeric_decimal, received())
+                .unwrap_err(),
+            RealtimeError::FinancialDecimalMustBeString
+        );
+        let stale = json!({
+            "channel":"trades",
+            "data":[{"coin":"BTC","time":1699999990000_i64,
+                "px":"65000","sz":"0.1","side":"B","tid":42}]
+        });
+        assert_eq!(
+            normalizer().normalize(stale, received()).unwrap_err(),
+            RealtimeError::InvalidTimestamp
+        );
+        let unknown = json!({
+            "channel":"trades",
+            "data":[{"coin":"ETH","time":1700000000001_i64,
+                "px":"3500","sz":"0.1","side":"B","tid":42}]
+        });
+        assert_eq!(
+            normalizer().normalize(unknown, received()).unwrap_err(),
+            RealtimeError::UnknownInstrument
+        );
+    }
+
+    #[test]
+    fn persistence_failure_and_duplicates_do_not_consume_sequence() {
+        let event = normalizer()
+            .normalize(
+                json!({
+                    "channel":"trades",
+                    "data":[{"coin":"BTC","time":1700000000001_i64,
+                        "px":"65000","sz":"0.1","side":"B","tid":42}]
+                }),
+                received(),
+            )
+            .unwrap()
+            .remove(0);
+        let mut replay = SequencedReplay::new("stream-1", 2).unwrap();
+        assert_eq!(
+            replay.publish(event.clone(), false).unwrap_err(),
+            RealtimeError::PersistenceUnavailable
+        );
+        assert_eq!(replay.sequence(), 0);
+        assert_eq!(
+            replay
+                .publish(event.clone(), true)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
+        assert!(replay.publish(event, true).unwrap().is_none());
+        assert_eq!(replay.sequence(), 1);
+    }
+
+    #[test]
+    fn filtered_replay_is_contiguous_and_expired_gap_is_explicit() {
+        let mut replay = SequencedReplay::new("stream-1", 2).unwrap();
+        let frames = [
+            ("BTC", "65000", 1_700_000_000_001_i64),
+            ("BTC", "65001", 1_700_000_000_002_i64),
+            ("BTC", "65002", 1_700_000_000_003_i64),
+        ];
+        for (coin, price, time) in frames {
+            let event = normalizer()
+                .normalize(
+                    json!({"channel":"trades","data":[{
+                        "coin":coin,"time":time,"px":price,"sz":"0.1",
+                        "side":"B","tid":time
+                    }]}),
+                    received(),
+                )
+                .unwrap()
+                .remove(0);
+            replay.publish(event, true).unwrap();
+        }
+        let filter = SubscriptionFilter {
+            instruments: BTreeSet::from(["OTHER.HYPL".into()]),
+            data_types: BTreeSet::from([DataType::Trade]),
+        };
+        assert_eq!(
+            replay.replay_after("stream-1", 0, &filter).unwrap_err(),
+            RealtimeError::GapUnrecoverable {
+                earliest_sequence: 2
+            }
+        );
+        let resumed = replay.replay_after("stream-1", 1, &filter).unwrap();
+        assert_eq!(resumed.len(), 2);
+        assert!(matches!(
+            resumed[0],
+            ReplayFrame::SequenceWatermark { sequence: 2, .. }
+        ));
+        assert_eq!(
+            replay.replay_after("old-stream", 1, &filter).unwrap_err(),
+            RealtimeError::StreamChanged
+        );
+    }
+}
