@@ -1060,12 +1060,14 @@ impl DurableJobCoordinator {
 
 struct AuditLog {
     file: Mutex<std::fs::File>,
+    path: PathBuf,
 }
 impl AuditLog {
     fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             file: Mutex::new(file),
+            path: path.to_owned(),
         })
     }
     fn record(&self, value: &serde_json::Value, durable: bool) -> Result<()> {
@@ -1135,6 +1137,60 @@ impl AuditCoordinator {
 
     fn record_request(&self, value: &serde_json::Value) -> Result<()> {
         self.local.record(value, false)
+    }
+
+    async fn list_admin(
+        &self,
+        limit: i64,
+        offset: i64,
+        action: Option<&str>,
+        outcome: Option<&str>,
+    ) -> std::result::Result<
+        (Vec<marketcow_storage::AdminAuditRecord>, bool),
+        marketcow_storage::RepositoryError,
+    > {
+        if let Some(repository) = &self.repository {
+            return repository
+                .list(limit, offset, action, outcome)
+                .await
+                .map(|records| (records, true));
+        }
+        if !(1..=200).contains(&limit)
+            || !(0..=10_000).contains(&offset)
+            || action.is_some_and(|value| {
+                value.is_empty() || value.len() > 120 || value.chars().any(char::is_control)
+            })
+            || outcome.is_some_and(|value| {
+                !matches!(value, "accepted" | "succeeded" | "rejected" | "failed")
+            })
+        {
+            return Err(marketcow_storage::RepositoryError::InvalidInput);
+        }
+        let bytes = fs::read(&self.local.path)
+            .map_err(|_| marketcow_storage::RepositoryError::Unavailable)?;
+        let mut records = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .filter(|record: &marketcow_storage::AdminAuditRecord| {
+                action.is_none_or(|value| record.action == value)
+                    && outcome.is_none_or(|value| record.outcome == value)
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            right
+                .occurred_at
+                .cmp(&left.occurred_at)
+                .then_with(|| right.audit_id.cmp(&left.audit_id))
+        });
+        let offset = usize::try_from(offset)
+            .map_err(|_| marketcow_storage::RepositoryError::InvalidInput)?;
+        let limit =
+            usize::try_from(limit).map_err(|_| marketcow_storage::RepositoryError::InvalidInput)?;
+        Ok((
+            records.into_iter().skip(offset).take(limit).collect(),
+            false,
+        ))
     }
 
     async fn record_admin(&self, record: &marketcow_storage::AdminAuditRecord) -> Result<()> {
@@ -1915,6 +1971,7 @@ fn app(state: AppState) -> Router {
         .route("/mcp", post(mcp))
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
+        .route("/v1/admin/audit", get(admin_audit_events))
         .route(
             "/v1/admin/polymarket/checkpoint",
             axum::routing::post(admin_checkpoint),
@@ -2925,6 +2982,63 @@ async fn admin_migration() -> Json<serde_json::Value> {
     Json(json!({
         "phase":"shadow", "cutover_allowed":false, "tradude_may_manage_marketcow":false
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminAuditQuery {
+    #[serde(default = "default_audit_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    outcome: String,
+}
+
+fn default_audit_limit() -> i64 {
+    50
+}
+
+async fn admin_audit_events(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    Query(query): Query<AdminAuditQuery>,
+) -> Response {
+    let action = (!query.action.is_empty()).then_some(query.action.as_str());
+    let outcome = (!query.outcome.is_empty()).then_some(query.outcome.as_str());
+    match state
+        .audit
+        .list_admin(query.limit, query.offset, action, outcome)
+        .await
+    {
+        Ok((items, durable)) => Json(json!({
+            "schema":"marketcow.admin-audit.v1",
+            "page":{
+                "limit":query.limit,
+                "offset":query.offset,
+                "returned":items.len()
+            },
+            "items":items,
+            "durable":durable
+        }))
+        .into_response(),
+        Err(marketcow_storage::RepositoryError::InvalidInput) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_audit_query",
+            false,
+            &request_id,
+        ),
+        Err(repository_error) => {
+            warn!(error=%repository_error, request_id, "admin_audit_query_failed_closed");
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit_unavailable",
+                true,
+                &request_id,
+            )
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5010,6 +5124,51 @@ mod tests {
         assert_eq!(events[0]["action"], "http.admin.request");
         assert_eq!(events[0]["outcome"], "rejected");
         assert_eq!(events[0]["parameters_json"]["stage"], "authentication");
+    }
+
+    #[tokio::test]
+    async fn admin_audit_read_model_is_versioned_filtered_and_bounded() {
+        let (_dir, state) = test_state();
+        let event = admin_audit_record(
+            "request-audit-list-1",
+            "admin:test",
+            "/v1/admin/instruments/AAPL.XNAS",
+            "succeeded",
+            json!({"method":"PUT"}),
+            "",
+        );
+        state.audit.record_admin(&event).await.unwrap();
+        let response = admin_audit_events(
+            State(state.clone()),
+            Extension("query-1".into()),
+            Query(AdminAuditQuery {
+                limit: 10,
+                offset: 0,
+                action: "http.admin.request".into(),
+                outcome: "succeeded".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(body["schema"], "marketcow.admin-audit.v1");
+        assert_eq!(body["durable"], false);
+        assert_eq!(body["page"], json!({"limit":10,"offset":0,"returned":1}));
+        assert_eq!(body["items"][0], serde_json::to_value(event).unwrap());
+
+        let invalid = admin_audit_events(
+            State(state),
+            Extension("query-2".into()),
+            Query(AdminAuditQuery {
+                limit: 201,
+                offset: 0,
+                action: String::new(),
+                outcome: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

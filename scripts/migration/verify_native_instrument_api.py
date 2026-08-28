@@ -35,9 +35,12 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def get_json(url: str) -> tuple[int, dict]:
+def get_json(url: str, bearer_token: str = "") -> tuple[int, dict]:
+    request: str | Request = url
+    if bearer_token:
+        request = Request(url, headers={"Authorization": f"Bearer {bearer_token}"})
     try:
-        with urlopen(url, timeout=2) as response:  # noqa: S310 - loopback URL only
+        with urlopen(request, timeout=2) as response:  # noqa: S310 - loopback URL only
             return response.status, json.load(response)
     except HTTPError as error:
         return error.code, json.load(error)
@@ -231,6 +234,23 @@ def main() -> int:
                     and expected.get("content_hash") == canonical_hash(instrument_input)
                     and str(expected.get("updated_at", "")).endswith("Z")
                 )
+                audit_status, audit_page = get_json(
+                    f"{base_url}/v1/admin/audit?limit=10&offset=0",
+                    "local-integration-admin-token",
+                )
+                audit_items = audit_page.get("items", [])
+                audit_outcomes = [item.get("outcome") for item in audit_items]
+                checks["admin_audit_query_matches_python_contract"] = (
+                    audit_status == 200
+                    and audit_page.get("schema") == "marketcow.admin-audit.v1"
+                    and audit_page.get("durable") is True
+                    and audit_page.get("page") == {
+                        "limit": 10, "offset": 0, "returned": 4,
+                    }
+                    and audit_outcomes.count("accepted") == 2
+                    and audit_outcomes.count("succeeded") == 1
+                    and audit_outcomes.count("rejected") == 1
+                )
 
                 status, actual = get_json(f"{base_url}/v1/instruments/AAPL.XNAS")
                 checks["http_get_200"] = status == 200
@@ -329,7 +349,7 @@ def main() -> int:
                 text=True,
             ).stdout.strip()
             checks["postgres_audit_has_rejected_accepted_and_succeeded"] = (
-                audit_summary == "3|1|1|1"
+                audit_summary == "5|2|2|1"
             )
             postgres_audit_ids = subprocess.run(
                 [
@@ -353,7 +373,7 @@ def main() -> int:
             )
             checks["local_and_postgres_admin_audit_ids_match"] = (
                 local_admin_audit_ids == postgres_audit_ids
-                and len(local_admin_audit_ids) == 3
+                and len(local_admin_audit_ids) == 5
             )
             migration_count = subprocess.run(
                 [
