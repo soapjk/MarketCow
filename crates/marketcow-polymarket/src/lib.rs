@@ -3,7 +3,8 @@
 
 use chrono::{DateTime, Utc};
 use marketcow_core::{
-    CONTRACT_VERSION, CanonicalEvent, EventKind, Level, Price, Side, SideLevels, SourceEvidence,
+    CONTRACT_VERSION, CanonicalEvent, EventKind, Level, MarketRecord, NegativeRiskRelation, Price,
+    Side, SideLevels, SourceEvidence,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -59,6 +60,8 @@ pub enum NormalizeError {
     InvalidLevels,
     #[error("financial decimal is invalid")]
     InvalidDecimal,
+    #[error("catalog payload is invalid")]
+    InvalidCatalog,
 }
 
 struct FrameContext {
@@ -89,6 +92,68 @@ pub fn normalize_frame(
         observed_at,
     };
     match event_type.as_str() {
+        "catalog_revision" => {
+            let catalog_revision = string_alias(raw, &["catalog_revision", "revision"])
+                .filter(|value| !value.is_empty())
+                .ok_or(NormalizeError::MissingField("catalog_revision"))?;
+            let markets = serde_json::from_value::<Vec<MarketRecord>>(
+                raw.get("markets")
+                    .cloned()
+                    .ok_or(NormalizeError::MissingField("markets"))?,
+            )
+            .map_err(|_| NormalizeError::InvalidCatalog)?;
+            let negative_risk_relations = serde_json::from_value::<Vec<NegativeRiskRelation>>(
+                raw.get("negative_risk_relations")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new())),
+            )
+            .map_err(|_| NormalizeError::InvalidCatalog)?;
+            Ok(vec![build_event(
+                config,
+                &context,
+                first_cursor,
+                &catalog_revision,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: catalog_revision.clone(),
+                    markets,
+                    negative_risk_relations,
+                },
+            )])
+        }
+        "new_market" => {
+            let condition_id = string_alias(raw, &["condition_id", "market"])
+                .filter(|value| !value.is_empty())
+                .ok_or(NormalizeError::MissingField("condition_id"))?;
+            Ok(vec![build_event(
+                config,
+                &context,
+                first_cursor,
+                &condition_id,
+                EventKind::NewMarket {
+                    condition_id: condition_id.clone(),
+                },
+            )])
+        }
+        "market_resolved" => {
+            let condition_id = string_alias(raw, &["condition_id", "market"])
+                .filter(|value| !value.is_empty())
+                .ok_or(NormalizeError::MissingField("condition_id"))?;
+            let winning_token_id = string_alias(raw, &["winning_asset_id", "winning_token_id"])
+                .filter(|value| !value.is_empty());
+            let winning_outcome =
+                string_alias(raw, &["winning_outcome"]).filter(|value| !value.is_empty());
+            Ok(vec![build_event(
+                config,
+                &context,
+                first_cursor,
+                &condition_id,
+                EventKind::MarketResolved {
+                    condition_id: condition_id.clone(),
+                    winning_token_id,
+                    winning_outcome,
+                },
+            )])
+        }
         "book" => {
             let token_id = string_alias(raw, &["asset_id", "token_id"])
                 .filter(|value| !value.is_empty())
@@ -483,8 +548,72 @@ mod tests {
                 at(),
                 1,
             ),
-            Err(NormalizeError::UnsupportedEventType("new_market".into()))
+            Err(NormalizeError::MissingField("condition_id"))
         );
+    }
+
+    #[test]
+    fn catalog_and_lifecycle_frames_are_typed_before_cursor_commit() {
+        let catalog = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"catalog_revision",
+                "catalog_revision":"catalog-1",
+                "markets":[{
+                    "market_id":"m1", "condition_id":"condition-1",
+                    "outcomes":[
+                        {"token_id":"yes-1","outcome":"Yes","instrument_id":"POLY.M1.YES"},
+                        {"token_id":"no-1","outcome":"No","instrument_id":"POLY.M1.NO"}
+                    ],
+                    "negative_risk_group":null, "lifecycle_state":"active",
+                    "resolution":null, "metadata_revision":"metadata-1",
+                    "observed_at":"2026-08-03T04:00:00Z", "terminal_at":null
+                }],
+                "negative_risk_relations":[]
+            }),
+            at(),
+            1,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(matches!(
+            catalog.kind,
+            EventKind::CatalogSnapshot { ref catalog_revision, .. }
+                if catalog_revision == "catalog-1"
+        ));
+
+        let new_market = normalize_frame(
+            &config(),
+            serde_json::json!({"event_type":"new_market","market":"condition-2"}),
+            at(),
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(matches!(
+            new_market.kind,
+            EventKind::NewMarket { ref condition_id } if condition_id == "condition-2"
+        ));
+
+        let resolved = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"market_resolved", "market":"condition-1",
+                "winning_asset_id":"yes-1", "winning_outcome":"Yes"
+            }),
+            at(),
+            3,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(matches!(
+            resolved.kind,
+            EventKind::MarketResolved {
+                ref condition_id,
+                winning_token_id: Some(ref token),
+                winning_outcome: Some(ref outcome),
+            } if condition_id == "condition-1" && token == "yes-1" && outcome == "Yes"
+        ));
     }
 
     #[test]

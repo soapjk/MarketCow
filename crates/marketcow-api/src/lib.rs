@@ -37,6 +37,9 @@ pub struct SnapshotResponse {
     pub fail_closed_reason: Option<String>,
     pub unresolved_gaps: Vec<String>,
     pub books: Vec<BookView>,
+    pub catalog_revision: Option<String>,
+    pub markets: Vec<marketcow_core::MarketRecord>,
+    pub negative_risk_relations: Vec<marketcow_core::NegativeRiskRelation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +178,13 @@ pub fn snapshot(projection: &Projection) -> SnapshotResponse {
             .iter()
             .map(|(token_id, book)| book_view(token_id, book))
             .collect(),
+        catalog_revision: projection.catalog_revision.clone(),
+        markets: projection.markets.values().cloned().collect(),
+        negative_risk_relations: projection
+            .negative_risk_relations
+            .values()
+            .cloned()
+            .collect(),
     }
 }
 
@@ -260,6 +270,10 @@ pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, Re
         cursor: record.event.cursor,
         event_id: record.event.event_id.clone(),
         event_type: match &record.event.kind {
+            EventKind::CatalogSnapshot { .. } => "catalog_revision",
+            EventKind::NewMarket { .. } => "new_market",
+            EventKind::MarketResolved { .. } if record.applied => "market_terminal",
+            EventKind::MarketResolved { .. } => "market_resolved",
             EventKind::FullBook { .. } => "full_book",
             EventKind::Delta { .. } => "delta",
             EventKind::AtomicDelta { .. } => "delta",

@@ -148,9 +148,61 @@ pub struct SideLevels {
     pub levels: Vec<Level>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketLifecycleState {
+    Active,
+    Closed,
+    Resolved,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeToken {
+    pub token_id: String,
+    pub outcome: String,
+    pub instrument_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketRecord {
+    pub market_id: String,
+    pub condition_id: String,
+    pub outcomes: [OutcomeToken; 2],
+    pub negative_risk_group: Option<String>,
+    pub lifecycle_state: MarketLifecycleState,
+    pub resolution: Option<String>,
+    pub metadata_revision: String,
+    pub observed_at: DateTime<Utc>,
+    pub terminal_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NegativeRiskRelation {
+    pub group_id: String,
+    pub member_market_ids: BTreeSet<String>,
+    pub yes_token_ids: BTreeSet<String>,
+    pub revision: String,
+    pub complete: bool,
+    pub valid_to: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum EventKind {
+    CatalogSnapshot {
+        catalog_revision: String,
+        markets: Vec<MarketRecord>,
+        negative_risk_relations: Vec<NegativeRiskRelation>,
+    },
+    NewMarket {
+        condition_id: String,
+    },
+    MarketResolved {
+        condition_id: String,
+        winning_token_id: Option<String>,
+        winning_outcome: Option<String>,
+    },
     FullBook {
         token_id: String,
         bids: Vec<Level>,
@@ -191,6 +243,12 @@ pub enum EventKind {
 impl EventKind {
     pub fn token_id(&self) -> &str {
         match self {
+            Self::CatalogSnapshot {
+                catalog_revision, ..
+            } => catalog_revision,
+            Self::NewMarket { condition_id } | Self::MarketResolved { condition_id, .. } => {
+                condition_id
+            }
             Self::FullBook { token_id, .. }
             | Self::Delta { token_id, .. }
             | Self::AtomicDelta { token_id, .. }
@@ -255,6 +313,14 @@ pub struct Projection {
     pub persisted_cursor: u64,
     pub scope_id: String,
     pub books: BTreeMap<String, Book>,
+    #[serde(default)]
+    pub catalog_revision: Option<String>,
+    #[serde(default)]
+    pub markets: BTreeMap<String, MarketRecord>,
+    #[serde(default)]
+    pub condition_to_market: BTreeMap<String, String>,
+    #[serde(default)]
+    pub negative_risk_relations: BTreeMap<String, NegativeRiskRelation>,
     pub unresolved_gaps: BTreeSet<String>,
     pub recent_event_ids: VecDeque<String>,
     pub ready: bool,
@@ -270,6 +336,10 @@ impl Projection {
             persisted_cursor: 0,
             scope_id: scope_id.into(),
             books: BTreeMap::new(),
+            catalog_revision: None,
+            markets: BTreeMap::new(),
+            condition_to_market: BTreeMap::new(),
+            negative_risk_relations: BTreeMap::new(),
             unresolved_gaps: BTreeSet::new(),
             recent_event_ids: VecDeque::new(),
             ready: false,
@@ -286,6 +356,10 @@ impl Projection {
             "persisted_cursor": self.persisted_cursor,
             "scope_id": self.scope_id,
             "books": self.books,
+            "catalog_revision": self.catalog_revision,
+            "markets": self.markets,
+            "condition_to_market": self.condition_to_market,
+            "negative_risk_relations": self.negative_risk_relations,
             "unresolved_gaps": self.unresolved_gaps,
             "recent_event_ids": self.recent_event_ids,
             "ready": self.ready,
@@ -294,6 +368,105 @@ impl Projection {
         let bytes = serde_json::to_vec(&value).expect("projection is serializable");
         hex::encode(Sha256::digest(bytes))
     }
+}
+
+type CatalogState = (
+    BTreeMap<String, MarketRecord>,
+    BTreeMap<String, String>,
+    BTreeMap<String, NegativeRiskRelation>,
+    BTreeSet<String>,
+);
+
+fn validated_catalog(
+    markets: &[MarketRecord],
+    relations: &[NegativeRiskRelation],
+) -> Option<CatalogState> {
+    let mut by_market = BTreeMap::new();
+    let mut by_condition = BTreeMap::new();
+    let mut active_tokens = BTreeSet::new();
+    let mut expected_groups: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> =
+        BTreeMap::new();
+    let mut all_tokens = BTreeSet::new();
+    let mut all_instruments = BTreeSet::new();
+    for market in markets {
+        let terminal = market.lifecycle_state != MarketLifecycleState::Active;
+        let outcome_tokens = market
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.token_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if market.market_id.is_empty()
+            || market.condition_id.is_empty()
+            || market.metadata_revision.is_empty()
+            || terminal != market.terminal_at.is_some()
+            || market.lifecycle_state == MarketLifecycleState::Resolved
+                && market.resolution.as_deref().is_none_or(str::is_empty)
+            || outcome_tokens.len() != 2
+            || market.outcomes.iter().any(|outcome| {
+                outcome.token_id.is_empty()
+                    || outcome.outcome.is_empty()
+                    || outcome.instrument_id.is_empty()
+                    || !all_tokens.insert(outcome.token_id.clone())
+                    || !all_instruments.insert(outcome.instrument_id.clone())
+            })
+            || by_condition
+                .insert(market.condition_id.clone(), market.market_id.clone())
+                .is_some()
+            || by_market
+                .insert(market.market_id.clone(), market.clone())
+                .is_some()
+        {
+            return None;
+        }
+        if market.lifecycle_state == MarketLifecycleState::Active {
+            active_tokens.extend(
+                market
+                    .outcomes
+                    .iter()
+                    .map(|outcome| outcome.token_id.clone()),
+            );
+        }
+        if let Some(group_id) = &market.negative_risk_group {
+            if group_id.is_empty() || market.lifecycle_state != MarketLifecycleState::Active {
+                continue;
+            }
+            let yes = market
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.outcome.eq_ignore_ascii_case("yes"))
+                .collect::<Vec<_>>();
+            if yes.len() != 1 {
+                return None;
+            }
+            let expected = expected_groups.entry(group_id.clone()).or_default();
+            expected.0.insert(market.market_id.clone());
+            expected.1.insert(yes[0].token_id.clone());
+        }
+    }
+    let mut by_group = BTreeMap::new();
+    for relation in relations {
+        if relation.group_id.is_empty()
+            || relation.revision.is_empty()
+            || !relation.complete
+            || relation.valid_to.is_some()
+            || relation.member_market_ids.len() < 2
+            || by_group
+                .insert(relation.group_id.clone(), relation.clone())
+                .is_some()
+        {
+            return None;
+        }
+    }
+    if expected_groups.len() != by_group.len()
+        || expected_groups.iter().any(|(group_id, expected)| {
+            by_group.get(group_id).is_none_or(|relation| {
+                relation.member_market_ids != expected.0 || relation.yes_token_ids != expected.1
+            })
+        })
+    {
+        return None;
+    }
+    Some((by_market, by_condition, by_group, active_tokens))
 }
 
 pub trait DurableLog {
@@ -440,6 +613,122 @@ impl<L: DurableLog> SingleWriter<L> {
             });
         } else {
             match &event.kind {
+                EventKind::CatalogSnapshot {
+                    catalog_revision,
+                    markets,
+                    negative_risk_relations,
+                } => {
+                    let mut combined = markets.clone();
+                    combined.extend(
+                        next.markets
+                            .values()
+                            .filter(|existing| {
+                                existing.lifecycle_state == MarketLifecycleState::Resolved
+                                    && !markets
+                                        .iter()
+                                        .any(|market| market.market_id == existing.market_id)
+                            })
+                            .cloned(),
+                    );
+                    if catalog_revision.is_empty() {
+                        next.unresolved_gaps.insert("catalog:invalid".into());
+                        applied = false;
+                        rejected = Some("invalid_catalog_snapshot".into());
+                    } else if let Some((catalog, conditions, relations, active_tokens)) =
+                        validated_catalog(&combined, negative_risk_relations)
+                    {
+                        next.catalog_revision = Some(catalog_revision.clone());
+                        next.markets = catalog;
+                        next.condition_to_market = conditions;
+                        next.negative_risk_relations = relations;
+                        next.books
+                            .retain(|token_id, _| active_tokens.contains(token_id));
+                        next.unresolved_gaps.retain(|gap| {
+                            !gap.starts_with("catalog:") && !gap.starts_with("negative_risk:")
+                        });
+                    } else {
+                        next.unresolved_gaps.insert("catalog:invalid".into());
+                        applied = false;
+                        rejected = Some("invalid_catalog_snapshot".into());
+                    }
+                }
+                EventKind::NewMarket { condition_id } => {
+                    next.unresolved_gaps
+                        .insert(format!("catalog:{condition_id}"));
+                    rejected = Some("catalog_refresh_required".into());
+                }
+                EventKind::MarketResolved {
+                    condition_id,
+                    winning_token_id,
+                    winning_outcome,
+                } => {
+                    if let Some(market_id) = next.condition_to_market.get(condition_id).cloned() {
+                        let market = next
+                            .markets
+                            .get(&market_id)
+                            .expect("condition index is valid");
+                        let winning_token_valid = winning_token_id.as_ref().is_none_or(|winner| {
+                            market
+                                .outcomes
+                                .iter()
+                                .any(|outcome| &outcome.token_id == winner)
+                        });
+                        let winning_outcome_valid = winning_outcome.as_ref().is_none_or(|winner| {
+                            market
+                                .outcomes
+                                .iter()
+                                .any(|outcome| &outcome.outcome == winner)
+                        });
+                        if !winning_token_valid || !winning_outcome_valid {
+                            next.unresolved_gaps
+                                .insert(format!("catalog:{condition_id}"));
+                            applied = false;
+                            rejected = Some("market_resolution_source_mismatch".into());
+                        } else {
+                            let market = next
+                                .markets
+                                .get_mut(&market_id)
+                                .expect("condition index is valid");
+                            market.lifecycle_state = MarketLifecycleState::Resolved;
+                            market.resolution = winning_outcome
+                                .clone()
+                                .or_else(|| winning_token_id.clone())
+                                .or_else(|| Some("resolved".into()));
+                            market.terminal_at = Some(event.source_observed_at);
+                            market.metadata_revision = hex::encode(Sha256::digest(format!(
+                                "{}\0{}",
+                                market.metadata_revision, event.source.raw_sha256
+                            )));
+                            let outcomes = market.outcomes.clone();
+                            let group = market.negative_risk_group.clone();
+                            for outcome in outcomes {
+                                next.books.remove(&outcome.token_id);
+                                next.unresolved_gaps.remove(&outcome.token_id);
+                            }
+                            if let Some(group_id) = group {
+                                if let Some(relation) =
+                                    next.negative_risk_relations.get_mut(&group_id)
+                                {
+                                    relation.complete = false;
+                                    relation.valid_to = Some(event.source_observed_at);
+                                    relation.revision = hex::encode(Sha256::digest(format!(
+                                        "{}\0{}",
+                                        relation.revision, event.source.raw_sha256
+                                    )));
+                                }
+                                next.unresolved_gaps
+                                    .insert(format!("negative_risk:{group_id}"));
+                            }
+                            next.unresolved_gaps
+                                .insert(format!("catalog:{condition_id}"));
+                        }
+                    } else {
+                        next.unresolved_gaps
+                            .insert(format!("catalog:{condition_id}"));
+                        applied = false;
+                        rejected = Some("catalog_refresh_required".into());
+                    }
+                }
                 EventKind::SourceGap { token_id, reason } => {
                     next.unresolved_gaps.insert(token_id.clone());
                     applied = false;
@@ -452,8 +741,20 @@ impl<L: DurableLog> SingleWriter<L> {
                     tick_size,
                     tick_version,
                 } => {
+                    let token_is_active = next.catalog_revision.is_none()
+                        || next.markets.values().any(|market| {
+                            market.lifecycle_state == MarketLifecycleState::Active
+                                && market
+                                    .outcomes
+                                    .iter()
+                                    .any(|outcome| &outcome.token_id == token_id)
+                        });
                     let mut book = next.books.get(token_id).cloned().unwrap_or_default();
-                    if tick_version.is_empty()
+                    if !token_is_active {
+                        next.unresolved_gaps.insert(token_id.clone());
+                        applied = false;
+                        rejected = Some("token_not_in_active_catalog".into());
+                    } else if tick_version.is_empty()
                         || !Book::levels_tick_aligned(tick_size, bids)
                         || !Book::levels_tick_aligned(tick_size, asks)
                     {
@@ -631,7 +932,15 @@ impl<L: DurableLog> SingleWriter<L> {
                 }
             }
         }
-        next.ready = next.unresolved_gaps.is_empty() && !next.books.is_empty();
+        let catalog_books_complete = next.catalog_revision.is_none()
+            || next
+                .markets
+                .values()
+                .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                .flat_map(|market| market.outcomes.iter())
+                .all(|outcome| next.books.contains_key(&outcome.token_id));
+        next.ready =
+            next.unresolved_gaps.is_empty() && !next.books.is_empty() && catalog_books_complete;
         next.fail_closed_reason = rejected
             .clone()
             .or_else(|| (!next.ready).then(|| "unresolved_gap".into()));
@@ -1361,6 +1670,151 @@ mod tests {
             replay_after_checkpoint(checkpoint, &divergent),
             Err(CoreError::ReplayDivergence { cursor: 2 })
         ));
+    }
+
+    fn market(market_id: &str, condition_id: &str, negative_group: Option<&str>) -> MarketRecord {
+        MarketRecord {
+            market_id: market_id.into(),
+            condition_id: condition_id.into(),
+            outcomes: [
+                OutcomeToken {
+                    token_id: format!("{market_id}-yes"),
+                    outcome: "Yes".into(),
+                    instrument_id: format!("POLY.{market_id}.YES"),
+                },
+                OutcomeToken {
+                    token_id: format!("{market_id}-no"),
+                    outcome: "No".into(),
+                    instrument_id: format!("POLY.{market_id}.NO"),
+                },
+            ],
+            negative_risk_group: negative_group.map(str::to_owned),
+            lifecycle_state: MarketLifecycleState::Active,
+            resolution: None,
+            metadata_revision: format!("revision-{market_id}"),
+            observed_at: Utc::now(),
+            terminal_at: None,
+        }
+    }
+
+    #[test]
+    fn catalog_requires_every_active_book_and_resolution_is_durably_fail_closed() {
+        struct MemoryLog(Vec<PersistedEvent>);
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!()
+            }
+            fn append_outcome(&mut self, event: &PersistedEvent) -> Result<(), CoreError> {
+                self.0.push(event.clone());
+                Ok(())
+            }
+        }
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        let market = market("m1", "condition-1", None);
+        assert!(
+            writer
+                .apply(event(
+                    1,
+                    EventKind::CatalogSnapshot {
+                        catalog_revision: "catalog-1".into(),
+                        markets: vec![market],
+                        negative_risk_relations: Vec::new(),
+                    },
+                ))
+                .unwrap()
+                .persisted
+                .applied
+        );
+        for (cursor, token_id) in [(2, "m1-yes"), (3, "m1-no")] {
+            let outcome = writer
+                .apply(event(
+                    cursor,
+                    EventKind::FullBook {
+                        token_id: token_id.into(),
+                        bids: levels("0.4", "1"),
+                        asks: levels("0.6", "1"),
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v1".into(),
+                    },
+                ))
+                .unwrap();
+            assert_eq!(outcome.projection.ready, cursor == 3);
+        }
+        let resolved = writer
+            .apply(event(
+                4,
+                EventKind::MarketResolved {
+                    condition_id: "condition-1".into(),
+                    winning_token_id: Some("m1-yes".into()),
+                    winning_outcome: Some("Yes".into()),
+                },
+            ))
+            .unwrap();
+        assert!(resolved.persisted.applied);
+        assert_eq!(resolved.persisted.fail_closed_reason.as_deref(), None);
+        assert!(resolved.projection.books.is_empty());
+        assert_eq!(
+            resolved.projection.markets["m1"].lifecycle_state,
+            MarketLifecycleState::Resolved
+        );
+
+        let refreshed = writer
+            .apply(event(
+                5,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-2".into(),
+                    markets: Vec::new(),
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+        assert!(refreshed.persisted.applied);
+        assert!(refreshed.projection.markets.contains_key("m1"));
+        assert!(!refreshed.projection.ready);
+    }
+
+    #[test]
+    fn negative_risk_catalog_requires_exact_complete_yes_membership() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+        let markets = vec![
+            market("m1", "condition-1", Some("group-1")),
+            market("m2", "condition-2", Some("group-1")),
+        ];
+        let invalid_relation = NegativeRiskRelation {
+            group_id: "group-1".into(),
+            member_market_ids: ["m1".into(), "m2".into()].into(),
+            yes_token_ids: ["m1-yes".into()].into(),
+            revision: "relation-1".into(),
+            complete: true,
+            valid_to: None,
+        };
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog);
+        let rejected = writer
+            .apply(event(
+                1,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-invalid".into(),
+                    markets,
+                    negative_risk_relations: vec![invalid_relation],
+                },
+            ))
+            .unwrap();
+        assert!(!rejected.persisted.applied);
+        assert_eq!(
+            rejected.persisted.fail_closed_reason.as_deref(),
+            Some("invalid_catalog_snapshot")
+        );
+        assert!(
+            rejected
+                .projection
+                .unresolved_gaps
+                .contains("catalog:invalid")
+        );
     }
 
     #[test]
