@@ -1993,13 +1993,7 @@ async fn mcp_tool_call(
             return mcp_result(request_id, mcp_tool_result(error, true));
         };
         return match instrument_lookup(state, instrument_id).await {
-            Ok(record) => mcp_result(
-                request_id,
-                mcp_tool_result(
-                    serde_json::to_value(record).expect("InstrumentRecord serializes"),
-                    false,
-                ),
-            ),
+            Ok(record) => mcp_result(request_id, mcp_serialized_tool_result(&record)),
             Err((status, detail)) => {
                 let error = json!({
                     "error":"marketcow_api_error",
@@ -2058,6 +2052,14 @@ fn mcp_tool_result(payload: serde_json::Value, is_error: bool) -> serde_json::Va
         "content":[{"type":"text","text":serde_json::to_string(&payload).expect("JSON value serializes")}],
         "structuredContent":payload,
         "isError":is_error
+    })
+}
+
+fn mcp_serialized_tool_result<T: Serialize>(payload: &T) -> serde_json::Value {
+    json!({
+        "content":[{"type":"text","text":serde_json::to_string(payload).expect("tool payload serializes")}],
+        "structuredContent":serde_json::to_value(payload).expect("tool payload serializes"),
+        "isError":false
     })
 }
 
