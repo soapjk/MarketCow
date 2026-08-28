@@ -4,6 +4,8 @@ use marketcow_contracts::{EventContractFields, LIVE_SCHEMA_VERSION};
 use marketcow_core::{Book, EventKind, Level, PersistedEvent, Projection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::Arc;
 use thiserror::Error;
 
 pub const MAX_EVENT_PAGE: usize = 1_000;
@@ -285,7 +287,7 @@ pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, Re
         .into(),
         canonical_payload,
         canonical_payload_sha256: hex::encode(Sha256::digest(canonical_bytes)),
-        raw_payload: record.event.raw_payload.clone(),
+        raw_payload: (*record.event.raw_payload).clone(),
         raw_payload_sha256: record.event.source.raw_sha256.clone(),
         applied: record.applied,
         fail_closed_reason: record.fail_closed_reason.clone(),
@@ -370,7 +372,7 @@ mod tests {
                 duplicate: false,
                 revised: false,
             },
-            raw_payload,
+            raw_payload: Arc::new(raw_payload),
             kind,
         }
     }

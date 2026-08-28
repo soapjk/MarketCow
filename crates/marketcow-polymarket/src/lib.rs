@@ -8,7 +8,7 @@ use marketcow_core::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 use thiserror::Error;
 
 pub const NORMALIZER_VERSION: &str = "marketcow.polymarket.normalizer.v1";
@@ -65,7 +65,7 @@ pub enum NormalizeError {
 }
 
 struct FrameContext {
-    raw_payload: Value,
+    raw_payload: Arc<Value>,
     raw_sha256: String,
     received_at: DateTime<Utc>,
     observed_at: DateTime<Utc>,
@@ -86,7 +86,7 @@ pub fn normalize_frame(
     let observed_at = parse_observed_at(raw.get("timestamp"), received_at)?;
     let raw_sha256 = content_sha256(&raw_payload)?;
     let context = FrameContext {
-        raw_payload: raw_payload.clone(),
+        raw_payload: Arc::new(raw_payload.clone()),
         raw_sha256,
         received_at,
         observed_at,
@@ -528,6 +528,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(token_ids, ["a-token", "z-token"]);
+        assert!(Arc::ptr_eq(&events[0].raw_payload, &events[1].raw_payload));
     }
 
     #[test]

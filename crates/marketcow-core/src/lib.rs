@@ -287,7 +287,7 @@ pub struct CanonicalEvent {
     pub normalizer_version: String,
     pub config_revision: String,
     pub source: SourceEvidence,
-    pub raw_payload: serde_json::Value,
+    pub raw_payload: Arc<serde_json::Value>,
     pub kind: EventKind,
 }
 
@@ -1026,11 +1026,27 @@ struct WalRecord {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WalBatchRecord {
+    #[serde(default = "wal_batch_v1")]
+    batch_version: u8,
     first_cursor: u64,
     last_cursor: u64,
     crc32c: u32,
     payload_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frame_raw_payload: Option<serde_json::Value>,
     payloads: Vec<PersistedEvent>,
+}
+
+const fn wal_batch_v1() -> u8 {
+    1
+}
+
+fn wal_batch_integrity_bytes(record: &WalBatchRecord) -> Result<Vec<u8>, CoreError> {
+    match (record.batch_version, record.frame_raw_payload.as_ref()) {
+        (1, None) => Ok(serde_json::to_vec(&record.payloads)?),
+        (2, Some(raw_payload)) => Ok(serde_json::to_vec(&(raw_payload, &record.payloads))?),
+        _ => Err(CoreError::CorruptWal),
+    }
 }
 
 pub struct SegmentedWal {
@@ -1167,8 +1183,8 @@ impl SegmentedWal {
             for line in lines {
                 let value: serde_json::Value = serde_json::from_str(&line?)?;
                 if value.get("payloads").is_some() {
-                    let record: WalBatchRecord = serde_json::from_value(value)?;
-                    let payload = serde_json::to_vec(&record.payloads)?;
+                    let mut record: WalBatchRecord = serde_json::from_value(value)?;
+                    let payload = wal_batch_integrity_bytes(&record)?;
                     if record.payloads.is_empty()
                         || record.payloads.first().map(|item| item.event.cursor)
                             != Some(record.first_cursor)
@@ -1178,6 +1194,21 @@ impl SegmentedWal {
                         || hex::encode(Sha256::digest(&payload)) != record.payload_sha256
                     {
                         return Err(CoreError::CorruptWal);
+                    }
+                    if let Some(raw_payload) = record.frame_raw_payload.take() {
+                        let raw_payload = Arc::new(raw_payload);
+                        let raw_sha256 =
+                            hex::encode(Sha256::digest(serde_json::to_vec(raw_payload.as_ref())?));
+                        if record
+                            .payloads
+                            .iter()
+                            .any(|persisted| persisted.event.source.raw_sha256 != raw_sha256)
+                        {
+                            return Err(CoreError::CorruptWal);
+                        }
+                        for persisted in &mut record.payloads {
+                            persisted.event.raw_payload = raw_payload.clone();
+                        }
                     }
                     for persisted in record.payloads {
                         if output
@@ -1259,14 +1290,30 @@ impl DurableLog for SegmentedWal {
         {
             return Err(CoreError::CorruptWal);
         }
-        let payload = serde_json::to_vec(outcomes)?;
-        let record = WalBatchRecord {
+        let frame_raw_payload = outcomes[0].event.raw_payload.clone();
+        let raw_sha256 = &outcomes[0].event.source.raw_sha256;
+        if outcomes.iter().any(|outcome| {
+            outcome.event.source.raw_sha256 != *raw_sha256
+                || outcome.event.raw_payload.as_ref() != frame_raw_payload.as_ref()
+        }) {
+            return Err(CoreError::CorruptWal);
+        }
+        let mut payloads = outcomes.to_vec();
+        for persisted in &mut payloads {
+            persisted.event.raw_payload = Arc::new(serde_json::Value::Null);
+        }
+        let mut record = WalBatchRecord {
+            batch_version: 2,
             first_cursor: first.event.cursor,
             last_cursor: outcomes.last().expect("non-empty").event.cursor,
-            crc32c: crc32c::crc32c(&payload),
-            payload_sha256: hex::encode(Sha256::digest(&payload)),
-            payloads: outcomes.to_vec(),
+            crc32c: 0,
+            payload_sha256: String::new(),
+            frame_raw_payload: Some((*frame_raw_payload).clone()),
+            payloads,
         };
+        let payload = wal_batch_integrity_bytes(&record)?;
+        record.crc32c = crc32c::crc32c(&payload);
+        record.payload_sha256 = hex::encode(Sha256::digest(&payload));
         let line = serde_json::to_vec(&record)?;
         if self.file.is_none() || self.bytes + line.len() as u64 + 1 > self.max_segment_bytes {
             self.rotate(first.event.cursor)?;
@@ -1420,7 +1467,7 @@ mod tests {
                 duplicate: false,
                 revised: false,
             },
-            raw_payload,
+            raw_payload: Arc::new(raw_payload),
             kind,
         }
     }
@@ -1693,31 +1740,54 @@ mod tests {
         let dir = tempdir().unwrap();
         let wal = SegmentedWal::open(dir.path(), "batch", 16 * 1024).unwrap();
         let mut state = SingleWriter::new("scope".into(), wal);
-        state
-            .apply_batch(vec![
-                event(
-                    1,
-                    EventKind::SourceGap {
-                        token_id: "a".into(),
-                        reason: "fixture".into(),
-                    },
-                ),
-                event(
-                    2,
-                    EventKind::SourceGap {
-                        token_id: "b".into(),
-                        reason: "fixture".into(),
-                    },
-                ),
-            ])
-            .unwrap();
+        let first = event(
+            1,
+            EventKind::SourceGap {
+                token_id: "a".into(),
+                reason: "fixture".into(),
+            },
+        );
+        let mut second = event(
+            2,
+            EventKind::SourceGap {
+                token_id: "b".into(),
+                reason: "fixture".into(),
+            },
+        );
+        second.raw_payload = first.raw_payload.clone();
+        second.source.raw_sha256 = first.source.raw_sha256.clone();
+        state.apply_batch(vec![first, second]).unwrap();
         drop(state);
         let path = wal_paths(dir.path()).unwrap().remove(0);
-        assert_eq!(BufReader::new(File::open(path).unwrap()).lines().count(), 2);
+        assert_eq!(
+            BufReader::new(File::open(&path).unwrap()).lines().count(),
+            2
+        );
+        let record: serde_json::Value = serde_json::from_str(
+            &BufReader::new(File::open(&path).unwrap())
+                .lines()
+                .nth(1)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["batch_version"], 2);
+        assert!(record["frame_raw_payload"].is_object());
+        assert!(
+            record["payloads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|payload| payload["event"]["raw_payload"].is_null())
+        );
         let recovered = SegmentedWal::verify(dir.path()).unwrap();
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0].event.cursor, 1);
         assert_eq!(recovered[1].event.cursor, 2);
+        assert!(Arc::ptr_eq(
+            &recovered[0].event.raw_payload,
+            &recovered[1].event.raw_payload
+        ));
     }
 
     #[test]
@@ -1725,29 +1795,66 @@ mod tests {
         let dir = tempdir().unwrap();
         let wal = SegmentedWal::open(dir.path(), "batch", 16 * 1024).unwrap();
         let mut state = SingleWriter::new("scope".into(), wal);
-        state
-            .apply_batch(vec![
-                event(
-                    1,
-                    EventKind::SourceGap {
-                        token_id: "a".into(),
-                        reason: "fixture".into(),
-                    },
-                ),
-                event(
-                    2,
-                    EventKind::SourceGap {
-                        token_id: "b".into(),
-                        reason: "fixture".into(),
-                    },
-                ),
-            ])
-            .unwrap();
+        let first = event(
+            1,
+            EventKind::SourceGap {
+                token_id: "a".into(),
+                reason: "fixture".into(),
+            },
+        );
+        let mut second = event(
+            2,
+            EventKind::SourceGap {
+                token_id: "b".into(),
+                reason: "fixture".into(),
+            },
+        );
+        second.raw_payload = first.raw_payload.clone();
+        second.source.raw_sha256 = first.source.raw_sha256.clone();
+        state.apply_batch(vec![first, second]).unwrap();
         drop(state);
         let path = wal_paths(dir.path()).unwrap().remove(0);
         let bytes = fs::read(&path).unwrap();
         fs::write(&path, &bytes[..bytes.len() - 12]).unwrap();
         assert!(SegmentedWal::verify(dir.path()).is_err());
+    }
+
+    #[test]
+    fn wal_batch_v1_remains_replay_compatible() {
+        let dir = tempdir().unwrap();
+        let mut wal = SegmentedWal::open(dir.path(), "batch-v1", 16 * 1024).unwrap();
+        wal.rotate(1).unwrap();
+        let payloads = vec![PersistedEvent {
+            event: event(
+                1,
+                EventKind::SourceGap {
+                    token_id: "legacy".into(),
+                    reason: "fixture".into(),
+                },
+            ),
+            applied: false,
+            fail_closed_reason: Some("fixture".into()),
+        }];
+        let mut record = WalBatchRecord {
+            batch_version: 1,
+            first_cursor: 1,
+            last_cursor: 1,
+            crc32c: 0,
+            payload_sha256: String::new(),
+            frame_raw_payload: None,
+            payloads,
+        };
+        let payload = wal_batch_integrity_bytes(&record).unwrap();
+        record.crc32c = crc32c::crc32c(&payload);
+        record.payload_sha256 = hex::encode(Sha256::digest(&payload));
+        let line = serde_json::to_vec(&record).unwrap();
+        wal.file.as_mut().unwrap().write_all(&line).unwrap();
+        wal.file.as_mut().unwrap().write_all(b"\n").unwrap();
+        wal.file.as_mut().unwrap().sync_data().unwrap();
+        drop(wal);
+        let recovered = SegmentedWal::verify(dir.path()).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].event.raw_payload["fixture_cursor"], 1);
     }
 
     #[test]

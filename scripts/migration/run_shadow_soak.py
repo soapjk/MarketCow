@@ -109,6 +109,8 @@ def main() -> None:
     if any(storage_root.iterdir()):
         parser.error("storage root must be empty")
     reader_latencies: list[float] = []
+    bootstrap_persistence_latencies_us: list[float] = []
+    bootstrap_publication_latencies_us: list[float] = []
     persistence_latencies_us: list[float] = []
     publication_latencies_us: list[float] = []
     failures: list[dict[str, object]] = []
@@ -162,8 +164,8 @@ def main() -> None:
                 for token in TOKENS:
                     now = datetime.now(UTC)
                     body = ingest(base, raw_book(token, "0.40", "0.42", now), now)
-                    persistence_latencies_us.append(body["persistence_latency_us"])
-                    publication_latencies_us.append(body["publication_latency_us"])
+                    bootstrap_persistence_latencies_us.append(body["persistence_latency_us"])
+                    bootstrap_publication_latencies_us.append(body["publication_latency_us"])
                     ingest_count += 1
                     canonical_event_count += body["events"]
 
@@ -180,8 +182,8 @@ def main() -> None:
                         for token in TOKENS
                     ],
                 }, observed)
-                persistence_latencies_us.append(seed["persistence_latency_us"])
-                publication_latencies_us.append(seed["publication_latency_us"])
+                bootstrap_persistence_latencies_us.append(seed["persistence_latency_us"])
+                bootstrap_publication_latencies_us.append(seed["publication_latency_us"])
                 ingest_count += 1
                 canonical_event_count += seed["events"]
                 deadline = time.monotonic() + args.duration_seconds
@@ -367,6 +369,18 @@ def main() -> None:
             "p95": percentile(reader_latencies, .95),
             "p99": percentile(reader_latencies, .99),
             "max": max(reader_latencies, default=math.inf),
+        },
+        "bootstrap_persistence_latency_us": {
+            "p50": percentile(bootstrap_persistence_latencies_us, .50),
+            "p95": percentile(bootstrap_persistence_latencies_us, .95),
+            "p99": percentile(bootstrap_persistence_latencies_us, .99),
+            "max": max(bootstrap_persistence_latencies_us, default=math.inf),
+        },
+        "bootstrap_publication_latency_us": {
+            "p50": percentile(bootstrap_publication_latencies_us, .50),
+            "p95": percentile(bootstrap_publication_latencies_us, .95),
+            "p99": percentile(bootstrap_publication_latencies_us, .99),
+            "max": max(bootstrap_publication_latencies_us, default=math.inf),
         },
         "persistence_latency_us": {
             "p50": percentile(persistence_latencies_us, .50),
