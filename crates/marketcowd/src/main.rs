@@ -592,6 +592,39 @@ impl InstrumentCoordinator {
         Err(marketcow_storage::RepositoryError::Unavailable)
     }
 
+    async fn resolve(
+        &self,
+        namespace: &str,
+        external_symbol: &str,
+    ) -> Result<Option<marketcow_storage::InstrumentRecord>, marketcow_storage::RepositoryError>
+    {
+        if let Some(repository) = &self.repository {
+            return repository.resolve(namespace, external_symbol).await;
+        }
+        #[cfg(test)]
+        if self.memory_enabled {
+            let (kind, name) = namespace
+                .split_once(':')
+                .ok_or(marketcow_storage::RepositoryError::InvalidInput)?;
+            if !matches!(kind, "provider" | "broker")
+                || name.is_empty()
+                || external_symbol.is_empty()
+            {
+                return Err(marketcow_storage::RepositoryError::InvalidInput);
+            }
+            return Ok(self.memory.lock().await.values().find_map(|record| {
+                let mappings = match kind {
+                    "provider" => &record.provider_symbols,
+                    "broker" => &record.broker_symbols,
+                    _ => unreachable!("mapping kind was validated"),
+                };
+                (mappings.get(name).map(String::as_str) == Some(external_symbol))
+                    .then(|| record.clone())
+            }));
+        }
+        Err(marketcow_storage::RepositoryError::Unavailable)
+    }
+
     #[cfg(test)]
     async fn insert_fixture(&self, record: marketcow_storage::InstrumentRecord) {
         self.memory
@@ -1666,6 +1699,7 @@ fn app(state: AppState) -> Router {
             get(live_full_sync),
         )
         .route("/v1/market-data/stream", get(market_data_stream))
+        .route("/v1/instruments:resolve", get(resolve_instrument))
         .route("/v1/instruments/{instrument_id}", get(get_instrument))
         .route("/mcp", post(mcp))
         .route("/metrics", get(metrics))
@@ -1761,6 +1795,44 @@ async fn get_instrument(
     match instrument_lookup(&state, &instrument_id).await {
         Ok(record) => Json(record).into_response(),
         Err((status, detail)) => (status, Json(json!({"detail":detail}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ResolveInstrumentQuery {
+    namespace: String,
+    external_symbol: String,
+}
+
+async fn resolve_instrument(
+    State(state): State<AppState>,
+    Query(query): Query<ResolveInstrumentQuery>,
+) -> Response {
+    match state
+        .instruments
+        .resolve(&query.namespace, &query.external_symbol)
+        .await
+    {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"detail":{
+                "code":"instrument_mapping_not_found",
+                "namespace":query.namespace,
+                "external_symbol":query.external_symbol
+            }})),
+        )
+            .into_response(),
+        Err(marketcow_storage::RepositoryError::InvalidInput) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"detail":{"code":"invalid_instrument_mapping"}})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"detail":{"code":"instrument_repository_unavailable"}})),
+        )
+            .into_response(),
     }
 }
 
@@ -3434,6 +3506,45 @@ mod tests {
             serde_json::from_slice(&to_bytes(http.into_body(), 16_384).await.unwrap()).unwrap();
         assert_eq!(http, serde_json::to_value(&fixture).unwrap());
         assert_eq!(http["tick_size"], "0.0100");
+
+        let resolved = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/v1/instruments:resolve?namespace=provider%3Alongport&external_symbol=AAPL.US",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        let resolved: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resolved.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(resolved, http);
+
+        let unresolved = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/v1/instruments:resolve?namespace=provider%3Alongport&external_symbol=MSFT.US",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unresolved.status(), StatusCode::NOT_FOUND);
+        let unresolved: serde_json::Value =
+            serde_json::from_slice(&to_bytes(unresolved.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(
+            unresolved["detail"],
+            json!({
+                "code":"instrument_mapping_not_found",
+                "namespace":"provider:longport",
+                "external_symbol":"MSFT.US"
+            })
+        );
 
         let mcp = app(state.clone())
             .oneshot(

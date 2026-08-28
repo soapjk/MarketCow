@@ -197,6 +197,9 @@ def main() -> int:
                  0.0100,0.00000001,1,'2026-08-28T00:00:00Z','2026-08-28T00:00:01Z',
                  '{"longport":"AAPL.US"}'::jsonb,'{"ibkr":"AAPL"}'::jsonb,
                  'sha256:""" + "a" * 64 + """','2026-08-28T00:00:02Z');
+                INSERT INTO instrument_symbol_mapping
+                (namespace,external_symbol,instrument_id)
+                VALUES ('provider:longport','AAPL.US','AAPL.XNAS');
                 """
                 subprocess.run(
                     ["psql", dsn, "-v", "ON_ERROR_STOP=1", "-c", sql],
@@ -213,6 +216,27 @@ def main() -> int:
                     and missing == {"detail": {
                         "code": "instrument_not_found",
                         "instrument_id": "MSFT.XNAS",
+                    }}
+                )
+                resolve_url = (
+                    f"{base_url}/v1/instruments:resolve"
+                    "?namespace=provider%3Alongport&external_symbol=AAPL.US"
+                )
+                status, resolved = get_json(resolve_url)
+                checks["http_mapping_resolve_exact_record"] = (
+                    status == 200 and resolved == expected
+                )
+                missing_resolve_url = (
+                    f"{base_url}/v1/instruments:resolve"
+                    "?namespace=provider%3Alongport&external_symbol=MSFT.US"
+                )
+                status, unresolved = get_json(missing_resolve_url)
+                checks["http_mapping_missing_404_machine_detail"] = (
+                    status == 404
+                    and unresolved == {"detail": {
+                        "code": "instrument_mapping_not_found",
+                        "namespace": "provider:longport",
+                        "external_symbol": "MSFT.US",
                     }}
                 )
 
@@ -257,8 +281,12 @@ def main() -> int:
                 )
                 restart_health = wait_for_health(process, base_url)
                 status, restarted = get_json(f"{base_url}/v1/instruments/AAPL.XNAS")
+                resolve_status, restarted_resolve = get_json(resolve_url)
                 checks["restart_health_200"] = restart_health.get("status") == "healthy"
                 checks["restart_reads_same_postgres_record"] = status == 200 and restarted == expected
+                checks["restart_resolves_same_mapping"] = (
+                    resolve_status == 200 and restarted_resolve == expected
+                )
                 process_exit_codes.append(stop_process(process))
                 process = None
 
