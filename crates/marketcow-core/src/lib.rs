@@ -475,6 +475,13 @@ pub trait DurableLog {
     fn append_outcome(&mut self, outcome: &PersistedEvent) -> Result<(), CoreError> {
         self.append(&outcome.event)
     }
+
+    fn append_outcomes(&mut self, outcomes: &[PersistedEvent]) -> Result<(), CoreError> {
+        for outcome in outcomes {
+            self.append_outcome(outcome)?;
+        }
+        Ok(())
+    }
 }
 
 /// Per-client bounded queue. A full queue closes only that consumer; it never blocks apply.
@@ -563,6 +570,45 @@ impl<L: DurableLog> SingleWriter<L> {
             current: ArcSwap::from_pointee(projection),
             log,
         })
+    }
+
+    /// Validates every logical event in one upstream frame against an isolated candidate, writes
+    /// all WAL records with one durability barrier, then publishes only the final generation.
+    pub fn apply_batch(
+        &mut self,
+        events: Vec<CanonicalEvent>,
+    ) -> Result<Vec<ApplyOutcome>, CoreError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        struct CandidateLog;
+        impl DurableLog for CandidateLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+        let starting = (*self.current.load_full()).clone();
+        let mut candidate = SingleWriter::resume(starting, CandidateLog)?;
+        let mut persisted = Vec::with_capacity(events.len());
+        for event in events {
+            persisted.push(candidate.apply(event)?.persisted);
+        }
+        let persistence_started = std::time::Instant::now();
+        self.log.append_outcomes(&persisted)?;
+        let persistence_latency_us = persistence_started.elapsed().as_micros() as u64;
+        let final_projection = candidate.projection();
+        let publication_started = std::time::Instant::now();
+        self.current.store(final_projection.clone());
+        let publication_latency_us = publication_started.elapsed().as_micros() as u64;
+        Ok(persisted
+            .into_iter()
+            .map(|persisted| ApplyOutcome {
+                projection: final_projection.clone(),
+                persisted,
+                persistence_latency_us,
+                publication_latency_us,
+            })
+            .collect())
     }
 
     /// Applies a candidate, validates it, durably appends, then atomically publishes it.
@@ -978,6 +1024,15 @@ struct WalRecord {
     payload: PersistedEvent,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct WalBatchRecord {
+    first_cursor: u64,
+    last_cursor: u64,
+    crc32c: u32,
+    payload_sha256: String,
+    payloads: Vec<PersistedEvent>,
+}
+
 pub struct SegmentedWal {
     root: PathBuf,
     stream_id: String,
@@ -1061,6 +1116,28 @@ impl SegmentedWal {
         Ok(())
     }
 
+    fn write_outcome_without_final_sync(
+        &mut self,
+        outcome: &PersistedEvent,
+    ) -> Result<(), CoreError> {
+        let payload = serde_json::to_vec(outcome)?;
+        let record = WalRecord {
+            cursor: outcome.event.cursor,
+            crc32c: crc32c::crc32c(&payload),
+            payload_sha256: hex::encode(Sha256::digest(&payload)),
+            payload: outcome.clone(),
+        };
+        let line = serde_json::to_vec(&record)?;
+        if self.file.is_none() || self.bytes + line.len() as u64 + 1 > self.max_segment_bytes {
+            self.rotate(outcome.event.cursor)?;
+        }
+        let file = self.file.as_mut().expect("rotated");
+        file.write_all(&line)?;
+        file.write_all(b"\n")?;
+        self.bytes += line.len() as u64 + 1;
+        Ok(())
+    }
+
     pub fn verify(root: impl AsRef<Path>) -> Result<Vec<PersistedEvent>, CoreError> {
         let paths = wal_paths(root.as_ref())?;
         let mut output = Vec::new();
@@ -1088,19 +1165,49 @@ impl SegmentedWal {
                 return Err(CoreError::CorruptWal);
             }
             for line in lines {
-                let record: WalRecord = serde_json::from_str(&line?)?;
-                let payload = serde_json::to_vec(&record.payload)?;
-                if crc32c::crc32c(&payload) != record.crc32c
-                    || hex::encode(Sha256::digest(&payload)) != record.payload_sha256
-                {
-                    return Err(CoreError::CorruptWal);
+                let value: serde_json::Value = serde_json::from_str(&line?)?;
+                if value.get("payloads").is_some() {
+                    let record: WalBatchRecord = serde_json::from_value(value)?;
+                    let payload = serde_json::to_vec(&record.payloads)?;
+                    if record.payloads.is_empty()
+                        || record.payloads.first().map(|item| item.event.cursor)
+                            != Some(record.first_cursor)
+                        || record.payloads.last().map(|item| item.event.cursor)
+                            != Some(record.last_cursor)
+                        || crc32c::crc32c(&payload) != record.crc32c
+                        || hex::encode(Sha256::digest(&payload)) != record.payload_sha256
+                    {
+                        return Err(CoreError::CorruptWal);
+                    }
+                    for persisted in record.payloads {
+                        if output
+                            .last()
+                            .map(|item: &PersistedEvent| item.event.cursor + 1)
+                            != Some(persisted.event.cursor)
+                            && !output.is_empty()
+                        {
+                            return Err(CoreError::CorruptWal);
+                        }
+                        output.push(persisted);
+                    }
+                } else {
+                    let record: WalRecord = serde_json::from_value(value)?;
+                    let payload = serde_json::to_vec(&record.payload)?;
+                    if crc32c::crc32c(&payload) != record.crc32c
+                        || hex::encode(Sha256::digest(&payload)) != record.payload_sha256
+                    {
+                        return Err(CoreError::CorruptWal);
+                    }
+                    if output
+                        .last()
+                        .map(|item: &PersistedEvent| item.event.cursor + 1)
+                        != Some(record.cursor)
+                        && !output.is_empty()
+                    {
+                        return Err(CoreError::CorruptWal);
+                    }
+                    output.push(record.payload);
                 }
-                if output.last().map(|e: &PersistedEvent| e.event.cursor + 1) != Some(record.cursor)
-                    && !output.is_empty()
-                {
-                    return Err(CoreError::CorruptWal);
-                }
-                output.push(record.payload);
             }
             previous_segment_sha256 = Some(hex::encode(Sha256::digest(fs::read(path)?)));
         }
@@ -1137,16 +1244,32 @@ impl DurableLog for SegmentedWal {
     }
 
     fn append_outcome(&mut self, outcome: &PersistedEvent) -> Result<(), CoreError> {
-        let payload = serde_json::to_vec(outcome)?;
-        let record = WalRecord {
-            cursor: outcome.event.cursor,
+        self.write_outcome_without_final_sync(outcome)?;
+        let file = self.file.as_mut().expect("rotated");
+        file.sync_data()?;
+        Ok(())
+    }
+    fn append_outcomes(&mut self, outcomes: &[PersistedEvent]) -> Result<(), CoreError> {
+        let Some(first) = outcomes.first() else {
+            return Ok(());
+        };
+        if outcomes
+            .windows(2)
+            .any(|pair| pair[0].event.cursor + 1 != pair[1].event.cursor)
+        {
+            return Err(CoreError::CorruptWal);
+        }
+        let payload = serde_json::to_vec(outcomes)?;
+        let record = WalBatchRecord {
+            first_cursor: first.event.cursor,
+            last_cursor: outcomes.last().expect("non-empty").event.cursor,
             crc32c: crc32c::crc32c(&payload),
             payload_sha256: hex::encode(Sha256::digest(&payload)),
-            payload: outcome.clone(),
+            payloads: outcomes.to_vec(),
         };
         let line = serde_json::to_vec(&record)?;
         if self.file.is_none() || self.bytes + line.len() as u64 + 1 > self.max_segment_bytes {
-            self.rotate(outcome.event.cursor)?;
+            self.rotate(first.event.cursor)?;
         }
         let file = self.file.as_mut().expect("rotated");
         file.write_all(&line)?;
@@ -1484,6 +1607,147 @@ mod tests {
         );
         assert_eq!(state.projection().cursor, 0);
         assert_eq!(state.projection().persisted_cursor, 0);
+    }
+
+    #[test]
+    fn upstream_frame_group_commit_publishes_only_after_one_batch_barrier() {
+        #[derive(Default)]
+        struct BatchLog {
+            batches: usize,
+            records: Vec<PersistedEvent>,
+        }
+        impl DurableLog for BatchLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!("batch append is required")
+            }
+            fn append_outcomes(&mut self, outcomes: &[PersistedEvent]) -> Result<(), CoreError> {
+                self.batches += 1;
+                self.records.extend_from_slice(outcomes);
+                Ok(())
+            }
+        }
+        let mut state = SingleWriter::new("scope".into(), BatchLog::default());
+        let outcomes = state
+            .apply_batch(vec![
+                event(
+                    1,
+                    EventKind::FullBook {
+                        token_id: "t".into(),
+                        bids: levels("0.4", "1"),
+                        asks: levels("0.6", "1"),
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v1".into(),
+                    },
+                ),
+                event(
+                    2,
+                    EventKind::Delta {
+                        token_id: "t".into(),
+                        side: Side::Bid,
+                        levels: levels("0.4", "2"),
+                    },
+                ),
+            ])
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(state.log.batches, 1);
+        assert_eq!(state.log.records.len(), 2);
+        assert_eq!(state.projection().cursor, 2);
+        assert_eq!(state.projection().persisted_cursor, 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.projection.cursor == 2)
+        );
+    }
+
+    #[test]
+    fn failed_group_commit_publishes_none_of_the_frame() {
+        struct FailingBatchLog;
+        impl DurableLog for FailingBatchLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!("batch append is required")
+            }
+            fn append_outcomes(&mut self, _: &[PersistedEvent]) -> Result<(), CoreError> {
+                Err(CoreError::Io(std::io::Error::other("batch fsync failed")))
+            }
+        }
+        let mut state = SingleWriter::new("scope".into(), FailingBatchLog);
+        assert!(
+            state
+                .apply_batch(vec![event(
+                    1,
+                    EventKind::SourceGap {
+                        token_id: "t".into(),
+                        reason: "disconnect".into(),
+                    },
+                )])
+                .is_err()
+        );
+        assert_eq!(state.projection().cursor, 0);
+        assert_eq!(state.projection().persisted_cursor, 0);
+    }
+
+    #[test]
+    fn segmented_wal_encodes_a_logical_frame_as_one_verified_batch_record() {
+        let dir = tempdir().unwrap();
+        let wal = SegmentedWal::open(dir.path(), "batch", 16 * 1024).unwrap();
+        let mut state = SingleWriter::new("scope".into(), wal);
+        state
+            .apply_batch(vec![
+                event(
+                    1,
+                    EventKind::SourceGap {
+                        token_id: "a".into(),
+                        reason: "fixture".into(),
+                    },
+                ),
+                event(
+                    2,
+                    EventKind::SourceGap {
+                        token_id: "b".into(),
+                        reason: "fixture".into(),
+                    },
+                ),
+            ])
+            .unwrap();
+        drop(state);
+        let path = wal_paths(dir.path()).unwrap().remove(0);
+        assert_eq!(BufReader::new(File::open(path).unwrap()).lines().count(), 2);
+        let recovered = SegmentedWal::verify(dir.path()).unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].event.cursor, 1);
+        assert_eq!(recovered[1].event.cursor, 2);
+    }
+
+    #[test]
+    fn torn_batch_record_fails_closed_without_partial_replay() {
+        let dir = tempdir().unwrap();
+        let wal = SegmentedWal::open(dir.path(), "batch", 16 * 1024).unwrap();
+        let mut state = SingleWriter::new("scope".into(), wal);
+        state
+            .apply_batch(vec![
+                event(
+                    1,
+                    EventKind::SourceGap {
+                        token_id: "a".into(),
+                        reason: "fixture".into(),
+                    },
+                ),
+                event(
+                    2,
+                    EventKind::SourceGap {
+                        token_id: "b".into(),
+                        reason: "fixture".into(),
+                    },
+                ),
+            ])
+            .unwrap();
+        drop(state);
+        let path = wal_paths(dir.path()).unwrap().remove(0);
+        let bytes = fs::read(&path).unwrap();
+        fs::write(&path, &bytes[..bytes.len() - 12]).unwrap();
+        assert!(SegmentedWal::verify(dir.path()).is_err());
     }
 
     #[test]

@@ -130,14 +130,12 @@ impl PolymarketRuntime {
             self.config.config_revision.clone(),
         );
         let events = normalize_frame(&normalizer, raw_payload, received_at, next_cursor)?;
-        let mut outcomes = Vec::with_capacity(events.len());
-        for event in events {
-            let outcome = self.writer.apply(event)?;
+        let outcomes = self.writer.apply_batch(events)?;
+        for outcome in &outcomes {
             self.recent_events.push(outcome.persisted.clone());
             if self.recent_events.len() > self.config.recent_event_capacity {
                 self.recent_events.remove(0);
             }
-            outcomes.push(outcome);
         }
         Ok(outcomes)
     }

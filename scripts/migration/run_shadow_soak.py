@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+import hashlib
 import json
 import math
 import os
 import subprocess
-import tempfile
 import time
 import urllib.request
 from datetime import UTC, datetime
@@ -19,6 +20,14 @@ def percentile(values: list[float], percentile_value: float) -> float:
         return math.inf
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, math.ceil(percentile_value * len(ordered)) - 1)]
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def request_json(url: str, *, payload: dict | None = None, admin: bool = False) -> tuple[int, dict]:
@@ -68,13 +77,28 @@ def main() -> None:
     parser.add_argument("--interval-seconds", type=float, default=0.25)
     parser.add_argument("--port", type=int, default=18870)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--storage-root", type=Path, required=True)
+    parser.add_argument("--binary", type=Path)
+    parser.add_argument("--expected-binary-sha256", required=True)
+    parser.add_argument("--binary-commit", required=True)
     args = parser.parse_args()
     if args.duration_seconds < 1 or args.interval_seconds <= 0:
         parser.error("duration and interval must be positive")
     root = Path(__file__).resolve().parents[2]
-    binary = root / "target/debug/marketcow"
+    binary = (args.binary or root / "target/debug/marketcow").resolve()
     if not binary.is_file():
         raise SystemExit("build target/debug/marketcow first")
+    binary_sha256 = file_sha256(binary)
+    if binary_sha256 != args.expected_binary_sha256.lower():
+        raise SystemExit("binary SHA-256 does not match the declared launch identity")
+    if not args.binary_commit.strip() or len(args.binary_commit) > 128:
+        parser.error("binary commit must be present and at most 128 characters")
+    storage_root = args.storage_root.resolve()
+    if not storage_root.is_absolute() or storage_root == Path("/"):
+        parser.error("storage root must be an absolute narrow path")
+    storage_root.mkdir(parents=True, exist_ok=True)
+    if any(storage_root.iterdir()):
+        parser.error("storage root must be empty")
     latencies: list[float] = []
     failures: list[dict[str, object]] = []
     max_rss_kb = 0
@@ -87,7 +111,8 @@ def main() -> None:
     checkpoint_count = 0
     ingest_count = 0
     process_log_tail = ""
-    with tempfile.TemporaryDirectory(prefix="marketcow-shadow-soak-") as temporary:
+    # The storage root is intentionally retained for artifact-specific restart recovery.
+    with nullcontext(str(storage_root)) as temporary:
         env = {
             **os.environ,
             "MARKETCOW_RUST_PROFILE": "test",
@@ -201,19 +226,28 @@ def main() -> None:
         process_log_tail = log_path.read_text(errors="replace")[-4000:]
         elapsed_seconds = (datetime.now(UTC) - started_at).total_seconds()
 
-    passed = (
-        elapsed_seconds >= args.duration_seconds
-        and not failures
-        and percentile(latencies, .99) <= 50
-        and maximums["book_age_ms"] <= 5_000
-        and maximums["gap_count"] == 0
-        and maximums["queue_depth"] == 0
-        and maximums["cursor_lag"] == 0
-        and maximums["persistence_latency_us"] <= 50_000
-        and maximums["publication_latency_us"] <= 5_000
-    )
+    gate_verdicts = {
+        "duration_reached": elapsed_seconds >= args.duration_seconds,
+        "runner_failures_zero": not failures,
+        "readiness_p99_ms_lte_50": percentile(latencies, .99) <= 50,
+        "book_age_ms_lte_5000": maximums["book_age_ms"] <= 5_000,
+        "gap_count_zero": maximums["gap_count"] == 0,
+        "queue_depth_zero": maximums["queue_depth"] == 0,
+        "cursor_lag_zero": maximums["cursor_lag"] == 0,
+        "maximum_persistence_latency_us_lte_50000": (
+            maximums["persistence_latency_us"] <= 50_000
+        ),
+        "maximum_publication_latency_us_lte_5000": (
+            maximums["publication_latency_us"] <= 5_000
+        ),
+        "real_orders_disabled": True,
+    }
+    passed = all(gate_verdicts.values())
     result = {
-        "schema_version": "marketcow.shadow-soak.v2",
+        "schema_version": "marketcow.shadow-soak.v3",
+        "binary_commit": args.binary_commit,
+        "binary_sha256": binary_sha256,
+        "storage_root": str(storage_root),
         "started_at": started_at.isoformat(),
         "finished_at": datetime.now(UTC).isoformat(),
         "requested_duration_seconds": args.duration_seconds,
@@ -229,6 +263,7 @@ def main() -> None:
         "final_metrics": final_metrics,
         "max_rss_kb": max_rss_kb,
         "failures": failures[:100],
+        "gate_verdicts": gate_verdicts,
         "process_log_tail": process_log_tail,
         "real_order_submission_enabled": False,
         "passed": passed,
