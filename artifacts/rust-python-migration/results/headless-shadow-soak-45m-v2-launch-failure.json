@@ -1,0 +1,49 @@
+{
+  "automation_id": "scheduled_task:62a78ed3-d244-46b7-b230-c034ebfa57d2",
+  "automation_run_id": "scheduled_run:66b031b288064b3aa2a9119f5dbafdf5",
+  "binary_commit": "ba5f60aea82c2c167c165d211e75301bf298d860",
+  "binary_path": "target/debug/marketcow",
+  "binary_sha256_actual": "37d83b1127d5e95622e97cb5287ca4d301ad024d6d698cbacc4bfa95e2b4913f",
+  "binary_sha256_expected": "37d83b1127d5e95622e97cb5287ca4d301ad024d6d698cbacc4bfa95e2b4913f",
+  "expected_output_path": "artifacts/rust-python-migration/results/headless-shadow-soak-45m.json",
+  "expected_schema_version": "marketcow.headless-shadow-soak.v2",
+  "expected_storage_root": "/tmp/marketcow-headless-shadow-45m-v2.4RDt4z/storage",
+  "launch_directory": "/tmp/marketcow-headless-shadow-45m-v2.4RDt4z",
+  "launch_directory_exists": true,
+  "launch_log_path": "/tmp/marketcow-headless-shadow-45m-v2.4RDt4z/process.log",
+  "launch_log_size_bytes": 0,
+  "observed_at": "2026-08-28T13:34:50+08:00",
+  "observed_output": {
+    "finished_at": "2026-08-28T04:11:21.434009Z",
+    "modified_at": "2026-08-28T12:11:21+08:00",
+    "schema_version": "marketcow.headless-shadow-soak.v1",
+    "sha256": "0d46b288c8ea4b83f23949a6eefb27f1b9b0f3dc2cf16346da513e76ce944962",
+    "stale_from_previous_run": true
+  },
+  "passed": false,
+  "pid": 38254,
+  "process_exit": {
+    "automation_observed_at": "2026-08-28T04:36:37.371Z",
+    "diagnostic": "The OS no longer exposes the monitored process.",
+    "exit_code": null,
+    "exit_status_kind": "unknown",
+    "reason": "process_disappeared"
+  },
+  "recovery_check": {
+    "performed": false,
+    "reason": "run-specific storage root was never created"
+  },
+  "real_order_submission_enabled": false,
+  "requested_duration_seconds": 2700,
+  "schema_version": "marketcow.headless-shadow-soak-launch.v1",
+  "storage_root_exists": false,
+  "tradude_manages_marketcow": false,
+  "verdicts": {
+    "binary_identity_matches": true,
+    "fresh_v2_output_exists": false,
+    "launch_log_has_diagnostics": false,
+    "process_survived_requested_duration": false,
+    "recovery_evidence_available": false,
+    "run_specific_storage_exists": false
+  }
+}
