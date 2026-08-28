@@ -129,7 +129,15 @@ impl PolymarketRuntime {
             self.config.scope_id.clone(),
             self.config.config_revision.clone(),
         );
-        let events = normalize_frame(&normalizer, raw_payload, received_at, next_cursor)?;
+        let mut events = normalize_frame(&normalizer, raw_payload, received_at, next_cursor)?;
+        let projection = self.writer.projection();
+        events.retain(|event| !projection.recent_event_ids.contains(&event.event_id));
+        for (offset, event) in events.iter_mut().enumerate() {
+            event.cursor = next_cursor + u64::try_from(offset).expect("bounded frame offset");
+        }
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
         let outcomes = self.writer.apply_batch(events)?;
         for outcome in &outcomes {
             self.recent_events.push(outcome.persisted.clone());
@@ -324,6 +332,22 @@ mod tests {
         assert_eq!(recovered.projection().cursor, 2);
         assert_eq!(recovered.projection().hash(), expected);
         assert_eq!(recovered.recent_events().len(), 2);
+    }
+
+    #[test]
+    fn repeated_upstream_snapshot_is_an_idempotent_noop() {
+        let dir = tempdir().unwrap();
+        let mut runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
+        let first = runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+        assert_eq!(first.len(), 1);
+        let expected_hash = runtime.projection().hash();
+
+        let duplicate = runtime.apply_raw(snapshot("yes", 0), at(1)).unwrap();
+
+        assert!(duplicate.is_empty());
+        assert_eq!(runtime.projection().cursor, 1);
+        assert_eq!(runtime.projection().hash(), expected_hash);
+        assert_eq!(runtime.recent_events().len(), 1);
     }
 
     #[test]
