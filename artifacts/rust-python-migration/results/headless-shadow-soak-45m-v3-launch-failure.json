@@ -1,0 +1,52 @@
+{
+  "automation_id": "scheduled_task:d688ce6e-7020-4271-a060-f11b2e90e157",
+  "binary_commit_expected": "270cfcb43610d738dd9ec1ceff03df79b9a0266f",
+  "binary_path": "target/debug/marketcow",
+  "binary_sha256_actual": "a211af3d01471f813ac3b2b35ac6a2181fd4c916711850844b48ac19380f849d",
+  "binary_sha256_expected": "a211af3d01471f813ac3b2b35ac6a2181fd4c916711850844b48ac19380f849d",
+  "expected_output_path": "artifacts/rust-python-migration/results/headless-shadow-soak-45m.json",
+  "expected_schema_version": "marketcow.headless-shadow-soak.v2",
+  "expected_storage_root": "/tmp/marketcow-headless-shadow-45m-v3.UXIc9h/storage",
+  "launch_directory": "/tmp/marketcow-headless-shadow-45m-v3.UXIc9h",
+  "launch_directory_exists": true,
+  "launch_log_path": "/tmp/marketcow-headless-shadow-45m-v3.UXIc9h/process.log",
+  "launch_log_size_bytes": 0,
+  "observed_at": "2026-08-28T06:29:15Z",
+  "observed_output": {
+    "elapsed_seconds": 2701.173748792,
+    "finished_at": "2026-08-28T04:11:21.434009Z",
+    "modified_at": "2026-08-28T12:11:21+08:00",
+    "passed": false,
+    "schema_version": "marketcow.headless-shadow-soak.v1",
+    "sha256": "0d46b288c8ea4b83f23949a6eefb27f1b9b0f3dc2cf16346da513e76ce944962",
+    "stale_from_previous_run": true
+  },
+  "passed": false,
+  "pid": 4901,
+  "process_exit": {
+    "exit_code": null,
+    "reason": "process_exit_automation_callback"
+  },
+  "recovery_check": {
+    "performed": false,
+    "reason": "the soak result itself did not pass and no fresh schema-v2 identity was produced"
+  },
+  "real_order_submission_enabled": false,
+  "requested_duration_seconds": 2700,
+  "schema_version": "marketcow.headless-shadow-soak-launch.v1",
+  "storage_observation": {
+    "exists": true,
+    "files": [],
+    "wal_directory_exists": true
+  },
+  "tradude_manages_marketcow": false,
+  "verdicts": {
+    "binary_identity_matches": true,
+    "fresh_v2_output_exists": false,
+    "launch_log_has_diagnostics": false,
+    "process_survived_requested_duration": false,
+    "recovery_evidence_available": false,
+    "run_specific_storage_has_wal_or_checkpoint_files": false,
+    "soak_result_passed": false
+  }
+}
