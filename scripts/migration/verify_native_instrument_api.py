@@ -198,6 +198,9 @@ def main() -> int:
                     health.get("components", {}).get("control_plane_persistence")
                     == "healthy"
                 )
+                checks["audit_persistence_healthy"] = (
+                    health.get("components", {}).get("audit_persistence") == "healthy"
+                )
                 checks["config_revision_is_sha256"] = (
                     isinstance(health.get("config_revision"), str)
                     and health["config_revision"].startswith("sha256:")
@@ -312,19 +315,59 @@ def main() -> int:
                 process_exit_codes.append(stop_process(process))
                 process = None
 
+            audit_summary = subprocess.run(
+                [
+                    "psql", dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c",
+                    "SELECT COUNT(*),"
+                    "COUNT(*) FILTER (WHERE outcome='accepted'),"
+                    "COUNT(*) FILTER (WHERE outcome='succeeded'),"
+                    "COUNT(*) FILTER (WHERE outcome='rejected') "
+                    "FROM admin_audit_event WHERE action='http.admin.request'",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            checks["postgres_audit_has_rejected_accepted_and_succeeded"] = (
+                audit_summary == "3|1|1|1"
+            )
+            postgres_audit_ids = subprocess.run(
+                [
+                    "psql", dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c",
+                    "SELECT audit_id FROM admin_audit_event "
+                    "WHERE action='http.admin.request' ORDER BY audit_id",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            local_audit = [
+                json.loads(line)
+                for line in (storage / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+                if line
+            ]
+            local_admin_audit_ids = sorted(
+                event["audit_id"]
+                for event in local_audit
+                if event.get("schema_version") == "marketcow.admin-audit.v1"
+            )
+            checks["local_and_postgres_admin_audit_ids_match"] = (
+                local_admin_audit_ids == postgres_audit_ids
+                and len(local_admin_audit_ids) == 3
+            )
             migration_count = subprocess.run(
                 [
                     "psql", dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c",
                     "SELECT COUNT(*) FROM marketcow_rust_migration "
                     "WHERE version IN ('rust-provider-job-v1',"
                     "'rust-artifact-manifest-v1','rust-instrument-master-v1',"
-                    "'rust-control-plane-v1')",
+                    "'rust-control-plane-v1','rust-admin-audit-v1')",
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            checks["all_four_rust_migrations_recorded_once"] = migration_count == "4"
+            checks["all_five_rust_migrations_recorded_once"] = migration_count == "5"
             config_count = subprocess.run(
                 [
                     "psql", dsn, "-At", "-v", "ON_ERROR_STOP=1", "-c",

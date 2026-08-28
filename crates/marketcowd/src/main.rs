@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -407,7 +407,7 @@ fn absolute_env(name: &str) -> Result<PathBuf> {
 #[derive(Clone)]
 struct AppState {
     config: Config,
-    audit: Arc<AuditLog>,
+    audit: Arc<AuditCoordinator>,
     metrics: Arc<Metrics>,
     projection: Arc<ArcSwap<marketcow_core::Projection>>,
     recent_events: Arc<ArcSwap<Vec<marketcow_core::PersistedEvent>>>,
@@ -1068,13 +1068,84 @@ impl AuditLog {
             file: Mutex::new(file),
         })
     }
-    fn record(&self, value: serde_json::Value) {
-        if let Ok(mut file) = self.file.lock()
-            && let Ok(line) = serde_json::to_vec(&value)
-        {
-            let _ = file.write_all(&line);
-            let _ = file.write_all(b"\n");
+    fn record(&self, value: &serde_json::Value, durable: bool) -> Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("local audit lock is poisoned"))?;
+        let line = serde_json::to_vec(value)?;
+        file.write_all(&line)?;
+        file.write_all(b"\n")?;
+        if durable {
+            file.sync_data()?;
+        } else {
+            file.flush()?;
         }
+        Ok(())
+    }
+}
+
+struct AuditCoordinator {
+    local: AuditLog,
+    repository: Option<Arc<marketcow_storage::PostgresAuditRepository>>,
+}
+
+impl AuditCoordinator {
+    async fn open(config: &Config) -> Result<Self> {
+        let local = AuditLog::open(&config.storage_root.join("audit.jsonl"))?;
+        let Some(dsn) = env::var("MARKETCOW_POSTGRES_DSN").ok() else {
+            if config.profile == "production" {
+                bail!("MARKETCOW_POSTGRES_DSN is required in production");
+            }
+            return Ok(Self {
+                local,
+                repository: None,
+            });
+        };
+        let binary_commit = env::var("MARKETCOW_BINARY_COMMIT").unwrap_or_default();
+        if binary_commit.is_empty() {
+            bail!("MARKETCOW_BINARY_COMMIT is required when PostgreSQL audit is enabled");
+        }
+        let repository = Arc::new(
+            marketcow_storage::PostgresAuditRepository::connect(&dsn)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?,
+        );
+        repository
+            .migrate_safe_forward(&binary_commit)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Self {
+            local,
+            repository: Some(repository),
+        })
+    }
+
+    #[cfg(test)]
+    fn memory(path: &Path) -> Self {
+        Self {
+            local: AuditLog::open(path).expect("test audit log opens"),
+            repository: None,
+        }
+    }
+
+    fn persistence_enabled(&self) -> bool {
+        self.repository.is_some()
+    }
+
+    fn record_request(&self, value: &serde_json::Value) -> Result<()> {
+        self.local.record(value, false)
+    }
+
+    async fn record_admin(&self, record: &marketcow_storage::AdminAuditRecord) -> Result<()> {
+        self.local.record(&serde_json::to_value(record)?, true)?;
+        if let Some(repository) = &self.repository {
+            repository
+                .append(record)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        Ok(())
     }
 }
 
@@ -1497,7 +1568,7 @@ async fn supervise_worker_pool(
 async fn serve() -> Result<()> {
     let config = Config::load()?;
     preflight(&config)?;
-    let audit = Arc::new(AuditLog::open(&config.storage_root.join("audit.jsonl"))?);
+    let audit = Arc::new(AuditCoordinator::open(&config).await?);
     let control_plane = Arc::new(ControlPlaneCoordinator::open(&config).await?);
     let runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(
         &config,
@@ -1892,7 +1963,8 @@ fn health_payload(state: &AppState) -> serde_json::Value {
             "api":"healthy","wal":"healthy","python_workers":worker_health,
             "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "instrument_persistence":if state.instruments.persistence_enabled() { "healthy" } else { "degraded_development_only" },
-            "control_plane_persistence":if state.control_plane.persistence_enabled() { "healthy" } else { "degraded_development_only" }
+            "control_plane_persistence":if state.control_plane.persistence_enabled() { "healthy" } else { "degraded_development_only" },
+            "audit_persistence":if state.audit.persistence_enabled() { "healthy" } else { "degraded_development_only" }
         },
         "config_revision":state.control_plane.config_revision,
         "python_worker_pool":{
@@ -3195,11 +3267,18 @@ async fn request_boundary(
         .headers()
         .get("x-request-id")
         .and_then(|x| x.to_str().ok())
-        .filter(|x| x.len() <= 128)
+        .filter(|x| {
+            !x.is_empty()
+                && x.len() <= 128
+                && x.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let path = request.uri().path().to_owned();
-    if path.starts_with("/v1/admin/") {
+    let method = request.method().as_str().to_owned();
+    let is_admin = path.starts_with("/v1/admin/");
+    if is_admin {
         let expected = env::var("MARKETCOW_RUST_ADMIN_TOKEN").unwrap_or_default();
         let supplied = request
             .headers()
@@ -3208,6 +3287,23 @@ async fn request_boundary(
             .and_then(|x| x.strip_prefix("Bearer "))
             .unwrap_or("");
         if expected.is_empty() || !constant_time_equal(expected.as_bytes(), supplied.as_bytes()) {
+            let rejected = admin_audit_record(
+                &request_id,
+                "anonymous",
+                &path,
+                "rejected",
+                json!({"method":method,"stage":"authentication"}),
+                "authentication_required",
+            );
+            if let Err(audit_error) = state.audit.record_admin(&rejected).await {
+                warn!(error=%audit_error, request_id, "admin_audit_failed_closed");
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "audit_unavailable",
+                    true,
+                    &request_id,
+                );
+            }
             return error(
                 StatusCode::UNAUTHORIZED,
                 "authentication_required",
@@ -3215,10 +3311,70 @@ async fn request_boundary(
                 &request_id,
             );
         }
+        let accepted = admin_audit_record(
+            &request_id,
+            "admin:bearer",
+            &path,
+            "accepted",
+            json!({"method":method,"stage":"request_boundary"}),
+            "",
+        );
+        if let Err(audit_error) = state.audit.record_admin(&accepted).await {
+            warn!(error=%audit_error, request_id, "admin_audit_failed_closed");
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit_unavailable",
+                true,
+                &request_id,
+            );
+        }
     }
     request.extensions_mut().insert(request_id.clone());
     let started = std::time::Instant::now();
     let mut response = next.run(request).await;
+    let handler_status = response.status();
+    if is_admin {
+        let outcome = if handler_status.is_server_error() {
+            "failed"
+        } else if handler_status.is_client_error() {
+            "rejected"
+        } else {
+            "succeeded"
+        };
+        let completed = admin_audit_record(
+            &request_id,
+            "admin:bearer",
+            &path,
+            outcome,
+            json!({
+                "method":method,
+                "stage":"handler_result",
+                "status":handler_status.as_u16(),
+                "elapsed_us":started.elapsed().as_micros()
+            }),
+            "",
+        );
+        if let Err(audit_error) = state.audit.record_admin(&completed).await {
+            warn!(error=%audit_error, request_id, "admin_audit_outcome_failed_closed");
+            response = error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit_unavailable",
+                true,
+                &request_id,
+            );
+        }
+    } else if let Err(audit_error) = state.audit.record_request(&json!({
+        "at":Utc::now(),"request_id":request_id,"path":path,
+        "status":handler_status.as_u16(),"elapsed_us":started.elapsed().as_micros()
+    })) {
+        warn!(error=%audit_error, request_id, "request_audit_failed_closed");
+        response = error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "audit_unavailable",
+            true,
+            &request_id,
+        );
+    }
     state.metrics.requests.fetch_add(1, Ordering::Relaxed);
     if response.status().is_client_error() || response.status().is_server_error() {
         state.metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -3226,11 +3382,33 @@ async fn request_boundary(
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
     }
-    state
-        .audit
-        .record(json!({"at":Utc::now(),"request_id":request_id,"path":path,
-        "status":response.status().as_u16(),"elapsed_us":started.elapsed().as_micros()}));
     response
+}
+
+fn admin_audit_record(
+    request_id: &str,
+    actor: &str,
+    target: &str,
+    outcome: &str,
+    parameters_json: serde_json::Value,
+    detail: &str,
+) -> marketcow_storage::AdminAuditRecord {
+    let now = Utc::now();
+    let occurred_at = now
+        .with_nanosecond(now.nanosecond() / 1_000 * 1_000)
+        .expect("microsecond precision is a valid timestamp");
+    marketcow_storage::AdminAuditRecord {
+        audit_id: format!("audit-{}", Uuid::new_v4()),
+        schema_version: "marketcow.admin-audit.v1".into(),
+        occurred_at,
+        actor: actor.into(),
+        action: "http.admin.request".into(),
+        target: target.into(),
+        outcome: outcome.into(),
+        request_id: request_id.into(),
+        parameters_json,
+        detail: detail.into(),
+    }
 }
 
 fn constant_time_equal(a: &[u8], b: &[u8]) -> bool {
@@ -3716,7 +3894,7 @@ mod tests {
 
     fn test_state() -> (tempfile::TempDir, AppState) {
         let dir = tempdir().unwrap();
-        let audit = Arc::new(AuditLog::open(&dir.path().join("audit.jsonl")).unwrap());
+        let audit = Arc::new(AuditCoordinator::memory(&dir.path().join("audit.jsonl")));
         let config = Config {
             profile: "test".into(),
             bind: "127.0.0.1:8870".parse().unwrap(),
@@ -4809,17 +4987,29 @@ mod tests {
     }
     #[tokio::test]
     async fn admin_is_fail_closed_without_token() {
-        let (_dir, state) = test_state();
+        let (dir, state) = test_state();
         let response = app(state)
             .oneshot(
                 Request::builder()
                     .uri("/v1/admin/migration")
+                    .header("x-request-id", "audit-rejection-1")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let events = fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        let events = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["schema_version"], "marketcow.admin-audit.v1");
+        assert_eq!(events[0]["request_id"], "audit-rejection-1");
+        assert_eq!(events[0]["action"], "http.admin.request");
+        assert_eq!(events[0]["outcome"], "rejected");
+        assert_eq!(events[0]["parameters_json"]["stage"], "authentication");
     }
 
     #[tokio::test]
