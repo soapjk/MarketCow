@@ -12,7 +12,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{Timelike, Utc};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -20,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     net::SocketAddr,
     os::fd::AsRawFd,
@@ -433,7 +434,8 @@ struct AppState {
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
     jobs: Arc<DurableJobCoordinator>,
     instruments: Arc<InstrumentCoordinator>,
-    quotes: Arc<QuoteCoordinator>,
+    market_data: Arc<MarketDataCoordinator>,
+    canonical_cursor: Arc<CanonicalCursorSigner>,
     control_plane: Arc<ControlPlaneCoordinator>,
     stream: broadcast::Sender<marketcow_core::PersistedEvent>,
     worker_status: Arc<PythonWorkerStatus>,
@@ -549,15 +551,17 @@ struct InstrumentCoordinator {
     memory_enabled: bool,
 }
 
-struct QuoteCoordinator {
+struct MarketDataCoordinator {
     repository: Option<Arc<marketcow_storage::ClickHouseQuoteRepository>>,
     #[cfg(test)]
-    memory: AsyncMutex<BTreeMap<String, serde_json::Value>>,
+    memory_quotes: AsyncMutex<BTreeMap<String, serde_json::Value>>,
+    #[cfg(test)]
+    memory_bars: AsyncMutex<Vec<marketcow_storage::CanonicalBarRecord>>,
     #[cfg(test)]
     memory_enabled: bool,
 }
 
-impl QuoteCoordinator {
+impl MarketDataCoordinator {
     async fn open(profile: &str) -> Result<Self> {
         let Some(database) = env::var("MARKETCOW_CLICKHOUSE_DATABASE").ok() else {
             if profile == "production" {
@@ -566,7 +570,9 @@ impl QuoteCoordinator {
             return Ok(Self {
                 repository: None,
                 #[cfg(test)]
-                memory: AsyncMutex::new(BTreeMap::new()),
+                memory_quotes: AsyncMutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                memory_bars: AsyncMutex::new(Vec::new()),
                 #[cfg(test)]
                 memory_enabled: false,
             });
@@ -592,10 +598,20 @@ impl QuoteCoordinator {
             .health_probe()
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
+        let binary_commit = env::var("MARKETCOW_BINARY_COMMIT").unwrap_or_default();
+        if binary_commit.is_empty() {
+            bail!("MARKETCOW_BINARY_COMMIT is required when ClickHouse market data is enabled");
+        }
+        repository
+            .migrate_safe_forward(&binary_commit)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         Ok(Self {
             repository: Some(repository),
             #[cfg(test)]
-            memory: AsyncMutex::new(BTreeMap::new()),
+            memory_quotes: AsyncMutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            memory_bars: AsyncMutex::new(Vec::new()),
             #[cfg(test)]
             memory_enabled: false,
         })
@@ -605,7 +621,8 @@ impl QuoteCoordinator {
     fn memory() -> Self {
         Self {
             repository: None,
-            memory: AsyncMutex::new(BTreeMap::new()),
+            memory_quotes: AsyncMutex::new(BTreeMap::new()),
+            memory_bars: AsyncMutex::new(Vec::new()),
             memory_enabled: true,
         }
     }
@@ -624,7 +641,7 @@ impl QuoteCoordinator {
         }
         #[cfg(test)]
         if self.memory_enabled {
-            let memory = self.memory.lock().await;
+            let memory = self.memory_quotes.lock().await;
             return Ok(symbols
                 .iter()
                 .filter_map(|symbol| memory.get(symbol).cloned().map(|row| (symbol.clone(), row)))
@@ -633,10 +650,265 @@ impl QuoteCoordinator {
         Err(marketcow_storage::RepositoryError::Unavailable)
     }
 
+    async fn canonical_page(
+        &self,
+        query: &marketcow_storage::CanonicalPageQuery,
+    ) -> std::result::Result<
+        (Vec<marketcow_storage::CanonicalBarRecord>, bool),
+        marketcow_storage::RepositoryError,
+    > {
+        if let Some(repository) = &self.repository {
+            return repository.canonical_page(query).await;
+        }
+        #[cfg(test)]
+        if self.memory_enabled {
+            let mut rows = self
+                .memory_bars
+                .lock()
+                .await
+                .iter()
+                .filter(|record| {
+                    record.symbol == query.symbol
+                        && record.interval == query.interval
+                        && record.adjustment == query.adjustment
+                        && record.bar_time >= query.start
+                        && record.bar_time <= query.end
+                        && query.after.is_none_or(|after| record.bar_time > after)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            rows.sort_by_key(|record| record.bar_time);
+            let has_more = rows.len() > query.page_size as usize;
+            rows.truncate(query.page_size as usize);
+            return Ok((rows, has_more));
+        }
+        Err(marketcow_storage::RepositoryError::Unavailable)
+    }
+
+    async fn canonical_identity(
+        &self,
+        query: &marketcow_storage::CanonicalPageQuery,
+    ) -> std::result::Result<
+        marketcow_storage::CanonicalDatasetIdentity,
+        marketcow_storage::RepositoryError,
+    > {
+        if let Some(repository) = &self.repository {
+            return repository.canonical_identity(query).await;
+        }
+        #[cfg(test)]
+        if self.memory_enabled {
+            let mut rows = self
+                .memory_bars
+                .lock()
+                .await
+                .iter()
+                .filter(|record| {
+                    record.symbol == query.symbol
+                        && record.interval == query.interval
+                        && record.adjustment == query.adjustment
+                        && record.bar_time >= query.start
+                        && record.bar_time <= query.end
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            rows.sort_by_key(|record| record.bar_time);
+            let max_ingested_millis = rows
+                .iter()
+                .map(|record| record.ingested_at.timestamp_millis())
+                .max()
+                .unwrap_or(0);
+            let content_hash = format!(
+                "sha256:{}",
+                hex::encode(Sha256::digest(
+                    serde_json::to_vec(&rows)
+                        .map_err(|_| marketcow_storage::RepositoryError::Unavailable)?
+                ))
+            );
+            let identity_payload = serde_json::to_vec(&json!({
+                "symbol":query.symbol,
+                "interval":query.interval,
+                "adjustment":query.adjustment,
+                "start":query.start,
+                "end":query.end,
+                "row_count":rows.len(),
+                "max_ingested_millis":max_ingested_millis,
+                "content_hash":content_hash
+            }))
+            .map_err(|_| marketcow_storage::RepositoryError::Unavailable)?;
+            let snapshot = hex::encode(Sha256::digest(identity_payload));
+            return Ok(marketcow_storage::CanonicalDatasetIdentity {
+                symbol: query.symbol.clone(),
+                interval: query.interval.clone(),
+                adjustment: query.adjustment.clone(),
+                start: query.start,
+                end: query.end,
+                row_count: rows.len() as u64,
+                max_ingested_millis,
+                content_hash,
+                canonical_version: max_ingested_millis.to_string(),
+                snapshot_id: snapshot[..32].into(),
+            });
+        }
+        Err(marketcow_storage::RepositoryError::Unavailable)
+    }
+
     #[cfg(test)]
     async fn put_memory(&self, symbol: &str, payload: serde_json::Value) {
-        self.memory.lock().await.insert(symbol.into(), payload);
+        self.memory_quotes
+            .lock()
+            .await
+            .insert(symbol.into(), payload);
     }
+
+    #[cfg(test)]
+    async fn put_canonical_memory(&self, record: marketcow_storage::CanonicalBarRecord) {
+        self.memory_bars.lock().await.push(record);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CanonicalCursorBinding {
+    instrument_id: String,
+    start: String,
+    end: String,
+    interval: String,
+    adjustment: String,
+    page_size: u32,
+    snapshot_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CanonicalCursorPayload {
+    v: u8,
+    q: CanonicalCursorBinding,
+    after_ms: i64,
+    iat: i64,
+}
+
+struct CanonicalCursorSigner {
+    secret: Vec<u8>,
+    ttl_seconds: i64,
+}
+
+impl CanonicalCursorSigner {
+    fn open(storage_root: &Path) -> Result<Self> {
+        let ttl_seconds = env::var("MARKETCOW_MARKET_BAR_CURSOR_TTL_SECONDS")
+            .unwrap_or_else(|_| "3600".into())
+            .parse::<i64>()?;
+        if !(60..=86_400).contains(&ttl_seconds) {
+            bail!("MARKETCOW_MARKET_BAR_CURSOR_TTL_SECONDS must be between 60 and 86400");
+        }
+        let secret = match env::var("MARKETCOW_MARKET_BAR_CURSOR_SECRET") {
+            Ok(secret) => validate_cursor_secret(secret.as_bytes())?,
+            Err(env::VarError::NotPresent) => {
+                let path = storage_root.join(".market-bar-cursor.key");
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) => {
+                        if !metadata.file_type().is_file() || metadata.mode() & 0o777 != 0o600 {
+                            bail!("market bar cursor key must be a mode-0600 regular file");
+                        }
+                        validate_cursor_secret(&fs::read(path)?)?
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let generated =
+                            format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&path)?;
+                        file.write_all(generated.as_bytes())?;
+                        file.sync_all()?;
+                        File::open(storage_root)?.sync_all()?;
+                        generated.into_bytes()
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Self {
+            secret,
+            ttl_seconds,
+        })
+    }
+
+    fn encode(&self, binding: CanonicalCursorBinding, after_ms: i64, now: i64) -> Result<String> {
+        let payload = serde_json::to_vec(&CanonicalCursorPayload {
+            v: 1,
+            q: binding,
+            after_ms,
+            iat: now,
+        })?;
+        let signature = hmac_sha256(&self.secret, &payload);
+        Ok(format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(signature)
+        ))
+    }
+
+    fn decode(&self, token: &str, expected: &CanonicalCursorBinding, now: i64) -> Result<i64> {
+        if token.is_empty() || token.len() > 2_048 {
+            bail!("invalid cursor length");
+        }
+        let (payload, signature) = token.split_once('.').context("invalid canonical cursor")?;
+        let payload = URL_SAFE_NO_PAD.decode(payload)?;
+        let signature = URL_SAFE_NO_PAD.decode(signature)?;
+        let expected_signature = hmac_sha256(&self.secret, &payload);
+        if !constant_time_equal(&signature, &expected_signature) {
+            bail!("cursor integrity check failed");
+        }
+        let decoded: CanonicalCursorPayload = serde_json::from_slice(&payload)?;
+        if decoded.v != 1 || &decoded.q != expected {
+            bail!("cursor does not match this query");
+        }
+        if decoded.iat > now + 30 || now.saturating_sub(decoded.iat) > self.ttl_seconds {
+            bail!("cursor has expired or was issued in the future");
+        }
+        Ok(decoded.after_ms)
+    }
+}
+
+fn validate_cursor_secret(secret: &[u8]) -> Result<Vec<u8>> {
+    let secret = secret.trim_ascii();
+    let lowered = String::from_utf8_lossy(secret).to_ascii_lowercase();
+    if secret.len() < 32
+        || matches!(
+            lowered.as_str(),
+            "marketcow-local-cursor-secret"
+                | "replace-with-a-local-development-secret"
+                | "change-me"
+                | "changeme"
+        )
+        || lowered.contains("placeholder")
+    {
+        bail!("market bar cursor secret must contain at least 32 non-placeholder bytes");
+    }
+    Ok(secret.to_vec())
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut block = [0_u8; 64];
+    if key.len() > block.len() {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for index in 0..64 {
+        inner_pad[index] ^= block[index];
+        outer_pad[index] ^= block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    outer.finalize().into()
 }
 
 struct ControlPlaneCoordinator {
@@ -1862,7 +2134,8 @@ async fn serve() -> Result<()> {
         .await?,
     );
     let instruments = Arc::new(InstrumentCoordinator::open(&config.profile).await?);
-    let quotes = Arc::new(QuoteCoordinator::open(&config.profile).await?);
+    let market_data = Arc::new(MarketDataCoordinator::open(&config.profile).await?);
+    let canonical_cursor = Arc::new(CanonicalCursorSigner::open(&config.storage_root)?);
     let legacy_mcp = config
         .legacy_mcp_url
         .clone()
@@ -1878,7 +2151,8 @@ async fn serve() -> Result<()> {
         runtime: Arc::new(AsyncMutex::new(runtime)),
         jobs,
         instruments,
-        quotes,
+        market_data,
+        canonical_cursor,
         control_plane,
         stream,
         worker_status: Arc::new(PythonWorkerStatus::default()),
@@ -2197,6 +2471,7 @@ fn app(state: AppState) -> Router {
         )
         .route("/v1/instruments/{instrument_id}", get(get_instrument))
         .route("/v1/quotes/query", post(quotes_query))
+        .route("/v1/canonical-bars/{instrument_id}", get(canonical_bars))
         .route("/mcp", post(mcp))
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
@@ -2246,14 +2521,14 @@ fn health_payload(state: &AppState) -> serde_json::Value {
         "mcp":{
             "enabled":true,
             "endpoint":"/mcp",
-            "native_tools":3,
+            "native_tools":4,
             "legacy_proxy_configured":state.legacy_mcp.is_some()
         },
         "components":{
             "api":"healthy","wal":"healthy","python_workers":worker_health,
             "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "instrument_persistence":if state.instruments.persistence_enabled() { "healthy" } else { "degraded_development_only" },
-            "quote_persistence":if state.quotes.persistence_enabled() { "healthy" } else { "degraded_development_only" },
+            "market_data_persistence":if state.market_data.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "control_plane_persistence":if state.control_plane.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "audit_persistence":if state.audit.persistence_enabled() { "healthy" } else { "degraded_development_only" }
         },
@@ -2363,7 +2638,7 @@ async fn quotes_query(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let payloads = match state.quotes.latest_payloads(&unique).await {
+    let payloads = match state.market_data.latest_payloads(&unique).await {
         Ok(payloads) => payloads,
         Err(marketcow_storage::RepositoryError::InvalidInput) => {
             return (
@@ -2394,6 +2669,238 @@ async fn quotes_query(
         }
     }
     Json(json!({"count":items.len(),"items":items,"errors":errors})).into_response()
+}
+
+#[derive(Deserialize)]
+struct CanonicalBarsQuery {
+    start: String,
+    end: String,
+    interval: String,
+    adjustment: String,
+    page_size: u32,
+    cursor: Option<String>,
+}
+
+fn canonical_query_error(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"detail":{
+            "code":"invalid_canonical_query",
+            "message":message.into()
+        }})),
+    )
+        .into_response()
+}
+
+fn canonical_time(value: &chrono::DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+async fn canonical_bars(
+    State(state): State<AppState>,
+    AxumPath(instrument_id): AxumPath<String>,
+    Query(query): Query<CanonicalBarsQuery>,
+) -> Response {
+    let instrument = match instrument_lookup(&state, &instrument_id).await {
+        Ok(instrument) => instrument,
+        Err((status, detail)) => {
+            return (status, Json(json!({"detail":detail}))).into_response();
+        }
+    };
+    let start = match DateTime::parse_from_rfc3339(&query.start) {
+        Ok(value) => value.with_timezone(&Utc),
+        Err(_) => {
+            return canonical_query_error("start must be a timezone-aware RFC 3339 timestamp");
+        }
+    };
+    let end = match DateTime::parse_from_rfc3339(&query.end) {
+        Ok(value) => value.with_timezone(&Utc),
+        Err(_) => return canonical_query_error("end must be a timezone-aware RFC 3339 timestamp"),
+    };
+    if start > end || !(1..=1_000).contains(&query.page_size) {
+        return canonical_query_error("start/end must be ordered and page_size must be 1..1000");
+    }
+    let (storage_interval, interval_seconds) = match query.interval.as_str() {
+        "1-MINUTE" => ("1m", 60),
+        "5-MINUTE" => ("5m", 300),
+        "15-MINUTE" => ("15m", 900),
+        "30-MINUTE" => ("30m", 1_800),
+        "1-HOUR" => ("1h", 3_600),
+        "1-DAY" => ("1d", 86_400),
+        _ => return canonical_query_error("interval is not supported by schema v1"),
+    };
+    if !matches!(query.adjustment.as_str(), "raw" | "qfq" | "hfq") {
+        return canonical_query_error("adjustment must be raw, qfq or hfq");
+    }
+    let storage_symbol = if instrument.market == "CRYPTO" {
+        instrument.instrument_id.clone()
+    } else {
+        instrument.symbol.clone()
+    };
+    let mut storage_query = marketcow_storage::CanonicalPageQuery {
+        symbol: storage_symbol,
+        interval: storage_interval.into(),
+        adjustment: query.adjustment.clone(),
+        start,
+        end,
+        page_size: query.page_size,
+        after: None,
+    };
+    let identity = match state.market_data.canonical_identity(&storage_query).await {
+        Ok(identity) => identity,
+        Err(marketcow_storage::RepositoryError::InvalidInput) => {
+            return canonical_query_error("invalid canonical storage query");
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"detail":{"code":"canonical_repository_unavailable"}})),
+            )
+                .into_response();
+        }
+    };
+    let canonical_instrument_id = instrument.instrument_id.clone();
+    let binding = CanonicalCursorBinding {
+        instrument_id: canonical_instrument_id.clone(),
+        start: canonical_time(&start),
+        end: canonical_time(&end),
+        interval: query.interval.clone(),
+        adjustment: query.adjustment.clone(),
+        page_size: query.page_size,
+        snapshot_id: identity.snapshot_id.clone(),
+    };
+    let now = Utc::now().timestamp();
+    if let Some(cursor) = query.cursor.as_deref() {
+        let after_ms = match state.canonical_cursor.decode(cursor, &binding, now) {
+            Ok(after_ms) => after_ms,
+            Err(error) => return canonical_query_error(error.to_string()),
+        };
+        let Some(after) = DateTime::from_timestamp_millis(after_ms) else {
+            return canonical_query_error("canonical cursor position is invalid");
+        };
+        if after < start || after > end {
+            return canonical_query_error("canonical cursor position is outside the query range");
+        }
+        storage_query.after = Some(after);
+    }
+    let (records, has_more) = match state.market_data.canonical_page(&storage_query).await {
+        Ok(result) => result,
+        Err(marketcow_storage::RepositoryError::InvalidInput) => {
+            return canonical_query_error("invalid canonical storage page");
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"detail":{"code":"canonical_repository_unavailable"}})),
+            )
+                .into_response();
+        }
+    };
+    let confirmed = match state.market_data.canonical_identity(&storage_query).await {
+        Ok(identity) => identity,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"detail":{"code":"canonical_repository_unavailable"}})),
+            )
+                .into_response();
+        }
+    };
+    if confirmed != identity {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"detail":{
+                "code":"canonical_snapshot_changed",
+                "message":"canonical data changed during page read; restart query"
+            }})),
+        )
+            .into_response();
+    }
+    let bars = records
+        .iter()
+        .map(|record| {
+            let window_end = record.bar_time + chrono::Duration::seconds(interval_seconds);
+            json!({
+                "schema_version":1,
+                "instrument_id":canonical_instrument_id,
+                "interval":query.interval,
+                "adjustment":query.adjustment,
+                "price_type":"LAST",
+                "aggregation_source":"EXTERNAL",
+                "window_start":canonical_time(&record.bar_time),
+                "window_end":canonical_time(&window_end),
+                "ts_event":canonical_time(&window_end),
+                "ts_init":canonical_time(&record.ingested_at),
+                "open":record.open,
+                "high":record.high,
+                "low":record.low,
+                "close":record.close,
+                "volume":record.volume,
+                "factor_applicability":record.factor_applicability,
+                "corporate_action_factor":record.corporate_action_factor,
+                "applied_adjustment_multiplier":record.applied_adjustment_multiplier,
+                "adjustment_reference_date":record.adjustment_reference_date,
+                "reference_factor":record.reference_factor,
+                "factor_source":record.factor_source,
+                "factor_artifact_id":record.factor_artifact_id,
+                "factor_as_of":record.factor_as_of.map(|value| canonical_time(&value)),
+                "selected_source":record.selected_source,
+                "quality_status":record.quality_status,
+                "row_version":record.version.to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_cursor = if has_more {
+        records.last().and_then(|record| {
+            state
+                .canonical_cursor
+                .encode(binding, record.bar_time.timestamp_millis(), now)
+                .ok()
+        })
+    } else {
+        None
+    };
+    if has_more && next_cursor.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"detail":{"code":"canonical_cursor_unavailable"}})),
+        )
+            .into_response();
+    }
+    let dataset_payload = serde_json::to_vec(&json!({
+        "instrument_id":canonical_instrument_id,
+        "interval":query.interval,
+        "adjustment":query.adjustment,
+        "start":canonical_time(&start),
+        "end":canonical_time(&end)
+    }))
+    .expect("canonical dataset identity serializes");
+    let dataset_hash = hex::encode(Sha256::digest(dataset_payload));
+    Json(json!({
+        "schema_version":1,
+        "manifest":{
+            "schema_version":1,
+            "adjustment_contract_version":1,
+            "dataset_id":&dataset_hash[..24],
+            "snapshot_id":identity.snapshot_id,
+            "canonical_version":identity.canonical_version,
+            "instruments":[canonical_instrument_id],
+            "interval":query.interval,
+            "adjustment":query.adjustment,
+            "start":canonical_time(&start),
+            "end":canonical_time(&end),
+            "end_inclusive":true,
+            "row_count":identity.row_count,
+            "content_hash":identity.content_hash
+        },
+        "count":bars.len(),
+        "bars":bars,
+        "page_size":query.page_size,
+        "next_cursor":next_cursor,
+        "truncated":has_more,
+        "provenance":{"layer":"canonical","backend":"clickhouse"}
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -3153,10 +3660,11 @@ async fn mcp_tools_list(state: &AppState, request_id: serde_json::Value) -> serd
     let native_health = marketcow_contracts::mcp_service_health_tool_definition();
     let native_instrument = marketcow_contracts::mcp_get_instrument_tool_definition();
     let native_quotes = marketcow_contracts::mcp_get_quotes_tool_definition();
+    let native_canonical = marketcow_contracts::mcp_get_canonical_bars_tool_definition();
     let Some(proxy) = &state.legacy_mcp else {
         return mcp_result(
             request_id,
-            json!({"tools":[native_health,native_instrument,native_quotes]}),
+            json!({"tools":[native_health,native_instrument,native_quotes,native_canonical]}),
         );
     };
     let proxy_request = json!({
@@ -3199,6 +3707,7 @@ async fn mcp_tools_list(state: &AppState, request_id: serde_json::Value) -> serd
                 Some("service_health") => native_health.clone(),
                 Some("get_instrument") => native_instrument.clone(),
                 Some("get_quotes") => native_quotes.clone(),
+                Some("get_canonical_bars") => native_canonical.clone(),
                 _ => tool.clone(),
             },
         )
@@ -3341,7 +3850,7 @@ async fn mcp_tool_call(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        return match state.quotes.latest_payloads(&unique).await {
+        return match state.market_data.latest_payloads(&unique).await {
             Ok(payloads) => {
                 let mut items = Vec::new();
                 let mut errors = Vec::new();
@@ -3372,6 +3881,187 @@ async fn mcp_tool_call(
                     true,
                 ),
             ),
+        };
+    }
+    if name == Some("get_canonical_bars") {
+        let arguments = arguments.as_object().expect("arguments were validated");
+        let allowed = BTreeSet::from([
+            "instrument_id",
+            "start",
+            "end",
+            "interval",
+            "adjustment",
+            "page_size",
+            "cursor",
+        ]);
+        let mut unexpected = arguments
+            .keys()
+            .filter(|key| !allowed.contains(key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        unexpected.sort();
+        if !unexpected.is_empty() {
+            return mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({"error":"invalid_tool_input","detail":format!(
+                        "unexpected argument(s): {}", unexpected.join(", ")
+                    )}),
+                    true,
+                ),
+            );
+        }
+        let required_string = |name: &str| {
+            arguments
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        let Some(instrument_id) = required_string("instrument_id") else {
+            return mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({
+                        "error":"invalid_tool_input","detail":"missing or invalid instrument_id"
+                    }),
+                    true,
+                ),
+            );
+        };
+        let Some(start) = required_string("start") else {
+            return mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({
+                        "error":"invalid_tool_input","detail":"missing or invalid start"
+                    }),
+                    true,
+                ),
+            );
+        };
+        let Some(end) = required_string("end") else {
+            return mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({
+                        "error":"invalid_tool_input","detail":"missing or invalid end"
+                    }),
+                    true,
+                ),
+            );
+        };
+        let optional_string = |name: &str, default: &str| {
+            arguments
+                .get(name)
+                .map(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| Some(default.into()))
+        };
+        let Some(interval) = optional_string("interval", "1-DAY") else {
+            return mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({
+                        "error":"invalid_tool_input","detail":"interval must be a string"
+                    }),
+                    true,
+                ),
+            );
+        };
+        let Some(adjustment) = optional_string("adjustment", "qfq") else {
+            return mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({
+                        "error":"invalid_tool_input","detail":"adjustment must be a string"
+                    }),
+                    true,
+                ),
+            );
+        };
+        let page_size = match arguments.get("page_size") {
+            Some(value) => match value.as_u64().and_then(|value| u32::try_from(value).ok()) {
+                Some(value) if (1..=1_000).contains(&value) => value,
+                _ => {
+                    return mcp_result(
+                        request_id,
+                        mcp_tool_result(
+                            json!({
+                                "error":"invalid_tool_input","detail":"page_size must be between 1 and 1000"
+                            }),
+                            true,
+                        ),
+                    );
+                }
+            },
+            None => 500,
+        };
+        let cursor = match arguments.get("cursor") {
+            Some(value) => match value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => Some(value.to_owned()),
+                None => {
+                    return mcp_result(
+                        request_id,
+                        mcp_tool_result(
+                            json!({
+                                "error":"invalid_tool_input","detail":"cursor must be a non-empty string"
+                            }),
+                            true,
+                        ),
+                    );
+                }
+            },
+            None => None,
+        };
+        let response = canonical_bars(
+            State(state.clone()),
+            AxumPath(instrument_id),
+            Query(CanonicalBarsQuery {
+                start,
+                end,
+                interval,
+                adjustment,
+                page_size,
+                cursor,
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = match axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024).await {
+            Ok(body) => body,
+            Err(_) => {
+                return mcp_result(
+                    request_id,
+                    mcp_tool_result(
+                        json!({
+                            "error":"marketcow_api_error",
+                            "detail":{"status_code":500,"detail":{"code":"canonical_response_unavailable"}}
+                        }),
+                        true,
+                    ),
+                );
+            }
+        };
+        let payload = serde_json::from_slice::<serde_json::Value>(&body)
+            .unwrap_or_else(|_| json!({"detail":{"code":"canonical_response_invalid"}}));
+        return if status.is_success() {
+            mcp_result(request_id, mcp_tool_result(payload, false))
+        } else {
+            mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({
+                        "error":"marketcow_api_error",
+                        "detail":{"status_code":status.as_u16(),"detail":payload["detail"]}
+                    }),
+                    true,
+                ),
+            )
         };
     }
     if name != Some("service_health") {
@@ -5161,7 +5851,11 @@ mod tests {
                 runtime: Arc::new(AsyncMutex::new(runtime)),
                 jobs: Arc::new(DurableJobCoordinator::memory()),
                 instruments: Arc::new(InstrumentCoordinator::memory()),
-                quotes: Arc::new(QuoteCoordinator::memory()),
+                market_data: Arc::new(MarketDataCoordinator::memory()),
+                canonical_cursor: Arc::new(CanonicalCursorSigner {
+                    secret: b"test-canonical-cursor-secret-at-least-32-bytes".to_vec(),
+                    ttl_seconds: 3_600,
+                }),
                 control_plane: Arc::new(ControlPlaneCoordinator::memory("test-config-v1")),
                 stream,
                 worker_status: Arc::new(PythonWorkerStatus::default()),
@@ -5197,6 +5891,41 @@ mod tests {
             updated_at: chrono::DateTime::parse_from_rfc3339("2026-08-28T00:00:02Z")
                 .unwrap()
                 .with_timezone(&Utc),
+        }
+    }
+
+    fn canonical_bar_fixture(at: &str, version: u64) -> marketcow_storage::CanonicalBarRecord {
+        let bar_time = DateTime::parse_from_rfc3339(at)
+            .unwrap()
+            .with_timezone(&Utc);
+        marketcow_storage::CanonicalBarRecord {
+            symbol: "AAPL".into(),
+            interval: "1m".into(),
+            adjustment: "raw".into(),
+            bar_time,
+            open: "10.1250".into(),
+            high: "10.5000".into(),
+            low: "10.0000".into(),
+            close: "10.2500".into(),
+            raw_close: None,
+            adjustment_factor: None,
+            factor_applicability: Some("applicable".into()),
+            corporate_action_factor: Some("12.345678901234567890".into()),
+            applied_adjustment_multiplier: Some("1.000000000000000000".into()),
+            adjustment_reference_date: None,
+            reference_factor: None,
+            factor_source: Some("fixture".into()),
+            factor_artifact_id: Some("factor-artifact".into()),
+            factor_as_of: Some(bar_time + chrono::Duration::seconds(1)),
+            volume: "100.12500000".into(),
+            amount: None,
+            selected_source: "fixture".into(),
+            source_count: 1,
+            quality_status: "single_source".into(),
+            version,
+            observed_at: bar_time + chrono::Duration::seconds(1),
+            ingested_at: bar_time + chrono::Duration::seconds(61),
+            raw_artifact_id: Some("raw-artifact".into()),
         }
     }
 
@@ -5426,7 +6155,7 @@ mod tests {
     async fn native_cached_quotes_preserve_order_decimal_strings_and_mcp_contract() {
         let (_dir, state) = test_state();
         state
-            .quotes
+            .market_data
             .put_memory(
                 "AAPL.XNAS",
                 json!({
@@ -5496,6 +6225,118 @@ mod tests {
         let refresh: serde_json::Value =
             serde_json::from_slice(&to_bytes(refresh.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(refresh["detail"]["code"], "cached_quotes_only");
+    }
+
+    #[tokio::test]
+    async fn native_canonical_bars_are_snapshot_bound_signed_and_mcp_equal() {
+        let (_dir, state) = test_state();
+        state.instruments.insert_fixture(instrument_fixture()).await;
+        state
+            .market_data
+            .put_canonical_memory(canonical_bar_fixture("2026-08-28T00:00:00Z", 1))
+            .await;
+        state
+            .market_data
+            .put_canonical_memory(canonical_bar_fixture("2026-08-28T00:01:00Z", 2))
+            .await;
+        let base = "/v1/canonical-bars/AAPL.XNAS?start=2026-08-28T00%3A00%3A00Z&end=2026-08-28T00%3A02%3A00Z&interval=1-MINUTE&adjustment=raw";
+        let first = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}&page_size=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: serde_json::Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(first["schema_version"], 1);
+        assert_eq!(first["manifest"]["adjustment_contract_version"], 1);
+        assert_eq!(first["manifest"]["row_count"], 2);
+        assert_eq!(first["bars"][0]["open"], "10.1250");
+        assert_eq!(
+            first["bars"][0]["corporate_action_factor"],
+            "12.345678901234567890"
+        );
+        assert_eq!(first["truncated"], true);
+        let cursor = first["next_cursor"].as_str().unwrap();
+
+        let second = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}&page_size=1&cursor={cursor}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: serde_json::Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(second["count"], 1);
+        assert_eq!(second["bars"][0]["row_version"], "2");
+        assert_eq!(second["truncated"], false);
+
+        let mut tampered = cursor.as_bytes().to_vec();
+        tampered[0] = if tampered[0] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        let rejected = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}&page_size=1&cursor={tampered}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let http = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}&page_size=2"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let http: serde_json::Value =
+            serde_json::from_slice(&to_bytes(http.into_body(), 65_536).await.unwrap()).unwrap();
+        let mcp = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"get_canonical_bars","arguments":{"instrument_id":"AAPL.XNAS","start":"2026-08-28T00:00:00Z","end":"2026-08-28T00:02:00Z","interval":"1-MINUTE","adjustment":"raw","page_size":2}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mcp: serde_json::Value =
+            serde_json::from_slice(&to_bytes(mcp.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(mcp["result"]["isError"], false);
+        assert_eq!(mcp["result"]["structuredContent"], http);
+
+        let binding = CanonicalCursorBinding {
+            instrument_id: "AAPL.XNAS".into(),
+            start: "2026-08-28T00:00:00.000Z".into(),
+            end: "2026-08-28T00:02:00.000Z".into(),
+            interval: "1-MINUTE".into(),
+            adjustment: "raw".into(),
+            page_size: 1,
+            snapshot_id: first["manifest"]["snapshot_id"].as_str().unwrap().into(),
+        };
+        let signer = CanonicalCursorSigner {
+            secret: b"canonical-cursor-test-secret".to_vec(),
+            ttl_seconds: 3_600,
+        };
+        let expired = signer.encode(binding.clone(), 1, 1).unwrap();
+        assert!(signer.decode(&expired, &binding, 3_602).is_err());
     }
 
     #[tokio::test]
@@ -5756,12 +6597,17 @@ mod tests {
             "../../../tests/fixtures/mcp-get-instrument-tool-v1.json"
         ))
         .unwrap();
+        let canonical_golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/mcp-get-canonical-bars-tool-v1.json"
+        ))
+        .unwrap();
         assert_eq!(
             listed["result"]["tools"],
             json!([
                 health_golden,
                 instrument_golden,
-                marketcow_contracts::mcp_get_quotes_tool_definition()
+                marketcow_contracts::mcp_get_quotes_tool_definition(),
+                canonical_golden
             ])
         );
 
@@ -5939,7 +6785,7 @@ mod tests {
         state.legacy_mcp =
             Some(LegacyMcpProxy::new(format!("http://{legacy_address}/mcp")).unwrap());
         state
-            .quotes
+            .market_data
             .put_memory(
                 "AAPL.XNAS",
                 json!({
@@ -5980,6 +6826,10 @@ mod tests {
         assert_eq!(
             listed["result"]["tools"][3],
             marketcow_contracts::mcp_get_quotes_tool_definition()
+        );
+        assert_eq!(
+            listed["result"]["tools"][5],
+            marketcow_contracts::mcp_get_canonical_bars_tool_definition()
         );
 
         let call = app(state.clone())

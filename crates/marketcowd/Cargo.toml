@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 arc-swap.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 http.workspace = true

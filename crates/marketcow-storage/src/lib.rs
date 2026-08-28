@@ -763,9 +763,12 @@ impl ClickHouseQuoteRepository {
             .query(
                 "SELECT count() AS row_count, \
                  ifNull(max(ingested_at_ms), 0) AS max_ingested_millis, \
-                 lower(hex(SHA256(arrayStringConcat(groupArray(row_text), '\\n')))) \
+                 lower(hex(SHA256(arrayStringConcat( \
+                   arrayMap(x -> tupleElement(x, 2), \
+                     arraySort(groupArray((bar_time_ms, row_text)))), '\\n')))) \
                    AS content_sha256 \
-                 FROM (SELECT toUnixTimestamp64Milli(ingested_at) AS ingested_at_ms, \
+                 FROM (SELECT toUnixTimestamp64Milli(bar_time) AS bar_time_ms, \
+                   toUnixTimestamp64Milli(ingested_at) AS ingested_at_ms, \
                    toJSONString(tuple( \
                      toUnixTimestamp64Milli(bar_time), toString(open), toString(high), \
                      toString(low), toString(close), ifNull(toString(raw_close), ''), \
@@ -783,8 +786,7 @@ impl ClickHouseQuoteRepository {
                    FROM market_bar_canonical FINAL WHERE symbol = ? AND interval = ? \
                    AND adjustment = ? \
                    AND bar_time >= parseDateTime64BestEffort(?, 3, 'UTC') \
-                   AND bar_time <= parseDateTime64BestEffort(?, 3, 'UTC') \
-                   ORDER BY bar_time)",
+                   AND bar_time <= parseDateTime64BestEffort(?, 3, 'UTC'))",
             )
             .bind(&request.symbol)
             .bind(&request.interval)

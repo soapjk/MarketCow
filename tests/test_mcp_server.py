@@ -114,6 +114,14 @@ class McpServerTest(unittest.TestCase):
             quote_golden,
         )
         self.assertIn("get_canonical_bars", names)
+        canonical_golden = json.loads(
+            (Path(__file__).parent / "fixtures/mcp-get-canonical-bars-tool-v1.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            next(tool for tool in tools if tool["name"] == "get_canonical_bars"),
+            canonical_golden,
+        )
         self.assertIn("get_financial_statements", names)
         self.assertIn("get_fund_dividend_history", names)
         self.assertTrue(all(tool["annotations"]["readOnlyHint"] for tool in tools))

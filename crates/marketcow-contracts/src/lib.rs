@@ -105,6 +105,41 @@ pub fn mcp_get_quotes_tool_definition() -> serde_json::Value {
     })
 }
 
+pub fn mcp_get_canonical_bars_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name":"get_canonical_bars",
+        "description":"Read deterministic canonical OHLCV bars for an exact UTC window, with provenance and a continuation cursor.",
+        "inputSchema":{
+            "type":"object",
+            "properties":{
+                "instrument_id":{"type":"string","description":"Canonical ID such as AAPL.XNAS."},
+                "start":{"type":"string","description":"Inclusive timezone-aware ISO-8601 window start."},
+                "end":{"type":"string","description":"Inclusive timezone-aware ISO-8601 window end."},
+                "interval":{
+                    "type":"string","description":"Canonical contract interval.",
+                    "enum":["1-DAY","1-HOUR","1-MINUTE","15-MINUTE","30-MINUTE","5-MINUTE"],
+                    "default":"1-DAY"
+                },
+                "adjustment":{
+                    "type":"string","description":"Price adjustment series.",
+                    "enum":["raw","qfq","hfq"],"default":"qfq"
+                },
+                "page_size":{
+                    "type":"integer","description":"Maximum rows in this page.",
+                    "minimum":1,"maximum":1000,"default":500
+                },
+                "cursor":{"type":"string","description":"Continuation cursor from the previous page."}
+            },
+            "required":["instrument_id","start","end"],
+            "additionalProperties":false
+        },
+        "annotations":{
+            "readOnlyHint":true,"destructiveHint":false,
+            "idempotentHint":true,"openWorldHint":false
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineErrorDetail {
     pub code: String,
@@ -343,5 +378,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(mcp_get_quotes_tool_definition(), golden);
+    }
+
+    #[test]
+    fn rust_mcp_get_canonical_bars_definition_matches_python_golden() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/mcp-get-canonical-bars-tool-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(mcp_get_canonical_bars_tool_definition(), golden);
     }
 }
