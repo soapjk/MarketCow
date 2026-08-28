@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Extension, Query, Request, State},
-    http::{HeaderValue, StatusCode},
+    extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -538,6 +538,11 @@ fn app(state: AppState) -> Router {
             "/v1/admin/polymarket/shadow-ingest",
             axum::routing::post(admin_shadow_ingest),
         )
+        .route("/v1/admin/jobs", axum::routing::post(admin_submit_job))
+        .route(
+            "/v1/admin/jobs/{job_id}",
+            get(admin_get_job).post(admin_cancel_job),
+        )
         .layer(DefaultBodyLimit::max(1_048_576))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -688,6 +693,130 @@ async fn admin_migration() -> Json<serde_json::Value> {
     Json(json!({
         "phase":"shadow", "cutover_allowed":false, "tradude_may_manage_marketcow":false
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitProviderJobRequest {
+    job_type: String,
+    request_schema: String,
+    request: serde_json::Value,
+    deadline: chrono::DateTime<Utc>,
+    #[serde(default = "default_max_job_attempts")]
+    max_attempts: u32,
+}
+
+fn default_max_job_attempts() -> u32 {
+    3
+}
+
+async fn admin_submit_job(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    headers: HeaderMap,
+    Json(request): Json<SubmitProviderJobRequest>,
+) -> Response {
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+    else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "idempotency_key_required",
+            false,
+            &request_id,
+        );
+    };
+    let mut engine = state.jobs.lock().await;
+    match engine.submit(
+        marketcow_jobs::SubmitJob {
+            idempotency_key: idempotency_key.into(),
+            job_type: request.job_type,
+            request_schema: request.request_schema,
+            request: request.request,
+            deadline: request.deadline,
+            max_attempts: request.max_attempts,
+            audit_actor: format!("admin_request:{request_id}"),
+        },
+        Utc::now(),
+    ) {
+        Ok(job) => Json(admin_job_view(job)).into_response(),
+        Err(marketcow_jobs::JobEngineError::IdempotencyConflict) => error(
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+            false,
+            &request_id,
+        ),
+        Err(_) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_job_request",
+            false,
+            &request_id,
+        ),
+    }
+}
+
+async fn admin_get_job(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    match state.jobs.lock().await.get(&job_id) {
+        Some(job) => Json(admin_job_view(job)).into_response(),
+        None => error(StatusCode::NOT_FOUND, "job_not_found", false, &request_id),
+    }
+}
+
+async fn admin_cancel_job(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    let mut engine = state.jobs.lock().await;
+    match engine.cancel(&job_id, &format!("admin_request:{request_id}"), Utc::now()) {
+        Ok(job) => Json(admin_job_view(job)).into_response(),
+        Err(marketcow_jobs::JobEngineError::NotFound) => {
+            error(StatusCode::NOT_FOUND, "job_not_found", false, &request_id)
+        }
+        Err(marketcow_jobs::JobEngineError::InvalidTransition) => error(
+            StatusCode::CONFLICT,
+            "job_terminal_or_transition_conflict",
+            false,
+            &request_id,
+        ),
+        Err(_) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_job_cancel",
+            false,
+            &request_id,
+        ),
+    }
+}
+
+fn admin_job_view(job: &marketcow_jobs::ProviderJob) -> serde_json::Value {
+    json!({
+        "schema_version":job.schema_version,
+        "job_id":job.job_id,
+        "idempotency_key":job.idempotency_key,
+        "job_type":job.job_type,
+        "request_schema":job.request_schema,
+        "request_sha256":job.request_sha256,
+        "status":job.status,
+        "revision":job.revision,
+        "owner_id":job.owner_id,
+        "lease_active":job.lease_token.is_some(),
+        "lease_expires_at":job.lease_expires_at,
+        "deadline":job.deadline,
+        "attempt":job.attempt,
+        "max_attempts":job.max_attempts,
+        "created_at":job.created_at,
+        "started_at":job.started_at,
+        "finished_at":job.finished_at,
+        "error":job.error,
+        "result":job.result,
+        "audit_actor":job.audit_actor,
+        "real_order_submission_enabled":false
+    })
 }
 
 async fn admin_checkpoint(
@@ -1390,6 +1519,56 @@ mod tests {
             marketcow_jobs::JobStatus::Succeeded
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_job_submission_is_idempotent_and_never_exposes_lease_token() {
+        let (_dir, state) = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static("idem-admin-1"));
+        let request = || SubmitProviderJobRequest {
+            job_type: "provider.history".into(),
+            request_schema: "marketcow.provider.history.v1".into(),
+            request: json!({"symbol":"AAPL.XNAS"}),
+            deadline: Utc::now() + chrono::Duration::minutes(5),
+            max_attempts: 2,
+        };
+        let first = admin_submit_job(
+            State(state.clone()),
+            Extension("request-1".into()),
+            headers.clone(),
+            Json(request()),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = to_bytes(first.into_body(), 16_384).await.unwrap();
+        let first_value: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert!(first_value.get("lease_token").is_none());
+        assert_eq!(first_value["lease_active"], false);
+        assert_eq!(first_value["real_order_submission_enabled"], false);
+
+        let second = admin_submit_job(
+            State(state.clone()),
+            Extension("request-2".into()),
+            headers.clone(),
+            Json(request()),
+        )
+        .await;
+        let second_body = to_bytes(second.into_body(), 16_384).await.unwrap();
+        let second_value: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+        assert_eq!(first_value["job_id"], second_value["job_id"]);
+
+        let conflict = admin_submit_job(
+            State(state),
+            Extension("request-3".into()),
+            headers,
+            Json(SubmitProviderJobRequest {
+                request: json!({"symbol":"MSFT.XNAS"}),
+                ..request()
+            }),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
     }
     #[tokio::test]
     async fn admin_is_fail_closed_without_token() {
