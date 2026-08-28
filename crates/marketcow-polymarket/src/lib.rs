@@ -568,6 +568,27 @@ mod tests {
             Some("best_bid_ask_source_mismatch")
         );
         assert!(outcome.projection.unresolved_gaps.contains("yes-1"));
+
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        writer.apply(snapshot(1)).unwrap();
+        let tick_mismatch = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"tick_size_change", "asset_id":"yes-1",
+                "old_tick_size":"0.001", "new_tick_size":"0.01"
+            }),
+            at(),
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        let outcome = writer.apply(tick_mismatch).unwrap();
+        assert!(!outcome.persisted.applied);
+        assert_eq!(
+            outcome.persisted.fail_closed_reason.as_deref(),
+            Some("tick_size_source_mismatch")
+        );
+        assert_eq!(outcome.projection.persisted_cursor, 2);
     }
 
     #[test]
