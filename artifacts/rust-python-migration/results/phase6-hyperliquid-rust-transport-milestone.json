@@ -1,0 +1,67 @@
+{
+  "schema_version": "marketcow.migration-milestone.v1",
+  "phase": 6,
+  "status": "partial",
+  "milestone": "hyperliquid_rust_websocket_transport",
+  "finished_at": "2026-08-28T09:33:51Z",
+  "authoritative_plan": {
+    "path": "/Volumes/T9/projects/marketcow-workitem-collaboration-7424ef29-33e7-418f-8df0-83afc6caf0/artifacts/objective-marketcow-rust-python-migration-technical-plan.md",
+    "sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4"
+  },
+  "source_commit": "40eb5290bdc253f63b3cad2e4239480afffaefbb",
+  "implementation": {
+    "path": "crates/marketcow-realtime/src/lib.rs",
+    "sha256": "99cba3c44067c2800919e17657615f3e503fb9d1ad322cea3406abf25bb50bab",
+    "cargo_lock_sha256": "a56dcf3446190ace5703d90919d66e4b5957fdf7766d4019674cb51f5ec43ce8"
+  },
+  "protocol_sources": [
+    {
+      "title": "Hyperliquid WebSocket subscriptions",
+      "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions.md",
+      "observed_contract": "subscribe l2Book/trades/activeAssetCtx and subscriptionResponse acknowledgement"
+    },
+    {
+      "title": "Hyperliquid WebSocket timeouts and heartbeats",
+      "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/timeouts-and-heartbeats.md",
+      "observed_contract": "application ping request and pong channel response before 60-second server idle timeout"
+    }
+  ],
+  "verification": [
+    {
+      "command": "cargo test --workspace --all-targets",
+      "exit_code": 0,
+      "result": "105 passed; 5 environment-gated real-store tests ignored"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0,
+      "result": "passed with warnings denied"
+    },
+    {
+      "command": "uv run --isolated --frozen --with pytest python -m pytest -q tests/test_hyperliquid_realtime.py tests/test_realtime.py tests/test_market_data_contracts.py tests/test_rust_python_worker.py",
+      "exit_code": 0,
+      "result": "43 passed; 17 subtests passed"
+    }
+  ],
+  "gate_verdicts": {
+    "production_endpoint_is_exact_wss_allowlist": true,
+    "loopback_endpoint_is_test_only": true,
+    "subscription_set_is_deterministic_and_unambiguous": true,
+    "subscription_acknowledgement_is_validated": true,
+    "application_heartbeat_matches_official_contract": true,
+    "exact_websocket_payload_sha256_is_preserved": true,
+    "bbo_l2_trade_and_context_frames_are_typed": true,
+    "malformed_or_binary_frame_disconnects_fail_closed": true,
+    "bounded_reconnect_budget_is_enforced": true,
+    "bounded_consumer_queue_stops_without_silent_loss": true,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow": false,
+    "phase6_complete": false
+  },
+  "remaining": [
+    "connect transport output to a segmented authoritative WAL and checkpoint before publication",
+    "expose shadow-only Hyperliquid subscriptions through the Rust gateway and readiness model",
+    "run controlled upstream network differential and reconnect recovery evidence",
+    "migrate generic RealtimeHub, LongPort and EastMoney/Sina owners"
+  ]
+}
