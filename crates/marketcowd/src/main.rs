@@ -17,21 +17,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::Write,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    process::Command as ProcessCommand,
     signal,
     sync::{Mutex as AsyncMutex, broadcast},
+    task::JoinSet,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -92,6 +96,89 @@ struct Config {
     real_order_submission_enabled: bool,
     shadow_mode: bool,
     maximum_book_age_ms: u64,
+    python_workers: PythonWorkerConfig,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PythonWorkerConfig {
+    executable: Option<PathBuf>,
+    script: Option<PathBuf>,
+    revision: String,
+    pool_size: usize,
+    max_restarts: usize,
+    restart_window_seconds: u64,
+    restart_backoff_millis: u64,
+}
+
+impl PythonWorkerConfig {
+    fn load() -> Result<Self> {
+        let executable = optional_absolute_env("MARKETCOW_PYTHON_WORKER_EXECUTABLE")?;
+        let script = optional_absolute_env("MARKETCOW_PYTHON_WORKER_SCRIPT")?;
+        if executable.is_some() != script.is_some() {
+            bail!(
+                "MARKETCOW_PYTHON_WORKER_EXECUTABLE and MARKETCOW_PYTHON_WORKER_SCRIPT must be configured together"
+            );
+        }
+        let enabled = executable.is_some();
+        let pool_size = env::var("MARKETCOW_PYTHON_WORKER_POOL_SIZE")
+            .unwrap_or_else(|_| if enabled { "2" } else { "0" }.into())
+            .parse::<usize>()?;
+        if enabled && !(1..=16).contains(&pool_size) {
+            bail!("enabled Python worker pool size must be between 1 and 16");
+        }
+        if !enabled && pool_size != 0 {
+            bail!("Python worker pool size must be zero when the worker is disabled");
+        }
+        let revision =
+            env::var("MARKETCOW_PYTHON_WORKER_REVISION").unwrap_or_else(|_| "development".into());
+        if revision.is_empty() || revision.len() > 256 {
+            bail!("Python worker revision must contain 1 to 256 bytes");
+        }
+        let max_restarts = env::var("MARKETCOW_PYTHON_WORKER_MAX_RESTARTS")
+            .unwrap_or_else(|_| "3".into())
+            .parse::<usize>()?;
+        if !(1..=20).contains(&max_restarts) {
+            bail!("Python worker max restarts must be between 1 and 20");
+        }
+        let restart_window_seconds = env::var("MARKETCOW_PYTHON_WORKER_RESTART_WINDOW_SECONDS")
+            .unwrap_or_else(|_| "60".into())
+            .parse::<u64>()?;
+        if !(10..=3600).contains(&restart_window_seconds) {
+            bail!("Python worker restart window must be between 10 and 3600 seconds");
+        }
+        let restart_backoff_millis = env::var("MARKETCOW_PYTHON_WORKER_RESTART_BACKOFF_MILLIS")
+            .unwrap_or_else(|_| "1000".into())
+            .parse::<u64>()?;
+        if !(100..=60_000).contains(&restart_backoff_millis) {
+            bail!("Python worker restart backoff must be between 100 and 60000 milliseconds");
+        }
+        Ok(Self {
+            executable,
+            script,
+            revision,
+            pool_size,
+            max_restarts,
+            restart_window_seconds,
+            restart_backoff_millis,
+        })
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            executable: None,
+            script: None,
+            revision: "test".into(),
+            pool_size: 0,
+            max_restarts: 3,
+            restart_window_seconds: 60,
+            restart_backoff_millis: 1000,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.executable.is_some()
+    }
 }
 
 impl Config {
@@ -110,6 +197,7 @@ impl Config {
         let maximum_book_age_ms = env::var("MARKETCOW_RUST_MAX_BOOK_AGE_MS")
             .unwrap_or_else(|_| "30000".into())
             .parse::<u64>()?;
+        let python_workers = PythonWorkerConfig::load()?;
         if orders {
             bail!("real order submission is prohibited by the migration safety gate");
         }
@@ -140,7 +228,22 @@ impl Config {
             real_order_submission_enabled: false,
             shadow_mode,
             maximum_book_age_ms,
+            python_workers,
         })
+    }
+}
+
+fn optional_absolute_env(name: &str) -> Result<Option<PathBuf>> {
+    match env::var(name) {
+        Ok(value) => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                bail!("{name} must be absolute");
+            }
+            Ok(Some(path))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -163,6 +266,14 @@ struct AppState {
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
     jobs: Arc<DurableJobCoordinator>,
     stream: broadcast::Sender<marketcow_core::PersistedEvent>,
+    worker_status: Arc<PythonWorkerStatus>,
+}
+
+#[derive(Default)]
+struct PythonWorkerStatus {
+    live: AtomicU64,
+    restarts: AtomicU64,
+    budget_exhaustions: AtomicU64,
 }
 
 #[derive(Default)]
@@ -535,7 +646,147 @@ fn preflight(config: &Config) -> Result<()> {
     let probe = config.storage_root.join(".preflight-write");
     fs::write(&probe, b"shadow")?;
     fs::remove_file(probe)?;
+    if let (Some(executable), Some(script)) = (
+        &config.python_workers.executable,
+        &config.python_workers.script,
+    ) {
+        let executable_metadata = fs::metadata(executable).with_context(|| {
+            format!("worker executable is unavailable: {}", executable.display())
+        })?;
+        if !executable_metadata.is_file() || executable_metadata.permissions().mode() & 0o111 == 0 {
+            bail!("worker executable must be an executable regular file");
+        }
+        if !fs::metadata(script)
+            .with_context(|| format!("worker script is unavailable: {}", script.display()))?
+            .is_file()
+        {
+            bail!("worker script must be a regular file");
+        }
+    }
     Ok(())
+}
+
+fn sanitize_worker_command(
+    command: &mut ProcessCommand,
+    config: &PythonWorkerConfig,
+    socket: &Path,
+) {
+    command
+        .env_clear()
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("LC_ALL", "C.UTF-8")
+        .arg(config.script.as_ref().expect("enabled worker has script"))
+        .arg("--socket")
+        .arg(socket)
+        .arg("--revision")
+        .arg(&config.revision)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+}
+
+fn worker_command(config: &PythonWorkerConfig, socket: &Path) -> ProcessCommand {
+    let mut command = ProcessCommand::new(
+        config
+            .executable
+            .as_ref()
+            .expect("enabled worker has executable"),
+    );
+    sanitize_worker_command(&mut command, config, socket);
+    command
+}
+
+fn consume_restart_budget(
+    restart_times: &mut VecDeque<Instant>,
+    now: Instant,
+    window: Duration,
+    max_restarts: usize,
+) -> Option<Duration> {
+    while restart_times
+        .front()
+        .is_some_and(|at| now.duration_since(*at) >= window)
+    {
+        restart_times.pop_front();
+    }
+    if restart_times.len() >= max_restarts {
+        return Some(window.saturating_sub(
+            now.duration_since(*restart_times.front().expect("restart budget is nonempty")),
+        ));
+    }
+    restart_times.push_back(now);
+    None
+}
+
+async fn supervise_worker_slot(
+    slot: usize,
+    config: PythonWorkerConfig,
+    socket: PathBuf,
+    status: Arc<PythonWorkerStatus>,
+) {
+    let window = Duration::from_secs(config.restart_window_seconds);
+    let backoff = Duration::from_millis(config.restart_backoff_millis);
+    let mut restart_times = VecDeque::new();
+    let mut first_spawn = true;
+    loop {
+        if !first_spawn {
+            let now = Instant::now();
+            if let Some(wait) =
+                consume_restart_budget(&mut restart_times, now, window, config.max_restarts)
+            {
+                status.budget_exhaustions.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    slot,
+                    wait_ms = wait.as_millis(),
+                    "python_worker_restart_budget_exhausted"
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            status.restarts.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(backoff).await;
+        }
+        first_spawn = false;
+        let mut command = worker_command(&config, &socket);
+        match command.spawn() {
+            Ok(mut child) => {
+                status.live.fetch_add(1, Ordering::Relaxed);
+                info!(slot, pid=?child.id(), "python_worker_started");
+                let result = child.wait().await;
+                status.live.fetch_sub(1, Ordering::Relaxed);
+                warn!(slot, result=?result, "python_worker_exited");
+            }
+            Err(error) => warn!(slot, error=%error, "python_worker_spawn_failed"),
+        }
+    }
+}
+
+async fn supervise_worker_pool(
+    config: PythonWorkerConfig,
+    socket: PathBuf,
+    status: Arc<PythonWorkerStatus>,
+) {
+    for _ in 0..200 {
+        if fs::metadata(&socket).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if fs::metadata(&socket).is_err() {
+        warn!(path=%socket.display(), "python_worker_socket_startup_timeout");
+        return;
+    }
+    let mut slots = JoinSet::new();
+    for slot in 0..config.pool_size {
+        slots.spawn(supervise_worker_slot(
+            slot,
+            config.clone(),
+            socket.clone(),
+            status.clone(),
+        ));
+    }
+    while slots.join_next().await.is_some() {}
 }
 
 async fn serve() -> Result<()> {
@@ -556,6 +807,7 @@ async fn serve() -> Result<()> {
         runtime: Arc::new(AsyncMutex::new(runtime)),
         jobs,
         stream,
+        worker_status: Arc::new(PythonWorkerStatus::default()),
     };
     let worker_path = config.worker_socket.clone();
     let worker_jobs = state.jobs.clone();
@@ -570,15 +822,28 @@ async fn serve() -> Result<()> {
         )
         .await
     });
+    let worker_pool = config.python_workers.enabled().then(|| {
+        tokio::spawn(supervise_worker_pool(
+            config.python_workers.clone(),
+            config.worker_socket.clone(),
+            state.worker_status.clone(),
+        ))
+    });
     let app = app(state);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     info!(bind=%config.bind, shadow=true, "marketcowd_ready");
-    axum::serve(listener, app)
+    let server_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
-        .await?;
+        .await;
+    if let Some(worker_pool) = worker_pool {
+        worker_pool.abort();
+        let _ = worker_pool.await;
+    }
     worker.abort();
+    let _ = worker.await;
     let _ = fs::remove_file(&config.worker_socket);
     info!("marketcowd_stopped");
+    server_result?;
     Ok(())
 }
 
@@ -870,12 +1135,27 @@ fn app(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let configured_workers = state.config.python_workers.pool_size as u64;
+    let live_workers = state.worker_status.live.load(Ordering::Relaxed);
+    let worker_health = if configured_workers == 0 {
+        "disabled_optional"
+    } else if live_workers == configured_workers {
+        "healthy"
+    } else {
+        "degraded"
+    };
     Json(json!({
         "status":"healthy", "service":"marketcowd", "profile":state.config.profile,
         "shadow_mode":true, "real_order_submission_enabled":false,
         "components":{
-            "api":"healthy","wal":"healthy","python_workers":"degraded_optional",
+            "api":"healthy","wal":"healthy","python_workers":worker_health,
             "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" }
+        },
+        "python_worker_pool":{
+            "configured":configured_workers,
+            "live":live_workers,
+            "restarts":state.worker_status.restarts.load(Ordering::Relaxed),
+            "restart_budget_exhaustions":state.worker_status.budget_exhaustions.load(Ordering::Relaxed)
         }
     }))
 }
@@ -1577,7 +1857,9 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
              marketcow_stream_clients {}\nmarketcow_stream_disconnects_total {}\n\
              marketcow_stream_channel_depth {}\n\
              marketcow_stream_channel_capacity {}\nmarketcow_stream_slow_consumer_disconnects_total {}\n\
-             marketcow_persistence_latency_us {}\nmarketcow_publication_latency_us {}\n",
+             marketcow_persistence_latency_us {}\nmarketcow_publication_latency_us {}\n\
+             marketcow_python_workers_configured {}\nmarketcow_python_workers_live {}\n\
+             marketcow_python_worker_restarts_total {}\nmarketcow_python_worker_restart_budget_exhaustions_total {}\n",
             state.metrics.requests.load(Ordering::Relaxed),
             state.metrics.errors.load(Ordering::Relaxed),
             projection.cursor,
@@ -1596,6 +1878,13 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 .load(Ordering::Relaxed),
             state.metrics.persistence_latency_us.load(Ordering::Relaxed),
             state.metrics.publication_latency_us.load(Ordering::Relaxed),
+            state.config.python_workers.pool_size,
+            state.worker_status.live.load(Ordering::Relaxed),
+            state.worker_status.restarts.load(Ordering::Relaxed),
+            state
+                .worker_status
+                .budget_exhaustions
+                .load(Ordering::Relaxed),
         ),
     )
 }
@@ -1957,6 +2246,7 @@ mod tests {
             real_order_submission_enabled: false,
             shadow_mode: true,
             maximum_book_age_ms: 30_000,
+            python_workers: PythonWorkerConfig::disabled(),
         };
         let runtime =
             marketcow_runtime::PolymarketRuntime::open(marketcow_runtime::RuntimeConfig {
@@ -1979,6 +2269,7 @@ mod tests {
                 runtime: Arc::new(AsyncMutex::new(runtime)),
                 jobs: Arc::new(DurableJobCoordinator::memory()),
                 stream,
+                worker_status: Arc::new(PythonWorkerStatus::default()),
             },
         )
     }
@@ -2583,6 +2874,56 @@ mod tests {
         assert!(!constant_time_equal(b"abc", b"ab"));
     }
 
+    #[tokio::test]
+    async fn supervised_worker_command_clears_database_and_admin_credentials() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("credential-check.sh");
+        fs::write(
+            &script,
+            b"#!/bin/sh\nif [ \"${MARKETCOW_POSTGRES_DSN+x}\" = x ] || [ \"${MARKETCOW_CLICKHOUSE_DSN+x}\" = x ] || [ \"${MARKETCOW_RUST_ADMIN_TOKEN+x}\" = x ]; then exit 42; fi\nexit 0\n",
+        )
+        .unwrap();
+        let config = PythonWorkerConfig {
+            executable: Some(PathBuf::from("/bin/sh")),
+            script: Some(script),
+            revision: "credential-test".into(),
+            pool_size: 1,
+            max_restarts: 3,
+            restart_window_seconds: 60,
+            restart_backoff_millis: 100,
+        };
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .env("MARKETCOW_POSTGRES_DSN", "must-not-leak")
+            .env("MARKETCOW_CLICKHOUSE_DSN", "must-not-leak")
+            .env("MARKETCOW_RUST_ADMIN_TOKEN", "must-not-leak");
+        sanitize_worker_command(&mut command, &config, &dir.path().join("worker.sock"));
+        assert!(command.status().await.unwrap().success());
+    }
+
+    #[test]
+    fn worker_restart_budget_is_bounded_and_recovers_after_window() {
+        let start = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut restarts = VecDeque::new();
+        assert_eq!(
+            consume_restart_budget(&mut restarts, start, window, 2),
+            None
+        );
+        assert_eq!(
+            consume_restart_budget(&mut restarts, start + Duration::from_secs(1), window, 2),
+            None
+        );
+        assert_eq!(
+            consume_restart_budget(&mut restarts, start + Duration::from_secs(2), window, 2),
+            Some(Duration::from_secs(58))
+        );
+        assert_eq!(
+            consume_restart_budget(&mut restarts, start + window, window, 2),
+            None
+        );
+    }
+
     #[test]
     fn offline_replay_seeds_durable_ready_state_without_orders() {
         let dir = tempdir().unwrap();
@@ -2596,6 +2937,7 @@ mod tests {
             real_order_submission_enabled: false,
             shadow_mode: true,
             maximum_book_age_ms: 30_000,
+            python_workers: PythonWorkerConfig::disabled(),
         };
         preflight(&config).unwrap();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
