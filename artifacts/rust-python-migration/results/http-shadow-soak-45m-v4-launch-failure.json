@@ -1,0 +1,43 @@
+{
+  "schema_version": "marketcow.shadow-soak-launch.v1",
+  "observed_at": "2026-08-28T09:20:49Z",
+  "passed": false,
+  "requested_duration_seconds": 2700,
+  "pid": 81050,
+  "binary_path": "target/release/marketcow",
+  "binary_commit_expected": "07a8ab5b0e282cb0dd6fad71445865eac517e274",
+  "binary_sha256_expected": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "binary_sha256_actual": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "expected_schema_version": "marketcow.shadow-soak.v4",
+  "expected_output_path": "artifacts/rust-python-migration/results/http-shadow-soak-45m.json",
+  "expected_storage_root": "/tmp/marketcow-http-shadow-45m-v4.G0Hg7i/storage",
+  "launch_directory": "/tmp/marketcow-http-shadow-45m-v4.G0Hg7i",
+  "launch_log_path": "/tmp/marketcow-http-shadow-45m-v4.G0Hg7i/process.log",
+  "launch_log_size_bytes": 0,
+  "launch_log_modified_at": "2026-08-28T17:08:49+0800",
+  "automation_id": "scheduled_task:75a67c8e-4e6d-4114-a6a0-367710ddeaab",
+  "automation_run_id": "scheduled_run:2d6919223a6a6b71afb7d6ec6eb744bb",
+  "process_exit": {
+    "observed_at": "2026-08-28T09:09:02.654Z",
+    "reason": "process_disappeared",
+    "exit_status_kind": "unknown",
+    "exit_code": null,
+    "diagnostic": "The OS no longer exposes the monitored process."
+  },
+  "recovery_check": {
+    "performed": false,
+    "reason": "the soak result itself was not produced and therefore did not pass"
+  },
+  "verdicts": {
+    "binary_identity_matches": true,
+    "fresh_v4_output_exists": false,
+    "launch_log_has_diagnostics": false,
+    "run_specific_storage_exists": false,
+    "process_survived_requested_duration": false,
+    "soak_result_passed": false,
+    "recovery_evidence_available": false,
+    "http_network_soak_gate_passed": false
+  },
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}
