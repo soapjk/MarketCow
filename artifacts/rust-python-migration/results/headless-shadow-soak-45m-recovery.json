@@ -1,0 +1,34 @@
+{
+  "binary_sha256": "6c6c242097a028eee6ad3f8e1e60287e9b27783484b7096c9c5c38dac8b6637f",
+  "full_sync": {
+    "book_count": 2,
+    "boundary_cursor": 4994,
+    "persisted_cursor": 4994,
+    "published_cursor": 4994,
+    "unresolved_gap_count": 0
+  },
+  "manifest_cursor": 4994,
+  "passed": true,
+  "process_exit_code": 0,
+  "process_stderr_tail": "",
+  "readiness": {
+    "fail_closed_reason": null,
+    "mode": "shadow",
+    "ownership_registry": "docs/architecture/migration/domain-ownership.yaml",
+    "ready": true,
+    "real_order_submission_enabled": false,
+    "scope_id": "headless-current-shadow",
+    "writer_enabled": false
+  },
+  "real_order_submission_enabled": false,
+  "recovery_used_isolated_copy": true,
+  "schema_version": "marketcow.soak-recovery-check.v1",
+  "scope_id": "headless-current-shadow",
+  "source_storage_root": "/private/tmp/marketcow-headless-current-45m.hyMyVf",
+  "tradude_manages_marketcow": false,
+  "wal": {
+    "last_cursor": 4994,
+    "records": 4994,
+    "status": "ok"
+  }
+}
