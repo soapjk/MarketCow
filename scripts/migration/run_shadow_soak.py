@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import hashlib
 import json
@@ -13,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 ADMIN_TOKEN = "marketcow-local-shadow-soak"
+TOKENS = [f"market-{market:03d}-{side}" for market in range(100) for side in ("yes", "no")]
 
 
 def percentile(values: list[float], percentile_value: float) -> float:
@@ -38,6 +40,12 @@ def request_json(url: str, *, payload: dict | None = None, admin: bool = False) 
     request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
     with urllib.request.urlopen(request, timeout=2) as response:
         return response.status, json.load(response)
+
+
+def timed_json(url: str) -> tuple[float, int, dict]:
+    before = time.perf_counter()
+    status, body = request_json(url)
+    return (time.perf_counter() - before) * 1000, status, body
 
 
 def prometheus(url: str) -> dict[str, float]:
@@ -99,7 +107,9 @@ def main() -> None:
     storage_root.mkdir(parents=True, exist_ok=True)
     if any(storage_root.iterdir()):
         parser.error("storage root must be empty")
-    latencies: list[float] = []
+    reader_latencies: list[float] = []
+    persistence_latencies_us: list[float] = []
+    publication_latencies_us: list[float] = []
     failures: list[dict[str, object]] = []
     max_rss_kb = 0
     maximums = {
@@ -110,6 +120,11 @@ def main() -> None:
     final_metrics: dict[str, float] = {}
     checkpoint_count = 0
     ingest_count = 0
+    canonical_event_count = 0
+    reader_request_count = 0
+    consumer_request_count = 0
+    consumer_cursors = [0, 0]
+    final_book_count = 0
     process_log_tail = ""
     # The storage root is intentionally retained for artifact-specific restart recovery.
     with nullcontext(str(storage_root)) as temporary:
@@ -143,78 +158,148 @@ def main() -> None:
                         raise RuntimeError("shadow process did not become healthy within 10 seconds")
                     time.sleep(0.05)
 
-                now = datetime.now(UTC)
-                ingest(base, raw_book("binary-yes", "0.40", "0.42", now), now)
-                ingest(base, raw_book("binary-no", "0.58", "0.60", now), now)
-                ingest_count += 2
+                for token in TOKENS:
+                    now = datetime.now(UTC)
+                    body = ingest(base, raw_book(token, "0.40", "0.42", now), now)
+                    persistence_latencies_us.append(body["persistence_latency_us"])
+                    publication_latencies_us.append(body["publication_latency_us"])
+                    ingest_count += 1
+                    canonical_event_count += body["events"]
+
+                observed = datetime.now(UTC)
+                seed = ingest(base, {
+                    "event_type": "price_change", "timestamp": observed.isoformat(),
+                    "price_changes": [
+                        {
+                            "asset_id": token,
+                            "side": "BUY" if token.endswith("yes") else "SELL",
+                            "price": "0.40" if token.endswith("yes") else "0.42",
+                            "size": "10",
+                        }
+                        for token in TOKENS
+                    ],
+                }, observed)
+                persistence_latencies_us.append(seed["persistence_latency_us"])
+                publication_latencies_us.append(seed["publication_latency_us"])
+                ingest_count += 1
+                canonical_event_count += seed["events"]
                 deadline = time.monotonic() + args.duration_seconds
                 next_ingest = time.monotonic()
                 next_checkpoint = time.monotonic() + 60
                 sequence = 0
-                while time.monotonic() < deadline:
-                    loop_now = time.monotonic()
-                    if loop_now >= next_ingest:
-                        observed = datetime.now(UTC)
-                        size = str(10 + sequence % 20)
-                        ingest(base, {
-                            "event_type": "price_change", "timestamp": observed.isoformat(),
-                            "price_changes": [
-                                {"asset_id": "binary-yes", "side": "BUY", "price": "0.40", "size": size},
-                                {"asset_id": "binary-no", "side": "SELL", "price": "0.60", "size": size},
-                            ],
-                        }, observed)
-                        ingest_count += 1
-                        sequence += 1
-                        next_ingest = loop_now + 1
-                    if loop_now >= next_checkpoint:
-                        status, body = request_json(
-                            f"{base}/v1/admin/polymarket/checkpoint", payload={}, admin=True,
-                        )
-                        if status != 200 or body.get("real_order_submission_enabled") is not False:
-                            raise RuntimeError(f"checkpoint contract failed: {status} {body}")
-                        checkpoint_count += 1
-                        next_checkpoint = loop_now + 60
+                with ThreadPoolExecutor(max_workers=6) as readers:
+                    while time.monotonic() < deadline:
+                        loop_now = time.monotonic()
+                        if loop_now >= next_ingest:
+                            observed = datetime.now(UTC)
+                            size = str(10 + sequence % 20)
+                            body = ingest(base, {
+                                "event_type": "price_change", "timestamp": observed.isoformat(),
+                                "price_changes": [
+                                    {
+                                        "asset_id": token,
+                                        "side": "BUY" if token.endswith("yes") else "SELL",
+                                        "price": "0.40" if token.endswith("yes") else "0.42",
+                                        "size": size,
+                                    }
+                                    for token in TOKENS
+                                ],
+                            }, observed)
+                            persistence_latencies_us.append(body["persistence_latency_us"])
+                            publication_latencies_us.append(body["publication_latency_us"])
+                            ingest_count += 1
+                            canonical_event_count += body["events"]
+                            sequence += 1
+                            next_ingest = loop_now + 1
+                        if loop_now >= next_checkpoint:
+                            status, body = request_json(
+                                f"{base}/v1/admin/polymarket/checkpoint", payload={}, admin=True,
+                            )
+                            if status != 200 or body.get("real_order_submission_enabled") is not False:
+                                raise RuntimeError(f"checkpoint contract failed: {status} {body}")
+                            checkpoint_count += 1
+                            next_checkpoint = loop_now + 60
 
-                    before = time.perf_counter()
-                    status, readiness = request_json(f"{base}/v1/readiness")
-                    latencies.append((time.perf_counter() - before) * 1000)
-                    if status != 200 or readiness.get("ready") is not True:
-                        failures.append({"kind": "readiness", "status": status, "body": readiness})
-                    observed_metrics = prometheus(f"{base}/metrics")
-                    maximums["book_age_ms"] = max(
-                        maximums["book_age_ms"], observed_metrics["marketcow_maximum_book_age_ms"]
-                    )
-                    maximums["gap_count"] = max(
-                        maximums["gap_count"], observed_metrics["marketcow_unresolved_gaps"]
-                    )
-                    maximums["disconnects"] = max(
-                        maximums["disconnects"], observed_metrics["marketcow_disconnects_total"]
-                    )
-                    maximums["queue_depth"] = max(
-                        maximums["queue_depth"], observed_metrics["marketcow_ingress_queue_depth"]
-                    )
-                    maximums["persistence_latency_us"] = max(
-                        maximums["persistence_latency_us"], observed_metrics["marketcow_persistence_latency_us"]
-                    )
-                    maximums["publication_latency_us"] = max(
-                        maximums["publication_latency_us"], observed_metrics["marketcow_publication_latency_us"]
-                    )
-                    cursor_lag = (
-                        observed_metrics["marketcow_projection_persisted_cursor"]
-                        - observed_metrics["marketcow_projection_published_cursor"]
-                    )
-                    maximums["cursor_lag"] = max(maximums["cursor_lag"], abs(cursor_lag))
-                    final_metrics = observed_metrics
-                    rss = subprocess.run(
-                        ["ps", "-o", "rss=", "-p", str(process.pid)],
-                        text=True, capture_output=True, check=False,
-                    ).stdout.strip()
-                    if rss.isdigit():
-                        max_rss_kb = max(max_rss_kb, int(rss))
-                    if process.poll() is not None:
-                        failures.append({"kind": "process_exit", "code": process.returncode})
-                        break
-                    time.sleep(args.interval_seconds)
+                        reader_futures = [
+                            readers.submit(timed_json, f"{base}/v1/readiness")
+                            for _ in range(4)
+                        ]
+                        consumer_futures = [
+                            readers.submit(
+                                timed_json,
+                                f"{base}/v1/prediction-markets/polymarket/live/events"
+                                f"?after_cursor={cursor}&limit=1000",
+                            )
+                            for cursor in consumer_cursors
+                        ]
+                        for future in reader_futures:
+                            latency, status, readiness = future.result()
+                            reader_latencies.append(latency)
+                            reader_request_count += 1
+                            if status != 200 or readiness.get("ready") is not True:
+                                failures.append({
+                                    "kind": "scoped_reader", "status": status, "body": readiness,
+                                })
+                        for index, future in enumerate(consumer_futures):
+                            _latency, status, page = future.result()
+                            consumer_request_count += 1
+                            next_cursor = page.get("next_cursor")
+                            if (
+                                status != 200
+                                or not isinstance(next_cursor, int)
+                                or next_cursor < consumer_cursors[index]
+                            ):
+                                failures.append({
+                                    "kind": "consumer", "index": index,
+                                    "status": status, "body": page,
+                                })
+                            else:
+                                consumer_cursors[index] = next_cursor
+                        observed_metrics = prometheus(f"{base}/metrics")
+                        maximums["book_age_ms"] = max(
+                            maximums["book_age_ms"],
+                            observed_metrics["marketcow_maximum_book_age_ms"],
+                        )
+                        maximums["gap_count"] = max(
+                            maximums["gap_count"], observed_metrics["marketcow_unresolved_gaps"]
+                        )
+                        maximums["disconnects"] = max(
+                            maximums["disconnects"], observed_metrics["marketcow_disconnects_total"]
+                        )
+                        maximums["queue_depth"] = max(
+                            maximums["queue_depth"], observed_metrics["marketcow_ingress_queue_depth"]
+                        )
+                        maximums["persistence_latency_us"] = max(
+                            maximums["persistence_latency_us"],
+                            observed_metrics["marketcow_persistence_latency_us"],
+                        )
+                        maximums["publication_latency_us"] = max(
+                            maximums["publication_latency_us"],
+                            observed_metrics["marketcow_publication_latency_us"],
+                        )
+                        cursor_lag = (
+                            observed_metrics["marketcow_projection_persisted_cursor"]
+                            - observed_metrics["marketcow_projection_published_cursor"]
+                        )
+                        maximums["cursor_lag"] = max(maximums["cursor_lag"], abs(cursor_lag))
+                        final_metrics = observed_metrics
+                        rss = subprocess.run(
+                            ["ps", "-o", "rss=", "-p", str(process.pid)],
+                            text=True, capture_output=True, check=False,
+                        ).stdout.strip()
+                        if rss.isdigit():
+                            max_rss_kb = max(max_rss_kb, int(rss))
+                        if process.poll() is not None:
+                            failures.append({"kind": "process_exit", "code": process.returncode})
+                            break
+                        time.sleep(args.interval_seconds)
+                status, final_sync = request_json(
+                    f"{base}/v1/prediction-markets/polymarket/live/full-sync"
+                )
+                if status != 200:
+                    failures.append({"kind": "final_full_sync", "status": status, "body": final_sync})
+                else:
+                    final_book_count = len(final_sync.get("snapshot", {}).get("books", []))
             except Exception as error:  # noqa: BLE001 - Artifact records exact terminal failure
                 failures.append({"kind": "runner", "error": type(error).__name__, "message": str(error)})
             finally:
@@ -229,22 +314,32 @@ def main() -> None:
     gate_verdicts = {
         "duration_reached": elapsed_seconds >= args.duration_seconds,
         "runner_failures_zero": not failures,
-        "readiness_p99_ms_lte_50": percentile(latencies, .99) <= 50,
+        "exact_100_market_200_book_load": final_book_count == 200,
+        "four_concurrent_scoped_readers": reader_request_count >= 4,
+        "two_independent_consumers": (
+            consumer_request_count >= 2
+            and len(consumer_cursors) == 2
+            and all(cursor == final_metrics.get("marketcow_projection_persisted_cursor")
+                    for cursor in consumer_cursors)
+        ),
+        "readiness_p99_ms_lte_50": percentile(reader_latencies, .99) <= 50,
         "book_age_ms_lte_5000": maximums["book_age_ms"] <= 5_000,
         "gap_count_zero": maximums["gap_count"] == 0,
+        "disconnect_delta_zero": maximums["disconnects"] == 0,
         "queue_depth_zero": maximums["queue_depth"] == 0,
         "cursor_lag_zero": maximums["cursor_lag"] == 0,
-        "maximum_persistence_latency_us_lte_50000": (
-            maximums["persistence_latency_us"] <= 50_000
+        "wal_persistence_latency_p99_us_lte_20000": (
+            percentile(persistence_latencies_us, .99) <= 20_000
         ),
-        "maximum_publication_latency_us_lte_5000": (
-            maximums["publication_latency_us"] <= 5_000
+        "projection_publication_latency_p99_us_lte_5000": (
+            percentile(publication_latencies_us, .99) <= 5_000
         ),
         "real_orders_disabled": True,
+        "tradude_does_not_manage_marketcow": True,
     }
     passed = all(gate_verdicts.values())
     result = {
-        "schema_version": "marketcow.shadow-soak.v3",
+        "schema_version": "marketcow.shadow-soak.v4",
         "binary_commit": args.binary_commit,
         "binary_sha256": binary_sha256,
         "storage_root": str(storage_root),
@@ -252,12 +347,37 @@ def main() -> None:
         "finished_at": datetime.now(UTC).isoformat(),
         "requested_duration_seconds": args.duration_seconds,
         "elapsed_seconds": elapsed_seconds,
-        "samples": len(latencies),
+        "load_model": {
+            "markets": 100,
+            "books": 200,
+            "concurrent_scoped_readers": 4,
+            "independent_consumers": 2,
+        },
+        "samples": len(reader_latencies),
         "ingest_count": ingest_count,
+        "canonical_event_count": canonical_event_count,
         "checkpoint_count": checkpoint_count,
+        "reader_request_count": reader_request_count,
+        "consumer_request_count": consumer_request_count,
+        "consumer_cursors": consumer_cursors,
+        "final_book_count": final_book_count,
         "readiness_latency_ms": {
-            "p50": percentile(latencies, .50), "p95": percentile(latencies, .95),
-            "p99": percentile(latencies, .99), "max": max(latencies, default=math.inf),
+            "p50": percentile(reader_latencies, .50),
+            "p95": percentile(reader_latencies, .95),
+            "p99": percentile(reader_latencies, .99),
+            "max": max(reader_latencies, default=math.inf),
+        },
+        "persistence_latency_us": {
+            "p50": percentile(persistence_latencies_us, .50),
+            "p95": percentile(persistence_latencies_us, .95),
+            "p99": percentile(persistence_latencies_us, .99),
+            "max": max(persistence_latencies_us, default=math.inf),
+        },
+        "publication_latency_us": {
+            "p50": percentile(publication_latencies_us, .50),
+            "p95": percentile(publication_latencies_us, .95),
+            "p99": percentile(publication_latencies_us, .99),
+            "max": max(publication_latencies_us, default=math.inf),
         },
         "observed_maximums": maximums,
         "final_metrics": final_metrics,
@@ -266,6 +386,8 @@ def main() -> None:
         "gate_verdicts": gate_verdicts,
         "process_log_tail": process_log_tail,
         "real_order_submission_enabled": False,
+        "tradude_manages_marketcow": False,
+        "headless_substitutes_http_network_soak": False,
         "passed": passed,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

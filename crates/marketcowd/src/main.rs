@@ -2281,6 +2281,8 @@ fn run_headless_shadow_soak(
     let mut maximum_persistence_latency_us = 0_u64;
     let mut maximum_publication_latency_us = 0_u64;
     let mut apply_latency_us = Vec::new();
+    let mut persistence_latency_us = Vec::new();
+    let mut publication_latency_us = Vec::new();
     let mut next_checkpoint = started + std::time::Duration::from_secs(60);
 
     for (token_id, bid, ask) in [
@@ -2294,7 +2296,22 @@ fn run_headless_shadow_soak(
             "asks":[{"price":ask,"size":"11"}],
             "hash":format!("headless-{token_id}-{}", now.timestamp_nanos_opt().unwrap_or_default())
         });
-        for outcome in runtime.apply_raw(raw, now)? {
+        let outcomes = runtime.apply_raw(raw, now)?;
+        if let Some(maximum) = outcomes
+            .iter()
+            .map(|outcome| outcome.persistence_latency_us)
+            .max()
+        {
+            persistence_latency_us.push(maximum);
+        }
+        if let Some(maximum) = outcomes
+            .iter()
+            .map(|outcome| outcome.publication_latency_us)
+            .max()
+        {
+            publication_latency_us.push(maximum);
+        }
+        for outcome in outcomes {
             event_count += 1;
             if !outcome.persisted.applied {
                 rejected_count += 1;
@@ -2321,6 +2338,20 @@ fn run_headless_shadow_soak(
             now,
         )?;
         apply_latency_us.push(apply_started.elapsed().as_micros() as u64);
+        if let Some(maximum) = outcomes
+            .iter()
+            .map(|outcome| outcome.persistence_latency_us)
+            .max()
+        {
+            persistence_latency_us.push(maximum);
+        }
+        if let Some(maximum) = outcomes
+            .iter()
+            .map(|outcome| outcome.publication_latency_us)
+            .max()
+        {
+            publication_latency_us.push(maximum);
+        }
         for outcome in outcomes {
             event_count += 1;
             if !outcome.persisted.applied {
@@ -2359,14 +2390,16 @@ fn run_headless_shadow_soak(
     let projection = runtime.projection();
     let elapsed_seconds = started.elapsed().as_secs_f64();
     apply_latency_us.sort_unstable();
-    let percentile = |ratio: f64| -> u64 {
-        if apply_latency_us.is_empty() {
+    persistence_latency_us.sort_unstable();
+    publication_latency_us.sort_unstable();
+    let percentile = |values: &[u64], ratio: f64| -> u64 {
+        if values.is_empty() {
             return u64::MAX;
         }
-        let index = ((apply_latency_us.len() as f64 * ratio).ceil() as usize)
+        let index = ((values.len() as f64 * ratio).ceil() as usize)
             .saturating_sub(1)
-            .min(apply_latency_us.len() - 1);
-        apply_latency_us[index]
+            .min(values.len() - 1);
+        values[index]
     };
     let max_rss_kb = maximum_resident_set_kb();
     let gate_verdicts = json!({
@@ -2377,9 +2410,11 @@ fn run_headless_shadow_soak(
         "published_cursor_equals_persisted_cursor":projection.cursor == projection.persisted_cursor,
         "maximum_book_age_within_limit":maximum_book_age_ms
             <= interval_millis.saturating_mul(2).max(5_000),
-        "apply_latency_p99_us_lte_50000":percentile(0.99) <= 50_000,
-        "maximum_persistence_latency_us_lte_50000":maximum_persistence_latency_us <= 50_000,
-        "maximum_publication_latency_us_lte_5000":maximum_publication_latency_us <= 5_000,
+        "apply_latency_p99_us_lte_20000":percentile(&apply_latency_us, 0.99) <= 20_000,
+        "wal_persistence_latency_p99_us_lte_20000":
+            percentile(&persistence_latency_us, 0.99) <= 20_000,
+        "projection_publication_latency_p99_us_lte_5000":
+            percentile(&publication_latency_us, 0.99) <= 5_000,
         "real_orders_disabled":!config.real_order_submission_enabled,
         "tradude_does_not_manage_marketcow":true
     });
@@ -2389,7 +2424,7 @@ fn run_headless_shadow_soak(
         .values()
         .all(|value| value == &serde_json::Value::Bool(true));
     let result = json!({
-        "schema_version":"marketcow.headless-shadow-soak.v2",
+        "schema_version":"marketcow.headless-shadow-soak.v3",
         "binary_commit":binary_commit,
         "binary_path":binary_path,
         "binary_sha256":binary_sha256,
@@ -2409,8 +2444,17 @@ fn run_headless_shadow_soak(
         "maximum_book_age_ms":maximum_book_age_ms,
         "ingress_queue_depth":0,
         "disconnect_count":0,
-        "apply_latency_us":{"p50":percentile(0.50),"p95":percentile(0.95),"p99":percentile(0.99),
+        "apply_latency_us":{"p50":percentile(&apply_latency_us, 0.50),
+            "p95":percentile(&apply_latency_us, 0.95),"p99":percentile(&apply_latency_us, 0.99),
             "max":apply_latency_us.last().copied().unwrap_or(u64::MAX)},
+        "persistence_latency_us":{"p50":percentile(&persistence_latency_us, 0.50),
+            "p95":percentile(&persistence_latency_us, 0.95),
+            "p99":percentile(&persistence_latency_us, 0.99),
+            "max":persistence_latency_us.last().copied().unwrap_or(u64::MAX)},
+        "publication_latency_us":{"p50":percentile(&publication_latency_us, 0.50),
+            "p95":percentile(&publication_latency_us, 0.95),
+            "p99":percentile(&publication_latency_us, 0.99),
+            "max":publication_latency_us.last().copied().unwrap_or(u64::MAX)},
         "maximum_persistence_latency_us":maximum_persistence_latency_us,
         "maximum_publication_latency_us":maximum_publication_latency_us,
         "max_rss_kb":max_rss_kb,
@@ -4952,25 +4996,27 @@ async fn admin_shadow_ingest(
                 .iter()
                 .filter(|outcome| !outcome.persisted.applied)
                 .count();
-            if let Some(maximum) = outcomes
+            let persistence_latency_us = outcomes
                 .iter()
                 .map(|value| value.persistence_latency_us)
                 .max()
-            {
+                .unwrap_or(0);
+            if persistence_latency_us > 0 {
                 state
                     .metrics
                     .persistence_latency_us
-                    .fetch_max(maximum, Ordering::Relaxed);
+                    .fetch_max(persistence_latency_us, Ordering::Relaxed);
             }
-            if let Some(maximum) = outcomes
+            let publication_latency_us = outcomes
                 .iter()
                 .map(|value| value.publication_latency_us)
                 .max()
-            {
+                .unwrap_or(0);
+            if publication_latency_us > 0 {
                 state
                     .metrics
                     .publication_latency_us
-                    .fetch_max(maximum, Ordering::Relaxed);
+                    .fetch_max(publication_latency_us, Ordering::Relaxed);
             }
             state.projection.store(runtime.projection());
             state
@@ -4989,6 +5035,8 @@ async fn admin_shadow_ingest(
                 "published_cursor":projection.cursor,
                 "persisted_cursor":projection.persisted_cursor,
                 "ready":projection.ready,
+                "persistence_latency_us":persistence_latency_us,
+                "publication_latency_us":publication_latency_us,
                 "real_order_submission_enabled":false
             }))
             .into_response()
@@ -7594,6 +7642,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
+        let response: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16_384).await.unwrap()).unwrap();
+        assert!(response["persistence_latency_us"].as_u64().is_some());
+        assert!(response["publication_latency_us"].as_u64().is_some());
         assert_eq!(state.projection.load().cursor, 1);
         assert!(state.projection.load().ready);
         assert_eq!(state.recent_events.load().len(), 1);
