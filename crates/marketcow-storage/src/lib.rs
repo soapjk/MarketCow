@@ -145,7 +145,7 @@ struct ClickHouseQuoteRow {
 #[derive(clickhouse::Row, Deserialize)]
 struct ClickHouseCurrentQuote {
     payload_json: String,
-    content_version: clickhouse::types::UInt256,
+    latest_content_version: clickhouse::types::UInt256,
 }
 
 #[derive(clickhouse::Row, Deserialize)]
@@ -266,7 +266,7 @@ impl ClickHouseQuoteRepository {
             .client
             .query(
                 "SELECT argMax(payload_json, content_version) AS payload_json, \
-                 max(content_version) AS content_version \
+                 max(content_version) AS latest_content_version \
                  FROM market_quote_latest WHERE symbol = ?",
             )
             .bind(&quote.instrument_id)
@@ -276,10 +276,11 @@ impl ClickHouseQuoteRepository {
         if current.payload_json == payload_json {
             return Ok(false);
         }
-        let version = if computed > current.content_version {
+        let version = if computed > current.latest_content_version {
             computed
         } else {
-            increment_uint256(current.content_version).ok_or(RepositoryError::InvalidInput)?
+            increment_uint256(current.latest_content_version)
+                .ok_or(RepositoryError::InvalidInput)?
         };
         let mut insert = self
             .client
