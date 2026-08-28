@@ -47,6 +47,18 @@ every 250 milliseconds on all supported hosts and kills/reaps an over-limit work
 cannot be measured, it kills the worker and records a fail-closed monitor failure instead of
 running without enforcement.
 
+Rust dispatch also requires an explicit policy for every worker capability. Defaults limit
+SEC filing transforms to one in-flight task with a 1000 ms minimum interval, and CSV
+inference to two in-flight tasks. Override the complete map atomically with JSON; omitted
+capabilities fail closed and receive no lease:
+
+```text
+MARKETCOW_PYTHON_DISPATCH_POLICIES_JSON={"transform.sec_dividend_filing":{"max_in_flight":1,"minimum_interval_millis":1000},"transform.csv_inference":{"max_in_flight":2,"minimum_interval_millis":0}}
+```
+
+The last claim time is part of the authoritative job payload, so restart/recovery does not
+reset the interval. `/v1/health` reports the effective non-secret policy map.
+
 ## Cutover (future Phase 7 gate)
 
 Drain Rust and Python consumers; stop the Python writer; flush and hash legacy WAL; record a

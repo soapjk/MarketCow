@@ -118,6 +118,7 @@ struct PythonWorkerConfig {
     restart_backoff_millis: u64,
     memory_limit_mib: u64,
     cpu_limit_seconds: u64,
+    dispatch_policies: BTreeMap<String, marketcow_jobs::DispatchPolicy>,
 }
 
 impl PythonWorkerConfig {
@@ -174,6 +175,15 @@ impl PythonWorkerConfig {
         if !(1..=86_400).contains(&cpu_limit_seconds) {
             bail!("Python worker CPU limit must be between 1 and 86400 seconds");
         }
+        let dispatch_policies = match env::var("MARKETCOW_PYTHON_DISPATCH_POLICIES_JSON") {
+            Ok(raw) => {
+                serde_json::from_str::<BTreeMap<String, marketcow_jobs::DispatchPolicy>>(&raw)
+                    .context("Python dispatch policy JSON is invalid")?
+            }
+            Err(env::VarError::NotPresent) => default_dispatch_policies(),
+            Err(error) => return Err(error.into()),
+        };
+        validate_dispatch_policies(&dispatch_policies)?;
         Ok(Self {
             executable,
             script,
@@ -184,6 +194,7 @@ impl PythonWorkerConfig {
             restart_backoff_millis,
             memory_limit_mib,
             cpu_limit_seconds,
+            dispatch_policies,
         })
     }
 
@@ -199,12 +210,54 @@ impl PythonWorkerConfig {
             restart_backoff_millis: 1000,
             memory_limit_mib: 2048,
             cpu_limit_seconds: 900,
+            dispatch_policies: default_dispatch_policies(),
         }
     }
 
     fn enabled(&self) -> bool {
         self.executable.is_some()
     }
+}
+
+fn default_dispatch_policies() -> BTreeMap<String, marketcow_jobs::DispatchPolicy> {
+    BTreeMap::from([
+        (
+            SEC_DIVIDEND_TASK.into(),
+            marketcow_jobs::DispatchPolicy {
+                max_in_flight: 1,
+                minimum_interval_millis: 1_000,
+            },
+        ),
+        (
+            CSV_INFERENCE_TASK.into(),
+            marketcow_jobs::DispatchPolicy {
+                max_in_flight: 2,
+                minimum_interval_millis: 0,
+            },
+        ),
+    ])
+}
+
+fn validate_dispatch_policies(
+    policies: &BTreeMap<String, marketcow_jobs::DispatchPolicy>,
+) -> Result<()> {
+    if policies.is_empty() || policies.len() > 64 {
+        bail!("Python dispatch policy count must be between 1 and 64");
+    }
+    for (capability, policy) in policies {
+        if capability.is_empty()
+            || capability.len() > 128
+            || !capability
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            bail!("Python dispatch policy capability is invalid");
+        }
+        policy
+            .validate()
+            .map_err(|error| anyhow::anyhow!("Python dispatch policy is invalid: {error}"))?;
+    }
+    Ok(())
 }
 
 impl Config {
@@ -328,24 +381,41 @@ struct DurableJobCoordinator {
     engine: AsyncMutex<marketcow_jobs::JobEngine>,
     repository: Option<Arc<marketcow_storage::PostgresJobRepository>>,
     memory_artifacts: AsyncMutex<BTreeMap<String, marketcow_storage::ArtifactManifestRecord>>,
+    dispatch_policies: BTreeMap<String, marketcow_jobs::DispatchPolicy>,
 }
 
 impl DurableJobCoordinator {
+    #[cfg(test)]
     fn memory() -> Self {
         Self {
             engine: AsyncMutex::new(marketcow_jobs::JobEngine::default()),
             repository: None,
             memory_artifacts: AsyncMutex::new(BTreeMap::new()),
+            dispatch_policies: BTreeMap::new(),
         }
     }
 
-    async fn open(profile: &str) -> Result<Self> {
+    fn memory_with_policies(
+        dispatch_policies: BTreeMap<String, marketcow_jobs::DispatchPolicy>,
+    ) -> Self {
+        Self {
+            engine: AsyncMutex::new(marketcow_jobs::JobEngine::default()),
+            repository: None,
+            memory_artifacts: AsyncMutex::new(BTreeMap::new()),
+            dispatch_policies,
+        }
+    }
+
+    async fn open(
+        profile: &str,
+        dispatch_policies: BTreeMap<String, marketcow_jobs::DispatchPolicy>,
+    ) -> Result<Self> {
         let dsn = env::var("MARKETCOW_POSTGRES_DSN").ok();
         let Some(dsn) = dsn else {
             if profile == "production" {
                 bail!("MARKETCOW_POSTGRES_DSN is required in production");
             }
-            return Ok(Self::memory());
+            return Ok(Self::memory_with_policies(dispatch_policies));
         };
         let binary_commit = env::var("MARKETCOW_BINARY_COMMIT").unwrap_or_default();
         if binary_commit.is_empty() {
@@ -373,6 +443,7 @@ impl DurableJobCoordinator {
             engine: AsyncMutex::new(engine),
             repository: Some(repository),
             memory_artifacts: AsyncMutex::new(BTreeMap::new()),
+            dispatch_policies,
         })
     }
 
@@ -443,9 +514,18 @@ impl DurableJobCoordinator {
             .await?;
 
         let before_claim = engine.clone();
-        let claimed = engine
-            .claim_next(worker_id, capabilities, lease_duration, now)?
-            .cloned();
+        let claimed = if self.dispatch_policies.is_empty() {
+            engine.claim_next(worker_id, capabilities, lease_duration, now)?
+        } else {
+            engine.claim_next_with_policies(
+                worker_id,
+                capabilities,
+                &self.dispatch_policies,
+                lease_duration,
+                now,
+            )?
+        }
+        .cloned();
         if let Some(job) = &claimed {
             self.persist_single_or_rollback(&mut engine, before_claim, job)
                 .await?;
@@ -961,7 +1041,13 @@ async fn serve() -> Result<()> {
     let runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(&config))?;
     let projection = runtime.projection();
     let recent_events = runtime.recent_events().to_vec();
-    let jobs = Arc::new(DurableJobCoordinator::open(&config.profile).await?);
+    let jobs = Arc::new(
+        DurableJobCoordinator::open(
+            &config.profile,
+            config.python_workers.dispatch_policies.clone(),
+        )
+        .await?,
+    );
     let (stream, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
     let state = AppState {
         config: config.clone(),
@@ -1324,7 +1410,8 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
             "memory_limit_kills":state.worker_status.memory_limit_kills.load(Ordering::Relaxed),
             "memory_monitor_failures":state.worker_status.memory_monitor_failures.load(Ordering::Relaxed),
             "memory_limit_mib":state.config.python_workers.memory_limit_mib,
-            "cpu_limit_seconds":state.config.python_workers.cpu_limit_seconds
+            "cpu_limit_seconds":state.config.python_workers.cpu_limit_seconds,
+            "dispatch_policies":&state.config.python_workers.dispatch_policies
         }
     }))
 }
@@ -2894,6 +2981,7 @@ mod tests {
             engine: AsyncMutex::new(engine),
             repository: None,
             memory_artifacts: AsyncMutex::new(BTreeMap::new()),
+            dispatch_policies: default_dispatch_policies(),
         });
         let server_jobs = jobs.clone();
         let server_socket = socket.clone();
@@ -3385,6 +3473,7 @@ mod tests {
             restart_backoff_millis: 100,
             memory_limit_mib: 512,
             cpu_limit_seconds: 7,
+            dispatch_policies: default_dispatch_policies(),
         };
         let mut command = ProcessCommand::new("/bin/sh");
         command

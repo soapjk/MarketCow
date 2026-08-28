@@ -11,6 +11,21 @@ use uuid::Uuid;
 pub const JOB_SCHEMA_VERSION: &str = "marketcow.job.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchPolicy {
+    pub max_in_flight: usize,
+    pub minimum_interval_millis: u64,
+}
+
+impl DispatchPolicy {
+    pub fn validate(self) -> Result<Self, JobEngineError> {
+        if !(1..=1024).contains(&self.max_in_flight) || self.minimum_interval_millis > 86_400_000 {
+            return Err(JobEngineError::InvalidInput);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Pending,
@@ -60,6 +75,8 @@ pub struct ProviderJob {
     pub owner_id: Option<String>,
     pub lease_token: Option<String>,
     pub lease_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub claimed_at: Option<DateTime<Utc>>,
     pub deadline: DateTime<Utc>,
     pub attempt: u32,
     pub max_attempts: u32,
@@ -171,6 +188,7 @@ impl JobEngine {
             owner_id: None,
             lease_token: None,
             lease_expires_at: None,
+            claimed_at: None,
             deadline: input.deadline,
             attempt: 0,
             max_attempts: input.max_attempts,
@@ -210,6 +228,7 @@ impl JobEngine {
         job.owner_id = Some(worker_id.into());
         job.lease_token = Some(Uuid::new_v4().to_string());
         job.lease_expires_at = Some((now + lease_duration).min(job.deadline));
+        job.claimed_at = Some(now);
         Ok(job)
     }
 
@@ -230,6 +249,64 @@ impl JobEngine {
                     && capabilities
                         .iter()
                         .any(|capability| capability == &job.job_type)
+            })
+            .map(|job| job.job_id.clone());
+        match job_id {
+            Some(job_id) => self
+                .claim(&job_id, worker_id, lease_duration, now)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    pub fn claim_next_with_policies(
+        &mut self,
+        worker_id: &str,
+        capabilities: &[String],
+        policies: &BTreeMap<String, DispatchPolicy>,
+        lease_duration: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Option<&ProviderJob>, JobEngineError> {
+        for policy in policies.values().copied() {
+            policy.validate()?;
+        }
+        let job_id = self
+            .jobs
+            .values()
+            .find(|candidate| {
+                let Some(policy) = policies.get(&candidate.job_type) else {
+                    return false;
+                };
+                if candidate.status != JobStatus::Pending
+                    || candidate.attempt >= candidate.max_attempts
+                    || now >= candidate.deadline
+                    || !capabilities
+                        .iter()
+                        .any(|capability| capability == &candidate.job_type)
+                {
+                    return false;
+                }
+                let active = self
+                    .jobs
+                    .values()
+                    .filter(|job| {
+                        job.job_type == candidate.job_type
+                            && matches!(job.status, JobStatus::Claimed | JobStatus::Running)
+                    })
+                    .count();
+                if active >= policy.max_in_flight {
+                    return false;
+                }
+                let last_dispatch = self
+                    .jobs
+                    .values()
+                    .filter(|job| job.job_type == candidate.job_type && job.attempt > 0)
+                    .filter_map(|job| job.claimed_at.or(job.started_at).or(Some(job.created_at)))
+                    .max();
+                last_dispatch.is_none_or(|last| {
+                    now.signed_duration_since(last).num_milliseconds()
+                        >= policy.minimum_interval_millis as i64
+                })
             })
             .map(|job| job.job_id.clone());
         match job_id {
@@ -489,6 +566,10 @@ fn validate_recovered_job(job: &ProviderJob) -> Result<(), JobEngineError> {
         || job.max_attempts > 20
         || job.attempt > job.max_attempts
         || job.deadline <= job.created_at
+        || (job.attempt == 0 && job.claimed_at.is_some())
+        || job
+            .claimed_at
+            .is_some_and(|claimed| claimed < job.created_at || claimed >= job.deadline)
         || sha256_json(&job.request)? != job.request_sha256
         || !lease_fields_valid
         || !status_fields_valid
@@ -731,6 +812,119 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claimed.job_id, job_id);
+    }
+
+    #[test]
+    fn dispatch_policy_enforces_concurrency_interval_and_survives_recovery() {
+        let mut engine = JobEngine::default();
+        let first_id = engine.submit(submit(), now()).unwrap().job_id.clone();
+        let mut second = submit();
+        second.idempotency_key = "idem-2".into();
+        let second_id = engine.submit(second, now()).unwrap().job_id.clone();
+        let policies = BTreeMap::from([(
+            "provider.history".into(),
+            DispatchPolicy {
+                max_in_flight: 1,
+                minimum_interval_millis: 1_000,
+            },
+        )]);
+        let capability = ["provider.history".into()];
+        let first = engine
+            .claim_next_with_policies(
+                "worker-1",
+                &capability,
+                &policies,
+                Duration::seconds(30),
+                now(),
+            )
+            .unwrap()
+            .unwrap()
+            .clone();
+        let claimed_id = first.job_id.clone();
+        let remaining_id = if claimed_id == first_id {
+            second_id
+        } else {
+            first_id
+        };
+        assert_eq!(first.claimed_at, Some(now()));
+        assert!(
+            engine
+                .claim_next_with_policies(
+                    "worker-2",
+                    &capability,
+                    &policies,
+                    Duration::seconds(30),
+                    now() + Duration::milliseconds(500),
+                )
+                .unwrap()
+                .is_none()
+        );
+        engine
+            .cancel(&claimed_id, "operator", now() + Duration::milliseconds(500))
+            .unwrap();
+        let mut recovered = JobEngine::recover(engine.snapshot()).unwrap();
+        assert!(
+            recovered
+                .claim_next_with_policies(
+                    "worker-2",
+                    &capability,
+                    &policies,
+                    Duration::seconds(30),
+                    now() + Duration::milliseconds(999),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            recovered
+                .claim_next_with_policies(
+                    "worker-2",
+                    &capability,
+                    &policies,
+                    Duration::seconds(30),
+                    now() + Duration::milliseconds(1_000),
+                )
+                .unwrap()
+                .unwrap()
+                .job_id,
+            remaining_id
+        );
+    }
+
+    #[test]
+    fn dispatch_policy_fails_closed_for_unconfigured_or_invalid_capability() {
+        let mut engine = JobEngine::default();
+        engine.submit(submit(), now()).unwrap();
+        let capability = ["provider.history".into()];
+        assert!(
+            engine
+                .claim_next_with_policies(
+                    "worker",
+                    &capability,
+                    &BTreeMap::new(),
+                    Duration::seconds(30),
+                    now(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let invalid = BTreeMap::from([(
+            "provider.history".into(),
+            DispatchPolicy {
+                max_in_flight: 0,
+                minimum_interval_millis: 0,
+            },
+        )]);
+        assert_eq!(
+            engine.claim_next_with_policies(
+                "worker",
+                &capability,
+                &invalid,
+                Duration::seconds(30),
+                now(),
+            ),
+            Err(JobEngineError::InvalidInput)
+        );
     }
 
     #[test]
