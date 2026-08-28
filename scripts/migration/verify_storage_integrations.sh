@@ -83,7 +83,7 @@ MARKETCOW_TEST_CLICKHOUSE_DATABASE=marketcow_test \
 MARKETCOW_TEST_CLICKHOUSE_USERNAME=marketcow_test \
 MARKETCOW_TEST_CLICKHOUSE_PASSWORD=marketcow_test_password \
   cargo test -p marketcow-storage \
-  clickhouse_quote_round_trip_when_test_endpoint_is_configured -- --ignored --nocapture
+  clickhouse_market_data_round_trip_when_test_endpoint_is_configured -- --ignored --nocapture
 docker stop "$container_name" >/dev/null
 clickhouse_started=false
 
@@ -98,7 +98,12 @@ jq -n \
   --arg pg_root "$pg_root" \
   '{schema_version:$schema_version,git_commit:$git_commit,passed:true,
     postgres:{version:$postgres_version,test:"postgres_job_repository_round_trip_when_test_dsn_is_configured",passed:true,ephemeral_root:$pg_root},
-    clickhouse:{image:$clickhouse_image,image_id:$clickhouse_image_id,test:"clickhouse_quote_round_trip_when_test_endpoint_is_configured",passed:true},
+    clickhouse:{image:$clickhouse_image,image_id:$clickhouse_image_id,
+      test:"clickhouse_market_data_round_trip_when_test_endpoint_is_configured",
+      gates:{safe_forward_migrations:true,quote_exact_decimal_and_idempotency:true,
+        canonical_page_order_and_ohlcv_validation:true,
+        adjustment_factor_decimal128_scale_18:true,
+        factor_provenance_round_trip:true},passed:true},
     real_order_submission_enabled:false,tradude_manages_marketcow:false}' >"$temporary"
 mv "$temporary" "$output"
 cat "$output"

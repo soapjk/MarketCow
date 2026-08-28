@@ -3282,7 +3282,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MARKETCOW_TEST_CLICKHOUSE_URL and MARKETCOW_TEST_CLICKHOUSE_DATABASE"]
-    async fn clickhouse_quote_round_trip_when_test_endpoint_is_configured() {
+    async fn clickhouse_market_data_round_trip_when_test_endpoint_is_configured() {
         let config = ClickHouseConfig::new(
             std::env::var("MARKETCOW_TEST_CLICKHOUSE_URL").expect("test ClickHouse URL"),
             std::env::var("MARKETCOW_TEST_CLICKHOUSE_DATABASE").expect("test ClickHouse database"),
