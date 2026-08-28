@@ -142,6 +142,56 @@ CREATE INDEX IF NOT EXISTS migration_checkpoint_status_idx
 "#;
 const CONTROL_PLANE_MIGRATION_LOCK: i64 = 0x4d_43_43_54_4c;
 
+pub const ADMIN_AUDIT_MIGRATION_VERSION: &str = "rust-admin-audit-v1";
+pub const ADMIN_AUDIT_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS admin_audit_event (
+    audit_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL CHECK (schema_version = 'marketcow.admin-audit.v1'),
+    occurred_at TIMESTAMPTZ NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'succeeded', 'rejected', 'failed')),
+    request_id TEXT NOT NULL DEFAULT '',
+    parameters_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS admin_audit_event_occurred_idx
+    ON admin_audit_event (occurred_at DESC, audit_id DESC);
+CREATE INDEX IF NOT EXISTS admin_audit_event_action_idx
+    ON admin_audit_event (action, occurred_at DESC);
+CREATE OR REPLACE FUNCTION marketcow_reject_admin_audit_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'admin_audit_event is append-only';
+END;
+$$;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'admin_audit_event_no_update_delete'
+          AND tgrelid = 'admin_audit_event'::regclass
+    ) THEN
+        CREATE TRIGGER admin_audit_event_no_update_delete
+        BEFORE UPDATE OR DELETE ON admin_audit_event
+        FOR EACH ROW EXECUTE FUNCTION marketcow_reject_admin_audit_mutation();
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'admin_audit_event_no_truncate'
+          AND tgrelid = 'admin_audit_event'::regclass
+    ) THEN
+        CREATE TRIGGER admin_audit_event_no_truncate
+        BEFORE TRUNCATE ON admin_audit_event
+        FOR EACH STATEMENT EXECUTE FUNCTION marketcow_reject_admin_audit_mutation();
+    END IF;
+END;
+$$;
+REVOKE UPDATE, DELETE, TRUNCATE ON admin_audit_event FROM PUBLIC;
+"#;
+const ADMIN_AUDIT_MIGRATION_LOCK: i64 = 0x4d_43_41_55_44;
+
 pub const CLICKHOUSE_QUOTE_MIGRATION_VERSION: &str = "rust-quote-latest-v1";
 pub const CLICKHOUSE_QUOTE_MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS market_quote_latest (
@@ -884,6 +934,8 @@ pub enum RepositoryError {
     InstrumentConflict,
     #[error("immutable runtime configuration identity conflict")]
     ConfigConflict,
+    #[error("audit event identity conflict")]
+    AuditConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1652,6 +1704,253 @@ fn map_control_plane_write_error(error: tokio_postgres::Error) -> RepositoryErro
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminAuditRecord {
+    pub audit_id: String,
+    pub schema_version: String,
+    pub occurred_at: DateTime<Utc>,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub request_id: String,
+    pub parameters_json: serde_json::Value,
+    #[serde(default)]
+    pub detail: String,
+}
+
+pub struct PostgresAuditRepository {
+    client: tokio::sync::Mutex<tokio_postgres::Client>,
+}
+
+impl PostgresAuditRepository {
+    pub async fn connect(dsn: &str) -> Result<Self, RepositoryError> {
+        if dsn.trim().is_empty() {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::error!(error = %error, "postgres_audit_connection_failed");
+            }
+        });
+        Ok(Self {
+            client: tokio::sync::Mutex::new(client),
+        })
+    }
+
+    pub async fn migrate_safe_forward(&self, binary_commit: &str) -> Result<(), RepositoryError> {
+        if binary_commit.is_empty() || binary_commit.len() > 128 {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let checksum = hex::encode(Sha256::digest(ADMIN_AUDIT_MIGRATION_SQL.as_bytes()));
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&ADMIN_AUDIT_MIGRATION_LOCK],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        transaction
+            .batch_execute(RUST_MIGRATION_TABLE_SQL)
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let existing = transaction
+            .query_opt(
+                "SELECT checksum FROM marketcow_rust_migration WHERE version=$1",
+                &[&ADMIN_AUDIT_MIGRATION_VERSION],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if let Some(row) = existing {
+            if row.get::<_, String>(0) != checksum {
+                return Err(RepositoryError::MigrationChecksumMismatch);
+            }
+        } else {
+            transaction
+                .batch_execute(ADMIN_AUDIT_MIGRATION_SQL)
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+            transaction
+                .execute(
+                    "INSERT INTO marketcow_rust_migration \
+                     (version,checksum,applied_at,binary_commit,safe_forward) \
+                     VALUES ($1,$2,NOW(),$3,TRUE)",
+                    &[&ADMIN_AUDIT_MIGRATION_VERSION, &checksum, &binary_commit],
+                )
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)
+    }
+
+    pub async fn append(
+        &self,
+        record: &AdminAuditRecord,
+    ) -> Result<AdminAuditRecord, RepositoryError> {
+        validate_audit(record)?;
+        let client = self.client.lock().await;
+        let inserted = client
+            .query_opt(
+                "INSERT INTO admin_audit_event \
+                 (audit_id,schema_version,occurred_at,actor,action,target,outcome,request_id,\
+                  parameters_json,detail) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
+                 ON CONFLICT (audit_id) DO NOTHING \
+                 RETURNING audit_id,schema_version,occurred_at,actor,action,target,outcome,\
+                           request_id,parameters_json,detail",
+                &[
+                    &record.audit_id,
+                    &record.schema_version,
+                    &record.occurred_at,
+                    &record.actor,
+                    &record.action,
+                    &record.target,
+                    &record.outcome,
+                    &record.request_id,
+                    &record.parameters_json,
+                    &record.detail,
+                ],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if let Some(row) = inserted {
+            return decode_audit(row);
+        }
+        let existing = client
+            .query_one(
+                "SELECT audit_id,schema_version,occurred_at,actor,action,target,outcome,\
+                 request_id,parameters_json,detail FROM admin_audit_event WHERE audit_id=$1",
+                &[&record.audit_id],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)
+            .and_then(decode_audit)?;
+        if &existing == record {
+            Ok(existing)
+        } else {
+            Err(RepositoryError::AuditConflict)
+        }
+    }
+
+    pub async fn list(
+        &self,
+        limit: i64,
+        offset: i64,
+        action: Option<&str>,
+        outcome: Option<&str>,
+    ) -> Result<Vec<AdminAuditRecord>, RepositoryError> {
+        if !(1..=200).contains(&limit)
+            || !(0..=10_000).contains(&offset)
+            || action.is_some_and(|value| !valid_audit_text(value, 120, false))
+            || outcome.is_some_and(|value| {
+                !matches!(value, "accepted" | "succeeded" | "rejected" | "failed")
+            })
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let client = self.client.lock().await;
+        let rows =
+            match (action, outcome) {
+                (Some(action), Some(outcome)) => client
+                    .query(
+                        "SELECT audit_id,schema_version,occurred_at,actor,action,target,outcome,\
+                         request_id,parameters_json,detail FROM admin_audit_event \
+                         WHERE action=$1 AND outcome=$2 ORDER BY occurred_at DESC,audit_id DESC \
+                         LIMIT $3 OFFSET $4",
+                        &[&action, &outcome, &limit, &offset],
+                    )
+                    .await,
+                (Some(action), None) => client
+                    .query(
+                        "SELECT audit_id,schema_version,occurred_at,actor,action,target,outcome,\
+                         request_id,parameters_json,detail FROM admin_audit_event WHERE action=$1 \
+                         ORDER BY occurred_at DESC,audit_id DESC LIMIT $2 OFFSET $3",
+                        &[&action, &limit, &offset],
+                    )
+                    .await,
+                (None, Some(outcome)) => client
+                    .query(
+                        "SELECT audit_id,schema_version,occurred_at,actor,action,target,outcome,\
+                         request_id,parameters_json,detail FROM admin_audit_event WHERE outcome=$1 \
+                         ORDER BY occurred_at DESC,audit_id DESC LIMIT $2 OFFSET $3",
+                        &[&outcome, &limit, &offset],
+                    )
+                    .await,
+                (None, None) => client
+                    .query(
+                        "SELECT audit_id,schema_version,occurred_at,actor,action,target,outcome,\
+                         request_id,parameters_json,detail FROM admin_audit_event \
+                         ORDER BY occurred_at DESC,audit_id DESC LIMIT $1 OFFSET $2",
+                        &[&limit, &offset],
+                    )
+                    .await,
+            }
+            .map_err(|_| RepositoryError::Unavailable)?;
+        rows.into_iter().map(decode_audit).collect()
+    }
+}
+
+fn validate_audit(record: &AdminAuditRecord) -> Result<(), RepositoryError> {
+    if !valid_audit_text(&record.audit_id, 256, false)
+        || record.schema_version != "marketcow.admin-audit.v1"
+        || !record
+            .occurred_at
+            .timestamp_subsec_nanos()
+            .is_multiple_of(1_000)
+        || !valid_audit_text(&record.actor, 256, false)
+        || !valid_audit_text(&record.action, 120, false)
+        || !valid_audit_text(&record.target, 512, false)
+        || !matches!(
+            record.outcome.as_str(),
+            "accepted" | "succeeded" | "rejected" | "failed"
+        )
+        || !valid_audit_text(&record.request_id, 256, true)
+        || !record.parameters_json.is_object()
+        || !matches!(
+            serde_json::to_vec(&record.parameters_json),
+            Ok(value) if value.len() <= 65_536
+        )
+        || record.detail.len() > 4096
+    {
+        return Err(RepositoryError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn valid_audit_text(value: &str, maximum: usize, allow_empty: bool) -> bool {
+    (allow_empty || !value.is_empty())
+        && value.len() <= maximum
+        && !value.chars().any(char::is_control)
+}
+
+fn decode_audit(row: tokio_postgres::Row) -> Result<AdminAuditRecord, RepositoryError> {
+    let record = AdminAuditRecord {
+        audit_id: row.get(0),
+        schema_version: row.get(1),
+        occurred_at: row.get(2),
+        actor: row.get(3),
+        action: row.get(4),
+        target: row.get(5),
+        outcome: row.get(6),
+        request_id: row.get(7),
+        parameters_json: row.get(8),
+        detail: row.get(9),
+    };
+    validate_audit(&record).map_err(|_| RepositoryError::Unavailable)?;
+    Ok(record)
+}
+
 pub struct PostgresJobRepository {
     client: tokio::sync::Mutex<tokio_postgres::Client>,
 }
@@ -2283,6 +2582,42 @@ mod tests {
     }
 
     #[test]
+    fn admin_audit_contract_is_versioned_append_only_and_bounded() {
+        assert_eq!(ADMIN_AUDIT_MIGRATION_VERSION, "rust-admin-audit-v1");
+        assert!(ADMIN_AUDIT_MIGRATION_SQL.contains("marketcow.admin-audit.v1"));
+        assert!(ADMIN_AUDIT_MIGRATION_SQL.contains("admin_audit_event_no_update_delete"));
+        assert!(ADMIN_AUDIT_MIGRATION_SQL.contains("admin_audit_event_no_truncate"));
+        assert!(ADMIN_AUDIT_MIGRATION_SQL.contains("REVOKE UPDATE, DELETE, TRUNCATE"));
+        let record = AdminAuditRecord {
+            audit_id: "audit-1".into(),
+            schema_version: "marketcow.admin-audit.v1".into(),
+            occurred_at: DateTime::parse_from_rfc3339("2026-08-28T00:00:00.123456Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            actor: "operator:test".into(),
+            action: "instrument.upsert".into(),
+            target: "AAPL.XNAS".into(),
+            outcome: "succeeded".into(),
+            request_id: "request-1".into(),
+            parameters_json: serde_json::json!({"source":"integration-test"}),
+            detail: String::new(),
+        };
+        validate_audit(&record).unwrap();
+        let mut invalid = record.clone();
+        invalid.outcome = "unknown".into();
+        assert!(matches!(
+            validate_audit(&invalid),
+            Err(RepositoryError::InvalidInput)
+        ));
+        invalid = record;
+        invalid.occurred_at += Duration::nanoseconds(1);
+        assert!(matches!(
+            validate_audit(&invalid),
+            Err(RepositoryError::InvalidInput)
+        ));
+    }
+
+    #[test]
     fn worker_artifact_promotion_is_verified_content_addressed_and_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let staging_root = directory.path().join("staging");
@@ -2826,6 +3161,91 @@ mod tests {
                 .unwrap()
                 .revision,
             2
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MARKETCOW_TEST_POSTGRES_DSN"]
+    async fn postgres_audit_repository_is_append_only_when_test_dsn_is_configured() {
+        let dsn = std::env::var("MARKETCOW_TEST_POSTGRES_DSN")
+            .expect("set MARKETCOW_TEST_POSTGRES_DSN for the ignored integration test");
+        let repository = PostgresAuditRepository::connect(&dsn).await.unwrap();
+        repository
+            .migrate_safe_forward("test-binary-commit")
+            .await
+            .unwrap();
+        repository
+            .migrate_safe_forward("test-binary-commit")
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let record = AdminAuditRecord {
+            audit_id: format!("audit-{suffix}"),
+            schema_version: "marketcow.admin-audit.v1".into(),
+            occurred_at: DateTime::parse_from_rfc3339("2026-08-28T01:02:03.123456Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            actor: "operator:integration-test".into(),
+            action: format!("instrument.upsert.{suffix}"),
+            target: "AAPL.XNAS".into(),
+            outcome: "succeeded".into(),
+            request_id: format!("request-{suffix}"),
+            parameters_json: serde_json::json!({"unicode":"苹果😀","price":"0.100000000000000001"}),
+            detail: String::new(),
+        };
+        assert_eq!(repository.append(&record).await.unwrap(), record);
+        assert_eq!(repository.append(&record).await.unwrap(), record);
+        assert_eq!(
+            repository
+                .list(10, 0, Some(&record.action), Some("succeeded"))
+                .await
+                .unwrap(),
+            vec![record.clone()]
+        );
+        assert!(
+            repository
+                .list(10, 1, Some(&record.action), None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut conflicting = record.clone();
+        conflicting.detail = "different immutable payload".into();
+        assert!(matches!(
+            repository.append(&conflicting).await,
+            Err(RepositoryError::AuditConflict)
+        ));
+
+        let client = repository.client.lock().await;
+        assert!(
+            client
+                .execute(
+                    "UPDATE admin_audit_event SET detail='mutated' WHERE audit_id=$1",
+                    &[&record.audit_id],
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .execute(
+                    "DELETE FROM admin_audit_event WHERE audit_id=$1",
+                    &[&record.audit_id],
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT COUNT(*) FROM admin_audit_event WHERE audit_id=$1",
+                    &[&record.audit_id],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            1
         );
     }
 }
