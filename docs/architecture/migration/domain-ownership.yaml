@@ -1,5 +1,9 @@
 schema_version: marketcow.domain-ownership.v1
 revision: phase0-shadow
+service_boundary:
+  kind: market_data_read_service
+  trading_interfaces_allowed: false
+  order_signing_credentials_allowed: false
 domains:
   public_gateway:
     current_owner: python
@@ -31,4 +35,3 @@ domains:
 lifecycle:
   marketcow_owner: marketcow
   tradude_may_manage_marketcow: false
-
