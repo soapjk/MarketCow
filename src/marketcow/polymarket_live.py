@@ -4718,8 +4718,9 @@ class ClobBooksClient:
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
-        self.session = session or requests.Session()
-        self.requester = requester or self.session.post
+        self.session = session
+        self.requester = requester
+        self._thread_sessions = threading.local()
         self.timeout = timeout
         self.batch_size = min(500, max(1, batch_size))
         self.max_retries_per_batch = max(0, max_retries_per_batch)
@@ -4728,6 +4729,20 @@ class ClobBooksClient:
         self.sleeper = sleeper
         self.clock = clock
         self.last_evidence: dict[str, Any] | None = None
+
+    def _post(self, *args: Any, **kwargs: Any) -> Any:
+        if self.requester is not None:
+            return self.requester(*args, **kwargs)
+        if self.session is not None:
+            return self.session.post(*args, **kwargs)
+        # Periodic partitions run in separate worker threads. requests.Session
+        # mutates connection-pool state and is not a documented thread-safe
+        # boundary, so retain pooling without sharing a Session across them.
+        session = getattr(self._thread_sessions, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._thread_sessions.session = session
+        return session.post(*args, **kwargs)
 
     @staticmethod
     def _log_progress(evidence: dict[str, Any]) -> None:
@@ -4747,8 +4762,16 @@ class ClobBooksClient:
         *,
         batch_consumer: Callable[[list[dict[str, Any]]], None] | None = None,
         require_complete_batches: bool = False,
+        request_timeout: float | tuple[float, float] | None = None,
+        max_retries_per_batch: int | None = None,
     ) -> list[dict[str, Any]]:
         tokens = list(dict.fromkeys(str(item) for item in token_ids))
+        timeout = self.timeout if request_timeout is None else request_timeout
+        retry_limit = (
+            self.max_retries_per_batch
+            if max_retries_per_batch is None
+            else max(0, max_retries_per_batch)
+        )
         rows = []
         received_book_count = 0
         batch_count = (len(tokens) + self.batch_size - 1) // self.batch_size
@@ -4767,22 +4790,22 @@ class ClobBooksClient:
                 attempts = 0
                 while True:
                     try:
-                        response = self.requester(
-                            self.endpoint, json=request_body, timeout=self.timeout,
+                        response = self._post(
+                            self.endpoint, json=request_body, timeout=timeout,
                             headers={
                                 "Content-Type": "application/json",
                                 "User-Agent": "MarketCow/0.2",
                             },
                         )
                     except requests.RequestException:
-                        if attempts >= self.max_retries_per_batch:
+                        if attempts >= retry_limit:
                             raise
                         attempts += 1
                         retry_count += 1
                         continue
                     if response.status_code != 429 and response.status_code < 500:
                         break
-                    if attempts >= self.max_retries_per_batch:
+                    if attempts >= retry_limit:
                         response.raise_for_status()
                     attempts += 1
                     retry_count += 1
@@ -4816,7 +4839,7 @@ class ClobBooksClient:
                 missing = requested - received
                 if not missing:
                     break
-                if coverage_attempts >= self.max_retries_per_batch:
+                if coverage_attempts >= retry_limit:
                     raise ClobBooksCoverageError(missing)
                 coverage_attempts += 1
                 retry_count += 1
@@ -4951,11 +4974,24 @@ class LiveStateStore:
         # that sink happens immediately after the canonical in-memory event is
         # committed and before any JSONL/SQLite persistence work begins.
         self.live_event_sink: Callable[[LiveEventEnvelope], None] | None = None
+        self.live_event_batch_sink: (
+            Callable[[list[LiveEventEnvelope]], None] | None
+        ) = None
         self.live_book_sink: Callable[[LiveBook], None] | None = None
         self._async_persistence = False
         self._persistence_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._persistence_thread: threading.Thread | None = None
         self._persistence_condition = threading.Condition()
+        # The append-only log is the authority; SQLite is a rebuildable index.
+        # Keep their workers and queues separate so a large/fragmented derived
+        # index cannot hold up authoritative fsyncs or grow the collector's hot
+        # persistence queue without bound.
+        self._index_queue: queue.Queue[list[dict[str, Any]] | None] = queue.Queue(
+            maxsize=4,
+        )
+        self._index_thread: threading.Thread | None = None
+        self._index_condition = threading.Condition()
+        self.indexed_cursor = 0
         self.persisted_cursor = 0
         self.persistence_error: str | None = None
         # The append-only event log and the mutable SQLite index are separate
@@ -5013,8 +5049,15 @@ class LiveStateStore:
         if self._async_persistence:
             return
         self.persisted_cursor = self.cursor
+        self.indexed_cursor = self.cursor
         self.persistence_error = None
         self._async_persistence = True
+        self._index_thread = threading.Thread(
+            target=self._index_loop,
+            name="marketcow-polymarket-derived-index",
+            daemon=True,
+        )
+        self._index_thread.start()
         self._persistence_thread = threading.Thread(
             target=self._persistence_loop,
             name="marketcow-polymarket-persistence",
@@ -5033,8 +5076,16 @@ class LiveStateStore:
             thread.join(timeout=timeout)
             if thread.is_alive():
                 raise TimeoutError("Polymarket persistence worker did not stop")
+        self.flush_async_index(target_cursor=target, timeout=timeout)
+        self._index_queue.put(None)
+        index_thread = self._index_thread
+        if index_thread is not None:
+            index_thread.join(timeout=timeout)
+            if index_thread.is_alive():
+                raise TimeoutError("Polymarket derived-index worker did not stop")
         self._async_persistence = False
         self._persistence_thread = None
+        self._index_thread = None
 
     def flush_async_persistence(
         self, *, target_cursor: int | None = None, timeout: float = 30.0,
@@ -5057,16 +5108,40 @@ class LiveStateStore:
                     + self.persistence_error
                 )
 
+    def flush_async_index(
+        self, *, target_cursor: int | None = None, timeout: float = 30.0,
+    ) -> None:
+        """Wait for the rebuildable index without redefining log durability."""
+        if not self._async_persistence or not self._state_index_available:
+            return
+        target = self.cursor if target_cursor is None else target_cursor
+        deadline = time.monotonic() + timeout
+        with self._index_condition:
+            while self.indexed_cursor < target and self._state_index_available:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Polymarket derived index did not reach target cursor"
+                    )
+                self._index_condition.wait(timeout=remaining)
+
     def _persistence_record(
         self,
         envelope: LiveEventEnvelope,
         index_gaps: list[GapEntry],
     ) -> dict[str, Any]:
-        return {
+        # Event and book models are replaced rather than mutated after
+        # publication, so the authoritative writer can safely retain their
+        # references.  Deep-copy only mutable gap state needed by SQLite.
+        record: dict[str, Any] = {
             "kind": "event",
-            "event": envelope.model_copy(deep=True),
+            "event": envelope,
+        }
+        if not self._state_index_available:
+            return record
+        record.update({
             "book": (
-                self.books[envelope.token_id].model_copy(deep=True)
+                self.books[envelope.token_id]
                 if envelope.applied and envelope.token_id in self.books else None
             ),
             "gaps": [gap.model_copy(deep=True) for gap in index_gaps],
@@ -5089,7 +5164,8 @@ class LiveStateStore:
                 min(book.received_at for book in self.books.values()).isoformat()
                 if self.books else ""
             ),
-        }
+        })
+        return record
 
     def _persistence_loop(self) -> None:
         try:
@@ -5117,6 +5193,77 @@ class LiveStateStore:
             with self._persistence_condition:
                 self.persistence_error = f"{type(exc).__name__}:{exc}"
                 self._persistence_condition.notify_all()
+
+    def _isolate_derived_index(self, exc: BaseException) -> None:
+        self._state_index_available = False
+        self.derived_index_error = f"{type(exc).__name__}:{exc}"
+        LOGGER.error(
+            "polymarket_derived_index_isolated durable_cursor=%d reason=%s",
+            self.persisted_cursor, self.derived_index_error,
+        )
+        with self._index_condition:
+            self._index_condition.notify_all()
+
+    def _index_loop(self) -> None:
+        while True:
+            records = self._index_queue.get()
+            if records is None:
+                return
+            if not self._state_index_available:
+                continue
+            try:
+                self._persist_index_records(records)
+            except BaseException as exc:
+                LOGGER.exception("polymarket_derived_index_update_failed")
+                self._isolate_derived_index(exc)
+
+    def _persist_index_records(self, records: list[dict[str, Any]]) -> None:
+        event_records = [item for item in records if item["kind"] == "event"]
+        event_positions = {
+            id(record): (
+                record["byte_offset"], record["byte_length"],
+                record["line_sha256"],
+            )
+            for record in event_records
+        }
+        with self.state_index.batch():
+            for record in records:
+                if record["kind"] == "confirmation":
+                    self.state_index.confirm_book(
+                        record["book"],
+                        oldest_book_received_at=record[
+                            "oldest_book_received_at"
+                        ],
+                    )
+                    continue
+                event = record["event"]
+                byte_offset, byte_length, line_sha256 = event_positions[
+                    id(record)
+                ]
+                self.state_index.append(
+                    event,
+                    byte_offset=byte_offset,
+                    byte_length=byte_length,
+                    line_sha256=line_sha256,
+                    book=record["book"],
+                    gaps=record["gaps"],
+                    catalog_revision=record["catalog_revision"],
+                    event_log_size=record["event_log_size"],
+                    token_to_market=record["token_to_market"],
+                    active_recovery_id=record["active_recovery_id"],
+                    book_token_count=record["book_token_count"],
+                    book_complete_market_count=record[
+                        "book_complete_market_count"
+                    ],
+                    unresolved_gap_count=record["unresolved_gap_count"],
+                    oldest_book_received_at=record[
+                        "oldest_book_received_at"
+                    ],
+                )
+        if event_records:
+            with self._index_condition:
+                self.indexed_cursor = event_records[-1]["event"].cursor
+                self._index_condition.notify_all()
 
     def _persist_records(self, records: list[dict[str, Any]]) -> None:
         started = time.monotonic()
@@ -5149,61 +5296,28 @@ class LiveStateStore:
                     self._event_offset = last_offset
                     self._last_log_cursor = last_event.cursor
                     self._persistence_condition.notify_all()
-
-            if self._state_index_available:
-                try:
-                    event_positions = {
-                        id(record): (byte_offset, byte_length, line_sha256)
-                        for record, byte_offset, byte_length, line_sha256
-                        in indexed_events
-                    }
-                    with self.state_index.batch():
-                        for record in records:
-                            if record["kind"] == "confirmation":
-                                self.state_index.confirm_book(
-                                    record["book"],
-                                    oldest_book_received_at=record[
-                                        "oldest_book_received_at"
-                                    ],
-                                )
-                                continue
-                            event = record["event"]
-                            byte_offset, byte_length, line_sha256 = (
-                                event_positions[id(record)]
-                            )
-                            self.state_index.append(
-                                event,
-                                byte_offset=byte_offset,
-                                byte_length=byte_length,
-                                line_sha256=line_sha256,
-                                book=record["book"],
-                                gaps=record["gaps"],
-                                catalog_revision=record["catalog_revision"],
-                                event_log_size=last_offset,
-                                token_to_market=record["token_to_market"],
-                                active_recovery_id=record["active_recovery_id"],
-                                book_token_count=record["book_token_count"],
-                                book_complete_market_count=record[
-                                    "book_complete_market_count"
-                                ],
-                                unresolved_gap_count=record[
-                                    "unresolved_gap_count"
-                                ],
-                                oldest_book_received_at=record[
-                                    "oldest_book_received_at"
-                                ],
-                            )
-                except BaseException as exc:
-                    self._state_index_available = False
-                    self.derived_index_error = (
-                        f"{type(exc).__name__}:{exc}"
-                    )
-                    self.state_index.close()
-                    LOGGER.exception(
-                        "polymarket_derived_index_isolated "
-                        "durable_cursor=%d durable_event_log_size=%d",
-                        self.persisted_cursor, last_offset,
-                    )
+        if self._state_index_available:
+            positions = {
+                id(record): (byte_offset, byte_length, line_sha256)
+                for record, byte_offset, byte_length, line_sha256
+                in indexed_events
+            }
+            for record in records:
+                if record["kind"] != "event":
+                    continue
+                byte_offset, byte_length, line_sha256 = positions[id(record)]
+                record.update({
+                    "byte_offset": byte_offset,
+                    "byte_length": byte_length,
+                    "line_sha256": line_sha256,
+                    "event_log_size": last_offset,
+                })
+            try:
+                self._index_queue.put_nowait(records)
+            except queue.Full:
+                self._isolate_derived_index(RuntimeError(
+                    "derived index backlog exceeded 4 durable batches"
+                ))
         elapsed = time.monotonic() - started
         if elapsed >= 0.25:
             LOGGER.info(
@@ -5254,17 +5368,31 @@ class LiveStateStore:
     @contextmanager
     def event_publication_batch(self):
         """Group synchronous durability, or only memory mutation in hot mode."""
-        if self._async_persistence:
-            with self.memory_state_batch():
-                yield
-            return
-        with (
-            _publication_lock(self.root, exclusive=True),
-            self.memory_state_batch(),
-            self.state_index.batch(),
-            self.durable_event_batch(),
-        ):
-            yield
+        outermost = not hasattr(self._event_batch_state, "published_events")
+        if outermost:
+            self._event_batch_state.published_events = []
+        try:
+            if self._async_persistence:
+                with self.memory_state_batch():
+                    yield
+            else:
+                with (
+                    _publication_lock(self.root, exclusive=True),
+                    self.memory_state_batch(),
+                    self.state_index.batch(),
+                    self.durable_event_batch(),
+                ):
+                    yield
+            if outermost:
+                events = self._event_batch_state.published_events
+                if events and self.live_event_batch_sink is not None:
+                    self.live_event_batch_sink(events)
+                elif self.live_event_sink is not None:
+                    for event in events:
+                        self.live_event_sink(event)
+        finally:
+            if outermost:
+                del self._event_batch_state.published_events
 
     def _append(self, value: dict[str, Any]) -> tuple[int, int, str]:
         self.event_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5422,7 +5550,12 @@ class LiveStateStore:
         )
         envelope.event_id = live_event_identity(envelope)
         self.events.append(envelope)
-        if self.live_event_sink is not None:
+        publication_events = getattr(
+            self._event_batch_state, "published_events", None
+        )
+        if publication_events is not None:
+            publication_events.append(envelope)
+        elif self.live_event_sink is not None:
             self.live_event_sink(envelope)
         self._remember_raw_hash(raw_hash)
         index_gaps = list(gaps or [])
@@ -5529,19 +5662,22 @@ class LiveStateStore:
                 "source_hash": source_hash,
             })
             self.books[token_id] = confirmed
-            oldest = min(book.received_at for book in self.books.values())
             if self.live_book_sink is not None:
                 self.live_book_sink(confirmed)
-            if self._async_persistence:
-                self._persistence_queue.put({
-                    "kind": "confirmation",
-                    "book": confirmed.model_copy(deep=True),
-                    "oldest_book_received_at": oldest,
-                })
-            else:
+            if not self._async_persistence:
                 self.state_index.confirm_book(
-                    confirmed, oldest_book_received_at=oldest,
+                    confirmed,
+                    oldest_book_received_at=min(
+                        book.received_at for book in self.books.values()
+                    ),
                 )
+            # In async live mode this is only a freshness proof for the hot
+            # memory projection; it is not an authoritative event. Sending
+            # hundreds of confirmations per second through the append queue
+            # lets rebuildable SQLite work backpressure event-log fsyncs. A
+            # restart always performs a complete CLOB bootstrap before 8794
+            # becomes ready, so the derived index need not persist these
+            # transient confirmations between authoritative events.
             return None
         book = LiveBook(
             token_id=token_id, condition_id=market.identity.condition_id,
@@ -6128,6 +6264,41 @@ class LiveStateStore:
         if write_checkpoint:
             self.checkpoint()
         return coverage
+
+    def resolve_gaps_from_authoritative_books(
+        self, token_ids: Iterable[str], *, reason: str
+    ) -> LiveEventEnvelope | None:
+        """Close token gaps when a later validated full book is authoritative."""
+        authoritative = set(token_ids)
+        resolved_token_ids = sorted({
+            gap.token_id
+            for gap in self.gaps
+            if not gap.resolved and gap.token_id in authoritative
+        })
+        if not resolved_token_ids:
+            return None
+        recovery_id = content_sha256({
+            "reason": reason,
+            "boundary_cursor": self.cursor,
+            "resolved_gap_token_ids": resolved_token_ids,
+        })
+        resolved = set(resolved_token_ids)
+        for gap in self.gaps:
+            if not gap.resolved and gap.token_id in resolved:
+                gap.resolved = True
+                gap.resolution = f"{reason}:{recovery_id}"
+        return self._emit(
+            "recovery_completed",
+            {
+                "recovery_id": recovery_id,
+                "reason": reason,
+                "resolved_gap_token_ids": resolved_token_ids,
+                "recovered_token_count": len(resolved_token_ids),
+                "recovered_token_sha256": content_sha256(resolved_token_ids),
+            },
+            {},
+            applied=True,
+        )
 
     def recover_from_books(
         self, rows: list[dict[str, Any]], recovery_id: str,
@@ -7017,6 +7188,10 @@ class PolymarketLiveCollector:
         publish_checkpoints: bool = True,
         minimum_snapshot_refresh_age_seconds: float = 0,
         max_concurrent_snapshot_refreshes: int = 1,
+        periodic_snapshot_request_timeout: (
+            float | tuple[float, float] | None
+        ) = None,
+        periodic_snapshot_max_retries: int | None = None,
         websocket_flush_seconds: float = 0.1,
         max_websocket_batch_messages: int = 256,
         max_websocket_batch_items: int = 32,
@@ -7043,16 +7218,20 @@ class PolymarketLiveCollector:
         self.max_concurrent_snapshot_refreshes = max(
             1, max_concurrent_snapshot_refreshes,
         )
+        self.periodic_snapshot_request_timeout = periodic_snapshot_request_timeout
+        self.periodic_snapshot_max_retries = periodic_snapshot_max_retries
         self.websocket_flush_seconds = max(0, websocket_flush_seconds)
         self.max_websocket_batch_messages = max(1, max_websocket_batch_messages)
         self.max_websocket_batch_items = max(1, max_websocket_batch_items)
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
-        # Periodic REST refreshes and reconnect recovery both fetch the same
-        # books and publish through one durable boundary.  Letting their fetches
-        # overlap only creates a publication backlog whose snapshots are stale
-        # by the time they acquire the writer lock.
+        # Independent periodic partitions may fetch concurrently, but a full
+        # reconnect recovery must wait for them and prevent new registrations.
+        # Publication remains serialized by the store's short writer boundary.
         self._snapshot_operation_lock = asyncio.Lock()
+        self._active_periodic_snapshot_operations = 0
+        self._periodic_snapshot_operations_idle = asyncio.Event()
+        self._periodic_snapshot_operations_idle.set()
 
     def reconcile_terminal_tokens(
         self, missing_token_ids: Iterable[str], *, reason: str,
@@ -7146,7 +7325,12 @@ class PolymarketLiveCollector:
         return terminal_market_ids
 
     async def _fetch_complete_books(
-        self, token_ids: Iterable[str], *, reason: str,
+        self,
+        token_ids: Iterable[str],
+        *,
+        reason: str,
+        request_timeout: float | tuple[float, float] | None = None,
+        max_retries_per_batch: int | None = None,
     ) -> tuple[list[dict[str, Any]], set[str]]:
         requested = sorted(set(token_ids))
         try:
@@ -7154,6 +7338,8 @@ class PolymarketLiveCollector:
                 self.books_client.fetch_stream,
                 requested,
                 require_complete_batches=True,
+                request_timeout=request_timeout,
+                max_retries_per_batch=max_retries_per_batch,
             )
             return rows, set()
         except ClobBooksCoverageError as exc:
@@ -7168,6 +7354,8 @@ class PolymarketLiveCollector:
                     self.books_client.fetch_stream,
                     remaining,
                     require_complete_batches=True,
+                    request_timeout=request_timeout,
+                    max_retries_per_batch=max_retries_per_batch,
                 )
                 if remaining else []
             )
@@ -7424,6 +7612,8 @@ class PolymarketLiveCollector:
             if len(refresh_token_ids) <= self.books_client.batch_size:
                 rows, retired = await self._fetch_complete_books(
                     refresh_token_ids, reason=f"{reason}:clob_omission",
+                    request_timeout=self.periodic_snapshot_request_timeout,
+                    max_retries_per_batch=self.periodic_snapshot_max_retries,
                 )
                 tracker["expected"].difference_update(retired)
                 self._commit_recovery_rows(
@@ -7442,6 +7632,8 @@ class PolymarketLiveCollector:
                 refresh_token_ids,
                 batch_consumer=consume,
                 require_complete_batches=True,
+                request_timeout=self.periodic_snapshot_request_timeout,
+                max_retries_per_batch=self.periodic_snapshot_max_retries,
             )
         self._commit_recovery_rows(
             [],
@@ -7587,13 +7779,26 @@ class PolymarketLiveCollector:
             publish_started = time.monotonic()
             cursor_started = self.store.cursor
             with self.store.event_publication_batch():
+                authoritative_book_token_ids: set[str] = set()
                 for item in items:
-                    self.store.apply_websocket(
+                    events = self.store.apply_websocket(
                         item,
                         stale_events_are_resolved=(
                             self.snapshot_refresh_seconds is not None
                         ),
                     )
+                    if events:
+                        authoritative_book_token_ids.update(
+                            event.token_id
+                            for event in events
+                            if event.applied
+                            and event.event_type == "book"
+                            and event.token_id is not None
+                        )
+                self.store.resolve_gaps_from_authoritative_books(
+                    authoritative_book_token_ids,
+                    reason="websocket_full_book",
+                )
             publish_seconds = time.monotonic() - publish_started
             cursor_finished = self.store.cursor
         if sync_wait_seconds >= 0.25 or publish_seconds >= 0.25:
@@ -7622,35 +7827,45 @@ class PolymarketLiveCollector:
             await asyncio.sleep(self.snapshot_refresh_seconds + initial_delay)
             while True:
                 refresh_started = time.monotonic()
+                failed = False
                 try:
+                    # Periodic partitions contain complete market/relation
+                    # groups and publish through the store's short writer
+                    # boundary. Fetch them concurrently so a slow CLOB shard
+                    # cannot age every otherwise independent market. A full
+                    # reconnect recovery keeps precedence and suppresses new
+                    # periodic work while it owns the operation lock.
                     async with self._snapshot_operation_lock:
-                        queued_seconds = time.monotonic() - refresh_started
-                        if queued_seconds >= self.snapshot_refresh_seconds:
-                            LOGGER.info(
-                                "periodic_snapshot_refresh_superseded "
-                                "partition=%d queued_seconds=%.6f interval_seconds=%.6f",
-                                partition_index, queued_seconds,
-                                self.snapshot_refresh_seconds,
-                            )
-                        else:
-                            await self.refresh_books(
-                                "periodic_snapshot_refresh",
-                                partition_index=partition_index,
-                                partition_count=self.max_concurrent_snapshot_refreshes,
-                            )
+                        self._active_periodic_snapshot_operations += 1
+                        self._periodic_snapshot_operations_idle.clear()
+                    try:
+                        await self.refresh_books(
+                            "periodic_snapshot_refresh",
+                            partition_index=partition_index,
+                            partition_count=self.max_concurrent_snapshot_refreshes,
+                        )
+                    finally:
+                        self._active_periodic_snapshot_operations -= 1
+                        if self._active_periodic_snapshot_operations == 0:
+                            self._periodic_snapshot_operations_idle.set()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    failed = True
                     LOGGER.exception(
                         "periodic_snapshot_refresh_failed; retrying after %.3f seconds",
-                        self.snapshot_refresh_seconds,
+                        min(0.05, self.snapshot_refresh_seconds),
                     )
                 elapsed = time.monotonic() - refresh_started
                 # Keep a start-to-start cadence. Sleeping the full interval
                 # after a slow upstream request made a configured two-second
                 # refresh silently drift to four seconds or more, leaving too
                 # little room for a strict consumer's bounded read latency.
-                await asyncio.sleep(max(0, self.snapshot_refresh_seconds - elapsed))
+                await asyncio.sleep(
+                    min(0.05, self.snapshot_refresh_seconds)
+                    if failed
+                    else max(0, self.snapshot_refresh_seconds - elapsed)
+                )
 
         await asyncio.gather(*(
             worker(
@@ -7673,6 +7888,7 @@ class PolymarketLiveCollector:
                 if attempts > 1:
                     try:
                         async with self._snapshot_operation_lock:
+                            await self._periodic_snapshot_operations_idle.wait()
                             await self.bootstrap_books(
                                 f"websocket_reconnect:{attempts}"
                             )

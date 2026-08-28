@@ -44,7 +44,9 @@ def _validate_event(event: LiveEventEnvelope) -> None:
 
 def _decode_stream_message(
     raw: str | bytes,
-) -> tuple[dict[str, Any], LiveEventEnvelope | LiveBook | None]:
+) -> tuple[
+    dict[str, Any], LiveEventEnvelope | LiveBook | list[LiveBook] | None,
+]:
     """Decode and authenticate one frame in one worker scheduling hop."""
     message = json.loads(raw)
     kind = message.get("type")
@@ -52,8 +54,23 @@ def _decode_stream_message(
         event = LiveEventEnvelope.model_validate(message["event"])
         _validate_event(event)
         return message, event
+    if kind == "events":
+        events = [
+            LiveEventEnvelope.model_validate(item)
+            for item in message.get("events") or []
+        ]
+        if not events:
+            raise ValueError("live stream event batch is empty")
+        for event in events:
+            _validate_event(event)
+        return message, events
     if kind == "book_confirmation":
         return message, LiveBook.model_validate(message["book"])
+    if kind == "book_confirmations":
+        books = message.get("books")
+        if not isinstance(books, list) or not books:
+            raise ValueError("live stream book confirmation batch is empty")
+        return message, [LiveBook.model_validate(book) for book in books]
     return message, None
 
 
@@ -244,28 +261,40 @@ class PolymarketLiveProjection:
         self, event: LiveEventEnvelope,
     ) -> LiveEventEnvelope:
         """Apply an already authenticated event without CPU work on the loop."""
-        with self._lock:
-            if not self._ready:
-                raise ValueError("Polymarket live event arrived before replay was ready")
-            if event.cursor != self._latest_cursor + 1:
-                self._ready = False
-                self._error_code = "polymarket_live_stream_cursor_gap"
-                raise ValueError(
-                    "Polymarket live stream cursor gap: "
-                    f"expected {self._latest_cursor + 1}, observed {event.cursor}"
-                )
-            self._latest_cursor = event.cursor
-            self._advance_persisted_cursor_locked()
-            self._events.append(event)
-            self._apply_event_state(event)
-            self._last_message_at = datetime.now(timezone.utc)
-            self._generation += 1
-            for queue in tuple(self._subscribers):
-                if queue.full():
-                    self._subscribers.discard(queue)
-                    continue
-                queue.put_nowait(event)
+        self.apply_validated_lives([event])
         return event
+
+    def apply_validated_lives(
+        self, events: list[LiveEventEnvelope],
+    ) -> None:
+        """Atomically expose one ordered collector publication batch."""
+        if not events:
+            raise ValueError("Polymarket live event batch is empty")
+        with self._lock:
+            for event in events:
+                if not self._ready:
+                    raise ValueError(
+                        "Polymarket live event arrived before replay was ready"
+                    )
+                if event.cursor != self._latest_cursor + 1:
+                    self._ready = False
+                    self._error_code = "polymarket_live_stream_cursor_gap"
+                    raise ValueError(
+                        "Polymarket live stream cursor gap: "
+                        f"expected {self._latest_cursor + 1}, "
+                        f"observed {event.cursor}"
+                    )
+                self._latest_cursor = event.cursor
+                self._advance_persisted_cursor_locked()
+                self._events.append(event)
+                self._apply_event_state(event)
+                self._last_message_at = datetime.now(timezone.utc)
+                self._generation += 1
+                for queue in tuple(self._subscribers):
+                    if queue.full():
+                        self._subscribers.discard(queue)
+                        continue
+                    queue.put_nowait(event)
 
     def update_persistence(
         self, cursor: int, *, queue_depth: int = 0, error: str | None = None,
@@ -325,15 +354,44 @@ class PolymarketLiveProjection:
 
     def confirm_validated_book(self, book: LiveBook) -> None:
         """Apply an already validated confirmation in constant bounded time."""
+        self.confirm_validated_books([book])
+
+    def confirm_validated_books(self, books: list[LiveBook]) -> None:
+        """Atomically apply a validated immutable confirmation batch."""
+        if not books:
+            raise ValueError("Polymarket live book confirmation batch is empty")
         with self._lock:
-            previous = self._books.get(book.token_id)
-            if previous is None or previous.state_checksum != book.state_checksum:
-                self._ready = False
-                self._error_code = "polymarket_live_stream_confirmation_mismatch"
-                raise ValueError("Polymarket live book confirmation mismatches state")
-            self._books[book.token_id] = book
-            self._last_message_at = datetime.now(timezone.utc)
-            self._generation += 1
+            applicable = []
+            for book in books:
+                previous = self._books.get(book.token_id)
+                if previous is None:
+                    self._ready = False
+                    self._error_code = (
+                        "polymarket_live_stream_confirmation_mismatch"
+                    )
+                    raise ValueError(
+                        "Polymarket live book confirmation mismatches state"
+                    )
+                if previous.state_checksum != book.state_checksum:
+                    if book.received_at < previous.received_at:
+                        # A WebSocket delta published after this REST
+                        # confirmation can cross it between collector worker
+                        # threads and the loopback event loop. Its later
+                        # received_at proves the confirmation is superseded;
+                        # an equal/newer mismatch remains a hard divergence.
+                        continue
+                    self._ready = False
+                    self._error_code = (
+                        "polymarket_live_stream_confirmation_mismatch"
+                    )
+                    raise ValueError(
+                        "Polymarket live book confirmation mismatches state"
+                    )
+                applicable.append(book)
+            if applicable:
+                self._books.update({book.token_id: book for book in applicable})
+                self._last_message_at = datetime.now(timezone.utc)
+                self._generation += 1
 
     def _apply_event_state(self, event: LiveEventEnvelope) -> None:
         for gap in event.gaps:
@@ -714,17 +772,23 @@ class PolymarketLiveProjection:
                         "Live book tick differs from atomic instrument facts",
                         503,
                     )
-            # The immutable copy is part of the atomic boundary: none of the
-            # objects used to build health/bootstrap/snapshot may be observed
-            # from a later projection generation.
+            # Projection models are publication snapshots: ingestion replaces
+            # market/book/gap instances and never mutates an instance after it
+            # becomes visible.  Capture their references while holding the
+            # generation lock, then build and serialize the response after
+            # releasing it.  Deep-copying 100 markets and 200 books here used
+            # to hold the ingestion lock for hundreds of milliseconds per
+            # broad read; sustained health/bootstrap traffic could therefore
+            # starve the WebSocket consumer long enough for every book to age
+            # beyond the fail-closed freshness budget.
             copy_started = time.perf_counter()
-            markets = [market.model_copy(deep=True) for market in all_markets]
+            markets = tuple(all_markets)
             books = {
-                token_id: book.model_copy(deep=True)
+                token_id: book
                 for token_id, book in source_books.items()
                 if book is not None
             }
-            gaps = [gap.model_copy(deep=True) for gap in unresolved]
+            gaps = tuple(unresolved)
             phases["projection_copy_ms"] = (
                 time.perf_counter() - copy_started
             ) * 1000
@@ -1050,10 +1114,13 @@ class PolymarketLiveStreamServer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server: Any = None
         self._clients: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._pending_book_confirmations: dict[str, LiveBook] = {}
+        self._book_confirmation_flush_scheduled = False
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self.store.live_event_sink = self.publish
+        self.store.live_event_batch_sink = self.publish_batch
         self.store.live_book_sink = self.publish_book_confirmation
         self._server = await websockets.serve(
             self._handler,
@@ -1070,12 +1137,15 @@ class PolymarketLiveStreamServer:
 
     async def close(self) -> None:
         self.store.live_event_sink = None
+        self.store.live_event_batch_sink = None
         self.store.live_book_sink = None
         if self._server is not None:
             self._broadcast({"type": "close"})
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        self._pending_book_confirmations.clear()
+        self._book_confirmation_flush_scheduled = False
 
     def publish(self, event: LiveEventEnvelope) -> None:
         loop = self._loop
@@ -1089,16 +1159,42 @@ class PolymarketLiveStreamServer:
             {"type": "event", "event": event},
         )
 
-    def publish_book_confirmation(self, book: LiveBook) -> None:
+    def publish_batch(self, events: list[LiveEventEnvelope]) -> None:
         loop = self._loop
         if loop is None or loop.is_closed():
             return
         loop.call_soon_threadsafe(
             self._broadcast,
-            # LiveStateStore replaces books instead of mutating published
-            # instances, so a reference is a stable publication snapshot.
-            {"type": "book_confirmation", "book": book},
+            {"type": "events", "events": tuple(events)},
         )
+
+    def publish_book_confirmation(self, book: LiveBook) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(
+            self._queue_book_confirmation,
+            book,
+        )
+
+    def _queue_book_confirmation(self, book: LiveBook) -> None:
+        # LiveStateStore replaces books instead of mutating published
+        # instances, so retaining the newest reference per token is safe. A
+        # single loop-turn flush replaces hundreds of tiny WebSocket frames
+        # with one bounded batch while preserving the latest freshness proof.
+        self._pending_book_confirmations[book.token_id] = book
+        if self._book_confirmation_flush_scheduled:
+            return
+        self._book_confirmation_flush_scheduled = True
+        assert self._loop is not None
+        self._loop.call_soon(self._flush_book_confirmations)
+
+    def _flush_book_confirmations(self) -> None:
+        books = list(self._pending_book_confirmations.values())
+        self._pending_book_confirmations.clear()
+        self._book_confirmation_flush_scheduled = False
+        if books:
+            self._broadcast({"type": "book_confirmations", "books": books})
 
     def _broadcast(self, message: dict[str, Any]) -> None:
         for queue in tuple(self._clients):
@@ -1210,11 +1306,46 @@ class PolymarketLiveStreamServer:
                         "persistence_error": self.store.persistence_error,
                         "derived_index_error": self.store.derived_index_error,
                     }
-                else:
+                elif message["type"] == "events":
+                    events = [
+                        event for event in message["events"]
+                        if event.cursor > state["latest_cursor"]
+                    ]
+                    if not events:
+                        continue
+                    payload = {
+                        "schema_version": STREAM_SCHEMA,
+                        "type": "events",
+                        "events": [
+                            event.model_dump(mode="json") for event in events
+                        ],
+                        "persisted_cursor": self.store.persisted_cursor,
+                        "persistence_queue_depth": (
+                            self.store._persistence_queue.qsize()
+                        ),
+                        "persistence_error": self.store.persistence_error,
+                        "derived_index_error": self.store.derived_index_error,
+                    }
+                elif message["type"] == "book_confirmation":
                     payload = {
                         "schema_version": STREAM_SCHEMA,
                         "type": "book_confirmation",
                         "book": message["book"].model_dump(mode="json"),
+                        "persisted_cursor": self.store.persisted_cursor,
+                        "persistence_queue_depth": (
+                            self.store._persistence_queue.qsize()
+                        ),
+                        "persistence_error": self.store.persistence_error,
+                        "derived_index_error": self.store.derived_index_error,
+                    }
+                else:
+                    payload = {
+                        "schema_version": STREAM_SCHEMA,
+                        "type": "book_confirmations",
+                        "books": [
+                            book.model_dump(mode="json")
+                            for book in message["books"]
+                        ],
                         "persisted_cursor": self.store.persisted_cursor,
                         "persistence_queue_depth": (
                             self.store._persistence_queue.qsize()
@@ -1287,6 +1418,28 @@ class PolymarketLiveStreamClient:
                                     "derived_index_error"
                                 ),
                             )
+                        elif kind == "events":
+                            if (
+                                not isinstance(validated, list)
+                                or not all(
+                                    isinstance(event, LiveEventEnvelope)
+                                    for event in validated
+                                )
+                            ):
+                                raise ValueError(
+                                    "validated event batch is missing"
+                                )
+                            self.projection.apply_validated_lives(validated)
+                            self.projection.update_persistence(
+                                int(message.get("persisted_cursor", 0)),
+                                queue_depth=int(
+                                    message.get("persistence_queue_depth", 0)
+                                ),
+                                error=message.get("persistence_error"),
+                                derived_index_error=message.get(
+                                    "derived_index_error"
+                                ),
+                            )
                         elif kind == "book_confirmation":
                             if not isinstance(validated, LiveBook):
                                 raise ValueError(
@@ -1294,6 +1447,28 @@ class PolymarketLiveStreamClient:
                                 )
                             book = validated
                             self.projection.confirm_validated_book(book)
+                            self.projection.update_persistence(
+                                int(message.get("persisted_cursor", 0)),
+                                queue_depth=int(
+                                    message.get("persistence_queue_depth", 0)
+                                ),
+                                error=message.get("persistence_error"),
+                                derived_index_error=message.get(
+                                    "derived_index_error"
+                                ),
+                            )
+                        elif kind == "book_confirmations":
+                            if (
+                                not isinstance(validated, list)
+                                or not all(
+                                    isinstance(book, LiveBook)
+                                    for book in validated
+                                )
+                            ):
+                                raise ValueError(
+                                    "validated book confirmation batch is missing"
+                                )
+                            self.projection.confirm_validated_books(validated)
                             self.projection.update_persistence(
                                 int(message.get("persisted_cursor", 0)),
                                 queue_depth=int(

@@ -14,8 +14,11 @@ from unittest.mock import patch
 
 from marketcow.polymarket_live import (
     GammaLiveNormalizer,
+    LiveBook,
+    LiveMarket,
     LiveSnapshotPage,
     LiveStateStore,
+    PolymarketLiveCollector,
     PolymarketLiveReadError,
     PolymarketLiveReadStore,
     _durable_event_log_tail,
@@ -48,6 +51,91 @@ def populated_store(root: Path) -> LiveStateStore:
 
 
 class PolymarketAsyncPersistenceTest(unittest.TestCase):
+    def test_websocket_full_book_resolves_invalid_delta_in_atomic_batch(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            initial_books = [
+                book.model_copy(deep=True) for book in store.books.values()
+            ]
+            published_batches = []
+            store.live_event_batch_sink = published_batches.append
+            collector = PolymarketLiveCollector(
+                store,
+                unittest.mock.Mock(),
+                unittest.mock.Mock(),
+                snapshot_refresh_seconds=1,
+            )
+            crossed = {
+                "event_type": "price_change",
+                "timestamp": "1785739202000",
+                "price_changes": [{
+                    "asset_id": "yes-1",
+                    "side": "BUY",
+                    "price": "0.43",
+                    "size": "1",
+                }],
+            }
+            authoritative = snapshot(
+                "yes-1", "0.41", "0.44", "1785739202001"
+            )
+
+            collector._apply_websocket_batch([crossed, authoritative])
+
+            self.assertEqual(len(published_batches), 1)
+            events = published_batches[0]
+            self.assertEqual(
+                [event.event_type for event in events],
+                ["price_change", "book", "recovery_completed"],
+            )
+            self.assertFalse(events[0].applied)
+            self.assertEqual(
+                events[-1].canonical_payload["resolved_gap_token_ids"],
+                ["yes-1"],
+            )
+            self.assertEqual(sum(not gap.resolved for gap in store.gaps), 0)
+
+            projection = PolymarketLiveProjection(replay_capacity=100)
+            projection.install_state({
+                "schema_version": "marketcow.polymarket.live-stream.v1",
+                "type": "state",
+                "catalog_revision": store.catalog_revision,
+                "catalog_source": store.catalog_source,
+                "latest_cursor": events[0].cursor - 1,
+                "persisted_cursor": events[0].cursor - 1,
+                "active_recovery_id": None,
+                "markets": [
+                    market.model_dump(mode="json")
+                    for market in store.catalog.values()
+                ],
+                "books": [book.model_dump(mode="json") for book in initial_books],
+                "gaps": [],
+            })
+            projection.mark_ready({"latest_cursor": events[0].cursor - 1})
+            projection.apply_validated_lives(events)
+            self.assertEqual(projection.latest_cursor, events[-1].cursor)
+            self.assertEqual(sum(not gap.resolved for gap in projection._gaps), 0)
+
+    def test_freshness_confirmations_never_enter_authoritative_append_queue(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            published = []
+            store.live_book_sink = published.append
+            store.enable_async_persistence()
+            try:
+                confirmed_at = NOW + timedelta(seconds=1)
+                result = store.apply_snapshot(
+                    snapshot("yes-1", "0.40", "0.42"),
+                    received_at=confirmed_at,
+                    allow_freshness_confirmation=True,
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(store._persistence_queue.qsize(), 0)
+                self.assertEqual(published[0].received_at, confirmed_at)
+                self.assertEqual(store.persisted_cursor, store.cursor)
+            finally:
+                store.close_async_persistence(timeout=5)
+
     def test_live_sink_precedes_blocked_persistence_and_durable_tail_catches_up(self):
         with TemporaryDirectory() as temporary:
             store = populated_store(Path(temporary) / "live")
@@ -130,6 +218,10 @@ class PolymarketAsyncPersistenceTest(unittest.TestCase):
                 store.flush_async_persistence(
                     target_cursor=previous_cursor + 1, timeout=5,
                 )
+                for _ in range(100):
+                    if store.derived_index_error:
+                        break
+                    time.sleep(0.01)
             self.assertIsNotNone(first)
             self.assertIsNone(store.persistence_error)
             self.assertIn("database disk image is malformed", store.derived_index_error)
@@ -151,8 +243,101 @@ class PolymarketAsyncPersistenceTest(unittest.TestCase):
             self.assertEqual(tail.cursor, previous_cursor + 2)
             self.assertEqual(size, store.event_path.stat().st_size)
 
+    def test_slow_derived_index_cannot_delay_authoritative_log_fsync(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            previous_cursor = store.cursor
+            index_started = threading.Event()
+            release_index = threading.Event()
+            original = store._persist_index_records
+
+            def blocked(records):
+                index_started.set()
+                release_index.wait(timeout=5)
+                return original(records)
+
+            with patch.object(store, "_persist_index_records", side_effect=blocked):
+                store.enable_async_persistence()
+                emitted = store.apply_snapshot(
+                    snapshot("yes-1", "0.39", "0.41", "1785739210000"),
+                    received_at=NOW,
+                )
+                self.assertIsNotNone(emitted)
+                self.assertTrue(index_started.wait(timeout=2))
+                started = time.perf_counter()
+                store.flush_async_persistence(
+                    target_cursor=previous_cursor + 1, timeout=2,
+                )
+                self.assertLess(time.perf_counter() - started, 0.5)
+                tail, _size = _durable_event_log_tail(store.event_path)
+                self.assertIsNotNone(tail)
+                self.assertEqual(tail.cursor, previous_cursor + 1)
+                release_index.set()
+                store.close_async_persistence(timeout=5)
+
 
 class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
+    async def test_superseded_confirmation_cannot_regress_newer_book(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = populated_store(Path(temporary.name) / "live")
+        projection = PolymarketLiveProjection()
+        current = store.books["yes-1"].model_copy(update={
+            "received_at": NOW + timedelta(seconds=2),
+            "state_checksum": "newer-websocket-checksum",
+        })
+        projection._books[current.token_id] = current
+        older = current.model_copy(update={
+            "received_at": NOW + timedelta(seconds=1),
+            "state_checksum": "older-rest-checksum",
+        })
+
+        projection.confirm_validated_books([older])
+
+        self.assertIs(projection._books[current.token_id], current)
+
+    async def test_newer_mismatched_confirmation_still_fails_closed(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = populated_store(Path(temporary.name) / "live")
+        projection = PolymarketLiveProjection()
+        current = store.books["yes-1"]
+        projection._books[current.token_id] = current
+        divergent = current.model_copy(update={
+            "received_at": NOW + timedelta(seconds=1),
+            "state_checksum": "divergent-newer-checksum",
+        })
+
+        with self.assertRaisesRegex(ValueError, "mismatches state"):
+            projection.confirm_validated_books([divergent])
+
+    async def test_book_confirmations_coalesce_into_one_latest_per_token_batch(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        store = populated_store(Path(temporary.name) / "live")
+        server = PolymarketLiveStreamServer(store, port=free_port())
+        server._loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(maxsize=10)
+        server._clients.add(queue)
+        yes = store.books["yes-1"]
+        no = store.books["no-1"]
+        later = NOW + timedelta(seconds=1)
+
+        server.publish_book_confirmation(yes)
+        server.publish_book_confirmation(no)
+        server.publish_book_confirmation(yes.model_copy(update={
+            "received_at": later,
+        }))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        message = queue.get_nowait()
+        self.assertEqual(message["type"], "book_confirmations")
+        books = {book.token_id: book for book in message["books"]}
+        self.assertEqual(set(books), {"yes-1", "no-1"})
+        self.assertEqual(books["yes-1"].received_at, later)
+        self.assertTrue(queue.empty())
+
     async def test_loopback_stream_builds_projection_and_advances_without_sqlite(self):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -515,6 +700,53 @@ class PolymarketLiveStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not worker.is_alive() for worker in workers))
         self.assertEqual(projection.latest_cursor, store.cursor + 100)
         self.assertLess(elapsed, 0.5)
+
+    def test_broad_scope_capture_reuses_immutable_projection_models(self):
+        with TemporaryDirectory() as temporary:
+            store = populated_store(Path(temporary) / "live")
+            projection = PolymarketLiveProjection(replay_capacity=100)
+            projection.install_state({
+                "schema_version": "marketcow.polymarket.live-stream.v1",
+                "type": "state",
+                "catalog_revision": store.catalog_revision,
+                "catalog_source": store.catalog_source,
+                "latest_cursor": store.cursor,
+                "persisted_cursor": store.cursor,
+                "active_recovery_id": None,
+                "markets": [
+                    market.model_dump(mode="json")
+                    for market in store.catalog.values()
+                ],
+                "books": [
+                    book.model_dump(mode="json")
+                    for book in store.books.values()
+                ],
+                "gaps": [],
+            })
+            projection.mark_ready({"latest_cursor": store.cursor})
+            reader = PolymarketLiveReadStore(
+                store.root,
+                now_provider=lambda: NOW,
+                stable_snapshot_max_book_age_seconds=5,
+            )
+
+            with (
+                patch.object(
+                    LiveMarket,
+                    "model_copy",
+                    side_effect=AssertionError("market copied under capture lock"),
+                ),
+                patch.object(
+                    LiveBook,
+                    "model_copy",
+                    side_effect=AssertionError("book copied under capture lock"),
+                ),
+            ):
+                body = projection.snapshot_json(reader, ["m1"])
+
+            payload = json.loads(body)
+            self.assertEqual(payload["cursor"], store.cursor)
+            self.assertEqual(set(payload["books"]), {"yes-1", "no-1"})
 
     def test_full_sync_scoped_health_covers_relation_books_without_duplicates(self):
         temporary = TemporaryDirectory()

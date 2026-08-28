@@ -20,6 +20,7 @@ from scripts.run_polymarket_scoped_manifest import (
     validate_scope_lifetime,
     validate_snapshot_refresh_seconds,
 )
+from scripts.run_polymarket_live import effective_snapshot_refresh_seconds
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.polymarket_contracts import content_sha256
@@ -116,6 +117,20 @@ class Response:
 
 
 class PolymarketLiveTest(unittest.TestCase):
+    def test_bounded_scope_refresh_cadence_preserves_strict_headroom(self):
+        self.assertEqual(
+            effective_snapshot_refresh_seconds(2, bounded_scope=True), 1,
+        )
+        self.assertEqual(
+            effective_snapshot_refresh_seconds(0.5, bounded_scope=True), 0.5,
+        )
+        self.assertEqual(
+            effective_snapshot_refresh_seconds(2, bounded_scope=False), 2,
+        )
+        self.assertIsNone(
+            effective_snapshot_refresh_seconds(None, bounded_scope=True)
+        )
+
     def setUp(self):
         self.folder = TemporaryDirectory()
         self.root = Path(self.folder.name)
@@ -1176,6 +1191,25 @@ class PolymarketLiveTest(unittest.TestCase):
 
         self.assertEqual(len(client.fetch(["a"])), 1)
         self.assertEqual(client.last_evidence["retry_count"], 1)
+
+    def test_clob_books_periodic_override_fails_fast_without_inline_retry(self):
+        calls = []
+
+        def requester(*_args, **kwargs):
+            calls.append(kwargs["timeout"])
+            raise requests.Timeout("slow periodic shard")
+
+        client = ClobBooksClient(
+            requester=requester, timeout=20, max_retries_per_batch=5,
+        )
+
+        with self.assertRaises(requests.Timeout):
+            client.fetch_stream(
+                ["a"], request_timeout=(0.75, 0.75),
+                max_retries_per_batch=0,
+            )
+
+        self.assertEqual(calls, [(0.75, 0.75)])
 
     def test_clob_books_complete_batch_retries_only_omitted_tokens(self):
         requests_seen = []
@@ -3199,6 +3233,52 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
             # start the second request after roughly 250ms.
             self.assertLess(starts[1] - starts[0], 0.21)
 
+    def test_periodic_snapshot_refreshes_independent_partitions_concurrently(self):
+        with TemporaryDirectory() as folder:
+            collector = PolymarketLiveCollector(
+                LiveStateStore(Path(folder), now_provider=lambda: NOW),
+                GammaKeysetCatalog(
+                    requester=lambda *_args, **_kwargs: Response({"markets": []})
+                ),
+                ClobBooksClient(
+                    requester=lambda *_args, **_kwargs: Response([])
+                ),
+                snapshot_refresh_seconds=0.04,
+                max_concurrent_snapshot_refreshes=4,
+            )
+            active = 0
+            maximum_active = 0
+            partitions = set()
+
+            async def refresh(reason="startup", **partition):
+                nonlocal active, maximum_active
+                partitions.add((
+                    partition["partition_index"], partition["partition_count"],
+                ))
+                active += 1
+                maximum_active = max(maximum_active, active)
+                try:
+                    await asyncio.sleep(0.06)
+                finally:
+                    active -= 1
+                return "recovery"
+
+            collector.refresh_books = refresh
+
+            async def scenario():
+                task = asyncio.create_task(
+                    collector._refresh_snapshots_periodically()
+                )
+                await asyncio.sleep(0.25)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            asyncio.run(scenario())
+
+            self.assertGreaterEqual(maximum_active, 2)
+            self.assertEqual(partitions, {(index, 4) for index in range(4)})
+
     def test_scoped_collector_never_overwrites_global_checkpoint(self):
         with TemporaryDirectory() as folder:
             rows = [gamma_row()]
@@ -3620,9 +3700,11 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 snapshot_refresh_seconds=0.01,
             )
             attempts = []
+            attempt_times = []
 
             async def refresh(reason="startup", **_partition):
                 attempts.append(reason)
+                attempt_times.append(time.monotonic())
                 if len(attempts) == 1:
                     raise RuntimeError("transient CLOB failure")
                 return "recovery"
@@ -3648,6 +3730,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
                 attempts,
                 ["periodic_snapshot_refresh", "periodic_snapshot_refresh"],
             )
+            self.assertLess(attempt_times[1] - attempt_times[0], 0.09)
             self.assertIn("periodic_snapshot_refresh_failed", captured.output[0])
 
     def test_websocket_reconnect_retries_transient_book_recovery_failure(self):
