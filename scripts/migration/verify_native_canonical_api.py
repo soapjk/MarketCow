@@ -291,7 +291,7 @@ def main() -> int:
                 "page_size": "1",
             }
             canonical_url = (
-                f"{base_url}/v1/canonical-bars/aapl.xnas?{urlencode(query)}"
+                f"{base_url}/v1/canonical-bars/AAPL.XNAS?{urlencode(query)}"
             )
             status, first = json_request(canonical_url)
             cursor = first.get("next_cursor", "")
@@ -410,7 +410,7 @@ def main() -> int:
                 clickhouse_query(
                     clickhouse_url,
                     "SELECT count() FROM marketcow_rust_clickhouse_migration FINAL "
-                    "WHERE version IN ('rust-quote-read-v1',"
+                    "WHERE version IN ('rust-quote-latest-v1',"
                     "'rust-canonical-adjustment-read-v1')",
                 )
                 == "2"

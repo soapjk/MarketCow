@@ -1,0 +1,38 @@
+{
+  "binary": "/Volumes/T9/projects/marketcow-workitem-b8ffd893-5dfd-4894-8a17-7e759ca0495f/target/debug/marketcow",
+  "binary_sha256": "688151e6d9c36c53d7e51224c590cdb665220af2bffa455aa9819be237e35aa2",
+  "checks": {
+    "cursor_is_snapshot_bound": false,
+    "first_page_exact_decimal_and_manifest": false,
+    "four_native_tools_reported": true,
+    "http_and_mcp_are_identical": true,
+    "http_page_limit_matches_contract": true,
+    "instrument_registered": true,
+    "mcp_tool_matches_golden": true,
+    "postgres_and_clickhouse_healthy": true,
+    "real_orders_disabled": true,
+    "restart_recovers_exact_clickhouse_snapshot": true,
+    "safe_forward_migrations_recorded_once": false,
+    "signed_cursor_second_page": false,
+    "tampered_cursor_rejected": false,
+    "tradude_does_not_manage_marketcow": true
+  },
+  "clickhouse": {
+    "image": "clickhouse/clickhouse-server:25.8-alpine",
+    "image_id": "sha256:87e0a5b72f5465b18eacca7c76850e7ff551c9795c50e451f5646299e5e24146"
+  },
+  "failure": null,
+  "passed": false,
+  "process_exit_codes": [
+    0,
+    0
+  ],
+  "process_log_tail": "",
+  "safety": {
+    "headless_substitutes_http_network_soak": false,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow": false
+  },
+  "schema_version": "marketcow.native-canonical-api.v1",
+  "source_commit": "ab2e90b8511a41ed527361edda3943ccb85bb9d0"
+}
