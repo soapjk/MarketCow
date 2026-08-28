@@ -28,7 +28,18 @@
       "storage_root": "/tmp/marketcow-rust-polymarket-live-v2.1dQfI1/storage",
       "process_log": "/tmp/marketcow-rust-polymarket-live-v2.1dQfI1/process.log",
       "verdict": "failed",
-      "evidence": "32 connect timeouts produced 64 reconnect-boundary gap records plus terminal gaps; full-sync remained HTTP 503"
+      "evidence": "32 connect timeouts produced 64 reconnect-boundary gap records plus terminal gaps; full-sync remained HTTP 503",
+      "exit_observation": {
+        "observed_after_delayed_process_exit_notification": "2026-08-28T12:05:00Z",
+        "label_present": false,
+        "process_log_bytes": 402,
+        "shutdown_was_drained": true,
+        "shutdown_log_timestamp": "2026-08-28T11:52:46.902922Z",
+        "stopped_log_timestamp": "2026-08-28T11:52:46.925050Z",
+        "wal_verify": {"status":"ok","records":66,"last_cursor":66},
+        "checkpoint_cursor": 66,
+        "interpretation": "A clean controlled exit is not a passing live-data verdict; the retained v2 data remains failed gap-only evidence."
+      }
     },
     {
       "attempt": "v3",
