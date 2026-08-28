@@ -1,0 +1,47 @@
+{
+  "binary_sha256": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "checks": {
+    "checkpoint_manifest_loaded": true,
+    "full_sync_available": true,
+    "full_sync_cursor_matches_manifest": true,
+    "published_cursor_equals_persisted_cursor": true,
+    "real_orders_disabled": true,
+    "recovered_daemon_ready": true,
+    "tradude_does_not_manage_marketcow": true,
+    "unresolved_gap_count_zero": true,
+    "wal_cursor_matches_manifest": true,
+    "wal_verified": true
+  },
+  "failure": null,
+  "full_sync": {
+    "book_count": 200,
+    "boundary_cursor": 5100,
+    "persisted_cursor": 5100,
+    "published_cursor": 5100,
+    "unresolved_gap_count": 0
+  },
+  "manifest_cursor": 5100,
+  "passed": true,
+  "process_exit_code": 0,
+  "process_stderr_tail": "",
+  "readiness": {
+    "fail_closed_reason": null,
+    "mode": "shadow",
+    "ownership_registry": "docs/architecture/migration/domain-ownership.yaml",
+    "ready": true,
+    "real_order_submission_enabled": false,
+    "scope_id": "soak-shadow",
+    "writer_enabled": false
+  },
+  "real_order_submission_enabled": false,
+  "recovery_used_isolated_copy": true,
+  "schema_version": "marketcow.soak-recovery-check.v2",
+  "scope_id": "soak-shadow",
+  "source_storage_root": "/private/tmp/marketcow-http-shadow-smoke-v10.lk2tO7/storage",
+  "tradude_manages_marketcow": false,
+  "wal": {
+    "last_cursor": 5100,
+    "records": 5100,
+    "status": "ok"
+  }
+}

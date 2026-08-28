@@ -1,0 +1,128 @@
+{
+  "apply_latency_us": {
+    "max": 11867,
+    "p50": 7813,
+    "p95": 9868,
+    "p99": 11867
+  },
+  "binary_commit": "f1e386aa7baf2557c83ea7f5870a024b072c5760",
+  "binary_sha256": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "bootstrap_persistence_latency_us": {
+    "max": 12919,
+    "p50": 3712,
+    "p95": 4806,
+    "p99": 8963
+  },
+  "bootstrap_publication_latency_us": {
+    "max": 2,
+    "p50": 1,
+    "p95": 2,
+    "p99": 2
+  },
+  "canonical_event_count": 5100,
+  "checkpoint_count": 1,
+  "consumer_cursors": [
+    5100,
+    5100
+  ],
+  "consumer_request_count": 222,
+  "elapsed_seconds": 33.248554,
+  "failures": [],
+  "final_book_count": 200,
+  "final_metrics": {
+    "marketcow_book_count": 200.0,
+    "marketcow_disconnects_total": 0.0,
+    "marketcow_http_errors_total": 0.0,
+    "marketcow_http_requests_total": 1072.0,
+    "marketcow_ingress_queue_depth": 0.0,
+    "marketcow_maximum_book_age_ms": 975.0,
+    "marketcow_persistence_latency_us": 12919.0,
+    "marketcow_projection_persisted_cursor": 5100.0,
+    "marketcow_projection_published_cursor": 5100.0,
+    "marketcow_publication_latency_us": 9.0,
+    "marketcow_python_worker_cpu_limit_seconds": 900.0,
+    "marketcow_python_worker_memory_limit_kills_total": 0.0,
+    "marketcow_python_worker_memory_limit_mib": 2048.0,
+    "marketcow_python_worker_memory_monitor_failures_total": 0.0,
+    "marketcow_python_worker_restart_budget_exhaustions_total": 0.0,
+    "marketcow_python_worker_restarts_total": 0.0,
+    "marketcow_python_workers_configured": 0.0,
+    "marketcow_python_workers_live": 0.0,
+    "marketcow_real_order_submission_enabled": 0.0,
+    "marketcow_shadow_mode": 1.0,
+    "marketcow_stream_channel_capacity": 256.0,
+    "marketcow_stream_channel_depth": 0.0,
+    "marketcow_stream_clients": 0.0,
+    "marketcow_stream_disconnects_total": 0.0,
+    "marketcow_stream_slow_consumer_disconnects_total": 0.0,
+    "marketcow_unresolved_gaps": 0.0
+  },
+  "finished_at": "2026-08-28T09:04:46.126632+00:00",
+  "gate_verdicts": {
+    "book_age_ms_lte_5000": true,
+    "cursor_lag_zero": true,
+    "disconnect_delta_zero": true,
+    "duration_reached": true,
+    "exact_100_market_200_book_load": true,
+    "four_concurrent_scoped_readers": true,
+    "gap_count_zero": true,
+    "projection_publication_latency_p99_us_lte_5000": true,
+    "queue_depth_zero": true,
+    "readiness_p99_ms_lte_50": true,
+    "real_orders_disabled": true,
+    "runner_failures_zero": true,
+    "tradude_does_not_manage_marketcow": true,
+    "two_independent_consumers": true,
+    "upstream_receive_to_publish_p99_us_lte_20000": true,
+    "wal_persistence_latency_p99_us_lte_20000": true
+  },
+  "headless_substitutes_http_network_soak": false,
+  "ingest_count": 295,
+  "load_model": {
+    "books": 200,
+    "concurrent_scoped_readers": 4,
+    "frames_per_second": 4,
+    "independent_consumers": 2,
+    "markets": 100,
+    "token_updates_per_second": 200,
+    "updates_per_frame": 50
+  },
+  "max_rss_kb": 136432,
+  "observed_maximums": {
+    "book_age_ms": 1379.0,
+    "cursor_lag": 0.0,
+    "disconnects": 0.0,
+    "gap_count": 0.0,
+    "persistence_latency_us": 12919.0,
+    "publication_latency_us": 9.0,
+    "queue_depth": 0.0
+  },
+  "passed": true,
+  "persistence_latency_us": {
+    "max": 10140,
+    "p50": 5283,
+    "p95": 6159,
+    "p99": 10140
+  },
+  "process_log_tail": "",
+  "publication_latency_us": {
+    "max": 9,
+    "p50": 2,
+    "p95": 3,
+    "p99": 9
+  },
+  "reader_request_count": 444,
+  "readiness_latency_ms": {
+    "max": 18.42274999944493,
+    "p50": 2.877791994251311,
+    "p95": 4.598542000167072,
+    "p99": 11.830082978121936
+  },
+  "real_order_submission_enabled": false,
+  "requested_duration_seconds": 30,
+  "samples": 444,
+  "schema_version": "marketcow.shadow-soak.v4",
+  "started_at": "2026-08-28T09:04:12.877871+00:00",
+  "storage_root": "/private/tmp/marketcow-http-shadow-smoke-v10.lk2tO7/storage",
+  "tradude_manages_marketcow": false
+}
