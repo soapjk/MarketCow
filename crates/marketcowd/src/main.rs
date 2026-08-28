@@ -255,11 +255,12 @@ async fn readiness(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn scope(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({
-        "schema_version":"marketcow.polymarket.scope-discovery.v1",
-        "active_scope_id":state.config.scope_id, "scope_status":"shadow",
-        "real_order_submission_enabled":false
-    }))
+    Json(
+        serde_json::to_value(marketcow_contracts::ScopeDiscovery::shadow(
+            state.config.scope_id,
+        ))
+        .expect("scope contract is serializable"),
+    )
 }
 
 async fn admin_migration() -> Json<serde_json::Value> {
@@ -338,12 +339,17 @@ fn constant_time_equal(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn error(status: StatusCode, code: &str, retryable: bool, request_id: &str) -> Response {
+    let envelope = marketcow_contracts::MachineErrorEnvelope {
+        detail: marketcow_contracts::MachineErrorDetail {
+            code: code.into(),
+            message: code.replace('_', " "),
+            retryable,
+            request_id: request_id.into(),
+        },
+    };
     (
         status,
-        Json(
-            json!({"detail":{"code":code,"message":code.replace('_'," "),
-        "retryable":retryable,"request_id":request_id}}),
-        ),
+        Json(serde_json::to_value(envelope).expect("error contract is serializable")),
     )
         .into_response()
 }

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/marketcow-core", "crates/marketcowd"]
+members = [
+  "crates/marketcow-contracts",
+  "crates/marketcow-core",
+  "crates/marketcow-storage",
+  "crates/marketcowd",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,4 +33,3 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
-
