@@ -57,6 +57,25 @@ pub struct CheckpointResponse {
     pub unresolved_gaps: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullSyncHealth {
+    pub ready: bool,
+    pub book_count: usize,
+    pub unresolved_gap_count: usize,
+    pub fail_closed_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullSyncResponse {
+    pub schema_version: String,
+    pub scope_id: String,
+    pub projection_generation: u64,
+    pub boundary_cursor: u64,
+    pub health: FullSyncHealth,
+    pub snapshot: SnapshotResponse,
+    pub checkpoint: CheckpointResponse,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ReadApiError {
     #[error("event page limit must be between 1 and {MAX_EVENT_PAGE}")]
@@ -203,6 +222,25 @@ pub fn checkpoint(projection: &Projection) -> CheckpointResponse {
     }
 }
 
+/// Builds every recovery view from one immutable projection reference. Callers must perform
+/// freshness validation before invoking this function; no storage or second state read occurs.
+pub fn full_sync(projection: &Projection) -> FullSyncResponse {
+    FullSyncResponse {
+        schema_version: LIVE_SCHEMA_VERSION.into(),
+        scope_id: projection.scope_id.clone(),
+        projection_generation: projection.generation,
+        boundary_cursor: projection.cursor,
+        health: FullSyncHealth {
+            ready: projection.ready,
+            book_count: projection.books.len(),
+            unresolved_gap_count: projection.unresolved_gaps.len(),
+            fail_closed_reason: projection.fail_closed_reason.clone(),
+        },
+        snapshot: snapshot(projection),
+        checkpoint: checkpoint(projection),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +320,15 @@ mod tests {
         let checkpoint = checkpoint(&projection);
         assert_eq!(checkpoint.checkpoint_cursor, 1);
         assert_eq!(checkpoint.state_sha256.len(), 64);
+        let full = full_sync(&projection);
+        assert_eq!(full.projection_generation, full.snapshot.generation);
+        assert_eq!(
+            full.boundary_cursor,
+            full.snapshot.watermarks.published_cursor
+        );
+        assert_eq!(full.boundary_cursor, full.checkpoint.checkpoint_cursor);
+        assert_eq!(full.health.book_count, 1);
+        assert!(full.health.ready);
     }
 
     #[test]

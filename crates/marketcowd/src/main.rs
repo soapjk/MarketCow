@@ -518,6 +518,10 @@ fn app(state: AppState) -> Router {
             "/v1/prediction-markets/polymarket/live/checkpoint",
             get(live_checkpoint),
         )
+        .route(
+            "/v1/prediction-markets/polymarket/live/full-sync",
+            get(live_full_sync),
+        )
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
         .route(
@@ -651,6 +655,22 @@ async fn live_checkpoint(
         );
     }
     Json(marketcow_api::checkpoint(&projection)).into_response()
+}
+
+async fn live_full_sync(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+) -> Response {
+    let projection = state.projection.load_full();
+    if !projection.ready || !projection_fresh(&state.config, &projection) {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_projection_unready_or_stale",
+            true,
+            &request_id,
+        );
+    }
+    Json(marketcow_api::full_sync(&projection)).into_response()
 }
 
 #[cfg(test)]
@@ -1041,6 +1061,7 @@ mod tests {
             "/v1/prediction-markets/polymarket/live/snapshot",
             "/v1/prediction-markets/polymarket/live/events",
             "/v1/prediction-markets/polymarket/live/checkpoint",
+            "/v1/prediction-markets/polymarket/live/full-sync",
         ] {
             let response = app(state.clone())
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -1085,6 +1106,7 @@ mod tests {
             "/v1/prediction-markets/polymarket/live/snapshot",
             "/v1/prediction-markets/polymarket/live/events?after_cursor=1&limit=10",
             "/v1/prediction-markets/polymarket/live/checkpoint",
+            "/v1/prediction-markets/polymarket/live/full-sync",
         ] {
             let response = app(state.clone())
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
