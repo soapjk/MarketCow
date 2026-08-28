@@ -107,6 +107,41 @@ CREATE INDEX IF NOT EXISTS instrument_symbol_mapping_instrument_idx
 "#;
 const INSTRUMENT_MASTER_MIGRATION_LOCK: i64 = 0x4d_43_49_4e_53;
 
+pub const CONTROL_PLANE_MIGRATION_VERSION: &str = "rust-control-plane-v1";
+pub const CONTROL_PLANE_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS runtime_config_version (
+    config_id TEXT NOT NULL,
+    version BIGINT NOT NULL CHECK (version > 0),
+    profile TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    config_json JSONB NOT NULL,
+    config_sha256 TEXT NOT NULL CHECK (config_sha256 ~ '^[0-9a-f]{64}$'),
+    observed_at TIMESTAMPTZ NOT NULL,
+    actor TEXT NOT NULL,
+    PRIMARY KEY (config_id, version),
+    UNIQUE (config_id, config_sha256)
+);
+CREATE INDEX IF NOT EXISTS runtime_config_version_pit_idx
+    ON runtime_config_version (config_id, observed_at DESC, version DESC);
+CREATE TABLE IF NOT EXISTS migration_checkpoint (
+    run_id TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    shard TEXT NOT NULL DEFAULT '',
+    revision BIGINT NOT NULL CHECK (revision > 0),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    source_watermark TEXT,
+    target_watermark TEXT,
+    cursor_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    evidence_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (run_id, domain, shard)
+);
+CREATE INDEX IF NOT EXISTS migration_checkpoint_status_idx
+    ON migration_checkpoint (status, updated_at, run_id, domain, shard);
+"#;
+const CONTROL_PLANE_MIGRATION_LOCK: i64 = 0x4d_43_43_54_4c;
+
 pub const CLICKHOUSE_QUOTE_MIGRATION_VERSION: &str = "rust-quote-latest-v1";
 pub const CLICKHOUSE_QUOTE_MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS market_quote_latest (
@@ -847,6 +882,8 @@ pub enum RepositoryError {
     ArtifactVerificationFailed,
     #[error("instrument identity or symbol mapping conflict")]
     InstrumentConflict,
+    #[error("immutable runtime configuration identity conflict")]
+    ConfigConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1251,6 +1288,368 @@ fn valid_symbol_map(symbols: &std::collections::BTreeMap<String, String>) -> boo
             && !symbol.is_empty()
             && symbol.len() <= 128
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeConfigVersionRecord {
+    pub config_id: String,
+    pub version: u64,
+    pub profile: String,
+    pub schema_version: String,
+    pub config_json: serde_json::Value,
+    pub config_sha256: String,
+    pub observed_at: DateTime<Utc>,
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationCheckpointRecord {
+    pub run_id: String,
+    pub domain: String,
+    #[serde(default)]
+    pub shard: String,
+    pub revision: u64,
+    pub status: String,
+    pub source_watermark: Option<String>,
+    pub target_watermark: Option<String>,
+    pub cursor_json: serde_json::Value,
+    pub evidence_json: serde_json::Value,
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub struct PostgresControlPlaneRepository {
+    client: tokio::sync::Mutex<tokio_postgres::Client>,
+}
+
+impl PostgresControlPlaneRepository {
+    pub async fn connect(dsn: &str) -> Result<Self, RepositoryError> {
+        if dsn.trim().is_empty() {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::error!(error = %error, "postgres_control_plane_connection_failed");
+            }
+        });
+        Ok(Self {
+            client: tokio::sync::Mutex::new(client),
+        })
+    }
+
+    pub async fn migrate_safe_forward(&self, binary_commit: &str) -> Result<(), RepositoryError> {
+        if binary_commit.is_empty() || binary_commit.len() > 128 {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let checksum = hex::encode(Sha256::digest(CONTROL_PLANE_MIGRATION_SQL.as_bytes()));
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&CONTROL_PLANE_MIGRATION_LOCK],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        transaction
+            .batch_execute(RUST_MIGRATION_TABLE_SQL)
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let existing = transaction
+            .query_opt(
+                "SELECT checksum FROM marketcow_rust_migration WHERE version = $1",
+                &[&CONTROL_PLANE_MIGRATION_VERSION],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if let Some(row) = existing {
+            if row.get::<_, String>(0) != checksum {
+                return Err(RepositoryError::MigrationChecksumMismatch);
+            }
+        } else {
+            transaction
+                .batch_execute(CONTROL_PLANE_MIGRATION_SQL)
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+            transaction
+                .execute(
+                    "INSERT INTO marketcow_rust_migration \
+                     (version,checksum,applied_at,binary_commit,safe_forward) \
+                     VALUES ($1,$2,NOW(),$3,TRUE)",
+                    &[&CONTROL_PLANE_MIGRATION_VERSION, &checksum, &binary_commit],
+                )
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)
+    }
+
+    pub async fn save_runtime_config_version(
+        &self,
+        record: &RuntimeConfigVersionRecord,
+    ) -> Result<RuntimeConfigVersionRecord, RepositoryError> {
+        validate_runtime_config(record)?;
+        let canonical =
+            serde_json::to_vec(&record.config_json).map_err(|_| RepositoryError::InvalidInput)?;
+        if hex::encode(Sha256::digest(&canonical)) != record.config_sha256 {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let version = i64::try_from(record.version).map_err(|_| RepositoryError::InvalidInput)?;
+        let client = self.client.lock().await;
+        client
+            .query_one(
+                "INSERT INTO runtime_config_version \
+                 (config_id,version,profile,schema_version,config_json,config_sha256,observed_at,actor) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) \
+                 ON CONFLICT (config_id,config_sha256) DO UPDATE SET \
+                 config_sha256=EXCLUDED.config_sha256 \
+                 RETURNING config_id,version,profile,schema_version,config_json,config_sha256,observed_at,actor",
+                &[
+                    &record.config_id,
+                    &version,
+                    &record.profile,
+                    &record.schema_version,
+                    &record.config_json,
+                    &record.config_sha256,
+                    &record.observed_at,
+                    &record.actor,
+                ],
+            )
+            .await
+            .map_err(map_control_plane_write_error)
+            .and_then(decode_runtime_config)
+    }
+
+    pub async fn get_runtime_config_version(
+        &self,
+        config_id: &str,
+        as_of: Option<DateTime<Utc>>,
+    ) -> Result<Option<RuntimeConfigVersionRecord>, RepositoryError> {
+        if !valid_control_id(config_id, false) {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let client = self.client.lock().await;
+        let row = if let Some(as_of) = as_of {
+            client
+                .query_opt(
+                    "SELECT config_id,version,profile,schema_version,config_json,config_sha256,observed_at,actor \
+                     FROM runtime_config_version WHERE config_id=$1 AND observed_at <= $2 \
+                     ORDER BY observed_at DESC,version DESC LIMIT 1",
+                    &[&config_id, &as_of],
+                )
+                .await
+        } else {
+            client
+                .query_opt(
+                    "SELECT config_id,version,profile,schema_version,config_json,config_sha256,observed_at,actor \
+                     FROM runtime_config_version WHERE config_id=$1 \
+                     ORDER BY observed_at DESC,version DESC LIMIT 1",
+                    &[&config_id],
+                )
+                .await
+        }
+        .map_err(|_| RepositoryError::Unavailable)?;
+        row.map(decode_runtime_config).transpose()
+    }
+
+    pub async fn upsert_migration_checkpoint(
+        &self,
+        record: &MigrationCheckpointRecord,
+        expected_revision: u64,
+    ) -> Result<MigrationCheckpointRecord, RepositoryError> {
+        validate_checkpoint(record)?;
+        let expected_revision =
+            i64::try_from(expected_revision).map_err(|_| RepositoryError::InvalidInput)?;
+        let client = self.client.lock().await;
+        let row = if expected_revision == 0 {
+            client
+                .query_opt(
+                    "INSERT INTO migration_checkpoint \
+                     (run_id,domain,shard,revision,status,source_watermark,target_watermark,\
+                      cursor_json,evidence_json,error,updated_at) \
+                     VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$9,$10) \
+                     ON CONFLICT (run_id,domain,shard) DO NOTHING \
+                     RETURNING run_id,domain,shard,revision,status,source_watermark,\
+                               target_watermark,cursor_json,evidence_json,error,updated_at",
+                    &[
+                        &record.run_id,
+                        &record.domain,
+                        &record.shard,
+                        &record.status,
+                        &record.source_watermark,
+                        &record.target_watermark,
+                        &record.cursor_json,
+                        &record.evidence_json,
+                        &record.error,
+                        &record.updated_at,
+                    ],
+                )
+                .await
+        } else {
+            client
+                .query_opt(
+                    "UPDATE migration_checkpoint SET revision=revision+1,status=$1,\
+                     source_watermark=$2,target_watermark=$3,cursor_json=$4,evidence_json=$5,\
+                     error=$6,updated_at=$7 WHERE run_id=$8 AND domain=$9 AND shard=$10 \
+                     AND revision=$11 RETURNING run_id,domain,shard,revision,status,\
+                     source_watermark,target_watermark,cursor_json,evidence_json,error,updated_at",
+                    &[
+                        &record.status,
+                        &record.source_watermark,
+                        &record.target_watermark,
+                        &record.cursor_json,
+                        &record.evidence_json,
+                        &record.error,
+                        &record.updated_at,
+                        &record.run_id,
+                        &record.domain,
+                        &record.shard,
+                        &expected_revision,
+                    ],
+                )
+                .await
+        }
+        .map_err(|_| RepositoryError::Unavailable)?;
+        row.map(decode_checkpoint)
+            .transpose()?
+            .ok_or(RepositoryError::RevisionConflict)
+    }
+
+    pub async fn get_migration_checkpoint(
+        &self,
+        run_id: &str,
+        domain: &str,
+        shard: &str,
+    ) -> Result<Option<MigrationCheckpointRecord>, RepositoryError> {
+        if !valid_control_id(run_id, false)
+            || !valid_control_id(domain, false)
+            || !valid_control_id(shard, true)
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let client = self.client.lock().await;
+        client
+            .query_opt(
+                "SELECT run_id,domain,shard,revision,status,source_watermark,target_watermark,\
+                 cursor_json,evidence_json,error,updated_at FROM migration_checkpoint \
+                 WHERE run_id=$1 AND domain=$2 AND shard=$3",
+                &[&run_id, &domain, &shard],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?
+            .map(decode_checkpoint)
+            .transpose()
+    }
+}
+
+fn validate_runtime_config(record: &RuntimeConfigVersionRecord) -> Result<(), RepositoryError> {
+    if !valid_control_id(&record.config_id, false)
+        || record.version == 0
+        || !valid_control_id(&record.profile, false)
+        || !valid_control_id(&record.schema_version, false)
+        || !record.config_json.is_object()
+        || record.config_sha256.len() != 64
+        || !record
+            .config_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !valid_control_id(&record.actor, false)
+    {
+        return Err(RepositoryError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_checkpoint(record: &MigrationCheckpointRecord) -> Result<(), RepositoryError> {
+    if !valid_control_id(&record.run_id, false)
+        || !valid_control_id(&record.domain, false)
+        || !valid_control_id(&record.shard, true)
+        || !matches!(
+            record.status.as_str(),
+            "pending" | "running" | "completed" | "failed"
+        )
+        || !record.cursor_json.is_object()
+        || !record.evidence_json.is_object()
+        || record
+            .source_watermark
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024)
+        || record
+            .target_watermark
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024)
+        || record
+            .error
+            .as_ref()
+            .is_some_and(|value| value.len() > 4096)
+    {
+        return Err(RepositoryError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn valid_control_id(value: &str, allow_empty: bool) -> bool {
+    (allow_empty || !value.is_empty())
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+        })
+}
+
+fn decode_runtime_config(
+    row: tokio_postgres::Row,
+) -> Result<RuntimeConfigVersionRecord, RepositoryError> {
+    let record = RuntimeConfigVersionRecord {
+        config_id: row.get(0),
+        version: u64::try_from(row.get::<_, i64>(1)).map_err(|_| RepositoryError::Unavailable)?,
+        profile: row.get(2),
+        schema_version: row.get(3),
+        config_json: row.get(4),
+        config_sha256: row.get(5),
+        observed_at: row.get(6),
+        actor: row.get(7),
+    };
+    validate_runtime_config(&record).map_err(|_| RepositoryError::Unavailable)?;
+    Ok(record)
+}
+
+fn decode_checkpoint(
+    row: tokio_postgres::Row,
+) -> Result<MigrationCheckpointRecord, RepositoryError> {
+    let record = MigrationCheckpointRecord {
+        run_id: row.get(0),
+        domain: row.get(1),
+        shard: row.get(2),
+        revision: u64::try_from(row.get::<_, i64>(3)).map_err(|_| RepositoryError::Unavailable)?,
+        status: row.get(4),
+        source_watermark: row.get(5),
+        target_watermark: row.get(6),
+        cursor_json: row.get(7),
+        evidence_json: row.get(8),
+        error: row.get(9),
+        updated_at: row.get(10),
+    };
+    validate_checkpoint(&record).map_err(|_| RepositoryError::Unavailable)?;
+    Ok(record)
+}
+
+fn map_control_plane_write_error(error: tokio_postgres::Error) -> RepositoryError {
+    if error.as_db_error().is_some_and(|database| {
+        database.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
+    }) {
+        RepositoryError::ConfigConflict
+    } else {
+        RepositoryError::Unavailable
+    }
 }
 
 pub struct PostgresJobRepository {
@@ -1839,6 +2238,51 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_contract_is_versioned_immutable_and_cas_fenced() {
+        assert_eq!(CONTROL_PLANE_MIGRATION_VERSION, "rust-control-plane-v1");
+        assert!(CONTROL_PLANE_MIGRATION_SQL.contains("runtime_config_version"));
+        assert!(CONTROL_PLANE_MIGRATION_SQL.contains("UNIQUE (config_id, config_sha256)"));
+        assert!(CONTROL_PLANE_MIGRATION_SQL.contains("migration_checkpoint"));
+        assert!(CONTROL_PLANE_MIGRATION_SQL.contains("revision BIGINT NOT NULL"));
+        assert!(
+            CONTROL_PLANE_MIGRATION_SQL
+                .contains("status IN ('pending', 'running', 'completed', 'failed')")
+        );
+        let config = serde_json::json!({"metadata_backend":"postgres","unicode":"苹果😀"});
+        let canonical = serde_json::to_vec(&config).unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(&canonical)),
+            "707ec8c4e99a803d0ebba0da8b52e82f2e42a081a4a3598fec16945ebe4fa317"
+        );
+        let record = RuntimeConfigVersionRecord {
+            config_id: "runtime".into(),
+            version: 1,
+            profile: "shadow".into(),
+            schema_version: "marketcow.runtime-config.v1".into(),
+            config_json: config,
+            config_sha256: hex::encode(Sha256::digest(canonical)),
+            observed_at: Utc::now(),
+            actor: "integration-test".into(),
+        };
+        validate_runtime_config(&record).unwrap();
+        assert_eq!(record.config_sha256.len(), 64);
+        let checkpoint = MigrationCheckpointRecord {
+            run_id: "migration-1".into(),
+            domain: "instrument_master".into(),
+            shard: "a".into(),
+            revision: 0,
+            status: "running".into(),
+            source_watermark: Some("10".into()),
+            target_watermark: Some("9".into()),
+            cursor_json: serde_json::json!({"after":"AAPL.XNAS"}),
+            evidence_json: serde_json::json!({"rows":10}),
+            error: None,
+            updated_at: Utc::now(),
+        };
+        validate_checkpoint(&checkpoint).unwrap();
+    }
+
+    #[test]
     fn worker_artifact_promotion_is_verified_content_addressed_and_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let staging_root = directory.path().join("staging");
@@ -2215,5 +2659,173 @@ mod tests {
             repository.upsert(&conflicting).await,
             Err(RepositoryError::InstrumentConflict)
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MARKETCOW_TEST_POSTGRES_DSN"]
+    async fn postgres_control_plane_round_trip_when_test_dsn_is_configured() {
+        let dsn = std::env::var("MARKETCOW_TEST_POSTGRES_DSN")
+            .expect("set MARKETCOW_TEST_POSTGRES_DSN for the ignored integration test");
+        let repository = PostgresControlPlaneRepository::connect(&dsn).await.unwrap();
+        repository
+            .migrate_safe_forward("test-binary-commit")
+            .await
+            .unwrap();
+        repository
+            .migrate_safe_forward("test-binary-commit")
+            .await
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let config_id = format!("runtime-{suffix}");
+        let first_json = serde_json::json!({
+            "metadata_backend":"postgres",
+            "unicode":"苹果😀",
+            "value":"first"
+        });
+        let first = RuntimeConfigVersionRecord {
+            config_id: config_id.clone(),
+            version: 1,
+            profile: "shadow".into(),
+            schema_version: "marketcow.runtime-config.v1".into(),
+            config_sha256: hex::encode(Sha256::digest(serde_json::to_vec(&first_json).unwrap())),
+            config_json: first_json,
+            observed_at: DateTime::parse_from_rfc3339("2026-07-20T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            actor: "integration-test".into(),
+        };
+        let saved = repository
+            .save_runtime_config_version(&first)
+            .await
+            .unwrap();
+        assert_eq!(saved, first);
+        let mut equivalent = first.clone();
+        equivalent.version = 2;
+        equivalent.observed_at += Duration::hours(1);
+        assert_eq!(
+            repository
+                .save_runtime_config_version(&equivalent)
+                .await
+                .unwrap(),
+            first
+        );
+        let mut second = first.clone();
+        second.version = 2;
+        second.config_json = serde_json::json!({"metadata_backend":"postgres","value":"second"});
+        second.config_sha256 = hex::encode(Sha256::digest(
+            serde_json::to_vec(&second.config_json).unwrap(),
+        ));
+        second.observed_at += Duration::days(1);
+        assert_eq!(
+            repository
+                .save_runtime_config_version(&second)
+                .await
+                .unwrap(),
+            second
+        );
+        assert_eq!(
+            repository
+                .get_runtime_config_version(
+                    &config_id,
+                    Some(first.observed_at + Duration::hours(12)),
+                )
+                .await
+                .unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            repository
+                .get_runtime_config_version(&config_id, None)
+                .await
+                .unwrap(),
+            Some(second)
+        );
+        let mut bad_hash = first.clone();
+        bad_hash.version = 3;
+        bad_hash.config_sha256 = "0".repeat(64);
+        assert!(matches!(
+            repository.save_runtime_config_version(&bad_hash).await,
+            Err(RepositoryError::InvalidInput)
+        ));
+
+        let checkpoint = MigrationCheckpointRecord {
+            run_id: format!("migration-{suffix}"),
+            domain: "fundamental_snapshot".into(),
+            shard: "a".into(),
+            revision: 0,
+            status: "running".into(),
+            source_watermark: Some("10".into()),
+            target_watermark: Some("9".into()),
+            cursor_json: serde_json::json!({"after":"600001"}),
+            evidence_json: serde_json::json!({"rows":10}),
+            error: None,
+            updated_at: Utc::now(),
+        };
+        let created = repository
+            .upsert_migration_checkpoint(&checkpoint, 0)
+            .await
+            .unwrap();
+        assert_eq!(created.revision, 1);
+        let mut completed = checkpoint.clone();
+        completed.status = "completed".into();
+        completed.target_watermark = Some("10".into());
+        completed.updated_at += Duration::seconds(1);
+        let completed = repository
+            .upsert_migration_checkpoint(&completed, 1)
+            .await
+            .unwrap();
+        assert_eq!(completed.revision, 2);
+        assert_eq!(completed.cursor_json, checkpoint.cursor_json);
+        assert!(matches!(
+            repository.upsert_migration_checkpoint(&checkpoint, 1).await,
+            Err(RepositoryError::RevisionConflict)
+        ));
+        assert_eq!(
+            repository
+                .get_migration_checkpoint(
+                    &checkpoint.run_id,
+                    &checkpoint.domain,
+                    &checkpoint.shard,
+                )
+                .await
+                .unwrap(),
+            Some(completed)
+        );
+
+        let mut concurrent = checkpoint.clone();
+        concurrent.run_id = format!("migration-concurrent-{suffix}");
+        repository
+            .upsert_migration_checkpoint(&concurrent, 0)
+            .await
+            .unwrap();
+        let mut completed = concurrent.clone();
+        completed.status = "completed".into();
+        let mut failed = concurrent.clone();
+        failed.status = "failed".into();
+        failed.error = Some("injected".into());
+        let (left, right) = tokio::join!(
+            repository.upsert_migration_checkpoint(&completed, 1),
+            repository.upsert_migration_checkpoint(&failed, 1),
+        );
+        assert_eq!(
+            [left, right]
+                .into_iter()
+                .filter(|result| matches!(result, Err(RepositoryError::RevisionConflict)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            repository
+                .get_migration_checkpoint(
+                    &concurrent.run_id,
+                    &concurrent.domain,
+                    &concurrent.shard,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
     }
 }
