@@ -413,6 +413,7 @@ struct AppState {
     recent_events: Arc<ArcSwap<Vec<marketcow_core::PersistedEvent>>>,
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
     jobs: Arc<DurableJobCoordinator>,
+    instruments: Arc<InstrumentCoordinator>,
     stream: broadcast::Sender<marketcow_core::PersistedEvent>,
     worker_status: Arc<PythonWorkerStatus>,
     legacy_mcp: Option<LegacyMcpProxy>,
@@ -516,6 +517,88 @@ struct DurableJobCoordinator {
     repository: Option<Arc<marketcow_storage::PostgresJobRepository>>,
     memory_artifacts: AsyncMutex<BTreeMap<String, marketcow_storage::ArtifactManifestRecord>>,
     dispatch_policies: BTreeMap<String, marketcow_jobs::DispatchPolicy>,
+}
+
+struct InstrumentCoordinator {
+    repository: Option<Arc<marketcow_storage::PostgresInstrumentRepository>>,
+    #[cfg(test)]
+    memory: AsyncMutex<BTreeMap<String, marketcow_storage::InstrumentRecord>>,
+    #[cfg(test)]
+    memory_enabled: bool,
+}
+
+impl InstrumentCoordinator {
+    async fn open(profile: &str) -> Result<Self> {
+        let dsn = env::var("MARKETCOW_POSTGRES_DSN").ok();
+        let Some(dsn) = dsn else {
+            if profile == "production" {
+                bail!("MARKETCOW_POSTGRES_DSN is required in production");
+            }
+            return Ok(Self {
+                repository: None,
+                #[cfg(test)]
+                memory: AsyncMutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                memory_enabled: false,
+            });
+        };
+        let binary_commit = env::var("MARKETCOW_BINARY_COMMIT").unwrap_or_default();
+        if binary_commit.is_empty() {
+            bail!("MARKETCOW_BINARY_COMMIT is required when PostgreSQL instruments are enabled");
+        }
+        let repository = Arc::new(
+            marketcow_storage::PostgresInstrumentRepository::connect(&dsn)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?,
+        );
+        repository
+            .migrate_safe_forward(&binary_commit)
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Self {
+            repository: Some(repository),
+            #[cfg(test)]
+            memory: AsyncMutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            memory_enabled: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn memory() -> Self {
+        Self {
+            repository: None,
+            memory: AsyncMutex::new(BTreeMap::new()),
+            memory_enabled: true,
+        }
+    }
+
+    fn persistence_enabled(&self) -> bool {
+        self.repository.is_some()
+    }
+
+    async fn get(
+        &self,
+        instrument_id: &str,
+    ) -> Result<Option<marketcow_storage::InstrumentRecord>, marketcow_storage::RepositoryError>
+    {
+        if let Some(repository) = &self.repository {
+            return repository.get(instrument_id).await;
+        }
+        #[cfg(test)]
+        if self.memory_enabled {
+            return Ok(self.memory.lock().await.get(instrument_id).cloned());
+        }
+        Err(marketcow_storage::RepositoryError::Unavailable)
+    }
+
+    #[cfg(test)]
+    async fn insert_fixture(&self, record: marketcow_storage::InstrumentRecord) {
+        self.memory
+            .lock()
+            .await
+            .insert(record.instrument_id.clone(), record);
+    }
 }
 
 impl DurableJobCoordinator {
@@ -1261,6 +1344,7 @@ async fn serve() -> Result<()> {
         )
         .await?,
     );
+    let instruments = Arc::new(InstrumentCoordinator::open(&config.profile).await?);
     let legacy_mcp = config
         .legacy_mcp_url
         .clone()
@@ -1275,6 +1359,7 @@ async fn serve() -> Result<()> {
         recent_events: Arc::new(ArcSwap::from_pointee(recent_events)),
         runtime: Arc::new(AsyncMutex::new(runtime)),
         jobs,
+        instruments,
         stream,
         worker_status: Arc::new(PythonWorkerStatus::default()),
         legacy_mcp,
@@ -1581,6 +1666,7 @@ fn app(state: AppState) -> Router {
             get(live_full_sync),
         )
         .route("/v1/market-data/stream", get(market_data_stream))
+        .route("/v1/instruments/{instrument_id}", get(get_instrument))
         .route("/mcp", post(mcp))
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
@@ -1621,12 +1707,13 @@ fn health_payload(state: &AppState) -> serde_json::Value {
         "mcp":{
             "enabled":true,
             "endpoint":"/mcp",
-            "native_tools":1,
+            "native_tools":2,
             "legacy_proxy_configured":state.legacy_mcp.is_some()
         },
         "components":{
             "api":"healthy","wal":"healthy","python_workers":worker_health,
-            "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" }
+            "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" },
+            "instrument_persistence":if state.instruments.persistence_enabled() { "healthy" } else { "degraded_development_only" }
         },
         "python_worker_pool":{
             "configured":configured_workers,
@@ -1644,6 +1731,37 @@ fn health_payload(state: &AppState) -> serde_json::Value {
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(health_payload(&state))
+}
+
+async fn instrument_lookup(
+    state: &AppState,
+    instrument_id: &str,
+) -> Result<marketcow_storage::InstrumentRecord, (StatusCode, serde_json::Value)> {
+    match state.instruments.get(instrument_id).await {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            json!({"code":"instrument_not_found","instrument_id":instrument_id}),
+        )),
+        Err(marketcow_storage::RepositoryError::InvalidInput) => Err((
+            StatusCode::BAD_REQUEST,
+            json!({"code":"invalid_instrument_id","instrument_id":instrument_id}),
+        )),
+        Err(_) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"code":"instrument_repository_unavailable"}),
+        )),
+    }
+}
+
+async fn get_instrument(
+    State(state): State<AppState>,
+    AxumPath(instrument_id): AxumPath<String>,
+) -> Response {
+    match instrument_lookup(&state, &instrument_id).await {
+        Ok(record) => Json(record).into_response(),
+        Err((status, detail)) => (status, Json(json!({"detail":detail}))).into_response(),
+    }
 }
 
 async fn mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -1777,9 +1895,13 @@ async fn mcp_handle_request(
 }
 
 async fn mcp_tools_list(state: &AppState, request_id: serde_json::Value) -> serde_json::Value {
-    let native = marketcow_contracts::mcp_service_health_tool_definition();
+    let native_health = marketcow_contracts::mcp_service_health_tool_definition();
+    let native_instrument = marketcow_contracts::mcp_get_instrument_tool_definition();
     let Some(proxy) = &state.legacy_mcp else {
-        return mcp_result(request_id, json!({"tools":[native]}));
+        return mcp_result(
+            request_id,
+            json!({"tools":[native_health,native_instrument]}),
+        );
     };
     let proxy_request = json!({
         "jsonrpc":"2.0",
@@ -1814,14 +1936,16 @@ async fn mcp_tools_list(state: &AppState, request_id: serde_json::Value) -> serd
     if observed != expected || tools.len() != expected.len() || !safe {
         return mcp_error(request_id, -32603, "Legacy MCP tools contract is invalid");
     }
-    let mut merged = tools
+    let merged = tools
         .iter()
-        .filter(|tool| {
-            tool.get("name").and_then(serde_json::Value::as_str) != Some("service_health")
-        })
-        .cloned()
+        .map(
+            |tool| match tool.get("name").and_then(serde_json::Value::as_str) {
+                Some("service_health") => native_health.clone(),
+                Some("get_instrument") => native_instrument.clone(),
+                _ => tool.clone(),
+            },
+        )
         .collect::<Vec<_>>();
-    merged.insert(0, native);
     mcp_result(request_id, json!({"tools":merged}))
 }
 
@@ -1838,6 +1962,52 @@ async fn mcp_tool_call(
         .unwrap_or_else(|| json!({}));
     if name.is_none() || !arguments.is_object() {
         return mcp_error(request_id, -32602, "Invalid tool call parameters");
+    }
+    if name == Some("get_instrument") {
+        let arguments = arguments.as_object().expect("arguments were validated");
+        let mut unexpected = arguments
+            .keys()
+            .filter(|key| key.as_str() != "instrument_id")
+            .cloned()
+            .collect::<Vec<_>>();
+        unexpected.sort();
+        if !unexpected.is_empty() {
+            let error = json!({
+                "error":"invalid_tool_input",
+                "detail":format!("unexpected argument(s): {}", unexpected.join(", "))
+            });
+            return mcp_result(request_id, mcp_tool_result(error, true));
+        }
+        let Some(instrument_id) = arguments
+            .get("instrument_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            let detail = if arguments.contains_key("instrument_id") {
+                "instrument_id must be a non-empty string"
+            } else {
+                "missing required argument(s): instrument_id"
+            };
+            let error = json!({"error":"invalid_tool_input","detail":detail});
+            return mcp_result(request_id, mcp_tool_result(error, true));
+        };
+        return match instrument_lookup(state, instrument_id).await {
+            Ok(record) => mcp_result(
+                request_id,
+                mcp_tool_result(
+                    serde_json::to_value(record).expect("InstrumentRecord serializes"),
+                    false,
+                ),
+            ),
+            Err((status, detail)) => {
+                let error = json!({
+                    "error":"marketcow_api_error",
+                    "detail":{"status_code":status.as_u16(),"detail":detail}
+                });
+                mcp_result(request_id, mcp_tool_result(error, true))
+            }
+        };
     }
     if name != Some("service_health") {
         if !marketcow_contracts::MCP_LEGACY_TOOL_NAMES.contains(&name.expect("name was validated"))
@@ -3204,11 +3374,117 @@ mod tests {
                 recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
                 runtime: Arc::new(AsyncMutex::new(runtime)),
                 jobs: Arc::new(DurableJobCoordinator::memory()),
+                instruments: Arc::new(InstrumentCoordinator::memory()),
                 stream,
                 worker_status: Arc::new(PythonWorkerStatus::default()),
                 legacy_mcp: None,
             },
         )
+    }
+
+    fn instrument_fixture() -> marketcow_storage::InstrumentRecord {
+        marketcow_storage::InstrumentRecord {
+            schema_version: 1,
+            instrument_id: "AAPL.XNAS".into(),
+            instrument_type: "equity".into(),
+            asset_class: "equity".into(),
+            symbol: "AAPL".into(),
+            market: "US".into(),
+            mic: "XNAS".into(),
+            currency: "USD".into(),
+            price_precision: 4,
+            size_precision: 8,
+            tick_size: "0.0100".parse().unwrap(),
+            size_increment: "0.00000001".parse().unwrap(),
+            lot_size: "1".parse().unwrap(),
+            ts_event: chrono::DateTime::parse_from_rfc3339("2026-08-28T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ts_init: chrono::DateTime::parse_from_rfc3339("2026-08-28T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            provider_symbols: BTreeMap::from([("longport".into(), "AAPL.US".into())]),
+            broker_symbols: BTreeMap::from([("ibkr".into(), "AAPL".into())]),
+            content_hash: format!("sha256:{}", "a".repeat(64)),
+            updated_at: chrono::DateTime::parse_from_rfc3339("2026-08-28T00:00:02Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_instrument_http_and_mcp_share_the_exact_record() {
+        let (_dir, state) = test_state();
+        let fixture = instrument_fixture();
+        state.instruments.insert_fixture(fixture.clone()).await;
+
+        let http = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/instruments/AAPL.XNAS")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(http.status(), StatusCode::OK);
+        let http: serde_json::Value =
+            serde_json::from_slice(&to_bytes(http.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(http, serde_json::to_value(&fixture).unwrap());
+        assert_eq!(http["tick_size"], "0.0100");
+
+        let mcp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"get_instrument","arguments":{"instrument_id":" AAPL.XNAS "}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mcp: serde_json::Value =
+            serde_json::from_slice(&to_bytes(mcp.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(mcp["result"]["isError"], false);
+        assert_eq!(mcp["result"]["structuredContent"], http);
+
+        let missing = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/instruments/MSFT.XNAS")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing: serde_json::Value =
+            serde_json::from_slice(&to_bytes(missing.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(missing["detail"]["code"], "instrument_not_found");
+
+        let invalid = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"get_instrument","arguments":{"instrument_id":"AAPL.XNAS","extra":true}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let invalid: serde_json::Value =
+            serde_json::from_slice(&to_bytes(invalid.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(invalid["result"]["isError"], true);
+        assert_eq!(
+            invalid["result"]["structuredContent"]["error"],
+            "invalid_tool_input"
+        );
     }
 
     async fn legacy_mcp_fixture(Json(message): Json<serde_json::Value>) -> Json<serde_json::Value> {
@@ -3295,11 +3571,18 @@ mod tests {
             .unwrap();
         let listed: serde_json::Value =
             serde_json::from_slice(&to_bytes(list.into_body(), 16_384).await.unwrap()).unwrap();
-        let golden: serde_json::Value = serde_json::from_str(include_str!(
+        let health_golden: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/mcp-service-health-tool-v1.json"
         ))
         .unwrap();
-        assert_eq!(listed["result"]["tools"], json!([golden]));
+        let instrument_golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/mcp-get-instrument-tool-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            listed["result"]["tools"],
+            json!([health_golden, instrument_golden])
+        );
 
         let call = app(state.clone())
             .oneshot(
@@ -3495,8 +3778,12 @@ mod tests {
             listed["result"]["tools"][0],
             marketcow_contracts::mcp_service_health_tool_definition()
         );
+        assert_eq!(
+            listed["result"]["tools"][2],
+            marketcow_contracts::mcp_get_instrument_tool_definition()
+        );
 
-        let call = app(state)
+        let call = app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -3518,6 +3805,42 @@ mod tests {
             "legacy_fixture"
         );
         assert_eq!(called["result"]["structuredContent"]["tool"], "get_quotes");
+
+        state.instruments = Arc::new(InstrumentCoordinator {
+            repository: None,
+            memory: AsyncMutex::new(BTreeMap::new()),
+            memory_enabled: false,
+        });
+        let native_failure = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"get_instrument","arguments":{"instrument_id":"AAPL.XNAS"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let native_failure: serde_json::Value =
+            serde_json::from_slice(&to_bytes(native_failure.into_body(), 16_384).await.unwrap())
+                .unwrap();
+        assert_eq!(native_failure["result"]["isError"], true);
+        assert_eq!(
+            native_failure["result"]["structuredContent"]["error"],
+            "marketcow_api_error"
+        );
+        assert_eq!(
+            native_failure["result"]["structuredContent"]["detail"]["status_code"],
+            503
+        );
+        assert!(
+            native_failure["result"]["structuredContent"]
+                .get("via")
+                .is_none()
+        );
 
         assert!(
             validate_legacy_mcp_url(

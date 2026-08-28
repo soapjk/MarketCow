@@ -1,0 +1,23 @@
+{
+  "name": "get_instrument",
+  "description": "Get canonical identity, venue, currency, precision, and provider mappings.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "instrument_id": {
+        "type": "string",
+        "description": "Canonical ID such as AAPL.XNAS or 600519.XSHG."
+      }
+    },
+    "required": [
+      "instrument_id"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

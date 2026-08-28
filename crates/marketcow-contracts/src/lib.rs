@@ -52,6 +52,30 @@ pub fn mcp_service_health_tool_definition() -> serde_json::Value {
     })
 }
 
+pub fn mcp_get_instrument_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name":"get_instrument",
+        "description":"Get canonical identity, venue, currency, precision, and provider mappings.",
+        "inputSchema":{
+            "type":"object",
+            "properties":{
+                "instrument_id":{
+                    "type":"string",
+                    "description":"Canonical ID such as AAPL.XNAS or 600519.XSHG."
+                }
+            },
+            "required":["instrument_id"],
+            "additionalProperties":false
+        },
+        "annotations":{
+            "readOnlyHint":true,
+            "destructiveHint":false,
+            "idempotentHint":true,
+            "openWorldHint":false
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineErrorDetail {
     pub code: String,
@@ -272,5 +296,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(mcp_service_health_tool_definition(), golden);
+    }
+
+    #[test]
+    fn rust_mcp_get_instrument_definition_matches_python_golden() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/mcp-get-instrument-tool-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(mcp_get_instrument_tool_definition(), golden);
     }
 }
