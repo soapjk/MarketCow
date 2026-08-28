@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 pub const PREDICTION_MARKET_CONTRACT: &str = "marketcow.prediction_market.v1";
 pub const LIVE_SCHEMA_VERSION: &str = "marketcow.polymarket.live.v2";
+pub const WORKER_PROTOCOL_VERSION: &str = "marketcow.worker.v1";
+pub const MAX_WORKER_FRAME_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineErrorDetail {
@@ -51,6 +53,81 @@ pub struct EventContractFields {
     pub fail_closed_reason: Option<String>,
     pub gaps: Vec<serde_json::Value>,
     pub received_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerFrame {
+    pub protocol_version: String,
+    pub message_id: String,
+    #[serde(flatten)]
+    pub message: WorkerMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "message_type", rename_all = "snake_case")]
+pub enum WorkerMessage {
+    Hello {
+        worker_id: String,
+        worker_revision: String,
+        nonce: String,
+        capabilities: Vec<String>,
+    },
+    HelloAck {
+        daemon_revision: String,
+        nonce: String,
+        maximum_frame_bytes: usize,
+    },
+    Poll,
+    NoWork,
+    Task {
+        job_id: String,
+        lease_token: String,
+        deadline: DateTime<Utc>,
+        job_type: String,
+        request_schema: String,
+        request_sha256: String,
+        request: serde_json::Value,
+        staging_path: String,
+    },
+    Start {
+        job_id: String,
+        lease_token: String,
+    },
+    Complete {
+        job_id: String,
+        lease_token: String,
+        relative_path: String,
+        sha256: String,
+        size_bytes: u64,
+        media_type: String,
+    },
+    Fail {
+        job_id: String,
+        lease_token: String,
+        code: String,
+        classification: String,
+        redacted_message: String,
+        retryable: bool,
+    },
+    JobState {
+        job_id: String,
+        status: String,
+        revision: u64,
+    },
+    Error {
+        code: String,
+        retryable: bool,
+    },
+}
+
+impl WorkerFrame {
+    pub fn new(message_id: impl Into<String>, message: WorkerMessage) -> Self {
+        Self {
+            protocol_version: WORKER_PROTOCOL_VERSION.into(),
+            message_id: message_id.into(),
+            message,
+        }
+    }
 }
 
 pub fn validate_provider_neutral_fixture(value: &serde_json::Value) -> Result<(), String> {
@@ -118,5 +195,29 @@ mod tests {
             serde_json::to_value(error).unwrap()["detail"]["code"],
             "cursor_gap"
         );
+    }
+
+    #[test]
+    fn worker_protocol_is_versioned_typed_and_decimal_agnostic() {
+        let frame = WorkerFrame::new(
+            "message-1",
+            WorkerMessage::Task {
+                job_id: "job-1".into(),
+                lease_token: "lease-secret".into(),
+                deadline: DateTime::parse_from_rfc3339("2026-08-28T04:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                job_type: "provider.history".into(),
+                request_schema: "marketcow.provider.history.v1".into(),
+                request_sha256: "a".repeat(64),
+                request: serde_json::json!({"price":"0.100000000000000001"}),
+                staging_path: "/tmp/staging/job-1".into(),
+            },
+        );
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["protocol_version"], WORKER_PROTOCOL_VERSION);
+        assert_eq!(value["message_type"], "task");
+        assert_eq!(value["request"]["price"], "0.100000000000000001");
+        assert_eq!(serde_json::from_value::<WorkerFrame>(value).unwrap(), frame);
     }
 }

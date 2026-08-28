@@ -722,6 +722,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "marketcow-jobs"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "marketcow-polymarket"
 version = "0.1.0"
 dependencies = [
@@ -766,11 +779,13 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "hex",
  "http",
  "libc",
  "marketcow-api",
  "marketcow-contracts",
  "marketcow-core",
+ "marketcow-jobs",
  "marketcow-runtime",
  "serde",
  "serde_json",

@@ -4,6 +4,7 @@ members = [
   "crates/marketcow-api",
   "crates/marketcow-contracts",
   "crates/marketcow-core",
+  "crates/marketcow-jobs",
   "crates/marketcow-polymarket",
   "crates/marketcow-runtime",
   "crates/marketcow-storage",

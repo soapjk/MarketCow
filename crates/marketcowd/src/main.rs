@@ -12,10 +12,11 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -31,8 +32,6 @@ use tokio::{
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
-const PROTOCOL_VERSION: &str = "marketcow.worker.v1";
 
 #[derive(Parser)]
 #[command(name = "marketcow", version, about = "MarketCow Rust shadow platform")]
@@ -154,6 +153,7 @@ struct AppState {
     projection: Arc<ArcSwap<marketcow_core::Projection>>,
     recent_events: Arc<ArcSwap<Vec<marketcow_core::PersistedEvent>>>,
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
+    jobs: Arc<AsyncMutex<marketcow_jobs::JobEngine>>,
 }
 
 #[derive(Default)]
@@ -265,9 +265,15 @@ async fn serve() -> Result<()> {
         projection: Arc::new(ArcSwap::from(projection)),
         recent_events: Arc::new(ArcSwap::from_pointee(recent_events)),
         runtime: Arc::new(AsyncMutex::new(runtime)),
+        jobs: Arc::new(AsyncMutex::new(marketcow_jobs::JobEngine::default())),
     };
     let worker_path = config.worker_socket.clone();
-    let worker = tokio::spawn(async move { worker_server(worker_path).await });
+    let worker_jobs = state.jobs.clone();
+    let worker_staging_root = config.storage_root.join("worker-staging");
+    let worker =
+        tokio::spawn(
+            async move { worker_server(worker_path, worker_staging_root, worker_jobs).await },
+        );
     let app = app(state);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     info!(bind=%config.bind, shadow=true, "marketcowd_ready");
@@ -923,54 +929,261 @@ async fn shutdown() {
     warn!("shutdown_draining");
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct WorkerEnvelope {
-    protocol_version: String,
-    message_type: String,
-    worker_revision: String,
-    nonce: String,
-}
-
-async fn worker_server(path: PathBuf) -> Result<()> {
+async fn worker_server(
+    path: PathBuf,
+    staging_root: PathBuf,
+    jobs: Arc<AsyncMutex<marketcow_jobs::JobEngine>>,
+) -> Result<()> {
     let _ = fs::remove_file(&path);
+    fs::create_dir_all(&staging_root)?;
+    fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o700))?;
     let listener = UnixListener::bind(&path)?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
+        let connection_jobs = jobs.clone();
+        let connection_staging_root = staging_root.clone();
         tokio::spawn(async move {
-            match read_frame(&mut stream).await {
-                Ok(input)
-                    if input.protocol_version == PROTOCOL_VERSION
-                        && input.message_type == "hello" =>
-                {
-                    let response = WorkerEnvelope {
-                        protocol_version: PROTOCOL_VERSION.into(),
-                        message_type: "hello_ack".into(),
-                        worker_revision: env!("CARGO_PKG_VERSION").into(),
-                        nonce: input.nonce,
-                    };
-                    let _ = write_frame(&mut stream, &response).await;
-                }
-                Ok(_) => {
-                    let _ = stream.shutdown().await;
-                }
-                Err(error) => warn!(%error, "worker_handshake_rejected"),
+            if let Err(error) =
+                handle_worker(stream, connection_staging_root, connection_jobs).await
+            {
+                warn!(%error, "worker_connection_rejected");
             }
         });
     }
 }
 
-async fn read_frame(stream: &mut UnixStream) -> Result<WorkerEnvelope> {
+async fn handle_worker(
+    mut stream: UnixStream,
+    staging_root: PathBuf,
+    jobs: Arc<AsyncMutex<marketcow_jobs::JobEngine>>,
+) -> Result<()> {
+    use marketcow_contracts::{WORKER_PROTOCOL_VERSION, WorkerFrame, WorkerMessage};
+
+    let hello = tokio::time::timeout(std::time::Duration::from_secs(10), read_frame(&mut stream))
+        .await
+        .context("worker handshake timeout")??;
+    let (worker_id, worker_revision, nonce, capabilities) = match hello.message {
+        WorkerMessage::Hello {
+            worker_id,
+            worker_revision,
+            nonce,
+            capabilities,
+        } if hello.protocol_version == WORKER_PROTOCOL_VERSION
+            && !worker_id.is_empty()
+            && worker_id.len() <= 128
+            && !worker_revision.is_empty()
+            && worker_revision.len() <= 256
+            && !nonce.is_empty()
+            && nonce.len() <= 128
+            && capabilities.len() <= 64
+            && capabilities
+                .iter()
+                .all(|capability| !capability.is_empty() && capability.len() <= 128) =>
+        {
+            (worker_id, worker_revision, nonce, capabilities)
+        }
+        _ => bail!("invalid worker handshake"),
+    };
+    info!(worker_id, worker_revision, "worker_handshake_accepted");
+    write_frame(
+        &mut stream,
+        &WorkerFrame::new(
+            hello.message_id,
+            WorkerMessage::HelloAck {
+                daemon_revision: env!("CARGO_PKG_VERSION").into(),
+                nonce,
+                maximum_frame_bytes: marketcow_contracts::MAX_WORKER_FRAME_BYTES,
+            },
+        ),
+    )
+    .await?;
+
+    loop {
+        let input =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), read_frame(&mut stream))
+                .await
+            {
+                Ok(Ok(input)) => input,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => bail!("worker idle timeout"),
+            };
+        if input.protocol_version != WORKER_PROTOCOL_VERSION || input.message_id.is_empty() {
+            bail!("worker protocol mismatch");
+        }
+        let response = match input.message {
+            WorkerMessage::Poll => {
+                let now = Utc::now();
+                let claimed = {
+                    let mut engine = jobs.lock().await;
+                    engine.expire_leases(now);
+                    engine.requeue_retryable(now);
+                    engine
+                        .claim_next(
+                            &worker_id,
+                            &capabilities,
+                            chrono::Duration::seconds(60),
+                            now,
+                        )
+                        .map_err(anyhow::Error::msg)?
+                        .cloned()
+                };
+                match claimed {
+                    Some(job) => {
+                        let task_staging = staging_root.join(&job.job_id);
+                        fs::create_dir_all(&task_staging)?;
+                        fs::set_permissions(&task_staging, fs::Permissions::from_mode(0o700))?;
+                        WorkerMessage::Task {
+                            job_id: job.job_id,
+                            lease_token: job.lease_token.context("claimed job lacks lease")?,
+                            deadline: job.deadline,
+                            job_type: job.job_type,
+                            request_schema: job.request_schema,
+                            request_sha256: job.request_sha256,
+                            request: job.request,
+                            staging_path: task_staging.to_string_lossy().into_owned(),
+                        }
+                    }
+                    None => WorkerMessage::NoWork,
+                }
+            }
+            WorkerMessage::Start {
+                job_id,
+                lease_token,
+            } => {
+                let job = jobs
+                    .lock()
+                    .await
+                    .start(&job_id, &lease_token, Utc::now())
+                    .map_err(anyhow::Error::msg)?
+                    .clone();
+                worker_job_state(&job)
+            }
+            WorkerMessage::Complete {
+                job_id,
+                lease_token,
+                relative_path,
+                sha256,
+                size_bytes,
+                media_type,
+            } => {
+                let result = marketcow_jobs::StagedResult {
+                    relative_path,
+                    sha256,
+                    size_bytes,
+                    media_type,
+                };
+                verify_staged_result(&staging_root, &job_id, &result)?;
+                let job = jobs
+                    .lock()
+                    .await
+                    .succeed(&job_id, &lease_token, result, Utc::now())
+                    .map_err(anyhow::Error::msg)?
+                    .clone();
+                worker_job_state(&job)
+            }
+            WorkerMessage::Fail {
+                job_id,
+                lease_token,
+                code,
+                classification,
+                redacted_message,
+                retryable,
+            } => {
+                let job = jobs
+                    .lock()
+                    .await
+                    .fail(
+                        &job_id,
+                        &lease_token,
+                        marketcow_jobs::JobError {
+                            code,
+                            classification,
+                            redacted_message,
+                        },
+                        retryable,
+                        Utc::now(),
+                    )
+                    .map_err(anyhow::Error::msg)?
+                    .clone();
+                worker_job_state(&job)
+            }
+            _ => WorkerMessage::Error {
+                code: "worker_message_not_allowed".into(),
+                retryable: false,
+            },
+        };
+        write_frame(&mut stream, &WorkerFrame::new(input.message_id, response)).await?;
+    }
+}
+
+fn worker_job_state(job: &marketcow_jobs::ProviderJob) -> marketcow_contracts::WorkerMessage {
+    marketcow_contracts::WorkerMessage::JobState {
+        job_id: job.job_id.clone(),
+        status: serde_json::to_value(job.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into()),
+        revision: job.revision,
+    }
+}
+
+fn verify_staged_result(
+    staging_root: &Path,
+    job_id: &str,
+    result: &marketcow_jobs::StagedResult,
+) -> Result<()> {
+    if !job_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        bail!("invalid staging job id");
+    }
+    let task_root = staging_root.join(job_id);
+    let candidate = task_root.join(&result.relative_path);
+    let metadata = fs::symlink_metadata(&candidate)?;
+    if !metadata.file_type().is_file() || metadata.len() != result.size_bytes {
+        bail!("staged result metadata mismatch");
+    }
+    let canonical_task = fs::canonicalize(&task_root)?;
+    let canonical_candidate = fs::canonicalize(&candidate)?;
+    if canonical_candidate.parent() != Some(canonical_task.as_path()) {
+        bail!("staged result escaped task root");
+    }
+    let mut file = std::fs::File::open(&canonical_candidate)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    if actual != result.sha256.to_ascii_lowercase() {
+        bail!("staged result SHA-256 mismatch");
+    }
+    Ok(())
+}
+
+async fn read_frame(stream: &mut UnixStream) -> Result<marketcow_contracts::WorkerFrame> {
     let length = stream.read_u32().await? as usize;
-    if length == 0 || length > 1_048_576 {
+    if length == 0 || length > marketcow_contracts::MAX_WORKER_FRAME_BYTES {
         bail!("invalid worker frame length");
     }
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await?;
     Ok(serde_json::from_slice(&bytes)?)
 }
-async fn write_frame(stream: &mut UnixStream, value: &WorkerEnvelope) -> Result<()> {
+async fn write_frame(
+    stream: &mut UnixStream,
+    value: &marketcow_contracts::WorkerFrame,
+) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
+    if bytes.is_empty() || bytes.len() > marketcow_contracts::MAX_WORKER_FRAME_BYTES {
+        bail!("invalid worker response frame length");
+    }
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(&bytes).await?;
     stream.flush().await?;
@@ -1016,6 +1229,7 @@ mod tests {
                 projection: Arc::new(ArcSwap::from_pointee(bootstrap_projection("s".into()))),
                 recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
                 runtime: Arc::new(AsyncMutex::new(runtime)),
+                jobs: Arc::new(AsyncMutex::new(marketcow_jobs::JobEngine::default())),
             },
         )
     }
@@ -1037,6 +1251,145 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["real_order_submission_enabled"],
             false
         );
+    }
+
+    #[tokio::test]
+    async fn uds_worker_handshake_claim_start_and_verified_completion() {
+        use marketcow_contracts::{WorkerFrame, WorkerMessage};
+
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("worker.sock");
+        let staging = dir.path().join("staging");
+        let now = Utc::now();
+        let mut engine = marketcow_jobs::JobEngine::default();
+        let job_id = engine
+            .submit(
+                marketcow_jobs::SubmitJob {
+                    idempotency_key: "worker-flow-1".into(),
+                    job_type: "provider.history".into(),
+                    request_schema: "marketcow.provider.history.v1".into(),
+                    request: json!({"symbol":"AAPL.XNAS"}),
+                    deadline: now + chrono::Duration::minutes(5),
+                    max_attempts: 2,
+                    audit_actor: "test".into(),
+                },
+                now,
+            )
+            .unwrap()
+            .job_id
+            .clone();
+        let jobs = Arc::new(AsyncMutex::new(engine));
+        let server_jobs = jobs.clone();
+        let server_socket = socket.clone();
+        let server_staging = staging.clone();
+        let server =
+            tokio::spawn(
+                async move { worker_server(server_socket, server_staging, server_jobs).await },
+            );
+        let mut stream = None;
+        for _ in 0..100 {
+            match UnixStream::connect(&socket).await {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+        let mut stream = stream.expect("worker socket should become available");
+        assert_eq!(
+            fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        write_frame(
+            &mut stream,
+            &WorkerFrame::new(
+                "hello-1",
+                WorkerMessage::Hello {
+                    worker_id: "python-test".into(),
+                    worker_revision: "test-revision".into(),
+                    nonce: "nonce-1".into(),
+                    capabilities: vec!["provider.history".into()],
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let ack = read_frame(&mut stream).await.unwrap();
+        assert!(matches!(
+            ack.message,
+            WorkerMessage::HelloAck { nonce, .. } if nonce == "nonce-1"
+        ));
+
+        write_frame(
+            &mut stream,
+            &WorkerFrame::new("poll-1", WorkerMessage::Poll),
+        )
+        .await
+        .unwrap();
+        let task = read_frame(&mut stream).await.unwrap();
+        let (lease_token, staging_path) = match task.message {
+            WorkerMessage::Task {
+                job_id: assigned,
+                lease_token,
+                staging_path,
+                request_sha256,
+                ..
+            } => {
+                assert_eq!(assigned, job_id);
+                assert_eq!(request_sha256.len(), 64);
+                (lease_token, staging_path)
+            }
+            other => panic!("expected worker task, got {other:?}"),
+        };
+
+        write_frame(
+            &mut stream,
+            &WorkerFrame::new(
+                "start-1",
+                WorkerMessage::Start {
+                    job_id: job_id.clone(),
+                    lease_token: lease_token.clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut stream).await.unwrap().message,
+            WorkerMessage::JobState { ref status, .. } if status == "running"
+        ));
+
+        let result_bytes = br#"{"rows":1}"#;
+        let result_path = PathBuf::from(staging_path).join("result.json");
+        fs::write(&result_path, result_bytes).unwrap();
+        let result_sha256 = hex::encode(Sha256::digest(result_bytes));
+        write_frame(
+            &mut stream,
+            &WorkerFrame::new(
+                "complete-1",
+                WorkerMessage::Complete {
+                    job_id: job_id.clone(),
+                    lease_token,
+                    relative_path: "result.json".into(),
+                    sha256: result_sha256,
+                    size_bytes: result_bytes.len() as u64,
+                    media_type: "application/json".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut stream).await.unwrap().message,
+            WorkerMessage::JobState { ref status, .. } if status == "succeeded"
+        ));
+        assert_eq!(
+            jobs.lock().await.get(&job_id).unwrap().status,
+            marketcow_jobs::JobStatus::Succeeded
+        );
+        server.abort();
     }
     #[tokio::test]
     async fn admin_is_fail_closed_without_token() {

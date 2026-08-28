@@ -20,9 +20,12 @@ async def handshake(socket_path: Path, revision: str) -> dict[str, object]:
     payload = json.dumps(
         {
             "protocol_version": PROTOCOL_VERSION,
+            "message_id": secrets.token_hex(16),
             "message_type": "hello",
+            "worker_id": f"python-{os.getpid()}",
             "worker_revision": revision,
             "nonce": nonce,
+            "capabilities": [],
         },
         separators=(",", ":"),
     ).encode()
@@ -40,6 +43,8 @@ async def handshake(socket_path: Path, revision: str) -> dict[str, object]:
         raise ValueError("worker protocol version mismatch")
     if response.get("message_type") != "hello_ack" or response.get("nonce") != nonce:
         raise ValueError("worker handshake authentication failed")
+    if response.get("maximum_frame_bytes") != MAX_FRAME_BYTES:
+        raise ValueError("worker frame limit mismatch")
     return response
 
 
@@ -63,4 +68,3 @@ async def _main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(_main())
-
