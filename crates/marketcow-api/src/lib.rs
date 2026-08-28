@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const MAX_EVENT_PAGE: usize = 1_000;
+pub const STREAM_PROTOCOL_VERSION: &str = "marketcow.market-stream.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorWatermarks {
@@ -74,6 +75,74 @@ pub struct FullSyncResponse {
     pub health: FullSyncHealth,
     pub snapshot: SnapshotResponse,
     pub checkpoint: CheckpointResponse,
+}
+
+/// Versioned downstream WebSocket contract. Every frame carries the authoritative event cursor;
+/// clients must full-sync again after `resync_required` instead of guessing across a gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamFrame {
+    pub protocol_version: String,
+    pub scope_id: String,
+    pub cursor: u64,
+    #[serde(flatten)]
+    pub payload: StreamPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamPayload {
+    Subscription {
+        mode: String,
+        boundary_cursor: u64,
+        full_sync: Option<Box<FullSyncResponse>>,
+    },
+    Event {
+        event: EventContractFields,
+    },
+    ResyncRequired {
+        reason: String,
+        retryable: bool,
+    },
+}
+
+pub fn stream_subscription(projection: &Projection, resumed: bool) -> StreamFrame {
+    StreamFrame {
+        protocol_version: STREAM_PROTOCOL_VERSION.into(),
+        scope_id: projection.scope_id.clone(),
+        cursor: projection.cursor,
+        payload: StreamPayload::Subscription {
+            mode: if resumed { "resume" } else { "full_sync" }.into(),
+            boundary_cursor: projection.cursor,
+            full_sync: (!resumed).then(|| Box::new(full_sync(projection))),
+        },
+    }
+}
+
+pub fn stream_event(scope_id: &str, record: &PersistedEvent) -> Result<StreamFrame, ReadApiError> {
+    Ok(StreamFrame {
+        protocol_version: STREAM_PROTOCOL_VERSION.into(),
+        scope_id: scope_id.into(),
+        cursor: record.event.cursor,
+        payload: StreamPayload::Event {
+            event: event_contract(record)?,
+        },
+    })
+}
+
+pub fn stream_resync_required(
+    scope_id: &str,
+    cursor: u64,
+    reason: impl Into<String>,
+) -> StreamFrame {
+    StreamFrame {
+        protocol_version: STREAM_PROTOCOL_VERSION.into(),
+        scope_id: scope_id.into(),
+        cursor,
+        payload: StreamPayload::ResyncRequired {
+            reason: reason.into(),
+            retryable: true,
+        },
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -177,7 +246,7 @@ pub fn events_page(
     })
 }
 
-fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, ReadApiError> {
+pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, ReadApiError> {
     let canonical_payload =
         serde_json::to_value(&record.event.kind).map_err(|_| ReadApiError::Serialization)?;
     let canonical_bytes =
@@ -381,5 +450,38 @@ mod tests {
             response.events[0].gaps[0]["reason"],
             "source_gap:disconnect"
         );
+    }
+
+    #[test]
+    fn stream_contract_distinguishes_full_sync_resume_and_resync() {
+        let mut projection = Projection::bootstrap("scope-1");
+        projection.cursor = 7;
+        projection.persisted_cursor = 7;
+        let initial = stream_subscription(&projection, false);
+        assert_eq!(initial.protocol_version, STREAM_PROTOCOL_VERSION);
+        assert!(matches!(
+            initial.payload,
+            StreamPayload::Subscription {
+                ref mode,
+                boundary_cursor: 7,
+                full_sync: Some(_),
+            } if mode == "full_sync"
+        ));
+        let resume = stream_subscription(&projection, true);
+        assert!(matches!(
+            resume.payload,
+            StreamPayload::Subscription {
+                ref mode,
+                boundary_cursor: 7,
+                full_sync: None,
+            } if mode == "resume"
+        ));
+        assert!(matches!(
+            stream_resync_required("scope-1", 6, "slow_consumer").payload,
+            StreamPayload::ResyncRequired {
+                retryable: true,
+                ..
+            }
+        ));
     }
 }

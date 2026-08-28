@@ -2,7 +2,10 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State},
+    extract::{
+        DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State, WebSocketUpgrade,
+        ws::{CloseFrame, Message, WebSocket, close_code},
+    },
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -27,11 +30,15 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     signal,
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, broadcast},
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+
+const STREAM_CHANNEL_CAPACITY: usize = 256;
+const STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const STREAM_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Parser)]
 #[command(name = "marketcow", version, about = "MarketCow Rust shadow platform")]
@@ -154,6 +161,7 @@ struct AppState {
     recent_events: Arc<ArcSwap<Vec<marketcow_core::PersistedEvent>>>,
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
     jobs: Arc<AsyncMutex<marketcow_jobs::JobEngine>>,
+    stream: broadcast::Sender<marketcow_core::PersistedEvent>,
 }
 
 #[derive(Default)]
@@ -163,6 +171,9 @@ struct Metrics {
     disconnects: AtomicU64,
     persistence_latency_us: AtomicU64,
     publication_latency_us: AtomicU64,
+    stream_clients: AtomicU64,
+    stream_disconnects: AtomicU64,
+    stream_slow_consumer_disconnects: AtomicU64,
 }
 
 struct AuditLog {
@@ -258,6 +269,7 @@ async fn serve() -> Result<()> {
     let runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(&config))?;
     let projection = runtime.projection();
     let recent_events = runtime.recent_events().to_vec();
+    let (stream, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
     let state = AppState {
         config: config.clone(),
         audit,
@@ -266,6 +278,7 @@ async fn serve() -> Result<()> {
         recent_events: Arc::new(ArcSwap::from_pointee(recent_events)),
         runtime: Arc::new(AsyncMutex::new(runtime)),
         jobs: Arc::new(AsyncMutex::new(marketcow_jobs::JobEngine::default())),
+        stream,
     };
     let worker_path = config.worker_socket.clone();
     let worker_jobs = state.jobs.clone();
@@ -528,6 +541,7 @@ fn app(state: AppState) -> Router {
             "/v1/prediction-markets/polymarket/live/full-sync",
             get(live_full_sync),
         )
+        .route("/v1/market-data/stream", get(market_data_stream))
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
         .route(
@@ -682,6 +696,280 @@ async fn live_full_sync(
         );
     }
     Json(marketcow_api::full_sync(&projection)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamQuery {
+    after_cursor: Option<u64>,
+}
+
+async fn market_data_stream(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    Query(query): Query<StreamQuery>,
+) -> Response {
+    let projection = state.projection.load_full();
+    if !projection.ready || !projection_fresh(&state.config, &projection) {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_projection_unready_or_stale",
+            true,
+            &request_id,
+        );
+    }
+    if query
+        .after_cursor
+        .is_some_and(|cursor| cursor > projection.cursor)
+    {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "stream_cursor_ahead_of_projection",
+            false,
+            &request_id,
+        );
+    }
+    // Subscribe before capturing the immutable replay views. Events visible in both are skipped by
+    // cursor, while an event landing between the reads remains in at least one source.
+    let receiver = state.stream.subscribe();
+    let records = state.recent_events.load_full();
+    let projection = state.projection.load_full();
+    if !projection.ready || !projection_fresh(&state.config, &projection) {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_projection_unready_or_stale",
+            true,
+            &request_id,
+        );
+    }
+    ws.on_upgrade(move |socket| {
+        serve_market_data_stream(
+            socket,
+            state,
+            receiver,
+            projection,
+            records,
+            query.after_cursor,
+        )
+    })
+}
+
+struct StreamClientGuard(Arc<Metrics>);
+
+impl Drop for StreamClientGuard {
+    fn drop(&mut self) {
+        self.0.stream_clients.fetch_sub(1, Ordering::Relaxed);
+        self.0.stream_disconnects.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+async fn serve_market_data_stream(
+    mut socket: WebSocket,
+    state: AppState,
+    mut receiver: broadcast::Receiver<marketcow_core::PersistedEvent>,
+    projection: Arc<marketcow_core::Projection>,
+    records: Arc<Vec<marketcow_core::PersistedEvent>>,
+    after_cursor: Option<u64>,
+) {
+    state.metrics.stream_clients.fetch_add(1, Ordering::Relaxed);
+    let _guard = StreamClientGuard(state.metrics.clone());
+    let boundary = projection.cursor;
+    let mut last_cursor = after_cursor.unwrap_or(boundary);
+
+    if let Some(resume_cursor) = after_cursor {
+        let earliest = records.first().map(|record| record.event.cursor);
+        if resume_cursor < boundary
+            && earliest.is_some_and(|cursor| cursor > resume_cursor.saturating_add(1))
+        {
+            let frame = marketcow_api::stream_resync_required(
+                &state.config.scope_id,
+                resume_cursor,
+                "event_cursor_expired",
+            );
+            let _ = send_stream_frame(&mut socket, &frame).await;
+            close_stream(&mut socket, close_code::POLICY, "full_sync_required").await;
+            return;
+        }
+        if !deliver_stream_frame(
+            &mut socket,
+            &state,
+            &marketcow_api::stream_subscription(&projection, true),
+        )
+        .await
+        {
+            return;
+        }
+        for record in records
+            .iter()
+            .filter(|record| record.event.cursor > resume_cursor && record.event.cursor <= boundary)
+        {
+            if record.event.cursor != last_cursor.saturating_add(1) {
+                send_resync_and_close(&mut socket, &state, last_cursor, "stream_replay_gap").await;
+                return;
+            }
+            let Ok(frame) = marketcow_api::stream_event(&state.config.scope_id, record) else {
+                close_stream(&mut socket, close_code::ERROR, "serialization_failed").await;
+                return;
+            };
+            if !deliver_stream_frame(&mut socket, &state, &frame).await {
+                return;
+            }
+            last_cursor = record.event.cursor;
+        }
+        if last_cursor != boundary {
+            send_resync_and_close(&mut socket, &state, last_cursor, "stream_replay_incomplete")
+                .await;
+            return;
+        }
+    } else if !deliver_stream_frame(
+        &mut socket,
+        &state,
+        &marketcow_api::stream_subscription(&projection, false),
+    )
+    .await
+    {
+        return;
+    }
+
+    let mut freshness_check = tokio::time::interval(std::time::Duration::from_secs(1));
+    freshness_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        enum Next {
+            Client(Option<Result<Message, axum::Error>>),
+            Event(Box<Result<marketcow_core::PersistedEvent, broadcast::error::RecvError>>),
+            FreshnessCheck,
+        }
+        let next = tokio::select! {
+            message = socket.recv() => Next::Client(message),
+            event = receiver.recv() => Next::Event(Box::new(event)),
+            _ = freshness_check.tick() => Next::FreshnessCheck,
+        };
+        match next {
+            Next::Client(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => return,
+            Next::Client(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            Next::Client(Some(Ok(Message::Text(_) | Message::Binary(_)))) => {
+                close_stream(&mut socket, close_code::UNSUPPORTED, "server_push_only").await;
+                return;
+            }
+            Next::Event(event) => match *event {
+                Ok(record) if record.event.cursor <= last_cursor => {}
+                Ok(record) => {
+                    if record.event.cursor != last_cursor.saturating_add(1) {
+                        send_resync_and_close(&mut socket, &state, last_cursor, "stream_live_gap")
+                            .await;
+                        return;
+                    }
+                    let Ok(frame) = marketcow_api::stream_event(&state.config.scope_id, &record)
+                    else {
+                        close_stream(&mut socket, close_code::ERROR, "serialization_failed").await;
+                        return;
+                    };
+                    if !deliver_stream_frame(&mut socket, &state, &frame).await {
+                        return;
+                    }
+                    last_cursor = record.event.cursor;
+                    let current = state.projection.load_full();
+                    if !current.ready || !projection_fresh(&state.config, &current) {
+                        send_resync_and_close(
+                            &mut socket,
+                            &state,
+                            last_cursor,
+                            "projection_unready_or_stale",
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    state
+                        .metrics
+                        .stream_slow_consumer_disconnects
+                        .fetch_add(1, Ordering::Relaxed);
+                    send_resync_and_close(&mut socket, &state, last_cursor, "slow_consumer_lagged")
+                        .await;
+                    return;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    close_stream(&mut socket, close_code::RESTART, "server_shutdown").await;
+                    return;
+                }
+            },
+            Next::FreshnessCheck => {
+                let current = state.projection.load_full();
+                if !current.ready || !projection_fresh(&state.config, &current) {
+                    send_resync_and_close(
+                        &mut socket,
+                        &state,
+                        last_cursor,
+                        "projection_unready_or_stale",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+enum StreamSendError {
+    Timeout,
+    TransportOrSerialization,
+}
+
+async fn send_stream_frame(
+    socket: &mut WebSocket,
+    frame: &marketcow_api::StreamFrame,
+) -> std::result::Result<(), StreamSendError> {
+    let payload =
+        serde_json::to_string(frame).map_err(|_| StreamSendError::TransportOrSerialization)?;
+    match tokio::time::timeout(
+        STREAM_SEND_TIMEOUT,
+        socket.send(Message::Text(payload.into())),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(StreamSendError::TransportOrSerialization),
+        Err(_) => Err(StreamSendError::Timeout),
+    }
+}
+
+async fn deliver_stream_frame(
+    socket: &mut WebSocket,
+    state: &AppState,
+    frame: &marketcow_api::StreamFrame,
+) -> bool {
+    match send_stream_frame(socket, frame).await {
+        Ok(()) => true,
+        Err(StreamSendError::TransportOrSerialization) => false,
+        Err(StreamSendError::Timeout) => {
+            state
+                .metrics
+                .stream_slow_consumer_disconnects
+                .fetch_add(1, Ordering::Relaxed);
+            close_stream(socket, close_code::AGAIN, "slow_consumer").await;
+            false
+        }
+    }
+}
+
+async fn send_resync_and_close(
+    socket: &mut WebSocket,
+    state: &AppState,
+    cursor: u64,
+    reason: &str,
+) {
+    let frame = marketcow_api::stream_resync_required(&state.config.scope_id, cursor, reason);
+    let _ = send_stream_frame(socket, &frame).await;
+    close_stream(socket, close_code::AGAIN, "full_sync_required").await;
+}
+
+async fn close_stream(socket: &mut WebSocket, code: u16, reason: &'static str) {
+    let close = socket.send(Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    })));
+    let _ = tokio::time::timeout(STREAM_CLOSE_TIMEOUT, close).await;
 }
 
 #[cfg(test)]
@@ -902,6 +1190,11 @@ async fn admin_shadow_ingest(
                 .recent_events
                 .store(Arc::new(runtime.recent_events().to_vec()));
             let projection = runtime.projection();
+            // Publication is deliberately last: every delivered frame is already WAL-persisted
+            // and visible through the immutable projection/replay views.
+            for outcome in &outcomes {
+                let _ = state.stream.send(outcome.persisted.clone());
+            }
             Json(json!({
                 "status":"shadow_ingested",
                 "events":outcomes.len(),
@@ -956,6 +1249,9 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
              marketcow_projection_published_cursor {}\nmarketcow_projection_persisted_cursor {}\n\
              marketcow_unresolved_gaps {}\nmarketcow_book_count {}\nmarketcow_maximum_book_age_ms {}\n\
              marketcow_disconnects_total {}\nmarketcow_ingress_queue_depth 0\n\
+             marketcow_stream_clients {}\nmarketcow_stream_disconnects_total {}\n\
+             marketcow_stream_channel_depth {}\n\
+             marketcow_stream_channel_capacity {}\nmarketcow_stream_slow_consumer_disconnects_total {}\n\
              marketcow_persistence_latency_us {}\nmarketcow_publication_latency_us {}\n",
             state.metrics.requests.load(Ordering::Relaxed),
             state.metrics.errors.load(Ordering::Relaxed),
@@ -965,6 +1261,14 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
             projection.books.len(),
             maximum_book_age_ms,
             state.metrics.disconnects.load(Ordering::Relaxed),
+            state.metrics.stream_clients.load(Ordering::Relaxed),
+            state.metrics.stream_disconnects.load(Ordering::Relaxed),
+            state.stream.len(),
+            STREAM_CHANNEL_CAPACITY,
+            state
+                .metrics
+                .stream_slow_consumer_disconnects
+                .load(Ordering::Relaxed),
             state.metrics.persistence_latency_us.load(Ordering::Relaxed),
             state.metrics.publication_latency_us.load(Ordering::Relaxed),
         ),
@@ -1323,6 +1627,7 @@ async fn write_frame(
 mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
+    use futures_util::StreamExt;
     use tempfile::tempdir;
     use tower::ServiceExt;
 
@@ -1349,6 +1654,7 @@ mod tests {
                 recent_event_capacity: 100,
             })
             .unwrap();
+        let (stream, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
         (
             dir,
             AppState {
@@ -1359,6 +1665,7 @@ mod tests {
                 recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
                 runtime: Arc::new(AsyncMutex::new(runtime)),
                 jobs: Arc::new(AsyncMutex::new(marketcow_jobs::JobEngine::default())),
+                stream,
             },
         )
     }
@@ -1691,6 +1998,131 @@ mod tests {
         assert!(body.contains("marketcow_ingress_queue_depth 0"));
         assert!(body.contains("marketcow_persistence_latency_us "));
         assert!(body.contains("marketcow_publication_latency_us "));
+    }
+
+    #[tokio::test]
+    async fn websocket_full_sync_live_publish_and_cursor_resume_are_contiguous() {
+        let (_dir, state) = test_state();
+        let first_at = Utc::now();
+        let first = admin_shadow_ingest(
+            State(state.clone()),
+            Extension("seed-1".into()),
+            Json(ShadowIngestRequest {
+                received_at: Some(first_at),
+                raw_payload: json!({
+                    "event_type":"book", "asset_id":"yes",
+                    "timestamp":first_at.to_rfc3339(), "tick_size":"0.01",
+                    "bids":[{"price":"0.40","size":"10"}],
+                    "asks":[{"price":"0.60","size":"11"}]
+                }),
+            }),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app(server_state)).await.unwrap();
+        });
+        let (mut client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/v1/market-data/stream"))
+                .await
+                .unwrap();
+        let subscription = next_stream_frame(&mut client).await;
+        assert_eq!(subscription.cursor, 1);
+        assert!(matches!(
+            subscription.payload,
+            marketcow_api::StreamPayload::Subscription {
+                ref mode,
+                boundary_cursor: 1,
+                full_sync: Some(_),
+            } if mode == "full_sync"
+        ));
+
+        let second_at = first_at + chrono::Duration::milliseconds(1);
+        let second = admin_shadow_ingest(
+            State(state.clone()),
+            Extension("seed-2".into()),
+            Json(ShadowIngestRequest {
+                received_at: Some(second_at),
+                raw_payload: json!({
+                    "event_type":"book", "asset_id":"yes",
+                    "timestamp":second_at.to_rfc3339(), "tick_size":"0.01",
+                    "bids":[{"price":"0.41","size":"10"}],
+                    "asks":[{"price":"0.59","size":"11"}]
+                }),
+            }),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let live = next_stream_frame(&mut client).await;
+        assert_eq!(live.cursor, 2);
+        assert!(matches!(
+            live.payload,
+            marketcow_api::StreamPayload::Event { ref event } if event.cursor == 2
+        ));
+        client.close(None).await.unwrap();
+
+        let (mut resumed, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/v1/market-data/stream?after_cursor=1"
+        ))
+        .await
+        .unwrap();
+        let resume_ack = next_stream_frame(&mut resumed).await;
+        assert!(matches!(
+            resume_ack.payload,
+            marketcow_api::StreamPayload::Subscription {
+                ref mode,
+                boundary_cursor: 2,
+                full_sync: None,
+            } if mode == "resume"
+        ));
+        let replayed = next_stream_frame(&mut resumed).await;
+        assert_eq!(replayed.cursor, 2);
+        assert!(matches!(
+            replayed.payload,
+            marketcow_api::StreamPayload::Event { ref event } if event.cursor == 2
+        ));
+        let mut unavailable = (*state.projection.load_full()).clone();
+        unavailable.ready = false;
+        unavailable.fail_closed_reason = Some("test_gap".into());
+        state.projection.store(Arc::new(unavailable));
+        let resync = next_stream_frame(&mut resumed).await;
+        assert!(matches!(
+            resync.payload,
+            marketcow_api::StreamPayload::ResyncRequired {
+                ref reason,
+                retryable: true,
+            } if reason == "projection_unready_or_stale"
+        ));
+        let close = tokio::time::timeout(std::time::Duration::from_secs(2), resumed.next())
+            .await
+            .expect("stream close timed out")
+            .expect("stream ended without close frame")
+            .expect("stream transport failed");
+        assert!(matches!(
+            close,
+            tokio_tungstenite::tungstenite::Message::Close(Some(frame))
+                if u16::from(frame.code) == close_code::AGAIN
+        ));
+        server.abort();
+    }
+
+    async fn next_stream_frame<S>(
+        client: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> marketcow_api::StreamFrame
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), client.next())
+            .await
+            .expect("stream frame timed out")
+            .expect("stream closed")
+            .expect("stream transport failed");
+        let text = message.into_text().expect("expected text frame");
+        serde_json::from_str(&text).unwrap()
     }
 
     #[tokio::test]
