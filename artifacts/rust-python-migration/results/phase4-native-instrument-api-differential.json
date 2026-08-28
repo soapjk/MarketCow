@@ -1,10 +1,12 @@
 {
   "binary_path": "/Volumes/T9/projects/marketcow-workitem-b8ffd893-5dfd-4894-8a17-7e759ca0495f/target/debug/marketcow",
-  "binary_sha256": "46637d46531bdabe8d86558ac3ccfa7d15b043682f9a3f47ccaa193d90134559",
+  "binary_sha256": "d4f715189fee6332863c34a11a6cbedef4f78d9c83dc676354cbc3bc75edd5b8",
   "checks": {
     "all_three_rust_migrations_recorded_once": true,
     "http_exact_record": true,
     "http_get_200": true,
+    "http_mapping_missing_404_machine_detail": true,
+    "http_mapping_resolve_exact_record": true,
     "http_missing_404_machine_detail": true,
     "instrument_persistence_healthy": true,
     "mcp_call_http_200": true,
@@ -14,6 +16,7 @@
     "real_orders_disabled": true,
     "restart_health_200": true,
     "restart_reads_same_postgres_record": true,
+    "restart_resolves_same_mapping": true,
     "two_native_tools_reported": true
   },
   "failure": null,
@@ -28,6 +31,6 @@
   "process_log_tail": "",
   "real_order_submission_enabled": false,
   "schema_version": "marketcow.native-instrument-differential.v1",
-  "source_commit": "3edf374ab86b48bb3a00d10cc4f1eacd26854a3c",
+  "source_commit": "7a3206aadf2f8c2c7a35939bfde53202f03a5d6d",
   "tradude_manages_marketcow": false
 }
