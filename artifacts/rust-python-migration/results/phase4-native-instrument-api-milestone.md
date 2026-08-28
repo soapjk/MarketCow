@@ -3,12 +3,13 @@
 Date: 2026-08-28
 
 Status: partial Phase 2/4 evidence. Rust now owns `get_instrument` over public HTTP and MCP plus
-public provider/broker mapping resolve, but Instrument admin/batch paths and the other 12 legacy
-MCP tools are not migrated.
+public provider/broker mapping resolve and authenticated single-Instrument administration, but
+batch resolution/provider fallback and the other 12 legacy MCP tools are not migrated.
 
 Implementation commits: `d0f066ed3edf0504b624275f5d6888fd94138d1b`,
 `3edf374ab86b48bb3a00d10cc4f1eacd26854a3c`, and
-`7a3206aadf2f8c2c7a35939bfde53202f03a5d6d`.
+`7a3206aadf2f8c2c7a35939bfde53202f03a5d6d`, and
+`a14b98916176896cd39a40bbb03ccea70b75ef61`.
 
 ## Boundary and compatibility
 
@@ -20,6 +21,10 @@ Implementation commits: `d0f066ed3edf0504b624275f5d6888fd94138d1b`,
 - `GET /v1/instruments:resolve` uses the atomic provider/broker mapping table, preserves the
   `instrument_mapping_not_found` contract, and survives a process restart without rebuilding from
   SQLite or querying it on the hot path.
+- `PUT /v1/admin/instruments/{instrument_id}` uses the existing constant-time Bearer gate,
+  rejects path/payload conflicts, validates the typed financial contract, generates the same
+  sorted ASCII canonical hash as Python (including Unicode surrogate escaping), and commits the
+  Instrument plus mappings in one PostgreSQL transaction.
 - MCP tools/list replaces the staged Python definition with a Rust definition that is golden-equal
   to Python. Calls validate the same required/extra argument rules and preserve both structured
   JSON and byte-compatible `content[].text` field order.
@@ -37,8 +42,8 @@ shasum -a 256 target/debug/marketcow
 uv run --isolated --frozen python scripts/migration/verify_native_instrument_api.py \
   --binary target/debug/marketcow \
   --expected-binary-sha256 \
-    d4f715189fee6332863c34a11a6cbedef4f78d9c83dc676354cbc3bc75edd5b8 \
-  --source-commit 7a3206aadf2f8c2c7a35939bfde53202f03a5d6d \
+    674d197c57d7fc99c5947eaae7cf9a9566017c7c8ed2d95bc6633e836674b773 \
+  --source-commit a14b98916176896cd39a40bbb03ccea70b75ef61 \
   --output artifacts/rust-python-migration/results/phase4-native-instrument-api-differential.json
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
@@ -49,16 +54,17 @@ cargo fmt --all -- --check
 ```
 
 The differential started isolated PostgreSQL and two consecutive real MarketCow processes on
-loopback TCP. All 16 recorded gates passed: exact HTTP record, exact mapping resolution,
+loopback TCP. All 19 recorded gates passed: Bearer rejection and authenticated admin write with
+Python-equal content hash, exact HTTP record, exact mapping resolution,
 machine-readable missing-ID and missing-mapping 404s, Python-equal MCP definition and result,
 persistence health, three unique Rust migrations, and same-record/mapping reads after restart.
 Both processes exited cleanly with code 0.
 
-Workspace regression reported 80 passed, 0 failed and 3 explicit environment-gated storage tests
+Workspace regression reported 82 passed, 0 failed and 3 explicit environment-gated storage tests
 ignored. All 17 Python MCP tests, Clippy with warnings denied, Ruff and format checks passed.
 
 The checked binary SHA-256 is
-`d4f715189fee6332863c34a11a6cbedef4f78d9c83dc676354cbc3bc75edd5b8`. The result JSON SHA-256
-is `66be4558202245098032e6a6f1402408a0f135e65a17abac6cd3121b444df37f`.
+`674d197c57d7fc99c5947eaae7cf9a9566017c7c8ed2d95bc6633e836674b773`. The result JSON SHA-256
+is `c9267b12e6b669e1b3cc4211594e445fe640042c1032a6e2aa0ce5b57df37606`.
 This short integration result is not a headless or HTTP/network soak and does not satisfy the
 remaining longevity gates.
