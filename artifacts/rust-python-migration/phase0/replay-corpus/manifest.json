@@ -9,6 +9,19 @@
     "source": "artifacts/exact-100-scope-verification-7073-20260826.json"
   },
   "r2_cursor_range": {"first": 24906390, "last": 25040506, "availability": "not-present-in-repository"},
+  "b16f_exact_scope": {
+    "scope_id": "b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075",
+    "availability": "present-as-external-local-read-only-corpus",
+    "market_count": 100,
+    "token_count": 200,
+    "root": "/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/marketcow-production-20260827T143700CST/scopes/b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075",
+    "files": [
+      {"path": "manifest.json", "bytes": 1923, "sha256": "517688afba3803b2fb073f065aa6861a4b0dedd19eb2a9930d95788cd55410c2"},
+      {"path": "registry.json", "bytes": 32924044, "sha256": "31816b9883f189ddc8b31051c6c4f408e249163c998a0e904a4dabbd69b2c43e"},
+      {"path": "clob-token-universe.json", "bytes": 2643245, "sha256": "e14e0995f4fe27625c66cd01cf8f996e8e9e933fa56f9d9dc52b2781cf014a14"},
+      {"path": "selection-report.json", "bytes": 724374, "sha256": "edbac38414d346ab63bea8315ec2adb2fe72918e01236f675eceb2890742a615"}
+    ]
+  },
   "b16f_regression_classes": [
     "crossed_or_locked_delta_then_full_book", "disconnect_reconnect",
     "derived_sqlite_backlog", "large_response_serialization"
@@ -17,5 +30,5 @@
     "tests/fixtures/polymarket-live-provider-neutral-v2.json",
     "artifacts/exact-100-scope-verification-7073-20260826.json"
   ],
-  "note": "The exact r2 raw event window is referenced by contract but is absent locally; synthetic minimal reproductions cover its named boundaries and must not be described as the raw r2 corpus."
+  "note": "The b16f exact-scope catalog corpus is present and hash-pinned above. The exact r2 raw event window remains absent after searching MarketCow and the referenced Tradude local data roots; synthetic minimal reproductions cover named boundaries and must not be described as raw r2."
 }

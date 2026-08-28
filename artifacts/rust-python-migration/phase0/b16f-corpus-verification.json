@@ -1,0 +1,13 @@
+{
+  "b16f_exact_scope_available": true,
+  "b16f_exact_scope_errors": [],
+  "b16f_exact_scope_verified": true,
+  "local_contract_checks_passed": true,
+  "missing": [],
+  "passed": true,
+  "phase0_complete": false,
+  "plan_sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4",
+  "raw_r2_available": false,
+  "raw_r2_is_acceptance_blocker": true,
+  "schema_version": "marketcow.phase0-verification.v1"
+}
