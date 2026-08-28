@@ -15,9 +15,11 @@ axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
 http.workspace = true
+libc.workspace = true
 marketcow-core = { path = "../marketcow-core" }
 marketcow-contracts = { path = "../marketcow-contracts" }
 marketcow-api = { path = "../marketcow-api" }
+marketcow-runtime = { path = "../marketcow-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

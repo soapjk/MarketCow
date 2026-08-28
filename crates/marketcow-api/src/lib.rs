@@ -19,7 +19,8 @@ pub struct BookView {
     pub token_id: String,
     pub bids: Vec<Level>,
     pub asks: Vec<Level>,
-    pub tick_version: u64,
+    pub tick_size: Option<marketcow_core::Price>,
+    pub tick_version: String,
     pub source_observed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -107,7 +108,8 @@ fn book_view(token_id: &str, book: &Book) -> BookView {
                 quantity: *quantity,
             })
             .collect(),
-        tick_version: book.tick_version,
+        tick_size: book.tick_size.clone(),
+        tick_version: book.tick_version.clone(),
         source_observed_at: book.source_observed_at,
     }
 }
@@ -168,6 +170,7 @@ fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, ReadAp
         event_type: match &record.event.kind {
             EventKind::FullBook { .. } => "full_book",
             EventKind::Delta { .. } => "delta",
+            EventKind::AtomicDelta { .. } => "delta",
             EventKind::SourceGap { .. } => "source_gap",
         }
         .into(),
@@ -251,7 +254,8 @@ mod tests {
                 token_id: "yes".into(),
                 bids: vec![Level::new("0.4", "2.50").unwrap()],
                 asks: vec![Level::new("0.6", "3.25").unwrap()],
-                tick_version: 1,
+                tick_size: marketcow_core::Price::parse_tick("0.01").unwrap(),
+                tick_version: "tick-v1".into(),
             },
         )
     }

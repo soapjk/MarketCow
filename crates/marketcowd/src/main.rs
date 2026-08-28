@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use axum::{
     Json, Router,
-    extract::{Extension, Query, Request, State},
+    extract::{DefaultBodyLimit, Extension, Query, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -13,7 +13,6 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -27,6 +26,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     signal,
+    sync::Mutex as AsyncMutex,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -53,6 +53,20 @@ enum Command {
         #[command(subcommand)]
         command: WalCommand,
     },
+    Replay {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        checkpoint: bool,
+    },
+    ShadowSoak {
+        #[arg(long, default_value_t = 2700)]
+        duration_seconds: u64,
+        #[arg(long, default_value_t = 1000)]
+        interval_millis: u64,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -70,6 +84,7 @@ struct Config {
     scope_id: String,
     real_order_submission_enabled: bool,
     shadow_mode: bool,
+    maximum_book_age_ms: u64,
 }
 
 impl Config {
@@ -85,6 +100,9 @@ impl Config {
             env::var("MARKETCOW_RUST_SCOPE_ID").unwrap_or_else(|_| "shadow-unscoped".into());
         let shadow_mode = env::var("MARKETCOW_RUST_SHADOW").as_deref() != Ok("false");
         let orders = env::var("MARKETCOW_REAL_ORDER_SUBMISSION_ENABLED").as_deref() == Ok("true");
+        let maximum_book_age_ms = env::var("MARKETCOW_RUST_MAX_BOOK_AGE_MS")
+            .unwrap_or_else(|_| "30000".into())
+            .parse::<u64>()?;
         if orders {
             bail!("real order submission is prohibited by the migration safety gate");
         }
@@ -102,6 +120,9 @@ impl Config {
         if !shadow_mode {
             bail!("writer/cutover mode is not enabled in this work item");
         }
+        if maximum_book_age_ms == 0 {
+            bail!("MARKETCOW_RUST_MAX_BOOK_AGE_MS must be positive");
+        }
         Ok(Self {
             profile,
             bind,
@@ -111,6 +132,7 @@ impl Config {
             scope_id,
             real_order_submission_enabled: false,
             shadow_mode,
+            maximum_book_age_ms,
         })
     }
 }
@@ -131,12 +153,16 @@ struct AppState {
     metrics: Arc<Metrics>,
     projection: Arc<ArcSwap<marketcow_core::Projection>>,
     recent_events: Arc<ArcSwap<Vec<marketcow_core::PersistedEvent>>>,
+    runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
 }
 
 #[derive(Default)]
 struct Metrics {
     requests: AtomicU64,
     errors: AtomicU64,
+    disconnects: AtomicU64,
+    persistence_latency_us: AtomicU64,
+    publication_latency_us: AtomicU64,
 }
 
 struct AuditLog {
@@ -188,6 +214,26 @@ async fn main() -> Result<()> {
                 json!({"status":"ok","records":events.len(),"last_cursor":events.last().map(|x|x.event.cursor)})
             );
         }
+        Command::Replay { input, checkpoint } => {
+            let config = Config::load()?;
+            preflight(&config)?;
+            let result = replay_file(&config, &input, checkpoint)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Command::ShadowSoak {
+            duration_seconds,
+            interval_millis,
+            output,
+        } => {
+            let config = Config::load()?;
+            preflight(&config)?;
+            let result =
+                run_headless_shadow_soak(&config, duration_seconds, interval_millis, &output)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if result["passed"] != true {
+                bail!("headless shadow soak gate failed");
+            }
+        }
         Command::Serve => serve().await?,
     }
     Ok(())
@@ -209,14 +255,16 @@ async fn serve() -> Result<()> {
     let config = Config::load()?;
     preflight(&config)?;
     let audit = Arc::new(AuditLog::open(&config.storage_root.join("audit.jsonl"))?);
+    let runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(&config))?;
+    let projection = runtime.projection();
+    let recent_events = runtime.recent_events().to_vec();
     let state = AppState {
         config: config.clone(),
         audit,
         metrics: Arc::new(Metrics::default()),
-        projection: Arc::new(ArcSwap::from_pointee(bootstrap_projection(
-            config.scope_id.clone(),
-        ))),
-        recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
+        projection: Arc::new(ArcSwap::from(projection)),
+        recent_events: Arc::new(ArcSwap::from_pointee(recent_events)),
+        runtime: Arc::new(AsyncMutex::new(runtime)),
     };
     let worker_path = config.worker_socket.clone();
     let worker = tokio::spawn(async move { worker_server(worker_path).await });
@@ -230,6 +278,227 @@ async fn serve() -> Result<()> {
     let _ = fs::remove_file(&config.worker_socket);
     info!("marketcowd_stopped");
     Ok(())
+}
+
+fn runtime_config(config: &Config) -> marketcow_runtime::RuntimeConfig {
+    marketcow_runtime::RuntimeConfig {
+        root: config.storage_root.join("polymarket"),
+        scope_id: config.scope_id.clone(),
+        config_revision: "marketcowd-config-v1".into(),
+        wal_segment_bytes: 256 * 1024 * 1024,
+        recent_event_capacity: 10_000,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplayInput {
+    received_at: chrono::DateTime<Utc>,
+    raw_payload: serde_json::Value,
+}
+
+fn replay_file(config: &Config, input: &Path, checkpoint: bool) -> Result<serde_json::Value> {
+    use std::io::{BufRead, BufReader};
+
+    let mut runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(config))?;
+    let mut input_count = 0_u64;
+    let mut event_count = 0_u64;
+    let mut rejected_count = 0_u64;
+    for line in BufReader::new(std::fs::File::open(input)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: ReplayInput = serde_json::from_str(&line)?;
+        input_count += 1;
+        for outcome in runtime.apply_raw(value.raw_payload, value.received_at)? {
+            event_count += 1;
+            if !outcome.persisted.applied {
+                rejected_count += 1;
+            }
+        }
+    }
+    let manifest = checkpoint.then(|| runtime.checkpoint()).transpose()?;
+    let projection = runtime.projection();
+    Ok(json!({
+        "status":"replay_complete",
+        "input_frames":input_count,
+        "canonical_events":event_count,
+        "rejected_events":rejected_count,
+        "published_cursor":projection.cursor,
+        "persisted_cursor":projection.persisted_cursor,
+        "projection_sha256":projection.hash(),
+        "ready":projection.ready,
+        "checkpoint_cursor":manifest.map(|value|value.current.cursor),
+        "real_order_submission_enabled":false
+    }))
+}
+
+fn run_headless_shadow_soak(
+    config: &Config,
+    duration_seconds: u64,
+    interval_millis: u64,
+    output: &Path,
+) -> Result<serde_json::Value> {
+    if duration_seconds == 0 || interval_millis == 0 || !output.is_absolute() {
+        bail!("soak duration/interval must be positive and output must be absolute");
+    }
+    let mut runtime = marketcow_runtime::PolymarketRuntime::open(runtime_config(config))?;
+    let started_at = Utc::now();
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(duration_seconds);
+    let mut sequence = 0_u64;
+    let mut event_count = 0_u64;
+    let mut checkpoint_count = 0_u64;
+    let mut rejected_count = 0_u64;
+    let mut maximum_book_age_ms = 0_u64;
+    let mut maximum_persistence_latency_us = 0_u64;
+    let mut maximum_publication_latency_us = 0_u64;
+    let mut apply_latency_us = Vec::new();
+    let mut next_checkpoint = started + std::time::Duration::from_secs(60);
+
+    for (token_id, bid, ask) in [
+        ("binary-yes", "0.40", "0.42"),
+        ("binary-no", "0.58", "0.60"),
+    ] {
+        let now = Utc::now();
+        let raw = json!({
+            "event_type":"book", "asset_id":token_id, "timestamp":now,
+            "tick_size":"0.01", "bids":[{"price":bid,"size":"10"}],
+            "asks":[{"price":ask,"size":"11"}],
+            "hash":format!("headless-{token_id}-{}", now.timestamp_nanos_opt().unwrap_or_default())
+        });
+        for outcome in runtime.apply_raw(raw, now)? {
+            event_count += 1;
+            if !outcome.persisted.applied {
+                rejected_count += 1;
+            }
+            maximum_persistence_latency_us =
+                maximum_persistence_latency_us.max(outcome.persistence_latency_us);
+            maximum_publication_latency_us =
+                maximum_publication_latency_us.max(outcome.publication_latency_us);
+        }
+    }
+
+    while std::time::Instant::now() < deadline {
+        let now = Utc::now();
+        let size = (10 + sequence % 20).to_string();
+        let apply_started = std::time::Instant::now();
+        let outcomes = runtime.apply_raw(
+            json!({
+                "event_type":"price_change", "timestamp":now,
+                "price_changes":[
+                    {"asset_id":"binary-yes","side":"BUY","price":"0.40","size":size.clone()},
+                    {"asset_id":"binary-no","side":"SELL","price":"0.60","size":size}
+                ]
+            }),
+            now,
+        )?;
+        apply_latency_us.push(apply_started.elapsed().as_micros() as u64);
+        for outcome in outcomes {
+            event_count += 1;
+            if !outcome.persisted.applied {
+                rejected_count += 1;
+            }
+            maximum_persistence_latency_us =
+                maximum_persistence_latency_us.max(outcome.persistence_latency_us);
+            maximum_publication_latency_us =
+                maximum_publication_latency_us.max(outcome.publication_latency_us);
+        }
+        let projection = runtime.projection();
+        maximum_book_age_ms = maximum_book_age_ms.max(
+            projection
+                .books
+                .values()
+                .filter_map(|book| book.source_observed_at)
+                .map(|observed| {
+                    Utc::now()
+                        .signed_duration_since(observed)
+                        .num_milliseconds()
+                        .max(0) as u64
+                })
+                .max()
+                .unwrap_or(u64::MAX),
+        );
+        if std::time::Instant::now() >= next_checkpoint {
+            runtime.checkpoint()?;
+            checkpoint_count += 1;
+            next_checkpoint += std::time::Duration::from_secs(60);
+        }
+        sequence += 1;
+        std::thread::sleep(std::time::Duration::from_millis(interval_millis));
+    }
+    runtime.checkpoint()?;
+    checkpoint_count += 1;
+    let projection = runtime.projection();
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    apply_latency_us.sort_unstable();
+    let percentile = |ratio: f64| -> u64 {
+        if apply_latency_us.is_empty() {
+            return u64::MAX;
+        }
+        let index = ((apply_latency_us.len() as f64 * ratio).ceil() as usize)
+            .saturating_sub(1)
+            .min(apply_latency_us.len() - 1);
+        apply_latency_us[index]
+    };
+    let max_rss_kb = maximum_resident_set_kb();
+    let passed = elapsed_seconds >= duration_seconds as f64
+        && rejected_count == 0
+        && projection.ready
+        && projection.unresolved_gaps.is_empty()
+        && projection.cursor == projection.persisted_cursor
+        && maximum_book_age_ms <= interval_millis.saturating_mul(2).max(5_000)
+        && percentile(0.99) <= 50_000
+        && maximum_persistence_latency_us <= 50_000
+        && maximum_publication_latency_us <= 5_000
+        && !config.real_order_submission_enabled;
+    let result = json!({
+        "schema_version":"marketcow.headless-shadow-soak.v1",
+        "started_at":started_at,
+        "finished_at":Utc::now(),
+        "requested_duration_seconds":duration_seconds,
+        "elapsed_seconds":elapsed_seconds,
+        "samples":apply_latency_us.len(),
+        "canonical_events":event_count,
+        "rejected_events":rejected_count,
+        "checkpoint_count":checkpoint_count,
+        "published_cursor":projection.cursor,
+        "persisted_cursor":projection.persisted_cursor,
+        "unresolved_gap_count":projection.unresolved_gaps.len(),
+        "book_count":projection.books.len(),
+        "maximum_book_age_ms":maximum_book_age_ms,
+        "ingress_queue_depth":0,
+        "disconnect_count":0,
+        "apply_latency_us":{"p50":percentile(0.50),"p95":percentile(0.95),"p99":percentile(0.99),
+            "max":apply_latency_us.last().copied().unwrap_or(u64::MAX)},
+        "maximum_persistence_latency_us":maximum_persistence_latency_us,
+        "maximum_publication_latency_us":maximum_publication_latency_us,
+        "max_rss_kb":max_rss_kb,
+        "real_order_submission_enabled":false,
+        "tradude_manages_marketcow":false,
+        "passed":passed
+    });
+    let temporary = output.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(&result)?)?;
+    std::fs::File::open(&temporary)?.sync_all()?;
+    fs::rename(&temporary, output)?;
+    std::fs::File::open(output.parent().context("soak output needs a parent")?)?.sync_all()?;
+    Ok(result)
+}
+
+fn maximum_resident_set_kb() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: getrusage initializes the provided rusage on a zero return code.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful getrusage call above initialized usage.
+    let bytes_or_kb = unsafe { usage.assume_init() }.ru_maxrss;
+    #[cfg(target_os = "macos")]
+    let kilobytes = bytes_or_kb / 1024;
+    #[cfg(not(target_os = "macos"))]
+    let kilobytes = bytes_or_kb;
+    u64::try_from(kilobytes).ok()
 }
 
 fn app(state: AppState) -> Router {
@@ -251,6 +520,15 @@ fn app(state: AppState) -> Router {
         )
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
+        .route(
+            "/v1/admin/polymarket/checkpoint",
+            axum::routing::post(admin_checkpoint),
+        )
+        .route(
+            "/v1/admin/polymarket/shadow-ingest",
+            axum::routing::post(admin_shadow_ingest),
+        )
+        .layer(DefaultBodyLimit::max(1_048_576))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             request_boundary,
@@ -268,7 +546,9 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 async fn readiness(State(state): State<AppState>) -> Response {
     let projection = state.projection.load_full();
-    let status = if projection.ready {
+    let fresh = projection_fresh(&state.config, &projection);
+    let ready = projection.ready && fresh;
+    let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -276,9 +556,9 @@ async fn readiness(State(state): State<AppState>) -> Response {
     (
         status,
         Json(json!({
-            "ready":projection.ready, "mode":"shadow", "scope_id":state.config.scope_id,
+            "ready":ready, "mode":"shadow", "scope_id":state.config.scope_id,
             "writer_enabled":false, "real_order_submission_enabled":false,
-            "fail_closed_reason":projection.fail_closed_reason,
+            "fail_closed_reason":if fresh { projection.fail_closed_reason.clone() } else { Some("book_stale".into()) },
             "ownership_registry":"docs/architecture/migration/domain-ownership.yaml"
         })),
     )
@@ -299,10 +579,10 @@ async fn live_snapshot(
     Extension(request_id): Extension<String>,
 ) -> Response {
     let projection = state.projection.load_full();
-    if !projection.ready {
+    if !projection.ready || !projection_fresh(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "polymarket_projection_unready",
+            "polymarket_projection_unready_or_stale",
             true,
             &request_id,
         );
@@ -327,10 +607,11 @@ async fn live_events(
     Extension(request_id): Extension<String>,
     Query(query): Query<EventQuery>,
 ) -> Response {
-    if !state.projection.load().ready {
+    let projection = state.projection.load_full();
+    if !projection.ready || !projection_fresh(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "polymarket_projection_unready",
+            "polymarket_projection_unready_or_stale",
             true,
             &request_id,
         );
@@ -361,10 +642,10 @@ async fn live_checkpoint(
     Extension(request_id): Extension<String>,
 ) -> Response {
     let projection = state.projection.load_full();
-    if !projection.ready {
+    if !projection.ready || !projection_fresh(&state.config, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "polymarket_projection_unready",
+            "polymarket_projection_unready_or_stale",
             true,
             &request_id,
         );
@@ -372,19 +653,9 @@ async fn live_checkpoint(
     Json(marketcow_api::checkpoint(&projection)).into_response()
 }
 
+#[cfg(test)]
 fn bootstrap_projection(scope_id: String) -> marketcow_core::Projection {
-    marketcow_core::Projection {
-        generation: 0,
-        cursor: 0,
-        persisted_cursor: 0,
-        scope_id,
-        books: BTreeMap::new(),
-        unresolved_gaps: BTreeSet::new(),
-        recent_event_ids: VecDeque::new(),
-        ready: false,
-        fail_closed_reason: Some("bootstrap_required".into()),
-        published_at: Utc::now(),
-    }
+    marketcow_core::Projection::bootstrap(scope_id)
 }
 
 async fn admin_migration() -> Json<serde_json::Value> {
@@ -393,15 +664,154 @@ async fn admin_migration() -> Json<serde_json::Value> {
     }))
 }
 
+async fn admin_checkpoint(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+) -> Response {
+    let mut runtime = state.runtime.lock().await;
+    match runtime.checkpoint() {
+        Ok(manifest) => {
+            state.projection.store(runtime.projection());
+            state
+                .recent_events
+                .store(Arc::new(runtime.recent_events().to_vec()));
+            Json(json!({
+                "status":"checkpoint_written",
+                "cursor":manifest.current.cursor,
+                "projection_sha256":manifest.current.projection_sha256,
+                "real_order_submission_enabled":false
+            }))
+            .into_response()
+        }
+        Err(error_value) => {
+            warn!(error=%error_value, "checkpoint_failed");
+            error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "checkpoint_failed",
+                true,
+                &request_id,
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ShadowIngestRequest {
+    raw_payload: serde_json::Value,
+    received_at: Option<chrono::DateTime<Utc>>,
+}
+
+async fn admin_shadow_ingest(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    Json(request): Json<ShadowIngestRequest>,
+) -> Response {
+    if !state.config.shadow_mode || state.config.real_order_submission_enabled {
+        return error(
+            StatusCode::FORBIDDEN,
+            "shadow_ingest_disabled",
+            false,
+            &request_id,
+        );
+    }
+    let received_at = request.received_at.unwrap_or_else(Utc::now);
+    let mut runtime = state.runtime.lock().await;
+    match runtime.apply_raw(request.raw_payload, received_at) {
+        Ok(outcomes) => {
+            let rejected = outcomes
+                .iter()
+                .filter(|outcome| !outcome.persisted.applied)
+                .count();
+            if let Some(maximum) = outcomes
+                .iter()
+                .map(|value| value.persistence_latency_us)
+                .max()
+            {
+                state
+                    .metrics
+                    .persistence_latency_us
+                    .fetch_max(maximum, Ordering::Relaxed);
+            }
+            if let Some(maximum) = outcomes
+                .iter()
+                .map(|value| value.publication_latency_us)
+                .max()
+            {
+                state
+                    .metrics
+                    .publication_latency_us
+                    .fetch_max(maximum, Ordering::Relaxed);
+            }
+            state.projection.store(runtime.projection());
+            state
+                .recent_events
+                .store(Arc::new(runtime.recent_events().to_vec()));
+            let projection = runtime.projection();
+            Json(json!({
+                "status":"shadow_ingested",
+                "events":outcomes.len(),
+                "rejected":rejected,
+                "published_cursor":projection.cursor,
+                "persisted_cursor":projection.persisted_cursor,
+                "ready":projection.ready,
+                "real_order_submission_enabled":false
+            }))
+            .into_response()
+        }
+        Err(error_value) => {
+            warn!(error=%error_value, "shadow_ingest_rejected");
+            error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "shadow_ingest_rejected",
+                false,
+                &request_id,
+            )
+        }
+    }
+}
+
+fn projection_maximum_book_age_ms(projection: &marketcow_core::Projection) -> u64 {
+    projection
+        .books
+        .values()
+        .filter_map(|book| book.source_observed_at)
+        .map(|observed_at| {
+            Utc::now()
+                .signed_duration_since(observed_at)
+                .num_milliseconds()
+                .max(0) as u64
+        })
+        .max()
+        .unwrap_or(u64::MAX)
+}
+
+fn projection_fresh(config: &Config, projection: &marketcow_core::Projection) -> bool {
+    projection_maximum_book_age_ms(projection) <= config.maximum_book_age_ms
+}
+
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let projection = state.projection.load_full();
+    let maximum_book_age_ms = projection_maximum_book_age_ms(&projection);
     (
         [("content-type", "text/plain; version=0.0.4")],
         format!(
             "# TYPE marketcow_http_requests_total counter\nmarketcow_http_requests_total {}\n\
              # TYPE marketcow_http_errors_total counter\nmarketcow_http_errors_total {}\n\
-             marketcow_real_order_submission_enabled 0\nmarketcow_shadow_mode 1\n",
+             marketcow_real_order_submission_enabled 0\nmarketcow_shadow_mode 1\n\
+             marketcow_projection_published_cursor {}\nmarketcow_projection_persisted_cursor {}\n\
+             marketcow_unresolved_gaps {}\nmarketcow_book_count {}\nmarketcow_maximum_book_age_ms {}\n\
+             marketcow_disconnects_total {}\nmarketcow_ingress_queue_depth 0\n\
+             marketcow_persistence_latency_us {}\nmarketcow_publication_latency_us {}\n",
             state.metrics.requests.load(Ordering::Relaxed),
             state.metrics.errors.load(Ordering::Relaxed),
+            projection.cursor,
+            projection.persisted_cursor,
+            projection.unresolved_gaps.len(),
+            projection.books.len(),
+            maximum_book_age_ms,
+            state.metrics.disconnects.load(Ordering::Relaxed),
+            state.metrics.persistence_latency_us.load(Ordering::Relaxed),
+            state.metrics.publication_latency_us.load(Ordering::Relaxed),
         ),
     )
 }
@@ -566,7 +976,17 @@ mod tests {
             scope_id: "s".into(),
             real_order_submission_enabled: false,
             shadow_mode: true,
+            maximum_book_age_ms: 30_000,
         };
+        let runtime =
+            marketcow_runtime::PolymarketRuntime::open(marketcow_runtime::RuntimeConfig {
+                root: dir.path().join("polymarket"),
+                scope_id: "s".into(),
+                config_revision: "test-config-v1".into(),
+                wal_segment_bytes: 1_024,
+                recent_event_capacity: 100,
+            })
+            .unwrap();
         (
             dir,
             AppState {
@@ -575,6 +995,7 @@ mod tests {
                 metrics: Arc::new(Metrics::default()),
                 projection: Arc::new(ArcSwap::from_pointee(bootstrap_projection("s".into()))),
                 recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
+                runtime: Arc::new(AsyncMutex::new(runtime)),
             },
         )
     }
@@ -651,7 +1072,8 @@ mod tests {
                     "3".parse().unwrap(),
                 )]
                 .into(),
-                tick_version: 1,
+                tick_size: Some(marketcow_core::Price::parse_tick("0.01").unwrap()),
+                tick_version: "tick-v1".into(),
                 source_observed_at: Some(Utc::now()),
             },
         );
@@ -679,9 +1101,110 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
+
+    #[tokio::test]
+    async fn shadow_ingest_updates_durable_projection_and_latency_metrics() {
+        let (_dir, state) = test_state();
+        let now = Utc::now();
+        let response = admin_shadow_ingest(
+            State(state.clone()),
+            Extension("request-1".into()),
+            Json(ShadowIngestRequest {
+                received_at: Some(now),
+                raw_payload: json!({
+                    "event_type":"book", "asset_id":"yes",
+                    "timestamp":now.to_rfc3339(), "tick_size":"0.01",
+                    "bids":[{"price":"0.40","size":"10"}],
+                    "asks":[{"price":"0.60","size":"11"}]
+                }),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.projection.load().cursor, 1);
+        assert!(state.projection.load().ready);
+        assert_eq!(state.recent_events.load().len(), 1);
+
+        let metrics_response = metrics(State(state)).await.into_response();
+        let body = to_bytes(metrics_response.into_body(), 16_384)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("marketcow_projection_published_cursor 1"));
+        assert!(body.contains("marketcow_projection_persisted_cursor 1"));
+        assert!(body.contains("marketcow_ingress_queue_depth 0"));
+        assert!(body.contains("marketcow_persistence_latency_us "));
+        assert!(body.contains("marketcow_publication_latency_us "));
+    }
+
+    #[tokio::test]
+    async fn stale_projection_is_not_ready_even_when_book_state_is_valid() {
+        let (_dir, state) = test_state();
+        let mut projection = bootstrap_projection("s".into());
+        projection.ready = true;
+        projection.fail_closed_reason = None;
+        projection.books.insert(
+            "yes".into(),
+            marketcow_core::Book {
+                bids: [(
+                    marketcow_core::Price::parse("0.4").unwrap(),
+                    "1".parse().unwrap(),
+                )]
+                .into(),
+                asks: [(
+                    marketcow_core::Price::parse("0.6").unwrap(),
+                    "1".parse().unwrap(),
+                )]
+                .into(),
+                tick_size: Some(marketcow_core::Price::parse_tick("0.01").unwrap()),
+                tick_version: "tick-v1".into(),
+                source_observed_at: Some(Utc::now() - chrono::Duration::seconds(31)),
+            },
+        );
+        state.projection.store(Arc::new(projection));
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/readiness")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
     #[test]
     fn equality_does_not_accept_prefixes() {
         assert!(constant_time_equal(b"abc", b"abc"));
         assert!(!constant_time_equal(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn offline_replay_seeds_durable_ready_state_without_orders() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            profile: "test".into(),
+            bind: "127.0.0.1:8870".parse().unwrap(),
+            storage_root: dir.path().into(),
+            wal_root: dir.path().join("wal"),
+            worker_socket: dir.path().join("worker.sock"),
+            scope_id: "shadow-seed".into(),
+            real_order_submission_enabled: false,
+            shadow_mode: true,
+            maximum_book_age_ms: 30_000,
+        };
+        preflight(&config).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/polymarket-rust-shadow-seed.jsonl");
+        let result = replay_file(&config, &fixture, true).unwrap();
+        assert_eq!(result["input_frames"], 3);
+        assert_eq!(result["canonical_events"], 4);
+        assert_eq!(result["rejected_events"], 0);
+        assert_eq!(result["ready"], true);
+        assert_eq!(result["real_order_submission_enabled"], false);
+        let recovered =
+            marketcow_runtime::PolymarketRuntime::open(runtime_config(&config)).unwrap();
+        assert_eq!(recovered.projection().cursor, 4);
+        assert!(recovered.projection().ready);
     }
 }

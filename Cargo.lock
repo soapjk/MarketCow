@@ -722,6 +722,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "marketcow-polymarket"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "marketcow-core",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "marketcow-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "marketcow-core",
+ "marketcow-polymarket",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "marketcow-storage"
 version = "0.1.0"
 dependencies = [
@@ -742,9 +767,11 @@ dependencies = [
  "chrono",
  "clap",
  "http",
+ "libc",
  "marketcow-api",
  "marketcow-contracts",
  "marketcow-core",
+ "marketcow-runtime",
  "serde",
  "serde_json",
  "sha2",

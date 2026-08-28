@@ -33,6 +33,14 @@ impl Price {
         }
         Ok(Self(parsed.normalize()))
     }
+
+    pub fn parse_tick(value: &str) -> Result<Self, CoreError> {
+        let tick = Self::parse(value)?;
+        if tick.0.is_zero() {
+            return Err(CoreError::InvalidTickSize);
+        }
+        Ok(tick)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,12 +68,27 @@ impl Level {
 pub struct Book {
     pub bids: BTreeMap<Price, Decimal>,
     pub asks: BTreeMap<Price, Decimal>,
-    pub tick_version: u64,
+    pub tick_size: Option<Price>,
+    pub tick_version: String,
     pub source_observed_at: Option<DateTime<Utc>>,
 }
 
 impl Book {
-    fn replace(&mut self, bids: &[Level], asks: &[Level], tick_version: u64, at: DateTime<Utc>) {
+    fn levels_tick_aligned(tick_size: &Price, levels: &[Level]) -> bool {
+        !tick_size.0.is_zero()
+            && levels
+                .iter()
+                .all(|level| (level.price.0 % tick_size.0).is_zero())
+    }
+
+    fn replace(
+        &mut self,
+        bids: &[Level],
+        asks: &[Level],
+        tick_size: &Price,
+        tick_version: &str,
+        at: DateTime<Utc>,
+    ) {
         self.bids = bids
             .iter()
             .filter(|x| !x.quantity.is_zero())
@@ -76,7 +99,8 @@ impl Book {
             .filter(|x| !x.quantity.is_zero())
             .map(|x| (x.price.clone(), x.quantity))
             .collect();
-        self.tick_version = tick_version;
+        self.tick_size = Some(tick_size.clone());
+        self.tick_version = tick_version.into();
         self.source_observed_at = Some(at);
     }
 
@@ -95,6 +119,12 @@ impl Book {
         self.source_observed_at = Some(at);
     }
 
+    fn apply_batch(&mut self, changes: &[SideLevels], at: DateTime<Utc>) {
+        for change in changes {
+            self.apply(change.side, &change.levels, at);
+        }
+    }
+
     pub fn crossed_or_locked(&self) -> bool {
         match (self.bids.last_key_value(), self.asks.first_key_value()) {
             (Some((bid, _)), Some((ask, _))) => bid >= ask,
@@ -111,23 +141,45 @@ pub enum Side {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideLevels {
+    pub side: Side,
+    pub levels: Vec<Level>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum EventKind {
     FullBook {
         token_id: String,
         bids: Vec<Level>,
         asks: Vec<Level>,
-        tick_version: u64,
+        tick_size: Price,
+        tick_version: String,
     },
     Delta {
         token_id: String,
         side: Side,
         levels: Vec<Level>,
     },
+    AtomicDelta {
+        token_id: String,
+        changes: Vec<SideLevels>,
+    },
     SourceGap {
         token_id: String,
         reason: String,
     },
+}
+
+impl EventKind {
+    pub fn token_id(&self) -> &str {
+        match self {
+            Self::FullBook { token_id, .. }
+            | Self::Delta { token_id, .. }
+            | Self::AtomicDelta { token_id, .. }
+            | Self::SourceGap { token_id, .. } => token_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +224,8 @@ pub struct PersistedEvent {
 pub struct ApplyOutcome {
     pub projection: Arc<Projection>,
     pub persisted: PersistedEvent,
+    pub persistence_latency_us: u64,
+    pub publication_latency_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +243,21 @@ pub struct Projection {
 }
 
 impl Projection {
+    pub fn bootstrap(scope_id: impl Into<String>) -> Self {
+        Self {
+            generation: 0,
+            cursor: 0,
+            persisted_cursor: 0,
+            scope_id: scope_id.into(),
+            books: BTreeMap::new(),
+            unresolved_gaps: BTreeSet::new(),
+            recent_event_ids: VecDeque::new(),
+            ready: false,
+            fail_closed_reason: Some("bootstrap_required".into()),
+            published_at: Utc::now(),
+        }
+    }
+
     pub fn hash(&self) -> String {
         // Publication wall time is observability metadata, not canonical state.
         let value = serde_json::json!({
@@ -284,18 +353,7 @@ pub struct SingleWriter<L> {
 impl<L: DurableLog> SingleWriter<L> {
     pub fn new(scope_id: String, log: L) -> Self {
         Self {
-            current: ArcSwap::from_pointee(Projection {
-                generation: 0,
-                cursor: 0,
-                persisted_cursor: 0,
-                scope_id,
-                books: BTreeMap::new(),
-                unresolved_gaps: BTreeSet::new(),
-                recent_event_ids: VecDeque::new(),
-                ready: false,
-                fail_closed_reason: Some("bootstrap_required".into()),
-                published_at: Utc::now(),
-            }),
+            current: ArcSwap::from_pointee(Projection::bootstrap(scope_id)),
             log,
         }
     }
@@ -352,47 +410,119 @@ impl<L: DurableLog> SingleWriter<L> {
         next.published_at = Utc::now();
         let mut applied = true;
         let mut rejected = None;
-        match &event.kind {
-            EventKind::SourceGap { token_id, reason } => {
-                next.unresolved_gaps.insert(token_id.clone());
-                applied = false;
-                rejected = Some(format!("source_gap:{reason}"));
-            }
-            EventKind::FullBook {
-                token_id,
-                bids,
-                asks,
-                tick_version,
-            } => {
-                let mut book = next.books.get(token_id).cloned().unwrap_or_default();
-                book.replace(bids, asks, *tick_version, event.source_observed_at);
-                if book.crossed_or_locked() {
+        if event.source.missing || event.source.delayed {
+            next.unresolved_gaps.insert(event.kind.token_id().into());
+            applied = false;
+            rejected = Some(if event.source.missing {
+                "source_data_missing".into()
+            } else {
+                "source_data_delayed".into()
+            });
+        } else {
+            match &event.kind {
+                EventKind::SourceGap { token_id, reason } => {
                     next.unresolved_gaps.insert(token_id.clone());
                     applied = false;
-                    rejected = Some("crossed_or_locked_full_book".into());
-                } else {
-                    next.books.insert(token_id.clone(), book);
-                    next.unresolved_gaps.remove(token_id);
+                    rejected = Some(format!("source_gap:{reason}"));
                 }
-            }
-            EventKind::Delta {
-                token_id,
-                side,
-                levels,
-            } => {
-                if next.unresolved_gaps.contains(token_id) || !next.books.contains_key(token_id) {
-                    next.unresolved_gaps.insert(token_id.clone());
-                    applied = false;
-                    rejected = Some("full_book_recovery_required".into());
-                } else {
-                    let mut book = next.books[token_id].clone();
-                    book.apply(*side, levels, event.source_observed_at);
-                    if book.crossed_or_locked() {
+                EventKind::FullBook {
+                    token_id,
+                    bids,
+                    asks,
+                    tick_size,
+                    tick_version,
+                } => {
+                    let mut book = next.books.get(token_id).cloned().unwrap_or_default();
+                    if tick_version.is_empty()
+                        || !Book::levels_tick_aligned(tick_size, bids)
+                        || !Book::levels_tick_aligned(tick_size, asks)
+                    {
                         next.unresolved_gaps.insert(token_id.clone());
                         applied = false;
-                        rejected = Some("crossed_or_locked_delta".into());
+                        rejected = Some("invalid_tick_full_book".into());
                     } else {
-                        next.books.insert(token_id.clone(), book);
+                        book.replace(
+                            bids,
+                            asks,
+                            tick_size,
+                            tick_version,
+                            event.source_observed_at,
+                        );
+                        if book.crossed_or_locked() {
+                            next.unresolved_gaps.insert(token_id.clone());
+                            applied = false;
+                            rejected = Some("crossed_or_locked_full_book".into());
+                        } else {
+                            next.books.insert(token_id.clone(), book);
+                            next.unresolved_gaps.remove(token_id);
+                        }
+                    }
+                }
+                EventKind::Delta {
+                    token_id,
+                    side,
+                    levels,
+                } => {
+                    if next.unresolved_gaps.contains(token_id) || !next.books.contains_key(token_id)
+                    {
+                        next.unresolved_gaps.insert(token_id.clone());
+                        applied = false;
+                        rejected = Some("full_book_recovery_required".into());
+                    } else {
+                        let mut book = next.books[token_id].clone();
+                        let aligned = book
+                            .tick_size
+                            .as_ref()
+                            .is_some_and(|tick| Book::levels_tick_aligned(tick, levels));
+                        if !aligned {
+                            next.unresolved_gaps.insert(token_id.clone());
+                            applied = false;
+                            rejected = Some("invalid_tick_delta".into());
+                        } else {
+                            book.apply(*side, levels, event.source_observed_at);
+                        }
+                        if applied {
+                            if book.crossed_or_locked() {
+                                next.unresolved_gaps.insert(token_id.clone());
+                                applied = false;
+                                rejected = Some("crossed_or_locked_delta".into());
+                            } else {
+                                next.books.insert(token_id.clone(), book);
+                            }
+                        }
+                    }
+                }
+                EventKind::AtomicDelta { token_id, changes } => {
+                    if changes.is_empty()
+                        || next.unresolved_gaps.contains(token_id)
+                        || !next.books.contains_key(token_id)
+                    {
+                        next.unresolved_gaps.insert(token_id.clone());
+                        applied = false;
+                        rejected = Some("full_book_recovery_required".into());
+                    } else {
+                        let mut book = next.books[token_id].clone();
+                        let aligned = book.tick_size.as_ref().is_some_and(|tick| {
+                            changes
+                                .iter()
+                                .all(|change| Book::levels_tick_aligned(tick, &change.levels))
+                        });
+                        if !aligned {
+                            next.unresolved_gaps.insert(token_id.clone());
+                            applied = false;
+                            rejected = Some("invalid_tick_atomic_delta".into());
+                        } else {
+                            book.apply_batch(changes, event.source_observed_at);
+                        }
+                        if applied {
+                            if book.crossed_or_locked() {
+                                next.unresolved_gaps.insert(token_id.clone());
+                                applied = false;
+                                rejected = Some("crossed_or_locked_atomic_delta".into());
+                            } else {
+                                next.books.insert(token_id.clone(), book);
+                            }
+                        }
                     }
                 }
             }
@@ -406,17 +536,23 @@ impl<L: DurableLog> SingleWriter<L> {
             applied,
             fail_closed_reason: rejected,
         };
+        let persistence_started = std::time::Instant::now();
         self.log.append_outcome(&persisted)?;
+        let persistence_latency_us = persistence_started.elapsed().as_micros() as u64;
         next.persisted_cursor = event.cursor;
         next.recent_event_ids.push_back(event.event_id);
         if next.recent_event_ids.len() > 10_000 {
             next.recent_event_ids.pop_front();
         }
         let published = Arc::new(next);
+        let publication_started = std::time::Instant::now();
         self.current.store(published.clone());
+        let publication_latency_us = publication_started.elapsed().as_micros() as u64;
         Ok(ApplyOutcome {
             projection: published,
             persisted,
+            persistence_latency_us,
+            publication_latency_us,
         })
     }
 }
@@ -675,6 +811,8 @@ pub enum CoreError {
     InvalidPrice(String),
     #[error("quantity cannot be negative")]
     InvalidQuantity,
+    #[error("tick size must be positive")]
+    InvalidTickSize,
     #[error("schema mismatch")]
     SchemaMismatch,
     #[error("scope mismatch")]
@@ -776,7 +914,8 @@ mod tests {
                     token_id: "t".into(),
                     bids: levels("0.4", "1"),
                     asks: levels("0.6", "1"),
-                    tick_version: 1,
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
                 },
             ))
             .unwrap();
@@ -803,7 +942,8 @@ mod tests {
                     token_id: "t".into(),
                     bids: levels("0.3", "2"),
                     asks: levels("0.7", "2"),
-                    tick_version: 2,
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v2".into(),
                 },
             ))
             .unwrap();
@@ -833,7 +973,8 @@ mod tests {
                     token_id: "t".into(),
                     bids: levels("0.1", "3"),
                     asks: levels("0.9", "3"),
-                    tick_version: 1,
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
                 },
             ))
             .unwrap();
@@ -864,7 +1005,8 @@ mod tests {
                     token_id: "t".into(),
                     bids: levels("0.2", "1.25"),
                     asks: levels("0.8", "3.5"),
-                    tick_version: 1,
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
                 },
             ),
             event(
@@ -888,7 +1030,8 @@ mod tests {
                     token_id: "t".into(),
                     bids: levels("0.25", "5"),
                     asks: levels("0.75", "5"),
-                    tick_version: 2,
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v2".into(),
                 },
             ),
         ];
@@ -920,7 +1063,8 @@ mod tests {
                         token_id: "t".into(),
                         bids: levels("0.2", "1"),
                         asks: levels("0.8", "1"),
-                        tick_version: 1
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v1".into()
                     }
                 ))
                 .is_err()
@@ -973,7 +1117,8 @@ mod tests {
                 token_id: "t".into(),
                 bids: levels("0.2", "1"),
                 asks: levels("0.8", "1"),
-                tick_version: 1,
+                tick_size: Price::parse_tick("0.01").unwrap(),
+                tick_version: "tick-v1".into(),
             },
         );
         state.apply(first.clone()).unwrap();
@@ -997,7 +1142,8 @@ mod tests {
                     token_id: format!("token-{cursor}"),
                     bids: levels("0.2", "123456789.123456789"),
                     asks: levels("0.8", "987654321.987654321"),
-                    tick_version: 1,
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
                 },
             ))
             .unwrap();
@@ -1071,7 +1217,8 @@ mod tests {
                     token_id: "t".into(),
                     bids: levels("0.2", "1"),
                     asks: levels("0.8", "1"),
-                    tick_version: 1,
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
                 },
             ))
             .unwrap();
@@ -1093,7 +1240,8 @@ mod tests {
                     token_id: "t".into(),
                     bids: levels("0.3", "2"),
                     asks: levels("0.7", "2"),
-                    tick_version: 2,
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v2".into(),
                 },
             ))
             .unwrap();

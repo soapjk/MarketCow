@@ -1,0 +1,14 @@
+[package]
+name = "marketcow-polymarket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hex.workspace = true
+marketcow-core = { path = "../marketcow-core" }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+

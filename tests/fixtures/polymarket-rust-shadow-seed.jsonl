@@ -1,0 +1,3 @@
+{"received_at":"2026-08-03T04:00:00Z","raw_payload":{"event_type":"book","asset_id":"binary-yes","timestamp":"2026-08-03T04:00:00Z","tick_size":"0.01","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.42","size":"11"}],"hash":"shadow-seed-yes"}}
+{"received_at":"2026-08-03T04:00:00Z","raw_payload":{"event_type":"book","asset_id":"binary-no","timestamp":"2026-08-03T04:00:00Z","tick_size":"0.01","bids":[{"price":"0.58","size":"11"}],"asks":[{"price":"0.60","size":"10"}],"hash":"shadow-seed-no"}}
+{"received_at":"2026-08-03T04:00:01Z","raw_payload":{"event_type":"price_change","timestamp":"2026-08-03T04:00:01Z","price_changes":[{"asset_id":"binary-yes","side":"BUY","price":"0.40","size":"12"},{"asset_id":"binary-no","side":"SELL","price":"0.60","size":"12"}]}}
