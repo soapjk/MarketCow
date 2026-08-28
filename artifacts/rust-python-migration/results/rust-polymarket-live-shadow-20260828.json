@@ -39,6 +39,12 @@
         "wal_verify": {"status":"ok","records":66,"last_cursor":66},
         "checkpoint_cursor": 66,
         "interpretation": "A clean controlled exit is not a passing live-data verdict; the retained v2 data remains failed gap-only evidence."
+      },
+      "readiness_automation_observation": {
+        "automation_id": "scheduled_task:6b0936e0-2659-487b-ac80-c35c1ebc105e",
+        "status": "expired_without_valid_observation",
+        "observer_error": "zsh: read-only variable: status",
+        "interpretation": "The observer script itself was invalid under zsh, so its condition state is not readiness evidence. The v2 HTTP 503 verdict is instead supported by its retained gap-only WAL and failed projection state."
       }
     },
     {
