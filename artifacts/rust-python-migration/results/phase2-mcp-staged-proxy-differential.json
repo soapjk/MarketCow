@@ -1,0 +1,21 @@
+{
+  "binary_path": "/private/tmp/marketcow-mcp-build.Fw8hhp/target/debug/marketcow",
+  "binary_sha256": "56b469ef56d6cd8dd76b68fe38ef8ad725d7e3af27dc75f5c257b90280b9652a",
+  "checks": {
+    "all_14_tool_definitions_match": true,
+    "legacy_proxy_reported_without_url": true,
+    "proxied_call_http_200": true,
+    "proxied_tool_result_matches": true,
+    "real_orders_disabled": true,
+    "rust_health_available": true,
+    "tools_list_http_200": true
+  },
+  "failure": null,
+  "passed": true,
+  "process_exit_code": 0,
+  "process_stderr_tail": "",
+  "real_order_submission_enabled": false,
+  "schema_version": "marketcow.mcp-staged-proxy-differential.v1",
+  "source_commit": "85d7e3e52119c30c999fef76959c18d8ac04b049",
+  "tradude_manages_marketcow": false
+}
