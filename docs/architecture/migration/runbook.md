@@ -77,6 +77,20 @@ optional boolean `enable_overnight`. Rust opens it with symlink following disabl
 only as FD 3 to the LongPort capability process. The public API never accepts credentials, and
 the worker never receives PostgreSQL, ClickHouse, admin-token, or other capability secrets.
 
+## Native cached quote reads
+
+The Rust daemon owns `POST /v1/quotes/query` and MCP `get_quotes` once
+`MARKETCOW_CLICKHOUSE_DATABASE` is configured. It uses the existing loopback ClickHouse settings
+`MARKETCOW_CLICKHOUSE_HOST`, `MARKETCOW_CLICKHOUSE_PORT`,
+`MARKETCOW_CLICKHOUSE_USERNAME`, `MARKETCOW_CLICKHOUSE_PASSWORD`, and optional
+`MARKETCOW_CLICKHOUSE_SECURE=true`. Production refuses to start without the database setting.
+
+This boundary is deliberately cache-only: `refresh=true`, an explicit provider, or
+`allow_fallback=true` is rejected and never calls Python or an upstream provider. ClickHouse
+unavailability returns 503 instead of consulting SQLite. Missing symbols are returned as ordered
+per-item `unavailable` errors, while duplicate requested symbols remain duplicated in the response.
+The Rust quote writer remains disabled during this shadow milestone.
+
 The supervisor deterministically assigns exactly one registered capability to each process
 and passes it as `--capability`. The Python worker rejects unknown capabilities before opening
 the UDS and advertises only its assigned capability during the nonce-bound handshake. Pool
