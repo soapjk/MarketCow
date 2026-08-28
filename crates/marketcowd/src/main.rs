@@ -23,8 +23,9 @@ use std::{
     io::Write,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -108,6 +109,8 @@ struct PythonWorkerConfig {
     max_restarts: usize,
     restart_window_seconds: u64,
     restart_backoff_millis: u64,
+    memory_limit_mib: u64,
+    cpu_limit_seconds: u64,
 }
 
 impl PythonWorkerConfig {
@@ -152,6 +155,18 @@ impl PythonWorkerConfig {
         if !(100..=60_000).contains(&restart_backoff_millis) {
             bail!("Python worker restart backoff must be between 100 and 60000 milliseconds");
         }
+        let memory_limit_mib = env::var("MARKETCOW_PYTHON_WORKER_MEMORY_LIMIT_MIB")
+            .unwrap_or_else(|_| "2048".into())
+            .parse::<u64>()?;
+        if !(128..=16_384).contains(&memory_limit_mib) {
+            bail!("Python worker memory limit must be between 128 and 16384 MiB");
+        }
+        let cpu_limit_seconds = env::var("MARKETCOW_PYTHON_WORKER_CPU_LIMIT_SECONDS")
+            .unwrap_or_else(|_| "900".into())
+            .parse::<u64>()?;
+        if !(1..=86_400).contains(&cpu_limit_seconds) {
+            bail!("Python worker CPU limit must be between 1 and 86400 seconds");
+        }
         Ok(Self {
             executable,
             script,
@@ -160,6 +175,8 @@ impl PythonWorkerConfig {
             max_restarts,
             restart_window_seconds,
             restart_backoff_millis,
+            memory_limit_mib,
+            cpu_limit_seconds,
         })
     }
 
@@ -173,6 +190,8 @@ impl PythonWorkerConfig {
             max_restarts: 3,
             restart_window_seconds: 60,
             restart_backoff_millis: 1000,
+            memory_limit_mib: 2048,
+            cpu_limit_seconds: 900,
         }
     }
 
@@ -274,6 +293,8 @@ struct PythonWorkerStatus {
     live: AtomicU64,
     restarts: AtomicU64,
     budget_exhaustions: AtomicU64,
+    memory_limit_kills: AtomicU64,
+    memory_monitor_failures: AtomicU64,
 }
 
 #[derive(Default)]
@@ -662,6 +683,9 @@ fn preflight(config: &Config) -> Result<()> {
         {
             bail!("worker script must be a regular file");
         }
+        if !Path::new("/bin/ps").is_file() {
+            bail!("worker RSS monitor requires /bin/ps");
+        }
     }
     Ok(())
 }
@@ -685,6 +709,51 @@ fn sanitize_worker_command(
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    apply_worker_resource_limits(command, config);
+}
+
+fn apply_worker_resource_limits(command: &mut ProcessCommand, config: &PythonWorkerConfig) {
+    #[cfg(target_os = "linux")]
+    let memory_limit_mib = config.memory_limit_mib;
+    let cpu_seconds = config.cpu_limit_seconds as libc::rlim_t;
+    // SAFETY: the callback only invokes async-signal-safe setrlimit calls with Copy values and
+    // constructs an OS error on failure. It does not access shared process state after fork.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            set_process_limit(
+                libc::RLIMIT_AS as libc::c_int,
+                config_memory_bytes(memory_limit_mib)?,
+            )?;
+            set_process_limit(libc::RLIMIT_CPU as libc::c_int, cpu_seconds)?;
+            set_process_limit(libc::RLIMIT_NOFILE as libc::c_int, 256)?;
+            set_process_limit(libc::RLIMIT_CORE as libc::c_int, 0)?;
+            Ok(())
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn config_memory_bytes(memory_limit_mib: u64) -> std::io::Result<libc::rlim_t> {
+    memory_limit_mib
+        .checked_mul(1024 * 1024)
+        .map(|value| value as libc::rlim_t)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "memory limit overflow")
+        })
+}
+
+fn set_process_limit(resource: libc::c_int, value: libc::rlim_t) -> std::io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
+    };
+    // SAFETY: `limit` points to a fully initialized rlimit value for the duration of the call.
+    if unsafe { libc::setrlimit(resource as _, &limit) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 fn worker_command(config: &PythonWorkerConfig, socket: &Path) -> ProcessCommand {
@@ -717,6 +786,69 @@ fn consume_restart_budget(
     }
     restart_times.push_back(now);
     None
+}
+
+#[derive(Debug)]
+enum WorkerExit {
+    Exited(ExitStatus),
+    MemoryLimitExceeded { resident_kib: u64, limit_kib: u64 },
+}
+
+async fn resident_memory_kib(pid: u32) -> std::io::Result<u64> {
+    let output = ProcessCommand::new("/bin/ps")
+        .env_clear()
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("worker RSS probe failed"));
+    }
+    std::str::from_utf8(&output.stdout)
+        .map_err(|_| std::io::Error::other("worker RSS probe was not UTF-8"))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| std::io::Error::other("worker RSS probe was not numeric"))
+}
+
+async fn wait_for_worker(
+    child: &mut tokio::process::Child,
+    memory_limit_mib: u64,
+) -> std::io::Result<WorkerExit> {
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::other("worker PID unavailable"))?;
+    let limit_kib = memory_limit_mib
+        .checked_mul(1024)
+        .ok_or_else(|| std::io::Error::other("worker memory limit overflow"))?;
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(WorkerExit::Exited(status));
+        }
+        interval.tick().await;
+        match resident_memory_kib(pid).await {
+            Ok(resident_kib) if resident_kib > limit_kib => {
+                child.kill().await?;
+                return Ok(WorkerExit::MemoryLimitExceeded {
+                    resident_kib,
+                    limit_kib,
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(WorkerExit::Exited(status));
+                }
+                child.kill().await?;
+                return Err(error);
+            }
+        }
+    }
 }
 
 async fn supervise_worker_slot(
@@ -753,9 +885,29 @@ async fn supervise_worker_slot(
             Ok(mut child) => {
                 status.live.fetch_add(1, Ordering::Relaxed);
                 info!(slot, pid=?child.id(), "python_worker_started");
-                let result = child.wait().await;
+                let result = wait_for_worker(&mut child, config.memory_limit_mib).await;
                 status.live.fetch_sub(1, Ordering::Relaxed);
-                warn!(slot, result=?result, "python_worker_exited");
+                match result {
+                    Ok(WorkerExit::Exited(exit_status)) => {
+                        warn!(slot, status=?exit_status, "python_worker_exited");
+                    }
+                    Ok(WorkerExit::MemoryLimitExceeded {
+                        resident_kib,
+                        limit_kib,
+                    }) => {
+                        status.memory_limit_kills.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            slot,
+                            resident_kib, limit_kib, "python_worker_memory_limit_exceeded"
+                        );
+                    }
+                    Err(error) => {
+                        status
+                            .memory_monitor_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(slot, error=%error, "python_worker_memory_monitor_failed_closed");
+                    }
+                }
             }
             Err(error) => warn!(slot, error=%error, "python_worker_spawn_failed"),
         }
@@ -1155,7 +1307,11 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
             "configured":configured_workers,
             "live":live_workers,
             "restarts":state.worker_status.restarts.load(Ordering::Relaxed),
-            "restart_budget_exhaustions":state.worker_status.budget_exhaustions.load(Ordering::Relaxed)
+            "restart_budget_exhaustions":state.worker_status.budget_exhaustions.load(Ordering::Relaxed),
+            "memory_limit_kills":state.worker_status.memory_limit_kills.load(Ordering::Relaxed),
+            "memory_monitor_failures":state.worker_status.memory_monitor_failures.load(Ordering::Relaxed),
+            "memory_limit_mib":state.config.python_workers.memory_limit_mib,
+            "cpu_limit_seconds":state.config.python_workers.cpu_limit_seconds
         }
     }))
 }
@@ -1859,7 +2015,9 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
              marketcow_stream_channel_capacity {}\nmarketcow_stream_slow_consumer_disconnects_total {}\n\
              marketcow_persistence_latency_us {}\nmarketcow_publication_latency_us {}\n\
              marketcow_python_workers_configured {}\nmarketcow_python_workers_live {}\n\
-             marketcow_python_worker_restarts_total {}\nmarketcow_python_worker_restart_budget_exhaustions_total {}\n",
+             marketcow_python_worker_restarts_total {}\nmarketcow_python_worker_restart_budget_exhaustions_total {}\n\
+             marketcow_python_worker_memory_limit_kills_total {}\nmarketcow_python_worker_memory_monitor_failures_total {}\n\
+             marketcow_python_worker_memory_limit_mib {}\nmarketcow_python_worker_cpu_limit_seconds {}\n",
             state.metrics.requests.load(Ordering::Relaxed),
             state.metrics.errors.load(Ordering::Relaxed),
             projection.cursor,
@@ -1885,6 +2043,16 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 .worker_status
                 .budget_exhaustions
                 .load(Ordering::Relaxed),
+            state
+                .worker_status
+                .memory_limit_kills
+                .load(Ordering::Relaxed),
+            state
+                .worker_status
+                .memory_monitor_failures
+                .load(Ordering::Relaxed),
+            state.config.python_workers.memory_limit_mib,
+            state.config.python_workers.cpu_limit_seconds,
         ),
     )
 }
@@ -2875,12 +3043,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervised_worker_command_clears_database_and_admin_credentials() {
+    async fn supervised_worker_command_clears_credentials_and_applies_resource_limits() {
         let dir = tempdir().unwrap();
         let script = dir.path().join("credential-check.sh");
         fs::write(
             &script,
-            b"#!/bin/sh\nif [ \"${MARKETCOW_POSTGRES_DSN+x}\" = x ] || [ \"${MARKETCOW_CLICKHOUSE_DSN+x}\" = x ] || [ \"${MARKETCOW_RUST_ADMIN_TOKEN+x}\" = x ]; then exit 42; fi\nexit 0\n",
+            b"#!/bin/sh\nif [ \"${MARKETCOW_POSTGRES_DSN+x}\" = x ] || [ \"${MARKETCOW_CLICKHOUSE_DSN+x}\" = x ] || [ \"${MARKETCOW_RUST_ADMIN_TOKEN+x}\" = x ]; then exit 42; fi\n[ \"$(ulimit -t)\" = 7 ] || exit 43\n[ \"$(ulimit -n)\" = 256 ] || exit 45\n[ \"$(ulimit -c)\" = 0 ] || exit 46\nexit 0\n",
         )
         .unwrap();
         let config = PythonWorkerConfig {
@@ -2891,6 +3059,8 @@ mod tests {
             max_restarts: 3,
             restart_window_seconds: 60,
             restart_backoff_millis: 100,
+            memory_limit_mib: 512,
+            cpu_limit_seconds: 7,
         };
         let mut command = ProcessCommand::new("/bin/sh");
         command
@@ -2899,6 +3069,24 @@ mod tests {
             .env("MARKETCOW_RUST_ADMIN_TOKEN", "must-not-leak");
         sanitize_worker_command(&mut command, &config, &dir.path().join("worker.sock"));
         assert!(command.status().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn worker_memory_monitor_kills_and_reaps_over_limit_process() {
+        let mut child = ProcessCommand::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let outcome = wait_for_worker(&mut child, 0).await.unwrap();
+        assert!(matches!(
+            outcome,
+            WorkerExit::MemoryLimitExceeded {
+                resident_kib: 1..,
+                limit_kib: 0
+            }
+        ));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[test]

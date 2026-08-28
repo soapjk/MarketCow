@@ -38,6 +38,15 @@ configure its bounded values with `MARKETCOW_PYTHON_WORKER_MAX_RESTARTS`,
 without restarting or stopping the HTTP/WAL platform. Check `/v1/health` and the
 `marketcow_python_worker_*` metrics before enabling provider jobs.
 
+Each worker also has an independent resource envelope. Defaults are 2048 MiB resident
+memory, 900 seconds accumulated CPU, 256 file descriptors and zero-byte core dumps. Override
+the first two with `MARKETCOW_PYTHON_WORKER_MEMORY_LIMIT_MIB` (128–16384) and
+`MARKETCOW_PYTHON_WORKER_CPU_LIMIT_SECONDS` (1–86400). CPU, descriptor and core limits are
+installed before `exec`; Linux additionally installs `RLIMIT_AS`. The supervisor checks RSS
+every 250 milliseconds on all supported hosts and kills/reaps an over-limit worker. If RSS
+cannot be measured, it kills the worker and records a fail-closed monitor failure instead of
+running without enforcement.
+
 ## Cutover (future Phase 7 gate)
 
 Drain Rust and Python consumers; stop the Python writer; flush and hash legacy WAL; record a
