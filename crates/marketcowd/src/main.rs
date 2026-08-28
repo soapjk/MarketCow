@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
         DefaultBodyLimit, Extension, Path as AxumPath, Query, Request, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket, close_code},
@@ -9,7 +10,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -1474,6 +1475,7 @@ fn app(state: AppState) -> Router {
             get(live_full_sync),
         )
         .route("/v1/market-data/stream", get(market_data_stream))
+        .route("/mcp", post(mcp))
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
         .route(
@@ -1497,7 +1499,7 @@ fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+fn health_payload(state: &AppState) -> serde_json::Value {
     let configured_workers = state.config.python_workers.pool_size as u64;
     let live_workers = state.worker_status.live.load(Ordering::Relaxed);
     let worker_health = if configured_workers == 0 {
@@ -1507,9 +1509,10 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     } else {
         "degraded"
     };
-    Json(json!({
+    json!({
         "status":"healthy", "service":"marketcowd", "profile":state.config.profile,
         "shadow_mode":true, "real_order_submission_enabled":false,
+        "mcp":{"enabled":true,"endpoint":"/mcp"},
         "components":{
             "api":"healthy","wal":"healthy","python_workers":worker_health,
             "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" }
@@ -1525,7 +1528,182 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
             "cpu_limit_seconds":state.config.python_workers.cpu_limit_seconds,
             "dispatch_policies":&state.config.python_workers.dispatch_policies
         }
-    }))
+    })
+}
+
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(health_payload(&state))
+}
+
+async fn mcp(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    if headers.contains_key("origin") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"browser origins are not accepted by the MCP endpoint"})),
+        )
+            .into_response();
+    }
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .unwrap_or("");
+    if !content_type.eq_ignore_ascii_case("application/json") {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({"error":"Content-Type must be application/json"})),
+        )
+            .into_response();
+    }
+    if let Some(protocol) = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        && !marketcow_contracts::MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&protocol)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"unsupported MCP protocol version"})),
+        )
+            .into_response();
+    }
+    if body.len() > marketcow_contracts::MCP_MAX_REQUEST_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error":"MCP request exceeds 1 MiB"})),
+        )
+            .into_response();
+    }
+    let message = match serde_json::from_slice(&body) {
+        Ok(message) => message,
+        Err(_) => {
+            return Json(mcp_error(serde_json::Value::Null, -32700, "Parse error")).into_response();
+        }
+    };
+    match mcp_handle_message(&state, message) {
+        Some(response) => Json(response).into_response(),
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+fn mcp_handle_message(state: &AppState, message: serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(messages) = message.as_array() {
+        if messages.is_empty() || messages.len() > marketcow_contracts::MCP_MAX_BATCH_MESSAGES {
+            return Some(mcp_error(
+                serde_json::Value::Null,
+                -32600,
+                if messages.is_empty() {
+                    "Invalid Request"
+                } else {
+                    "Batch exceeds 100 messages"
+                },
+            ));
+        }
+        let responses = messages
+            .iter()
+            .filter_map(|message| mcp_handle_request(state, message))
+            .collect::<Vec<_>>();
+        return (!responses.is_empty()).then_some(serde_json::Value::Array(responses));
+    }
+    mcp_handle_request(state, &message)
+}
+
+fn mcp_handle_request(state: &AppState, message: &serde_json::Value) -> Option<serde_json::Value> {
+    let Some(request) = message.as_object() else {
+        return Some(mcp_error(
+            serde_json::Value::Null,
+            -32600,
+            "Invalid Request",
+        ));
+    };
+    let is_notification = !request.contains_key("id");
+    let request_id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let method = request.get("method").and_then(|value| value.as_str());
+    if request.get("jsonrpc").and_then(|value| value.as_str()) != Some("2.0") || method.is_none() {
+        return (!is_notification).then(|| mcp_error(request_id, -32600, "Invalid Request"));
+    }
+    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    if !params.is_object() {
+        return (!is_notification).then(|| mcp_error(request_id, -32602, "Invalid params"));
+    }
+    let method = method.expect("method was validated");
+    if is_notification {
+        return None;
+    }
+    let result = match method {
+        "initialize" => {
+            let requested = params
+                .get("protocolVersion")
+                .and_then(|value| value.as_str());
+            let protocol = requested
+                .filter(|version| {
+                    marketcow_contracts::MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(version)
+                })
+                .unwrap_or(marketcow_contracts::MCP_LATEST_PROTOCOL_VERSION);
+            json!({
+                "protocolVersion":protocol,
+                "capabilities":{"tools":{"listChanged":false}},
+                "serverInfo":{"name":"marketcow","title":"MarketCow Financial Data","version":env!("CARGO_PKG_VERSION")},
+                "instructions":"All tools are read-only and use cached MarketCow data. Search instruments first when venue identity is ambiguous. Treat provider timestamps, provenance, and quality fields as part of the analytical evidence."
+            })
+        }
+        "ping" => json!({}),
+        "tools/list" => json!({
+            "tools":[marketcow_contracts::mcp_service_health_tool_definition()]
+        }),
+        "tools/call" => return Some(mcp_tool_call(state, request_id, &params)),
+        _ => return Some(mcp_error(request_id, -32601, "Method not found")),
+    };
+    Some(json!({"jsonrpc":"2.0","id":request_id,"result":result}))
+}
+
+fn mcp_tool_call(
+    state: &AppState,
+    request_id: serde_json::Value,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let name = params.get("name").and_then(|value| value.as_str());
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if name.is_none() || !arguments.is_object() {
+        return mcp_error(request_id, -32602, "Invalid tool call parameters");
+    }
+    if name != Some("service_health") {
+        return mcp_error(
+            request_id,
+            -32602,
+            &format!("Unknown tool: {}", name.expect("name was validated")),
+        );
+    }
+    if !arguments
+        .as_object()
+        .expect("arguments were validated")
+        .is_empty()
+    {
+        let error = json!({"error":"invalid_tool_input","detail":"unexpected argument(s)"});
+        return mcp_result(request_id, mcp_tool_result(error, true));
+    }
+    mcp_result(request_id, mcp_tool_result(health_payload(state), false))
+}
+
+fn mcp_tool_result(payload: serde_json::Value, is_error: bool) -> serde_json::Value {
+    json!({
+        "content":[{"type":"text","text":serde_json::to_string(&payload).expect("JSON value serializes")}],
+        "structuredContent":payload,
+        "isError":is_error
+    })
+}
+
+fn mcp_result(request_id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    json!({"jsonrpc":"2.0","id":request_id,"result":result})
+}
+
+fn mcp_error(request_id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
+    json!({"jsonrpc":"2.0","id":request_id,"error":{"code":code,"message":message}})
 }
 
 async fn readiness(State(state): State<AppState>) -> Response {
@@ -2855,6 +3033,208 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["real_order_submission_enabled"],
             false
         );
+    }
+
+    #[tokio::test]
+    async fn rust_mcp_transport_is_golden_read_only_and_fails_closed() {
+        let (_dir, state) = test_state();
+        let initialize = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initialize.status(), StatusCode::OK);
+        let initialized: serde_json::Value =
+            serde_json::from_slice(&to_bytes(initialize.into_body(), 16_384).await.unwrap())
+                .unwrap();
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+
+        let list = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("mcp-protocol-version", "2025-11-25")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(list.into_body(), 16_384).await.unwrap()).unwrap();
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/mcp-service-health-tool-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(listed["result"]["tools"], json!([golden]));
+
+        let call = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"service_health","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let called: serde_json::Value =
+            serde_json::from_slice(&to_bytes(call.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(called["result"]["isError"], false);
+        assert_eq!(
+            called["result"]["structuredContent"]["real_order_submission_enabled"],
+            false
+        );
+        assert_eq!(
+            called["result"]["structuredContent"]["mcp"]["endpoint"],
+            "/mcp"
+        );
+
+        for request in [
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("origin", "https://attacker.example")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#))
+                .unwrap(),
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header("mcp-protocol-version", "unknown")
+                .body(Body::from(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#))
+                .unwrap(),
+        ] {
+            let response = app(state.clone()).oneshot(request).await.unwrap();
+            assert!(matches!(
+                response.status(),
+                StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST
+            ));
+        }
+        let wrong_media = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "text/plain")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_media.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let parse_error = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let parse_error: serde_json::Value =
+            serde_json::from_slice(&to_bytes(parse_error.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(parse_error["error"]["code"], -32700);
+
+        let empty_batch = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from("[]"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let empty_batch: serde_json::Value =
+            serde_json::from_slice(&to_bytes(empty_batch.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(empty_batch["error"]["code"], -32600);
+
+        let oversized = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![
+                        b' ';
+                        marketcow_contracts::MCP_MAX_REQUEST_BYTES
+                            + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let notification = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(notification.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn rust_mcp_initialize_works_over_a_real_tcp_listener() {
+        let (_dir, state) = test_state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"unknown"}}"#;
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST /mcp HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let payload = response.split("\r\n\r\n").nth(1).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(
+            payload["result"]["protocolVersion"],
+            marketcow_contracts::MCP_LATEST_PROTOCOL_VERSION
+        );
+        assert_eq!(payload["result"]["serverInfo"]["name"], "marketcow");
+        server.abort();
     }
 
     #[tokio::test]

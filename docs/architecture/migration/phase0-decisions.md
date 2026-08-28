@@ -34,8 +34,11 @@ revision, update cadence and raw SHA-256.
    deadlines and idempotent insert tokens. It is not linked into the realtime core.
 5. **LongPort:** remains a Python bridge until its Rust client passes sequence, reconnect,
    source-evidence and replay tests. It is out of the Polymarket sample cutover.
-6. **MCP:** Rust owns transport/auth first; existing tool implementations are proxied until
-   golden tests pass. SDK choice is deferred without delaying HTTP/realtime ownership.
+6. **MCP:** Rust owns transport/auth first. A tool is advertised only after its native or
+   staged-proxy dispatch passes the frozen Python golden contract; the first native tool is
+   `service_health`, while the remaining legacy tools stay undiscoverable and fail closed until
+   their dispatch exists. The bounded JSON-RPC/Axum transport avoids an immature SDK dependency;
+   SDK choice remains deferred without delaying HTTP/realtime ownership.
 7. **Worker protocol:** length-prefixed versioned JSON over UDS for Phase 1. This avoids a
    build-time `protoc` dependency while retaining typed schemas, deadlines and hashes.
    UDS mode is `0600`; no TCP fallback exists. gRPC is a compatible future transport ADR.
@@ -62,4 +65,3 @@ conclusion is produced by the migration.
 Each completed phase writes machine-readable results below
 `artifacts/rust-python-migration/results/`. A result contains the command, commit, timestamps,
 input hashes and measured assertions. A phase without such evidence is incomplete.
-

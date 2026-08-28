@@ -1,0 +1,16 @@
+{
+  "name": "service_health",
+  "description": "Check whether the local MarketCow API and its data stores are healthy.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

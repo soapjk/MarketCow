@@ -95,6 +95,14 @@ class McpServerTest(unittest.TestCase):
     def test_lists_only_read_only_tools(self) -> None:
         response = self.request("tools/list")
         tools = response["result"]["tools"]
+        golden = json.loads(
+            (Path(__file__).parent / "fixtures/mcp-service-health-tool-v1.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            next(tool for tool in tools if tool["name"] == "service_health"),
+            golden,
+        )
         names = {tool["name"] for tool in tools}
         self.assertIn("get_quotes", names)
         self.assertIn("get_canonical_bars", names)

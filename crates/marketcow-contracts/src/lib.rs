@@ -7,6 +7,34 @@ pub const PREDICTION_MARKET_CONTRACT: &str = "marketcow.prediction_market.v1";
 pub const LIVE_SCHEMA_VERSION: &str = "marketcow.polymarket.live.v2";
 pub const WORKER_PROTOCOL_VERSION: &str = "marketcow.worker.v1";
 pub const MAX_WORKER_FRAME_BYTES: usize = 1_048_576;
+pub const MCP_LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const MCP_SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] = [
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    MCP_LATEST_PROTOCOL_VERSION,
+];
+pub const MCP_MAX_REQUEST_BYTES: usize = 1_048_576;
+pub const MCP_MAX_BATCH_MESSAGES: usize = 100;
+
+pub fn mcp_service_health_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name":"service_health",
+        "description":"Check whether the local MarketCow API and its data stores are healthy.",
+        "inputSchema":{
+            "type":"object",
+            "properties":{},
+            "required":[],
+            "additionalProperties":false
+        },
+        "annotations":{
+            "readOnlyHint":true,
+            "destructiveHint":false,
+            "idempotentHint":true,
+            "openWorldHint":false
+        }
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineErrorDetail {
@@ -219,5 +247,14 @@ mod tests {
         assert_eq!(value["message_type"], "task");
         assert_eq!(value["request"]["price"], "0.100000000000000001");
         assert_eq!(serde_json::from_value::<WorkerFrame>(value).unwrap(), frame);
+    }
+
+    #[test]
+    fn rust_mcp_service_health_definition_matches_python_golden() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/mcp-service-health-tool-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(mcp_service_health_tool_definition(), golden);
     }
 }
