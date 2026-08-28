@@ -1005,13 +1005,15 @@ impl<L: DurableLog> SingleWriter<L> {
         next.fail_closed_reason = rejected
             .clone()
             .or_else(|| (!next.ready).then(|| "unresolved_gap".into()));
+        let event_cursor = event.cursor;
         let persisted = PersistedEvent {
-            event: event.clone(),
+            event,
             applied,
             fail_closed_reason: rejected,
         };
-        next.persisted_cursor = event.cursor;
-        next.recent_event_ids.push_back(event.event_id);
+        next.persisted_cursor = event_cursor;
+        next.recent_event_ids
+            .push_back(persisted.event.event_id.clone());
         if next.recent_event_ids.len() > 10_000 {
             next.recent_event_ids.pop_front();
         }
@@ -1060,6 +1062,62 @@ struct WalBatchRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     frame_raw_payload: Option<serde_json::Value>,
     payloads: Vec<PersistedEvent>,
+}
+
+#[derive(Serialize)]
+struct WalCanonicalEventV2<'a> {
+    schema_version: &'a str,
+    cursor: u64,
+    event_id: &'a str,
+    scope_id: &'a str,
+    received_at: &'a DateTime<Utc>,
+    source_observed_at: &'a DateTime<Utc>,
+    normalizer_version: &'a str,
+    config_revision: &'a str,
+    source: &'a SourceEvidence,
+    raw_payload: (),
+    kind: &'a EventKind,
+}
+
+#[derive(Serialize)]
+struct WalPersistedEventV2<'a> {
+    event: WalCanonicalEventV2<'a>,
+    applied: bool,
+    fail_closed_reason: &'a Option<String>,
+}
+
+impl<'a> From<&'a PersistedEvent> for WalPersistedEventV2<'a> {
+    fn from(persisted: &'a PersistedEvent) -> Self {
+        let event = &persisted.event;
+        Self {
+            event: WalCanonicalEventV2 {
+                schema_version: &event.schema_version,
+                cursor: event.cursor,
+                event_id: &event.event_id,
+                scope_id: &event.scope_id,
+                received_at: &event.received_at,
+                source_observed_at: &event.source_observed_at,
+                normalizer_version: &event.normalizer_version,
+                config_revision: &event.config_revision,
+                source: &event.source,
+                raw_payload: (),
+                kind: &event.kind,
+            },
+            applied: persisted.applied,
+            fail_closed_reason: &persisted.fail_closed_reason,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WalBatchRecordV2<'a> {
+    batch_version: u8,
+    first_cursor: u64,
+    last_cursor: u64,
+    crc32c: u32,
+    payload_sha256: String,
+    frame_raw_payload: &'a serde_json::Value,
+    payloads: Vec<WalPersistedEventV2<'a>>,
 }
 
 const fn wal_batch_v1() -> u8 {
@@ -1315,30 +1373,28 @@ impl DurableLog for SegmentedWal {
         {
             return Err(CoreError::CorruptWal);
         }
-        let frame_raw_payload = outcomes[0].event.raw_payload.clone();
+        let frame_raw_payload = outcomes[0].event.raw_payload.as_ref();
         let raw_sha256 = &outcomes[0].event.source.raw_sha256;
         if outcomes.iter().any(|outcome| {
             outcome.event.source.raw_sha256 != *raw_sha256
-                || outcome.event.raw_payload.as_ref() != frame_raw_payload.as_ref()
+                || outcome.event.raw_payload.as_ref() != frame_raw_payload
         }) {
             return Err(CoreError::CorruptWal);
         }
-        let mut payloads = outcomes.to_vec();
-        for persisted in &mut payloads {
-            persisted.event.raw_payload = Arc::new(serde_json::Value::Null);
-        }
-        let mut record = WalBatchRecord {
+        let payloads = outcomes
+            .iter()
+            .map(WalPersistedEventV2::from)
+            .collect::<Vec<_>>();
+        let payload = serde_json::to_vec(&(frame_raw_payload, &payloads))?;
+        let record = WalBatchRecordV2 {
             batch_version: 2,
             first_cursor: first.event.cursor,
             last_cursor: outcomes.last().expect("non-empty").event.cursor,
-            crc32c: 0,
-            payload_sha256: String::new(),
-            frame_raw_payload: Some((*frame_raw_payload).clone()),
+            crc32c: crc32c::crc32c(&payload),
+            payload_sha256: hex::encode(Sha256::digest(&payload)),
+            frame_raw_payload,
             payloads,
         };
-        let payload = wal_batch_integrity_bytes(&record)?;
-        record.crc32c = crc32c::crc32c(&payload);
-        record.payload_sha256 = hex::encode(Sha256::digest(&payload));
         let line = serde_json::to_vec(&record)?;
         if self.file.is_none() || self.bytes + line.len() as u64 + 1 > self.max_segment_bytes {
             self.rotate(first.event.cursor)?;
