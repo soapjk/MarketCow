@@ -53,6 +53,7 @@ SIZE_INCREMENT_SOURCE_URL = (
 CLOB_MARKET_STREAM_SOURCE_URL = (
     "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 )
+SCOPED_WRITER_MAX_STARTUP_INDEX_CATCH_UP_EVENTS = 100_000
 
 
 _PUBLICATION_LOCKS = threading.local()
@@ -6672,7 +6673,11 @@ def build_live_state_index(root: Path) -> dict[str, Any]:
     }
 
 
-def catch_up_live_state_index(root: Path) -> dict[str, int]:
+def catch_up_live_state_index(
+    root: Path,
+    *,
+    maximum_replayed_events: int | None = None,
+) -> dict[str, int]:
     """Replay a crash-truncated event-log tail into the mutable state index."""
     root = root.resolve()
     event_path = root / "events.jsonl"
@@ -6693,6 +6698,21 @@ def catch_up_live_state_index(root: Path) -> dict[str, int]:
                 "latest_cursor": previous_cursor,
                 "replayed_events": 0,
             }
+        if maximum_replayed_events is not None:
+            tail, _ = _durable_event_log_tail(event_path)
+            pending_events = (
+                tail.cursor - previous_cursor if tail is not None else 0
+            )
+            if pending_events < 0:
+                raise RuntimeError(
+                    "live state index cursor is ahead of the durable event log"
+                )
+            if pending_events > maximum_replayed_events:
+                raise RuntimeError(
+                    "live state index startup catch-up exceeds bounded budget: "
+                    f"pending_events={pending_events} "
+                    f"maximum_replayed_events={maximum_replayed_events}"
+                )
         catalog_revision = metadata.get("catalog_revision") or None
         active_recovery_id = metadata.get("active_recovery_id") or None
         expected_cursor = previous_cursor + 1
@@ -6814,7 +6834,12 @@ def load_scoped_live_store(
     # above and never observe this intentionally unstable internal boundary.
     try:
         LiveStateIndex(root).ensure_runtime_schema()
-        recovery = catch_up_live_state_index(root)
+        recovery = catch_up_live_state_index(
+            root,
+            maximum_replayed_events=(
+                SCOPED_WRITER_MAX_STARTUP_INDEX_CATCH_UP_EVENTS
+            ),
+        )
         if recovery["replayed_events"]:
             LOGGER.warning("live_state_index_tail_recovered %s", recovery)
         snapshot = reader.snapshot(

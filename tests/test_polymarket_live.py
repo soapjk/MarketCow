@@ -2197,6 +2197,49 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertFalse(scoped._state_index_available)
         self.assertIn("database disk image is malformed", scoped.derived_index_error)
 
+    def test_scoped_writer_bounds_large_derived_index_startup_backlog(self):
+        root = self.root / "live"
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        rows = [gamma_row()]
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        durable_size = writer.event_path.stat().st_size
+
+        with (
+            patch.object(
+                polymarket_live_module,
+                "SCOPED_WRITER_MAX_STARTUP_INDEX_CATCH_UP_EVENTS",
+                0,
+            ),
+            patch.object(
+                polymarket_live_module.LiveStateIndex,
+                "append",
+                side_effect=RuntimeError("interrupted after durable append"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "interrupted after durable append"),
+        ):
+            writer.mark_recovery_started("large-startup-backlog")
+
+        with patch.object(
+            polymarket_live_module,
+            "SCOPED_WRITER_MAX_STARTUP_INDEX_CATCH_UP_EVENTS",
+            0,
+        ):
+            scoped = load_scoped_live_store(
+                root, ["m1"], now_provider=lambda: NOW,
+            )
+
+        self.assertEqual(scoped.cursor, writer.cursor)
+        self.assertEqual(scoped.persisted_cursor, writer.cursor)
+        self.assertGreater(scoped._event_offset, durable_size)
+        self.assertEqual(scoped.books, {})
+        self.assertFalse(scoped._state_index_available)
+        self.assertIn(
+            "startup catch-up exceeds bounded budget",
+            scoped.derived_index_error,
+        )
+
     def test_state_index_rebuild_resumes_from_committed_event_boundary(self):
         root = self.root / "live"
         writer = LiveStateStore(root, now_provider=lambda: NOW)
