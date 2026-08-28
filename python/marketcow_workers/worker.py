@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import hashlib
+import io
 import json
 import os
 import secrets
@@ -18,7 +20,13 @@ MAX_FRAME_BYTES = 1_048_576
 SEC_DIVIDEND_TASK = "transform.sec_dividend_filing"
 SEC_DIVIDEND_REQUEST_SCHEMA = "marketcow.worker.transform.sec-dividend-filing.v1"
 SEC_DIVIDEND_RESULT_SCHEMA = "marketcow.worker.transform.sec-dividend-filing-result.v1"
+CSV_INFERENCE_TASK = "transform.csv_inference"
+CSV_INFERENCE_REQUEST_SCHEMA = "marketcow.worker.transform.csv-inference.v1"
+CSV_INFERENCE_RESULT_SCHEMA = "marketcow.worker.transform.csv-inference-result.v1"
 POLL_INTERVAL_SECONDS = 1.0
+MAX_CSV_ROWS = 10_000
+MAX_CSV_COLUMNS = 256
+ALLOWED_CSV_DELIMITERS = (",", "\t", ";", "|")
 
 Handler = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -124,8 +132,67 @@ def handle_sec_dividend_filing(request: dict[str, Any]) -> dict[str, Any]:
     return {"schema_version": SEC_DIVIDEND_RESULT_SCHEMA, "rows": rows}
 
 
+def handle_csv_inference(request: dict[str, Any]) -> dict[str, Any]:
+    required = {"content", "source", "observed_at"}
+    optional = {"delimiter"}
+    if not required.issubset(request) or not set(request).issubset(required | optional):
+        raise ValueError("CSV inference request fields are invalid")
+    if not all(isinstance(request[key], str) for key in required):
+        raise ValueError("CSV inference request fields are invalid")
+    content = request["content"]
+    if not content or "\x00" in content or len(content.encode()) > MAX_FRAME_BYTES // 2:
+        raise ValueError("CSV content is empty, contains NUL, or is too large")
+    source = request["source"]
+    if not source or len(source) > 2048:
+        raise ValueError("CSV source is invalid")
+    observed_at = datetime.fromisoformat(request["observed_at"].replace("Z", "+00:00"))
+    if observed_at.tzinfo is None:
+        raise ValueError("observed_at must be timezone-aware")
+    requested_delimiter = request.get("delimiter")
+    if requested_delimiter is not None and requested_delimiter not in ALLOWED_CSV_DELIMITERS:
+        raise ValueError("CSV delimiter is unsupported")
+    if requested_delimiter is None:
+        try:
+            delimiter = csv.Sniffer().sniff(
+                content[:8192], delimiters="".join(ALLOWED_CSV_DELIMITERS)
+            ).delimiter
+        except csv.Error as error:
+            raise ValueError("CSV delimiter could not be inferred") from error
+    else:
+        delimiter = requested_delimiter
+    reader = csv.reader(io.StringIO(content, newline=""), delimiter=delimiter, strict=True)
+    try:
+        columns = next(reader)
+        if not columns or len(columns) > MAX_CSV_COLUMNS:
+            raise ValueError("CSV column count is invalid")
+        if any(not column or len(column) > 512 for column in columns):
+            raise ValueError("CSV header is invalid")
+        if len(set(columns)) != len(columns):
+            raise ValueError("CSV headers must be unique")
+        rows: list[list[str]] = []
+        for row in reader:
+            if len(rows) >= MAX_CSV_ROWS:
+                raise ValueError("CSV row count exceeds limit")
+            if len(row) != len(columns):
+                raise ValueError("CSV row width does not match header")
+            rows.append(row)
+    except csv.Error as error:
+        raise ValueError("CSV syntax is invalid") from error
+    return {
+        "schema_version": CSV_INFERENCE_RESULT_SCHEMA,
+        "source": source,
+        "observed_at": observed_at.astimezone(UTC).isoformat(),
+        "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "delimiter": delimiter,
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+    }
+
+
 HANDLERS: dict[tuple[str, str], Handler] = {
     (SEC_DIVIDEND_TASK, SEC_DIVIDEND_REQUEST_SCHEMA): handle_sec_dividend_filing,
+    (CSV_INFERENCE_TASK, CSV_INFERENCE_REQUEST_SCHEMA): handle_csv_inference,
 }
 
 

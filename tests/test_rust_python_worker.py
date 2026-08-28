@@ -9,12 +9,15 @@ from tempfile import TemporaryDirectory
 import pytest
 
 from python.marketcow_workers.worker import (
+    CSV_INFERENCE_REQUEST_SCHEMA,
+    CSV_INFERENCE_RESULT_SCHEMA,
+    CSV_INFERENCE_TASK,
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
-    SEC_DIVIDEND_REQUEST_SCHEMA,
     SEC_DIVIDEND_RESULT_SCHEMA,
     SEC_DIVIDEND_TASK,
     handle_sec_dividend_filing,
+    handle_csv_inference,
     handshake,
     run_worker,
     safe_staging_path,
@@ -90,7 +93,44 @@ def test_sec_dividend_handler_preserves_exact_decimal_and_provenance() -> None:
     assert result["rows"][0]["source_type"] == "regulatory_filing"
 
 
-def test_python_worker_executes_task_only_through_leased_uds_protocol() -> None:
+def test_csv_inference_is_bounded_exact_and_provenance_preserving() -> None:
+    content = 'symbol,amount,currency,note\nAAPL.XNAS,0.250000000000000001,USD,"declared, exact"\n'
+    result = handle_csv_inference({
+        "content": content,
+        "source": "fixture://dividend.csv",
+        "observed_at": "2026-08-28T08:00:00+08:00",
+    })
+    assert result == {
+        "schema_version": CSV_INFERENCE_RESULT_SCHEMA,
+        "source": "fixture://dividend.csv",
+        "observed_at": "2026-08-28T00:00:00+00:00",
+        "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "delimiter": ",",
+        "columns": ["symbol", "amount", "currency", "note"],
+        "rows": [["AAPL.XNAS", "0.250000000000000001", "USD", "declared, exact"]],
+        "row_count": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "symbol,symbol\nAAPL.XNAS,AAPL.XNAS\n",
+        "symbol,amount\nAAPL.XNAS\n",
+        "symbol,amount\nAAPL.XNAS,1\x00\n",
+    ],
+)
+def test_csv_inference_rejects_ambiguous_or_malformed_input(content: str) -> None:
+    with pytest.raises(ValueError):
+        handle_csv_inference({
+            "content": content,
+            "source": "fixture://invalid.csv",
+            "observed_at": "2026-08-28T00:00:00Z",
+            "delimiter": ",",
+        })
+
+
+def test_python_worker_executes_csv_task_only_through_leased_uds_protocol() -> None:
     async def scenario() -> None:
         temporary = TemporaryDirectory(prefix="mc-worker-task-", dir="/tmp")
         root = Path(temporary.name)
@@ -98,14 +138,9 @@ def test_python_worker_executes_task_only_through_leased_uds_protocol() -> None:
         staging_path = root / "staging" / "job-1"
         staging_path.mkdir(parents=True)
         request = {
-            "text": (
-                "Dividend of $0.125 per share payable October 1, 2026 "
-                "to holders of record September 15, 2026."
-            ),
-            "symbol": "AAPL.XNAS",
-            "filed_at": "2026-08-28T00:00:00Z",
-            "source_url": "https://www.sec.gov/Archives/fixture.htm",
-            "accession": "0000000000-26-000002",
+            "content": "symbol,amount,currency\nAAPL.XNAS,0.125000000000000001,USD\n",
+            "source": "fixture://leased-dividend.csv",
+            "observed_at": "2026-08-28T00:00:00Z",
         }
         request_sha256 = hashlib.sha256(
             json.dumps(request, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()
@@ -128,7 +163,7 @@ def test_python_worker_executes_task_only_through_leased_uds_protocol() -> None:
         async def server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             hello = await read_request(reader)
             assert hello["message_type"] == "hello"
-            assert hello["capabilities"] == [SEC_DIVIDEND_TASK]
+            assert hello["capabilities"] == [CSV_INFERENCE_TASK, SEC_DIVIDEND_TASK]
             await respond(
                 writer,
                 hello,
@@ -146,8 +181,8 @@ def test_python_worker_executes_task_only_through_leased_uds_protocol() -> None:
                 job_id="job-1",
                 lease_token="lease-1",
                 deadline=(datetime.now(UTC) + timedelta(minutes=1)).isoformat(),
-                job_type=SEC_DIVIDEND_TASK,
-                request_schema=SEC_DIVIDEND_REQUEST_SCHEMA,
+                job_type=CSV_INFERENCE_TASK,
+                request_schema=CSV_INFERENCE_REQUEST_SCHEMA,
                 request_sha256=request_sha256,
                 request=request,
                 staging_path=str(staging_path),
@@ -165,7 +200,8 @@ def test_python_worker_executes_task_only_through_leased_uds_protocol() -> None:
             assert complete["sha256"] == hashlib.sha256(body).hexdigest()
             assert complete["size_bytes"] == len(body)
             parsed = json.loads(body)
-            assert parsed["rows"][0]["amount_per_share"] == "0.125"
+            assert parsed["rows"][0][1] == "0.125000000000000001"
+            assert parsed["source"] == "fixture://leased-dividend.csv"
             await respond(
                 writer,
                 complete,
