@@ -276,6 +276,30 @@ impl JobEngine {
         Ok(job)
     }
 
+    /// Authorizes an untrusted worker result before any filesystem promotion is attempted.
+    /// The final transition repeats the same lease checks so expiry or cancellation races remain
+    /// fail-closed.
+    pub fn authorize_result(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<&ProviderJob, JobEngineError> {
+        let job = self.jobs.get(job_id).ok_or(JobEngineError::NotFound)?;
+        if now >= job.deadline {
+            return Err(JobEngineError::DeadlineElapsed);
+        }
+        if job.lease_token.as_deref() != Some(lease_token)
+            || job.lease_expires_at.is_none_or(|expires| now >= expires)
+        {
+            return Err(JobEngineError::LeaseRejected);
+        }
+        if job.status != JobStatus::Running {
+            return Err(JobEngineError::InvalidTransition);
+        }
+        Ok(job)
+    }
+
     pub fn fail(
         &mut self,
         job_id: &str,
@@ -478,7 +502,10 @@ fn validate_result(result: &StagedResult) -> Result<(), JobEngineError> {
     let path = std::path::Path::new(&result.relative_path);
     if path.is_absolute()
         || result.relative_path.is_empty()
-        || path.components().count() != 1
+        || result.relative_path.len() > 512
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
         || result.sha256.len() != 64
         || !result.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
         || result.media_type.is_empty()
@@ -545,6 +572,13 @@ mod tests {
             .clone();
         let token = claimed.lease_token.unwrap();
         engine.start(&job_id, &token, now()).unwrap();
+        assert_eq!(
+            engine
+                .authorize_result(&job_id, "wrong-token", now())
+                .unwrap_err(),
+            JobEngineError::LeaseRejected
+        );
+        engine.authorize_result(&job_id, &token, now()).unwrap();
         let done = engine
             .succeed(
                 &job_id,
@@ -560,6 +594,29 @@ mod tests {
             .unwrap();
         assert_eq!(done.status, JobStatus::Succeeded);
         assert!(done.lease_token.is_none());
+    }
+
+    #[test]
+    fn result_authorization_fails_closed_before_start_and_after_expiry() {
+        let mut engine = JobEngine::default();
+        let job_id = engine.submit(submit(), now()).unwrap().job_id.clone();
+        let token = engine
+            .claim(&job_id, "worker", Duration::seconds(10), now())
+            .unwrap()
+            .lease_token
+            .clone()
+            .unwrap();
+        assert_eq!(
+            engine.authorize_result(&job_id, &token, now()).unwrap_err(),
+            JobEngineError::InvalidTransition
+        );
+        engine.start(&job_id, &token, now()).unwrap();
+        assert_eq!(
+            engine
+                .authorize_result(&job_id, &token, now() + Duration::seconds(10))
+                .unwrap_err(),
+            JobEngineError::LeaseRejected
+        );
     }
 
     #[test]

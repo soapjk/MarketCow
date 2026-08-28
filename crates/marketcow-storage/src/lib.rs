@@ -6,7 +6,12 @@ use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::Path, sync::Mutex};
+use std::{
+    fs::{self, File},
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 use thiserror::Error;
 
 pub const PROVIDER_JOB_MIGRATION_VERSION: &str = "rust-provider-job-v1";
@@ -40,6 +45,25 @@ CREATE TABLE IF NOT EXISTS marketcow_rust_migration (
 );
 "#;
 const PROVIDER_JOB_MIGRATION_LOCK: i64 = 0x4d_43_4a_4f_42;
+
+pub const ARTIFACT_MANIFEST_MIGRATION_VERSION: &str = "rust-artifact-manifest-v1";
+pub const ARTIFACT_MANIFEST_MIGRATION_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS raw_artifact_manifest (
+    artifact_id TEXT PRIMARY KEY,
+    dataset TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_url TEXT,
+    observed_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL,
+    raw_response_locator TEXT,
+    storage_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    byte_size BIGINT NOT NULL CHECK (byte_size >= 0),
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS raw_artifact_dataset_ingested_idx
+    ON raw_artifact_manifest (dataset, ingested_at DESC);
+"#;
 
 pub const CLICKHOUSE_QUOTE_MIGRATION_VERSION: &str = "rust-quote-latest-v1";
 pub const CLICKHOUSE_QUOTE_MIGRATION_SQL: &str = r#"
@@ -407,6 +431,181 @@ pub struct QuoteRecord {
     pub raw_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactManifestRecord {
+    pub artifact_id: String,
+    pub dataset: String,
+    pub revision: String,
+    pub source: String,
+    pub source_url: Option<String>,
+    pub observed_at: DateTime<Utc>,
+    pub ingested_at: DateTime<Utc>,
+    pub raw_response_locator: Option<String>,
+    pub storage_path: String,
+    pub relative_path: String,
+    pub sha256: String,
+    pub byte_size: u64,
+    pub media_type: String,
+    pub metadata_json: serde_json::Value,
+}
+
+/// Verifies a worker-owned staging file, then atomically promotes it into the Rust-owned,
+/// content-addressed Artifact store. An existing identical target makes retries idempotent.
+pub struct WorkerArtifactPromotion<'a> {
+    pub staging_root: &'a Path,
+    pub artifact_root: &'a Path,
+    pub job_id: &'a str,
+    pub dataset: &'a str,
+    pub revision: &'a str,
+    pub source: &'a str,
+    pub result: &'a marketcow_jobs::StagedResult,
+    pub ingested_at: DateTime<Utc>,
+}
+
+pub fn promote_worker_artifact(
+    promotion: WorkerArtifactPromotion<'_>,
+) -> Result<ArtifactManifestRecord, RepositoryError> {
+    let WorkerArtifactPromotion {
+        staging_root,
+        artifact_root,
+        job_id,
+        dataset,
+        revision,
+        source,
+        result,
+        ingested_at,
+    } = promotion;
+    if !staging_root.is_absolute()
+        || !artifact_root.is_absolute()
+        || staging_root == Path::new("/")
+        || artifact_root == Path::new("/")
+        || !valid_path_segment(job_id, 128)
+        || !valid_path_segment(dataset, 128)
+        || !valid_path_segment(revision, 192)
+        || source.is_empty()
+        || source.len() > 256
+        || result.relative_path.is_empty()
+        || result.media_type.is_empty()
+        || result.media_type.len() > 255
+        || result
+            .media_type
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
+        || result.sha256.len() != 64
+        || !result.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(RepositoryError::InvalidInput);
+    }
+    let relative_staging = Path::new(&result.relative_path);
+    if relative_staging.is_absolute()
+        || relative_staging.components().count() != 1
+        || !relative_staging
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(RepositoryError::InvalidInput);
+    }
+    let sha256 = result.sha256.to_ascii_lowercase();
+    let relative_path = PathBuf::from(dataset)
+        .join(revision)
+        .join(&sha256[..2])
+        .join(&sha256);
+    let target = artifact_root.join(&relative_path);
+    let target_parent = target.parent().ok_or(RepositoryError::InvalidInput)?;
+    fs::create_dir_all(target_parent).map_err(|_| RepositoryError::Unavailable)?;
+    if target.exists() {
+        verify_file_identity(&target, &sha256, result.size_bytes)?;
+    } else {
+        let task_root = staging_root.join(job_id);
+        let candidate = task_root.join(relative_staging);
+        let metadata =
+            fs::symlink_metadata(&candidate).map_err(|_| RepositoryError::Unavailable)?;
+        if !metadata.file_type().is_file() || metadata.len() != result.size_bytes {
+            return Err(RepositoryError::ArtifactVerificationFailed);
+        }
+        let canonical_task =
+            fs::canonicalize(&task_root).map_err(|_| RepositoryError::Unavailable)?;
+        let canonical_candidate =
+            fs::canonicalize(&candidate).map_err(|_| RepositoryError::Unavailable)?;
+        if canonical_candidate.parent() != Some(canonical_task.as_path()) {
+            return Err(RepositoryError::ArtifactVerificationFailed);
+        }
+        verify_file_identity(&canonical_candidate, &sha256, result.size_bytes)?;
+        File::open(&canonical_candidate)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| RepositoryError::Unavailable)?;
+        fs::rename(&canonical_candidate, &target).map_err(|_| RepositoryError::Unavailable)?;
+        File::open(target_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| RepositoryError::Unavailable)?;
+    }
+    let artifact_id = hex::encode(Sha256::digest(
+        format!("{dataset}\0{revision}\0{sha256}").as_bytes(),
+    ));
+    Ok(ArtifactManifestRecord {
+        artifact_id,
+        dataset: dataset.into(),
+        revision: revision.into(),
+        source: source.into(),
+        source_url: None,
+        observed_at: ingested_at,
+        ingested_at,
+        raw_response_locator: Some(format!(
+            "worker-staging://{job_id}/{}",
+            result.relative_path
+        )),
+        storage_path: target.to_string_lossy().into_owned(),
+        relative_path: relative_path.to_string_lossy().into_owned(),
+        sha256,
+        byte_size: result.size_bytes,
+        media_type: result.media_type.clone(),
+        metadata_json: serde_json::json!({
+            "job_id": job_id,
+            "request_schema": revision,
+            "media_type": result.media_type,
+            "relative_path": relative_path,
+            "registered_by": "marketcowd"
+        }),
+    })
+}
+
+fn valid_path_segment(value: &str, maximum_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && value != "."
+        && value != ".."
+}
+
+fn verify_file_identity(
+    path: &Path,
+    expected_sha256: &str,
+    expected_size: u64,
+) -> Result<(), RepositoryError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| RepositoryError::Unavailable)?;
+    if !metadata.file_type().is_file() || metadata.len() != expected_size {
+        return Err(RepositoryError::ArtifactVerificationFailed);
+    }
+    let mut file = File::open(path).map_err(|_| RepositoryError::Unavailable)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hex::encode(hasher.finalize()) != expected_sha256.to_ascii_lowercase() {
+        return Err(RepositoryError::ArtifactVerificationFailed);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyKey(pub String);
 
@@ -420,7 +619,7 @@ pub trait AuditRepository: Send + Sync {
     fn append(&self, actor: &str, action: &str) -> Result<(), RepositoryError>;
 }
 pub trait ArtifactManifestRepository: Send + Sync {
-    fn register_verified(&self, sha256: &str, size: u64) -> Result<(), RepositoryError>;
+    fn register_verified(&self, record: &ArtifactManifestRecord) -> Result<(), RepositoryError>;
 }
 pub trait FundamentalRepository: Send + Sync {}
 pub trait MarketBarRepository: Send + Sync {}
@@ -601,6 +800,8 @@ pub enum RepositoryError {
     RevisionConflict,
     #[error("migration checksum mismatch")]
     MigrationChecksumMismatch,
+    #[error("artifact verification failed")]
+    ArtifactVerificationFailed,
 }
 
 pub struct PostgresJobRepository {
@@ -669,6 +870,39 @@ impl PostgresJobRepository {
                      (version, checksum, applied_at, binary_commit, safe_forward) \
                      VALUES ($1, $2, NOW(), $3, TRUE)",
                     &[&PROVIDER_JOB_MIGRATION_VERSION, &checksum, &binary_commit],
+                )
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+        }
+        let artifact_checksum =
+            hex::encode(Sha256::digest(ARTIFACT_MANIFEST_MIGRATION_SQL.as_bytes()));
+        let artifact_existing = transaction
+            .query_opt(
+                "SELECT checksum FROM marketcow_rust_migration WHERE version = $1",
+                &[&ARTIFACT_MANIFEST_MIGRATION_VERSION],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if let Some(row) = artifact_existing {
+            let recorded: String = row.get(0);
+            if recorded != artifact_checksum {
+                return Err(RepositoryError::MigrationChecksumMismatch);
+            }
+        } else {
+            transaction
+                .batch_execute(ARTIFACT_MANIFEST_MIGRATION_SQL)
+                .await
+                .map_err(|_| RepositoryError::Unavailable)?;
+            transaction
+                .execute(
+                    "INSERT INTO marketcow_rust_migration \
+                     (version, checksum, applied_at, binary_commit, safe_forward) \
+                     VALUES ($1, $2, NOW(), $3, TRUE)",
+                    &[
+                        &ARTIFACT_MANIFEST_MIGRATION_VERSION,
+                        &artifact_checksum,
+                        &binary_commit,
+                    ],
                 )
                 .await
                 .map_err(|_| RepositoryError::Unavailable)?;
@@ -762,6 +996,101 @@ impl PostgresJobRepository {
         } else {
             Err(RepositoryError::RevisionConflict)
         }
+    }
+
+    /// Atomically records a verified Artifact manifest and advances the owning job. A filesystem
+    /// body may already have been promoted, but it is not authoritative or discoverable until
+    /// this transaction commits.
+    pub async fn compare_and_swap_with_artifact(
+        &self,
+        job: &marketcow_jobs::ProviderJob,
+        expected_revision: u64,
+        artifact: &ArtifactManifestRecord,
+    ) -> Result<(), RepositoryError> {
+        validate_job_for_storage(job)?;
+        validate_artifact_manifest(artifact)?;
+        if job.revision != expected_revision.saturating_add(1)
+            || job.status != marketcow_jobs::JobStatus::Succeeded
+            || job.result.as_ref().is_none_or(|result| {
+                result.sha256.to_ascii_lowercase() != artifact.sha256
+                    || result.size_bytes != artifact.byte_size
+                    || result.media_type != artifact.media_type
+                    || result.relative_path != artifact.relative_path
+            })
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let payload = serde_json::to_value(job).map_err(|_| RepositoryError::InvalidInput)?;
+        let status = job_status_text(job.status);
+        let revision = i64::try_from(job.revision).map_err(|_| RepositoryError::InvalidInput)?;
+        let expected =
+            i64::try_from(expected_revision).map_err(|_| RepositoryError::InvalidInput)?;
+        let byte_size =
+            i64::try_from(artifact.byte_size).map_err(|_| RepositoryError::InvalidInput)?;
+        let observed_at = artifact.observed_at.to_rfc3339();
+        let ingested_at = artifact.ingested_at.to_rfc3339();
+        let mut client = self.client.lock().await;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO raw_artifact_manifest \
+                 (artifact_id,dataset,source,source_url,observed_at,ingested_at, \
+                  raw_response_locator,storage_path,sha256,byte_size,metadata_json) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+                 ON CONFLICT (artifact_id) DO NOTHING",
+                &[
+                    &artifact.artifact_id,
+                    &artifact.dataset,
+                    &artifact.source,
+                    &artifact.source_url,
+                    &observed_at,
+                    &ingested_at,
+                    &artifact.raw_response_locator,
+                    &artifact.storage_path,
+                    &artifact.sha256,
+                    &byte_size,
+                    &artifact.metadata_json,
+                ],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let stored = transaction
+            .query_one(
+                "SELECT dataset,source,storage_path,sha256,byte_size,metadata_json \
+                 FROM raw_artifact_manifest WHERE artifact_id=$1 FOR SHARE",
+                &[&artifact.artifact_id],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        let stored_size: i64 = stored.get(4);
+        let stored_metadata: serde_json::Value = stored.get(5);
+        if stored.get::<_, String>(0) != artifact.dataset
+            || stored.get::<_, String>(1) != artifact.source
+            || stored.get::<_, String>(2) != artifact.storage_path
+            || stored.get::<_, String>(3) != artifact.sha256
+            || stored_size != byte_size
+            || stored_metadata != artifact.metadata_json
+        {
+            return Err(RepositoryError::IdempotencyConflict);
+        }
+        let affected = transaction
+            .execute(
+                "UPDATE provider_job SET status=$2, revision=$3, deadline=$4, payload=$5, updated_at=NOW() \
+                 WHERE job_id=$1 AND revision=$6",
+                &[&job.job_id, &status, &revision, &job.deadline, &payload, &expected],
+            )
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        if affected != 1 {
+            return Err(RepositoryError::RevisionConflict);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)
     }
 
     pub async fn compare_and_swap_many(
@@ -892,6 +1221,30 @@ fn validate_job_for_storage(job: &marketcow_jobs::ProviderJob) -> Result<(), Rep
     Ok(())
 }
 
+fn validate_artifact_manifest(artifact: &ArtifactManifestRecord) -> Result<(), RepositoryError> {
+    if artifact.artifact_id.len() != 64
+        || !artifact
+            .artifact_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || !valid_path_segment(&artifact.dataset, 128)
+        || !valid_path_segment(&artifact.revision, 192)
+        || artifact.source.is_empty()
+        || artifact.source.len() > 256
+        || artifact.storage_path.is_empty()
+        || !Path::new(&artifact.storage_path).is_absolute()
+        || artifact.relative_path.is_empty()
+        || Path::new(&artifact.relative_path).is_absolute()
+        || artifact.sha256.len() != 64
+        || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || artifact.media_type.is_empty()
+        || !artifact.metadata_json.is_object()
+    {
+        return Err(RepositoryError::InvalidInput);
+    }
+    Ok(())
+}
+
 fn job_status_text(status: marketcow_jobs::JobStatus) -> &'static str {
     match status {
         marketcow_jobs::JobStatus::Pending => "pending",
@@ -962,6 +1315,110 @@ mod tests {
             hex::encode(Sha256::digest(PROVIDER_JOB_MIGRATION_SQL.as_bytes())).len(),
             64
         );
+        assert_eq!(
+            ARTIFACT_MANIFEST_MIGRATION_VERSION,
+            "rust-artifact-manifest-v1"
+        );
+        assert!(ARTIFACT_MANIFEST_MIGRATION_SQL.contains("raw_artifact_manifest"));
+        assert!(ARTIFACT_MANIFEST_MIGRATION_SQL.contains("byte_size >= 0"));
+    }
+
+    #[test]
+    fn worker_artifact_promotion_is_verified_content_addressed_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = directory.path().join("staging");
+        let artifact_root = directory.path().join("artifacts");
+        let task_root = staging_root.join("job-1");
+        fs::create_dir_all(&task_root).unwrap();
+        let body = br#"{"price":"0.100000000000000001"}"#;
+        let sha256 = hex::encode(Sha256::digest(body));
+        fs::write(task_root.join("result.json"), body).unwrap();
+        let result = marketcow_jobs::StagedResult {
+            relative_path: "result.json".into(),
+            sha256: sha256.clone(),
+            size_bytes: body.len() as u64,
+            media_type: "application/json".into(),
+        };
+        let at = Utc::now();
+        let first = promote_worker_artifact(WorkerArtifactPromotion {
+            staging_root: &staging_root,
+            artifact_root: &artifact_root,
+            job_id: "job-1",
+            dataset: "provider.history",
+            revision: "marketcow.provider.history.v1",
+            source: "worker:test",
+            result: &result,
+            ingested_at: at,
+        })
+        .unwrap();
+        assert_eq!(first.sha256, sha256);
+        assert_eq!(first.byte_size, body.len() as u64);
+        assert!(Path::new(&first.storage_path).is_file());
+        assert_eq!(fs::read(&first.storage_path).unwrap(), body);
+        assert_eq!(first.metadata_json["registered_by"], "marketcowd");
+
+        // A retry succeeds after the staging file was consumed by the atomic rename.
+        assert!(!task_root.join("result.json").exists());
+        let second = promote_worker_artifact(WorkerArtifactPromotion {
+            staging_root: &staging_root,
+            artifact_root: &artifact_root,
+            job_id: "job-1",
+            dataset: "provider.history",
+            revision: "marketcow.provider.history.v1",
+            source: "worker:test",
+            result: &result,
+            ingested_at: at,
+        })
+        .unwrap();
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn worker_artifact_promotion_rejects_escape_and_hash_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = directory.path().join("staging");
+        let artifact_root = directory.path().join("artifacts");
+        let task_root = staging_root.join("job-1");
+        fs::create_dir_all(&task_root).unwrap();
+        fs::write(task_root.join("result.json"), b"body").unwrap();
+        let mismatch = marketcow_jobs::StagedResult {
+            relative_path: "result.json".into(),
+            sha256: "a".repeat(64),
+            size_bytes: 4,
+            media_type: "application/json".into(),
+        };
+        assert!(matches!(
+            promote_worker_artifact(WorkerArtifactPromotion {
+                staging_root: &staging_root,
+                artifact_root: &artifact_root,
+                job_id: "job-1",
+                dataset: "provider.history",
+                revision: "marketcow.provider.history.v1",
+                source: "worker:test",
+                result: &mismatch,
+                ingested_at: Utc::now(),
+            }),
+            Err(RepositoryError::ArtifactVerificationFailed)
+        ));
+        let escape = marketcow_jobs::StagedResult {
+            relative_path: "../outside".into(),
+            sha256: "a".repeat(64),
+            size_bytes: 4,
+            media_type: "application/json".into(),
+        };
+        assert!(matches!(
+            promote_worker_artifact(WorkerArtifactPromotion {
+                staging_root: &staging_root,
+                artifact_root: &artifact_root,
+                job_id: "job-1",
+                dataset: "provider.history",
+                revision: "marketcow.provider.history.v1",
+                source: "worker:test",
+                result: &escape,
+                ingested_at: Utc::now(),
+            }),
+            Err(RepositoryError::InvalidInput)
+        ));
     }
 
     #[test]
@@ -1138,5 +1595,50 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.job_id == job.job_id)
         );
+        let artifact_sha256 = "d".repeat(64);
+        let artifact_relative_path =
+            format!("provider.history/marketcow.provider.history.v1/dd/{artifact_sha256}");
+        let completed = engine
+            .succeed(
+                &job.job_id,
+                &lease_token,
+                marketcow_jobs::StagedResult {
+                    relative_path: artifact_relative_path.clone(),
+                    sha256: artifact_sha256.clone(),
+                    size_bytes: 4,
+                    media_type: "application/json".into(),
+                },
+                now + Duration::seconds(1),
+            )
+            .unwrap()
+            .clone();
+        let artifact = ArtifactManifestRecord {
+            artifact_id: hex::encode(Sha256::digest(
+                format!("{}\0{}", job.job_id, artifact_sha256).as_bytes(),
+            )),
+            dataset: "provider.history".into(),
+            revision: "marketcow.provider.history.v1".into(),
+            source: "python-worker:integration-test".into(),
+            source_url: None,
+            observed_at: now,
+            ingested_at: now,
+            raw_response_locator: Some(format!("worker-staging://{}/result.json", job.job_id)),
+            storage_path: format!("/tmp/marketcow-test-artifacts/{artifact_relative_path}"),
+            relative_path: artifact_relative_path,
+            sha256: artifact_sha256,
+            byte_size: 4,
+            media_type: "application/json".into(),
+            metadata_json: serde_json::json!({
+                "job_id": job.job_id,
+                "request_schema": "marketcow.provider.history.v1",
+                "media_type": "application/json",
+                "registered_by": "marketcowd"
+            }),
+        };
+        repository
+            .compare_and_swap_with_artifact(&completed, 3, &artifact)
+            .await
+            .unwrap();
+        assert_eq!(repository.get(&job.job_id).await.unwrap(), Some(completed));
     }
 }

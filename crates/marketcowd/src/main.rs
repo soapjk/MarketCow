@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     env,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -187,6 +188,7 @@ enum DurableJobError {
 struct DurableJobCoordinator {
     engine: AsyncMutex<marketcow_jobs::JobEngine>,
     repository: Option<Arc<marketcow_storage::PostgresJobRepository>>,
+    memory_artifacts: AsyncMutex<BTreeMap<String, marketcow_storage::ArtifactManifestRecord>>,
 }
 
 impl DurableJobCoordinator {
@@ -194,6 +196,7 @@ impl DurableJobCoordinator {
         Self {
             engine: AsyncMutex::new(marketcow_jobs::JobEngine::default()),
             repository: None,
+            memory_artifacts: AsyncMutex::new(BTreeMap::new()),
         }
     }
 
@@ -230,6 +233,7 @@ impl DurableJobCoordinator {
         Ok(Self {
             engine: AsyncMutex::new(engine),
             repository: Some(repository),
+            memory_artifacts: AsyncMutex::new(BTreeMap::new()),
         })
     }
 
@@ -324,18 +328,61 @@ impl DurableJobCoordinator {
         Ok(updated)
     }
 
-    async fn succeed(
+    async fn authorize_result(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
+        Ok(self
+            .engine
+            .lock()
+            .await
+            .authorize_result(job_id, lease_token, now)?
+            .clone())
+    }
+
+    async fn succeed_with_artifact(
         &self,
         job_id: &str,
         lease_token: &str,
         result: marketcow_jobs::StagedResult,
+        artifact: marketcow_storage::ArtifactManifestRecord,
         now: chrono::DateTime<Utc>,
     ) -> std::result::Result<marketcow_jobs::ProviderJob, DurableJobError> {
+        if result.sha256.to_ascii_lowercase() != artifact.sha256
+            || result.size_bytes != artifact.byte_size
+            || result.media_type != artifact.media_type
+            || result.relative_path != artifact.relative_path
+        {
+            return Err(marketcow_storage::RepositoryError::InvalidInput.into());
+        }
         let mut engine = self.engine.lock().await;
         let before = engine.clone();
         let updated = engine.succeed(job_id, lease_token, result, now)?.clone();
-        self.persist_single_or_rollback(&mut engine, before, &updated)
-            .await?;
+        let expected_revision = before
+            .get(&updated.job_id)
+            .map(|job| job.revision)
+            .ok_or(marketcow_jobs::JobEngineError::NotFound)?;
+        if let Some(repository) = &self.repository {
+            if let Err(error) = repository
+                .compare_and_swap_with_artifact(&updated, expected_revision, &artifact)
+                .await
+            {
+                *engine = before;
+                return Err(error.into());
+            }
+        } else {
+            let mut manifests = self.memory_artifacts.lock().await;
+            if manifests
+                .get(&artifact.artifact_id)
+                .is_some_and(|stored| stored != &artifact)
+            {
+                *engine = before;
+                return Err(marketcow_storage::RepositoryError::IdempotencyConflict.into());
+            }
+            manifests.insert(artifact.artifact_id.clone(), artifact);
+        }
         Ok(updated)
     }
 
@@ -513,10 +560,16 @@ async fn serve() -> Result<()> {
     let worker_path = config.worker_socket.clone();
     let worker_jobs = state.jobs.clone();
     let worker_staging_root = config.storage_root.join("worker-staging");
-    let worker =
-        tokio::spawn(
-            async move { worker_server(worker_path, worker_staging_root, worker_jobs).await },
-        );
+    let worker_artifact_root = config.storage_root.join("artifacts");
+    let worker = tokio::spawn(async move {
+        worker_server(
+            worker_path,
+            worker_staging_root,
+            worker_artifact_root,
+            worker_jobs,
+        )
+        .await
+    });
     let app = app(state);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     info!(bind=%config.bind, shadow=true, "marketcowd_ready");
@@ -1637,6 +1690,7 @@ async fn shutdown() {
 async fn worker_server(
     path: PathBuf,
     staging_root: PathBuf,
+    artifact_root: PathBuf,
     jobs: Arc<DurableJobCoordinator>,
 ) -> Result<()> {
     let _ = fs::remove_file(&path);
@@ -1648,9 +1702,15 @@ async fn worker_server(
         let (stream, _) = listener.accept().await?;
         let connection_jobs = jobs.clone();
         let connection_staging_root = staging_root.clone();
+        let connection_artifact_root = artifact_root.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                handle_worker(stream, connection_staging_root, connection_jobs).await
+            if let Err(error) = handle_worker(
+                stream,
+                connection_staging_root,
+                connection_artifact_root,
+                connection_jobs,
+            )
+            .await
             {
                 warn!(%error, "worker_connection_rejected");
             }
@@ -1661,6 +1721,7 @@ async fn worker_server(
 async fn handle_worker(
     mut stream: UnixStream,
     staging_root: PathBuf,
+    artifact_root: PathBuf,
     jobs: Arc<DurableJobCoordinator>,
 ) -> Result<()> {
     use marketcow_contracts::{WORKER_PROTOCOL_VERSION, WorkerFrame, WorkerMessage};
@@ -1767,9 +1828,45 @@ async fn handle_worker(
                     size_bytes,
                     media_type,
                 };
-                verify_staged_result(&staging_root, &job_id, &result)?;
+                let now = Utc::now();
+                let authorized = jobs.authorize_result(&job_id, &lease_token, now).await?;
+                let promotion_staging_root = staging_root.clone();
+                let promotion_artifact_root = artifact_root.clone();
+                let promotion_job_id = job_id.clone();
+                let promotion_dataset = authorized.job_type.clone();
+                let promotion_revision = authorized.request_schema.clone();
+                let promotion_source = format!("python-worker:{worker_id}");
+                let promotion_result = result.clone();
+                let artifact = tokio::task::spawn_blocking(move || {
+                    marketcow_storage::promote_worker_artifact(
+                        marketcow_storage::WorkerArtifactPromotion {
+                            staging_root: &promotion_staging_root,
+                            artifact_root: &promotion_artifact_root,
+                            job_id: &promotion_job_id,
+                            dataset: &promotion_dataset,
+                            revision: &promotion_revision,
+                            source: &promotion_source,
+                            result: &promotion_result,
+                            ingested_at: now,
+                        },
+                    )
+                })
+                .await
+                .context("artifact promotion task failed")??;
+                let promoted_result = marketcow_jobs::StagedResult {
+                    relative_path: artifact.relative_path.clone(),
+                    sha256: artifact.sha256.clone(),
+                    size_bytes: artifact.byte_size,
+                    media_type: artifact.media_type.clone(),
+                };
                 let job = jobs
-                    .succeed(&job_id, &lease_token, result, Utc::now())
+                    .succeed_with_artifact(
+                        &job_id,
+                        &lease_token,
+                        promoted_result,
+                        artifact,
+                        Utc::now(),
+                    )
                     .await?;
                 worker_job_state(&job)
             }
@@ -1814,45 +1911,6 @@ fn worker_job_state(job: &marketcow_jobs::ProviderJob) -> marketcow_contracts::W
             .unwrap_or_else(|| "unknown".into()),
         revision: job.revision,
     }
-}
-
-fn verify_staged_result(
-    staging_root: &Path,
-    job_id: &str,
-    result: &marketcow_jobs::StagedResult,
-) -> Result<()> {
-    if !job_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        bail!("invalid staging job id");
-    }
-    let task_root = staging_root.join(job_id);
-    let candidate = task_root.join(&result.relative_path);
-    let metadata = fs::symlink_metadata(&candidate)?;
-    if !metadata.file_type().is_file() || metadata.len() != result.size_bytes {
-        bail!("staged result metadata mismatch");
-    }
-    let canonical_task = fs::canonicalize(&task_root)?;
-    let canonical_candidate = fs::canonicalize(&candidate)?;
-    if canonical_candidate.parent() != Some(canonical_task.as_path()) {
-        bail!("staged result escaped task root");
-    }
-    let mut file = std::fs::File::open(&canonical_candidate)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = Read::read(&mut file, &mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let actual = hex::encode(hasher.finalize());
-    if actual != result.sha256.to_ascii_lowercase() {
-        bail!("staged result SHA-256 mismatch");
-    }
-    Ok(())
 }
 
 async fn read_frame(stream: &mut UnixStream) -> Result<marketcow_contracts::WorkerFrame> {
@@ -1945,6 +2003,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_manifest_and_job_success_are_one_coordinator_transition() {
+        let jobs = DurableJobCoordinator::memory();
+        let now = Utc::now();
+        let submitted = jobs
+            .submit(
+                marketcow_jobs::SubmitJob {
+                    idempotency_key: "artifact-transition-1".into(),
+                    job_type: "provider.history".into(),
+                    request_schema: "marketcow.provider.history.v1".into(),
+                    request: json!({"symbol":"AAPL.XNAS"}),
+                    deadline: now + chrono::Duration::minutes(5),
+                    max_attempts: 2,
+                    audit_actor: "test".into(),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let claimed = jobs
+            .reconcile_and_claim(
+                "worker",
+                &["provider.history".into()],
+                chrono::Duration::seconds(60),
+                now,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let lease_token = claimed.lease_token.unwrap();
+        jobs.start(&submitted.job_id, &lease_token, now)
+            .await
+            .unwrap();
+        jobs.authorize_result(&submitted.job_id, &lease_token, now)
+            .await
+            .unwrap();
+        let relative_path = format!(
+            "provider.history/marketcow.provider.history.v1/aa/{}",
+            "a".repeat(64)
+        );
+        let result = marketcow_jobs::StagedResult {
+            relative_path: relative_path.clone(),
+            sha256: "a".repeat(64),
+            size_bytes: 4,
+            media_type: "application/json".into(),
+        };
+        let artifact = marketcow_storage::ArtifactManifestRecord {
+            artifact_id: "b".repeat(64),
+            dataset: "provider.history".into(),
+            revision: "marketcow.provider.history.v1".into(),
+            source: "python-worker:test".into(),
+            source_url: None,
+            observed_at: now,
+            ingested_at: now,
+            raw_response_locator: Some(format!(
+                "worker-staging://{}/result.json",
+                submitted.job_id
+            )),
+            storage_path: format!("/tmp/artifacts/{relative_path}"),
+            relative_path,
+            sha256: "a".repeat(64),
+            byte_size: 4,
+            media_type: "application/json".into(),
+            metadata_json: json!({"job_id":submitted.job_id}),
+        };
+        let mut mismatched = artifact.clone();
+        mismatched.byte_size = 5;
+        assert!(
+            jobs.succeed_with_artifact(
+                &submitted.job_id,
+                &lease_token,
+                result.clone(),
+                mismatched,
+                now,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            jobs.get(&submitted.job_id).await.unwrap().status,
+            marketcow_jobs::JobStatus::Running
+        );
+        let completed = jobs
+            .succeed_with_artifact(&submitted.job_id, &lease_token, result, artifact, now)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, marketcow_jobs::JobStatus::Succeeded);
+        assert_eq!(jobs.memory_artifacts.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn uds_worker_handshake_claim_start_and_verified_completion() {
         use marketcow_contracts::{WorkerFrame, WorkerMessage};
 
@@ -1972,16 +2120,19 @@ mod tests {
         let jobs = Arc::new(DurableJobCoordinator {
             engine: AsyncMutex::new(engine),
             repository: None,
+            memory_artifacts: AsyncMutex::new(BTreeMap::new()),
         });
         let server_jobs = jobs.clone();
         let server_socket = socket.clone();
         let server_staging = staging.clone();
-        let server =
-            tokio::spawn(
-                async move { worker_server(server_socket, server_staging, server_jobs).await },
-            );
+        let artifact_root = dir.path().join("artifacts");
+        let server_artifacts = artifact_root.clone();
+        let server = tokio::spawn(async move {
+            worker_server(server_socket, server_staging, server_artifacts, server_jobs).await
+        });
         let mut stream = None;
         for _ in 0..100 {
+            assert!(!server.is_finished(), "worker server exited during startup");
             match UnixStream::connect(&socket).await {
                 Ok(connected) => {
                     stream = Some(connected);
@@ -2079,10 +2230,15 @@ mod tests {
             read_frame(&mut stream).await.unwrap().message,
             WorkerMessage::JobState { ref status, .. } if status == "succeeded"
         ));
+        let completed = jobs.get(&job_id).await.unwrap();
+        assert_eq!(completed.status, marketcow_jobs::JobStatus::Succeeded);
+        let completed_result = completed.result.unwrap();
+        assert_ne!(completed_result.relative_path, "result.json");
         assert_eq!(
-            jobs.get(&job_id).await.unwrap().status,
-            marketcow_jobs::JobStatus::Succeeded
+            fs::read(artifact_root.join(&completed_result.relative_path)).unwrap(),
+            result_bytes
         );
+        assert_eq!(jobs.memory_artifacts.lock().await.len(), 1);
         server.abort();
     }
 
