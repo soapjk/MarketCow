@@ -433,6 +433,7 @@ struct AppState {
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
     jobs: Arc<DurableJobCoordinator>,
     instruments: Arc<InstrumentCoordinator>,
+    quotes: Arc<QuoteCoordinator>,
     control_plane: Arc<ControlPlaneCoordinator>,
     stream: broadcast::Sender<marketcow_core::PersistedEvent>,
     worker_status: Arc<PythonWorkerStatus>,
@@ -546,6 +547,96 @@ struct InstrumentCoordinator {
     memory: AsyncMutex<BTreeMap<String, marketcow_storage::InstrumentRecord>>,
     #[cfg(test)]
     memory_enabled: bool,
+}
+
+struct QuoteCoordinator {
+    repository: Option<Arc<marketcow_storage::ClickHouseQuoteRepository>>,
+    #[cfg(test)]
+    memory: AsyncMutex<BTreeMap<String, serde_json::Value>>,
+    #[cfg(test)]
+    memory_enabled: bool,
+}
+
+impl QuoteCoordinator {
+    async fn open(profile: &str) -> Result<Self> {
+        let Some(database) = env::var("MARKETCOW_CLICKHOUSE_DATABASE").ok() else {
+            if profile == "production" {
+                bail!("MARKETCOW_CLICKHOUSE_DATABASE is required in production");
+            }
+            return Ok(Self {
+                repository: None,
+                #[cfg(test)]
+                memory: AsyncMutex::new(BTreeMap::new()),
+                #[cfg(test)]
+                memory_enabled: false,
+            });
+        };
+        let host = env::var("MARKETCOW_CLICKHOUSE_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let port = env::var("MARKETCOW_CLICKHOUSE_PORT")
+            .unwrap_or_else(|_| "8123".into())
+            .parse::<u16>()?;
+        let scheme = if env::var("MARKETCOW_CLICKHOUSE_SECURE").as_deref() == Ok("true") {
+            "https"
+        } else {
+            "http"
+        };
+        let config = marketcow_storage::ClickHouseConfig::new(
+            format!("{scheme}://{host}:{port}"),
+            database,
+            env::var("MARKETCOW_CLICKHOUSE_USERNAME").unwrap_or_else(|_| "default".into()),
+            env::var("MARKETCOW_CLICKHOUSE_PASSWORD").unwrap_or_default(),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        let repository = Arc::new(marketcow_storage::ClickHouseQuoteRepository::new(config));
+        repository
+            .health_probe()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Self {
+            repository: Some(repository),
+            #[cfg(test)]
+            memory: AsyncMutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            memory_enabled: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn memory() -> Self {
+        Self {
+            repository: None,
+            memory: AsyncMutex::new(BTreeMap::new()),
+            memory_enabled: true,
+        }
+    }
+
+    fn persistence_enabled(&self) -> bool {
+        self.repository.is_some()
+    }
+
+    async fn latest_payloads(
+        &self,
+        symbols: &[String],
+    ) -> std::result::Result<BTreeMap<String, serde_json::Value>, marketcow_storage::RepositoryError>
+    {
+        if let Some(repository) = &self.repository {
+            return repository.latest_payloads(symbols).await;
+        }
+        #[cfg(test)]
+        if self.memory_enabled {
+            let memory = self.memory.lock().await;
+            return Ok(symbols
+                .iter()
+                .filter_map(|symbol| memory.get(symbol).cloned().map(|row| (symbol.clone(), row)))
+                .collect());
+        }
+        Err(marketcow_storage::RepositoryError::Unavailable)
+    }
+
+    #[cfg(test)]
+    async fn put_memory(&self, symbol: &str, payload: serde_json::Value) {
+        self.memory.lock().await.insert(symbol.into(), payload);
+    }
 }
 
 struct ControlPlaneCoordinator {
@@ -1771,6 +1862,7 @@ async fn serve() -> Result<()> {
         .await?,
     );
     let instruments = Arc::new(InstrumentCoordinator::open(&config.profile).await?);
+    let quotes = Arc::new(QuoteCoordinator::open(&config.profile).await?);
     let legacy_mcp = config
         .legacy_mcp_url
         .clone()
@@ -1786,6 +1878,7 @@ async fn serve() -> Result<()> {
         runtime: Arc::new(AsyncMutex::new(runtime)),
         jobs,
         instruments,
+        quotes,
         control_plane,
         stream,
         worker_status: Arc::new(PythonWorkerStatus::default()),
@@ -2103,6 +2196,7 @@ fn app(state: AppState) -> Router {
             post(resolve_instruments_batch),
         )
         .route("/v1/instruments/{instrument_id}", get(get_instrument))
+        .route("/v1/quotes/query", post(quotes_query))
         .route("/mcp", post(mcp))
         .route("/metrics", get(metrics))
         .route("/v1/admin/migration", get(admin_migration))
@@ -2152,13 +2246,14 @@ fn health_payload(state: &AppState) -> serde_json::Value {
         "mcp":{
             "enabled":true,
             "endpoint":"/mcp",
-            "native_tools":2,
+            "native_tools":3,
             "legacy_proxy_configured":state.legacy_mcp.is_some()
         },
         "components":{
             "api":"healthy","wal":"healthy","python_workers":worker_health,
             "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "instrument_persistence":if state.instruments.persistence_enabled() { "healthy" } else { "degraded_development_only" },
+            "quote_persistence":if state.quotes.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "control_plane_persistence":if state.control_plane.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "audit_persistence":if state.audit.persistence_enabled() { "healthy" } else { "degraded_development_only" }
         },
@@ -2210,6 +2305,95 @@ async fn get_instrument(
         Ok(record) => Json(record).into_response(),
         Err((status, detail)) => (status, Json(json!({"detail":detail}))).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuoteQueryRequest {
+    symbols: Vec<String>,
+    #[serde(default)]
+    refresh: bool,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    allow_fallback: bool,
+}
+
+async fn quotes_query(
+    State(state): State<AppState>,
+    Json(request): Json<QuoteQueryRequest>,
+) -> Response {
+    if request.symbols.is_empty() || request.symbols.len() > 20 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"detail":{"code":"invalid_symbols","message":"symbols must contain between 1 and 20 values"}})),
+        )
+            .into_response();
+    }
+    if request.refresh || request.provider.is_some() || request.allow_fallback {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"detail":{
+                "code":"cached_quotes_only",
+                "message":"the Rust quote boundary does not call upstream providers"
+            }})),
+        )
+            .into_response();
+    }
+    let mut symbols = Vec::with_capacity(request.symbols.len());
+    for raw in request.symbols {
+        let symbol = raw.trim().to_ascii_uppercase();
+        if symbol.is_empty()
+            || symbol.len() > 64
+            || symbol
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"detail":{"code":"invalid_quote_symbol","symbol":raw}})),
+            )
+                .into_response();
+        }
+        symbols.push(symbol);
+    }
+    let unique = symbols
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let payloads = match state.quotes.latest_payloads(&unique).await {
+        Ok(payloads) => payloads,
+        Err(marketcow_storage::RepositoryError::InvalidInput) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"detail":{"code":"invalid_quote_query"}})),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"detail":{"code":"quote_repository_unavailable"}})),
+            )
+                .into_response();
+        }
+    };
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    for symbol in symbols {
+        if let Some(payload) = payloads.get(&symbol) {
+            items.push(payload.clone());
+        } else {
+            errors.push(json!({
+                "symbol":symbol,
+                "status":"unavailable",
+                "error":"cached quote not found"
+            }));
+        }
+    }
+    Json(json!({"count":items.len(),"items":items,"errors":errors})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2968,10 +3152,11 @@ async fn mcp_handle_request(
 async fn mcp_tools_list(state: &AppState, request_id: serde_json::Value) -> serde_json::Value {
     let native_health = marketcow_contracts::mcp_service_health_tool_definition();
     let native_instrument = marketcow_contracts::mcp_get_instrument_tool_definition();
+    let native_quotes = marketcow_contracts::mcp_get_quotes_tool_definition();
     let Some(proxy) = &state.legacy_mcp else {
         return mcp_result(
             request_id,
-            json!({"tools":[native_health,native_instrument]}),
+            json!({"tools":[native_health,native_instrument,native_quotes]}),
         );
     };
     let proxy_request = json!({
@@ -3013,6 +3198,7 @@ async fn mcp_tools_list(state: &AppState, request_id: serde_json::Value) -> serd
             |tool| match tool.get("name").and_then(serde_json::Value::as_str) {
                 Some("service_health") => native_health.clone(),
                 Some("get_instrument") => native_instrument.clone(),
+                Some("get_quotes") => native_quotes.clone(),
                 _ => tool.clone(),
             },
         )
@@ -3072,6 +3258,120 @@ async fn mcp_tool_call(
                 });
                 mcp_result(request_id, mcp_tool_result(error, true))
             }
+        };
+    }
+    if name == Some("get_quotes") {
+        let arguments = arguments.as_object().expect("arguments were validated");
+        let mut unexpected = arguments
+            .keys()
+            .filter(|key| key.as_str() != "symbols")
+            .cloned()
+            .collect::<Vec<_>>();
+        unexpected.sort();
+        if !unexpected.is_empty() {
+            let error = json!({
+                "error":"invalid_tool_input",
+                "detail":format!("unexpected argument(s): {}", unexpected.join(", "))
+            });
+            return mcp_result(request_id, mcp_tool_result(error, true));
+        }
+        let Some(values) = arguments
+            .get("symbols")
+            .and_then(serde_json::Value::as_array)
+        else {
+            let detail = if arguments.contains_key("symbols") {
+                "symbols must be an array containing between 1 and 20 non-empty strings"
+            } else {
+                "missing required argument(s): symbols"
+            };
+            return mcp_result(
+                request_id,
+                mcp_tool_result(json!({"error":"invalid_tool_input","detail":detail}), true),
+            );
+        };
+        if values.is_empty() || values.len() > 20 {
+            return mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({
+                        "error":"invalid_tool_input",
+                        "detail":"symbols must be an array containing between 1 and 20 non-empty strings"
+                    }),
+                    true,
+                ),
+            );
+        }
+        let mut symbols = Vec::with_capacity(values.len());
+        for value in values {
+            let Some(raw) = value.as_str() else {
+                return mcp_result(
+                    request_id,
+                    mcp_tool_result(
+                        json!({
+                            "error":"invalid_tool_input",
+                            "detail":"symbols must be an array containing between 1 and 20 non-empty strings"
+                        }),
+                        true,
+                    ),
+                );
+            };
+            let symbol = raw.trim().to_ascii_uppercase();
+            if symbol.is_empty()
+                || symbol.len() > 64
+                || symbol
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            {
+                return mcp_result(
+                    request_id,
+                    mcp_tool_result(
+                        json!({
+                            "error":"invalid_tool_input",
+                            "detail":"symbols must be an array containing between 1 and 20 non-empty strings"
+                        }),
+                        true,
+                    ),
+                );
+            }
+            symbols.push(symbol);
+        }
+        let unique = symbols
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        return match state.quotes.latest_payloads(&unique).await {
+            Ok(payloads) => {
+                let mut items = Vec::new();
+                let mut errors = Vec::new();
+                for symbol in symbols {
+                    if let Some(payload) = payloads.get(&symbol) {
+                        items.push(payload.clone());
+                    } else {
+                        errors.push(json!({"symbol":symbol,"status":"unavailable","error":"cached quote not found"}));
+                    }
+                }
+                mcp_result(
+                    request_id,
+                    mcp_tool_result(
+                        json!({
+                            "count":items.len(),"items":items,"errors":errors
+                        }),
+                        false,
+                    ),
+                )
+            }
+            Err(_) => mcp_result(
+                request_id,
+                mcp_tool_result(
+                    json!({
+                        "error":"marketcow_api_error",
+                        "detail":{"status_code":503,"detail":{"code":"quote_repository_unavailable"}}
+                    }),
+                    true,
+                ),
+            ),
         };
     }
     if name != Some("service_health") {
@@ -4861,6 +5161,7 @@ mod tests {
                 runtime: Arc::new(AsyncMutex::new(runtime)),
                 jobs: Arc::new(DurableJobCoordinator::memory()),
                 instruments: Arc::new(InstrumentCoordinator::memory()),
+                quotes: Arc::new(QuoteCoordinator::memory()),
                 control_plane: Arc::new(ControlPlaneCoordinator::memory("test-config-v1")),
                 stream,
                 worker_status: Arc::new(PythonWorkerStatus::default()),
@@ -5119,6 +5420,82 @@ mod tests {
             invalid["result"]["structuredContent"]["error"],
             "invalid_tool_input"
         );
+    }
+
+    #[tokio::test]
+    async fn native_cached_quotes_preserve_order_decimal_strings_and_mcp_contract() {
+        let (_dir, state) = test_state();
+        state
+            .quotes
+            .put_memory(
+                "AAPL.XNAS",
+                json!({
+                    "symbol":"AAPL.XNAS",
+                    "bid_price":"213.8700",
+                    "ask_price":"213.8800",
+                    "bid_size":"100.00000000",
+                    "ask_size":"90.00000000",
+                    "currency":"USD",
+                    "observed_at":"2026-08-28T00:00:00Z",
+                    "source":"fixture"
+                }),
+            )
+            .await;
+
+        let http = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/quotes/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"symbols":[" aapl.xnas ","MSFT.XNAS","AAPL.XNAS"],"refresh":false,"provider":null,"allow_fallback":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(http.status(), StatusCode::OK);
+        let http: serde_json::Value =
+            serde_json::from_slice(&to_bytes(http.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(http["count"], 2);
+        assert_eq!(http["items"][0]["bid_price"], "213.8700");
+        assert_eq!(http["items"][1]["bid_size"], "100.00000000");
+        assert_eq!(http["errors"][0]["symbol"], "MSFT.XNAS");
+
+        let mcp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"get_quotes","arguments":{"symbols":["AAPL.XNAS","MSFT.XNAS","AAPL.XNAS"]}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mcp: serde_json::Value =
+            serde_json::from_slice(&to_bytes(mcp.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(mcp["result"]["isError"], false);
+        assert_eq!(mcp["result"]["structuredContent"], http);
+
+        let refresh = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/quotes/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"symbols":["AAPL.XNAS"],"refresh":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refresh.status(), StatusCode::BAD_REQUEST);
+        let refresh: serde_json::Value =
+            serde_json::from_slice(&to_bytes(refresh.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(refresh["detail"]["code"], "cached_quotes_only");
     }
 
     #[tokio::test]
@@ -5381,7 +5758,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             listed["result"]["tools"],
-            json!([health_golden, instrument_golden])
+            json!([
+                health_golden,
+                instrument_golden,
+                marketcow_contracts::mcp_get_quotes_tool_definition()
+            ])
         );
 
         let call = app(state.clone())
@@ -5557,6 +5938,20 @@ mod tests {
         let (_dir, mut state) = test_state();
         state.legacy_mcp =
             Some(LegacyMcpProxy::new(format!("http://{legacy_address}/mcp")).unwrap());
+        state
+            .quotes
+            .put_memory(
+                "AAPL.XNAS",
+                json!({
+                    "symbol":"AAPL.XNAS",
+                    "bid_price":"213.8700",
+                    "ask_price":"213.8800",
+                    "currency":"USD",
+                    "observed_at":"2026-08-28T00:00:00Z",
+                    "source":"fixture"
+                }),
+            )
+            .await;
 
         let list = app(state.clone())
             .oneshot(
@@ -5582,6 +5977,10 @@ mod tests {
             listed["result"]["tools"][2],
             marketcow_contracts::mcp_get_instrument_tool_definition()
         );
+        assert_eq!(
+            listed["result"]["tools"][3],
+            marketcow_contracts::mcp_get_quotes_tool_definition()
+        );
 
         let call = app(state.clone())
             .oneshot(
@@ -5600,11 +5999,12 @@ mod tests {
             serde_json::from_slice(&to_bytes(call.into_body(), 16_384).await.unwrap()).unwrap();
         assert_eq!(called["id"], 8);
         assert_eq!(called["result"]["isError"], false);
+        assert_eq!(called["result"]["structuredContent"]["count"], 1);
         assert_eq!(
-            called["result"]["structuredContent"]["via"],
-            "legacy_fixture"
+            called["result"]["structuredContent"]["items"][0]["bid_price"],
+            "213.8700"
         );
-        assert_eq!(called["result"]["structuredContent"]["tool"], "get_quotes");
+        assert_eq!(called["result"]["structuredContent"]["errors"], json!([]));
 
         state.instruments = Arc::new(InstrumentCoordinator {
             repository: None,

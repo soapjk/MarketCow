@@ -1,0 +1,28 @@
+{
+  "name": "get_quotes",
+  "description": "Read cached quotes for up to 20 symbols without calling upstream providers.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "symbols": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "description": "MarketCow symbol or canonical instrument identifier, depending on the endpoint."
+        },
+        "minItems": 1,
+        "maxItems": 20
+      }
+    },
+    "required": [
+      "symbols"
+    ],
+    "additionalProperties": false
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

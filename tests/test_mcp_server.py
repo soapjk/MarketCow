@@ -105,6 +105,14 @@ class McpServerTest(unittest.TestCase):
         )
         names = {tool["name"] for tool in tools}
         self.assertIn("get_quotes", names)
+        quote_golden = json.loads(
+            (Path(__file__).parent / "fixtures/mcp-get-quotes-tool-v1.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            next(tool for tool in tools if tool["name"] == "get_quotes"),
+            quote_golden,
+        )
         self.assertIn("get_canonical_bars", names)
         self.assertIn("get_financial_statements", names)
         self.assertIn("get_fund_dividend_history", names)

@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
@@ -281,6 +282,12 @@ struct ClickHousePayloadOnly {
 }
 
 #[derive(clickhouse::Row, Deserialize)]
+struct ClickHouseQuotePayload {
+    symbol: String,
+    payload_json: String,
+}
+
+#[derive(clickhouse::Row, Deserialize)]
 struct ClickHouseMigrationChecksum {
     checksum: String,
 }
@@ -457,6 +464,38 @@ impl ClickHouseQuoteRepository {
                 .map(Some)
                 .map_err(|_| RepositoryError::Unavailable)
         }
+    }
+
+    /// Reads cached payloads only. The caller supplies at most 20 canonical symbols and restores
+    /// request order; this repository never calls a provider or falls back to SQLite.
+    pub async fn latest_payloads(
+        &self,
+        instrument_ids: &[String],
+    ) -> Result<BTreeMap<String, serde_json::Value>, RepositoryError> {
+        if instrument_ids.is_empty()
+            || instrument_ids.len() > 20
+            || instrument_ids.iter().any(|value| value.is_empty())
+        {
+            return Err(RepositoryError::InvalidInput);
+        }
+        let rows = self
+            .client
+            .query(
+                "SELECT symbol, argMax(payload_json, content_version) AS payload_json \
+                 FROM market_quote_latest FINAL WHERE symbol IN ? \
+                 GROUP BY symbol ORDER BY symbol",
+            )
+            .bind(instrument_ids)
+            .fetch_all::<ClickHouseQuotePayload>()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        rows.into_iter()
+            .map(|row| {
+                serde_json::from_str(&row.payload_json)
+                    .map(|payload| (row.symbol, payload))
+                    .map_err(|_| RepositoryError::Unavailable)
+            })
+            .collect()
     }
 }
 
@@ -2820,8 +2859,18 @@ mod tests {
         assert!(!repository.upsert_quote(&quote, Utc::now()).await.unwrap());
         assert_eq!(
             repository.latest(&quote.instrument_id).await.unwrap(),
-            Some(quote)
+            Some(quote.clone())
         );
+        let payloads = repository
+            .latest_payloads(&[quote.instrument_id.clone(), "MISSING.XNAS".into()])
+            .await
+            .unwrap();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[&quote.instrument_id]["bid"],
+            "0.100000000000000001"
+        );
+        assert_eq!(payloads[&quote.instrument_id]["currency"], "USD");
     }
 
     #[tokio::test]

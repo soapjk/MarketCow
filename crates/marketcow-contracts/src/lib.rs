@@ -76,6 +76,35 @@ pub fn mcp_get_instrument_tool_definition() -> serde_json::Value {
     })
 }
 
+pub fn mcp_get_quotes_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name":"get_quotes",
+        "description":"Read cached quotes for up to 20 symbols without calling upstream providers.",
+        "inputSchema":{
+            "type":"object",
+            "properties":{
+                "symbols":{
+                    "type":"array",
+                    "items":{
+                        "type":"string",
+                        "description":"MarketCow symbol or canonical instrument identifier, depending on the endpoint."
+                    },
+                    "minItems":1,
+                    "maxItems":20
+                }
+            },
+            "required":["symbols"],
+            "additionalProperties":false
+        },
+        "annotations":{
+            "readOnlyHint":true,
+            "destructiveHint":false,
+            "idempotentHint":true,
+            "openWorldHint":false
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineErrorDetail {
     pub code: String,
@@ -305,5 +334,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(mcp_get_instrument_tool_definition(), golden);
+    }
+
+    #[test]
+    fn rust_mcp_get_quotes_definition_matches_python_golden() {
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/mcp-get-quotes-tool-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(mcp_get_quotes_tool_definition(), golden);
     }
 }
