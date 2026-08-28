@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 import httpx
 
+from marketcow.market_data_contracts import canonical_hash
 from marketcow.mcp_server import MarketCowClient, McpServer, create_tools
 
 
@@ -50,6 +51,19 @@ def post_json(url: str, payload: dict) -> tuple[int, dict]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    try:
+        with urlopen(request, timeout=2) as response:  # noqa: S310 - loopback URL only
+            return response.status, json.load(response)
+    except HTTPError as error:
+        return error.code, json.load(error)
+
+
+def put_json(url: str, payload: dict, bearer_token: str = "") -> tuple[int, dict]:
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    headers = {"Content-Type": "application/json"}
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    request = Request(url, data=body, headers=headers, method="PUT")
     try:
         with urlopen(request, timeout=2) as response:  # noqa: S310 - loopback URL only
             return response.status, json.load(response)
@@ -95,7 +109,7 @@ def main() -> int:
     if len(source_commit) != 40 or any(c not in "0123456789abcdef" for c in source_commit):
         raise SystemExit("source commit must be a full 40-character Git SHA")
 
-    expected = {
+    instrument_input = {
         "schema_version": 1,
         "instrument_id": "AAPL.XNAS",
         "instrument_type": "equity",
@@ -113,9 +127,8 @@ def main() -> int:
         "ts_init": "2026-08-28T00:00:01Z",
         "provider_symbols": {"longport": "AAPL.US"},
         "broker_symbols": {"ibkr": "AAPL"},
-        "content_hash": "sha256:" + "a" * 64,
-        "updated_at": "2026-08-28T00:00:02Z",
     }
+    expected: dict = {}
     checks: dict[str, bool] = {}
     failure = ""
     process_exit_codes: list[int] = []
@@ -147,6 +160,7 @@ def main() -> int:
             "MARKETCOW_REAL_ORDER_SUBMISSION_ENABLED": "false",
             "MARKETCOW_POSTGRES_DSN": dsn,
             "MARKETCOW_BINARY_COMMIT": source_commit,
+            "MARKETCOW_RUST_ADMIN_TOKEN": "local-integration-admin-token",
         }
         try:
             subprocess.run(
@@ -187,24 +201,23 @@ def main() -> int:
                     health.get("mcp", {}).get("native_tools") == 2
                 )
 
-                sql = """
-                INSERT INTO instrument_master
-                (instrument_id,schema_version,instrument_type,asset_class,symbol,market,mic,
-                 currency,price_precision,size_precision,tick_size,size_increment,lot_size,
-                 ts_event,ts_init,provider_symbols,broker_symbols,content_hash,updated_at)
-                VALUES
-                ('AAPL.XNAS',1,'equity','equity','AAPL','US','XNAS','USD',4,8,
-                 0.0100,0.00000001,1,'2026-08-28T00:00:00Z','2026-08-28T00:00:01Z',
-                 '{"longport":"AAPL.US"}'::jsonb,'{"ibkr":"AAPL"}'::jsonb,
-                 'sha256:""" + "a" * 64 + """','2026-08-28T00:00:02Z');
-                INSERT INTO instrument_symbol_mapping
-                (namespace,external_symbol,instrument_id)
-                VALUES ('provider:longport','AAPL.US','AAPL.XNAS');
-                """
-                subprocess.run(
-                    ["psql", dsn, "-v", "ON_ERROR_STOP=1", "-c", sql],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
+                admin_url = f"{base_url}/v1/admin/instruments/AAPL.XNAS"
+                unauthorized_status, unauthorized = put_json(
+                    admin_url, instrument_input
+                )
+                checks["admin_put_requires_bearer"] = (
+                    unauthorized_status == 401
+                    and unauthorized.get("detail", {}).get("code")
+                    == "authentication_required"
+                )
+                admin_status, expected = put_json(
+                    admin_url, instrument_input, "local-integration-admin-token"
+                )
+                checks["admin_put_200"] = admin_status == 200
+                checks["admin_put_exact_contract_and_hash"] = (
+                    all(expected.get(key) == value for key, value in instrument_input.items())
+                    and expected.get("content_hash") == canonical_hash(instrument_input)
+                    and str(expected.get("updated_at", "")).endswith("Z")
                 )
 
                 status, actual = get_json(f"{base_url}/v1/instruments/AAPL.XNAS")

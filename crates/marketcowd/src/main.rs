@@ -625,6 +625,43 @@ impl InstrumentCoordinator {
         Err(marketcow_storage::RepositoryError::Unavailable)
     }
 
+    async fn upsert(
+        &self,
+        record: &marketcow_storage::InstrumentRecord,
+    ) -> Result<(), marketcow_storage::RepositoryError> {
+        record.validate()?;
+        if let Some(repository) = &self.repository {
+            return repository.upsert(record).await;
+        }
+        #[cfg(test)]
+        if self.memory_enabled {
+            let records = self.memory.lock().await;
+            for existing in records.values() {
+                if existing.instrument_id == record.instrument_id {
+                    continue;
+                }
+                let provider_conflict = record
+                    .provider_symbols
+                    .iter()
+                    .any(|(name, symbol)| existing.provider_symbols.get(name) == Some(symbol));
+                let broker_conflict = record
+                    .broker_symbols
+                    .iter()
+                    .any(|(name, symbol)| existing.broker_symbols.get(name) == Some(symbol));
+                if provider_conflict || broker_conflict {
+                    return Err(marketcow_storage::RepositoryError::InstrumentConflict);
+                }
+            }
+            drop(records);
+            self.memory
+                .lock()
+                .await
+                .insert(record.instrument_id.clone(), record.clone());
+            return Ok(());
+        }
+        Err(marketcow_storage::RepositoryError::Unavailable)
+    }
+
     #[cfg(test)]
     async fn insert_fixture(&self, record: marketcow_storage::InstrumentRecord) {
         self.memory
@@ -1714,6 +1751,10 @@ fn app(state: AppState) -> Router {
         )
         .route("/v1/admin/jobs", axum::routing::post(admin_submit_job))
         .route(
+            "/v1/admin/instruments/{instrument_id}",
+            axum::routing::put(admin_upsert_instrument),
+        )
+        .route(
             "/v1/admin/jobs/{job_id}",
             get(admin_get_job).post(admin_cancel_job),
         )
@@ -1804,6 +1845,124 @@ struct ResolveInstrumentQuery {
     external_symbol: String,
 }
 
+fn instrument_schema_version() -> u8 {
+    1
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstrumentInput {
+    #[serde(default = "instrument_schema_version")]
+    schema_version: u8,
+    instrument_id: String,
+    instrument_type: String,
+    asset_class: String,
+    symbol: String,
+    market: String,
+    mic: String,
+    currency: String,
+    price_precision: u8,
+    size_precision: u8,
+    #[serde(with = "rust_decimal::serde::str")]
+    tick_size: rust_decimal::Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    size_increment: rust_decimal::Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    lot_size: rust_decimal::Decimal,
+    ts_event: chrono::DateTime<Utc>,
+    ts_init: chrono::DateTime<Utc>,
+    provider_symbols: BTreeMap<String, String>,
+    #[serde(default)]
+    broker_symbols: BTreeMap<String, String>,
+}
+
+impl InstrumentInput {
+    fn into_record(self, content_hash: String) -> marketcow_storage::InstrumentRecord {
+        marketcow_storage::InstrumentRecord {
+            schema_version: self.schema_version,
+            instrument_id: self.instrument_id,
+            instrument_type: self.instrument_type,
+            asset_class: self.asset_class,
+            symbol: self.symbol,
+            market: self.market,
+            mic: self.mic,
+            currency: self.currency,
+            price_precision: self.price_precision,
+            size_precision: self.size_precision,
+            tick_size: self.tick_size,
+            size_increment: self.size_increment,
+            lot_size: self.lot_size,
+            ts_event: self.ts_event,
+            ts_init: self.ts_init,
+            provider_symbols: self.provider_symbols,
+            broker_symbols: self.broker_symbols,
+            content_hash,
+            updated_at: Utc::now(),
+        }
+    }
+}
+
+fn python_canonical_hash(value: &serde_json::Value) -> String {
+    let canonical = python_canonical_json(value);
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    )
+}
+
+fn python_canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => python_ascii_json_string(value),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(python_canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.iter()
+                    .map(|key| format!(
+                        "{}:{}",
+                        python_ascii_json_string(key),
+                        python_canonical_json(&values[*key])
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
+fn python_ascii_json_string(value: &str) -> String {
+    let json = serde_json::to_string(value).expect("string serializes");
+    let mut output = String::with_capacity(json.len());
+    for character in json.chars() {
+        if character.is_ascii() {
+            output.push(character);
+        } else {
+            let codepoint = character as u32;
+            if codepoint <= 0xffff {
+                output.push_str(&format!("\\u{codepoint:04x}"));
+            } else {
+                let adjusted = codepoint - 0x1_0000;
+                let high = 0xd800 + (adjusted >> 10);
+                let low = 0xdc00 + (adjusted & 0x3ff);
+                output.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
+            }
+        }
+    }
+    output
+}
+
 async fn resolve_instrument(
     State(state): State<AppState>,
     Query(query): Query<ResolveInstrumentQuery>,
@@ -1826,6 +1985,44 @@ async fn resolve_instrument(
         Err(marketcow_storage::RepositoryError::InvalidInput) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"detail":{"code":"invalid_instrument_mapping"}})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"detail":{"code":"instrument_repository_unavailable"}})),
+        )
+            .into_response(),
+    }
+}
+
+async fn admin_upsert_instrument(
+    State(state): State<AppState>,
+    AxumPath(instrument_id): AxumPath<String>,
+    Json(input): Json<InstrumentInput>,
+) -> Response {
+    if input.instrument_id != instrument_id {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"detail":{
+                "code":"instrument_conflict",
+                "message":"path and payload instrument_id must match"
+            }})),
+        )
+            .into_response();
+    }
+    let payload = serde_json::to_value(&input).expect("InstrumentInput serializes");
+    let record = input.into_record(python_canonical_hash(&payload));
+    match state.instruments.upsert(&record).await {
+        Ok(()) => Json(record).into_response(),
+        Err(
+            marketcow_storage::RepositoryError::InvalidInput
+            | marketcow_storage::RepositoryError::InstrumentConflict,
+        ) => (
+            StatusCode::CONFLICT,
+            Json(json!({"detail":{
+                "code":"instrument_conflict",
+                "message":"instrument identity or symbol mapping conflict"
+            }})),
         )
             .into_response(),
         Err(_) => (
@@ -3484,6 +3681,90 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         }
+    }
+
+    fn instrument_input_fixture() -> InstrumentInput {
+        InstrumentInput {
+            schema_version: 1,
+            instrument_id: "AAPL.XNAS".into(),
+            instrument_type: "equity".into(),
+            asset_class: "equity".into(),
+            symbol: "AAPL".into(),
+            market: "US".into(),
+            mic: "XNAS".into(),
+            currency: "USD".into(),
+            price_precision: 4,
+            size_precision: 8,
+            tick_size: "0.0100".parse().unwrap(),
+            size_increment: "0.00000001".parse().unwrap(),
+            lot_size: "1".parse().unwrap(),
+            ts_event: chrono::DateTime::parse_from_rfc3339("2026-08-28T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            ts_init: chrono::DateTime::parse_from_rfc3339("2026-08-28T00:00:01Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            provider_symbols: BTreeMap::from([("longport".into(), "苹果😀.US".into())]),
+            broker_symbols: BTreeMap::from([("ibkr".into(), "AAPL".into())]),
+        }
+    }
+
+    #[test]
+    fn rust_instrument_canonical_hash_matches_python_ascii_json() {
+        let input = instrument_input_fixture();
+        let payload = serde_json::to_value(input).unwrap();
+        assert_eq!(
+            python_canonical_hash(&payload),
+            "sha256:3f9bc2d717069d9ed054df3affc0d51d1b9db736bb52d69bc18b1e6a60fd7c59"
+        );
+        assert_eq!(
+            python_canonical_hash(&json!({"b":"😀","a":"苹果","n":1})),
+            "sha256:4edca75104bc677b750ffe0eabd0763dccbeacd9e38f7b67157591261fde598b"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_instrument_upsert_is_validated_hashed_and_queryable() {
+        let (_dir, state) = test_state();
+        let response = admin_upsert_instrument(
+            State(state.clone()),
+            AxumPath("AAPL.XNAS".into()),
+            Json(instrument_input_fixture()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(
+            saved["content_hash"],
+            "sha256:3f9bc2d717069d9ed054df3affc0d51d1b9db736bb52d69bc18b1e6a60fd7c59"
+        );
+        assert_eq!(saved["tick_size"], "0.0100");
+        assert!(saved["updated_at"].as_str().unwrap().ends_with('Z'));
+
+        let fetched = state.instruments.get("AAPL.XNAS").await.unwrap().unwrap();
+        assert_eq!(
+            fetched.content_hash,
+            saved["content_hash"].as_str().unwrap()
+        );
+        assert_eq!(
+            state
+                .instruments
+                .resolve("provider:longport", "苹果😀.US")
+                .await
+                .unwrap()
+                .unwrap()
+                .instrument_id,
+            "AAPL.XNAS"
+        );
+
+        let conflict = admin_upsert_instrument(
+            State(state),
+            AxumPath("MSFT.XNAS".into()),
+            Json(instrument_input_fixture()),
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

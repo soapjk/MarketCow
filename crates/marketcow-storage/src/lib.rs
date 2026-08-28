@@ -875,6 +875,12 @@ pub struct InstrumentRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+impl InstrumentRecord {
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        validate_instrument(self)
+    }
+}
+
 pub struct PostgresInstrumentRepository {
     client: tokio::sync::Mutex<tokio_postgres::Client>,
 }
