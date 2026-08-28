@@ -197,6 +197,8 @@ def main() -> None:
                         if loop_now >= next_ingest:
                             observed = datetime.now(UTC)
                             size = str(10 + sequence % 20)
+                            frame_start = (sequence % 4) * 50
+                            frame_tokens = TOKENS[frame_start:frame_start + 50]
                             body = ingest(base, {
                                 "event_type": "price_change", "timestamp": observed.isoformat(),
                                 "price_changes": [
@@ -206,7 +208,7 @@ def main() -> None:
                                         "price": "0.40" if token.endswith("yes") else "0.42",
                                         "size": size,
                                     }
-                                    for token in TOKENS
+                                    for token in frame_tokens
                                 ],
                             }, observed)
                             persistence_latencies_us.append(body["persistence_latency_us"])
@@ -215,7 +217,7 @@ def main() -> None:
                             ingest_count += 1
                             canonical_event_count += body["events"]
                             sequence += 1
-                            next_ingest = loop_now + 1
+                            next_ingest = loop_now + 0.25
                         if loop_now >= next_checkpoint:
                             status, body = request_json(
                                 f"{base}/v1/admin/polymarket/checkpoint", payload={}, admin=True,
@@ -360,6 +362,9 @@ def main() -> None:
             "books": 200,
             "concurrent_scoped_readers": 4,
             "independent_consumers": 2,
+            "updates_per_frame": 50,
+            "frames_per_second": 4,
+            "token_updates_per_second": 200,
         },
         "samples": len(reader_latencies),
         "ingest_count": ingest_count,

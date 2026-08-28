@@ -51,7 +51,11 @@ revision, update cadence and raw SHA-256.
     readers and two independent consumers. Gates: publish p99 <=20 ms, WAL p99 <=20 ms,
     health p99 <=50 ms, queue bounded, hot SQLite queries zero, gaps/disconnect delta zero,
     and no health/bootstrap 503. This work item requires a reproducible >=45 minute run;
-    60 minute, 24 hour and 7 day evidence remain later release gates.
+    60 minute, 24 hour and 7 day evidence remain later release gates. Until raw r2 supplies an
+    observed fanout distribution, the deterministic shadow load uses four 50-token frames per
+    second, rotating across all 200 subscribed tokens. This preserves 200 token updates/second
+    and refreshes every book once per second without inventing a 200-change single-frame source
+    shape; results record all four parameters explicitly.
 
 ## Permission and compliance boundary
 
