@@ -1,0 +1,66 @@
+{
+  "schema_version": "marketcow.migration.dynamic-universe-local-gate.v1",
+  "status": "passed_local_not_deployed",
+  "verified_at": "2026-08-29T15:40:00+08:00",
+  "implementation_commit": "1ccf28f1db2252519f3ccd9496086ad6f6488e51",
+  "collaboration_task_id": "ae96db3b-7ddc-42f2-b93f-620d65b26915",
+  "contracts": {
+    "generation_artifact": "marketcow.polymarket.rust-live-scope.v4",
+    "universe": "marketcow.polymarket.universe.v1",
+    "scope_discovery": "marketcow.polymarket.scope-discovery.v3",
+    "websocket": "marketcow.market-stream.v2",
+    "activation_receipt": "marketcow.polymarket.universe-activation-receipt.v1"
+  },
+  "gates": {
+    "stable_universe_id_and_monotonic_generation": "passed",
+    "target_minimum_and_filter_contract": "passed",
+    "single_market_isolation_and_ranked_replenishment": "passed",
+    "below_minimum_fail_closed_without_artifact": "passed",
+    "complete_active_added_removed_excluded_and_retry": "passed",
+    "removed_market_condition_and_token_identity_retained": "passed",
+    "isolated_candidate_wal_checkpoint_before_publish": "passed",
+    "restart_cursor_and_projection_hash_recovery": "passed",
+    "mixed_generation_http_503": "passed",
+    "universe_changed_full_sync_required": "passed",
+    "exact_instrument_book_tick_validation": "passed",
+    "read_only_and_real_orders_disabled": "passed",
+    "production_18872_runtime": "not_run_requires_explicit_deployment_authorization"
+  },
+  "tests": [
+    {
+      "command": "cargo test --workspace --no-fail-fast",
+      "result": "158 passed, 0 failed, 5 ignored environment-backed repository tests"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "python3 -m pytest -q tests/test_build_polymarket_rust_scope.py",
+      "result": "9 passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "key_files": [
+    "docs/architecture/migration/polymarket-dynamic-universe-v1.md",
+    "scripts/migration/build_polymarket_dynamic_universe.py",
+    "crates/marketcowd/src/main.rs",
+    "crates/marketcow-runtime/src/lib.rs",
+    "crates/marketcow-api/src/lib.rs",
+    "tests/test_build_polymarket_rust_scope.py"
+  ],
+  "safety": {
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false,
+    "market_data_surface_only": true,
+    "production_service_changed": false
+  },
+  "limitations": [
+    "No production deployment or 18872 runtime activation was performed in this local gate.",
+    "A live candidate universe, registered v4 artifact, activation, WS handoff and stability window remain required before collaboration acceptance can be claimed.",
+    "The five ignored Rust tests require configured PostgreSQL/ClickHouse endpoints and are unchanged from the existing workspace gate."
+  ]
+}
