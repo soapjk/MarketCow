@@ -1,0 +1,107 @@
+{
+  "schema_version": "marketcow.polymarket.readiness-gate.v1",
+  "passed": false,
+  "observed_at": "2026-08-29T01:33:38Z",
+  "binary": {
+    "commit": "4bab1641db335735c518b803c95ceb4fd3e8df3f",
+    "path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow",
+    "sha256": "36820db35e0996e3cc7a2ad0fac83efc415bc506c422f66ea211cc832d0251e9"
+  },
+  "process": {
+    "pid": 20438,
+    "launchd_label": "com.marketcow.rust-polymarket-4bab164-preflight-v2",
+    "state": "running",
+    "runs": 1,
+    "last_exit_code": null,
+    "bind": "127.0.0.1:18877",
+    "storage_root": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage"
+  },
+  "scope": {
+    "http_status": 200,
+    "schema_version": "marketcow.polymarket.scope-discovery.v2",
+    "active_scope_id": "b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075",
+    "market_count": 100,
+    "token_count": 200,
+    "boundary_cursor": 9989,
+    "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+    "ready": false,
+    "scope_status": "unready",
+    "real_order_submission_enabled": false
+  },
+  "projection": {
+    "cursor": 9989,
+    "persisted_cursor": 9989,
+    "ready": false,
+    "fail_closed_reason": "source_gap:rust_transport_terminal",
+    "market_count": 100,
+    "book_count": 192,
+    "missing_token_count": 8,
+    "unresolved_gap_count": 200,
+    "negative_risk_relation_count": 4,
+    "atomic_market_mapping_complete": true,
+    "instrument_facts_complete": true,
+    "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+    "missing_token_ids": [
+      "104395343874183563614294661572511549483323380566480259326385023398853634676648",
+      "111126093363019741646613603775948952115153338567540771946887929034772329211598",
+      "15995879212061634690117401102406740344182259907577722804398192920069534852349",
+      "26959901029027254380798270417437187918161300364245312492738617063578841209943",
+      "3072267155056216064390305670194426043866153256677959157935508602718248489561",
+      "41788805497281443038944448757005617443191661269981578670159463752100674221229",
+      "6582589776814859692552461535494791082489325058539818794179479886091076909307",
+      "95135051762164380056991390211019143717563239213951228227800337808129648215523"
+    ]
+  },
+  "network_gate": {
+    "readiness_http_status": 503,
+    "full_sync_http_status": 503,
+    "checkpoint_http_status": 503,
+    "error_code": "polymarket_projection_unready_or_stale",
+    "websocket_after_cursor": 9989,
+    "websocket_upgraded": false,
+    "websocket_http_status": 503
+  },
+  "durability": {
+    "wal_path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket/wal/b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075-00000000000000000001.wal",
+    "wal_size_bytes": 17147276,
+    "wal_record_count": 5295,
+    "wal_sha256": "df1337d8018cd6b5e86f09de0683fb096002b08c849328c600390cade762bdc5",
+    "checkpoint_path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket/checkpoints/00000000000000009989.json",
+    "checkpoint_sha256": "e1e025505b53f73980694d842baa4204b47d1860e706aa9658b11cebc1c213bd",
+    "checkpoint_manifest_hash_matches": true,
+    "wal_last_cursor": 9989
+  },
+  "gate_verdicts": {
+    "exact_binary_identity": true,
+    "process_running_without_restart": true,
+    "scope_schema_v2": true,
+    "scope_exact_100_markets_200_tokens": true,
+    "scope_ready": false,
+    "full_sync_http_200": false,
+    "full_sync_exact_200_books": false,
+    "full_sync_100_atomic_market_facts": false,
+    "catalog_revision_non_null": true,
+    "websocket_after_boundary_contiguous": false,
+    "wal_checkpoint_integrity": true,
+    "http_503_on_unready": true,
+    "websocket_rejects_unready_projection": true,
+    "gap_and_resync_unit_test": true,
+    "read_only_surface_test": true,
+    "prohibited_trading_route_probes_return_404": true,
+    "real_orders_disabled": true,
+    "tradude_does_not_manage_marketcow": true,
+    "replace_18872_authorized": false
+  },
+  "tests": [
+    {
+      "command": "python -m pytest -q tests/test_rust_migration_architecture.py",
+      "result": "6 passed in 0.20s"
+    },
+    {
+      "command": "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/cargo-target cargo test -p marketcowd websocket_full_sync_live_publish_and_cursor_resume_are_contiguous -- --nocapture",
+      "working_directory": "/Volumes/T9/.marketcow-builds/4bab164.1kURax",
+      "result": "1 passed; 0 failed; 33 filtered out"
+    }
+  ],
+  "failure_summary": "The pinned b16f catalog still marks four expired markets active. Their eight outcome tokens never received an upstream book or price_change, leaving 192/200 books. The transport subsequently terminated and the projection correctly remained fail-closed with all 200 tokens marked unresolved. Public full-sync and WebSocket continuity therefore cannot pass. Port 18872 was not replaced."
+}
