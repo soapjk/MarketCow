@@ -59,7 +59,7 @@ def _book_frames(path: Path) -> dict[str, dict[str, Any]]:
     return result
 
 
-def _valid_two_sided_book(frame: dict[str, Any], tick: str) -> bool:
+def _valid_two_sided_book(frame: dict[str, Any]) -> bool:
     if frame.get("event_type") != "book":
         return False
     bids, asks = frame.get("bids"), frame.get("asks")
@@ -69,7 +69,8 @@ def _valid_two_sided_book(frame: dict[str, Any], tick: str) -> bool:
     if not isinstance(reported_tick, str):
         return False
     try:
-        return Decimal(reported_tick) == Decimal(tick)
+        parsed = Decimal(reported_tick)
+        return parsed.is_finite() and parsed > 0
     except InvalidOperation:
         return False
 
@@ -146,13 +147,16 @@ def build_dynamic_universe(
                 )
                 if end_at > now + timedelta(seconds=maximum_capital_lock_seconds):
                     raise ValueError("capital lock exceeds configured maximum")
-                tick = market["instrument_facts"]["price_increment"]
                 token_ids = [outcome["token_id"] for outcome in market["outcomes"]]
                 frames = [books.get(token) for token in token_ids]
                 if any(frame is None for frame in frames):
                     reason, retryable = "book_missing", True
-                elif not all(_valid_two_sided_book(frame, tick) for frame in frames if frame):
+                elif not all(_valid_two_sided_book(frame) for frame in frames if frame):
                     reason, retryable = "one_sided_book", True
+                elif len({Decimal(frame["tick_size"]) for frame in frames if frame}) != 1:
+                    # The runtime can atomically reconcile a catalog tick to a newer
+                    # authoritative book tick, but the two outcome tokens must agree.
+                    reason, retryable = "instrument_facts_invalid", True
                 elif len(active) >= target_market_count:
                     reason, retryable = "target_capacity", False
                 else:

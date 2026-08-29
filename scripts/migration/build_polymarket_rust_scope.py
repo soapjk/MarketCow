@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -18,12 +19,23 @@ from typing import Any
 SCHEMA_VERSION = "marketcow.polymarket.rust-live-scope.v3"
 
 
-def sha256_file(path: Path) -> str:
+@functools.lru_cache(maxsize=32)
+def _sha256_file_cached(path: str, size: int, mtime_ns: int) -> str:
+    # Size and mtime are part of the key so a replaced source is never accepted under
+    # the hash of an earlier artifact. Dynamic-universe selection validates many
+    # candidates against the same immutable multi-gigabyte catalog.
+    del size, mtime_ns
     digest = hashlib.sha256()
-    with path.open("rb") as source:
+    with Path(path).open("rb") as source:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    resolved = path.resolve(strict=True)
+    stat = resolved.stat()
+    return _sha256_file_cached(str(resolved), stat.st_size, stat.st_mtime_ns)
 
 
 def _required_string(value: Any, name: str) -> str:

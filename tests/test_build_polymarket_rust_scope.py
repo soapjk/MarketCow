@@ -300,6 +300,34 @@ def test_dynamic_universe_records_capacity_exclusion(tmp_path: Path) -> None:
     }]
 
 
+def test_dynamic_universe_accepts_atomic_two_token_tick_change(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    books = _books(tmp_path)
+    payload = json.loads(books.read_text())
+    for frame in payload["books"]:
+        if frame["asset_id"] in {"30", "40"}:
+            frame["tick_size"] = "0.001"
+    books.write_text(json.dumps(payload))
+
+    result = build_dynamic_universe(
+        manifest, index, catalog, registry, books,
+        universe_id="d" * 64,
+        generation=1,
+        target_market_count=2,
+        minimum_market_count=2,
+        maximum_capital_lock_seconds=365 * 24 * 60 * 60,
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+
+    assert result["market_ids"] == ["1", "2"]
+    changed_ticks = {
+        frame["asset_id"]: frame["tick_size"]
+        for frame in result["initial_book_frames"]
+        if frame["asset_id"] in {"30", "40"}
+    }
+    assert changed_ticks == {"30": "0.001", "40": "0.001"}
+
+
 def test_dynamic_universe_fails_closed_below_minimum(tmp_path: Path) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
     with pytest.raises(ValueError, match="below minimum"):
