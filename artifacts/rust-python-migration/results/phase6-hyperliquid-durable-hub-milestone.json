@@ -1,0 +1,123 @@
+{
+  "schema_version": "marketcow.phase6.hyperliquid-durable-hub-milestone.v1",
+  "generated_at": "2026-08-29T04:50:00Z",
+  "passed": true,
+  "phase_complete": false,
+  "authoritative_plan": {
+    "path": "/Volumes/T9/projects/marketcow-workitem-collaboration-7424ef29-33e7-418f-8df0-83afc6caf0/artifacts/objective-marketcow-rust-python-migration-technical-plan.md",
+    "sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4"
+  },
+  "phase0_adr": {
+    "path": "docs/architecture/migration/phase0-decisions.md",
+    "sha256": "af99a2a41db7fd47f9afbbb6537d4fa8c1b53020a4cbe819a8193e4f92c9e43b",
+    "wal_encoding": "versioned canonical JSON",
+    "production_segment_target_bytes": 268435456,
+    "durability_boundary": "sync_data before projection publication"
+  },
+  "source_state": {
+    "base_commit": "314505a8bddab96ce611afc08c6fb7e00188447f",
+    "commit": "e4296397a94092648a524e7421a56b860c9a705e",
+    "committed": true,
+    "commit_blocker": null,
+    "files": {
+      "Cargo.lock": "741b52b8e269554f72ad8168471a903fbb2427c7e3885e2a5dea0654627becab",
+      "crates/marketcow-realtime/Cargo.toml": "5cb12b5c00099272b6146babc3030aea36a8ea20ac0398bbcfd0deb2326b8267",
+      "crates/marketcow-core/src/lib.rs": "8b70fec3a979d63edeb9ddaf753ddaf82863c3726d58195311a91b8bd4f6bc50",
+      "crates/marketcow-runtime/src/lib.rs": "c767640e2d8c83b168a57e9a158fcf91ac615944eb34270836572708a01b31ba",
+      "crates/marketcow-realtime/src/lib.rs": "2a82f01bd648801f4e33328e36215b1ca714c939e3fb21be3703e5953245e2b8",
+      "crates/marketcow-realtime/src/durability.rs": "b66ad1d5a95406486b2d9bfefab182dd59657c6012419f0556cb960ed01cc23b",
+      "crates/marketcow-realtime/src/hub.rs": "acce60667ee614ca745b73d3a0ca7c56b2a7b99c38e91e685ba4a34bb93ea7ee",
+      "crates/marketcow-realtime/src/longport.rs": "e4274cc819f5491ea11f951bed06d24a6dd68f07b64df6b7472b0e2b69a5a380",
+      "crates/marketcowd/Cargo.toml": "9f224fe9fd7345abc6f301d4c01f1e8750d9b0e07ef3473a3d914ea302012d7c",
+      "crates/marketcowd/src/main.rs": "9594492a0e75cb4eb546d24ee9af4b3d69871dcb3eec82ee2463d0314cb3ee55",
+      "python/marketcow_workers/longport_realtime_bridge.py": "e70553dbaab92a4119c35f810456d9747daa2d4ab9779a8f5571317fe69ea6ea",
+      "tests/fixtures/longport-realtime-bridge-v1.json": "6ba1320ef1eef96f8fd754c726d6ceb376138bc56cb6cde4e014c685e00764c0",
+      "tests/test_longport_realtime_bridge.py": "cc417e494aa6b439b8fcf9512344c19c8cf55e2fb39d178637af59bbf4178e0b",
+      "docs/architecture/migration/runbook.md": "3ff6d476bf9bc8ed562d45149eec82618061173b3b5a2a1531dbae1c1829ce7d"
+    }
+  },
+  "implemented": [
+    "exclusive advisory single-writer lock and owner-only storage permissions",
+    "versioned canonical JSON batch envelopes with per-record CRC32C and SHA-256 integrity",
+    "segmented append-only WAL with record and previous-segment SHA-256 chains",
+    "one upstream frame per WAL batch and one sync_data barrier before memory publication",
+    "full-WAL duplicate decisions that remain auditable without consuming public sequence",
+    "pre-append recomputation of provider event identity and exact raw SHA evidence validation",
+    "current/previous atomic checkpoint files bound to exact WAL cursor and record hash",
+    "checkpoint fallback plus post-boundary replay and clean WAL rollback detection",
+    "immutable ArcSwap Hub snapshots, strict transport attempt lifecycle, bounded replay and contiguous filtered watermarks",
+    "whole-frame downstream capacity reservation and permanent fail-closed on backpressure or invalid lifecycle",
+    "exact rust_decimal values and raw wire evidence preserved across WAL restart",
+    "persistence and publication latency values exposed on durable apply outcomes",
+    "LongPort typed raw-push bridge and Rust normalizer preserve exact decimals, source time, session and provider sequence without credentials or a Python public listener",
+    "marketcowd opt-in Hyperliquid shadow owns startup/shutdown, fixed allow-listed transport, durable hub and bounded queues",
+    "marketcowd exposes bounded provider snapshot/events/server-push WebSocket surfaces with filtered sequence watermarks and fail-closed resync",
+    "marketcowd integrates hub state and transport/gateway/public queue depths into readiness, health and Prometheus metrics",
+    "Polymarket replay retention uses O(1) front eviction and whole-frame duplicate prevalidation instead of repeated linear scans after the 10000-event window fills",
+    "the HTTP soak runner retains a distinct non-overwriting process log path in the run root and records that path in schema v4 results"
+  ],
+  "gate_verdicts": {
+    "authoritative_plan_hash_matches": true,
+    "phase0_adr_followed": true,
+    "single_writer_enforced": true,
+    "authoritative_log_append_only_and_hash_chained": true,
+    "upstream_frame_group_commit_is_atomic": true,
+    "wal_sync_precedes_projection_publication": true,
+    "invalid_or_tampered_event_changes_no_cursor": true,
+    "duplicate_decision_is_auditable_without_public_sequence": true,
+    "checkpoint_current_corruption_falls_back_to_previous": true,
+    "checkpoint_detects_clean_wal_rollback": true,
+    "bounded_gateway_backpressure_fails_before_batch_append": true,
+    "immutable_projection_and_replay_are_contiguous": true,
+    "exact_decimal_and_raw_sha_round_trip": true,
+    "rust_workspace_non_socket_suite_passed": true,
+    "rust_workspace_clippy_passed": true,
+    "rust_workspace_unfiltered_suite_passed": true,
+    "applicable_python_non_socket_subset_passed": true,
+    "applicable_python_full_suite_passed": true,
+    "marketcowd_public_gateway_connected": false,
+    "marketcowd_shadow_lifecycle_snapshot_and_observability_connected": true,
+    "marketcowd_provider_shadow_events_and_websocket_connected": true,
+    "longport_typed_bridge_golden_passed": true,
+    "longport_uds_streaming_lifecycle_connected": false,
+    "controlled_hyperliquid_upstream_differential_passed": false,
+    "checkpoint_startup_independent_of_total_wal_size": false,
+    "real_orders_disabled": true,
+    "tradude_manages_marketcow": false,
+    "phase6_exit_condition_met": false
+  },
+  "verification": {
+    "rust_workspace_unfiltered": {
+      "command": "cargo test --workspace --all-targets",
+      "passed": 147,
+      "failed": 0,
+      "ignored_environment_gated_real_storage": 5,
+      "filtered": 0,
+      "socket_and_process_tests_passed": true
+    },
+    "rust_clippy": {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "passed": true
+    },
+    "python_applicable_suite": {
+      "command": "PYTHONPATH=src:. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /Volumes/T9/projects/trade/nautilus_trader/.venv/bin/python3 -m pytest -q tests/test_hyperliquid_realtime.py tests/test_longport_realtime_bridge.py tests/test_market_data_contracts.py tests/test_rust_python_worker.py",
+      "passed": 31,
+      "failed": 0,
+      "deselected": 0
+    },
+    "preserved_tooling_failures": [
+      "The first Python command omitted PYTHONPATH=src:. and failed collection with three ModuleNotFoundError errors; no tests ran.",
+      "The repository .venv/bin/python3 is a broken symbolic-link cycle and failed with 'too many levels of symbolic links'.",
+      "The exact applicable suite was rerun with a known working isolated interpreter, the required PYTHONPATH, and external pytest plugins disabled; all 31 tests passed."
+    ]
+  },
+  "remaining": [
+    "connect the durable hub to the unified public realtime WebSocket and append-only lifecycle audit; the opt-in daemon lifecycle, snapshot, readiness, health and metrics are connected",
+    "add a sparse WAL index or equivalent so checkpoint startup does not scale with total history",
+    "run controlled Hyperliquid upstream differential, disconnect, recovery and sustained performance tests",
+    "connect the ADR-approved LongPort typed bridge to an owner-only UDS streaming lifecycle and migrate EastMoney/Sina polling quote",
+    "perform staged single-writer shadow/dual-run/cutover evidence; no writer handoff is enabled here"
+  ],
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}
