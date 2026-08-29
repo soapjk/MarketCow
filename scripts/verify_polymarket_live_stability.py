@@ -180,6 +180,7 @@ def main() -> None:
         "started_at": now(),
         "window_started_at": None,
         "window_finished_at": None,
+        "window_elapsed_seconds": None,
         "startup_observations": [],
         "samples": [],
         "failures": [],
@@ -187,6 +188,7 @@ def main() -> None:
     }
     startup_deadline = time.monotonic() + arguments.startup_timeout_seconds
     window_deadline = None
+    window_started_monotonic = None
     with httpx.Client(timeout=15, trust_env=False) as client:
         while window_deadline is None:
             observed_at = now()
@@ -223,7 +225,8 @@ def main() -> None:
             write_report(arguments.output, report)
             if ready:
                 report["window_started_at"] = now()
-                window_deadline = time.monotonic() + arguments.duration_seconds
+                window_started_monotonic = time.monotonic()
+                window_deadline = window_started_monotonic + arguments.duration_seconds
                 break
             if time.monotonic() >= startup_deadline:
                 report["failures"].append({"gate": "startup", "reason": "startup_timeout"})
@@ -232,6 +235,7 @@ def main() -> None:
                 raise SystemExit(1)
             time.sleep(arguments.interval_seconds)
 
+        assert window_started_monotonic is not None
         while time.monotonic() < window_deadline:
             observed_at = now()
             try:
@@ -266,6 +270,7 @@ def main() -> None:
             write_report(arguments.output, report)
             time.sleep(min(arguments.interval_seconds, max(0.0, window_deadline - time.monotonic())))
 
+        report["window_elapsed_seconds"] = time.monotonic() - window_started_monotonic
         cursors = [sample["boundary"]["boundary_cursor"] for sample in report["samples"] if sample.get("boundary")]
         try:
             report["websocket"] = asyncio.run(websocket_gate(arguments.base_url, arguments.expected_scope_id, cursors[-1]))
@@ -280,7 +285,8 @@ def main() -> None:
         report["cursor_start"] = cursors[0] if cursors else None
         report["cursor_finish"] = cursors[-1] if cursors else None
         report["passed"] = (
-            len(report["samples"]) >= int(arguments.duration_seconds / arguments.interval_seconds) - 2
+            report["window_elapsed_seconds"] >= arguments.duration_seconds
+            and len(report["samples"]) >= 2
             and not report["failures"]
             and bool(cursors)
             and cursors[-1] > cursors[0]
