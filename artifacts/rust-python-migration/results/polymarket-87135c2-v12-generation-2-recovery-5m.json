@@ -1,0 +1,76 @@
+{
+  "schema_version": "marketcow.dynamic-universe.live-gate.v1",
+  "verdict": "passed",
+  "runtime": {
+    "launchd_label": "com.marketcow.rust-polymarket-dynamic-87135c2-shadow-v12",
+    "pid": 58458,
+    "commit": "87135c2cb1fd7898de2b683b574715970a2ba284",
+    "binary_path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-87135c2",
+    "binary_sha256": "ea64fd9d043e9ea6c4ecd16cabab241a3f8f8c56a947ded0557f17929bfc8495",
+    "bind": "127.0.0.1:18872",
+    "listen_verified_during_gate": true,
+    "current_label_present": false,
+    "controlled_stop_at": "2026-08-29T12:09:16.003024Z",
+    "real_order_submission_enabled": false
+  },
+  "scope": {
+    "schema_version": "marketcow.polymarket.scope-discovery.v3",
+    "universe_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "generation": 2,
+    "ready": true,
+    "market_count": 100,
+    "token_count": 200,
+    "maximum_capital_lock_seconds": 2592000
+  },
+  "full_sync": {
+    "http_status": 200,
+    "market_count": 100,
+    "book_count": 200,
+    "negative_risk_relation_count": 5,
+    "unresolved_gap_count": 0,
+    "tick_mismatch_count": 0
+  },
+  "recovery": {
+    "required_cursor_at_least": 1586740,
+    "checkpoint_manifest_schema": "marketcow.polymarket.checkpoint-manifest.v2",
+    "checkpoint_cursor": 1614954,
+    "checkpoint_projection_sha256": "2044f9bfd033f4c110ce8e5f407d41479ba9ac8d18785510e724d1429533f478",
+    "wal_anchor_segment_first_cursor": 1614955,
+    "wal_anchor_segment_header_sha256": "e735404e9409d12d9e26f26e1601fa4d109e3b63364671a2d2876b1533f7f14b",
+    "offline_wal_verify": {
+      "command": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-87135c2 wal verify /tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket-universes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34/generation-00000000000000000002/wal",
+      "status": "ok",
+      "records": 1614954,
+      "last_cursor": 1614954
+    }
+  },
+  "continuity_and_surface": {
+    "websocket_after_boundary_contiguous": true,
+    "expired_cursor_resync_required": true,
+    "expired_cursor_close_code": 1008,
+    "read_only_paths_checked": 14,
+    "read_only_paths_all_404": true,
+    "orders_enabled": false
+  },
+  "prior_gap_remediation": {
+    "market_id": "2849008",
+    "previous_unresolved_token_count": 2,
+    "recovery_method": "fresh complete REST books in an atomically validated generation candidate",
+    "still_unresolved_during_v12_gate": false
+  },
+  "gate_verdicts": {
+    "runtime_identity": "passed",
+    "loopback_listener": "passed_during_gate",
+    "scope_contract_and_counts": "passed",
+    "maximum_capital_lock": "passed",
+    "scope_ready": "passed",
+    "full_sync_atomic_snapshot": "passed",
+    "checkpoint_cursor": "passed",
+    "wal_integrity": "passed",
+    "websocket_continuity": "passed",
+    "expired_cursor_resync": "passed",
+    "read_only_surface": "passed",
+    "generation_3_activation_authorized_after_gate": true
+  },
+  "evidence_note": "The current 18872 listener belongs to the later v13 process and was not used as v12 live evidence. v12 was stopped only after this gate passed and generation 3 was atomically activated."
+}
