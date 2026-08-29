@@ -1,0 +1,77 @@
+{
+  "schema_version": "marketcow.polymarket.universe-auto-refresh-live-evidence.v1",
+  "verdict": "passed_with_preserved_failures",
+  "overall_migration_complete": false,
+  "scheduler": {
+    "label": "com.marketcow.rust-polymarket-universe-auto-refresh-v1",
+    "interval_seconds": 300,
+    "runs_at_gate": 6,
+    "latest_exit_code": 0,
+    "latest_status": "no_change",
+    "live_generation": 7,
+    "candidate_generation": 8,
+    "candidate_activated": false,
+    "active_market_count": 100,
+    "minimum_market_count": 80,
+    "maximum_capital_lock_seconds": 2592000,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  },
+  "immutable_runtime": {
+    "source_commit": "7056708",
+    "root": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/auto-refresh/runtime-7056708",
+    "controller_sha256": "09b7cd32f3ba75669540dc2f06ee3997fa004a213135380cbb74f79bedbb162c",
+    "builder_sha256": "928a482e74a0d3b72354e3c46edb1a43c96cc02336d95f33d063085a218e49cb",
+    "scope_builder_sha256": "9e3bba63549070bc3063d1a2b12dadac9f4a5beaa8be0aec2c3315e4ae5675b0",
+    "book_fetcher_sha256": "fcaa060b590ef27be0ce7cca9822abfa241e21293e09ca1db5d4060d9fbc255c",
+    "catalog_index_sha256": "76846bc07c4254a9ed51704f1fc8d95cb359ad0b2556fa59c5acb787cbed9801",
+    "catalog_sha256": "764d5f3c62e6745d6982d2150ff3e7adccec999d162ac72f3a653f617f4bb79b"
+  },
+  "live_gate": {
+    "result": "artifacts/rust-python-migration/results/polymarket-auto-refresh-generation-7-live-gate.json",
+    "passed": true,
+    "samples": 5,
+    "failures": 0,
+    "cursor_start": 2014417,
+    "cursor_finish": 2014607,
+    "scope_schema": "marketcow.polymarket.scope-discovery.v3",
+    "market_count": 100,
+    "book_count": 200,
+    "relation_count": 5,
+    "tick_mismatch_count": 0,
+    "bad_instrument_revision_count": 0,
+    "bad_fee_schedule_count": 0,
+    "websocket_contiguous": true,
+    "expired_cursor_resync": true,
+    "read_only_paths_checked": 14,
+    "read_only_paths_all_404": true
+  },
+  "checkpoint_and_wal": {
+    "binary_sha256": "ea64fd9d043e9ea6c4ecd16cabab241a3f8f8c56a947ded0557f17929bfc8495",
+    "checkpoint_schema": "marketcow.polymarket.checkpoint-manifest.v2",
+    "checkpoint_cursor": 2013055,
+    "checkpoint_projection_sha256": "9503747f9eeed96cc7490d29e590a9573f62468e752be91b0c159af3022e2014",
+    "checkpoint_hash_match": true,
+    "previous_checkpoint_cursor": 2012054,
+    "previous_checkpoint_hash_match": true,
+    "parent_manifest_sha256": "e2206e844527d7229faa734f728e4e671ec4d8a6ea534a216cb4380397789136",
+    "parent_manifest_hash_match": true,
+    "wal_verify_status": "ok",
+    "wal_records": 20546,
+    "wal_last_cursor": 2013391
+  },
+  "preserved_failures": [
+    "launchd runs 1-3 failed because the external-volume Python module was unavailable",
+    "launchd run 4 failed after runpy still attempted to load source from the external volume",
+    "launchd run 5 loaded the internal code bundle but SQLite denied the external-volume catalog index",
+    "the first attempt to extend the read-only runtime bundle failed because its directory was intentionally non-writable",
+    "identity comparison bugs caused empty generation transitions 5 to 6 and 6 to 7; token ordering and equivalent RFC3339 precision are now normalized",
+    "the first combined generation-7 live gate received WebSocket close 1013 full_sync_required; a fresh full-sync boundary resumed contiguously and the reproducible rerun passed with zero failures"
+  ],
+  "commands": {
+    "tests": "python3 -m pytest -q tests/test_auto_refresh_polymarket_dynamic_universe.py tests/test_build_polymarket_rust_scope.py",
+    "quality": "python3 -m ruff check scripts/migration/auto_refresh_polymarket_dynamic_universe.py tests/test_auto_refresh_polymarket_dynamic_universe.py && git diff --check",
+    "live": "/usr/bin/python3 scripts/verify_polymarket_live_stability.py --base-url http://127.0.0.1:18872 --expected-scope-id cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34 --expected-scope-schema marketcow.polymarket.scope-discovery.v3 --expected-market-count 100 --expected-relation-count 5 --expected-universe-generation 7 --duration-seconds 5 --startup-timeout-seconds 10 --interval-seconds 1 --output artifacts/rust-python-migration/results/polymarket-auto-refresh-generation-7-live-gate.json",
+    "wal": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-87135c2 wal verify /tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket-universes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34/generation-00000000000000000007/wal"
+  }
+}
