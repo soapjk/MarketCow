@@ -10,8 +10,9 @@ mod hub;
 mod longport;
 pub use durability::{
     DurabilityError, DurableApplyOutcome, DurableRealtimeWriter, PersistedRealtimeEvent,
-    REALTIME_CHECKPOINT_VERSION, REALTIME_WAL_BATCH_VERSION, REALTIME_WAL_SEGMENT_VERSION,
-    REALTIME_WAL_VERSION, RealtimeCheckpoint, SegmentedRealtimeWal,
+    REALTIME_CHECKPOINT_VERSION, REALTIME_SPARSE_INDEX_VERSION, REALTIME_WAL_BATCH_VERSION,
+    REALTIME_WAL_SEGMENT_VERSION, REALTIME_WAL_VERSION, RealtimeCheckpoint, RealtimeSparseIndex,
+    SegmentedRealtimeWal, SparseCursorEntry,
 };
 pub use hub::{
     DurableRealtimeHub, REALTIME_HUB_PROJECTION_VERSION, RealtimeHubError, RealtimeHubHealth,

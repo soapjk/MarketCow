@@ -20,6 +20,9 @@ pub const REALTIME_WAL_VERSION: &str = "marketcow.realtime.wal.v1";
 pub const REALTIME_WAL_BATCH_VERSION: &str = "marketcow.realtime.wal-batch.v1";
 pub const REALTIME_WAL_SEGMENT_VERSION: &str = "marketcow.realtime.wal-segment.v1";
 pub const REALTIME_CHECKPOINT_VERSION: &str = "marketcow.realtime.checkpoint.v1";
+pub const REALTIME_SPARSE_INDEX_VERSION: &str = "marketcow.realtime.sparse-index.v1";
+const SPARSE_INDEX_STRIDE: u64 = 1_024;
+const SPARSE_INDEX_FILENAME: &str = "cursor-index.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedRealtimeEvent {
@@ -55,6 +58,38 @@ pub struct RealtimeCheckpoint {
     pub replay: Vec<StreamEvent>,
     pub created_at: DateTime<Utc>,
     pub state_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseCursorEntry {
+    pub first_wal_cursor: u64,
+    pub last_wal_cursor: u64,
+    pub segment_id: u64,
+    pub byte_offset: u64,
+    pub previous_record_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeSparseIndex {
+    pub schema_version: String,
+    pub stream_id: String,
+    pub config_revision: String,
+    pub stride: u64,
+    pub entries: Vec<SparseCursorEntry>,
+    pub state_sha256: String,
+}
+
+impl RealtimeSparseIndex {
+    /// Return the nearest indexed WAL batch at or before `cursor`. Callers scan forward from this
+    /// byte offset and still verify the authoritative WAL record/hash chain before replay.
+    pub fn locate(&self, cursor: u64) -> Option<&SparseCursorEntry> {
+        let boundary = self
+            .entries
+            .partition_point(|entry| entry.first_wal_cursor <= cursor);
+        boundary
+            .checked_sub(1)
+            .and_then(|index| self.entries.get(index))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,11 +166,21 @@ struct CheckpointIntegrity<'a> {
     created_at: &'a DateTime<Utc>,
 }
 
+#[derive(Serialize)]
+struct SparseIndexIntegrity<'a> {
+    schema_version: &'a str,
+    stream_id: &'a str,
+    config_revision: &'a str,
+    stride: u64,
+    entries: &'a [SparseCursorEntry],
+}
+
 #[derive(Debug)]
 struct VerifiedWal {
     records: Vec<PersistedRealtimeEvent>,
     paths: Vec<PathBuf>,
     last_segment_id: u64,
+    sparse_index: RealtimeSparseIndex,
 }
 
 #[derive(Debug)]
@@ -151,6 +196,7 @@ pub struct SegmentedRealtimeWal {
     current_segment_id: u64,
     records: Vec<PersistedRealtimeEvent>,
     applied_event_ids: BTreeSet<String>,
+    sparse_index: RealtimeSparseIndex,
     poisoned: bool,
     #[cfg(test)]
     fail_next_append: bool,
@@ -168,6 +214,7 @@ impl SegmentedRealtimeWal {
         create_private_directory(root)?;
         let writer_lock = acquire_writer_lock(&root.join("writer.lock"))?;
         let verified = verify_wal(root, Some((stream_id, config_revision)))?;
+        install_sparse_index(root, &verified.sparse_index)?;
         let (current_path, current_file, current_bytes) = match verified.paths.last() {
             Some(path) => {
                 let mut options = OpenOptions::new();
@@ -200,6 +247,7 @@ impl SegmentedRealtimeWal {
             current_segment_id: verified.last_segment_id,
             records: verified.records,
             applied_event_ids,
+            sparse_index: verified.sparse_index,
             poisoned: false,
             #[cfg(test)]
             fail_next_append: false,
@@ -220,6 +268,10 @@ impl SegmentedRealtimeWal {
 
     pub fn wal_cursor(&self) -> u64 {
         self.records.last().map_or(0, |record| record.wal_cursor)
+    }
+
+    pub fn sparse_index(&self) -> &RealtimeSparseIndex {
+        &self.sparse_index
     }
 
     fn append_decisions(
@@ -245,6 +297,7 @@ impl SegmentedRealtimeWal {
             .records
             .last()
             .map(|record| record.record_sha256.clone());
+        let batch_previous_record_sha256 = previous_record_sha256.clone();
         let mut records = Vec::with_capacity(decisions.len());
         for (index, decision) in decisions.iter().enumerate() {
             if decision.applied != decision.public_sequence.is_some()
@@ -294,6 +347,20 @@ impl SegmentedRealtimeWal {
 
         let result = (|| {
             self.ensure_segment(first_wal_cursor, line.len() as u64 + 1)?;
+            let byte_offset = self.current_bytes;
+            let sparse_entry = should_index_batch(
+                &self.sparse_index.entries,
+                self.current_segment_id,
+                first_wal_cursor,
+                last_wal_cursor,
+            )
+            .then_some(SparseCursorEntry {
+                first_wal_cursor,
+                last_wal_cursor,
+                segment_id: self.current_segment_id,
+                byte_offset,
+                previous_record_sha256: batch_previous_record_sha256,
+            });
             let file = self
                 .current_file
                 .as_mut()
@@ -301,6 +368,11 @@ impl SegmentedRealtimeWal {
             file.write_all(&line)?;
             file.write_all(b"\n")?;
             file.sync_data()?;
+            if let Some(entry) = sparse_entry {
+                self.sparse_index.entries.push(entry);
+                seal_sparse_index(&mut self.sparse_index)?;
+                write_sparse_index(&self.root, &self.sparse_index)?;
+            }
             Ok::<(), DurabilityError>(())
         })();
         if let Err(error) = result {
@@ -751,6 +823,7 @@ fn verify_wal(
     let mut stream_id: Option<String> = None;
     let mut config_revision: Option<String> = None;
     let mut last_segment_id = 0_u64;
+    let mut sparse_entries = Vec::new();
 
     for path in &paths {
         verify_private_regular_file(path)?;
@@ -785,11 +858,19 @@ fn verify_wal(
             return Err(DurabilityError::WalScopeMismatch);
         }
 
+        let mut byte_offset =
+            u64::try_from(lines[0].len() + 1).map_err(|_| DurabilityError::CursorOverflow)?;
         for line in &lines[1..lines.len() - 1] {
             if line.is_empty() {
                 return Err(DurabilityError::CorruptWal);
             }
             let batch: WalBatchRecord = serde_json::from_slice(line)?;
+            let batch_offset = byte_offset;
+            byte_offset = byte_offset
+                .checked_add(
+                    u64::try_from(line.len() + 1).map_err(|_| DurabilityError::CursorOverflow)?,
+                )
+                .ok_or(DurabilityError::CursorOverflow)?;
             let batch_integrity = batch_integrity_bytes(&batch)?;
             if batch.schema_version != REALTIME_WAL_BATCH_VERSION
                 || batch.records.is_empty()
@@ -802,6 +883,20 @@ fn verify_wal(
                 || batch.crc32c != crc32c::crc32c(&batch_integrity)
             {
                 return Err(DurabilityError::CorruptWal);
+            }
+            if should_index_batch(
+                &sparse_entries,
+                header.segment_id,
+                batch.first_wal_cursor,
+                batch.last_wal_cursor,
+            ) {
+                sparse_entries.push(SparseCursorEntry {
+                    first_wal_cursor: batch.first_wal_cursor,
+                    last_wal_cursor: batch.last_wal_cursor,
+                    segment_id: header.segment_id,
+                    byte_offset: batch_offset,
+                    previous_record_sha256: previous_record_sha256.clone(),
+                });
             }
             for record in batch.records {
                 let integrity = record_integrity_bytes(&record)?;
@@ -838,10 +933,28 @@ fn verify_wal(
         previous_segment_sha256 = Some(digest(&bytes));
     }
 
+    let (index_stream_id, index_config_revision) =
+        match (stream_id, config_revision, expected_scope) {
+            (Some(stream_id), Some(config_revision), _) => (stream_id, config_revision),
+            (None, None, Some((stream_id, config_revision))) => {
+                (stream_id.to_owned(), config_revision.to_owned())
+            }
+            _ => return Err(DurabilityError::WalScopeMismatch),
+        };
+    let mut sparse_index = RealtimeSparseIndex {
+        schema_version: REALTIME_SPARSE_INDEX_VERSION.into(),
+        stream_id: index_stream_id,
+        config_revision: index_config_revision,
+        stride: SPARSE_INDEX_STRIDE,
+        entries: sparse_entries,
+        state_sha256: String::new(),
+    };
+    seal_sparse_index(&mut sparse_index)?;
     Ok(VerifiedWal {
         records,
         paths,
         last_segment_id,
+        sparse_index,
     })
 }
 
@@ -891,6 +1004,95 @@ fn checkpoint_integrity_bytes(checkpoint: &RealtimeCheckpoint) -> Result<Vec<u8>
         replay: &checkpoint.replay,
         created_at: &checkpoint.created_at,
     })?)
+}
+
+fn sparse_index_integrity_bytes(index: &RealtimeSparseIndex) -> Result<Vec<u8>, DurabilityError> {
+    Ok(serde_json::to_vec(&SparseIndexIntegrity {
+        schema_version: &index.schema_version,
+        stream_id: &index.stream_id,
+        config_revision: &index.config_revision,
+        stride: index.stride,
+        entries: &index.entries,
+    })?)
+}
+
+fn seal_sparse_index(index: &mut RealtimeSparseIndex) -> Result<(), DurabilityError> {
+    index.state_sha256 = digest(&sparse_index_integrity_bytes(index)?);
+    Ok(())
+}
+
+fn sparse_index_is_valid(index: &RealtimeSparseIndex) -> bool {
+    index.schema_version == REALTIME_SPARSE_INDEX_VERSION
+        && !index.stream_id.is_empty()
+        && !index.config_revision.is_empty()
+        && index.stride == SPARSE_INDEX_STRIDE
+        && index.entries.iter().all(|entry| {
+            entry.first_wal_cursor > 0 && entry.first_wal_cursor <= entry.last_wal_cursor
+        })
+        && index.entries.windows(2).all(|pair| {
+            pair[0].first_wal_cursor < pair[1].first_wal_cursor
+                && pair[0].last_wal_cursor < pair[1].first_wal_cursor
+                && pair[0].segment_id <= pair[1].segment_id
+                && (pair[0].segment_id != pair[1].segment_id
+                    || pair[0].byte_offset < pair[1].byte_offset)
+        })
+        && sparse_index_integrity_bytes(index)
+            .map(|bytes| digest(&bytes) == index.state_sha256)
+            .unwrap_or(false)
+}
+
+fn should_index_batch(
+    entries: &[SparseCursorEntry],
+    segment_id: u64,
+    first_wal_cursor: u64,
+    last_wal_cursor: u64,
+) -> bool {
+    entries.last().is_none_or(|last| {
+        last.segment_id != segment_id
+            || last.last_wal_cursor / SPARSE_INDEX_STRIDE < last_wal_cursor / SPARSE_INDEX_STRIDE
+            || first_wal_cursor == 1
+    })
+}
+
+fn install_sparse_index(
+    root: &Path,
+    verified: &RealtimeSparseIndex,
+) -> Result<(), DurabilityError> {
+    let path = root.join(SPARSE_INDEX_FILENAME);
+    if path.exists() {
+        verify_private_regular_file(&path)?;
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(existing) = serde_json::from_slice::<RealtimeSparseIndex>(&bytes)
+            && sparse_index_is_valid(&existing)
+            && existing == *verified
+        {
+            return Ok(());
+        }
+    }
+    write_sparse_index(root, verified)
+}
+
+fn write_sparse_index(root: &Path, index: &RealtimeSparseIndex) -> Result<(), DurabilityError> {
+    if !sparse_index_is_valid(index) {
+        return Err(DurabilityError::CorruptWal);
+    }
+    let path = root.join(SPARSE_INDEX_FILENAME);
+    let temporary = root.join(format!(
+        ".cursor-index-{}-{}.tmp",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let bytes = serde_json::to_vec(index)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path)?;
+    File::open(root)?.sync_all()?;
+    Ok(())
 }
 
 fn valid_event_evidence(event: &NormalizedProviderEvent) -> bool {
@@ -1040,7 +1242,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn event(sequence: i64, price: &str) -> NormalizedProviderEvent {
-        let received = Utc.timestamp_millis_opt(1_700_000_001_000).unwrap();
+        let received = Utc.timestamp_millis_opt(1_700_000_010_000).unwrap();
         HyperliquidNormalizer::new([("BTC-PERP.HYPL".into(), "BTC".into())], 10_000)
             .unwrap()
             .normalize(
@@ -1076,6 +1278,64 @@ mod tests {
         let mut recovered = open(&root);
         let outcome = recovered.apply(event(1, "65000.10000000")).unwrap();
         assert_eq!(outcome.published.unwrap().sequence, 1);
+    }
+
+    #[test]
+    fn sparse_index_locates_batches_and_rebuilds_from_authoritative_wal() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("runtime");
+        let mut writer = open(&root);
+        writer.apply(event(1, "65000.10000000")).unwrap();
+        writer
+            .apply_batch(
+                (2..=1_024)
+                    .map(|sequence| event(sequence, "65000.10000000"))
+                    .collect(),
+            )
+            .unwrap();
+        let expected = writer.wal.sparse_index().clone();
+        assert_eq!(expected.schema_version, REALTIME_SPARSE_INDEX_VERSION);
+        assert_eq!(expected.entries.len(), 2);
+        assert_eq!(expected.locate(1).unwrap().first_wal_cursor, 1);
+        assert_eq!(expected.locate(1_024).unwrap().first_wal_cursor, 2);
+        assert!(sparse_index_is_valid(&expected));
+        drop(writer);
+
+        let index_path = root.join("wal").join(SPARSE_INDEX_FILENAME);
+        fs::write(&index_path, b"{corrupt-derived-index").unwrap();
+        let rebuilt = open(&root);
+        assert_eq!(rebuilt.sequence(), 1_024);
+        assert_eq!(rebuilt.wal.sparse_index(), &expected);
+        let persisted: RealtimeSparseIndex =
+            serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        assert_eq!(persisted, expected);
+        drop(rebuilt);
+
+        fs::remove_file(&index_path).unwrap();
+        let recreated = open(&root);
+        assert_eq!(recreated.wal.sparse_index(), &expected);
+        assert!(index_path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_index_symlink_is_rejected_instead_of_followed() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("runtime");
+        let writer = open(&root);
+        drop(writer);
+        let index_path = root.join("wal").join(SPARSE_INDEX_FILENAME);
+        fs::remove_file(&index_path).unwrap();
+        let target = directory.path().join("attacker-index.json");
+        fs::write(&target, b"{}").unwrap();
+        symlink(&target, &index_path).unwrap();
+        assert!(matches!(
+            DurableRealtimeWriter::open(&root, "hyperliquid-main", "config-v1", 1_024, 2),
+            Err(DurabilityError::InsecureStoragePermissions)
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"{}");
     }
 
     #[test]

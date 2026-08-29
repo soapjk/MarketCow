@@ -129,6 +129,15 @@ provider-specific Hyperliquid shadow route remains a rollback-compatible alias d
 Hyperliquid lifecycle transitions are fsync-appended to `audit.jsonl` with schema
 `marketcow.lifecycle-audit.v1`; failure to append a transition makes the hub fail closed.
 
+The realtime WAL maintains a derived `wal/cursor-index.json` using
+`marketcow.realtime.sparse-index.v1`. Entries bind a cursor range to a segment, byte offset and
+previous record hash; the whole index is SHA-256 sealed and atomically replaced with file and
+directory fsync. The index is never authoritative: missing or malformed content is rebuilt from
+the verified append-only WAL, while symlinks and unsafe permissions are rejected. This milestone
+provides logarithmic boundary lookup but startup still performs a full WAL integrity scan; do not
+claim history-independent startup until the checkpoint/segment manifest fast path is implemented
+and fault-tested.
+
 This is shadow evidence only. It does not enable a writer cutover, does not submit orders, and
 does not authorize Tradude to start, stop, restart, or supervise MarketCow. LongPort remains an
 owner-only UDS typed raw-push bridge; it has no Python public listener and is not yet wired to the
