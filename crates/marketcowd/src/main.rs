@@ -1926,6 +1926,26 @@ impl AuditCoordinator {
         self.local.record(value, false)
     }
 
+    fn record_lifecycle(
+        &self,
+        domain: &str,
+        transition: &str,
+        details: serde_json::Value,
+    ) -> Result<()> {
+        self.local.record(
+            &json!({
+                "schema_version":"marketcow.lifecycle-audit.v1",
+                "audit_id":format!("audit-{}", Uuid::new_v4()),
+                "occurred_at":Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
+                "domain":domain,
+                "transition":transition,
+                "details":details,
+                "real_order_submission_enabled":false
+            }),
+            true,
+        )
+    }
+
     async fn list_admin(
         &self,
         limit: i64,
@@ -2436,6 +2456,7 @@ impl HyperliquidQueueProbe {
 fn start_hyperliquid_shadow(
     config: &Config,
     config_revision: &str,
+    audit: Arc<AuditCoordinator>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<Option<HyperliquidShadowRuntime>> {
     let Some(shadow) = &config.hyperliquid_shadow else {
@@ -2461,6 +2482,17 @@ fn start_hyperliquid_shadow(
         HYPERLIQUID_REPLAY_CAPACITY,
     )?;
     let reader = hub.reader();
+    let recovered = reader.snapshot();
+    audit.record_lifecycle(
+        "hyperliquid",
+        "starting",
+        json!({
+            "stream_id":recovered.stream_id,
+            "config_revision":recovered.config_revision,
+            "recovered_public_sequence":recovered.public_sequence,
+            "recovered_wal_cursor":recovered.wal_cursor
+        }),
+    )?;
     let (transport_tx, mut transport_rx) = mpsc::channel(HYPERLIQUID_TRANSPORT_CHANNEL_CAPACITY);
     let (gateway_tx, mut gateway_rx) = mpsc::channel(HYPERLIQUID_GATEWAY_CHANNEL_CAPACITY);
     let queues = HyperliquidQueueProbe {
@@ -2470,6 +2502,7 @@ fn start_hyperliquid_shadow(
     let (public_stream, _) = broadcast::channel(HYPERLIQUID_PUBLIC_CHANNEL_CAPACITY);
     let terminal_error = Arc::new(Mutex::new(None::<String>));
     let terminal_for_transport = terminal_error.clone();
+    let audit_for_transport = audit.clone();
     let transport = tokio::spawn(async move {
         if let Err(error) = marketcow_realtime::run_hyperliquid_transport(
             marketcow_realtime::HyperliquidTransportConfig::production(),
@@ -2481,21 +2514,57 @@ fn start_hyperliquid_shadow(
         .await
         {
             warn!(error=%error, "hyperliquid_transport_failed_closed");
+            let _ = audit_for_transport.record_lifecycle(
+                "hyperliquid",
+                "failed_closed",
+                json!({"component":"transport","reason":error.reason_code()}),
+            );
             *terminal_for_transport
                 .lock()
                 .expect("terminal mutex poisoned") =
                 Some(format!("transport_{}", error.reason_code()));
         }
     });
+    let audit_for_owner = audit.clone();
     let owner = tokio::task::spawn_blocking(move || {
         let mut published_since_checkpoint = 0_usize;
         while let Some(output) = transport_rx.blocking_recv() {
+            let lifecycle_transition = match &output {
+                marketcow_realtime::TransportOutput::Connected { attempt } => {
+                    Some(("connected", json!({"attempt":attempt})))
+                }
+                marketcow_realtime::TransportOutput::SubscriptionsReady { attempt } => {
+                    Some(("ready", json!({"attempt":attempt})))
+                }
+                marketcow_realtime::TransportOutput::Degraded {
+                    attempt,
+                    reason,
+                    retryable,
+                } => Some((
+                    "degraded",
+                    json!({"attempt":attempt,"reason":reason,"retryable":retryable}),
+                )),
+                marketcow_realtime::TransportOutput::Events { .. } => None,
+            };
             match hub.ingest(output, &gateway_tx) {
                 Ok(published) => {
+                    if let Some((transition, details)) = lifecycle_transition
+                        && audit_for_owner
+                            .record_lifecycle("hyperliquid", transition, details)
+                            .is_err()
+                    {
+                        hub.fail_closed("lifecycle_audit_failed");
+                        return;
+                    }
                     published_since_checkpoint += published;
                     if published_since_checkpoint >= 1_000 {
                         if let Err(error) = hub.checkpoint() {
                             warn!(error=%error, "hyperliquid_checkpoint_failed_closed");
+                            let _ = audit_for_owner.record_lifecycle(
+                                "hyperliquid",
+                                "failed_closed",
+                                json!({"component":"checkpoint","reason":error.to_string()}),
+                            );
                             hub.fail_closed("checkpoint_failed");
                             return;
                         }
@@ -2504,6 +2573,11 @@ fn start_hyperliquid_shadow(
                 }
                 Err(error) => {
                     warn!(error=%error, "hyperliquid_owner_failed_closed");
+                    let _ = audit_for_owner.record_lifecycle(
+                        "hyperliquid",
+                        "failed_closed",
+                        json!({"component":"owner","reason":error.to_string()}),
+                    );
                     return;
                 }
             }
@@ -2516,7 +2590,18 @@ fn start_hyperliquid_shadow(
             hub.fail_closed(&reason);
         } else if let Err(error) = hub.checkpoint() {
             warn!(error=%error, "hyperliquid_shutdown_checkpoint_failed_closed");
+            let _ = audit_for_owner.record_lifecycle(
+                "hyperliquid",
+                "failed_closed",
+                json!({"component":"shutdown_checkpoint","reason":error.to_string()}),
+            );
             hub.fail_closed("shutdown_checkpoint_failed");
+        } else {
+            let _ = audit_for_owner.record_lifecycle(
+                "hyperliquid",
+                "stopped",
+                json!({"reason":"service_shutdown","checkpointed":true}),
+            );
         }
     });
     let public_stream_for_gateway = public_stream.clone();
@@ -2939,6 +3024,7 @@ async fn serve() -> Result<()> {
     let hyperliquid = start_hyperliquid_shadow(
         &config,
         &control_plane.config_revision,
+        audit.clone(),
         service_shutdown_rx.clone(),
     )?;
     let legacy_mcp = config
@@ -3668,6 +3754,15 @@ async fn hyperliquid_shadow_stream(
     State(state): State<AppState>,
     Extension(request_id): Extension<String>,
     Query(query): Query<HyperliquidEventQuery>,
+) -> Response {
+    hyperliquid_stream_response(ws, state, request_id, query).await
+}
+
+async fn hyperliquid_stream_response(
+    ws: WebSocketUpgrade,
+    state: AppState,
+    request_id: String,
+    query: HyperliquidEventQuery,
 ) -> Response {
     let filter = match hyperliquid_filter(&state, &query) {
         Ok(filter) => filter,
@@ -5556,7 +5651,10 @@ async fn live_full_sync(
 
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
+    provider: Option<String>,
     after_cursor: Option<u64>,
+    instruments: Option<String>,
+    data_types: Option<String>,
 }
 
 async fn market_data_stream(
@@ -5565,6 +5663,39 @@ async fn market_data_stream(
     Extension(request_id): Extension<String>,
     Query(query): Query<StreamQuery>,
 ) -> Response {
+    match query.provider.as_deref() {
+        Some("hyperliquid") => {
+            return hyperliquid_stream_response(
+                ws,
+                state,
+                request_id,
+                HyperliquidEventQuery {
+                    after_sequence: query.after_cursor,
+                    limit: default_event_limit(),
+                    instruments: query.instruments,
+                    data_types: query.data_types,
+                },
+            )
+            .await;
+        }
+        None | Some("polymarket") => {}
+        Some(_) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_realtime_provider",
+                false,
+                &request_id,
+            );
+        }
+    }
+    if query.instruments.is_some() || query.data_types.is_some() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "polymarket_stream_filter_unsupported",
+            false,
+            &request_id,
+        );
+    }
     let projection = state.projection.load_full();
     if !polymarket_projection_ready(&state, &projection) {
         return error(
@@ -8541,6 +8672,39 @@ mod tests {
         assert!(metrics.contains("marketcow_hyperliquid_shadow_ready 0"));
     }
 
+    #[test]
+    fn realtime_lifecycle_audit_is_append_only_and_orders_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = AuditCoordinator::memory(&path);
+        audit
+            .record_lifecycle(
+                "hyperliquid",
+                "starting",
+                json!({"recovered_public_sequence":7,"recovered_wal_cursor":7}),
+            )
+            .unwrap();
+        audit
+            .record_lifecycle("hyperliquid", "ready", json!({"attempt":1}))
+            .unwrap();
+        let records = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["schema_version"], "marketcow.lifecycle-audit.v1");
+        assert_eq!(records[0]["transition"], "starting");
+        assert_eq!(records[1]["transition"], "ready");
+        assert!(records.iter().all(|record| {
+            record["domain"] == "hyperliquid"
+                && record["real_order_submission_enabled"] == false
+                && record["audit_id"]
+                    .as_str()
+                    .is_some_and(|value| value.starts_with("audit-"))
+        }));
+    }
+
     #[tokio::test]
     async fn hyperliquid_shadow_events_are_bounded_and_filtered_with_watermarks() {
         let (dir, mut state) = test_state();
@@ -8612,6 +8776,92 @@ mod tests {
         assert_eq!(page["next_sequence"], 1);
         assert_eq!(page["frames"][0]["type"], "sequence_watermark");
         assert_eq!(page["real_order_submission_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn unified_market_data_stream_dispatches_hyperliquid_without_breaking_default() {
+        let (dir, mut state) = test_state();
+        let mut hub = marketcow_realtime::DurableRealtimeHub::open(
+            dir.path().join("hyperliquid-unified-stream"),
+            "hyperliquid-main",
+            "test-config-v1",
+            1_024,
+            8,
+        )
+        .unwrap();
+        let (gateway, mut gateway_receiver) = mpsc::channel(4);
+        hub.ingest(
+            marketcow_realtime::TransportOutput::Connected { attempt: 1 },
+            &gateway,
+        )
+        .unwrap();
+        hub.ingest(
+            marketcow_realtime::TransportOutput::SubscriptionsReady { attempt: 1 },
+            &gateway,
+        )
+        .unwrap();
+        let now = Utc::now();
+        let events = marketcow_realtime::HyperliquidNormalizer::new(
+            [("BTC-PERP.HYPL".into(), "BTC".into())],
+            30_000,
+        )
+        .unwrap()
+        .normalize(
+            json!({"channel":"trades","data":[{
+                "coin":"BTC","time":now.timestamp_millis(),"px":"65000.10",
+                "sz":"0.001","side":"B","tid":43
+            }]}),
+            now,
+        )
+        .unwrap();
+        hub.ingest(
+            marketcow_realtime::TransportOutput::Events { attempt: 1, events },
+            &gateway,
+        )
+        .unwrap();
+        let published = gateway_receiver.try_recv().unwrap();
+        let (public_stream, _) = broadcast::channel(8);
+        let _ = public_stream.send(published);
+        state.hyperliquid_shadow = Some(hub.reader());
+        state.hyperliquid_stream = Some(public_stream);
+        state.config.hyperliquid_shadow = Some(HyperliquidShadowConfig {
+            instruments: BTreeMap::from([("BTC-PERP.HYPL".into(), "BTC".into())]),
+            maximum_source_delay_millis: 30_000,
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/v1/market-data/stream?provider=hyperliquid&after_cursor=0&instruments=BTC-PERP.HYPL&data_types=trade"
+        ))
+        .await
+        .unwrap();
+        let subscription = client.next().await.unwrap().unwrap().into_text().unwrap();
+        let subscription: serde_json::Value = serde_json::from_str(&subscription).unwrap();
+        assert_eq!(subscription["type"], "subscription");
+        assert_eq!(subscription["provider"], "hyperliquid");
+        assert_eq!(subscription["stream_id"], "hyperliquid-main");
+        assert_eq!(subscription["real_order_submission_enabled"], false);
+        let replay = client.next().await.unwrap().unwrap().into_text().unwrap();
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        assert_eq!(replay["type"], "event");
+        assert_eq!(replay["stream"]["sequence"], 1);
+        assert_eq!(replay["stream"]["event"]["source"], "hyperliquid");
+        client.close(None).await.unwrap();
+        let unsupported = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/v1/market-data/stream?provider=unknown"
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            unsupported,
+            tokio_tungstenite::tungstenite::Error::Http(ref response)
+                if response.status() == StatusCode::UNPROCESSABLE_ENTITY
+        ));
+        server.abort();
     }
 
     #[tokio::test]

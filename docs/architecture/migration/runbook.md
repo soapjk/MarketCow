@@ -116,6 +116,19 @@ lagged cursors require resync and never skip silently. Transport, gateway, and p
 depths are observable independently. When the opt-in is enabled, readiness requires the
 Hyperliquid hub to be `ready`; do not bypass that gate.
 
+The frozen unified WebSocket entry point accepts Hyperliquid without changing the default
+Polymarket behavior:
+
+```text
+/v1/market-data/stream?provider=hyperliquid&after_cursor=<sequence>&instruments=<ids>&data_types=<types>
+```
+
+Omitting `provider` remains the Polymarket v1 contract; `provider=polymarket` is equivalent.
+Unknown providers and Polymarket-only filter combinations fail closed with HTTP 422. The
+provider-specific Hyperliquid shadow route remains a rollback-compatible alias during Phase 6.
+Hyperliquid lifecycle transitions are fsync-appended to `audit.jsonl` with schema
+`marketcow.lifecycle-audit.v1`; failure to append a transition makes the hub fail closed.
+
 This is shadow evidence only. It does not enable a writer cutover, does not submit orders, and
 does not authorize Tradude to start, stop, restart, or supervise MarketCow. LongPort remains an
 owner-only UDS typed raw-push bridge; it has no Python public listener and is not yet wired to the
