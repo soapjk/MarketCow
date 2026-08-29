@@ -157,6 +157,10 @@
     {
       "tool": "clean export Git identity probe",
       "result": "failed because the intentionally clean source export contains no .git directory; commit and binary identity were verified in the bound worktree and installed binary"
+    },
+    {
+      "tool": "first Corptie Artifact creation",
+      "result": "ARTIFACT_WORKER_SCOPE_FORBIDDEN because the Worker supplied visibility and repository locator; retry delegates scope derivation to the authoritative WorkItem binding and uses embedded JSON content"
     }
   ],
   "safety": {
