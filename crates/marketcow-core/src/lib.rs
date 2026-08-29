@@ -398,6 +398,113 @@ impl Projection {
         let bytes = serde_json::to_vec(&value).expect("projection is serializable");
         hex::encode(Sha256::digest(bytes))
     }
+
+    /// Verifies the public strategy tick invariant without mutating recovered state. This is used
+    /// by the HTTP readiness boundary so a legacy checkpoint cannot briefly expose stale catalog
+    /// facts before the next authoritative event reconciles it.
+    pub fn instrument_ticks_consistent(&self) -> bool {
+        self.catalog_revision.is_none()
+            || self
+                .markets
+                .values()
+                .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                .filter_map(|market| {
+                    market
+                        .instrument_facts
+                        .as_ref()
+                        .map(|facts| (market, facts))
+                })
+                .all(|(market, facts)| {
+                    market.outcomes.iter().all(|outcome| {
+                        self.books.get(&outcome.token_id).is_some_and(|book| {
+                            !book.tick_version.is_empty()
+                                && book.tick_size.as_ref() == Some(&facts.price_increment)
+                        })
+                    })
+                })
+    }
+}
+
+/// Reconciles the catalog's market-level executable price increment with the two authoritative
+/// outcome-token books. Polymarket binary outcomes share one market tick, but the tick may change
+/// after the hash-pinned catalog was produced. The reconciliation is all-or-nothing across the
+/// active catalog: a missing book, missing revision, or disagreement between outcome tokens keeps
+/// the projection fail-closed and leaves every catalog fact untouched.
+fn reconcile_active_market_instrument_ticks(projection: &mut Projection) -> bool {
+    if projection.catalog_revision.is_none() {
+        return true;
+    }
+
+    let mut updates = Vec::new();
+    for market in projection
+        .markets
+        .values()
+        .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+    {
+        let Some(facts) = market.instrument_facts.as_ref() else {
+            // Generic catalog users may not publish strategy facts. Exact Rust Polymarket scopes
+            // separately require them at configuration and readiness boundaries.
+            continue;
+        };
+        let mut common_tick: Option<Price> = None;
+        let mut token_ticks = BTreeMap::new();
+        for outcome in &market.outcomes {
+            let Some(book) = projection.books.get(&outcome.token_id) else {
+                return false;
+            };
+            let Some(tick_size) = book.tick_size.as_ref() else {
+                return false;
+            };
+            if book.tick_version.is_empty()
+                || common_tick
+                    .as_ref()
+                    .is_some_and(|expected| expected != tick_size)
+            {
+                return false;
+            }
+            common_tick.get_or_insert_with(|| tick_size.clone());
+            token_ticks.insert(
+                outcome.token_id.clone(),
+                serde_json::json!({
+                    "tick_size": tick_size,
+                    "tick_version": book.tick_version,
+                }),
+            );
+        }
+        let Some(price_increment) = common_tick else {
+            return false;
+        };
+        // This revision is independently reproducible from the same immutable projection. It
+        // binds every market fact plus both token-level tick revisions without relying on wall
+        // time or mutation history.
+        let revision_material = serde_json::json!({
+            "schema_version": "marketcow.polymarket.instrument-facts-revision.v1",
+            "market_id": market.market_id,
+            "condition_id": market.condition_id,
+            "price_increment": price_increment,
+            "size_increment": facts.size_increment,
+            "minimum_order_size": facts.minimum_order_size,
+            "settlement_currency": facts.settlement_currency,
+            "start_at": facts.start_at,
+            "end_at": facts.end_at,
+            "token_ticks": token_ticks,
+        });
+        let revision = hex::encode(Sha256::digest(
+            serde_json::to_vec(&revision_material).expect("instrument facts are serializable"),
+        ));
+        updates.push((market.market_id.clone(), price_increment, revision));
+    }
+
+    for (market_id, price_increment, revision) in updates {
+        let facts = projection
+            .markets
+            .get_mut(&market_id)
+            .and_then(|market| market.instrument_facts.as_mut())
+            .expect("active market facts were validated above");
+        facts.price_increment = price_increment;
+        facts.revision = revision;
+    }
+    true
 }
 
 type CatalogState = (
@@ -1030,10 +1137,16 @@ impl<L: DurableLog> SingleWriter<L> {
                 .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
                 .flat_map(|market| market.outcomes.iter())
                 .all(|outcome| next.books.contains_key(&outcome.token_id));
-        next.ready =
-            next.unresolved_gaps.is_empty() && !next.books.is_empty() && catalog_books_complete;
+        let instrument_ticks_consistent = reconcile_active_market_instrument_ticks(&mut next);
+        next.ready = next.unresolved_gaps.is_empty()
+            && !next.books.is_empty()
+            && catalog_books_complete
+            && instrument_ticks_consistent;
         next.fail_closed_reason = rejected
             .clone()
+            .or_else(|| {
+                (!instrument_ticks_consistent).then(|| "instrument_tick_inconsistent".into())
+            })
             .or_else(|| (!next.ready).then(|| "unresolved_gap".into()));
         let event_cursor = event.cursor;
         let persisted = PersistedEvent {
@@ -2290,6 +2403,172 @@ mod tests {
         assert!(refreshed.persisted.applied);
         assert!(refreshed.projection.markets.contains_key("m1"));
         assert!(!refreshed.projection.ready);
+    }
+
+    #[test]
+    fn market_instrument_tick_tracks_both_token_books_or_fails_closed() {
+        #[derive(Default)]
+        struct TickLog(Vec<PersistedEvent>);
+        impl DurableLog for TickLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!()
+            }
+            fn append_outcome(&mut self, event: &PersistedEvent) -> Result<(), CoreError> {
+                self.0.push(event.clone());
+                Ok(())
+            }
+        }
+        let mut writer = SingleWriter::new("scope".into(), TickLog::default());
+        let mut record = market("m1", "condition-1", None);
+        record.instrument_facts = Some(MarketInstrumentFacts {
+            price_increment: Price::parse_tick("0.01").unwrap(),
+            size_increment: Quantity::parse_positive("0.01").unwrap(),
+            minimum_order_size: Quantity::parse_positive("5").unwrap(),
+            settlement_currency: "pUSD".into(),
+            start_at: Utc::now(),
+            end_at: Utc::now() + chrono::Duration::days(1),
+            revision: "catalog-facts-v1".into(),
+        });
+        writer
+            .apply(event(
+                1,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-1".into(),
+                    markets: vec![record],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+
+        let yes = writer
+            .apply(event(
+                2,
+                EventKind::FullBook {
+                    token_id: "m1-yes".into(),
+                    bids: levels("0.4", "1"),
+                    asks: levels("0.6", "1"),
+                    tick_size: Price::parse_tick("0.001").unwrap(),
+                    tick_version: "yes-tick-001".into(),
+                },
+            ))
+            .unwrap();
+        assert!(!yes.projection.ready);
+        assert_eq!(
+            yes.projection.fail_closed_reason.as_deref(),
+            Some("instrument_tick_inconsistent")
+        );
+        assert_eq!(
+            yes.projection.markets["m1"]
+                .instrument_facts
+                .as_ref()
+                .unwrap()
+                .price_increment,
+            Price::parse_tick("0.01").unwrap()
+        );
+
+        let no = writer
+            .apply(event(
+                3,
+                EventKind::FullBook {
+                    token_id: "m1-no".into(),
+                    bids: levels("0.4", "1"),
+                    asks: levels("0.6", "1"),
+                    tick_size: Price::parse_tick("0.001").unwrap(),
+                    tick_version: "no-tick-001".into(),
+                },
+            ))
+            .unwrap();
+        assert!(no.projection.ready);
+        let reconciled = no.projection.markets["m1"]
+            .instrument_facts
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            reconciled.price_increment,
+            Price::parse_tick("0.001").unwrap()
+        );
+        assert_eq!(reconciled.revision.len(), 64);
+        assert_ne!(reconciled.revision, "catalog-facts-v1");
+        let stable_revision = reconciled.revision.clone();
+
+        let unchanged_tick = writer
+            .apply(event(
+                4,
+                EventKind::Delta {
+                    token_id: "m1-yes".into(),
+                    side: Side::Bid,
+                    levels: levels("0.4", "2"),
+                },
+            ))
+            .unwrap();
+        assert!(unchanged_tick.projection.ready);
+        assert_eq!(
+            unchanged_tick.projection.markets["m1"]
+                .instrument_facts
+                .as_ref()
+                .unwrap()
+                .revision,
+            stable_revision
+        );
+
+        let one_token_changed = writer
+            .apply(event(
+                5,
+                EventKind::TickSizeChange {
+                    token_id: "m1-yes".into(),
+                    old_tick_size: Some(Price::parse_tick("0.001").unwrap()),
+                    new_tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "yes-tick-01".into(),
+                },
+            ))
+            .unwrap();
+        assert!(one_token_changed.persisted.applied);
+        assert!(!one_token_changed.projection.ready);
+        assert_eq!(
+            one_token_changed.projection.fail_closed_reason.as_deref(),
+            Some("instrument_tick_inconsistent")
+        );
+        assert_eq!(
+            one_token_changed.projection.markets["m1"]
+                .instrument_facts
+                .as_ref()
+                .unwrap()
+                .price_increment,
+            Price::parse_tick("0.001").unwrap()
+        );
+
+        let both_tokens_changed = writer
+            .apply(event(
+                6,
+                EventKind::TickSizeChange {
+                    token_id: "m1-no".into(),
+                    old_tick_size: Some(Price::parse_tick("0.001").unwrap()),
+                    new_tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "no-tick-01".into(),
+                },
+            ))
+            .unwrap();
+        assert!(both_tokens_changed.projection.ready);
+        let updated = both_tokens_changed.projection.markets["m1"]
+            .instrument_facts
+            .as_ref()
+            .unwrap();
+        assert_eq!(updated.price_increment, Price::parse_tick("0.01").unwrap());
+        assert_ne!(updated.revision, stable_revision);
+        assert!(both_tokens_changed.projection.instrument_ticks_consistent());
+
+        let mut legacy_checkpoint = (*both_tokens_changed.projection).clone();
+        legacy_checkpoint
+            .markets
+            .get_mut("m1")
+            .unwrap()
+            .instrument_facts = Some(MarketInstrumentFacts {
+            price_increment: Price::parse_tick("0.001").unwrap(),
+            revision: "stale-checkpoint-revision".into(),
+            ..updated.clone()
+        });
+        assert!(legacy_checkpoint.ready);
+        assert!(!legacy_checkpoint.instrument_ticks_consistent());
     }
 
     #[test]

@@ -5879,6 +5879,7 @@ fn projection_fresh(config: &Config, projection: &marketcow_core::Projection) ->
 
 fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Projection) -> bool {
     projection.ready
+        && projection.instrument_ticks_consistent()
         && projection_fresh(&state.config, projection)
         && state
             .active_polymarket_scope
