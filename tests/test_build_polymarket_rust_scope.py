@@ -10,6 +10,9 @@ import pytest
 
 from scripts.migration.build_polymarket_rust_scope import build_scope, write_atomic_json
 from scripts.migration.build_polymarket_dynamic_universe import build_dynamic_universe
+from scripts.migration.fetch_polymarket_dynamic_candidate_books import (
+    build_candidate_book_snapshot,
+)
 from scripts.migration.refresh_polymarket_dynamic_universe_books import refresh_candidate
 
 
@@ -455,3 +458,37 @@ def test_dynamic_universe_book_refresh_fails_closed_on_missing_or_float_facts(
     floating["40"]["bids"] = [{"price": 0.40, "size": "10.00"}]
     with pytest.raises(ValueError, match="exact decimal string"):
         refresh_candidate(candidate, poster=_BookPoster(floating))
+
+
+def test_candidate_book_snapshot_preserves_isolatable_missing_and_one_sided_books(
+    tmp_path: Path,
+) -> None:
+    manifest, index, _, _ = _fixture(tmp_path)
+    books = _clob_books()
+    books.pop("40")
+    books["10"]["asks"] = []
+
+    snapshot = build_candidate_book_snapshot(
+        manifest,
+        index,
+        poster=_BookPoster(books),
+        batch_size=2,
+        observed_at=datetime(2026, 8, 29, 1, 2, 3, tzinfo=timezone.utc),
+    )
+
+    assert snapshot["schema_version"] == "marketcow.polymarket.candidate-books.v1"
+    assert snapshot["requested_token_count"] == 4
+    assert snapshot["book_count"] == 3
+    assert snapshot["missing_token_ids"] == ["40"]
+    assert snapshot["unresolved_market_ids"] == []
+    assert snapshot["observed_at"] == "2026-08-29T01:02:03Z"
+    assert next(book for book in snapshot["books"] if book["asset_id"] == "10")["asks"] == []
+
+
+def test_candidate_book_snapshot_fails_closed_on_invalid_numeric_payload(tmp_path: Path) -> None:
+    manifest, index, _, _ = _fixture(tmp_path)
+    books = _clob_books()
+    books["40"]["bids"] = [{"price": 0.40, "size": "10.00"}]
+
+    with pytest.raises(ValueError, match="exact decimal string"):
+        build_candidate_book_snapshot(manifest, index, poster=_BookPoster(books))
