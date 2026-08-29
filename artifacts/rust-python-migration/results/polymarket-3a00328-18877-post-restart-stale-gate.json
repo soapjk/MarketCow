@@ -1,0 +1,50 @@
+{
+  "schema_version": "marketcow.polymarket.readiness-gate.v1",
+  "recorded_at": "2026-08-29T02:03:02Z",
+  "verdict": "failed",
+  "gate_identity": {
+    "bind": "127.0.0.1:18877",
+    "pid": 54514,
+    "commit": "3a0032879f3a43e3b4b86813d60c0836c8d89ecb",
+    "binary_sha256": "06c8c8edc0d7dcc766afbad611922e4a747fdb041bfb0db8fd79f905f277937a",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34"
+  },
+  "failed_gates": [
+    {
+      "gate": "expected_process_identity",
+      "verdict": "failed",
+      "evidence": "ps -p 54514 returned no process"
+    },
+    {
+      "gate": "expected_listener",
+      "verdict": "failed",
+      "evidence": "no TCP listener on 127.0.0.1:18877"
+    },
+    {
+      "gate": "scope_http_probe",
+      "verdict": "failed",
+      "evidence": "curl connection refused; HTTP status 000"
+    }
+  ],
+  "reason": "The one-shot gate was delivered after the verified preflight process had written checkpoint cursor 58375 and was intentionally stopped for the guarded 18872 cutover. Process exit is not treated as success, and this stale exact-identity gate is not reused as cutover evidence.",
+  "superseding_runtime_observation": {
+    "bind": "127.0.0.1:18872",
+    "pid": 57128,
+    "commit": "3a0032879f3a43e3b4b86813d60c0836c8d89ecb",
+    "binary_sha256": "06c8c8edc0d7dcc766afbad611922e4a747fdb041bfb0db8fd79f905f277937a",
+    "scope_schema_version": "marketcow.polymarket.scope-discovery.v2",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "ready": true,
+    "scope_status": "ready",
+    "market_count": 100,
+    "token_count": 200,
+    "boundary_cursor": 62121,
+    "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+    "real_order_submission_enabled": false
+  },
+  "safety": {
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false,
+    "overall_migration_complete": false
+  }
+}
