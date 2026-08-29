@@ -47,6 +47,7 @@ use uuid::Uuid;
 
 const STREAM_CHANNEL_CAPACITY: usize = 256;
 const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 64;
+const POLYMARKET_TRANSPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
 const STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const STREAM_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_WORKER_RESULT_BYTES: u64 = 16 * 1024 * 1024;
@@ -2405,11 +2406,12 @@ fn start_polymarket_live(
                             }
                             Err(error) => {
                                 let _ = response.send(Err(error));
-                                match wait_for_polymarket_scope_recovery(
+                                match wait_for_polymarket_retry_or_scope_recovery(
                                     &state,
                                     &live,
                                     &mut shutdown,
                                     &mut scope_switches,
+                                    POLYMARKET_TRANSPORT_RESTART_DELAY,
                                 )
                                 .await
                                 {
@@ -2427,13 +2429,22 @@ fn start_polymarket_live(
                             if let Err(error) = apply_polymarket_terminal_gaps(&state, &live.token_ids).await {
                                 warn!(error=%error, "polymarket_terminal_gap_failed_closed");
                             }
-                            let _ = (&mut transport).await;
+                            match (&mut transport).await {
+                                Ok(Ok(())) => warn!("polymarket_transport_ended_without_shutdown"),
+                                Ok(Err(error)) => warn!(
+                                    reason=error.reason_code(),
+                                    error=%error,
+                                    "polymarket_transport_restart_cycle"
+                                ),
+                                Err(error) => warn!(error=%error, "polymarket_transport_task_failed"),
+                            }
                             let _ = checkpoint_polymarket_runtime(&state).await;
-                            match wait_for_polymarket_scope_recovery(
+                            match wait_for_polymarket_retry_or_scope_recovery(
                                 &state,
                                 &live,
                                 &mut shutdown,
                                 &mut scope_switches,
+                                POLYMARKET_TRANSPORT_RESTART_DELAY,
                             )
                             .await
                             {
@@ -2463,11 +2474,12 @@ fn start_polymarket_live(
                                 let _ = (&mut transport).await;
                                 let _ = apply_polymarket_terminal_gaps(&state, &live.token_ids).await;
                                 let _ = checkpoint_polymarket_runtime(&state).await;
-                                match wait_for_polymarket_scope_recovery(
+                                match wait_for_polymarket_retry_or_scope_recovery(
                                     &state,
                                     &live,
                                     &mut shutdown,
                                     &mut scope_switches,
+                                    POLYMARKET_TRANSPORT_RESTART_DELAY,
                                 )
                                 .await
                                 {
@@ -2621,14 +2633,25 @@ async fn apply_polymarket_terminal_gaps(state: &AppState, tokens: &[String]) -> 
     Ok(())
 }
 
-async fn wait_for_polymarket_scope_recovery(
+async fn wait_for_polymarket_retry_or_scope_recovery(
     state: &AppState,
     current: &PolymarketLiveConfig,
     shutdown: &mut watch::Receiver<bool>,
     scope_switches: &mut mpsc::Receiver<PolymarketScopeSwitchRequest>,
+    retry_delay: Duration,
 ) -> Option<PolymarketLiveConfig> {
+    let retry = tokio::time::sleep(retry_delay);
+    tokio::pin!(retry);
     loop {
         tokio::select! {
+            _ = &mut retry => {
+                warn!(
+                    scope_id=%current.scope_id,
+                    retry_delay_ms=retry_delay.as_millis(),
+                    "polymarket_transport_retrying_same_scope"
+                );
+                return Some(current.clone());
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return None;
@@ -6949,6 +6972,28 @@ mod tests {
                 .join("polymarket/checkpoint-manifest.json")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn exhausted_polymarket_transport_budget_retries_same_scope_without_admin_action() {
+        let (_dir, state) = test_state();
+        let current = dynamic_live_scope("current-scope", "1", "10", "20");
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (_scope_tx, mut scope_rx) = mpsc::channel(1);
+
+        let recovered = wait_for_polymarket_retry_or_scope_recovery(
+            &state,
+            &current,
+            &mut shutdown_rx,
+            &mut scope_rx,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("the daemon must begin another bounded transport cycle");
+
+        assert_eq!(recovered.scope_id, current.scope_id);
+        assert_eq!(recovered.token_ids, current.token_ids);
+        assert_eq!(recovered.scope_file_sha256, current.scope_file_sha256);
     }
 
     fn instrument_fixture() -> marketcow_storage::InstrumentRecord {
