@@ -1,0 +1,61 @@
+{
+  "schema_version": "marketcow.phase6.unified-hyperliquid-stream-milestone.v1",
+  "generated_at": "2026-08-29T06:30:00Z",
+  "passed": true,
+  "phase_complete": false,
+  "authoritative_plan_sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4",
+  "implementation_commit": "6e10988",
+  "implemented": [
+    "The frozen /v1/market-data/stream entry point dispatches provider=hyperliquid to the Rust-owned durable hub while an omitted provider retains the exact Polymarket behavior.",
+    "The unified after_cursor maps to the selected Hyperliquid stream's monotonic sequence; replay and live delivery remain contiguous and filtered non-matches use sequence watermarks.",
+    "Unknown providers and Polymarket filter combinations fail closed with HTTP 422.",
+    "The provider-specific Hyperliquid shadow stream remains a rollback-compatible alias during Phase 6.",
+    "Hyperliquid starting, connected, ready, degraded, failed_closed and stopped transitions are fsync-appended using marketcow.lifecycle-audit.v1.",
+    "Failure to append a lifecycle transition permanently fails the hub closed.",
+    "Every unified subscription reports real_order_submission_enabled=false; no trading, wallet, signing or order surface was added."
+  ],
+  "verification": {
+    "rust_workspace": {
+      "command": "cargo test --workspace --all-targets",
+      "passed": 149,
+      "failed": 0,
+      "ignored_real_storage_environment_gates": 5
+    },
+    "clippy": {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "passed": true
+    },
+    "targeted_websocket": {
+      "command": "cargo test -p marketcowd unified_market_data_stream_dispatches_hyperliquid_without_breaking_default -- --nocapture",
+      "passed": true,
+      "assertions": [
+        "provider=hyperliquid upgrades on the unified route",
+        "subscription identifies hyperliquid-main and orders disabled",
+        "replayed event sequence is 1 and source is hyperliquid",
+        "unknown provider handshake receives HTTP 422"
+      ]
+    },
+    "lifecycle_audit_test": {
+      "test": "realtime_lifecycle_audit_is_append_only_and_orders_disabled",
+      "passed": true,
+      "assertions": [
+        "two records remain in append order",
+        "schema is marketcow.lifecycle-audit.v1",
+        "domain is hyperliquid",
+        "orders disabled is explicit on every record"
+      ]
+    }
+  },
+  "preserved_failures": [
+    "The first full clippy run failed clippy::collapsible-if in the lifecycle-audit fail-closed branch. The branch was mechanically collapsed without semantic change, then the exact clippy command passed.",
+    "The earlier Phase 6 Python verification first omitted PYTHONPATH and then encountered the repository .venv symbolic-link cycle; the exact applicable suite was rerun with a known working isolated interpreter and 31 tests passed. Those failures remain in the preceding Phase 6 Artifact."
+  ],
+  "remaining": [
+    "add a sparse WAL cursor index so checkpoint startup does not scale with total history",
+    "run controlled upstream Hyperliquid differential, disconnect, recovery and sustained performance tests",
+    "connect LongPort to an owner-only UDS streaming lifecycle and migrate EastMoney/Sina polling quote",
+    "perform staged single-writer shadow/dual-run/cutover evidence; no writer handoff is enabled"
+  ],
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}
