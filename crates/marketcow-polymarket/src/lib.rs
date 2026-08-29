@@ -502,6 +502,16 @@ pub fn normalize_frame(
     received_at: DateTime<Utc>,
     first_cursor: u64,
 ) -> Result<Vec<CanonicalEvent>, NormalizeError> {
+    normalize_frame_with_book_tick(config, raw_payload, received_at, first_cursor, None)
+}
+
+pub fn normalize_frame_with_book_tick(
+    config: &NormalizerConfig,
+    raw_payload: Value,
+    received_at: DateTime<Utc>,
+    first_cursor: u64,
+    verified_book_tick: Option<Price>,
+) -> Result<Vec<CanonicalEvent>, NormalizeError> {
     config.validate()?;
     let raw = raw_payload
         .as_object()
@@ -607,10 +617,12 @@ pub fn normalize_frame(
             let token_id = string_alias(raw, &["asset_id", "token_id"])
                 .filter(|value| !value.is_empty())
                 .ok_or(NormalizeError::MissingField("asset_id"))?;
-            let tick_text = value_text(raw.get("tick_size"))
-                .ok_or(NormalizeError::MissingField("tick_size"))?;
-            let tick_size =
-                Price::parse_tick(&tick_text).map_err(|_| NormalizeError::InvalidDecimal)?;
+            let tick_size = match value_text(raw.get("tick_size")) {
+                Some(tick_text) => {
+                    Price::parse_tick(&tick_text).map_err(|_| NormalizeError::InvalidDecimal)?
+                }
+                None => verified_book_tick.ok_or(NormalizeError::MissingField("tick_size"))?,
+            };
             let bids = parse_levels(raw.get("bids"))?;
             let asks = parse_levels(raw.get("asks"))?;
             let tick_version =
@@ -932,6 +944,34 @@ mod tests {
         let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
         assert!(writer.apply(normalized).unwrap().persisted.applied);
         assert!(writer.projection().ready);
+    }
+
+    #[test]
+    fn book_without_tick_requires_an_explicit_verified_fallback() {
+        let raw = serde_json::json!({
+            "event_type":"book", "asset_id":"yes-1", "timestamp":"2026-08-03T04:00:00Z",
+            "bids":[{"price":"0.40","size":"10"}],
+            "asks":[{"price":"0.42","size":"11"}]
+        });
+        assert_eq!(
+            normalize_frame(&config(), raw.clone(), at(), 1),
+            Err(NormalizeError::MissingField("tick_size"))
+        );
+
+        let event = normalize_frame_with_book_tick(
+            &config(),
+            raw,
+            at(),
+            1,
+            Some(Price::parse_tick("0.01").unwrap()),
+        )
+        .unwrap()
+        .remove(0);
+        assert!(matches!(
+            event.kind,
+            EventKind::FullBook { ref tick_size, .. } if tick_size.0.to_string() == "0.01"
+        ));
+        assert!(event.raw_payload.get("tick_size").is_none());
     }
 
     #[test]

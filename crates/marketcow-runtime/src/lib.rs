@@ -6,7 +6,7 @@ use marketcow_core::{
     ApplyOutcome, PersistedEvent, Projection, SegmentedWal, SingleWriter, read_checkpoint,
     replay_after_checkpoint, write_checkpoint,
 };
-use marketcow_polymarket::{NormalizeError, NormalizerConfig, normalize_frame};
+use marketcow_polymarket::{NormalizeError, NormalizerConfig, normalize_frame_with_book_tick};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -124,13 +124,20 @@ impl PolymarketRuntime {
         raw_payload: Value,
         received_at: DateTime<Utc>,
     ) -> Result<Vec<ApplyOutcome>, RuntimeError> {
-        let next_cursor = self.writer.projection().cursor + 1;
+        let projection = self.writer.projection();
+        let next_cursor = projection.cursor + 1;
         let normalizer = NormalizerConfig::new(
             self.config.scope_id.clone(),
             self.config.config_revision.clone(),
         );
-        let mut events = normalize_frame(&normalizer, raw_payload, received_at, next_cursor)?;
-        let projection = self.writer.projection();
+        let verified_book_tick = verified_book_tick(&projection, &raw_payload);
+        let mut events = normalize_frame_with_book_tick(
+            &normalizer,
+            raw_payload,
+            received_at,
+            next_cursor,
+            verified_book_tick,
+        )?;
         events.retain(|event| !projection.recent_event_ids.contains(&event.event_id));
         for (offset, event) in events.iter_mut().enumerate() {
             event.cursor = next_cursor + u64::try_from(offset).expect("bounded frame offset");
@@ -178,6 +185,46 @@ impl PolymarketRuntime {
         self.last_manifest = Some(manifest.clone());
         Ok(manifest)
     }
+}
+
+fn verified_book_tick(
+    projection: &Projection,
+    raw_payload: &Value,
+) -> Option<marketcow_core::Price> {
+    let raw = raw_payload.as_object()?;
+    if raw
+        .get("event_type")
+        .or_else(|| raw.get("type"))
+        .and_then(Value::as_str)
+        != Some("book")
+        || raw.get("tick_size").is_some_and(|value| !value.is_null())
+    {
+        return None;
+    }
+    let token_id = raw
+        .get("asset_id")
+        .or_else(|| raw.get("token_id"))
+        .and_then(Value::as_str)?;
+    projection
+        .books
+        .get(token_id)
+        .and_then(|book| book.tick_size.clone())
+        .or_else(|| {
+            projection.markets.values().find_map(|market| {
+                if market
+                    .outcomes
+                    .iter()
+                    .any(|outcome| outcome.token_id == token_id)
+                {
+                    market
+                        .instrument_facts
+                        .as_ref()
+                        .map(|facts| facts.price_increment.clone())
+                } else {
+                    None
+                }
+            })
+        })
 }
 
 fn load_manifest(config: &RuntimeConfig) -> Result<Option<CheckpointManifest>, RuntimeError> {
@@ -348,6 +395,44 @@ mod tests {
         assert_eq!(runtime.projection().cursor, 1);
         assert_eq!(runtime.projection().hash(), expected_hash);
         assert_eq!(runtime.recent_events().len(), 1);
+    }
+
+    #[test]
+    fn book_without_tick_inherits_only_the_verified_projection_tick() {
+        let dir = tempdir().unwrap();
+        let mut runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
+        runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+
+        let outcomes = runtime
+            .apply_raw(
+                serde_json::json!({
+                    "event_type":"book", "asset_id":"yes",
+                    "timestamp":"2026-08-03T04:00:01Z",
+                    "bids":[{"price":"0.41","size":"12"}],
+                    "asks":[{"price":"0.61","size":"13"}]
+                }),
+                at(1),
+            )
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            runtime.projection().books["yes"]
+                .tick_size
+                .as_ref()
+                .unwrap()
+                .0
+                .to_string(),
+            "0.01"
+        );
+        assert_eq!(runtime.projection().cursor, 2);
+        assert!(
+            runtime.recent_events()[1]
+                .event
+                .raw_payload
+                .get("tick_size")
+                .is_none()
+        );
     }
 
     #[test]
