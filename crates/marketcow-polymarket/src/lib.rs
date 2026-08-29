@@ -795,21 +795,9 @@ fn build_event(
     token_id: &str,
     kind: EventKind,
 ) -> CanonicalEvent {
-    // Full books are recovery barriers as well as content snapshots. A quiet market can return
-    // byte-identical book payloads across connection boundaries; treating the later observation
-    // as a duplicate would leave the durable source gap open forever. Bind only full-book event
-    // identity to its receipt boundary while retaining the payload hash as immutable provenance.
-    // Incremental events keep content-addressed identities and therefore remain idempotent.
-    let receipt_boundary = matches!(&kind, EventKind::FullBook { .. })
-        .then(|| {
-            context
-                .received_at
-                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
-        })
-        .unwrap_or_default();
     let event_id = hex::encode(Sha256::digest(format!(
-        "{}\0{}\0{}\0{}\0{}",
-        config.scope_id, NORMALIZER_VERSION, context.raw_sha256, token_id, receipt_boundary
+        "{}\0{}\0{}\0{}",
+        config.scope_id, NORMALIZER_VERSION, context.raw_sha256, token_id
     )));
     let delay_ms = context
         .received_at
@@ -841,6 +829,24 @@ fn build_event(
         raw_payload: context.raw_payload.clone(),
         kind,
     }
+}
+
+/// Rebinds a byte-identical full book to a new recovery boundary. Callers must use this only when
+/// the content-addressed identity is already known and the token currently has a durable source
+/// gap. Normal repeated snapshots remain idempotent; an identical snapshot observed after a
+/// connection boundary can still close that gap without weakening incremental-event deduplication.
+pub fn bind_full_book_recovery_identity(event: &mut CanonicalEvent) -> bool {
+    if !matches!(&event.kind, EventKind::FullBook { .. }) {
+        return false;
+    }
+    event.event_id = hex::encode(Sha256::digest(format!(
+        "{}\0full_book_recovery\0{}",
+        event.event_id,
+        event
+            .received_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    )));
+    true
 }
 
 fn parse_levels(value: Option<&Value>) -> Result<Vec<Level>, NormalizeError> {
@@ -1085,6 +1091,9 @@ mod tests {
         )
         .unwrap()
         .remove(0);
+        assert_eq!(recovered.event_id, initial_event_id);
+        let mut recovered = recovered;
+        assert!(bind_full_book_recovery_identity(&mut recovered));
         assert_ne!(recovered.event_id, initial_event_id);
         assert_eq!(recovered.source.raw_sha256, initial_raw_sha256);
         assert!(writer.apply(recovered).unwrap().projection.ready);

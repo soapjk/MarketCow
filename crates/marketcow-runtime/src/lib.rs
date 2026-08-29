@@ -3,10 +3,13 @@
 
 use chrono::{DateTime, Utc};
 use marketcow_core::{
-    ApplyOutcome, PersistedEvent, Projection, SegmentedWal, SingleWriter, read_checkpoint,
-    replay_after_checkpoint, write_checkpoint,
+    ApplyOutcome, EventKind, PersistedEvent, Projection, SegmentedWal, SingleWriter,
+    read_checkpoint, replay_after_checkpoint, write_checkpoint,
 };
-use marketcow_polymarket::{NormalizeError, NormalizerConfig, normalize_frame_with_book_tick};
+use marketcow_polymarket::{
+    NormalizeError, NormalizerConfig, bind_full_book_recovery_identity,
+    normalize_frame_with_book_tick,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -138,6 +141,21 @@ impl PolymarketRuntime {
             next_cursor,
             verified_book_tick,
         )?;
+        for event in &mut events {
+            let duplicate = projection.recent_event_ids.contains(&event.event_id);
+            let closes_durable_gap = match &event.kind {
+                EventKind::FullBook { token_id, .. } => {
+                    projection.unresolved_gaps.contains(token_id)
+                }
+                _ => false,
+            };
+            if duplicate && closes_durable_gap {
+                // A quiet venue book may be byte-identical across reconnects. It is still a new
+                // recovery barrier after a durable source gap, while ordinary repeated snapshots
+                // and incremental events retain their content-addressed idempotency.
+                bind_full_book_recovery_identity(event);
+            }
+        }
         events.retain(|event| !projection.recent_event_ids.contains(&event.event_id));
         for (offset, event) in events.iter_mut().enumerate() {
             event.cursor = next_cursor + u64::try_from(offset).expect("bounded frame offset");
@@ -395,6 +413,39 @@ mod tests {
         assert_eq!(runtime.projection().cursor, 1);
         assert_eq!(runtime.projection().hash(), expected_hash);
         assert_eq!(runtime.recent_events().len(), 1);
+    }
+
+    #[test]
+    fn identical_upstream_snapshot_closes_a_durable_connection_gap() {
+        let dir = tempdir().unwrap();
+        let mut runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
+        let first = runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+        let first_event_id = first[0].persisted.event.event_id.clone();
+        let first_raw_sha256 = first[0].persisted.event.source.raw_sha256.clone();
+
+        runtime
+            .apply_raw(
+                serde_json::json!({
+                    "event_type":"source_gap", "asset_id":"yes",
+                    "reason":"upstream_connection_boundary", "timestamp":"2026-08-03T04:00:01Z"
+                }),
+                at(1),
+            )
+            .unwrap();
+        assert!(!runtime.projection().ready);
+        assert!(runtime.projection().unresolved_gaps.contains("yes"));
+
+        let recovered = runtime.apply_raw(snapshot("yes", 0), at(2)).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_ne!(recovered[0].persisted.event.event_id, first_event_id);
+        assert_eq!(
+            recovered[0].persisted.event.source.raw_sha256,
+            first_raw_sha256
+        );
+        assert_eq!(runtime.projection().cursor, 3);
+        assert!(runtime.projection().ready);
+        assert!(!runtime.projection().unresolved_gaps.contains("yes"));
     }
 
     #[test]
