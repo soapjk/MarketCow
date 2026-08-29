@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use marketcow_core::{
     ApplyOutcome, EventKind, PersistedEvent, Projection, SegmentedWal, SingleWriter,
-    read_checkpoint, replay_after_checkpoint, write_checkpoint,
+    WalCheckpointAnchor, read_checkpoint, replay_after_checkpoint, write_checkpoint,
 };
 use marketcow_polymarket::{
     NormalizeError, NormalizerConfig, bind_full_book_recovery_identity,
@@ -22,7 +22,8 @@ use std::{
 };
 use thiserror::Error;
 
-pub const CHECKPOINT_MANIFEST_VERSION: &str = "marketcow.polymarket.checkpoint-manifest.v1";
+const CHECKPOINT_MANIFEST_V1: &str = "marketcow.polymarket.checkpoint-manifest.v1";
+pub const CHECKPOINT_MANIFEST_VERSION: &str = "marketcow.polymarket.checkpoint-manifest.v2";
 const CANDIDATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
@@ -53,6 +54,10 @@ pub struct CheckpointReference {
     pub path: PathBuf,
     pub projection_sha256: String,
     pub cursor: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_anchor_segment_first_cursor: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_anchor_segment_header_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,20 +108,28 @@ impl PolymarketRuntime {
         config.validate()?;
         fs::create_dir_all(config.root.join("wal"))?;
         fs::create_dir_all(config.root.join("checkpoints"))?;
-        let records = SegmentedWal::verify(config.root.join("wal"))?;
+        let verified_wal = SegmentedWal::verify_with_anchors(config.root.join("wal"))?;
         let manifest = load_manifest(&config)?;
-        let recovered = recover_projection(&config, manifest.as_ref(), &records)?;
-        let wal = SegmentedWal::open(
+        let recovered = recover_projection(
+            &config,
+            manifest.as_ref(),
+            &verified_wal.records,
+            &verified_wal.checkpoint_anchors,
+        )?;
+        let wal = SegmentedWal::open_after_verification(
             config.root.join("wal"),
             &config.scope_id,
             config.wal_segment_bytes,
         )?;
         let writer = SingleWriter::resume(recovered, wal)?;
-        let start = records.len().saturating_sub(config.recent_event_capacity);
+        let start = verified_wal
+            .records
+            .len()
+            .saturating_sub(config.recent_event_capacity);
         Ok(Self {
             config,
             writer,
-            recent_events: records[start..].iter().cloned().collect(),
+            recent_events: verified_wal.records[start..].iter().cloned().collect(),
             last_manifest: manifest,
         })
     }
@@ -239,10 +252,16 @@ impl PolymarketRuntime {
         let relative_path = PathBuf::from(format!("checkpoints/{:020}.json", projection.cursor));
         let absolute_path = self.config.root.join(&relative_path);
         let projection_sha256 = write_checkpoint(&absolute_path, &projection)?;
+        let wal_anchor = self
+            .writer
+            .durable_log_mut()
+            .anchor_checkpoint(projection.cursor, &projection_sha256)?;
         let current = CheckpointReference {
             path: relative_path,
             projection_sha256,
             cursor: projection.cursor,
+            wal_anchor_segment_first_cursor: Some(wal_anchor.segment_first_cursor),
+            wal_anchor_segment_header_sha256: Some(wal_anchor.segment_header_sha256),
         };
         let previous = self.last_manifest.as_ref().and_then(|manifest| {
             if manifest.current.cursor != current.cursor {
@@ -382,8 +401,10 @@ fn load_manifest(config: &RuntimeConfig) -> Result<Option<CheckpointManifest>, R
         return Ok(None);
     }
     let manifest: CheckpointManifest = serde_json::from_slice(&fs::read(path)?)?;
-    if manifest.schema_version != CHECKPOINT_MANIFEST_VERSION
-        || manifest.scope_id != config.scope_id
+    if !matches!(
+        manifest.schema_version.as_str(),
+        CHECKPOINT_MANIFEST_V1 | CHECKPOINT_MANIFEST_VERSION
+    ) || manifest.scope_id != config.scope_id
     {
         return Err(RuntimeError::CheckpointScopeMismatch);
     }
@@ -394,6 +415,7 @@ fn recover_projection(
     config: &RuntimeConfig,
     manifest: Option<&CheckpointManifest>,
     records: &[PersistedEvent],
+    wal_anchors: &[WalCheckpointAnchor],
 ) -> Result<Projection, RuntimeError> {
     let last_wal_cursor = records.last().map_or(0, |record| record.event.cursor);
     if let Some(manifest) = manifest {
@@ -402,7 +424,14 @@ fn recover_projection(
                 continue;
             }
             if let Ok(checkpoint) = load_checkpoint_candidate(config, candidate)
-                && checkpoint_boundary_matches(config, &checkpoint, records)?
+                && checkpoint_boundary_matches(
+                    config,
+                    manifest.schema_version.as_str(),
+                    candidate,
+                    &checkpoint,
+                    records,
+                    wal_anchors,
+                )?
             {
                 return Ok(replay_after_checkpoint(checkpoint, records)?);
             }
@@ -442,8 +471,11 @@ fn load_checkpoint_candidate(
 
 fn checkpoint_boundary_matches(
     config: &RuntimeConfig,
+    manifest_schema_version: &str,
+    reference: &CheckpointReference,
     checkpoint: &Projection,
     records: &[PersistedEvent],
+    wal_anchors: &[WalCheckpointAnchor],
 ) -> Result<bool, RuntimeError> {
     let boundary = records.partition_point(|record| record.event.cursor <= checkpoint.cursor);
     if checkpoint.cursor > 0
@@ -453,6 +485,20 @@ fn checkpoint_boundary_matches(
             != Some(checkpoint.cursor)
     {
         return Err(RuntimeError::CheckpointBeyondWal);
+    }
+    if manifest_schema_version == CHECKPOINT_MANIFEST_VERSION {
+        let Some(segment_first_cursor) = reference.wal_anchor_segment_first_cursor else {
+            return Ok(false);
+        };
+        let Some(segment_header_sha256) = &reference.wal_anchor_segment_header_sha256 else {
+            return Ok(false);
+        };
+        return Ok(wal_anchors.iter().any(|anchor| {
+            anchor.checkpoint_cursor == checkpoint.cursor
+                && anchor.checkpoint_sha256 == reference.projection_sha256
+                && anchor.segment_first_cursor == segment_first_cursor
+                && anchor.segment_header_sha256 == *segment_header_sha256
+        }));
     }
     let rebuilt = replay_after_checkpoint(
         Projection::bootstrap(config.scope_id.clone()),
@@ -511,7 +557,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
         runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
-        runtime.checkpoint().unwrap();
+        let manifest = runtime.checkpoint().unwrap();
+        assert_eq!(manifest.schema_version, CHECKPOINT_MANIFEST_VERSION);
+        assert_eq!(manifest.current.wal_anchor_segment_first_cursor, Some(2));
+        assert!(
+            manifest
+                .current
+                .wal_anchor_segment_header_sha256
+                .as_ref()
+                .is_some_and(|hash| hash.len() == 64)
+        );
+        assert_eq!(runtime.projection().cursor, 1);
         runtime
             .apply_raw(
                 serde_json::json!({

@@ -1,0 +1,38 @@
+{
+  "schema_version": "marketcow.polymarket.restart-readiness-gate.v1",
+  "verdict": "failed",
+  "checked_at": "2026-08-29T17:49:08+08:00",
+  "deadline_seconds": 300,
+  "observed_elapsed_seconds": 322,
+  "runtime": {
+    "launchd_label": "com.marketcow.rust-polymarket-dynamic-d8effd9-shadow-v9",
+    "pid": 63875,
+    "commit": "d8effd947a2eba117b63e224335cd19a364c21d4",
+    "binary_sha256": "775c1d2dbe92be932358b1272ac88aec678d1277486b84a99c32e826aa3fdc94",
+    "real_order_submission_enabled": false
+  },
+  "gates": {
+    "process_running": true,
+    "launchd_runs": 1,
+    "http_scope_status": 0,
+    "http_listener_ready": false,
+    "marketcowd_ready_log_observed": false,
+    "cpu_percent_at_deadline": 98.4
+  },
+  "checkpoint": {
+    "cursor": 1300843,
+    "projection_sha256": "2fde1f6592e2cca03870a220a0c070e7ef8589772ad9d1b92cca4d5d53fc08bc",
+    "previous_cursor": 1299910,
+    "wal_last_cursor": 1300843
+  },
+  "diagnosis": {
+    "stage": "restart checkpoint semantic boundary verification",
+    "sample_stack": [
+      "marketcow_runtime::PolymarketRuntime::open",
+      "marketcow_runtime::recover_projection",
+      "marketcow_core::replay_after_checkpoint",
+      "marketcow_core::SingleWriter::evaluate_event"
+    ],
+    "summary": "Startup replays the full authoritative history to prove checkpoint semantic equivalence; the candidate-fork optimization does not change this independent restart path."
+  }
+}

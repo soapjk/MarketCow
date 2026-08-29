@@ -777,6 +777,13 @@ impl<L: DurableLog> SingleWriter<L> {
         self.current.load_full()
     }
 
+    /// Grants the runtime access to durability operations that do not publish market state.
+    /// This is intentionally mutable so an implementation can establish a durable checkpoint
+    /// boundary before the checkpoint manifest becomes visible.
+    pub fn durable_log_mut(&mut self) -> &mut L {
+        &mut self.log
+    }
+
     pub fn resume(projection: Projection, log: L) -> Result<Self, CoreError> {
         if projection.cursor != projection.persisted_cursor {
             return Err(CoreError::PersistedWatermarkMismatch);
@@ -1374,6 +1381,21 @@ pub struct SegmentedWal {
     current_path: Option<PathBuf>,
     file: Option<File>,
     bytes: u64,
+    segment_has_records: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalCheckpointAnchor {
+    pub checkpoint_cursor: u64,
+    pub checkpoint_sha256: String,
+    pub segment_first_cursor: u64,
+    pub segment_header_sha256: String,
+}
+
+#[derive(Debug)]
+pub struct VerifiedSegmentedWal {
+    pub records: Vec<PersistedEvent>,
+    pub checkpoint_anchors: Vec<WalCheckpointAnchor>,
 }
 
 impl SegmentedWal {
@@ -1390,6 +1412,16 @@ impl SegmentedWal {
     /// method. This avoids parsing the entire authoritative history a second time while
     /// preparing an isolated hot-switch candidate.
     pub fn open_verified_copy(
+        root: impl AsRef<Path>,
+        stream_id: &str,
+        max_segment_bytes: u64,
+    ) -> Result<Self, CoreError> {
+        Self::open_after_verification(root, stream_id, max_segment_bytes)
+    }
+
+    /// Opens a WAL immediately after the caller verified the same root. This avoids a redundant
+    /// full parse during single-threaded startup while retaining `open` as the safe default.
+    pub fn open_after_verification(
         root: impl AsRef<Path>,
         stream_id: &str,
         max_segment_bytes: u64,
@@ -1411,26 +1443,34 @@ impl SegmentedWal {
         }
         fs::create_dir_all(root)?;
         let mut paths = wal_paths(root)?;
-        let (segment_first_cursor, current_path, file, bytes) = match paths.pop() {
-            Some(path) => {
-                // Refuse to append to an unverified chain or a different stream.
-                if verify_chain {
-                    Self::verify(root)?;
+        let (segment_first_cursor, current_path, file, bytes, segment_has_records) =
+            match paths.pop() {
+                Some(path) => {
+                    // Refuse to append to an unverified chain or a different stream.
+                    if verify_chain {
+                        Self::verify(root)?;
+                    }
+                    let header = read_wal_header(&path)?;
+                    if header.get("stream_id").and_then(|value| value.as_str()) != Some(stream_id) {
+                        return Err(CoreError::WalStreamMismatch);
+                    }
+                    let first_cursor = header
+                        .get("first_cursor")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or(CoreError::CorruptWal)?;
+                    let bytes = fs::metadata(&path)?.len();
+                    let header_bytes = serde_json::to_vec(&header)?.len() as u64 + 1;
+                    let file = OpenOptions::new().append(true).open(&path)?;
+                    (
+                        Some(first_cursor),
+                        Some(path),
+                        Some(file),
+                        bytes,
+                        bytes > header_bytes,
+                    )
                 }
-                let header = read_wal_header(&path)?;
-                if header.get("stream_id").and_then(|value| value.as_str()) != Some(stream_id) {
-                    return Err(CoreError::WalStreamMismatch);
-                }
-                let first_cursor = header
-                    .get("first_cursor")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or(CoreError::CorruptWal)?;
-                let bytes = fs::metadata(&path)?.len();
-                let file = OpenOptions::new().append(true).open(&path)?;
-                (Some(first_cursor), Some(path), Some(file), bytes)
-            }
-            None => (None, None, None, 0),
-        };
+                None => (None, None, None, 0, false),
+            };
         Ok(Self {
             root: root.into(),
             stream_id: stream_id.into(),
@@ -1439,10 +1479,20 @@ impl SegmentedWal {
             current_path,
             file,
             bytes,
+            segment_has_records,
         })
     }
 
     fn rotate(&mut self, cursor: u64) -> Result<(), CoreError> {
+        self.rotate_with_checkpoint_anchor(cursor, None)?;
+        Ok(())
+    }
+
+    fn rotate_with_checkpoint_anchor(
+        &mut self,
+        cursor: u64,
+        checkpoint: Option<(u64, &str)>,
+    ) -> Result<WalCheckpointAnchor, CoreError> {
         if let Some(file) = &mut self.file {
             file.sync_all()?;
         }
@@ -1453,14 +1503,19 @@ impl SegmentedWal {
         let path = self
             .root
             .join(format!("{}-{cursor:020}.wal", self.stream_id));
+        let mut header = serde_json::json!({"magic":"MCWAL1","wal_version":1,
+            "stream_id":self.stream_id,"first_cursor":cursor,
+            "previous_segment_sha256":previous_segment_sha256});
+        if let Some((checkpoint_cursor, checkpoint_sha256)) = checkpoint {
+            header["checkpoint_cursor"] = serde_json::json!(checkpoint_cursor);
+            header["checkpoint_sha256"] = serde_json::json!(checkpoint_sha256);
+        }
+        let line = serde_json::to_vec(&header)?;
+        let segment_header_sha256 = hex::encode(Sha256::digest(&line));
         let mut file = OpenOptions::new()
             .create_new(true)
             .append(true)
             .open(&path)?;
-        let header = serde_json::json!({"magic":"MCWAL1","wal_version":1,
-            "stream_id":self.stream_id,"first_cursor":cursor,
-            "previous_segment_sha256":previous_segment_sha256});
-        let line = serde_json::to_vec(&header)?;
         file.write_all(&line)?;
         file.write_all(b"\n")?;
         file.sync_data()?;
@@ -1468,7 +1523,62 @@ impl SegmentedWal {
         self.segment_first_cursor = Some(cursor);
         self.current_path = Some(path);
         self.file = Some(file);
-        Ok(())
+        self.segment_has_records = false;
+        Ok(WalCheckpointAnchor {
+            checkpoint_cursor: checkpoint.map_or(0, |value| value.0),
+            checkpoint_sha256: checkpoint.map_or_else(String::new, |value| value.1.into()),
+            segment_first_cursor: cursor,
+            segment_header_sha256,
+        })
+    }
+
+    /// Starts the next WAL segment with a checkpoint hash in its immutable header. The anchor
+    /// consumes no public cursor, so downstream market streams remain contiguous. Later segment
+    /// hashes chain this header into the append-only WAL.
+    pub fn anchor_checkpoint(
+        &mut self,
+        checkpoint_cursor: u64,
+        checkpoint_sha256: &str,
+    ) -> Result<WalCheckpointAnchor, CoreError> {
+        if checkpoint_sha256.len() != 64
+            || !checkpoint_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(CoreError::CheckpointHash);
+        }
+        let next_cursor = checkpoint_cursor
+            .checked_add(1)
+            .ok_or(CoreError::CorruptWal)?;
+        if let Some(path) = &self.current_path {
+            let header = read_wal_header(path)?;
+            let bytes = serde_json::to_vec(&header)?;
+            if header
+                .get("first_cursor")
+                .and_then(serde_json::Value::as_u64)
+                == Some(next_cursor)
+                && header
+                    .get("checkpoint_cursor")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(checkpoint_cursor)
+                && header
+                    .get("checkpoint_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(checkpoint_sha256)
+                && fs::metadata(path)?.len() == u64::try_from(bytes.len() + 1).unwrap_or(u64::MAX)
+            {
+                return Ok(WalCheckpointAnchor {
+                    checkpoint_cursor,
+                    checkpoint_sha256: checkpoint_sha256.into(),
+                    segment_first_cursor: next_cursor,
+                    segment_header_sha256: hex::encode(Sha256::digest(bytes)),
+                });
+            }
+        }
+        self.rotate_with_checkpoint_anchor(
+            next_cursor,
+            Some((checkpoint_cursor, checkpoint_sha256)),
+        )
     }
 
     fn write_outcome_without_final_sync(
@@ -1483,19 +1593,28 @@ impl SegmentedWal {
             payload: outcome.clone(),
         };
         let line = serde_json::to_vec(&record)?;
-        if self.file.is_none() || self.bytes + line.len() as u64 + 1 > self.max_segment_bytes {
+        if self.file.is_none()
+            || self.segment_has_records
+                && self.bytes + line.len() as u64 + 1 > self.max_segment_bytes
+        {
             self.rotate(outcome.event.cursor)?;
         }
         let file = self.file.as_mut().expect("rotated");
         file.write_all(&line)?;
         file.write_all(b"\n")?;
         self.bytes += line.len() as u64 + 1;
+        self.segment_has_records = true;
         Ok(())
     }
 
     pub fn verify(root: impl AsRef<Path>) -> Result<Vec<PersistedEvent>, CoreError> {
+        Ok(Self::verify_with_anchors(root)?.records)
+    }
+
+    pub fn verify_with_anchors(root: impl AsRef<Path>) -> Result<VerifiedSegmentedWal, CoreError> {
         let paths = wal_paths(root.as_ref())?;
         let mut output = Vec::new();
+        let mut checkpoint_anchors = Vec::new();
         let mut previous_segment_sha256: Option<String> = None;
         let mut stream_id: Option<String> = None;
         for path in paths {
@@ -1518,6 +1637,37 @@ impl SegmentedWal {
                 .map(str::to_owned);
             if actual_previous != previous_segment_sha256 {
                 return Err(CoreError::CorruptWal);
+            }
+            match (
+                header.get("checkpoint_cursor"),
+                header.get("checkpoint_sha256"),
+            ) {
+                (Some(cursor), Some(checkpoint_sha256)) => {
+                    let checkpoint_cursor = cursor.as_u64().ok_or(CoreError::CorruptWal)?;
+                    let checkpoint_sha256 = checkpoint_sha256
+                        .as_str()
+                        .filter(|hash| {
+                            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                        .ok_or(CoreError::CorruptWal)?;
+                    let segment_first_cursor = header
+                        .get("first_cursor")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or(CoreError::CorruptWal)?;
+                    if checkpoint_cursor.checked_add(1) != Some(segment_first_cursor) {
+                        return Err(CoreError::CorruptWal);
+                    }
+                    checkpoint_anchors.push(WalCheckpointAnchor {
+                        checkpoint_cursor,
+                        checkpoint_sha256: checkpoint_sha256.into(),
+                        segment_first_cursor,
+                        segment_header_sha256: hex::encode(Sha256::digest(serde_json::to_vec(
+                            &header,
+                        )?)),
+                    });
+                }
+                (None, None) => {}
+                _ => return Err(CoreError::CorruptWal),
             }
             for line in lines {
                 let value: serde_json::Value = serde_json::from_str(&line?)?;
@@ -1581,7 +1731,10 @@ impl SegmentedWal {
             }
             previous_segment_sha256 = Some(hex::encode(Sha256::digest(fs::read(path)?)));
         }
-        Ok(output)
+        Ok(VerifiedSegmentedWal {
+            records: output,
+            checkpoint_anchors,
+        })
     }
 }
 
@@ -1652,7 +1805,10 @@ impl DurableLog for SegmentedWal {
             payloads,
         };
         let line = serde_json::to_vec(&record)?;
-        if self.file.is_none() || self.bytes + line.len() as u64 + 1 > self.max_segment_bytes {
+        if self.file.is_none()
+            || self.segment_has_records
+                && self.bytes + line.len() as u64 + 1 > self.max_segment_bytes
+        {
             self.rotate(first.event.cursor)?;
         }
         let file = self.file.as_mut().expect("rotated");
@@ -1660,6 +1816,7 @@ impl DurableLog for SegmentedWal {
         file.write_all(b"\n")?;
         file.sync_data()?;
         self.bytes += line.len() as u64 + 1;
+        self.segment_has_records = true;
         Ok(())
     }
 }
