@@ -2681,7 +2681,7 @@ async fn serve() -> Result<()> {
     ))?;
     seed_polymarket_scope_catalog(&mut runtime, config.polymarket_live.as_ref())?;
     let projection = runtime.projection();
-    let recent_events = runtime.recent_events().iter().cloned().collect();
+    let recent_events = clone_polymarket_recent_events(&runtime);
     let jobs = Arc::new(
         DurableJobCoordinator::open(
             &config.profile,
@@ -5735,7 +5735,7 @@ async fn admin_checkpoint(
             state.projection.store(runtime.projection());
             state
                 .recent_events
-                .store(Arc::new(runtime.recent_events().iter().cloned().collect()));
+                .store(Arc::new(clone_polymarket_recent_events(&runtime)));
             Json(json!({
                 "status":"checkpoint_written",
                 "cursor":manifest.current.cursor,
@@ -5813,7 +5813,7 @@ async fn admin_shadow_ingest(
             state.projection.store(runtime.projection());
             state
                 .recent_events
-                .store(Arc::new(runtime.recent_events().iter().cloned().collect()));
+                .store(Arc::new(clone_polymarket_recent_events(&runtime)));
             let projection = runtime.projection();
             // Publication is deliberately last: every delivered frame is already WAL-persisted
             // and visible through the immutable projection/replay views.
