@@ -1,0 +1,168 @@
+{
+  "schema_version": "marketcow.polymarket.revision-2-live-gate.v1",
+  "generated_at": "2026-08-29T02:31:18Z",
+  "verdict": "passed",
+  "overall_migration_complete": false,
+  "collaboration_task_id": "3b45bb0e-0f48-4413-84bc-c3c928a387a1",
+  "runtime_identity": {
+    "commit": "62c8db4b9766a3b672cd617f6ec3b3200325963b",
+    "pid": 67255,
+    "process_start": "Sat Aug 29 10:21:58 2026",
+    "binary": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-62c8db4",
+    "binary_sha256": "73838d63d4b793706773105ec309d9a0215a597cf0341aad10d2ed74638c3a4c",
+    "launchd_label": "com.marketcow.rust-polymarket-62c8db4-shadow-v2",
+    "bind": "127.0.0.1:18872",
+    "storage_root": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage",
+    "process_log": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-62c8db4-18872.log",
+    "real_order_submission_enabled": false,
+    "lifecycle_owner": "launchd",
+    "tradude_manages_lifecycle": false
+  },
+  "scope_gate": {
+    "passed": true,
+    "schema_version": "marketcow.polymarket.scope-discovery.v2",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "scope_status": "ready",
+    "ready": true,
+    "market_count": 100,
+    "token_count": 200,
+    "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+    "real_order_submission_enabled": false,
+    "command": "curl --noproxy '*' http://127.0.0.1:18872/v1/prediction-markets/polymarket/live/scope"
+  },
+  "atomic_full_sync_gate": {
+    "passed": true,
+    "schema_version": "marketcow.polymarket.live.v2",
+    "boundary_cursor": 117529,
+    "projection_generation": 117529,
+    "snapshot_generation": 117529,
+    "published_cursor": 117529,
+    "persisted_cursor": 117529,
+    "checkpoint_cursor": 117529,
+    "market_count": 100,
+    "book_count": 200,
+    "unique_token_count": 200,
+    "negative_risk_relation_count": 4,
+    "missing_token_count": 0,
+    "tick_mismatch_token_count": 0,
+    "invalid_instrument_revision_count": 0,
+    "all_markets_active": true,
+    "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+    "projection_revision_contract": {
+      "projection_generation": 117529,
+      "checkpoint_state_sha256": "940a09b87fc5c4817001345d6612ec57845eef627b27ea4d3f91bc7d32bed2de",
+      "note": "live.v2 has no separate top-level projection_revision; the monotonic generation and checkpoint state SHA-256 are the non-null auditable projection identity"
+    },
+    "evidence": "/tmp/marketcow-r2-atomic-summary.json",
+    "command": "curl --noproxy '*' http://127.0.0.1:18872/v1/prediction-markets/polymarket/live/full-sync"
+  },
+  "websocket_gate": {
+    "passed": true,
+    "full_sync_boundary": 123375,
+    "subscription_boundary": 123375,
+    "event_cursors": [123376, 123377, 123378, 123379, 123380],
+    "protocol_version": "marketcow.market-stream.v1",
+    "mode": "resume",
+    "expired_cursor": {
+      "after_cursor": 0,
+      "frame_type": "resync_required",
+      "reason": "event_cursor_expired",
+      "retryable": true,
+      "close_code": 1008,
+      "close_reason": "full_sync_required"
+    },
+    "cursor_ahead": {
+      "http_status": 422,
+      "code": "stream_cursor_ahead_of_projection",
+      "retryable": false
+    },
+    "evidence": [
+      "/tmp/marketcow-r2-ws-live-boundary-corrected.json",
+      "/tmp/marketcow-r2-ws-expired.json",
+      "/tmp/marketcow-r2-ws-cursor-ahead.json"
+    ]
+  },
+  "recovery_gate": {
+    "passed": true,
+    "pre_restart_checkpoint_cursor": 113163,
+    "post_restart_checkpoint_cursor": 127734,
+    "post_restart_checkpoint_file": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket-scopes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34/checkpoints/00000000000000127734.json",
+    "checkpoint_file_sha256": "2380d03e4560b42e5ace99f98455ea9a41a466152467345f884cbadc1379fdb1",
+    "admin_projection_sha256": "2380d03e4560b42e5ace99f98455ea9a41a466152467345f884cbadc1379fdb1",
+    "wal": {
+      "file": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket-scopes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34/wal/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34-00000000000000000001.wal",
+      "magic": "MCWAL1",
+      "first_cursor": 1,
+      "observed_last_cursor": 130542,
+      "batch_count": 66312,
+      "payload_count": 130542,
+      "batch_versions": [2],
+      "gap_count": 0
+    },
+    "evidence": [
+      "/tmp/marketcow-r2-admin-checkpoint.json",
+      "/tmp/marketcow-r2-wal-chain.json"
+    ]
+  },
+  "failure_and_read_only_gate": {
+    "passed": true,
+    "http_event_cursor_expired": 410,
+    "http_invalid_event_limit": 422,
+    "read_only_probe_count": 14,
+    "read_only_probe_status": 404,
+    "real_order_submission_enabled": false,
+    "http_503_ready_false_gap_evidence": "workspace tests realtime_routes_fail_closed_until_projection_is_ready, rejected_event_is_returned_as_auditable_gap, and websocket_full_sync_live_publish_and_cursor_resume_are_contiguous",
+    "evidence": "/tmp/marketcow-r2-http-boundary.json"
+  },
+  "tests": {
+    "passed": true,
+    "clean_source_export": "/Volumes/T9/.marketcow-builds/tick-facts-staged.kkgjCE",
+    "cargo_target_dir": "/Volumes/T9/.marketcow-builds/cargo-target",
+    "workspace_test_command": "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/cargo-target cargo test --workspace",
+    "workspace_test_result": "115 passed, 0 failed, 5 ignored external PostgreSQL/ClickHouse tests",
+    "clippy_command": "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/cargo-target cargo clippy --workspace --all-targets -- -D warnings",
+    "clippy_result": "passed"
+  },
+  "preserved_tooling_failures": [
+    {
+      "tool": "scripts/verify_polymarket_exact_scope.py",
+      "result": "failed all three rounds with KeyError: cursor because the script expected a legacy top-level cursor/bootstrap shape",
+      "evidence": "/tmp/marketcow-r2-exact-scope.json"
+    },
+    {
+      "tool": "initial jq schema probe",
+      "result": "failed with null has no keys while probing the absent legacy bootstrap object"
+    },
+    {
+      "tool": "initial WebSocket probe",
+      "result": "failed because websockets auto-selected a system SOCKS proxy and python-socks was unavailable"
+    },
+    {
+      "tool": "second WebSocket proxy probe",
+      "result": "clearing process proxy environment was insufficient; explicit websockets proxy=None was required"
+    },
+    {
+      "tool": "first live-boundary predicate",
+      "result": "data were contiguous but the predicate incorrectly required live cursors not to exceed the subscription boundary; corrected evidence is separate",
+      "evidence": "/tmp/marketcow-r2-ws-live-boundary.json"
+    },
+    {
+      "tool": "first HTTP boundary probe",
+      "result": "failed by forcing a WebSocket handshake response through JSON decoding"
+    },
+    {
+      "tool": "first WAL chain probe",
+      "result": "did not start because the worktree UUID in workdir was mistyped"
+    },
+    {
+      "tool": "clean export Git identity probe",
+      "result": "failed because the intentionally clean source export contains no .git directory; commit and binary identity were verified in the bound worktree and installed binary"
+    }
+  ],
+  "safety": {
+    "marketcow_read_only": true,
+    "real_orders_disabled": true,
+    "tradude_lifecycle_management": false,
+    "overall_phase_0_to_7_migration_claimed_complete": false
+  }
+}
