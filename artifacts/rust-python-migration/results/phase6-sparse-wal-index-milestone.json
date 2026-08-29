@@ -1,0 +1,57 @@
+{
+  "schema_version": "marketcow.phase6.sparse-wal-index-milestone.v1",
+  "generated_at": "2026-08-29T06:45:00Z",
+  "passed": true,
+  "phase_complete": false,
+  "implementation_commit": "c603796",
+  "authoritative_plan_sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4",
+  "implemented": [
+    "Versioned marketcow.realtime.sparse-index.v1 contract with SHA-256 state binding.",
+    "Sparse entries bind first/last WAL cursor, segment id, byte offset and previous record SHA-256.",
+    "O(log n) nearest boundary lookup via partition_point, followed by mandatory authoritative WAL verification.",
+    "Atomic owner-only index replacement with file fsync, rename and directory fsync.",
+    "Missing or malformed derived index is rebuilt from the verified append-only WAL.",
+    "Index symlinks or unsafe file types/permissions are rejected instead of followed.",
+    "Index maintenance occurs only after the WAL batch sync barrier; an index persistence failure prevents memory publication and poisons the writer for deterministic restart."
+  ],
+  "verification": {
+    "targeted": {
+      "command": "cargo test -p marketcow-realtime sparse_index -- --nocapture",
+      "passed": 2,
+      "failed": 0,
+      "covered": [
+        "cursor 1 and cursor 1024 locate the correct indexed WAL batches",
+        "corrupt index content is rebuilt exactly from authoritative WAL",
+        "missing index is recreated",
+        "symlink index is rejected and target content is unchanged"
+      ]
+    },
+    "workspace": {
+      "command": "cargo test --workspace --all-targets",
+      "passed": 151,
+      "failed": 0,
+      "ignored_real_storage_environment_gates": 5
+    },
+    "clippy": {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "passed": true
+    }
+  },
+  "preserved_failures": [
+    "The first targeted test used a received-at fixture only 1000 ms after the base source timestamp; events 1001-1024 were correctly rejected as InvalidTimestamp. The fixture boundary was corrected to 10000 ms and the same gate passed.",
+    "The first full clippy run rejected a bool::then closure as unnecessary lazy evaluation. It was mechanically changed to then_some and the exact clippy command passed."
+  ],
+  "explicit_non_claims": [
+    "The index is currently verified or rebuilt after a full authoritative WAL integrity scan, so startup is not yet independent of total WAL history.",
+    "No compaction, archival rewrite, writer handoff or production cutover is enabled.",
+    "Phase 6 and the overall migration remain incomplete."
+  ],
+  "remaining": [
+    "bind the checkpoint and immutable segment-hash manifest to a safe index fast path so startup scans only the post-checkpoint tail",
+    "benchmark and fault-inject the fast path against large retained WAL history",
+    "run controlled Hyperliquid upstream recovery and sustained performance tests",
+    "connect LongPort owner-only UDS streaming and complete staged writer handoff"
+  ],
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}
