@@ -1,9 +1,25 @@
 //! Provider-neutral realtime normalization and replay primitives.
 //!
-//! This crate deliberately has no HTTP, database, socket, or async-runtime dependency. Venue
-//! adapters provide raw frames; the Rust owner validates exact decimals and source time before a
-//! single writer assigns the public stream sequence. Persistence remains an outer concern so an
-//! event cannot be published before its authoritative append succeeds.
+//! This crate deliberately has no HTTP or database dependency. Venue adapters provide raw frames;
+//! the Rust owner validates exact decimals and source time before its durable single writer assigns
+//! the public stream sequence. The writer owns append, sync, replay, and publication ordering so
+//! callers cannot publish before the authoritative append succeeds.
+
+mod durability;
+mod hub;
+mod longport;
+pub use durability::{
+    DurabilityError, DurableApplyOutcome, DurableRealtimeWriter, PersistedRealtimeEvent,
+    REALTIME_CHECKPOINT_VERSION, REALTIME_WAL_BATCH_VERSION, REALTIME_WAL_SEGMENT_VERSION,
+    REALTIME_WAL_VERSION, RealtimeCheckpoint, SegmentedRealtimeWal,
+};
+pub use hub::{
+    DurableRealtimeHub, REALTIME_HUB_PROJECTION_VERSION, RealtimeHubError, RealtimeHubHealth,
+    RealtimeHubProjection, RealtimeHubReader,
+};
+pub use longport::{
+    LONGPORT_BRIDGE_VERSION, LONGPORT_NORMALIZER_VERSION, LongPortBridgeNormalizer,
+};
 
 use chrono::{DateTime, TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -49,10 +65,39 @@ pub enum AggressorSide {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventQuality {
+    pub status: String,
+    pub delayed: bool,
+    pub stale: bool,
+    pub degraded: bool,
+}
+
+impl EventQuality {
+    fn live() -> Self {
+        Self {
+            status: "live".into(),
+            delayed: false,
+            stale: false,
+            degraded: false,
+        }
+    }
+
+    fn degraded() -> Self {
+        Self {
+            status: "degraded".into(),
+            delayed: false,
+            stale: false,
+            degraded: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookLevel {
     pub price: ExactDecimal,
     pub size: ExactDecimal,
     pub order_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub order_count: Option<u64>,
 }
 
@@ -66,6 +111,8 @@ pub enum ProviderPayload {
         bids: Vec<BookLevel>,
         asks: Vec<BookLevel>,
         ts_event_source: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_sequence: Option<u64>,
     },
     Quote {
         bid_price: ExactDecimal,
@@ -92,6 +139,20 @@ pub enum ProviderPayload {
         market_status: String,
         oracle_status: String,
     },
+    MarketState {
+        trade_status: String,
+        session: String,
+        tradable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_sequence: Option<u64>,
+        ts_event_source: String,
+    },
+    StreamStatus {
+        state: String,
+        reason_code: String,
+        last_sequence: Option<u64>,
+        resume_supported: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,37 +164,93 @@ pub struct NormalizedProviderEvent {
     pub source_observed_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
     pub raw_sha256: String,
+    pub normalizer_ordinal: u64,
     pub event_id: String,
+    pub quality: EventQuality,
     pub payload: ProviderPayload,
 }
 
+pub(crate) struct NormalizedEventMetadata<'a> {
+    pub source: &'a str,
+    pub normalizer_version: &'a str,
+    pub instrument_id: &'a str,
+    pub source_observed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub raw_sha256: &'a str,
+    pub ordinal: usize,
+    pub quality: EventQuality,
+}
+
 impl NormalizedProviderEvent {
-    fn new(
-        instrument_id: &str,
-        source_observed_at: DateTime<Utc>,
-        received_at: DateTime<Utc>,
-        raw_sha256: &str,
-        ordinal: usize,
-        payload: ProviderPayload,
-    ) -> Self {
+    fn new(metadata: NormalizedEventMetadata<'_>, payload: ProviderPayload) -> Self {
+        let NormalizedEventMetadata {
+            source,
+            normalizer_version,
+            instrument_id,
+            source_observed_at,
+            received_at,
+            raw_sha256,
+            ordinal,
+            quality,
+        } = metadata;
+        let normalizer_ordinal = u64::try_from(ordinal).expect("event ordinal fits into u64");
         let event_id = sha256(&serde_json::json!({
-            "normalizer": HYPERLIQUID_NORMALIZER_VERSION,
+            "normalizer": normalizer_version,
             "instrument_id": instrument_id,
             "source_observed_at": source_observed_at,
             "raw_sha256": raw_sha256,
-            "ordinal": ordinal,
+            "ordinal": normalizer_ordinal,
             "payload": payload,
         }));
         Self {
             contract_version: REALTIME_CONTRACT_VERSION.into(),
-            normalizer_version: HYPERLIQUID_NORMALIZER_VERSION.into(),
+            normalizer_version: normalizer_version.into(),
             instrument_id: instrument_id.into(),
-            source: "hyperliquid".into(),
+            source: source.into(),
             source_observed_at,
             received_at,
             raw_sha256: raw_sha256.into(),
+            normalizer_ordinal,
             event_id,
+            quality,
             payload,
+        }
+    }
+
+    pub(crate) fn evidence_is_valid(&self) -> bool {
+        let known_normalizer_source = matches!(
+            (self.normalizer_version.as_str(), self.source.as_str()),
+            (HYPERLIQUID_NORMALIZER_VERSION, "hyperliquid")
+                | (LONGPORT_NORMALIZER_VERSION, "longport")
+        );
+        self.contract_version == REALTIME_CONTRACT_VERSION
+            && known_normalizer_source
+            && !self.instrument_id.is_empty()
+            && valid_sha256_text(&self.raw_sha256)
+            && self.received_at >= self.source_observed_at
+            && self.event_id
+                == sha256(&serde_json::json!({
+                    "normalizer": self.normalizer_version,
+                    "instrument_id": self.instrument_id,
+                    "source_observed_at": self.source_observed_at,
+                    "raw_sha256": self.raw_sha256,
+                    "ordinal": self.normalizer_ordinal,
+                    "payload": self.payload,
+                }))
+            && self.quality_is_valid()
+    }
+
+    fn quality_is_valid(&self) -> bool {
+        let live = self.quality == EventQuality::live();
+        let degraded = self.quality == EventQuality::degraded();
+        match (&self.source[..], &self.payload) {
+            ("hyperliquid", _) => live,
+            ("longport", ProviderPayload::Quote { .. }) => degraded,
+            ("longport", ProviderPayload::StreamStatus { state, .. }) => {
+                (state == "live" && live) || (state == "degraded" && degraded)
+            }
+            ("longport", _) => live,
+            _ => false,
         }
     }
 
@@ -143,6 +260,8 @@ impl NormalizedProviderEvent {
             ProviderPayload::Quote { .. } => DataType::Quote,
             ProviderPayload::Trade { .. } => DataType::Trade,
             ProviderPayload::AssetContext { .. } => DataType::AssetContext,
+            ProviderPayload::MarketState { .. } => DataType::MarketState,
+            ProviderPayload::StreamStatus { .. } => DataType::StreamStatus,
         }
     }
 
@@ -154,19 +273,39 @@ impl NormalizedProviderEvent {
             ProviderPayload::Quote { .. } => ("quote", &self.payload),
             ProviderPayload::Trade { .. } => ("trade", &self.payload),
             ProviderPayload::AssetContext { .. } => ("asset_context", &self.payload),
+            ProviderPayload::MarketState { .. } => ("market_state", &self.payload),
+            ProviderPayload::StreamStatus { .. } => ("stream_status", &self.payload),
         };
         let serialized = serde_json::to_value(payload).expect("typed provider payload serializes");
         let payload = serialized
             .get("payload")
             .cloned()
             .expect("internally-tagged provider payload has content");
-        serde_json::json!({
+        let mut output = serde_json::json!({
             "event_type":event_type,
-            "instrument_id":self.instrument_id,
             "source":self.source,
             "ts_event":python_iso(self.source_observed_at),
             "payload":payload,
-        })
+        });
+        if !matches!(&self.payload, ProviderPayload::StreamStatus { .. }) {
+            output
+                .as_object_mut()
+                .expect("public event is an object")
+                .insert(
+                    "instrument_id".into(),
+                    Value::String(self.instrument_id.clone()),
+                );
+        }
+        if self.quality.degraded {
+            output
+                .as_object_mut()
+                .expect("public event is an object")
+                .insert(
+                    "quality".into(),
+                    serde_json::to_value(&self.quality).expect("quality serializes"),
+                );
+        }
+        output
     }
 }
 
@@ -272,11 +411,16 @@ impl HyperliquidNormalizer {
             "L1_MBP"
         };
         let mut events = vec![NormalizedProviderEvent::new(
-            instrument_id,
-            observed_at,
-            received_at,
-            raw_sha256,
-            0,
+            NormalizedEventMetadata {
+                source: "hyperliquid",
+                normalizer_version: HYPERLIQUID_NORMALIZER_VERSION,
+                instrument_id,
+                source_observed_at: observed_at,
+                received_at,
+                raw_sha256,
+                ordinal: 0,
+                quality: EventQuality::live(),
+            },
             ProviderPayload::OrderBookSnapshot {
                 book_type: book_type.into(),
                 depth,
@@ -284,15 +428,21 @@ impl HyperliquidNormalizer {
                 bids: bids.clone(),
                 asks: asks.clone(),
                 ts_event_source: "provider".into(),
+                provider_sequence: None,
             },
         )];
         if let Some((bid, ask)) = bids.first().zip(asks.first()) {
             events.push(NormalizedProviderEvent::new(
-                instrument_id,
-                observed_at,
-                received_at,
-                raw_sha256,
-                1,
+                NormalizedEventMetadata {
+                    source: "hyperliquid",
+                    normalizer_version: HYPERLIQUID_NORMALIZER_VERSION,
+                    instrument_id,
+                    source_observed_at: observed_at,
+                    received_at,
+                    raw_sha256,
+                    ordinal: 1,
+                    quality: EventQuality::live(),
+                },
                 ProviderPayload::Quote {
                     bid_price: bid.price.clone(),
                     ask_price: ask.price.clone(),
@@ -343,11 +493,16 @@ impl HyperliquidNormalizer {
                     _ => return Err(RealtimeError::InvalidPayload),
                 };
                 Ok(NormalizedProviderEvent::new(
-                    instrument_id,
-                    observed_at,
-                    received_at,
-                    raw_sha256,
-                    ordinal,
+                    NormalizedEventMetadata {
+                        source: "hyperliquid",
+                        normalizer_version: HYPERLIQUID_NORMALIZER_VERSION,
+                        instrument_id,
+                        source_observed_at: observed_at,
+                        received_at,
+                        raw_sha256,
+                        ordinal,
+                        quality: EventQuality::live(),
+                    },
                     ProviderPayload::Trade {
                         price: ExactDecimal::positive(required(trade, "px")?)?,
                         size: ExactDecimal::positive(required(trade, "sz")?)?,
@@ -385,11 +540,16 @@ impl HyperliquidNormalizer {
             "unavailable"
         };
         Ok(vec![NormalizedProviderEvent::new(
-            instrument_id,
-            observed_at,
-            received_at,
-            raw_sha256,
-            0,
+            NormalizedEventMetadata {
+                source: "hyperliquid",
+                normalizer_version: HYPERLIQUID_NORMALIZER_VERSION,
+                instrument_id,
+                source_observed_at: observed_at,
+                received_at,
+                raw_sha256,
+                ordinal: 0,
+                quality: EventQuality::live(),
+            },
             ProviderPayload::AssetContext {
                 mark_price: optional_positive(context.get("markPx"))?,
                 oracle_price: oracle,
@@ -462,7 +622,11 @@ pub fn hyperliquid_subscriptions(
     mappings: &BTreeMap<String, String>,
     data_types: &BTreeSet<DataType>,
 ) -> Result<Vec<HyperliquidSubscription>, RealtimeError> {
-    if mappings.is_empty() || data_types.is_empty() {
+    if mappings.is_empty()
+        || data_types.is_empty()
+        || data_types.contains(&DataType::MarketState)
+        || data_types.contains(&DataType::StreamStatus)
+    {
         return Err(RealtimeError::InvalidConfig);
     }
     let wants_book =
@@ -841,7 +1005,7 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    fn reason_code(&self) -> &'static str {
+    pub fn reason_code(&self) -> &'static str {
         match self {
             Self::InvalidConfig => "invalid_config",
             Self::ConnectTimeout => "connect_timeout",
@@ -869,6 +1033,8 @@ pub enum DataType {
     Trade,
     OrderBook,
     AssetContext,
+    MarketState,
+    StreamStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -892,14 +1058,16 @@ pub struct SubscriptionFilter {
 }
 
 impl SubscriptionFilter {
-    fn matches(&self, event: &NormalizedProviderEvent) -> bool {
+    pub fn matches(&self, event: &NormalizedProviderEvent) -> bool {
         self.instruments.contains(&event.instrument_id)
-            && self.data_types.contains(&event.data_type())
+            && (matches!(&event.payload, ProviderPayload::StreamStatus { .. })
+                || self.data_types.contains(&event.data_type()))
     }
 }
 
-/// Single-writer sequence and bounded replay state. Callers must durably append the normalized
-/// event before `publish`; rejected/duplicate events never consume a public sequence.
+/// In-memory sequence and bounded replay state owned by `DurableRealtimeWriter`. Its mutation API
+/// is crate-private so a caller cannot bypass the append-and-sync boundary. Rejected/duplicate
+/// decisions never consume a public sequence.
 #[derive(Debug)]
 pub struct SequencedReplay {
     stream_id: String,
@@ -929,21 +1097,24 @@ impl SequencedReplay {
         })
     }
 
-    pub fn publish(
+    pub(crate) fn commit_persisted(
         &mut self,
         event: NormalizedProviderEvent,
-        authoritative_append_succeeded: bool,
-    ) -> Result<Option<StreamEvent>, RealtimeError> {
-        if !authoritative_append_succeeded {
-            return Err(RealtimeError::PersistenceUnavailable);
-        }
+        sequence: u64,
+    ) -> Result<StreamEvent, RealtimeError> {
         if self.recent_event_ids.contains(&event.event_id) {
-            return Ok(None);
+            return Err(RealtimeError::DuplicateCommit);
         }
-        let sequence = self
+        let expected = self
             .sequence
             .checked_add(1)
             .ok_or(RealtimeError::SequenceOverflow)?;
+        if sequence != expected {
+            return Err(RealtimeError::SequenceMismatch {
+                expected,
+                actual: sequence,
+            });
+        }
         let stream = StreamEvent {
             stream_id: self.stream_id.clone(),
             sequence,
@@ -960,7 +1131,57 @@ impl SequencedReplay {
                 self.recent_event_ids.remove(&event_id);
             }
         }
-        Ok(Some(stream))
+        Ok(stream)
+    }
+
+    pub(crate) fn snapshot(&self) -> (String, usize, u64, Vec<StreamEvent>) {
+        (
+            self.stream_id.clone(),
+            self.replay_capacity,
+            self.sequence,
+            self.replay.iter().cloned().collect(),
+        )
+    }
+
+    pub(crate) fn restore_tail(
+        stream_id: String,
+        replay_capacity: usize,
+        sequence: u64,
+        events: Vec<StreamEvent>,
+    ) -> Result<Self, RealtimeError> {
+        if events.len() > replay_capacity
+            || events
+                .last()
+                .map_or(sequence != 0, |event| event.sequence != sequence)
+            || events.windows(2).any(|pair| {
+                pair[0].sequence.checked_add(1) != Some(pair[1].sequence)
+                    || pair[0].stream_id != stream_id
+                    || pair[1].stream_id != stream_id
+            })
+            || events
+                .first()
+                .is_some_and(|event| event.stream_id != stream_id || event.sequence == 0)
+        {
+            return Err(RealtimeError::InvalidReplaySnapshot);
+        }
+        let recent_event_ids = events
+            .iter()
+            .map(|event| event.event.event_id.clone())
+            .collect::<BTreeSet<_>>();
+        if recent_event_ids.len() != events.len() {
+            return Err(RealtimeError::InvalidReplaySnapshot);
+        }
+        Ok(Self {
+            stream_id,
+            replay_capacity,
+            sequence,
+            recent_event_order: events
+                .iter()
+                .map(|event| event.event.event_id.clone())
+                .collect(),
+            recent_event_ids,
+            replay: events.into(),
+        })
     }
 
     pub fn replay_after(
@@ -971,6 +1192,11 @@ impl SequencedReplay {
     ) -> Result<Vec<ReplayFrame>, RealtimeError> {
         if stream_id != self.stream_id {
             return Err(RealtimeError::StreamChanged);
+        }
+        if after > self.sequence {
+            return Err(RealtimeError::CursorAhead {
+                current_sequence: self.sequence,
+            });
         }
         let earliest = self
             .replay
@@ -1033,14 +1259,20 @@ pub enum RealtimeError {
     BookTooDeep,
     #[error("provider batch is empty")]
     EmptyBatch,
-    #[error("authoritative event append failed")]
-    PersistenceUnavailable,
     #[error("stream identity changed; full sync is required")]
     StreamChanged,
+    #[error("consumer cursor is ahead of current sequence {current_sequence}")]
+    CursorAhead { current_sequence: u64 },
     #[error("replay gap is unrecoverable; earliest sequence is {earliest_sequence}")]
     GapUnrecoverable { earliest_sequence: u64 },
     #[error("stream sequence overflow")]
     SequenceOverflow,
+    #[error("persisted event duplicates current replay state")]
+    DuplicateCommit,
+    #[error("persisted sequence mismatch: expected {expected}, got {actual}")]
+    SequenceMismatch { expected: u64, actual: u64 },
+    #[error("replay snapshot is invalid")]
+    InvalidReplaySnapshot,
 }
 
 fn required<'a>(
@@ -1200,6 +1432,13 @@ fn sha256(value: &Value) -> String {
     hex::encode(Sha256::digest(
         serde_json::to_vec(value).expect("JSON values are serializable"),
     ))
+}
+
+fn valid_sha256_text(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn python_iso(value: DateTime<Utc>) -> String {
@@ -1391,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_failure_and_duplicates_do_not_consume_sequence() {
+    fn replay_state_rejects_duplicate_commit_without_consuming_sequence() {
         let event = normalizer()
             .normalize(
                 json!({
@@ -1405,19 +1644,13 @@ mod tests {
             .remove(0);
         let mut replay = SequencedReplay::new("stream-1", 2).unwrap();
         assert_eq!(
-            replay.publish(event.clone(), false).unwrap_err(),
-            RealtimeError::PersistenceUnavailable
-        );
-        assert_eq!(replay.sequence(), 0);
-        assert_eq!(
-            replay
-                .publish(event.clone(), true)
-                .unwrap()
-                .unwrap()
-                .sequence,
+            replay.commit_persisted(event.clone(), 1).unwrap().sequence,
             1
         );
-        assert!(replay.publish(event, true).unwrap().is_none());
+        assert_eq!(
+            replay.commit_persisted(event, 2).unwrap_err(),
+            RealtimeError::DuplicateCommit
+        );
         assert_eq!(replay.sequence(), 1);
     }
 
@@ -1440,7 +1673,8 @@ mod tests {
                 )
                 .unwrap()
                 .remove(0);
-            replay.publish(event, true).unwrap();
+            let sequence = replay.sequence().checked_add(1).unwrap();
+            replay.commit_persisted(event, sequence).unwrap();
         }
         let filter = SubscriptionFilter {
             instruments: BTreeSet::from(["OTHER.HYPL".into()]),

@@ -1,0 +1,148 @@
+{
+  "schema_version": "marketcow.longport.bridge-golden.v1",
+  "received_at": "2026-07-23T01:00:01Z",
+  "mappings": {
+    "AAPL.XNAS": "AAPL.US"
+  },
+  "cases": [
+    {
+      "name": "l1_depth_and_degraded_observation_quote",
+      "raw": {
+        "schema_version": "marketcow.longport.raw-push.v1",
+        "channel": "depth",
+        "symbol": "AAPL.US",
+        "observed_at": "2026-07-23T01:00:00Z",
+        "provider_sequence": 10,
+        "bids": [
+          {"price": "100.0000", "size": "2"}
+        ],
+        "asks": [
+          {"price": "101.0000", "size": "3"}
+        ]
+      },
+      "expected": [
+        {
+          "event_type": "order_book_snapshot",
+          "instrument_id": "AAPL.XNAS",
+          "source": "longport",
+          "ts_event": "2026-07-23T01:00:00Z",
+          "payload": {
+            "book_type": "L1_MBP",
+            "depth": 1,
+            "baseline_sequence": 0,
+            "bids": [
+              {"price": "100", "size": "2", "order_id": "0"}
+            ],
+            "asks": [
+              {"price": "101", "size": "3", "order_id": "0"}
+            ],
+            "ts_event_source": "marketcow_observation",
+            "provider_sequence": 10
+          }
+        },
+        {
+          "event_type": "quote",
+          "instrument_id": "AAPL.XNAS",
+          "source": "longport",
+          "ts_event": "2026-07-23T01:00:00Z",
+          "quality": {
+            "status": "degraded",
+            "delayed": false,
+            "stale": false,
+            "degraded": true
+          },
+          "payload": {
+            "bid_price": "100",
+            "ask_price": "101",
+            "bid_size": "2",
+            "ask_size": "3",
+            "ts_event_source": "marketcow_observation"
+          }
+        }
+      ]
+    },
+    {
+      "name": "provider_market_state",
+      "raw": {
+        "schema_version": "marketcow.longport.raw-push.v1",
+        "channel": "market_state",
+        "symbol": "AAPL.US",
+        "timestamp": "2026-07-23T01:00:00Z",
+        "provider_sequence": 11,
+        "trade_status": "Normal",
+        "trade_session": "Normal"
+      },
+      "expected": [
+        {
+          "event_type": "market_state",
+          "instrument_id": "AAPL.XNAS",
+          "source": "longport",
+          "ts_event": "2026-07-23T01:00:00Z",
+          "payload": {
+            "trade_status": "active",
+            "session": "regular",
+            "tradable": true,
+            "provider_sequence": 11,
+            "ts_event_source": "provider"
+          }
+        }
+      ]
+    },
+    {
+      "name": "regular_trade_and_disabled_overnight_audit",
+      "raw": {
+        "schema_version": "marketcow.longport.raw-push.v1",
+        "channel": "trades",
+        "symbol": "AAPL.US",
+        "trades": [
+          {
+            "timestamp": "2026-07-23T01:00:00Z",
+            "price": "100.5",
+            "volume": "4",
+            "direction": "Buy",
+            "trade_session": "Normal"
+          },
+          {
+            "timestamp": "2026-07-23T01:00:00Z",
+            "price": "100.5",
+            "volume": "4",
+            "direction": "Buy",
+            "trade_session": "Overnight"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "event_type": "trade",
+          "instrument_id": "AAPL.XNAS",
+          "source": "longport",
+          "ts_event": "2026-07-23T01:00:00Z",
+          "payload": {
+            "price": "100.5",
+            "size": "4",
+            "trade_id": "longport:c4264dd7b63b89cbf18fa4045b909a40e6b50eb2ab4e29ae337cd2a96f79d272",
+            "aggressor_side": "BUYER",
+            "session": "regular"
+          }
+        },
+        {
+          "event_type": "stream_status",
+          "source": "longport",
+          "ts_event": "2026-07-23T01:00:00Z",
+          "quality": {
+            "status": "degraded",
+            "delayed": false,
+            "stale": false,
+            "degraded": true
+          },
+          "payload": {
+            "state": "degraded",
+            "reason_code": "overnight_trade_rejected",
+            "last_sequence": null,
+            "resume_supported": true
+          }
+        }
+      ]
+    }
+  ]
+}

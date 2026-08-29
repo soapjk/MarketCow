@@ -24,6 +24,7 @@ marketcow-polymarket = { path = "../marketcow-polymarket" }
 marketcow-contracts = { path = "../marketcow-contracts" }
 marketcow-api = { path = "../marketcow-api" }
 marketcow-runtime = { path = "../marketcow-runtime" }
+marketcow-realtime = { path = "../marketcow-realtime" }
 marketcow-storage = { path = "../marketcow-storage" }
 serde.workspace = true
 serde_json.workspace = true

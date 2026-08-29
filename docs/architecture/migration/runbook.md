@@ -91,6 +91,36 @@ unavailability returns 503 instead of consulting SQLite. Missing symbols are ret
 per-item `unavailable` errors, while duplicate requested symbols remain duplicated in the response.
 The Rust quote writer remains disabled during this shadow milestone.
 
+## Hyperliquid Rust realtime shadow
+
+The Hyperliquid transport is disabled by default. To opt into a scoped shadow, provide an
+explicit canonical-instrument-to-provider-coin map; the endpoint remains fixed to the
+allow-listed `wss://api.hyperliquid.xyz/ws` and accepts no credentials:
+
+```text
+MARKETCOW_HYPERLIQUID_SHADOW_ENABLED=true
+MARKETCOW_HYPERLIQUID_INSTRUMENTS_JSON={"BTC-PERP.HYPL":"BTC"}
+MARKETCOW_HYPERLIQUID_MAX_SOURCE_DELAY_MILLIS=30000
+```
+
+Before binding the public Rust listener, `marketcowd` validates the mapping, opens the
+single-writer WAL under `<storage-root>/hyperliquid`, restores its checkpoint/replay state and
+starts the bounded Rust transport. One upstream frame is persisted and synced as one WAL batch
+before its immutable projection can advance. Transport, owner, gateway-backpressure or
+checkpoint failure becomes a non-resettable fail-closed state until a fresh process replays the
+WAL. Inspect the bounded `snapshot` and `events` endpoints under
+`/v1/market-data/providers/hyperliquid/shadow/`, its server-push-only `stream` WebSocket,
+`/v1/health`, `/v1/readiness`, and `marketcow_hyperliquid_*` metrics. Filtered replay emits
+sequence watermarks for non-matching events, preserving a contiguous cursor. Expired, ahead, or
+lagged cursors require resync and never skip silently. Transport, gateway, and public-channel
+depths are observable independently. When the opt-in is enabled, readiness requires the
+Hyperliquid hub to be `ready`; do not bypass that gate.
+
+This is shadow evidence only. It does not enable a writer cutover, does not submit orders, and
+does not authorize Tradude to start, stop, restart, or supervise MarketCow. LongPort remains an
+owner-only UDS typed raw-push bridge; it has no Python public listener and is not yet wired to the
+daemon streaming lifecycle.
+
 The supervisor deterministically assigns exactly one registered capability to each process
 and passes it as `--capability`. The Python worker rejects unknown capabilities before opening
 the UDS and advertises only its assigned capability during the nonce-bound handshake. Pool

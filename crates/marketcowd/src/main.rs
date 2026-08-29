@@ -51,6 +51,11 @@ const STREAM_CHANNEL_CAPACITY: usize = 256;
 // closed through `try_send` in the transport.
 const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 256;
 const POLYMARKET_TRANSPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
+const HYPERLIQUID_TRANSPORT_CHANNEL_CAPACITY: usize = 64;
+const HYPERLIQUID_GATEWAY_CHANNEL_CAPACITY: usize = 4_096;
+const HYPERLIQUID_PUBLIC_CHANNEL_CAPACITY: usize = 4_096;
+const HYPERLIQUID_REPLAY_CAPACITY: usize = 10_000;
+const HYPERLIQUID_WAL_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 const STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const STREAM_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 const MAX_WORKER_RESULT_BYTES: u64 = 16 * 1024 * 1024;
@@ -131,6 +136,7 @@ struct Config {
     legacy_mcp_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     polymarket_live: Option<PolymarketLiveConfig>,
+    hyperliquid_shadow: Option<HyperliquidShadowConfig>,
     python_workers: PythonWorkerConfig,
 }
 
@@ -177,6 +183,12 @@ struct PolymarketCatalogFrame {
     markets: Vec<marketcow_core::MarketRecord>,
     #[serde(default)]
     negative_risk_relations: Vec<marketcow_core::NegativeRiskRelation>,
+}
+
+#[derive(Clone, Serialize)]
+struct HyperliquidShadowConfig {
+    instruments: BTreeMap<String, String>,
+    maximum_source_delay_millis: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -392,6 +404,7 @@ impl Config {
             Err(error) => return Err(error.into()),
         };
         let polymarket_live = load_polymarket_live_config(&scope_id)?;
+        let hyperliquid_shadow = load_hyperliquid_shadow_config()?;
         let python_workers = PythonWorkerConfig::load()?;
         if orders {
             bail!("real order submission is prohibited by the migration safety gate");
@@ -425,6 +438,7 @@ impl Config {
             maximum_book_age_ms,
             legacy_mcp_url,
             polymarket_live,
+            hyperliquid_shadow,
             python_workers,
         })
     }
@@ -604,6 +618,38 @@ fn load_polymarket_scope_file_at(
     }))
 }
 
+fn load_hyperliquid_shadow_config() -> Result<Option<HyperliquidShadowConfig>> {
+    if env::var("MARKETCOW_HYPERLIQUID_SHADOW_ENABLED").as_deref() != Ok("true") {
+        return Ok(None);
+    }
+    let encoded = env::var("MARKETCOW_HYPERLIQUID_INSTRUMENTS_JSON")
+        .context("enabled Hyperliquid shadow requires MARKETCOW_HYPERLIQUID_INSTRUMENTS_JSON")?;
+    let instruments: BTreeMap<String, String> = serde_json::from_str(&encoded)
+        .context("MARKETCOW_HYPERLIQUID_INSTRUMENTS_JSON must be a JSON object")?;
+    let maximum_source_delay_millis = env::var("MARKETCOW_HYPERLIQUID_MAX_SOURCE_DELAY_MILLIS")
+        .unwrap_or_else(|_| "30000".into())
+        .parse::<i64>()?;
+    // Both constructors validate duplicate normalized coins, identifiers, and delay bounds. Build
+    // the subscription set here so an invalid scope fails before any public listener is bound.
+    marketcow_realtime::HyperliquidNormalizer::new(
+        instruments.clone(),
+        maximum_source_delay_millis,
+    )?;
+    marketcow_realtime::hyperliquid_subscriptions(
+        &instruments,
+        &BTreeSet::from([
+            marketcow_realtime::DataType::Quote,
+            marketcow_realtime::DataType::OrderBook,
+            marketcow_realtime::DataType::Trade,
+            marketcow_realtime::DataType::AssetContext,
+        ]),
+    )?;
+    Ok(Some(HyperliquidShadowConfig {
+        instruments,
+        maximum_source_delay_millis,
+    }))
+}
+
 fn validate_legacy_mcp_url(value: &str, public_bind: SocketAddr) -> Result<()> {
     let parsed = url::Url::parse(value).context("MARKETCOW_LEGACY_MCP_URL must be a URL")?;
     let host = parsed
@@ -668,6 +714,9 @@ struct AppState {
     canonical_cursor: Arc<CanonicalCursorSigner>,
     control_plane: Arc<ControlPlaneCoordinator>,
     stream: broadcast::Sender<marketcow_core::PersistedEvent>,
+    hyperliquid_shadow: Option<marketcow_realtime::RealtimeHubReader>,
+    hyperliquid_stream: Option<broadcast::Sender<marketcow_realtime::StreamEvent>>,
+    hyperliquid_queues: Option<HyperliquidQueueProbe>,
     worker_status: Arc<PythonWorkerStatus>,
     legacy_mcp: Option<LegacyMcpProxy>,
 }
@@ -2359,6 +2408,133 @@ async fn supervise_worker_pool(
     while slots.join_next().await.is_some() {}
 }
 
+struct HyperliquidShadowRuntime {
+    reader: marketcow_realtime::RealtimeHubReader,
+    stream: broadcast::Sender<marketcow_realtime::StreamEvent>,
+    queues: HyperliquidQueueProbe,
+    transport: tokio::task::JoinHandle<()>,
+    owner: tokio::task::JoinHandle<()>,
+    gateway: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct HyperliquidQueueProbe {
+    transport: mpsc::Sender<marketcow_realtime::TransportOutput>,
+    gateway: mpsc::Sender<marketcow_realtime::StreamEvent>,
+}
+
+impl HyperliquidQueueProbe {
+    fn transport_depth(&self) -> usize {
+        self.transport.max_capacity() - self.transport.capacity()
+    }
+
+    fn gateway_depth(&self) -> usize {
+        self.gateway.max_capacity() - self.gateway.capacity()
+    }
+}
+
+fn start_hyperliquid_shadow(
+    config: &Config,
+    config_revision: &str,
+    shutdown: watch::Receiver<bool>,
+) -> Result<Option<HyperliquidShadowRuntime>> {
+    let Some(shadow) = &config.hyperliquid_shadow else {
+        return Ok(None);
+    };
+    let data_types = BTreeSet::from([
+        marketcow_realtime::DataType::Quote,
+        marketcow_realtime::DataType::OrderBook,
+        marketcow_realtime::DataType::Trade,
+        marketcow_realtime::DataType::AssetContext,
+    ]);
+    let normalizer = marketcow_realtime::HyperliquidNormalizer::new(
+        shadow.instruments.clone(),
+        shadow.maximum_source_delay_millis,
+    )?;
+    let subscriptions =
+        marketcow_realtime::hyperliquid_subscriptions(&shadow.instruments, &data_types)?;
+    let mut hub = marketcow_realtime::DurableRealtimeHub::open(
+        config.storage_root.join("hyperliquid"),
+        "hyperliquid-main",
+        config_revision,
+        HYPERLIQUID_WAL_SEGMENT_BYTES,
+        HYPERLIQUID_REPLAY_CAPACITY,
+    )?;
+    let reader = hub.reader();
+    let (transport_tx, mut transport_rx) = mpsc::channel(HYPERLIQUID_TRANSPORT_CHANNEL_CAPACITY);
+    let (gateway_tx, mut gateway_rx) = mpsc::channel(HYPERLIQUID_GATEWAY_CHANNEL_CAPACITY);
+    let queues = HyperliquidQueueProbe {
+        transport: transport_tx.clone(),
+        gateway: gateway_tx.clone(),
+    };
+    let (public_stream, _) = broadcast::channel(HYPERLIQUID_PUBLIC_CHANNEL_CAPACITY);
+    let terminal_error = Arc::new(Mutex::new(None::<String>));
+    let terminal_for_transport = terminal_error.clone();
+    let transport = tokio::spawn(async move {
+        if let Err(error) = marketcow_realtime::run_hyperliquid_transport(
+            marketcow_realtime::HyperliquidTransportConfig::production(),
+            normalizer,
+            subscriptions,
+            transport_tx,
+            shutdown,
+        )
+        .await
+        {
+            warn!(error=%error, "hyperliquid_transport_failed_closed");
+            *terminal_for_transport
+                .lock()
+                .expect("terminal mutex poisoned") =
+                Some(format!("transport_{}", error.reason_code()));
+        }
+    });
+    let owner = tokio::task::spawn_blocking(move || {
+        let mut published_since_checkpoint = 0_usize;
+        while let Some(output) = transport_rx.blocking_recv() {
+            match hub.ingest(output, &gateway_tx) {
+                Ok(published) => {
+                    published_since_checkpoint += published;
+                    if published_since_checkpoint >= 1_000 {
+                        if let Err(error) = hub.checkpoint() {
+                            warn!(error=%error, "hyperliquid_checkpoint_failed_closed");
+                            hub.fail_closed("checkpoint_failed");
+                            return;
+                        }
+                        published_since_checkpoint = 0;
+                    }
+                }
+                Err(error) => {
+                    warn!(error=%error, "hyperliquid_owner_failed_closed");
+                    return;
+                }
+            }
+        }
+        if let Some(reason) = terminal_error
+            .lock()
+            .expect("terminal mutex poisoned")
+            .take()
+        {
+            hub.fail_closed(&reason);
+        } else if let Err(error) = hub.checkpoint() {
+            warn!(error=%error, "hyperliquid_shutdown_checkpoint_failed_closed");
+            hub.fail_closed("shutdown_checkpoint_failed");
+        }
+    });
+    let public_stream_for_gateway = public_stream.clone();
+    let gateway = tokio::spawn(async move {
+        while let Some(event) = gateway_rx.recv().await {
+            let _ = public_stream_for_gateway.send(event);
+        }
+    });
+    Ok(Some(HyperliquidShadowRuntime {
+        reader,
+        stream: public_stream,
+        queues,
+        transport,
+        owner,
+        gateway,
+    }))
+}
+
 fn start_polymarket_live(
     state: AppState,
     mut shutdown: watch::Receiver<bool>,
@@ -2760,6 +2936,11 @@ async fn serve() -> Result<()> {
     let market_data = Arc::new(MarketDataCoordinator::open(&config.profile).await?);
     let canonical_cursor = Arc::new(CanonicalCursorSigner::open(&config.storage_root)?);
     let (service_shutdown_tx, service_shutdown_rx) = watch::channel(false);
+    let hyperliquid = start_hyperliquid_shadow(
+        &config,
+        &control_plane.config_revision,
+        service_shutdown_rx.clone(),
+    )?;
     let legacy_mcp = config
         .legacy_mcp_url
         .clone()
@@ -2788,6 +2969,9 @@ async fn serve() -> Result<()> {
         canonical_cursor,
         control_plane,
         stream,
+        hyperliquid_shadow: hyperliquid.as_ref().map(|runtime| runtime.reader.clone()),
+        hyperliquid_stream: hyperliquid.as_ref().map(|runtime| runtime.stream.clone()),
+        hyperliquid_queues: hyperliquid.as_ref().map(|runtime| runtime.queues.clone()),
         worker_status: Arc::new(PythonWorkerStatus::default()),
         legacy_mcp,
     };
@@ -2836,6 +3020,20 @@ async fn serve() -> Result<()> {
     let _ = fs::remove_file(&config.worker_socket);
     if let Some(polymarket_live) = polymarket_live {
         let _ = polymarket_live.await;
+    }
+    if let Some(runtime) = hyperliquid {
+        let HyperliquidShadowRuntime {
+            reader: _,
+            stream: _,
+            queues,
+            transport,
+            owner,
+            gateway,
+        } = runtime;
+        drop(queues);
+        let _ = transport.await;
+        let _ = owner.await;
+        let _ = gateway.await;
     }
     info!("marketcowd_stopped");
     server_result?;
@@ -3166,6 +3364,18 @@ fn app(state: AppState) -> Router {
             get(live_full_sync),
         )
         .route("/v1/market-data/stream", get(market_data_stream))
+        .route(
+            "/v1/market-data/providers/hyperliquid/shadow/snapshot",
+            get(hyperliquid_shadow_snapshot),
+        )
+        .route(
+            "/v1/market-data/providers/hyperliquid/shadow/events",
+            get(hyperliquid_shadow_events),
+        )
+        .route(
+            "/v1/market-data/providers/hyperliquid/shadow/stream",
+            get(hyperliquid_shadow_stream),
+        )
         .route("/v1/instruments:resolve", get(resolve_instrument))
         .route(
             "/v1/instruments:resolve/query",
@@ -3221,8 +3431,18 @@ fn health_payload(state: &AppState) -> serde_json::Value {
     } else {
         "degraded"
     };
+    let hyperliquid_projection = state
+        .hyperliquid_shadow
+        .as_ref()
+        .map(marketcow_realtime::RealtimeHubReader::snapshot);
+    let hyperliquid_ready = hyperliquid_projection.as_ref().is_none_or(|projection| {
+        matches!(
+            projection.health,
+            marketcow_realtime::RealtimeHubHealth::Ready { .. }
+        )
+    });
     json!({
-        "status":"healthy", "service":"marketcowd", "profile":state.config.profile,
+        "status":if hyperliquid_ready { "healthy" } else { "degraded" }, "service":"marketcowd", "profile":state.config.profile,
         "shadow_mode":true, "real_order_submission_enabled":false,
         "mcp":{
             "enabled":true,
@@ -3232,6 +3452,19 @@ fn health_payload(state: &AppState) -> serde_json::Value {
         },
         "components":{
             "api":"healthy","wal":"healthy","python_workers":worker_health,
+            "hyperliquid_shadow":hyperliquid_projection.as_ref().map_or_else(
+                || json!({"enabled":false,"status":"disabled_optional"}),
+                |projection| json!({
+                    "enabled":true,
+                    "health":projection.health,
+                    "stream_id":projection.stream_id,
+                    "public_sequence":projection.public_sequence,
+                    "wal_cursor":projection.wal_cursor,
+                    "transport_queue_depth":state.hyperliquid_queues.as_ref().map_or(0, HyperliquidQueueProbe::transport_depth),
+                    "gateway_queue_depth":state.hyperliquid_queues.as_ref().map_or(0, HyperliquidQueueProbe::gateway_depth),
+                    "public_channel_depth":state.hyperliquid_stream.as_ref().map_or(0, broadcast::Sender::len)
+                })
+            ),
             "job_persistence":if state.jobs.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "instrument_persistence":if state.instruments.persistence_enabled() { "healthy" } else { "degraded_development_only" },
             "market_data_persistence":if state.market_data.persistence_enabled() { "healthy" } else { "degraded_development_only" },
@@ -3255,6 +3488,338 @@ fn health_payload(state: &AppState) -> serde_json::Value {
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(health_payload(&state))
+}
+
+async fn hyperliquid_shadow_snapshot(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+) -> Response {
+    match &state.hyperliquid_shadow {
+        Some(reader) => Json(reader.snapshot()).into_response(),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "hyperliquid_shadow_disabled",
+            false,
+            &request_id,
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HyperliquidEventQuery {
+    after_sequence: Option<u64>,
+    #[serde(default = "default_event_limit")]
+    limit: usize,
+    instruments: Option<String>,
+    data_types: Option<String>,
+}
+
+fn hyperliquid_filter(
+    state: &AppState,
+    query: &HyperliquidEventQuery,
+) -> Result<marketcow_realtime::SubscriptionFilter, &'static str> {
+    let configured = state
+        .config
+        .hyperliquid_shadow
+        .as_ref()
+        .ok_or("hyperliquid_shadow_disabled")?;
+    let instruments = match &query.instruments {
+        None => configured.instruments.keys().cloned().collect(),
+        Some(value) => {
+            if value.is_empty() || value.len() > 16_384 {
+                return Err("invalid_hyperliquid_instruments");
+            }
+            let instruments = value.split(',').map(str::to_owned).collect::<BTreeSet<_>>();
+            if instruments.is_empty()
+                || instruments.len() > 1_000
+                || instruments
+                    .iter()
+                    .any(|instrument| !configured.instruments.contains_key(instrument))
+            {
+                return Err("invalid_hyperliquid_instruments");
+            }
+            instruments
+        }
+    };
+    let all_data_types = BTreeSet::from([
+        marketcow_realtime::DataType::Quote,
+        marketcow_realtime::DataType::Trade,
+        marketcow_realtime::DataType::OrderBook,
+        marketcow_realtime::DataType::AssetContext,
+    ]);
+    let data_types = match &query.data_types {
+        None => all_data_types,
+        Some(value) => {
+            if value.is_empty() || value.len() > 256 {
+                return Err("invalid_hyperliquid_data_types");
+            }
+            let parsed = value
+                .split(',')
+                .map(|name| match name {
+                    "quote" => Ok(marketcow_realtime::DataType::Quote),
+                    "trade" => Ok(marketcow_realtime::DataType::Trade),
+                    "order_book" => Ok(marketcow_realtime::DataType::OrderBook),
+                    "asset_context" => Ok(marketcow_realtime::DataType::AssetContext),
+                    _ => Err("invalid_hyperliquid_data_types"),
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if parsed.is_empty() {
+                return Err("invalid_hyperliquid_data_types");
+            }
+            parsed
+        }
+    };
+    Ok(marketcow_realtime::SubscriptionFilter {
+        instruments,
+        data_types,
+    })
+}
+
+fn hyperliquid_ready_snapshot(
+    state: &AppState,
+) -> Result<Arc<marketcow_realtime::RealtimeHubProjection>, &'static str> {
+    let snapshot = state
+        .hyperliquid_shadow
+        .as_ref()
+        .ok_or("hyperliquid_shadow_disabled")?
+        .snapshot();
+    if !matches!(
+        snapshot.health,
+        marketcow_realtime::RealtimeHubHealth::Ready { .. }
+    ) {
+        return Err("hyperliquid_shadow_unready");
+    }
+    Ok(snapshot)
+}
+
+fn hyperliquid_query_error(code: &'static str, request_id: &str) -> Response {
+    let status = if code == "hyperliquid_shadow_disabled" {
+        StatusCode::NOT_FOUND
+    } else if code == "hyperliquid_shadow_unready" {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    error(status, code, status.is_server_error(), request_id)
+}
+
+async fn hyperliquid_shadow_events(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    Query(query): Query<HyperliquidEventQuery>,
+) -> Response {
+    if !(1..=1_000).contains(&query.limit) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_event_page_limit",
+            false,
+            &request_id,
+        );
+    }
+    let filter = match hyperliquid_filter(&state, &query) {
+        Ok(filter) => filter,
+        Err(code) => return hyperliquid_query_error(code, &request_id),
+    };
+    let snapshot = match hyperliquid_ready_snapshot(&state) {
+        Ok(snapshot) => snapshot,
+        Err(code) => return hyperliquid_query_error(code, &request_id),
+    };
+    let after = query.after_sequence.unwrap_or(0);
+    match snapshot.replay_after(&snapshot.stream_id, after, &filter) {
+        Ok(mut frames) => {
+            frames.truncate(query.limit);
+            let next_sequence = frames.last().map_or(after, |frame| match frame {
+                marketcow_realtime::ReplayFrame::Event { stream } => stream.sequence,
+                marketcow_realtime::ReplayFrame::SequenceWatermark { sequence, .. } => *sequence,
+            });
+            Json(json!({
+                "schema_version":"marketcow.realtime.events-page.v1",
+                "stream_id":snapshot.stream_id,
+                "current_sequence":snapshot.public_sequence,
+                "next_sequence":next_sequence,
+                "frames":frames,
+                "real_order_submission_enabled":false
+            }))
+            .into_response()
+        }
+        Err(marketcow_realtime::RealtimeError::GapUnrecoverable { .. }) => error(
+            StatusCode::GONE,
+            "hyperliquid_cursor_expired",
+            true,
+            &request_id,
+        ),
+        Err(marketcow_realtime::RealtimeError::CursorAhead { .. }) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hyperliquid_cursor_ahead",
+            false,
+            &request_id,
+        ),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "hyperliquid_replay_failed_closed",
+            true,
+            &request_id,
+        ),
+    }
+}
+
+async fn hyperliquid_shadow_stream(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    Query(query): Query<HyperliquidEventQuery>,
+) -> Response {
+    let filter = match hyperliquid_filter(&state, &query) {
+        Ok(filter) => filter,
+        Err(code) => return hyperliquid_query_error(code, &request_id),
+    };
+    let Some(stream) = &state.hyperliquid_stream else {
+        return hyperliquid_query_error("hyperliquid_shadow_disabled", &request_id);
+    };
+    let receiver = stream.subscribe();
+    let snapshot = match hyperliquid_ready_snapshot(&state) {
+        Ok(snapshot) => snapshot,
+        Err(code) => return hyperliquid_query_error(code, &request_id),
+    };
+    let after = query.after_sequence.unwrap_or(snapshot.public_sequence);
+    let replay = match snapshot.replay_after(&snapshot.stream_id, after, &filter) {
+        Ok(replay) => replay,
+        Err(marketcow_realtime::RealtimeError::GapUnrecoverable { .. }) => {
+            return error(
+                StatusCode::GONE,
+                "hyperliquid_cursor_expired",
+                true,
+                &request_id,
+            );
+        }
+        Err(marketcow_realtime::RealtimeError::CursorAhead { .. }) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "hyperliquid_cursor_ahead",
+                false,
+                &request_id,
+            );
+        }
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "hyperliquid_replay_failed_closed",
+                true,
+                &request_id,
+            );
+        }
+    };
+    ws.on_upgrade(move |socket| {
+        serve_hyperliquid_shadow_stream(socket, state, receiver, snapshot, replay, filter, after)
+    })
+}
+
+async fn send_hyperliquid_frame(socket: &mut WebSocket, value: &serde_json::Value) -> bool {
+    let Ok(encoded) = serde_json::to_string(value) else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(
+            STREAM_SEND_TIMEOUT,
+            socket.send(Message::Text(encoded.into()))
+        )
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+fn realtime_frame_json(frame: marketcow_realtime::ReplayFrame) -> serde_json::Value {
+    serde_json::to_value(frame).expect("realtime frame is serializable")
+}
+
+async fn serve_hyperliquid_shadow_stream(
+    mut socket: WebSocket,
+    state: AppState,
+    mut receiver: broadcast::Receiver<marketcow_realtime::StreamEvent>,
+    snapshot: Arc<marketcow_realtime::RealtimeHubProjection>,
+    replay: Vec<marketcow_realtime::ReplayFrame>,
+    filter: marketcow_realtime::SubscriptionFilter,
+    after: u64,
+) {
+    if !send_hyperliquid_frame(
+        &mut socket,
+        &json!({
+            "type":"subscription",
+            "schema_version":"marketcow.realtime.subscription.v1",
+            "provider":"hyperliquid",
+            "stream_id":snapshot.stream_id,
+            "current_sequence":snapshot.public_sequence,
+            "resumed":after < snapshot.public_sequence,
+            "real_order_submission_enabled":false
+        }),
+    )
+    .await
+    {
+        return;
+    }
+    let mut last_sequence = after;
+    for frame in replay {
+        last_sequence = match &frame {
+            marketcow_realtime::ReplayFrame::Event { stream } => stream.sequence,
+            marketcow_realtime::ReplayFrame::SequenceWatermark { sequence, .. } => *sequence,
+        };
+        if !send_hyperliquid_frame(&mut socket, &realtime_frame_json(frame)).await {
+            return;
+        }
+    }
+    let mut health_check = tokio::time::interval(Duration::from_secs(1));
+    health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            message = socket.recv() => match message {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                    close_stream(&mut socket, close_code::UNSUPPORTED, "server_push_only").await;
+                    return;
+                }
+            },
+            event = receiver.recv() => match event {
+                Ok(event) if event.sequence <= last_sequence => {}
+                Ok(event) if event.sequence == last_sequence.saturating_add(1) => {
+                    last_sequence = event.sequence;
+                    let frame = if filter.matches(&event.event) {
+                        marketcow_realtime::ReplayFrame::Event { stream: Box::new(event) }
+                    } else {
+                        marketcow_realtime::ReplayFrame::SequenceWatermark {
+                            stream_id: event.stream_id,
+                            sequence: event.sequence,
+                        }
+                    };
+                    if !send_hyperliquid_frame(&mut socket, &realtime_frame_json(frame)).await {
+                        return;
+                    }
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = send_hyperliquid_frame(&mut socket, &json!({
+                        "type":"resync_required","reason":"hyperliquid_stream_gap",
+                        "last_sequence":last_sequence
+                    })).await;
+                    close_stream(&mut socket, close_code::POLICY, "full_sync_required").await;
+                    return;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    close_stream(&mut socket, close_code::RESTART, "server_shutdown").await;
+                    return;
+                }
+            },
+            _ = health_check.tick() => {
+                if hyperliquid_ready_snapshot(&state).is_err() {
+                    let _ = send_hyperliquid_frame(&mut socket, &json!({
+                        "type":"resync_required","reason":"hyperliquid_shadow_unready",
+                        "last_sequence":last_sequence
+                    })).await;
+                    close_stream(&mut socket, close_code::POLICY, "full_sync_required").await;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 async fn instrument_lookup(
@@ -4841,7 +5406,14 @@ fn mcp_error(request_id: serde_json::Value, code: i64, message: &str) -> serde_j
 async fn readiness(State(state): State<AppState>) -> Response {
     let projection = state.projection.load_full();
     let fresh = projection_fresh(&state.config, &projection);
-    let ready = polymarket_projection_ready(&state, &projection);
+    let hyperliquid_ready = state.hyperliquid_shadow.as_ref().is_none_or(|reader| {
+        matches!(
+            reader.snapshot().health,
+            marketcow_realtime::RealtimeHubHealth::Ready { .. }
+        )
+    });
+    let polymarket_ready = polymarket_projection_ready(&state, &projection);
+    let ready = polymarket_ready && hyperliquid_ready;
     let status = if ready {
         StatusCode::OK
     } else {
@@ -4854,11 +5426,15 @@ async fn readiness(State(state): State<AppState>) -> Response {
             "writer_enabled":false, "real_order_submission_enabled":false,
             "fail_closed_reason":if !fresh {
                 Some("book_stale".to_string())
-            } else if !ready {
+            } else if !polymarket_ready {
                 projection.fail_closed_reason.clone().or_else(|| Some("polymarket_projection_unready".into()))
+            } else if !hyperliquid_ready {
+                Some("hyperliquid_shadow_unready".into())
             } else {
                 None
             },
+            "hyperliquid_shadow_enabled":state.hyperliquid_shadow.is_some(),
+            "hyperliquid_shadow_ready":hyperliquid_ready,
             "ownership_registry":"docs/architecture/migration/domain-ownership.yaml"
         })),
     )
@@ -5961,6 +6537,33 @@ fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Pr
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let projection = state.projection.load_full();
     let maximum_book_age_ms = projection_maximum_book_age_ms(&projection);
+    let hyperliquid = state
+        .hyperliquid_shadow
+        .as_ref()
+        .map(marketcow_realtime::RealtimeHubReader::snapshot);
+    let hyperliquid_enabled = u8::from(hyperliquid.is_some());
+    let hyperliquid_ready = u8::from(hyperliquid.as_ref().is_some_and(|projection| {
+        matches!(
+            projection.health,
+            marketcow_realtime::RealtimeHubHealth::Ready { .. }
+        )
+    }));
+    let hyperliquid_sequence = hyperliquid
+        .as_ref()
+        .map_or(0, |value| value.public_sequence);
+    let hyperliquid_wal_cursor = hyperliquid.as_ref().map_or(0, |value| value.wal_cursor);
+    let hyperliquid_transport_depth = state
+        .hyperliquid_queues
+        .as_ref()
+        .map_or(0, HyperliquidQueueProbe::transport_depth);
+    let hyperliquid_gateway_depth = state
+        .hyperliquid_queues
+        .as_ref()
+        .map_or(0, HyperliquidQueueProbe::gateway_depth);
+    let hyperliquid_public_depth = state
+        .hyperliquid_stream
+        .as_ref()
+        .map_or(0, broadcast::Sender::len);
     (
         [("content-type", "text/plain; version=0.0.4")],
         format!(
@@ -5977,7 +6580,11 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
              marketcow_python_workers_configured {}\nmarketcow_python_workers_live {}\n\
              marketcow_python_worker_restarts_total {}\nmarketcow_python_worker_restart_budget_exhaustions_total {}\n\
              marketcow_python_worker_memory_limit_kills_total {}\nmarketcow_python_worker_memory_monitor_failures_total {}\n\
-             marketcow_python_worker_memory_limit_mib {}\nmarketcow_python_worker_cpu_limit_seconds {}\n",
+             marketcow_python_worker_memory_limit_mib {}\nmarketcow_python_worker_cpu_limit_seconds {}\n\
+             marketcow_hyperliquid_shadow_enabled {}\nmarketcow_hyperliquid_shadow_ready {}\n\
+             marketcow_hyperliquid_public_sequence {}\nmarketcow_hyperliquid_wal_cursor {}\n\
+             marketcow_hyperliquid_transport_queue_depth {}\nmarketcow_hyperliquid_gateway_queue_depth {}\n\
+             marketcow_hyperliquid_public_channel_depth {}\n",
             state.metrics.requests.load(Ordering::Relaxed),
             state.metrics.errors.load(Ordering::Relaxed),
             projection.cursor,
@@ -6013,6 +6620,13 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 .load(Ordering::Relaxed),
             state.config.python_workers.memory_limit_mib,
             state.config.python_workers.cpu_limit_seconds,
+            hyperliquid_enabled,
+            hyperliquid_ready,
+            hyperliquid_sequence,
+            hyperliquid_wal_cursor,
+            hyperliquid_transport_depth,
+            hyperliquid_gateway_depth,
+            hyperliquid_public_depth,
         ),
     )
 }
@@ -6763,6 +7377,7 @@ mod tests {
             maximum_book_age_ms: 30_000,
             legacy_mcp_url: None,
             polymarket_live: None,
+            hyperliquid_shadow: None,
             python_workers: PythonWorkerConfig::disabled(),
         };
         let runtime =
@@ -6795,6 +7410,9 @@ mod tests {
                 }),
                 control_plane: Arc::new(ControlPlaneCoordinator::memory("test-config-v1")),
                 stream,
+                hyperliquid_shadow: None,
+                hyperliquid_stream: None,
+                hyperliquid_queues: None,
                 worker_status: Arc::new(PythonWorkerStatus::default()),
                 legacy_mcp: None,
             },
@@ -7871,6 +8489,129 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["real_order_submission_enabled"],
             false
         );
+    }
+
+    #[tokio::test]
+    async fn enabled_hyperliquid_shadow_is_visible_and_fail_closed_while_starting() {
+        let (dir, mut state) = test_state();
+        let hub = marketcow_realtime::DurableRealtimeHub::open(
+            dir.path().join("hyperliquid-shadow"),
+            "hyperliquid-main",
+            "test-config-v1",
+            1_024,
+            8,
+        )
+        .unwrap();
+        state.hyperliquid_shadow = Some(hub.reader());
+        state.config.hyperliquid_shadow = Some(HyperliquidShadowConfig {
+            instruments: BTreeMap::from([("BTC-PERP.HYPL".into(), "BTC".into())]),
+            maximum_source_delay_millis: 30_000,
+        });
+
+        let snapshot = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/market-data/providers/hyperliquid/shadow/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(snapshot.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(snapshot["stream_id"], "hyperliquid-main");
+        assert_eq!(snapshot["health"]["state"], "starting");
+
+        let health = health_payload(&state);
+        assert_eq!(health["status"], "degraded");
+        assert_eq!(health["real_order_submission_enabled"], false);
+        assert_eq!(health["components"]["hyperliquid_shadow"]["enabled"], true);
+        let readiness = readiness(State(state.clone())).await;
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let metrics = metrics(State(state)).await.into_response();
+        let metrics = String::from_utf8(
+            to_bytes(metrics.into_body(), 16_384)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(metrics.contains("marketcow_hyperliquid_shadow_enabled 1"));
+        assert!(metrics.contains("marketcow_hyperliquid_shadow_ready 0"));
+    }
+
+    #[tokio::test]
+    async fn hyperliquid_shadow_events_are_bounded_and_filtered_with_watermarks() {
+        let (dir, mut state) = test_state();
+        let mut hub = marketcow_realtime::DurableRealtimeHub::open(
+            dir.path().join("hyperliquid-events"),
+            "hyperliquid-main",
+            "test-config-v1",
+            1_024,
+            8,
+        )
+        .unwrap();
+        let (gateway, mut gateway_receiver) = mpsc::channel(4);
+        hub.ingest(
+            marketcow_realtime::TransportOutput::Connected { attempt: 1 },
+            &gateway,
+        )
+        .unwrap();
+        hub.ingest(
+            marketcow_realtime::TransportOutput::SubscriptionsReady { attempt: 1 },
+            &gateway,
+        )
+        .unwrap();
+        let now = Utc::now();
+        let event = marketcow_realtime::HyperliquidNormalizer::new(
+            [("BTC-PERP.HYPL".into(), "BTC".into())],
+            30_000,
+        )
+        .unwrap()
+        .normalize(
+            json!({"channel":"trades","data":[{
+                "coin":"BTC","time":now.timestamp_millis(),"px":"65000.10",
+                "sz":"0.001","side":"B","tid":42
+            }]}),
+            now,
+        )
+        .unwrap();
+        hub.ingest(
+            marketcow_realtime::TransportOutput::Events {
+                attempt: 1,
+                events: event,
+            },
+            &gateway,
+        )
+        .unwrap();
+        let published = gateway_receiver.try_recv().unwrap();
+        let (public_stream, _) = broadcast::channel(8);
+        let _ = public_stream.send(published);
+        state.hyperliquid_shadow = Some(hub.reader());
+        state.hyperliquid_stream = Some(public_stream);
+        state.config.hyperliquid_shadow = Some(HyperliquidShadowConfig {
+            instruments: BTreeMap::from([("BTC-PERP.HYPL".into(), "BTC".into())]),
+            maximum_source_delay_millis: 30_000,
+        });
+
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/market-data/providers/hyperliquid/shadow/events?after_sequence=0&limit=8&instruments=BTC-PERP.HYPL&data_types=quote")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16_384).await.unwrap()).unwrap();
+        assert_eq!(page["schema_version"], "marketcow.realtime.events-page.v1");
+        assert_eq!(page["current_sequence"], 1);
+        assert_eq!(page["next_sequence"], 1);
+        assert_eq!(page["frames"][0]["type"], "sequence_watermark");
+        assert_eq!(page["real_order_submission_enabled"], false);
     }
 
     #[tokio::test]
@@ -9219,6 +9960,7 @@ mod tests {
             maximum_book_age_ms: 30_000,
             legacy_mcp_url: None,
             polymarket_live: None,
+            hyperliquid_shadow: None,
             python_workers: PythonWorkerConfig::disabled(),
         };
         preflight(&config).unwrap();

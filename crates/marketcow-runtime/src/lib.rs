@@ -13,6 +13,7 @@ use marketcow_polymarket::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -87,7 +88,7 @@ pub enum RuntimeError {
 pub struct PolymarketRuntime {
     config: RuntimeConfig,
     writer: SingleWriter<SegmentedWal>,
-    recent_events: Vec<PersistedEvent>,
+    recent_events: VecDeque<PersistedEvent>,
     last_manifest: Option<CheckpointManifest>,
 }
 
@@ -109,7 +110,7 @@ impl PolymarketRuntime {
         Ok(Self {
             config,
             writer,
-            recent_events: records[start..].to_vec(),
+            recent_events: records[start..].iter().cloned().collect(),
             last_manifest: manifest,
         })
     }
@@ -118,7 +119,7 @@ impl PolymarketRuntime {
         self.writer.projection()
     }
 
-    pub fn recent_events(&self) -> &[PersistedEvent] {
+    pub fn recent_events(&self) -> &VecDeque<PersistedEvent> {
         &self.recent_events
     }
 
@@ -165,9 +166,9 @@ impl PolymarketRuntime {
         }
         let outcomes = self.writer.apply_batch(events)?;
         for outcome in &outcomes {
-            self.recent_events.push(outcome.persisted.clone());
+            self.recent_events.push_back(outcome.persisted.clone());
             if self.recent_events.len() > self.config.recent_event_capacity {
-                self.recent_events.remove(0);
+                self.recent_events.pop_front();
             }
         }
         Ok(outcomes)

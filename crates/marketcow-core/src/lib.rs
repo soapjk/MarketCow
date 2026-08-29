@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -810,9 +810,21 @@ impl<L: DurableLog> SingleWriter<L> {
             return Err(CoreError::InvalidSourceEvidence);
         }
         let mut next = (*self.current.load_full()).clone();
+        // A provider frame can contain many logical updates. Scan the bounded duplicate window
+        // once instead of linearly scanning it for every event in the same batch.
+        let mut event_ids = next
+            .recent_event_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        for event in &events {
+            if !event_ids.insert(event.event_id.clone()) {
+                return Err(CoreError::DuplicateEvent(event.event_id.clone()));
+            }
+        }
         let mut persisted = Vec::with_capacity(events.len());
         for event in events {
-            let (updated, outcome) = Self::evaluate_event(next, event, false)?;
+            let (updated, outcome) = Self::evaluate_event(next, event, false, false)?;
             next = updated;
             persisted.push(outcome);
         }
@@ -843,6 +855,7 @@ impl<L: DurableLog> SingleWriter<L> {
         mut next: Projection,
         event: CanonicalEvent,
         validate_raw_payload: bool,
+        validate_duplicate: bool,
     ) -> Result<(Projection, PersistedEvent), CoreError> {
         if event.schema_version != CONTRACT_VERSION {
             return Err(CoreError::SchemaMismatch);
@@ -865,7 +878,7 @@ impl<L: DurableLog> SingleWriter<L> {
         {
             return Err(CoreError::InvalidSourceEvidence);
         }
-        if next.recent_event_ids.contains(&event.event_id) {
+        if validate_duplicate && next.recent_event_ids.contains(&event.event_id) {
             return Err(CoreError::DuplicateEvent(event.event_id));
         }
         if event.cursor != next.cursor + 1 {
@@ -1247,7 +1260,7 @@ impl<L: DurableLog> SingleWriter<L> {
         validate_raw_payload: bool,
     ) -> Result<ApplyOutcome, CoreError> {
         let previous = (*self.current.load_full()).clone();
-        let (next, persisted) = Self::evaluate_event(previous, event, validate_raw_payload)?;
+        let (next, persisted) = Self::evaluate_event(previous, event, validate_raw_payload, true)?;
         let persistence_started = std::time::Instant::now();
         self.log.append_outcome(&persisted)?;
         let persistence_latency_us = persistence_started.elapsed().as_micros() as u64;
@@ -2007,6 +2020,39 @@ mod tests {
                 .iter()
                 .all(|outcome| outcome.projection.cursor == 2)
         );
+    }
+
+    #[test]
+    fn duplicate_inside_upstream_batch_is_rejected_before_the_wal_barrier() {
+        #[derive(Default)]
+        struct CountingLog(usize);
+        impl DurableLog for CountingLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!("batch append is required")
+            }
+            fn append_outcomes(&mut self, _: &[PersistedEvent]) -> Result<(), CoreError> {
+                self.0 += 1;
+                Ok(())
+            }
+        }
+        let mut writer = SingleWriter::new("scope".into(), CountingLog::default());
+        let original = event(
+            1,
+            EventKind::FullBook {
+                token_id: "t".into(),
+                bids: levels("0.4", "1"),
+                asks: levels("0.6", "1"),
+                tick_size: Price::parse_tick("0.01").unwrap(),
+                tick_version: "tick-v1".into(),
+            },
+        );
+        let duplicate = original.clone();
+        assert!(matches!(
+            writer.apply_batch(vec![original, duplicate]),
+            Err(CoreError::DuplicateEvent(_))
+        ));
+        assert_eq!(writer.log.0, 0);
+        assert_eq!(writer.projection().cursor, 0);
     }
 
     #[test]
