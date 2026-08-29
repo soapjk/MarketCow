@@ -1,0 +1,138 @@
+{
+  "schema_version": "marketcow.dynamic-universe.replacement-live-gate.v1",
+  "verdict": "passed_with_preserved_tooling_failure",
+  "overall_migration_complete": false,
+  "runtime": {
+    "service_pid": 87309,
+    "launchd_label": "com.marketcow.rust-polymarket-dynamic-87135c2-shadow-v13",
+    "commit": "87135c2cb1fd7898de2b683b574715970a2ba284",
+    "binary_sha256": "ea64fd9d043e9ea6c4ecd16cabab241a3f8f8c56a947ded0557f17929bfc8495",
+    "bind": "127.0.0.1:18872",
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  },
+  "candidate_inputs": {
+    "ranked_market_count": 500,
+    "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+    "catalog_index_sha256": "76846bc07c4254a9ed51704f1fc8d95cb359ad0b2556fa59c5acb787cbed9801",
+    "catalog_sha256": "764d5f3c62e6745d6982d2150ff3e7adccec999d162ac72f3a653f617f4bb79b",
+    "candidate_book_requested_tokens": 1000,
+    "candidate_book_count": 958,
+    "candidate_missing_token_count": 42,
+    "candidate_unresolved_market_count": 0,
+    "candidate_book_snapshot_sha256": "d0ea7a2e48dd61ebefc5fc08c520dc2f8f21dc07ae79b99785c712dcd3ac4977"
+  },
+  "deterministic_isolation": {
+    "kind": "one_sided_book",
+    "market_id": "3055022",
+    "token_id": "23339199211540021670118016596636314587869304333969151798245425102191313291003",
+    "fault_injected_book_snapshot_sha256": "92a22b084974da58741ae2b2f858f2c7fa5cbf655172f80402e78f64bacd32aa",
+    "excluded_reason_code": "one_sided_book",
+    "retryable": true,
+    "replacement_market_id": "2911874"
+  },
+  "candidate": {
+    "path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/registry/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34-generation-4-replacement-candidate-final.json",
+    "sha256": "f1994a0ee1c67ebc21b179842312c6c70714e8b00ef969892d39e4ad8bf2fbb2",
+    "generation": 4,
+    "market_count": 100,
+    "token_count": 200,
+    "book_count": 200,
+    "relation_count": 5,
+    "target_market_count": 100,
+    "minimum_market_count": 80,
+    "maximum_capital_lock_seconds": 2592000,
+    "added_market_identities": [
+      {
+        "market_id": "2911874",
+        "condition_id": "0x31327c6fbdc70a44d97f8e8973f536b6a748e01b4c0ca5549ed0910c703b1d7b",
+        "token_ids": [
+          "30774565298935121666763850272423963284589055313497974568971929195252437852383",
+          "8310650677069487821478025416478130051168635736368290554555541536659374960027"
+        ],
+        "end_at": "2026-08-31T00:00:00Z"
+      }
+    ],
+    "removed_market_identities": [
+      {
+        "market_id": "3055022",
+        "condition_id": "0xaff0aedf83c0531388d22c302f8fd64ea3eb00aa822fbc57fedd0f7867d0d467",
+        "token_ids": [
+          "23339199211540021670118016596636314587869304333969151798245425102191313291003",
+          "51828736259384973741087760200703482075261154192254123762265203110469756668625"
+        ],
+        "end_at": "2026-08-29T23:59:00Z"
+      }
+    ]
+  },
+  "activation": {
+    "schema_version": "marketcow.polymarket.universe-activation-receipt.v1",
+    "http_status": 200,
+    "status": "activated_ready",
+    "elapsed_seconds": 2.012306,
+    "previous_generation": 3,
+    "active_generation": 4,
+    "boundary_cursor": 1703152,
+    "full_sync_required": true,
+    "scope_file_sha256": "f1994a0ee1c67ebc21b179842312c6c70714e8b00ef969892d39e4ad8bf2fbb2",
+    "real_order_submission_enabled": false
+  },
+  "old_connection_control_event": {
+    "observer_pid": 29576,
+    "observer_runs": 1,
+    "observer_exit_code": 0,
+    "protocol_version": "marketcow.market-stream.v2",
+    "old_generation": 3,
+    "new_generation": 4,
+    "switch_boundary_cursor": 1703152,
+    "cursor": 1703152,
+    "full_sync_required": true,
+    "added_markets": ["2911874"],
+    "removed_markets": ["3055022"],
+    "verdict": "passed"
+  },
+  "post_activation": {
+    "scope_http_status": 200,
+    "full_sync_http_status": 200,
+    "ready": true,
+    "scope_status": "ready",
+    "generation": 4,
+    "market_count": 100,
+    "token_count": 200,
+    "book_count": 200,
+    "relation_count": 5,
+    "unresolved_gap_count": 0,
+    "tick_mismatch_count": 0,
+    "bad_instrument_revision_count": 0,
+    "bad_fee_schedule_count": 0,
+    "catalog_revision": "76ebc558f824f0cdfa7c7ebd579f5034f5ce7f58120a23b98ea0e474d2373003",
+    "five_second_sample_count": 5,
+    "five_second_failed_samples": 0,
+    "cursor_start": 1705965,
+    "cursor_finish": 1706121,
+    "websocket_event_cursors": [1706122, 1706123, 1706124, 1706125, 1706126],
+    "expired_cursor_resync": true,
+    "expired_cursor_close_code": 1008,
+    "read_only_paths_checked": 14,
+    "read_only_paths_all_404": true
+  },
+  "checkpoint_and_wal": {
+    "checkpoint_cursor": 1707681,
+    "checkpoint_projection_sha256": "6a5f2eb0d05020363ba1c1370c1d3bb5e9e33988b45647d162fe8a874dac6e3a",
+    "checkpoint_hash_match": true,
+    "parent_lineage_manifest_sha256": "4bbc70a5d1a92895de839e3059f37081884fc74ae70092ddc694e0d216024d42",
+    "parent_checkpoint_cursor": 1702951,
+    "parent_checkpoint_sha256": "90dc6cea382a96bb78f9f247b397c2cd6845abe26fa4f1d145dc901c139ed1b2",
+    "child_wal_verify_status": "ok",
+    "child_wal_records": 4740,
+    "child_wal_last_cursor": 1707691,
+    "generation_storage_size_approx": "20M"
+  },
+  "preserved_failure": {
+    "name": "generation_4_activation_request_v1_missing_contract_fields",
+    "http_status": 422,
+    "elapsed_seconds": 0.273982,
+    "response": "Failed to deserialize the JSON body into the target type: missing field schema_version",
+    "impact": "No activation occurred; generation 3 remained ready and the old-connection observer remained attached. The corrected versioned request then passed."
+  }
+}
