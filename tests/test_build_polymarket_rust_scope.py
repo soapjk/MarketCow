@@ -87,7 +87,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                     },
                 },
                 "start_at": "2026-01-01T00:00:00Z",
-                "end_at": "2027-01-01T00:00:00Z",
+                "end_at": "2026-09-01T00:00:00Z",
                 "lifecycle_state": "active", "resolution": None,
                 "metadata_revision": f"metadata-{market_id}",
                 "observed_at": "2026-01-02T00:00:00Z",
@@ -259,7 +259,7 @@ def test_dynamic_universe_isolates_failure_and_atomically_replenishes(tmp_path: 
         generation=7,
         target_market_count=1,
         minimum_market_count=1,
-        maximum_capital_lock_seconds=365 * 24 * 60 * 60,
+        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
         previous_market_ids=["1"],
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
@@ -273,7 +273,7 @@ def test_dynamic_universe_isolates_failure_and_atomically_replenishes(tmp_path: 
         "market_id": "1",
         "condition_id": "condition-1",
         "token_ids": ["10", "20"],
-        "end_at": "2027-01-01T00:00:00Z",
+        "end_at": "2026-09-01T00:00:00Z",
     }]
     assert result["universe"]["excluded_markets"][0]["reason_code"] == "one_sided_book"
     assert len(result["initial_book_frames"]) == 2
@@ -287,7 +287,7 @@ def test_dynamic_universe_records_capacity_exclusion(tmp_path: Path) -> None:
         generation=1,
         target_market_count=1,
         minimum_market_count=1,
-        maximum_capital_lock_seconds=365 * 24 * 60 * 60,
+        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
     assert result["market_ids"] == ["2"]  # ranked manifest order is [2, 1]
@@ -315,7 +315,7 @@ def test_dynamic_universe_accepts_atomic_two_token_tick_change(tmp_path: Path) -
         generation=1,
         target_market_count=2,
         minimum_market_count=2,
-        maximum_capital_lock_seconds=365 * 24 * 60 * 60,
+        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
 
@@ -338,6 +338,20 @@ def test_dynamic_universe_fails_closed_below_minimum(tmp_path: Path) -> None:
             generation=1,
             target_market_count=2,
             minimum_market_count=2,
-            maximum_capital_lock_seconds=365 * 24 * 60 * 60,
+            maximum_capital_lock_seconds=30 * 24 * 60 * 60,
+            validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+
+
+def test_dynamic_universe_rejects_capital_lock_policy_above_thirty_days(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    with pytest.raises(ValueError, match="configuration is invalid"):
+        build_dynamic_universe(
+            manifest, index, catalog, registry, _books(tmp_path),
+            universe_id="e" * 64,
+            generation=1,
+            target_market_count=1,
+            minimum_market_count=1,
+            maximum_capital_lock_seconds=30 * 24 * 60 * 60 + 1,
             validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
         )

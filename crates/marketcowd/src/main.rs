@@ -737,6 +737,7 @@ fn validate_polymarket_universe_contract(
     initial_book_frames: &[serde_json::Value],
     activated_at: DateTime<Utc>,
 ) -> Result<()> {
+    const MAXIMUM_CAPITAL_LOCK_SECONDS: u64 = 30 * 24 * 60 * 60;
     if universe.schema_version != "marketcow.polymarket.universe.v1"
         || universe.universe_id != scope_id
         || universe.universe_id.len() != 64
@@ -753,6 +754,7 @@ fn validate_polymarket_universe_contract(
         || !universe.filters.require_two_sided_books
         || !universe.filters.require_complete_instrument_facts
         || universe.filters.maximum_capital_lock_seconds == 0
+        || universe.filters.maximum_capital_lock_seconds > MAXIMUM_CAPITAL_LOCK_SECONDS
         || universe.validated_at > activated_at
     {
         bail!("dynamic Polymarket universe contract is invalid");
@@ -6250,11 +6252,15 @@ async fn serve_market_data_stream(
         {
             return;
         }
-        for record in records
-            .iter()
-            .filter(|record| record.event.cursor > resume_cursor && record.event.cursor <= boundary)
-        {
-            if record.event.cursor != last_cursor.saturating_add(1) {
+        let replay_window = match polymarket_replay_window(&records, resume_cursor, boundary) {
+            Ok(window) => window,
+            Err(reason) => {
+                send_resync_and_close(&mut socket, &state, last_cursor, reason).await;
+                return;
+            }
+        };
+        for record in &records[replay_window] {
+            if record.event.cursor <= resume_cursor {
                 send_resync_and_close(&mut socket, &state, last_cursor, "stream_replay_gap").await;
                 return;
             }
@@ -6387,6 +6393,33 @@ async fn serve_market_data_stream(
             }
         }
     }
+}
+
+fn polymarket_replay_window(
+    records: &[marketcow_core::PersistedEvent],
+    resume_cursor: u64,
+    boundary: u64,
+) -> std::result::Result<std::ops::Range<usize>, &'static str> {
+    if resume_cursor > boundary
+        || records
+            .windows(2)
+            .any(|pair| pair[0].event.cursor >= pair[1].event.cursor)
+    {
+        return Err("stream_replay_gap");
+    }
+    let start = records.partition_point(|record| record.event.cursor <= resume_cursor);
+    let end = records.partition_point(|record| record.event.cursor <= boundary);
+    let mut expected = resume_cursor.saturating_add(1);
+    for record in &records[start..end] {
+        if record.event.cursor != expected {
+            return Err("stream_replay_gap");
+        }
+        expected = expected.saturating_add(1);
+    }
+    if expected.saturating_sub(1) != boundary {
+        return Err("stream_replay_incomplete");
+    }
+    Ok(start..end)
 }
 
 fn polymarket_universe_change_frame(
@@ -8298,7 +8331,7 @@ mod tests {
                 "minimum_order_size":"5",
                 "settlement_currency":"pUSD",
                 "start_at":"2026-01-01T00:00:00Z",
-                "end_at":"2027-01-01T00:00:00Z",
+                "end_at":"2026-09-01T00:00:00Z",
                 "revision":format!("instrument-{market_id}")
             }
         });
@@ -8390,7 +8423,7 @@ mod tests {
             market_id: market_id.into(),
             condition_id: format!("condition-{market_id}"),
             token_ids: vec![yes.into(), no.into()],
-            end_at: "2027-01-01T00:00:00Z".parse().unwrap(),
+            end_at: "2026-09-01T00:00:00Z".parse().unwrap(),
         };
         let removed_identities = previous_market
             .filter(|previous| *previous != market_id)
@@ -8399,7 +8432,7 @@ mod tests {
                     market_id: previous.into(),
                     condition_id: format!("condition-{previous}"),
                     token_ids: vec!["10".into(), "20".into()],
-                    end_at: "2027-01-01T00:00:00Z".parse().unwrap(),
+                    end_at: "2026-09-01T00:00:00Z".parse().unwrap(),
                 }]
             });
         live.universe = Some(PolymarketUniverseContract {
@@ -8411,7 +8444,7 @@ mod tests {
             filters: PolymarketUniverseFilters {
                 require_two_sided_books: true,
                 require_complete_instrument_facts: true,
-                maximum_capital_lock_seconds: 365 * 24 * 60 * 60,
+                maximum_capital_lock_seconds: 30 * 24 * 60 * 60,
             },
             active_markets: vec![active_identity.clone()],
             added_markets: previous_market
@@ -8517,6 +8550,24 @@ mod tests {
             load_polymarket_scope_file_at(
                 &universe_id,
                 &invalid_path.to_string_lossy(),
+                "2026-08-29T00:00:01Z".parse().unwrap(),
+            )
+            .is_err()
+        );
+
+        let mut excessive_lock = loaded;
+        excessive_lock
+            .universe
+            .as_mut()
+            .unwrap()
+            .filters
+            .maximum_capital_lock_seconds = 30 * 24 * 60 * 60 + 1;
+        let excessive_lock_path = dir.path().join("excessive-lock-generation.json");
+        write_dynamic_universe_scope(&excessive_lock_path, &excessive_lock);
+        assert!(
+            load_polymarket_scope_file_at(
+                &universe_id,
+                &excessive_lock_path.to_string_lossy(),
                 "2026-08-29T00:00:01Z".parse().unwrap(),
             )
             .is_err()
@@ -10963,6 +11014,53 @@ mod tests {
                 if u16::from(frame.code) == close_code::AGAIN
         ));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_resume_window_never_returns_cursor_at_or_below_request() {
+        let (_dir, state) = test_state();
+        let first_at = Utc::now();
+        for index in 0..3 {
+            let observed_at = first_at + chrono::Duration::milliseconds(index);
+            let response = admin_shadow_ingest(
+                State(state.clone()),
+                Extension(format!("resume-lower-bound-{index}")),
+                Json(ShadowIngestRequest {
+                    received_at: Some(observed_at),
+                    raw_payload: json!({
+                        "event_type":"book", "asset_id":"yes",
+                        "timestamp":observed_at.to_rfc3339(), "tick_size":"0.01",
+                        "bids":[{"price":format!("0.4{index}"),"size":"10"}],
+                        "asks":[{"price":"0.60","size":"11"}]
+                    }),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let mut records = state.recent_events.load_full().as_ref().clone();
+        assert_eq!(records.len(), 3);
+        records[0].event.cursor = 1_239_461;
+        records[1].event.cursor = 1_239_471;
+        records[2].event.cursor = 1_239_472;
+
+        let requested = 1_239_470;
+        let window = polymarket_replay_window(&records, requested, 1_239_472).unwrap();
+        let replay = &records[window];
+        assert_eq!(
+            replay
+                .iter()
+                .map(|record| record.event.cursor)
+                .collect::<Vec<_>>(),
+            vec![1_239_471, 1_239_472]
+        );
+        assert!(replay.iter().all(|record| record.event.cursor > requested));
+
+        records.swap(1, 2);
+        assert_eq!(
+            polymarket_replay_window(&records, requested, 1_239_472),
+            Err("stream_replay_gap")
+        );
     }
 
     async fn next_stream_frame<S>(

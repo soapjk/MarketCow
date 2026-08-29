@@ -22,6 +22,7 @@ from scripts.migration.build_polymarket_rust_scope import build_scope, sha256_fi
 
 SCHEMA_VERSION = "marketcow.polymarket.rust-live-scope.v4"
 UNIVERSE_SCHEMA_VERSION = "marketcow.polymarket.universe.v1"
+MAXIMUM_CAPITAL_LOCK_SECONDS = 30 * 24 * 60 * 60
 
 
 def _reason(error: Exception) -> tuple[str, bool]:
@@ -99,6 +100,7 @@ def build_dynamic_universe(
         or minimum_market_count > target_market_count
         or target_market_count > 250
         or maximum_capital_lock_seconds <= 0
+        or maximum_capital_lock_seconds > MAXIMUM_CAPITAL_LOCK_SECONDS
         or retry_seconds <= 0
     ):
         raise ValueError("dynamic universe configuration is invalid")
