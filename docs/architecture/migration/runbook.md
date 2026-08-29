@@ -136,7 +136,10 @@ directory fsync. The index is never authoritative: missing or malformed content 
 the verified append-only WAL, while symlinks and unsafe permissions are rejected. This milestone
 provides logarithmic boundary lookup but startup still performs a full WAL integrity scan; do not
 claim history-independent startup until the checkpoint/segment manifest fast path is implemented
-and fault-tested.
+and fault-tested. An ordinary derived-index write failure sets `sparse_index_healthy=false` but
+does not block authoritative WAL append or realtime publication; the next append retries the
+atomic index replacement. Unsafe symlinks/file types remain a security failure and are not treated
+as ordinary degradation.
 
 This is shadow evidence only. It does not enable a writer cutover, does not submit orders, and
 does not authorize Tradude to start, stop, restart, or supervise MarketCow. LongPort remains an

@@ -197,9 +197,12 @@ pub struct SegmentedRealtimeWal {
     records: Vec<PersistedRealtimeEvent>,
     applied_event_ids: BTreeSet<String>,
     sparse_index: RealtimeSparseIndex,
+    sparse_index_healthy: bool,
     poisoned: bool,
     #[cfg(test)]
     fail_next_append: bool,
+    #[cfg(test)]
+    fail_next_index_write: bool,
 }
 
 impl SegmentedRealtimeWal {
@@ -214,7 +217,7 @@ impl SegmentedRealtimeWal {
         create_private_directory(root)?;
         let writer_lock = acquire_writer_lock(&root.join("writer.lock"))?;
         let verified = verify_wal(root, Some((stream_id, config_revision)))?;
-        install_sparse_index(root, &verified.sparse_index)?;
+        let sparse_index_healthy = install_sparse_index(root, &verified.sparse_index)?;
         let (current_path, current_file, current_bytes) = match verified.paths.last() {
             Some(path) => {
                 let mut options = OpenOptions::new();
@@ -248,9 +251,12 @@ impl SegmentedRealtimeWal {
             records: verified.records,
             applied_event_ids,
             sparse_index: verified.sparse_index,
+            sparse_index_healthy,
             poisoned: false,
             #[cfg(test)]
             fail_next_append: false,
+            #[cfg(test)]
+            fail_next_index_write: false,
         })
     }
 
@@ -272,6 +278,10 @@ impl SegmentedRealtimeWal {
 
     pub fn sparse_index(&self) -> &RealtimeSparseIndex {
         &self.sparse_index
+    }
+
+    pub fn sparse_index_healthy(&self) -> bool {
+        self.sparse_index_healthy
     }
 
     fn append_decisions(
@@ -368,10 +378,18 @@ impl SegmentedRealtimeWal {
             file.write_all(&line)?;
             file.write_all(b"\n")?;
             file.sync_data()?;
+            let index_changed = sparse_entry.is_some();
             if let Some(entry) = sparse_entry {
                 self.sparse_index.entries.push(entry);
                 seal_sparse_index(&mut self.sparse_index)?;
-                write_sparse_index(&self.root, &self.sparse_index)?;
+            }
+            if index_changed || !self.sparse_index_healthy {
+                #[cfg(test)]
+                let injected_failure = std::mem::take(&mut self.fail_next_index_write);
+                #[cfg(not(test))]
+                let injected_failure = false;
+                self.sparse_index_healthy =
+                    !injected_failure && write_sparse_index(&self.root, &self.sparse_index).is_ok();
             }
             Ok::<(), DurabilityError>(())
         })();
@@ -445,6 +463,11 @@ impl SegmentedRealtimeWal {
     #[cfg(test)]
     fn inject_append_failure(&mut self) {
         self.fail_next_append = true;
+    }
+
+    #[cfg(test)]
+    fn inject_index_write_failure(&mut self) {
+        self.fail_next_index_write = true;
     }
 }
 
@@ -634,6 +657,10 @@ impl DurableRealtimeWriter {
 
     pub fn recovered_checkpoint_cursor(&self) -> Option<u64> {
         self.recovered_checkpoint_cursor
+    }
+
+    pub fn sparse_index_healthy(&self) -> bool {
+        self.wal.sparse_index_healthy()
     }
 
     pub fn replay(&self) -> &SequencedReplay {
@@ -1057,7 +1084,7 @@ fn should_index_batch(
 fn install_sparse_index(
     root: &Path,
     verified: &RealtimeSparseIndex,
-) -> Result<(), DurabilityError> {
+) -> Result<bool, DurabilityError> {
     let path = root.join(SPARSE_INDEX_FILENAME);
     if path.exists() {
         verify_private_regular_file(&path)?;
@@ -1066,10 +1093,10 @@ fn install_sparse_index(
             && sparse_index_is_valid(&existing)
             && existing == *verified
         {
-            return Ok(());
+            return Ok(true);
         }
     }
-    write_sparse_index(root, verified)
+    Ok(write_sparse_index(root, verified).is_ok())
 }
 
 fn write_sparse_index(root: &Path, index: &RealtimeSparseIndex) -> Result<(), DurabilityError> {
@@ -1336,6 +1363,30 @@ mod tests {
             Err(DurabilityError::InsecureStoragePermissions)
         ));
         assert_eq!(fs::read(&target).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn derived_index_write_failure_degrades_without_blocking_authoritative_wal() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("runtime");
+        let mut writer = open(&root);
+        writer.wal.inject_index_write_failure();
+        let first = writer.apply(event(1, "65000.10000000")).unwrap();
+        assert_eq!(first.published.unwrap().sequence, 1);
+        assert_eq!(writer.wal_cursor(), 1);
+        assert!(!writer.sparse_index_healthy());
+
+        let second = writer.apply(event(2, "65000.20000000")).unwrap();
+        assert_eq!(second.published.unwrap().sequence, 2);
+        assert_eq!(writer.wal_cursor(), 2);
+        assert!(writer.sparse_index_healthy());
+        let persisted: RealtimeSparseIndex = serde_json::from_slice(
+            &fs::read(root.join("wal").join(SPARSE_INDEX_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.entries.len(), 2);
+        assert_eq!(persisted.entries[0].first_wal_cursor, 1);
+        assert_eq!(persisted.entries[1].first_wal_cursor, 2);
     }
 
     #[test]
