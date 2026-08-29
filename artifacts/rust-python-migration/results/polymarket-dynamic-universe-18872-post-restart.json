@@ -1,0 +1,205 @@
+{
+  "base_url": "http://127.0.0.1:18872",
+  "cursor_finish": 1212019,
+  "cursor_start": 1211873,
+  "duration_seconds": 5,
+  "expected_scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+  "expired_cursor": {
+    "close": {
+      "code": 1008,
+      "reason": "full_sync_required"
+    },
+    "frame": {
+      "cursor": 0,
+      "protocol_version": "marketcow.market-stream.v2",
+      "reason": "event_cursor_expired",
+      "retryable": true,
+      "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+      "type": "resync_required"
+    },
+    "passed": true
+  },
+  "failures": [],
+  "interval_seconds": 1.0,
+  "passed": true,
+  "read_only": {
+    "/v1/cancel": 404,
+    "/v1/execute": 404,
+    "/v1/order": 404,
+    "/v1/orders": 404,
+    "/v1/prediction-markets/polymarket/cancel": 404,
+    "/v1/prediction-markets/polymarket/orders": 404,
+    "/v1/prediction-markets/polymarket/sign": 404,
+    "/v1/prediction-markets/polymarket/submit": 404,
+    "/v1/prediction-markets/polymarket/trade": 404,
+    "/v1/prediction-markets/polymarket/wallet": 404,
+    "/v1/sign": 404,
+    "/v1/submit": 404,
+    "/v1/trade": 404,
+    "/v1/wallet": 404
+  },
+  "samples": [
+    {
+      "boundary": {
+        "bad_fee_schedule_count": 0,
+        "bad_revision_count": 0,
+        "book_count": 200,
+        "boundary_cursor": 1211873,
+        "catalog_revision": "01fa45c873262f9d68304e0cf87a322a6b98968adb493ccc3c4b4710c0485307",
+        "checkpoint_state_sha256": "82b7c9ee0c1abf45deca1c92870f357e3eae63ec27b89d084344c2c02869717b",
+        "dynamic_universe_valid": true,
+        "fail_closed_reason": null,
+        "market_count": 100,
+        "missing_count": 0,
+        "passed": true,
+        "relation_count": 4,
+        "tick_mismatch_count": 0,
+        "token_count": 200,
+        "universe_generation": 1
+      },
+      "full_sync_http_status": 200,
+      "observed_at": "2026-08-29T08:45:41.092103+00:00",
+      "passed": true,
+      "scope_http_status": 200,
+      "scope_ready": true
+    },
+    {
+      "boundary": {
+        "bad_fee_schedule_count": 0,
+        "bad_revision_count": 0,
+        "book_count": 200,
+        "boundary_cursor": 1211903,
+        "catalog_revision": "01fa45c873262f9d68304e0cf87a322a6b98968adb493ccc3c4b4710c0485307",
+        "checkpoint_state_sha256": "95d6149eff98e1a8c58093b991f75a596b483a75c292fa3dfa09439591208c33",
+        "dynamic_universe_valid": true,
+        "fail_closed_reason": null,
+        "market_count": 100,
+        "missing_count": 0,
+        "passed": true,
+        "relation_count": 4,
+        "tick_mismatch_count": 0,
+        "token_count": 200,
+        "universe_generation": 1
+      },
+      "full_sync_http_status": 200,
+      "observed_at": "2026-08-29T08:45:42.198284+00:00",
+      "passed": true,
+      "scope_http_status": 200,
+      "scope_ready": true
+    },
+    {
+      "boundary": {
+        "bad_fee_schedule_count": 0,
+        "bad_revision_count": 0,
+        "book_count": 200,
+        "boundary_cursor": 1211937,
+        "catalog_revision": "01fa45c873262f9d68304e0cf87a322a6b98968adb493ccc3c4b4710c0485307",
+        "checkpoint_state_sha256": "d84d16aba1b54eae38e76ea28ae5e095d3889d7e815c9943b88d33310848fe11",
+        "dynamic_universe_valid": true,
+        "fail_closed_reason": null,
+        "market_count": 100,
+        "missing_count": 0,
+        "passed": true,
+        "relation_count": 4,
+        "tick_mismatch_count": 0,
+        "token_count": 200,
+        "universe_generation": 1
+      },
+      "full_sync_http_status": 200,
+      "observed_at": "2026-08-29T08:45:43.372901+00:00",
+      "passed": true,
+      "scope_http_status": 200,
+      "scope_ready": true
+    },
+    {
+      "boundary": {
+        "bad_fee_schedule_count": 0,
+        "bad_revision_count": 0,
+        "book_count": 200,
+        "boundary_cursor": 1211989,
+        "catalog_revision": "01fa45c873262f9d68304e0cf87a322a6b98968adb493ccc3c4b4710c0485307",
+        "checkpoint_state_sha256": "96bfd06d8b72916688020387d67af0c0a53a38774937adde44962ce7c1a5bd75",
+        "dynamic_universe_valid": true,
+        "fail_closed_reason": null,
+        "market_count": 100,
+        "missing_count": 0,
+        "passed": true,
+        "relation_count": 4,
+        "tick_mismatch_count": 0,
+        "token_count": 200,
+        "universe_generation": 1
+      },
+      "full_sync_http_status": 200,
+      "observed_at": "2026-08-29T08:45:44.517344+00:00",
+      "passed": true,
+      "scope_http_status": 200,
+      "scope_ready": true
+    },
+    {
+      "boundary": {
+        "bad_fee_schedule_count": 0,
+        "bad_revision_count": 0,
+        "book_count": 200,
+        "boundary_cursor": 1212019,
+        "catalog_revision": "01fa45c873262f9d68304e0cf87a322a6b98968adb493ccc3c4b4710c0485307",
+        "checkpoint_state_sha256": "018a8703b010eb0f46df79b8b5706a865a8de27a6ed7d3b47385db1b6df0fd2e",
+        "dynamic_universe_valid": true,
+        "fail_closed_reason": null,
+        "market_count": 100,
+        "missing_count": 0,
+        "passed": true,
+        "relation_count": 4,
+        "tick_mismatch_count": 0,
+        "token_count": 200,
+        "universe_generation": 1
+      },
+      "full_sync_http_status": 200,
+      "observed_at": "2026-08-29T08:45:45.689878+00:00",
+      "passed": true,
+      "scope_http_status": 200,
+      "scope_ready": true
+    }
+  ],
+  "schema_version": "marketcow.polymarket.live-stability-gate.v1",
+  "started_at": "2026-08-29T08:45:40.787962+00:00",
+  "startup_observations": [
+    {
+      "boundary": {
+        "bad_fee_schedule_count": 0,
+        "bad_revision_count": 0,
+        "book_count": 200,
+        "boundary_cursor": 1211873,
+        "catalog_revision": "01fa45c873262f9d68304e0cf87a322a6b98968adb493ccc3c4b4710c0485307",
+        "checkpoint_state_sha256": "82b7c9ee0c1abf45deca1c92870f357e3eae63ec27b89d084344c2c02869717b",
+        "dynamic_universe_valid": true,
+        "fail_closed_reason": null,
+        "market_count": 100,
+        "missing_count": 0,
+        "passed": true,
+        "relation_count": 4,
+        "tick_mismatch_count": 0,
+        "token_count": 200,
+        "universe_generation": 1
+      },
+      "full_sync_status": 200,
+      "observed_at": "2026-08-29T08:45:40.876001+00:00",
+      "scope_ready": true,
+      "scope_status": 200
+    }
+  ],
+  "websocket": {
+    "event_cursors": [
+      1212020,
+      1212021,
+      1212022,
+      1212023,
+      1212024
+    ],
+    "passed": true,
+    "requested_boundary": 1212019,
+    "subscription_boundary": 1212059
+  },
+  "window_elapsed_seconds": 5.059152207992156,
+  "window_finished_at": "2026-08-29T08:45:50.028459+00:00",
+  "window_started_at": "2026-08-29T08:45:41.092084+00:00"
+}

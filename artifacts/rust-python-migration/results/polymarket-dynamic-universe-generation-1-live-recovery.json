@@ -1,0 +1,97 @@
+{
+  "schema_version": "marketcow.polymarket.dynamic-universe-live-recovery.v1",
+  "recorded_at": "2026-08-29T08:46:30Z",
+  "overall_dynamic_universe_acceptance_passed": false,
+  "runtime": {
+    "label": "com.marketcow.rust-polymarket-dynamic-0d6db86-shadow-v8",
+    "pid_after_restart": 3475,
+    "launchd_runs": 2,
+    "commit": "0d6db86725a833676848cea1f2140582b1ab42a1",
+    "binary_sha256": "1312840aca6f161b31b2db2ab167dcdf45acc9c99b02f5aa983f70a4abc2f7ed",
+    "bind": "127.0.0.1:18872",
+    "real_order_submission_enabled": false,
+    "tradude_manages_lifecycle": false
+  },
+  "universe": {
+    "schema_version": "marketcow.polymarket.scope-discovery.v3",
+    "universe_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "generation": 1,
+    "active_scope_sha256": "aa497ff617ac692fe13e34f9445b6d91f24938c3e767efb44d44812bb6e075c3",
+    "target_market_count": 100,
+    "minimum_market_count": 80,
+    "active_market_count": 100,
+    "token_count": 200,
+    "added_market_ids": ["3055022", "3145216", "3207827"],
+    "removed_market_ids": ["565065", "703258", "908713"],
+    "excluded_market_count": 13,
+    "catalog_revision": "01fa45c873262f9d68304e0cf87a322a6b98968adb493ccc3c4b4710c0485307"
+  },
+  "pre_restart": {
+    "ready": true,
+    "boundary_cursor": 1208101,
+    "checkpoint_cursor": 1208101,
+    "checkpoint_state_sha256": "2330b93c4ab7166d9322bd349a2cc2430b8d57f3ca6fd2a2ac409bcaacf7362a",
+    "wal_last_cursor": 1209326,
+    "wal_records": 1209326,
+    "wal_status": "ok"
+  },
+  "restart": {
+    "shutdown_started_at": "2026-08-29T08:30:44.662322Z",
+    "ready_at": "2026-08-29T08:45:08.395200Z",
+    "recovery_elapsed_seconds": 863.732878,
+    "persisted_generation_recovered": true,
+    "cursor_not_regressed": true,
+    "performance_gate_passed": false,
+    "performance_failure": "checkpoint/WAL recovery required about 14 minutes 24 seconds"
+  },
+  "post_restart": {
+    "scope_ready": true,
+    "full_sync_http_status": 200,
+    "boundary_cursor_first_probe": 1211562,
+    "checkpoint_cursor_first_probe": 1211562,
+    "checkpoint_state_sha256_first_probe": "2cbfcb15bf17123ec04fe2c8fda193688f92843242084cac99d79fc45b756dd8",
+    "market_count": 100,
+    "book_count": 200,
+    "relation_count": 4,
+    "latest_checkpoint_cursor": 1212451,
+    "latest_checkpoint_file_sha256": "d444135d79d87eba3ed033e54477c8c9128baabd5b628fb2fc54e21ccbf6fcdb",
+    "wal_last_cursor": 1213281,
+    "wal_records": 1213281,
+    "wal_status": "ok"
+  },
+  "gates": {
+    "pre_restart_stability": {
+      "passed": true,
+      "samples": 268,
+      "failures": 0,
+      "cursor_start": 1194105,
+      "cursor_finish": 1207063,
+      "result": "artifacts/rust-python-migration/results/polymarket-dynamic-universe-18872-stability-5m-r2.json"
+    },
+    "post_restart_recovery": {
+      "passed": true,
+      "samples": 5,
+      "failures": 0,
+      "cursor_start": 1211873,
+      "cursor_finish": 1212019,
+      "websocket_continuity": true,
+      "expired_cursor_resync": true,
+      "read_only_path_count": 14,
+      "result": "artifacts/rust-python-migration/results/polymarket-dynamic-universe-18872-post-restart.json"
+    },
+    "live_universe_changed": {
+      "passed": false,
+      "failure": "the pre-activation WebSocket observer timed out after 30 seconds before receiving universe_changed",
+      "required_follow_up": "reproduce a live generation transition with an observer held through activation and verify the v2 control payload"
+    }
+  },
+  "preserved_failures": [
+    "initial 5-minute verifier PID 79316 exited without a result and left a zero-byte log",
+    "pre-activation WebSocket observer timed out before universe_changed was observed",
+    "scope activation returned HTTP 504 scope_switch_timeout while generation preparation continued safely in the background",
+    "manual checkpoint request used nonexistent /v1/admin/checkpoint and returned HTTP 404",
+    "first readiness condition Automation was rejected by observer-script safety classification",
+    "restart recovery took approximately 14 minutes 24 seconds",
+    "generation checkpoint directory retains a large number of immutable checkpoint files and needs a non-destructive retention policy"
+  ]
+}
