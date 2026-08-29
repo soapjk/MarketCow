@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,7 @@ def test_build_scope_is_deterministic_and_hash_pinned(tmp_path: Path) -> None:
         expected_market_count=2,
         expected_token_count=4,
         expected_manifest_sha256=manifest_sha256,
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
     assert scope["schema_version"] == "marketcow.polymarket.rust-live-scope.v2"
     assert scope["market_ids"] == ["1", "2"]
@@ -126,4 +128,18 @@ def test_build_scope_fails_closed_on_manifest_hash_mismatch(tmp_path: Path) -> N
             expected_market_count=2,
             expected_token_count=4,
             expected_manifest_sha256="0" * 64,
+        )
+
+
+def test_build_scope_fails_closed_on_expired_active_market(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    with pytest.raises(ValueError, match="expires before required validity boundary"):
+        build_scope(
+            manifest,
+            index,
+            catalog,
+            registry,
+            expected_market_count=2,
+            expected_token_count=4,
+            validated_at=datetime(2028, 1, 1, tzinfo=timezone.utc),
         )

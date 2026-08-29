@@ -478,6 +478,14 @@ fn load_polymarket_scope_file(
     expected_scope_id: &str,
     scope_path: &str,
 ) -> Result<Option<PolymarketLiveConfig>> {
+    load_polymarket_scope_file_at(expected_scope_id, scope_path, Utc::now())
+}
+
+fn load_polymarket_scope_file_at(
+    expected_scope_id: &str,
+    scope_path: &str,
+    activated_at: chrono::DateTime<Utc>,
+) -> Result<Option<PolymarketLiveConfig>> {
     let path = Path::new(scope_path);
     if !path.is_absolute() {
         bail!("MARKETCOW_POLYMARKET_SCOPE_FILE must be an absolute path");
@@ -536,6 +544,24 @@ fn load_polymarket_scope_file(
             .any(|market| market.instrument_facts.is_none())
     {
         bail!("Polymarket scope catalog frame does not exactly cover the declared scope");
+    }
+    let expired_or_inactive = catalog
+        .markets
+        .iter()
+        .filter(|market| {
+            market.lifecycle_state != marketcow_core::MarketLifecycleState::Active
+                || market
+                    .instrument_facts
+                    .as_ref()
+                    .is_none_or(|facts| facts.end_at <= activated_at)
+        })
+        .map(|market| market.market_id.clone())
+        .collect::<Vec<_>>();
+    if !expired_or_inactive.is_empty() {
+        bail!(
+            "Polymarket live scope contains expired or inactive markets: {}",
+            expired_or_inactive.join(",")
+        );
     }
     let relation_markets = catalog
         .negative_risk_relations
@@ -6754,6 +6780,49 @@ mod tests {
         );
         assert_eq!(loaded.scope_file_sha256.as_deref().map(str::len), Some(64));
         assert!(load_polymarket_scope_file("wrong-scope", path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn polymarket_live_scope_file_rejects_expired_active_market() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("expired-scope.json");
+        let mut market = test_scope_market("1", "10", "20");
+        market["instrument_facts"]["end_at"] = json!("2026-08-27T23:59:00Z");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema_version":"marketcow.polymarket.rust-live-scope.v2",
+                "scope_id":"expired-scope",
+                "market_count":1,
+                "token_count":2,
+                "market_ids":["1"],
+                "token_ids":["10","20"],
+                "catalog_revision":"catalog-v1",
+                "catalog_frame":{
+                    "event_type":"catalog_revision",
+                    "catalog_revision":"catalog-v1",
+                    "markets":[market],
+                    "negative_risk_relations":[]
+                },
+                "source":{
+                    "manifest_sha256":"a".repeat(64),
+                    "catalog_index_sha256":"b".repeat(64),
+                    "catalog_sha256":"c".repeat(64),
+                    "registry_sha256":"d".repeat(64)
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = load_polymarket_scope_file_at(
+            "expired-scope",
+            path.to_str().unwrap(),
+            "2026-08-29T00:00:00Z".parse().unwrap(),
+        )
+        .err()
+        .expect("expired market must be rejected");
+        assert!(error.to_string().contains("expired or inactive markets: 1"));
     }
 
     fn test_scope_market(market_id: &str, yes: &str, no: &str) -> serde_json::Value {

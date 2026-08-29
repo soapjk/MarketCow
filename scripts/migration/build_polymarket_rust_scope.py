@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,15 @@ def build_scope(
     expected_market_count: int,
     expected_token_count: int,
     expected_manifest_sha256: str | None = None,
+    validated_at: datetime | None = None,
+    minimum_scope_lifetime_seconds: int = 0,
 ) -> dict[str, Any]:
+    if minimum_scope_lifetime_seconds < 0:
+        raise ValueError("minimum scope lifetime must not be negative")
+    observed_at = validated_at or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        raise ValueError("validated_at must be timezone-aware")
+    required_valid_until = observed_at + timedelta(seconds=minimum_scope_lifetime_seconds)
     manifest_bytes = manifest_path.read_bytes()
     manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     if expected_manifest_sha256 and manifest_sha256 != expected_manifest_sha256.lower():
@@ -134,6 +143,14 @@ def build_scope(
             }
             start_at = _required_string(row.get("start_at"), f"{market_id}.start_at")
             end_at = _required_string(row.get("end_at"), f"{market_id}.end_at")
+            try:
+                end_datetime = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ValueError(f"{market_id}.end_at must be an ISO-8601 timestamp") from error
+            if end_datetime.tzinfo is None or end_datetime <= required_valid_until:
+                raise ValueError(
+                    f"exact live scope market {market_id} expires before required validity boundary"
+                )
             lifecycle = _required_string(row.get("lifecycle_state"), f"{market_id}.lifecycle_state")
             if lifecycle != "active":
                 raise ValueError(f"exact live scope contains non-active market {market_id}")
@@ -266,6 +283,7 @@ def main() -> int:
     parser.add_argument("--expected-market-count", type=int, default=100)
     parser.add_argument("--expected-token-count", type=int, default=200)
     parser.add_argument("--expected-manifest-sha256")
+    parser.add_argument("--minimum-scope-lifetime-seconds", type=int, default=0)
     arguments = parser.parse_args()
     payload = build_scope(
         arguments.manifest,
@@ -275,6 +293,7 @@ def main() -> int:
         expected_market_count=arguments.expected_market_count,
         expected_token_count=arguments.expected_token_count,
         expected_manifest_sha256=arguments.expected_manifest_sha256,
+        minimum_scope_lifetime_seconds=arguments.minimum_scope_lifetime_seconds,
     )
     write_atomic_json(arguments.output, payload)
     print(
