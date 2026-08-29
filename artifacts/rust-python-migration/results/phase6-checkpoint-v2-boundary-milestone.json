@@ -1,0 +1,52 @@
+{
+  "schema_version": "marketcow.phase6.checkpoint-v2-boundary-milestone.v1",
+  "generated_at": "2026-08-29T07:05:00Z",
+  "passed": true,
+  "phase_complete": false,
+  "adr_commit": "65a212a",
+  "implementation_commit": "1570b1e",
+  "authoritative_plan_sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4",
+  "implemented": [
+    "checkpoint v2 binds the sparse-index prefix hash at its WAL cursor",
+    "checkpoint v2 binds the located boundary segment id and byte offset",
+    "legal post-checkpoint WAL and index extension preserves the committed prefix",
+    "a checkpoint with a recomputed self hash but mixed boundary evidence is rejected as CheckpointWalDivergence",
+    "checkpoint v1 remains readable through the conservative full-WAL verification fallback",
+    "ordinary derived-index failure remains degraded and does not block authoritative WAL publication"
+  ],
+  "verification": {
+    "checkpoint_suite": {
+      "command": "cargo test -p marketcow-realtime checkpoint -- --nocapture",
+      "passed": 5,
+      "failed": 0
+    },
+    "workspace": {
+      "command": "cargo test --workspace --all-targets",
+      "passed": 154,
+      "failed": 0,
+      "ignored_real_storage_environment_gates": 5
+    },
+    "clippy": {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "passed": true
+    }
+  },
+  "preserved_failures": [
+    "The first v2 implementation bound the whole mutable sparse-index hash. Two restart tests correctly failed CheckpointWalDivergence after legitimate post-checkpoint append. The binding was changed to the immutable prefix at checkpoint cursor and all tests passed.",
+    "One targeted cargo test command supplied two TESTNAME filters and was rejected by cargo before running tests. The checkpoint suite was rerun with the single shared filter and passed five tests."
+  ],
+  "explicit_non_claims": [
+    "closed-segment manifest binding is not implemented",
+    "the reader still verifies the complete WAL before recovery",
+    "tail-only replay and the <=30 second large-history startup gate are not implemented",
+    "Phase 6 and the overall migration remain incomplete"
+  ],
+  "next": [
+    "bind immutable closed-segment manifest and exact active-segment prefix evidence",
+    "implement an opt-in tail-only reader with automatic v1/full-scan fallback",
+    "fault-inject manifest rollback, prefix tampering, torn tail and mixed generations",
+    "benchmark startup across fixed tail with increasing closed history"
+  ],
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}
