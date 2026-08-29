@@ -1,0 +1,163 @@
+{
+  "schema_version": "marketcow.polymarket.fee-schedule-live-gate.v1",
+  "generated_at": "2026-08-29T04:39:14Z",
+  "passed": true,
+  "collaboration_task_id": "135ece5d-b6dc-4d92-9892-a93d11d4ab76",
+  "scope": "atomic Polymarket fee schedule facts and live recovery gate only; this is not overall migration acceptance",
+  "runtime": {
+    "launchd_label": "com.marketcow.rust-polymarket-fees-9e76d53-shadow-v7",
+    "pid": 13531,
+    "launchd_state": "running",
+    "launchd_runs": 1,
+    "launchd_last_exit": "never exited",
+    "commit": "9e76d53109c96b4ff233da73eee8214086c34337",
+    "binary_sha256": "66afcdb6b4526ed578028da79922d244ce68eea13d5055f1fff427e681fd257c",
+    "listen": "127.0.0.1:18872",
+    "real_order_submission_enabled": false,
+    "lifecycle_owner": "MarketCow launchd; Tradude does not start or restart MarketCow"
+  },
+  "scope_gate": {
+    "http_status": 200,
+    "schema_version": "marketcow.polymarket.scope-discovery.v2",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "scope_status": "ready",
+    "ready": true,
+    "market_count": 100,
+    "token_count": 200,
+    "real_order_submission_enabled": false
+  },
+  "atomic_full_sync_gate": {
+    "http_status": 200,
+    "schema_version": "marketcow.polymarket.live.v2",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "boundary_cursor": 538238,
+    "projection_generation": 538238,
+    "snapshot_generation": 538238,
+    "market_count": 100,
+    "book_count": 200,
+    "negative_risk_relation_count": 4,
+    "gap_count": 0,
+    "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+    "projection_state_sha256": "f26e87bdc732ef6fc99494d6e9ecd2a53149f870f825d287a7db4d5d76763890",
+    "tick_mismatch_count": 0,
+    "fee_schedule_count": 100,
+    "zero_taker_rate_count": 39,
+    "nonzero_taker_rate_count": 61,
+    "informational_only_count": 100,
+    "distinct_schedule_id_count": 100,
+    "distinct_fee_revision_count": 100,
+    "provenance_item_count": 200,
+    "exact_decimal_json_strings": true,
+    "all_required_ids_revisions_and_provenance_sha_are_nonempty_64hex": true,
+    "same_scope_generation_boundary_and_revisions": true,
+    "execution_semantics": "All schedules are explicitly informational_only because executable rounding/tie semantics are not authoritatively available. MarketCow does not silently substitute zero fees. Tradude may only use an explicit research assumption in shadow mode; executable trading remains fail-closed."
+  },
+  "stability_and_stream_gate": {
+    "verifier_result": "/tmp/marketcow-fee-final-base-gate.json",
+    "schema_version": "marketcow.polymarket.live-stability-gate.v1",
+    "passed": true,
+    "sample_count": 9,
+    "failed_sample_count": 0,
+    "window_elapsed_seconds": "10.150035375001607",
+    "cursor_start": 542712,
+    "cursor_finish": 543242,
+    "all_scope_ready": true,
+    "all_full_sync_http_200": true,
+    "all_samples_100_markets_200_books_4_relations_zero_tick_mismatch": true,
+    "websocket": {
+      "passed": true,
+      "requested_boundary": 543242,
+      "subscription_boundary": 543252,
+      "event_cursors": [543243, 543244, 543245, 543246, 543247],
+      "contiguous": true
+    },
+    "expired_cursor": {
+      "passed": true,
+      "after_cursor": 0,
+      "frame_type": "resync_required",
+      "reason": "event_cursor_expired",
+      "retryable": true,
+      "close_code": 1008,
+      "close_reason": "full_sync_required"
+    }
+  },
+  "checkpoint_and_wal_gate": {
+    "passed": true,
+    "pre_restart_checkpoint_cursor": 534854,
+    "pre_restart_projection_sha256": "04ec0cc497d9a292d0bf6063b4ea6e6477fb761b1479ca35565410937ef97fc9",
+    "recovered_ready_after_restart": true,
+    "current_checkpoint_cursor": 546087,
+    "current_checkpoint_projection_sha256": "de2c8b7411cbd4bff845cace07fb36468a700b0e4cc5dae2d57a6002b5ffcc25",
+    "previous_checkpoint_cursor": 545087,
+    "wal_verify_status": "ok",
+    "wal_last_cursor": 546239,
+    "cursor_ordering_verified": "546239 >= 546087 >= 534854",
+    "verification_note": "The exact release binary verified the scope-specific WAL directory. The generic soak recovery helper was intentionally not used because it targets the legacy polymarket/wal layout rather than polymarket-scopes/<scope>/wal."
+  },
+  "read_only_surface_gate": {
+    "passed": true,
+    "expected_status": 404,
+    "paths": [
+      "/v1/cancel",
+      "/v1/execute",
+      "/v1/order",
+      "/v1/orders",
+      "/v1/prediction-markets/polymarket/cancel",
+      "/v1/prediction-markets/polymarket/orders",
+      "/v1/prediction-markets/polymarket/sign",
+      "/v1/prediction-markets/polymarket/submit",
+      "/v1/prediction-markets/polymarket/trade",
+      "/v1/prediction-markets/polymarket/wallet",
+      "/v1/sign",
+      "/v1/submit",
+      "/v1/trade",
+      "/v1/wallet"
+    ],
+    "all_returned_404": true,
+    "real_order_submission_enabled": false
+  },
+  "reproducible_verification": [
+    {
+      "command": "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/polymarket-fees-recovery-clean-target cargo test --workspace",
+      "result": "passed; core 22, runtime 7, polymarket 14, marketcowd 39, storage 11 passed and 5 environment-gated ignored, all other workspace tests passed"
+    },
+    {
+      "command": "/Volumes/T9/projects/trade/nautilus_trader/.venv/bin/python3 -m pytest -q tests/test_build_polymarket_rust_scope.py",
+      "result": "6 passed"
+    },
+    {
+      "command": "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/polymarket-fees-recovery-clean-target cargo clippy --workspace --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/polymarket-fees-recovery-clean-target cargo build --release -p marketcowd",
+      "result": "passed; binary SHA-256 66afcdb6b4526ed578028da79922d244ce68eea13d5055f1fff427e681fd257c"
+    },
+    {
+      "command": "/Volumes/T9/projects/trade/nautilus_trader/.venv/bin/python3 scripts/verify_polymarket_live_stability.py --base-url http://127.0.0.1:18872 --expected-scope-id cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34 --duration-seconds 10 --startup-timeout-seconds 15 --interval-seconds 1 --output /tmp/marketcow-fee-final-base-gate.json",
+      "result": "passed; 9/9 samples, cursor 542712 to 543242, contiguous WS 543243..543247, expired cursor resync, 14/14 read-only paths 404"
+    },
+    {
+      "command": "<exact SHA-verified marketcow-9e76d53 binary> wal verify <retained storage>/polymarket-scopes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34/wal",
+      "result": "status ok; WAL last cursor 546239; checkpoint cursor 546087; recovered beyond pre-restart cursor 534854"
+    }
+  ],
+  "preserved_failures": [
+    "A clean-export default python3 lacked pytest; the required test was rerun with the exact project virtual environment and passed 6 tests.",
+    "An earlier release build completed successfully but a combined shell command exited 128 because git rev-parse was invoked inside a git archive export without .git metadata.",
+    "A launchd executable placed on an external volume exited EX_CONFIG 78 and produced no process log.",
+    "Copying isolated storage to /tmp failed ENOSPC; only the incomplete 737 MB temporary copy was removed, while the complete external source was retained.",
+    "A previous restart required approximately five minutes to scan and verify the large WAL and returned transient fail-closed full-sync HTTP 503 while unready.",
+    "The c18442a fee build remained unready because eight tokens across four quiet markets emitted byte-identical full-book recovery payloads that the content-addressed event identity correctly deduplicated but therefore could not close the durable connection gap.",
+    "Independent upstream checks showed REST /book HTTP 200 with two-sided books for all eight tokens, independent WS subscriptions received 8/8 for those tokens and 200/200 for the full scope; the defect was local recovery identity binding, not missing upstream books.",
+    "The first recovery patch was too broad and failed marketcow-runtime::tests::repeated_upstream_snapshot_is_an_idempotent_noop by making every repeated full book unique. Commit 9e76d53 scopes identity rebinding only to duplicate full books for tokens with an unresolved durable gap; ordinary repeats remain idempotent.",
+    "The prior dd0e9fd service PID 84496 exited cleanly during an intentional MarketCow-managed cutover after shutdown_draining and marketcowd_stopped; this was not inferred as a successful gate or a crash.",
+    "Earlier HTTP soak and stability-verifier failures remain preserved in their original artifacts and are not replaced or reclassified by this fee-schedule gate.",
+    "The first formal Artifact creation attempt returned ARTIFACT_WORKER_SCOPE_FORBIDDEN because the Worker supplied repository and visibility scope fields; no evidence was lost, and the retry omitted Worker-forbidden scope fields so Corptie could derive WorkItem-private scope."
+  ],
+  "authoritative_external_sources": [
+    "https://docs.polymarket.com/trading/fees",
+    "https://docs.polymarket.com/trading/clients/public",
+    "https://docs.polymarket.com/api-reference/wss/market"
+  ]
+}
