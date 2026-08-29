@@ -1,0 +1,64 @@
+{
+  "schema_version": "marketcow.phase6.sparse-wal-index-milestone.v2",
+  "generated_at": "2026-08-29T06:55:00Z",
+  "passed": true,
+  "phase_complete": false,
+  "implementation_commits": ["c603796", "8447243"],
+  "supersedes": {
+    "result": "artifacts/rust-python-migration/results/phase6-sparse-wal-index-milestone.json",
+    "artifact_id": "artifact:80288c94-4666-4e37-b977-f9a608eb68a6",
+    "reason": "The v1 evidence incorrectly stated that a derived-index persistence failure prevents publication. The authoritative plan requires derived-index degradation not to stop WAL append or realtime."
+  },
+  "authoritative_plan": {
+    "sha256": "62d1a0418eedf6dbf00c37dabce827e0cf1b4d3c8fc43536ffe3e0421d3742d4",
+    "required_invariant": "derived index corruption/degradation cannot stop authoritative WAL append"
+  },
+  "corrected_behavior": [
+    "The SHA-bound disposable sparse index retains segment, byte-offset, cursor-range and previous-record-hash bindings with O(log n) lookup.",
+    "Missing or malformed index content is rebuilt from the fully verified authoritative WAL.",
+    "An ordinary index write failure sets sparse_index_healthy=false while the already-synced authoritative WAL event is published normally.",
+    "A later append retries the atomic index write and restores sparse_index_healthy=true on success.",
+    "Symlinks, unsafe file types and unsafe permissions remain security failures and fail closed rather than being followed.",
+    "The index remains derived and never changes or replaces an authoritative WAL record."
+  ],
+  "verification": {
+    "workspace": {
+      "command": "cargo test --workspace --all-targets",
+      "passed": 152,
+      "failed": 0,
+      "ignored_real_storage_environment_gates": 5
+    },
+    "clippy": {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "passed": true
+    },
+    "index_rebuild_and_security": {
+      "command": "cargo test -p marketcow-realtime sparse_index -- --nocapture",
+      "passed": 2,
+      "failed": 0
+    },
+    "degradation_continuity": {
+      "command": "cargo test -p marketcow-realtime derived_index_write_failure_degrades_without_blocking_authoritative_wal -- --nocapture",
+      "passed": 1,
+      "failed": 0,
+      "assertions": [
+        "first event is WAL-synced and published at sequence 1 despite injected index write failure",
+        "sparse_index_healthy becomes false without poisoning the writer",
+        "second event is WAL-synced and published at sequence 2",
+        "index retry succeeds and sparse_index_healthy returns true"
+      ]
+    }
+  },
+  "preserved_failures": [
+    "The v1 Artifact encoded the wrong derived-index failure policy and is explicitly superseded, not silently edited or revoked.",
+    "The first corrected degradation test expected one index entry, but the 1 KiB test segment size correctly created two segments and two entries. The assertion was corrected to exact cursors 1 and 2, then passed.",
+    "Earlier InvalidTimestamp fixture and clippy then/then_some failures remain preserved in the v1 result."
+  ],
+  "explicit_non_claims": [
+    "Startup still performs a full WAL integrity scan before using/rebuilding the index.",
+    "The checkpoint/segment-manifest fast path and <=30 second history-independent startup gate are not complete.",
+    "Phase 6 and the overall migration remain incomplete."
+  ],
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false
+}
