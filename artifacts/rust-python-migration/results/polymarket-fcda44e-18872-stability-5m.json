@@ -1,0 +1,288 @@
+{
+  "base_url": "http://127.0.0.1:18872",
+  "duration_seconds": 300,
+  "expected_scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+  "failures": [],
+  "interval_seconds": 1.0,
+  "passed": false,
+  "samples": [],
+  "schema_version": "marketcow.polymarket.live-stability-gate.v1",
+  "started_at": "2026-08-29T02:52:22.898779+00:00",
+  "startup_observations": [
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:22.961359+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:24.107072+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:25.266044+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:26.425135+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:27.512313+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:28.673946+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:29.899556+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:31.047593+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:32.198271+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:33.453200+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:34.611421+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:35.757651+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:36.918678+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:38.062758+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:39.201089+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:40.369537+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:41.560855+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:42.752646+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:43.909081+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:45.099519+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:46.253377+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:47.416042+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:48.679006+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:49.880089+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:51.038335+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:52.196953+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:53.363258+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:54.563596+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:55.724653+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:56.878422+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:58.051256+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:52:59.256418+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:53:00.419603+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:53:01.577494+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:53:02.719228+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:53:03.874026+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:53:05.030515+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:53:06.168310+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    },
+    {
+      "boundary": null,
+      "full_sync_status": 503,
+      "observed_at": "2026-08-29T02:53:07.299000+00:00",
+      "scope_ready": false,
+      "scope_status": 200
+    }
+  ],
+  "window_finished_at": null,
+  "window_started_at": null
+}

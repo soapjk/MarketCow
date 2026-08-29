@@ -1,0 +1,122 @@
+{
+  "schema_version": "marketcow.polymarket.live-gate-evidence.v1",
+  "passed": true,
+  "overall_migration_complete": false,
+  "service": {
+    "base_url": "http://127.0.0.1:18872",
+    "pid": 84496,
+    "runtime_commit": "dd0e9fdb63eccd60ed1e14639525d72b6e6bb70d",
+    "binary_path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-dd0e9fd",
+    "binary_sha256": "516f2d0c4f9efa1dd6110510000b9953251be31ef19caef4afcc74bde20869c4",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  },
+  "stability_gate": {
+    "result": "artifacts/rust-python-migration/results/polymarket-dd0e9fd-18872-stability-5m-r2.json",
+    "schema_version": "marketcow.polymarket.live-stability-gate.v1",
+    "window_elapsed_seconds": 300.18767391599977,
+    "samples": 251,
+    "failed_samples": 0,
+    "cursor_start": 204472,
+    "cursor_finish": 233837,
+    "market_count_per_sample": 100,
+    "book_count_per_sample": 200,
+    "token_count_per_sample": 200,
+    "negative_risk_relation_count_per_sample": 4,
+    "tick_mismatch_count_per_sample": 0,
+    "missing_fact_count_per_sample": 0,
+    "bad_instrument_revision_count_per_sample": 0,
+    "websocket_event_cursors": [233838, 233839, 233840, 233841, 233842],
+    "expired_cursor_resync": true,
+    "read_only_paths_checked": 14,
+    "read_only_status": 404
+  },
+  "checkpoint_wal_gate": {
+    "pre_restart_baseline_cursor": 168784,
+    "checkpoint_cursor": 244798,
+    "checkpoint_persisted_cursor": 244798,
+    "manifest_wal_last_cursor": 244798,
+    "checkpoint_path": "polymarket-scopes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34/checkpoints/00000000000000244798.json",
+    "checkpoint_expected_sha256": "a49b849b94cb45707c35a929e30c1e9131b5a50f219f23ad065d677af336a5b5",
+    "checkpoint_actual_sha256": "a49b849b94cb45707c35a929e30c1e9131b5a50f219f23ad065d677af336a5b5",
+    "wal_verify_status": "ok",
+    "wal_verified_last_cursor": 245184,
+    "wal_verified_records": 245184
+  },
+  "tests": [
+    {
+      "command": "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/polymarket-capacity-target cargo test --workspace",
+      "working_directory": "/Volumes/T9/.marketcow-builds/polymarket-capacity.diVzaN",
+      "source_commit": "dd0e9fdb63eccd60ed1e14639525d72b6e6bb70d",
+      "result": "passed",
+      "passed": 118,
+      "failed": 0,
+      "ignored_external_database_tests": 5
+    },
+    {
+      "command": "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/polymarket-capacity-target cargo clippy --workspace --all-targets -- -D warnings",
+      "working_directory": "/Volumes/T9/.marketcow-builds/polymarket-capacity.diVzaN",
+      "source_commit": "dd0e9fdb63eccd60ed1e14639525d72b6e6bb70d",
+      "result": "passed"
+    },
+    {
+      "command": "python3 -m py_compile scripts/verify_polymarket_live_stability.py",
+      "result": "passed"
+    },
+    {
+      "command": "verify_polymarket_live_stability.py --duration-seconds 5 against 127.0.0.1:18872",
+      "result": "passed",
+      "window_elapsed_seconds": 5.067897499997343,
+      "samples": 5
+    }
+  ],
+  "preserved_failures": [
+    {
+      "name": "fcda44e_first_stability_gate",
+      "result": "failed",
+      "samples": 257,
+      "failed_samples": 37,
+      "diagnostic": "two strict_backpressure transport cycles"
+    },
+    {
+      "name": "fcda44e_keepalive_rerun_overwrite",
+      "result": "tooling_failure",
+      "diagnostic": "KeepAlive verifier restarted and overwrote its first result; overwritten and partial files remain preserved"
+    },
+    {
+      "name": "launchd_external_volume",
+      "result": "tooling_failure",
+      "diagnostic": "external-volume launch returned EX_CONFIG 78"
+    },
+    {
+      "name": "nohup_verifier",
+      "result": "tooling_failure",
+      "diagnostic": "unified exec reaped the background verifier before result creation"
+    },
+    {
+      "name": "dd0e9fd_initial_startup_probe",
+      "result": "tooling_failure",
+      "diagnostic": "60-second startup timeout while existing WAL replay was still in progress"
+    },
+    {
+      "name": "automation_cancel",
+      "result": "tooling_failure",
+      "diagnostic": "cancel of an already completed Automation returned TASK_NOT_MUTABLE"
+    },
+    {
+      "name": "dd0e9fd_first_5m_verifier",
+      "result": "tooling_failure",
+      "evidence": "artifacts/rust-python-migration/results/polymarket-dd0e9fd-18872-stability-5m.json",
+      "samples": 258,
+      "failed_samples": 0,
+      "reported_passed": false,
+      "diagnostic": "fixed sample-count assumption rejected a complete 300-second window; verifier corrected in commit bb4f511"
+    },
+    {
+      "name": "checkpoint_probe_path_manifest_race",
+      "result": "tooling_failure",
+      "diagnostic": "an old fixed checkpoint path was compared with a newer auto-advanced manifest; same-manifest snapshot verification subsequently passed"
+    }
+  ]
+}
