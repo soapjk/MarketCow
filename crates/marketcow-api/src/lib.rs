@@ -9,7 +9,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub const MAX_EVENT_PAGE: usize = 1_000;
-pub const STREAM_PROTOCOL_VERSION: &str = "marketcow.market-stream.v1";
+pub const STREAM_PROTOCOL_VERSION: &str = "marketcow.market-stream.v2";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorWatermarks {
@@ -108,6 +108,40 @@ pub enum StreamPayload {
         reason: String,
         retryable: bool,
     },
+    UniverseChanged {
+        universe_id: String,
+        old_generation: u64,
+        new_generation: u64,
+        added_markets: Vec<String>,
+        removed_markets: Vec<String>,
+        switch_boundary_cursor: u64,
+        full_sync_required: bool,
+    },
+}
+
+pub fn stream_universe_changed(
+    scope_id: &str,
+    cursor: u64,
+    universe_id: impl Into<String>,
+    old_generation: u64,
+    new_generation: u64,
+    added_markets: Vec<String>,
+    removed_markets: Vec<String>,
+) -> StreamFrame {
+    StreamFrame {
+        protocol_version: STREAM_PROTOCOL_VERSION.into(),
+        scope_id: scope_id.into(),
+        cursor,
+        payload: StreamPayload::UniverseChanged {
+            universe_id: universe_id.into(),
+            old_generation,
+            new_generation,
+            added_markets,
+            removed_markets,
+            switch_boundary_cursor: cursor,
+            full_sync_required: true,
+        },
+    }
 }
 
 pub fn stream_subscription(projection: &Projection, resumed: bool) -> StreamFrame {
@@ -496,6 +530,30 @@ mod tests {
             stream_resync_required("scope-1", 6, "slow_consumer").payload,
             StreamPayload::ResyncRequired {
                 retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn universe_change_is_an_explicit_atomic_resync_boundary() {
+        let frame = stream_universe_changed(
+            "universe-a",
+            42,
+            "universe-a",
+            7,
+            8,
+            vec!["new-market".into()],
+            vec!["expired-market".into()],
+        );
+        assert_eq!(frame.cursor, 42);
+        assert!(matches!(
+            frame.payload,
+            StreamPayload::UniverseChanged {
+                old_generation: 7,
+                new_generation: 8,
+                switch_boundary_cursor: 42,
+                full_sync_required: true,
                 ..
             }
         ));

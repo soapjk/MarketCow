@@ -149,10 +149,16 @@ struct PolymarketLiveConfig {
     catalog_revision: Option<String>,
     catalog_frame: Option<serde_json::Value>,
     scope_file_sha256: Option<String>,
+    #[serde(skip_serializing)]
+    scope_file_path: Option<PathBuf>,
     source_manifest_sha256: Option<String>,
     catalog_index_sha256: Option<String>,
     catalog_sha256: Option<String>,
     registry_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    universe: Option<PolymarketUniverseContract>,
+    #[serde(skip_serializing)]
+    initial_book_frames: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +172,51 @@ struct PolymarketLiveScopeFile {
     catalog_revision: String,
     catalog_frame: serde_json::Value,
     source: PolymarketLiveScopeSource,
+    #[serde(default)]
+    universe: Option<PolymarketUniverseContract>,
+    #[serde(default)]
+    initial_book_frames: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PolymarketUniverseContract {
+    schema_version: String,
+    universe_id: String,
+    generation: u64,
+    target_market_count: usize,
+    minimum_market_count: usize,
+    filters: PolymarketUniverseFilters,
+    active_markets: Vec<PolymarketUniverseMarket>,
+    added_markets: Vec<String>,
+    removed_markets: Vec<String>,
+    added_market_identities: Vec<PolymarketUniverseMarket>,
+    removed_market_identities: Vec<PolymarketUniverseMarket>,
+    excluded_markets: Vec<PolymarketUniverseExclusion>,
+    validated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PolymarketUniverseFilters {
+    require_two_sided_books: bool,
+    require_complete_instrument_facts: bool,
+    maximum_capital_lock_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PolymarketUniverseMarket {
+    market_id: String,
+    condition_id: String,
+    token_ids: Vec<String>,
+    end_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PolymarketUniverseExclusion {
+    market_id: String,
+    reason_code: String,
+    retryable: bool,
+    retry_after: Option<DateTime<Utc>>,
+    observed_at: DateTime<Utc>,
 }
 
 #[derive(Deserialize)]
@@ -403,7 +454,7 @@ impl Config {
             Err(env::VarError::NotPresent) => None,
             Err(error) => return Err(error.into()),
         };
-        let polymarket_live = load_polymarket_live_config(&scope_id)?;
+        let polymarket_live = load_polymarket_live_config(&scope_id, &storage_root)?;
         let hyperliquid_shadow = load_hyperliquid_shadow_config()?;
         let python_workers = PythonWorkerConfig::load()?;
         if orders {
@@ -444,7 +495,44 @@ impl Config {
     }
 }
 
-fn load_polymarket_live_config(expected_scope_id: &str) -> Result<Option<PolymarketLiveConfig>> {
+fn load_polymarket_live_config(
+    expected_scope_id: &str,
+    storage_root: &Path,
+) -> Result<Option<PolymarketLiveConfig>> {
+    let configured = load_polymarket_live_config_from_env(expected_scope_id)?;
+    if configured.is_none() {
+        return Ok(None);
+    }
+    if env::var("MARKETCOW_POLYMARKET_IGNORE_PERSISTED_UNIVERSE").as_deref() == Ok("true") {
+        return Ok(configured);
+    }
+    let persisted_path = storage_root
+        .join("polymarket-universe-control")
+        .join("active-scope.json");
+    if !persisted_path.exists() {
+        return Ok(configured);
+    }
+    let persisted =
+        load_polymarket_scope_file(expected_scope_id, &persisted_path.to_string_lossy())?
+            .context("persisted Polymarket universe is empty")?;
+    let persisted_generation = persisted
+        .universe
+        .as_ref()
+        .context("persisted Polymarket activation is not a dynamic universe")?
+        .generation;
+    let configured_generation = configured
+        .as_ref()
+        .and_then(|live| live.universe.as_ref())
+        .map_or(0, |universe| universe.generation);
+    if persisted_generation < configured_generation {
+        bail!("persisted Polymarket universe generation regressed behind configured generation");
+    }
+    Ok(Some(persisted))
+}
+
+fn load_polymarket_live_config_from_env(
+    expected_scope_id: &str,
+) -> Result<Option<PolymarketLiveConfig>> {
     if env::var("MARKETCOW_POLYMARKET_LIVE_ENABLED").as_deref() != Ok("true") {
         return Ok(None);
     }
@@ -465,10 +553,13 @@ fn load_polymarket_live_config(expected_scope_id: &str) -> Result<Option<Polymar
                 catalog_revision: None,
                 catalog_frame: None,
                 scope_file_sha256: None,
+                scope_file_path: None,
                 source_manifest_sha256: None,
                 catalog_index_sha256: None,
                 catalog_sha256: None,
                 registry_sha256: None,
+                universe: None,
+                initial_book_frames: Vec::new(),
             }))
         }
         (None, Some(scope_path)) => load_polymarket_scope_file(expected_scope_id, &scope_path),
@@ -512,7 +603,8 @@ fn load_polymarket_scope_file_at(
     let scope_file_sha256 = hex::encode(Sha256::digest(&encoded));
     let scope: PolymarketLiveScopeFile = serde_json::from_slice(&encoded)
         .context("MARKETCOW_POLYMARKET_SCOPE_FILE must be valid JSON")?;
-    if scope.schema_version != "marketcow.polymarket.rust-live-scope.v3" {
+    let dynamic_universe = scope.schema_version == "marketcow.polymarket.rust-live-scope.v4";
+    if !dynamic_universe && scope.schema_version != "marketcow.polymarket.rust-live-scope.v3" {
         bail!("unsupported Polymarket Rust live scope schema");
     }
     if scope.scope_id != expected_scope_id {
@@ -593,6 +685,22 @@ fn load_polymarket_scope_file_at(
     if !relation_markets.is_subset(&markets) {
         bail!("Polymarket scope relation crosses the declared scope boundary");
     }
+    if dynamic_universe {
+        let universe = scope
+            .universe
+            .as_ref()
+            .context("dynamic Polymarket scope requires universe contract")?;
+        validate_polymarket_universe_contract(
+            universe,
+            &scope.scope_id,
+            &catalog,
+            &token_ids,
+            &scope.initial_book_frames,
+            activated_at,
+        )?;
+    } else if scope.universe.is_some() || !scope.initial_book_frames.is_empty() {
+        bail!("legacy Polymarket scope cannot carry dynamic universe fields");
+    }
     for digest in [
         &scope.source.manifest_sha256,
         &scope.source.catalog_index_sha256,
@@ -611,11 +719,186 @@ fn load_polymarket_scope_file_at(
         catalog_revision: Some(scope.catalog_revision),
         catalog_frame: Some(scope.catalog_frame),
         scope_file_sha256: Some(scope_file_sha256),
+        scope_file_path: Some(path.to_path_buf()),
         source_manifest_sha256: Some(scope.source.manifest_sha256.to_ascii_lowercase()),
         catalog_index_sha256: Some(scope.source.catalog_index_sha256.to_ascii_lowercase()),
         catalog_sha256: Some(scope.source.catalog_sha256.to_ascii_lowercase()),
         registry_sha256: Some(scope.source.registry_sha256.to_ascii_lowercase()),
+        universe: scope.universe,
+        initial_book_frames: scope.initial_book_frames,
     }))
+}
+
+fn validate_polymarket_universe_contract(
+    universe: &PolymarketUniverseContract,
+    scope_id: &str,
+    catalog: &PolymarketCatalogFrame,
+    token_ids: &[String],
+    initial_book_frames: &[serde_json::Value],
+    activated_at: DateTime<Utc>,
+) -> Result<()> {
+    if universe.schema_version != "marketcow.polymarket.universe.v1"
+        || universe.universe_id != scope_id
+        || universe.universe_id.len() != 64
+        || !universe
+            .universe_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || universe.generation == 0
+        || universe.minimum_market_count == 0
+        || universe.minimum_market_count > universe.target_market_count
+        || universe.target_market_count > 250
+        || universe.active_markets.len() < universe.minimum_market_count
+        || universe.active_markets.len() > universe.target_market_count
+        || !universe.filters.require_two_sided_books
+        || !universe.filters.require_complete_instrument_facts
+        || universe.filters.maximum_capital_lock_seconds == 0
+        || universe.validated_at > activated_at
+    {
+        bail!("dynamic Polymarket universe contract is invalid");
+    }
+    let catalog_by_market = catalog
+        .markets
+        .iter()
+        .map(|market| (market.market_id.as_str(), market))
+        .collect::<BTreeMap<_, _>>();
+    let active_ids = universe
+        .active_markets
+        .iter()
+        .map(|market| market.market_id.clone())
+        .collect::<BTreeSet<_>>();
+    if active_ids.len() != universe.active_markets.len()
+        || active_ids
+            != catalog_by_market
+                .keys()
+                .map(|value| (*value).to_owned())
+                .collect()
+    {
+        bail!("dynamic universe active markets do not exactly match its catalog");
+    }
+    for active in &universe.active_markets {
+        let market = catalog_by_market[active.market_id.as_str()];
+        let expected_tokens = market
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.token_id.clone())
+            .collect::<BTreeSet<_>>();
+        let declared_tokens = active.token_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let facts = market
+            .instrument_facts
+            .as_ref()
+            .context("dynamic universe market lacks instrument facts")?;
+        let maximum_end = universe.validated_at
+            + chrono::Duration::seconds(
+                i64::try_from(universe.filters.maximum_capital_lock_seconds)
+                    .context("maximum capital lock exceeds signed duration")?,
+            );
+        if active.condition_id != market.condition_id
+            || active.token_ids.len() != 2
+            || declared_tokens != expected_tokens
+            || active.end_at != facts.end_at
+            || active.end_at <= activated_at
+            || active.end_at > maximum_end
+        {
+            bail!("dynamic universe market identity or capital-lock boundary is invalid");
+        }
+    }
+    let added = universe
+        .added_markets
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let removed = universe
+        .removed_markets
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if added.len() != universe.added_markets.len()
+        || removed.len() != universe.removed_markets.len()
+        || !added.is_subset(&active_ids)
+        || !added.is_disjoint(&removed)
+    {
+        bail!("dynamic universe membership delta is invalid");
+    }
+    let added_identities = universe
+        .added_market_identities
+        .iter()
+        .map(|market| market.market_id.clone())
+        .collect::<BTreeSet<_>>();
+    let removed_identities = universe
+        .removed_market_identities
+        .iter()
+        .map(|market| market.market_id.clone())
+        .collect::<BTreeSet<_>>();
+    if added_identities != added
+        || removed_identities != removed
+        || universe.added_market_identities.iter().any(|identity| {
+            universe
+                .active_markets
+                .iter()
+                .find(|active| active.market_id == identity.market_id)
+                != Some(identity)
+        })
+        || universe.removed_market_identities.iter().any(|identity| {
+            identity.condition_id.is_empty()
+                || identity.token_ids.len() != 2
+                || identity.token_ids.iter().collect::<BTreeSet<_>>().len() != 2
+        })
+    {
+        bail!("dynamic universe membership identities are incomplete");
+    }
+    const EXCLUSION_REASONS: &[&str] = &[
+        "market_expired",
+        "market_not_found",
+        "one_sided_book",
+        "token_missing",
+        "book_missing",
+        "instrument_facts_missing",
+        "instrument_facts_invalid",
+        "capital_lock_exceeded",
+        "fee_facts_unavailable",
+        "target_capacity",
+    ];
+    let mut excluded_ids = BTreeSet::new();
+    for excluded in &universe.excluded_markets {
+        if excluded.market_id.is_empty()
+            || active_ids.contains(&excluded.market_id)
+            || !excluded_ids.insert(excluded.market_id.clone())
+            || !EXCLUSION_REASONS.contains(&excluded.reason_code.as_str())
+            || excluded.retryable != excluded.retry_after.is_some()
+            || excluded
+                .retry_after
+                .is_some_and(|retry_after| retry_after <= excluded.observed_at)
+        {
+            bail!("dynamic universe exclusion is invalid");
+        }
+    }
+    let expected_tokens = token_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut book_tokens = BTreeSet::new();
+    for frame in initial_book_frames {
+        let token_id = frame
+            .get("asset_id")
+            .or_else(|| frame.get("token_id"))
+            .and_then(serde_json::Value::as_str)
+            .context("dynamic universe initial book lacks token identity")?;
+        let bids = frame.get("bids").and_then(serde_json::Value::as_array);
+        let asks = frame.get("asks").and_then(serde_json::Value::as_array);
+        if frame.get("event_type").and_then(serde_json::Value::as_str) != Some("book")
+            || frame
+                .get("tick_size")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+            || bids.is_none_or(Vec::is_empty)
+            || asks.is_none_or(Vec::is_empty)
+            || !book_tokens.insert(token_id.to_owned())
+        {
+            bail!("dynamic universe initial books must be unique and two-sided");
+        }
+    }
+    if book_tokens != expected_tokens {
+        bail!("dynamic universe initial books do not exactly cover active tokens");
+    }
+    Ok(())
 }
 
 fn load_hyperliquid_shadow_config() -> Result<Option<HyperliquidShadowConfig>> {
@@ -723,7 +1006,6 @@ struct AppState {
 
 struct PolymarketScopeSwitchRequest {
     live: PolymarketLiveConfig,
-    runtime: marketcow_runtime::PolymarketRuntime,
     response: tokio::sync::oneshot::Sender<Result<PolymarketScopeSwitchReceipt, String>>,
 }
 
@@ -733,6 +1015,9 @@ struct PolymarketScopeSwitchReceipt {
     active_scope_id: String,
     boundary_cursor: u64,
     scope_file_sha256: String,
+    universe_id: Option<String>,
+    previous_generation: Option<u64>,
+    active_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -2664,8 +2949,18 @@ fn start_polymarket_live(
                         };
                         let _ = transport_shutdown_tx.send(true);
                         let _ = (&mut transport).await;
-                        let PolymarketScopeSwitchRequest { live: requested_live, runtime, response } = request;
-                        match commit_polymarket_scope_switch(&state, &live, requested_live, runtime).await {
+                        let PolymarketScopeSwitchRequest { live: requested_live, response } = request;
+                        let candidate = prepare_polymarket_scope_candidate(&state, &live, &requested_live).await;
+                        let result = match candidate {
+                            Ok(runtime) => commit_polymarket_scope_switch(
+                                &state,
+                                &live,
+                                requested_live,
+                                runtime,
+                            ).await,
+                            Err(error) => Err(error),
+                        };
+                        match result {
                             Ok((activated, receipt)) => {
                                 live = activated;
                                 info!(scope_id=%live.scope_id, boundary_cursor=receipt.boundary_cursor, "polymarket_scope_activated");
@@ -2769,14 +3064,54 @@ fn start_polymarket_live(
 async fn commit_polymarket_scope_switch(
     state: &AppState,
     current: &PolymarketLiveConfig,
-    activated: PolymarketLiveConfig,
+    mut activated: PolymarketLiveConfig,
     candidate_runtime: marketcow_runtime::PolymarketRuntime,
 ) -> Result<(PolymarketLiveConfig, PolymarketScopeSwitchReceipt), String> {
     let previous_cursor = state.projection.load().cursor;
     let same_scope = current.scope_id == activated.scope_id;
+    if let Some(universe) = activated.universe.as_ref() {
+        let candidate = candidate_runtime.projection();
+        if candidate.cursor <= previous_cursor
+            || !candidate.ready
+            || !candidate.instrument_ticks_consistent()
+            || !projection_matches_polymarket_scope(&activated, &candidate, true)
+        {
+            return Err("universe_candidate_not_atomic_ready".into());
+        }
+        if universe.generation
+            != current
+                .universe
+                .as_ref()
+                .map_or(0, |value| value.generation)
+                .saturating_add(1)
+        {
+            return Err("universe_generation_not_monotonic".into());
+        }
+    }
     checkpoint_polymarket_runtime(state)
         .await
         .map_err(|error| format!("old_scope_checkpoint_failed:{error}"))?;
+    if let Some(universe) = activated.universe.clone() {
+        activated.scope_file_path = Some(
+            persist_active_polymarket_universe(state, &activated)
+                .map_err(|error| format!("universe_activation_persist_failed:{error}"))?,
+        );
+        state
+            .audit
+            .record_lifecycle(
+                "polymarket_universe",
+                "generation_prepared",
+                json!({
+                    "universe_id":universe.universe_id,
+                    "generation":universe.generation,
+                    "added_markets":universe.added_markets,
+                    "removed_markets":universe.removed_markets,
+                    "scope_file_sha256":activated.scope_file_sha256,
+                    "real_order_submission_enabled":false
+                }),
+            )
+            .map_err(|error| format!("universe_activation_audit_failed:{error}"))?;
+    }
     let previous_scope_id = current.scope_id.clone();
     let mut runtime = state.runtime.lock().await;
     *runtime = candidate_runtime;
@@ -2802,6 +3137,20 @@ async fn commit_polymarket_scope_switch(
     state
         .active_polymarket_scope
         .store(Some(Arc::new(activated.clone())));
+    if let Some(universe) = activated.universe.as_ref()
+        && let Err(error) = state.audit.record_lifecycle(
+            "polymarket_universe",
+            "generation_activated",
+            json!({
+                "universe_id":universe.universe_id,
+                "generation":universe.generation,
+                "boundary_cursor":state.projection.load().cursor,
+                "real_order_submission_enabled":false
+            }),
+        )
+    {
+        warn!(error=%error, "polymarket_universe_activation_audit_failed");
+    }
     // A same-scope artifact refresh (for example, a fee schedule revision) preserves the cursor
     // domain. Publish its catalog event after the atomic projection swap so existing consumers
     // either apply the new generation or fail closed on a cursor gap. Different scope IDs are
@@ -2815,8 +3164,52 @@ async fn commit_polymarket_scope_switch(
         active_scope_id: activated.scope_id.clone(),
         boundary_cursor,
         scope_file_sha256: activated.scope_file_sha256.clone().unwrap_or_default(),
+        universe_id: activated
+            .universe
+            .as_ref()
+            .map(|value| value.universe_id.clone()),
+        previous_generation: current.universe.as_ref().map(|value| value.generation),
+        active_generation: activated.universe.as_ref().map(|value| value.generation),
     };
     Ok((activated, receipt))
+}
+
+fn persist_active_polymarket_universe(
+    state: &AppState,
+    activated: &PolymarketLiveConfig,
+) -> Result<PathBuf> {
+    let source = activated
+        .scope_file_path
+        .as_ref()
+        .context("dynamic universe artifact source path is missing")?;
+    let bytes = fs::read(source).context("failed to read dynamic universe artifact")?;
+    let digest = hex::encode(Sha256::digest(&bytes));
+    if activated
+        .scope_file_sha256
+        .as_ref()
+        .is_none_or(|expected| !digest.eq_ignore_ascii_case(expected))
+    {
+        bail!("dynamic universe artifact hash changed before activation");
+    }
+    let directory = state
+        .config
+        .storage_root
+        .join("polymarket-universe-control");
+    fs::create_dir_all(&directory)?;
+    let destination = directory.join("active-scope.json");
+    let temporary = directory.join(format!(".active-scope.{}.tmp", Uuid::new_v4()));
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary)?;
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    drop(output);
+    fs::rename(&temporary, &destination)?;
+    File::open(&directory)?.sync_all()?;
+    Ok(destination)
 }
 
 fn projection_matches_polymarket_scope(
@@ -2871,17 +3264,24 @@ fn seed_polymarket_scope_catalog(
         return Ok(());
     };
     let projection = runtime.projection();
-    if projection_matches_polymarket_scope(live, &projection, false) {
+    let require_books = live.universe.is_some();
+    if projection_matches_polymarket_scope(live, &projection, require_books) {
         return Ok(());
     }
     if projection.catalog_revision.is_some()
         && !projection_catalog_identity_matches_scope(live, &projection)
+        && live.universe.is_none()
     {
         bail!("persisted Polymarket catalog does not match configured exact scope");
     }
-    runtime.apply_raw(catalog_frame.clone(), Utc::now())?;
+    if live.universe.is_none() || !projection_catalog_identity_matches_scope(live, &projection) {
+        runtime.apply_raw(catalog_frame.clone(), Utc::now())?;
+    }
+    for frame in &live.initial_book_frames {
+        runtime.apply_raw(frame.clone(), Utc::now())?;
+    }
     let projection = runtime.projection();
-    if !projection_matches_polymarket_scope(live, &projection, false) {
+    if !projection_matches_polymarket_scope(live, &projection, require_books) {
         bail!("Polymarket catalog seed failed exact-scope validation");
     }
     runtime.checkpoint()?;
@@ -2963,8 +3363,12 @@ async fn wait_for_polymarket_retry_or_scope_recovery(
                 }
             }
             request = scope_switches.recv() => {
-                let PolymarketScopeSwitchRequest { live, runtime, response } = request?;
-                match commit_polymarket_scope_switch(state, current, live, runtime).await {
+                let PolymarketScopeSwitchRequest { live, response } = request?;
+                let candidate = prepare_polymarket_scope_candidate(state, current, &live).await;
+                match match candidate {
+                    Ok(runtime) => commit_polymarket_scope_switch(state, current, live, runtime).await,
+                    Err(error) => Err(error),
+                } {
                     Ok((activated, receipt)) => {
                         info!(scope_id=%activated.scope_id, boundary_cursor=receipt.boundary_cursor, "polymarket_scope_recovered");
                         let _ = response.send(Ok(receipt));
@@ -3127,7 +3531,17 @@ async fn serve() -> Result<()> {
 }
 
 fn runtime_config(config: &Config, config_revision: &str) -> marketcow_runtime::RuntimeConfig {
-    let root = if config
+    let root = if let Some(universe) = config
+        .polymarket_live
+        .as_ref()
+        .and_then(|live| live.universe.as_ref())
+    {
+        config
+            .storage_root
+            .join("polymarket-universes")
+            .join(&universe.universe_id)
+            .join(format!("generation-{:020}", universe.generation))
+    } else if config
         .polymarket_live
         .as_ref()
         .is_some_and(|live| live.scope_file_sha256.is_some())
@@ -5536,13 +5950,29 @@ async fn readiness(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn scope(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let projection = state.projection.load_full();
+async fn scope(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+) -> Response {
+    let Some((projection, live)) = polymarket_atomic_view(&state) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_generation_transition_in_progress",
+            true,
+            &request_id,
+        );
+    };
     let ready = polymarket_projection_ready(&state, &projection);
-    let live = state.active_polymarket_scope.load_full();
+    let universe = live.as_ref().and_then(|value| value.universe.clone());
     Json(json!({
-        "schema_version":"marketcow.polymarket.scope-discovery.v2",
+        "schema_version":if universe.is_some() {
+            "marketcow.polymarket.scope-discovery.v3"
+        } else {
+            "marketcow.polymarket.scope-discovery.v2"
+        },
         "active_scope_id":projection.scope_id,
+        "universe_id":universe.as_ref().map(|value| value.universe_id.clone()),
+        "generation":universe.as_ref().map(|value| value.generation),
         "scope_status":if ready { "ready" } else { "unready" },
         "mode":"shadow",
         "ready":ready,
@@ -5550,8 +5980,16 @@ async fn scope(State(state): State<AppState>) -> Json<serde_json::Value> {
         "token_count":live.as_ref().map(|value| value.token_ids.len()),
         "catalog_revision":live.as_ref().and_then(|value| value.catalog_revision.clone()),
         "boundary_cursor":projection.cursor,
+        "target_market_count":universe.as_ref().map(|value| value.target_market_count),
+        "minimum_market_count":universe.as_ref().map(|value| value.minimum_market_count),
+        "active_markets":universe.as_ref().map(|value| value.active_markets.clone()),
+        "added_markets":universe.as_ref().map(|value| value.added_markets.clone()),
+        "removed_markets":universe.as_ref().map(|value| value.removed_markets.clone()),
+        "excluded_markets":universe.as_ref().map(|value| value.excluded_markets.clone()),
+        "filters":universe.as_ref().map(|value| value.filters.clone()),
         "real_order_submission_enabled":false,
     }))
+    .into_response()
 }
 
 async fn live_snapshot(
@@ -5637,7 +6075,14 @@ async fn live_full_sync(
     State(state): State<AppState>,
     Extension(request_id): Extension<String>,
 ) -> Response {
-    let projection = state.projection.load_full();
+    let Some((projection, live)) = polymarket_atomic_view(&state) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_generation_transition_in_progress",
+            true,
+            &request_id,
+        );
+    };
     if !polymarket_projection_ready(&state, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5646,7 +6091,21 @@ async fn live_full_sync(
             &request_id,
         );
     }
-    Json(marketcow_api::full_sync(&projection)).into_response()
+    let mut payload = serde_json::to_value(marketcow_api::full_sync(&projection))
+        .expect("full-sync response serializes");
+    if let Some(universe) = live.as_ref().and_then(|value| value.universe.clone()) {
+        let object = payload
+            .as_object_mut()
+            .expect("full-sync response is an object");
+        object.insert(
+            "universe_schema_version".into(),
+            json!("marketcow.polymarket.universe.v1"),
+        );
+        object.insert("universe_id".into(), json!(universe.universe_id));
+        object.insert("universe_generation".into(), json!(universe.generation));
+        object.insert("universe".into(), json!(universe));
+    }
+    Json(payload).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5762,6 +6221,10 @@ async fn serve_market_data_stream(
     let _guard = StreamClientGuard(state.metrics.clone());
     let boundary = projection.cursor;
     let subscription_scope_id = projection.scope_id.clone();
+    let subscription_universe = state
+        .active_polymarket_scope
+        .load_full()
+        .and_then(|live| live.universe.clone());
     let mut last_cursor = after_cursor.unwrap_or(boundary);
 
     if let Some(resume_cursor) = after_cursor {
@@ -5843,6 +6306,15 @@ async fn serve_market_data_stream(
                 Ok(record) if record.event.cursor <= last_cursor => {}
                 Ok(record) => {
                     let current = state.projection.load_full();
+                    if let Some(frame) = polymarket_universe_change_frame(
+                        &state,
+                        subscription_universe.as_ref(),
+                        current.cursor,
+                    ) {
+                        let _ = send_stream_frame(&mut socket, &frame).await;
+                        close_stream(&mut socket, close_code::POLICY, "full_sync_required").await;
+                        return;
+                    }
                     if current.scope_id != subscription_scope_id {
                         send_resync_and_close(&mut socket, &state, last_cursor, "scope_changed")
                             .await;
@@ -5889,6 +6361,15 @@ async fn serve_market_data_stream(
             },
             Next::FreshnessCheck => {
                 let current = state.projection.load_full();
+                if let Some(frame) = polymarket_universe_change_frame(
+                    &state,
+                    subscription_universe.as_ref(),
+                    current.cursor,
+                ) {
+                    let _ = send_stream_frame(&mut socket, &frame).await;
+                    close_stream(&mut socket, close_code::POLICY, "full_sync_required").await;
+                    return;
+                }
                 if current.scope_id != subscription_scope_id {
                     send_resync_and_close(&mut socket, &state, last_cursor, "scope_changed").await;
                     return;
@@ -5906,6 +6387,33 @@ async fn serve_market_data_stream(
             }
         }
     }
+}
+
+fn polymarket_universe_change_frame(
+    state: &AppState,
+    subscribed: Option<&PolymarketUniverseContract>,
+    boundary_cursor: u64,
+) -> Option<marketcow_api::StreamFrame> {
+    let current = state
+        .active_polymarket_scope
+        .load_full()?
+        .universe
+        .clone()?;
+    let old_generation = subscribed.map_or(0, |universe| universe.generation);
+    if subscribed.is_some_and(|universe| {
+        universe.universe_id == current.universe_id && universe.generation == current.generation
+    }) {
+        return None;
+    }
+    Some(marketcow_api::stream_universe_changed(
+        &current.universe_id,
+        boundary_cursor,
+        current.universe_id.clone(),
+        old_generation,
+        current.generation,
+        current.added_markets,
+        current.removed_markets,
+    ))
 }
 
 enum StreamSendError {
@@ -6003,6 +6511,100 @@ fn runtime_config_for_dynamic_scope(
     }
 }
 
+fn validate_polymarket_universe_transition(
+    current: &PolymarketLiveConfig,
+    activated: &PolymarketLiveConfig,
+) -> std::result::Result<(), String> {
+    let Some(next) = activated.universe.as_ref() else {
+        return Ok(());
+    };
+    if activated.scope_id != next.universe_id || current.scope_id != activated.scope_id {
+        return Err("universe_identity_changed".into());
+    }
+    let previous_generation = current
+        .universe
+        .as_ref()
+        .map_or(0, |universe| universe.generation);
+    if next.generation != previous_generation.saturating_add(1) {
+        return Err("universe_generation_not_monotonic".into());
+    }
+    let previous = current.market_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let active = activated
+        .market_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_added = active
+        .difference(&previous)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_removed = previous
+        .difference(&active)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if next.added_markets.iter().cloned().collect::<BTreeSet<_>>() != expected_added
+        || next
+            .removed_markets
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected_removed
+    {
+        return Err("universe_membership_delta_mismatch".into());
+    }
+    Ok(())
+}
+
+async fn prepare_polymarket_scope_candidate(
+    state: &AppState,
+    current: &PolymarketLiveConfig,
+    activated: &PolymarketLiveConfig,
+) -> std::result::Result<marketcow_runtime::PolymarketRuntime, String> {
+    validate_polymarket_universe_transition(current, activated)?;
+    let mut runtime = if let Some(universe) = activated.universe.as_ref() {
+        let root = state
+            .config
+            .storage_root
+            .join("polymarket-universes")
+            .join(&universe.universe_id)
+            .join(format!("generation-{:020}", universe.generation));
+        let config = marketcow_runtime::RuntimeConfig {
+            root,
+            scope_id: activated.scope_id.clone(),
+            config_revision: state.control_plane.config_revision.clone(),
+            wal_segment_bytes: 256 * 1024 * 1024,
+            recent_event_capacity: 10_000,
+        };
+        state
+            .runtime
+            .lock()
+            .await
+            .fork_candidate(config)
+            .map_err(|error| format!("universe_candidate_fork_failed:{error}"))?
+    } else {
+        marketcow_runtime::PolymarketRuntime::open(runtime_config_for_dynamic_scope(
+            &state.config,
+            &state.control_plane.config_revision,
+            &activated.scope_id,
+        ))
+        .map_err(|error| format!("scope_runtime_open_failed:{error}"))?
+    };
+    seed_polymarket_scope_catalog(&mut runtime, Some(activated))
+        .map_err(|error| format!("scope_catalog_seed_failed:{error}"))?;
+    let projection = runtime.projection();
+    if activated.universe.is_some()
+        && (!projection.ready
+            || !projection.instrument_ticks_consistent()
+            || !projection_matches_polymarket_scope(activated, &projection, true))
+    {
+        return Err("universe_candidate_not_ready".into());
+    }
+    runtime
+        .checkpoint()
+        .map_err(|error| format!("universe_candidate_checkpoint_failed:{error}"))?;
+    Ok(runtime)
+}
+
 async fn admin_activate_polymarket_scope(
     State(state): State<AppState>,
     Extension(request_id): Extension<String>,
@@ -6064,7 +6666,11 @@ async fn admin_activate_polymarket_scope(
         && active.scope_file_sha256 == live.scope_file_sha256
     {
         return Json(json!({
-            "schema_version":"marketcow.polymarket.scope-activation-receipt.v1",
+            "schema_version":if active.universe.is_some() {
+                "marketcow.polymarket.universe-activation-receipt.v1"
+            } else {
+                "marketcow.polymarket.scope-activation-receipt.v1"
+            },
             "status":"already_active",
             "active_scope_id":active.scope_id,
             "boundary_cursor":state.projection.load().cursor,
@@ -6073,35 +6679,10 @@ async fn admin_activate_polymarket_scope(
         }))
         .into_response();
     }
-    let mut runtime =
-        match marketcow_runtime::PolymarketRuntime::open(runtime_config_for_dynamic_scope(
-            &state.config,
-            &state.control_plane.config_revision,
-            &live.scope_id,
-        )) {
-            Ok(runtime) => runtime,
-            Err(_) => {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "scope_runtime_open_failed",
-                    true,
-                    &request_id,
-                );
-            }
-        };
-    if seed_polymarket_scope_catalog(&mut runtime, Some(&live)).is_err() {
-        return error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "scope_catalog_seed_failed",
-            false,
-            &request_id,
-        );
-    }
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     if sender
         .try_send(PolymarketScopeSwitchRequest {
             live,
-            runtime,
             response: response_tx,
         })
         .is_err()
@@ -6115,12 +6696,23 @@ async fn admin_activate_polymarket_scope(
     }
     match tokio::time::timeout(Duration::from_secs(10), response_rx).await {
         Ok(Ok(Ok(receipt))) => Json(json!({
-            "schema_version":"marketcow.polymarket.scope-activation-receipt.v1",
-            "status":"activated_unready",
+            "schema_version":if receipt.active_generation.is_some() {
+                "marketcow.polymarket.universe-activation-receipt.v1"
+            } else {
+                "marketcow.polymarket.scope-activation-receipt.v1"
+            },
+            "status":if receipt.active_generation.is_some() {
+                "activated_ready"
+            } else {
+                "activated_unready"
+            },
             "previous_scope_id":receipt.previous_scope_id,
             "active_scope_id":receipt.active_scope_id,
             "boundary_cursor":receipt.boundary_cursor,
             "scope_file_sha256":receipt.scope_file_sha256,
+            "universe_id":receipt.universe_id,
+            "previous_generation":receipt.previous_generation,
+            "active_generation":receipt.active_generation,
             "full_sync_required":true,
             "real_order_submission_enabled":false,
         }))
@@ -6663,6 +7255,34 @@ fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Pr
                 live.catalog_frame.is_none()
                     || projection_matches_polymarket_scope(live, projection, true)
             })
+}
+
+fn polymarket_atomic_view(
+    state: &AppState,
+) -> Option<(
+    Arc<marketcow_core::Projection>,
+    Option<Arc<PolymarketLiveConfig>>,
+)> {
+    for _ in 0..3 {
+        let before = state.active_polymarket_scope.load_full();
+        let projection = state.projection.load_full();
+        let after = state.active_polymarket_scope.load_full();
+        let same_config = match (&before, &after) {
+            (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+            (None, None) => true,
+            _ => false,
+        };
+        if same_config
+            && after.as_ref().is_none_or(|live| {
+                live.scope_id == projection.scope_id
+                    && (live.catalog_frame.is_none()
+                        || projection_catalog_identity_matches_scope(live, &projection))
+            })
+        {
+            return Some((projection, after));
+        }
+    }
+    None
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
@@ -7734,11 +8354,318 @@ mod tests {
                 "negative_risk_relations":[]
             })),
             scope_file_sha256: Some("a".repeat(64)),
+            scope_file_path: None,
             source_manifest_sha256: Some("b".repeat(64)),
             catalog_index_sha256: Some("c".repeat(64)),
             catalog_sha256: Some("d".repeat(64)),
             registry_sha256: Some("e".repeat(64)),
+            universe: None,
+            initial_book_frames: Vec::new(),
         }
+    }
+
+    fn dynamic_universe_live(
+        universe_id: &str,
+        generation: u64,
+        market_id: &str,
+        yes: &str,
+        no: &str,
+        previous_market: Option<&str>,
+    ) -> PolymarketLiveConfig {
+        let mut live = dynamic_live_scope(universe_id, market_id, yes, no);
+        live.initial_book_frames = vec![yes, no]
+            .into_iter()
+            .map(|token| {
+                json!({
+                    "event_type":"book",
+                    "asset_id":token,
+                    "tick_size":"0.01",
+                    "bids":[{"price":"0.40","size":"10"}],
+                    "asks":[{"price":"0.60","size":"10"}],
+                    "timestamp":"2026-08-29T00:00:00Z"
+                })
+            })
+            .collect();
+        let active_identity = PolymarketUniverseMarket {
+            market_id: market_id.into(),
+            condition_id: format!("condition-{market_id}"),
+            token_ids: vec![yes.into(), no.into()],
+            end_at: "2027-01-01T00:00:00Z".parse().unwrap(),
+        };
+        let removed_identities = previous_market
+            .filter(|previous| *previous != market_id)
+            .map_or_else(Vec::new, |previous| {
+                vec![PolymarketUniverseMarket {
+                    market_id: previous.into(),
+                    condition_id: format!("condition-{previous}"),
+                    token_ids: vec!["10".into(), "20".into()],
+                    end_at: "2027-01-01T00:00:00Z".parse().unwrap(),
+                }]
+            });
+        live.universe = Some(PolymarketUniverseContract {
+            schema_version: "marketcow.polymarket.universe.v1".into(),
+            universe_id: universe_id.into(),
+            generation,
+            target_market_count: 1,
+            minimum_market_count: 1,
+            filters: PolymarketUniverseFilters {
+                require_two_sided_books: true,
+                require_complete_instrument_facts: true,
+                maximum_capital_lock_seconds: 365 * 24 * 60 * 60,
+            },
+            active_markets: vec![active_identity.clone()],
+            added_markets: previous_market
+                .is_none_or(|previous| previous != market_id)
+                .then(|| market_id.into())
+                .into_iter()
+                .collect(),
+            removed_markets: previous_market
+                .filter(|previous| *previous != market_id)
+                .map_or_else(Vec::new, |previous| vec![previous.into()]),
+            added_market_identities: previous_market
+                .is_none_or(|previous| previous != market_id)
+                .then_some(active_identity)
+                .into_iter()
+                .collect(),
+            removed_market_identities: removed_identities,
+            excluded_markets: Vec::new(),
+            validated_at: "2026-08-29T00:00:00Z".parse().unwrap(),
+        });
+        live
+    }
+
+    #[test]
+    fn dynamic_universe_transition_is_monotonic_and_delta_exact() {
+        let universe_id = "a".repeat(64);
+        let current = dynamic_universe_live(&universe_id, 1, "1", "10", "20", None);
+        let next = dynamic_universe_live(&universe_id, 2, "2", "30", "40", Some("1"));
+        validate_polymarket_universe_transition(&current, &next).unwrap();
+
+        let mut skipped = next.clone();
+        skipped.universe.as_mut().unwrap().generation = 3;
+        assert_eq!(
+            validate_polymarket_universe_transition(&current, &skipped),
+            Err("universe_generation_not_monotonic".into())
+        );
+        let mut mixed = next;
+        mixed.universe.as_mut().unwrap().removed_markets.clear();
+        assert_eq!(
+            validate_polymarket_universe_transition(&current, &mixed),
+            Err("universe_membership_delta_mismatch".into())
+        );
+    }
+
+    fn write_dynamic_universe_scope(path: &Path, live: &PolymarketLiveConfig) -> String {
+        let payload = json!({
+            "schema_version":"marketcow.polymarket.rust-live-scope.v4",
+            "scope_id":live.scope_id,
+            "market_count":live.market_count,
+            "token_count":live.token_ids.len(),
+            "market_ids":live.market_ids,
+            "token_ids":live.token_ids,
+            "catalog_revision":live.catalog_revision,
+            "catalog_frame":live.catalog_frame,
+            "universe":live.universe,
+            "initial_book_frames":live.initial_book_frames,
+            "source":{
+                "manifest_sha256":"b".repeat(64),
+                "catalog_index_sha256":"c".repeat(64),
+                "catalog_sha256":"d".repeat(64),
+                "registry_sha256":"e".repeat(64)
+            }
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        fs::write(path, &bytes).unwrap();
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn dynamic_universe_scope_v4_is_strict_and_restart_pinned() {
+        let (dir, mut state) = test_state();
+        let universe_id = "c".repeat(64);
+        let live = dynamic_universe_live(&universe_id, 1, "1", "10", "20", None);
+        let source = dir.path().join("generation-1.json");
+        let digest = write_dynamic_universe_scope(&source, &live);
+        let loaded = load_polymarket_scope_file_at(
+            &universe_id,
+            &source.to_string_lossy(),
+            "2026-08-29T00:00:01Z".parse().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.scope_file_sha256.as_deref(), Some(digest.as_str()));
+        assert_eq!(loaded.universe.as_ref().unwrap().generation, 1);
+        assert_eq!(loaded.initial_book_frames.len(), 2);
+
+        state.config.scope_id = universe_id.clone();
+        state.config.polymarket_live = Some(loaded.clone());
+        let persisted = persist_active_polymarket_universe(&state, &loaded).unwrap();
+        assert_eq!(fs::read(&persisted).unwrap(), fs::read(&source).unwrap());
+        assert_eq!(
+            runtime_config(&state.config, "config-v1").root,
+            dir.path()
+                .join("polymarket-universes")
+                .join(&universe_id)
+                .join("generation-00000000000000000001")
+        );
+
+        let mut invalid = live;
+        invalid.initial_book_frames[0]["asks"] = json!([]);
+        let invalid_path = dir.path().join("invalid-generation.json");
+        write_dynamic_universe_scope(&invalid_path, &invalid);
+        assert!(
+            load_polymarket_scope_file_at(
+                &universe_id,
+                &invalid_path.to_string_lossy(),
+                "2026-08-29T00:00:01Z".parse().unwrap(),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_universe_candidate_isolated_ready_and_cursor_contiguous() {
+        let (dir, state) = test_state();
+        let universe_id = "b".repeat(64);
+        let current = dynamic_universe_live(&universe_id, 1, "1", "10", "20", None);
+        let mut runtime =
+            marketcow_runtime::PolymarketRuntime::open(marketcow_runtime::RuntimeConfig {
+                root: dir.path().join("active-universe"),
+                scope_id: universe_id.clone(),
+                config_revision: "test-config-v1".into(),
+                wal_segment_bytes: 1_024,
+                recent_event_capacity: 100,
+            })
+            .unwrap();
+        seed_polymarket_scope_catalog(&mut runtime, Some(&current)).unwrap();
+        let current_projection = runtime.projection();
+        assert!(current_projection.ready);
+        let current_cursor = current_projection.cursor;
+        *state.runtime.lock().await = runtime;
+        state.projection.store(current_projection);
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(current.clone())));
+
+        let next = dynamic_universe_live(&universe_id, 2, "2", "30", "40", Some("1"));
+        let candidate = prepare_polymarket_scope_candidate(&state, &current, &next)
+            .await
+            .unwrap();
+        let candidate_projection = candidate.projection();
+        assert!(candidate_projection.ready);
+        assert!(candidate_projection.cursor > current_cursor);
+        assert_eq!(
+            candidate_projection.markets.keys().collect::<Vec<_>>(),
+            vec!["2"]
+        );
+        assert_eq!(candidate_projection.books.len(), 2);
+        assert!(
+            dir.path()
+                .join("polymarket-universes")
+                .join(&universe_id)
+                .join("generation-00000000000000000002")
+                .join("checkpoint-manifest.json")
+                .exists()
+        );
+        let expected_hash = candidate_projection.hash();
+        let expected_cursor = candidate_projection.cursor;
+        drop(candidate);
+        let mut restart_config = state.config.clone();
+        restart_config.scope_id = universe_id.clone();
+        restart_config.polymarket_live = Some(next.clone());
+        let recovered = marketcow_runtime::PolymarketRuntime::open(runtime_config(
+            &restart_config,
+            "test-config-v1",
+        ))
+        .unwrap();
+        assert_eq!(recovered.projection().cursor, expected_cursor);
+        assert_eq!(recovered.projection().hash(), expected_hash);
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(next.clone())));
+        assert!(polymarket_atomic_view(&state).is_none());
+        let mixed = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/full-sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(current.clone())));
+        state.projection.store(candidate_projection);
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(next.clone())));
+        let control = polymarket_universe_change_frame(
+            &state,
+            current.universe.as_ref(),
+            state.projection.load().cursor,
+        )
+        .expect("generation change must force an explicit resync control frame");
+        assert!(matches!(
+            control.payload,
+            marketcow_api::StreamPayload::UniverseChanged {
+                old_generation: 1,
+                new_generation: 2,
+                full_sync_required: true,
+                ..
+            }
+        ));
+        let scope_response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/scope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scope_response.status(), StatusCode::OK);
+        let scope_body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(scope_response.into_body(), 32_768).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            scope_body["schema_version"],
+            "marketcow.polymarket.scope-discovery.v3"
+        );
+        assert_eq!(scope_body["universe_id"], universe_id);
+        assert_eq!(scope_body["generation"], 2);
+        assert_eq!(scope_body["active_markets"][0]["market_id"], "2");
+        assert_eq!(scope_body["added_markets"], json!(["2"]));
+        assert_eq!(scope_body["removed_markets"], json!(["1"]));
+
+        let full_sync = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/full-sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full_sync.status(), StatusCode::OK);
+        let full_sync: serde_json::Value =
+            serde_json::from_slice(&to_bytes(full_sync.into_body(), 128 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            full_sync["universe_schema_version"],
+            "marketcow.polymarket.universe.v1"
+        );
+        assert_eq!(full_sync["universe_generation"], 2);
+        assert_eq!(
+            full_sync["boundary_cursor"],
+            full_sync["checkpoint"]["checkpoint_cursor"]
+        );
+        assert_eq!(
+            full_sync["snapshot"]["markets"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(full_sync["snapshot"]["books"].as_array().unwrap().len(), 2);
     }
 
     #[test]

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from scripts.migration.build_polymarket_rust_scope import build_scope, write_atomic_json
+from scripts.migration.build_polymarket_dynamic_universe import build_dynamic_universe
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
@@ -232,5 +233,83 @@ def test_build_scope_fails_closed_outside_fee_effective_interval(tmp_path: Path)
             registry,
             expected_market_count=2,
             expected_token_count=4,
+            validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+
+
+def _books(tmp_path: Path, *, one_sided: set[str] | None = None) -> Path:
+    one_sided = one_sided or set()
+    path = tmp_path / "books.json"
+    path.write_text(json.dumps({"books": [{
+        "event_type": "book",
+        "asset_id": token,
+        "tick_size": "0.01",
+        "bids": [{"price": "0.40", "size": "10"}],
+        "asks": [] if token in one_sided else [{"price": "0.60", "size": "10"}],
+        "timestamp": "2026-08-29T00:00:00Z",
+    } for token in ("10", "20", "30", "40")]}))
+    return path
+
+
+def test_dynamic_universe_isolates_failure_and_atomically_replenishes(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    result = build_dynamic_universe(
+        manifest, index, catalog, registry, _books(tmp_path, one_sided={"10"}),
+        universe_id="a" * 64,
+        generation=7,
+        target_market_count=1,
+        minimum_market_count=1,
+        maximum_capital_lock_seconds=365 * 24 * 60 * 60,
+        previous_market_ids=["1"],
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    assert result["schema_version"] == "marketcow.polymarket.rust-live-scope.v4"
+    assert result["scope_id"] == "a" * 64
+    assert result["market_ids"] == ["2"]
+    assert result["universe"]["generation"] == 7
+    assert result["universe"]["added_markets"] == ["2"]
+    assert result["universe"]["removed_markets"] == ["1"]
+    assert result["universe"]["removed_market_identities"] == [{
+        "market_id": "1",
+        "condition_id": "condition-1",
+        "token_ids": ["10", "20"],
+        "end_at": "2027-01-01T00:00:00Z",
+    }]
+    assert result["universe"]["excluded_markets"][0]["reason_code"] == "one_sided_book"
+    assert len(result["initial_book_frames"]) == 2
+
+
+def test_dynamic_universe_records_capacity_exclusion(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    result = build_dynamic_universe(
+        manifest, index, catalog, registry, _books(tmp_path),
+        universe_id="b" * 64,
+        generation=1,
+        target_market_count=1,
+        minimum_market_count=1,
+        maximum_capital_lock_seconds=365 * 24 * 60 * 60,
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    assert result["market_ids"] == ["2"]  # ranked manifest order is [2, 1]
+    assert result["universe"]["excluded_markets"] == [{
+        "market_id": "1",
+        "reason_code": "target_capacity",
+        "retryable": False,
+        "retry_after": None,
+        "observed_at": "2026-08-29T00:00:00Z",
+    }]
+
+
+def test_dynamic_universe_fails_closed_below_minimum(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    with pytest.raises(ValueError, match="below minimum"):
+        build_dynamic_universe(
+            manifest, index, catalog, registry,
+            _books(tmp_path, one_sided={"10", "30"}),
+            universe_id="c" * 64,
+            generation=1,
+            target_market_count=2,
+            minimum_market_count=2,
+            maximum_capital_lock_seconds=365 * 24 * 60 * 60,
             validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
         )

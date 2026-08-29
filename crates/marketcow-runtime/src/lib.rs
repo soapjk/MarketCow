@@ -115,6 +115,35 @@ impl PolymarketRuntime {
         })
     }
 
+    /// Copies the verified active WAL/checkpoint chain into an isolated candidate root. The copy
+    /// is deliberately physical: candidate appends must never mutate a hard-linked active WAL.
+    /// Callers stop ingress before invoking this method, then fully validate the fork before swap.
+    pub fn fork_candidate(&mut self, config: RuntimeConfig) -> Result<Self, RuntimeError> {
+        config.validate()?;
+        if config.scope_id != self.config.scope_id {
+            return Err(RuntimeError::CheckpointScopeMismatch);
+        }
+        if config.root.exists() && config.root.read_dir()?.next().is_some() {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        self.checkpoint()?;
+        fs::create_dir_all(config.root.join("wal"))?;
+        fs::create_dir_all(config.root.join("checkpoints"))?;
+        copy_regular_files(&self.config.root.join("wal"), &config.root.join("wal"))?;
+        copy_regular_files(
+            &self.config.root.join("checkpoints"),
+            &config.root.join("checkpoints"),
+        )?;
+        fs::copy(
+            self.config.root.join("checkpoint-manifest.json"),
+            config.root.join("checkpoint-manifest.json"),
+        )?;
+        File::open(config.root.join("wal"))?.sync_all()?;
+        File::open(config.root.join("checkpoints"))?.sync_all()?;
+        File::open(&config.root)?.sync_all()?;
+        Self::open(config)
+    }
+
     pub fn projection(&self) -> Arc<Projection> {
         self.writer.projection()
     }
@@ -244,6 +273,18 @@ fn verified_book_tick(
                 }
             })
         })
+}
+
+fn copy_regular_files(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let metadata = entry.file_type()?;
+        if !metadata.is_file() || metadata.is_symlink() {
+            return Err(RuntimeError::InvalidConfig);
+        }
+        fs::copy(entry.path(), destination.join(entry.file_name()))?;
+    }
+    Ok(())
 }
 
 fn load_manifest(config: &RuntimeConfig) -> Result<Option<CheckpointManifest>, RuntimeError> {
