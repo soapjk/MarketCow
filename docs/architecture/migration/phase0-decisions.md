@@ -56,6 +56,19 @@ revision, update cadence and raw SHA-256.
     second, rotating across all 200 subscribed tokens. This preserves 200 token updates/second
     and refreshes every book once per second without inventing a 200-change single-frame source
     shape; results record all four parameters explicitly.
+11. **Checkpoint fast-path and duplicate window:** checkpoint v2 will bind the exact sparse-index
+    state hash, boundary segment/byte offset, boundary record hash and immutable closed-segment
+    manifest revision. A valid v2 checkpoint is the trusted recovery commitment described by the
+    authoritative plan: startup verifies the checkpoint and its boundary, then scans only the
+    bounded pre-boundary stride plus post-checkpoint WAL tail. Checkpoint v1 remains readable only
+    through the existing full-WAL verification fallback. Applied-event duplicate retention is
+    explicitly bounded to the checkpoint replay window; an older byte-identical upstream frame is
+    outside the resumable contract and must independently pass provider source-time freshness,
+    which rejects stale replay. Derived cursor/event-id indexes remain disposable: ordinary
+    corruption or write failure marks index health degraded while authoritative WAL append and
+    realtime continue; symlinks, unsafe permissions, WAL/checkpoint divergence and mixed manifest
+    generations remain fail-closed. The fast path cannot be enabled until v1 fallback, v2 boundary,
+    rollback, corruption and large-history startup tests all pass.
 
 ## Permission and compliance boundary
 
