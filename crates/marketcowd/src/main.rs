@@ -46,7 +46,10 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const STREAM_CHANNEL_CAPACITY: usize = 256;
-const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 64;
+// A 200-token scope may receive one full-book message per token during bootstrap. Keep the queue
+// bounded while allowing that verified atomic recovery burst; sustained pressure still fails
+// closed through `try_send` in the transport.
+const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 256;
 const POLYMARKET_TRANSPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
 const STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const STREAM_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
