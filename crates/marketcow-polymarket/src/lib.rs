@@ -795,9 +795,21 @@ fn build_event(
     token_id: &str,
     kind: EventKind,
 ) -> CanonicalEvent {
+    // Full books are recovery barriers as well as content snapshots. A quiet market can return
+    // byte-identical book payloads across connection boundaries; treating the later observation
+    // as a duplicate would leave the durable source gap open forever. Bind only full-book event
+    // identity to its receipt boundary while retaining the payload hash as immutable provenance.
+    // Incremental events keep content-addressed identities and therefore remain idempotent.
+    let receipt_boundary = matches!(&kind, EventKind::FullBook { .. })
+        .then(|| {
+            context
+                .received_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        })
+        .unwrap_or_default();
     let event_id = hex::encode(Sha256::digest(format!(
-        "{}\0{}\0{}\0{}",
-        config.scope_id, NORMALIZER_VERSION, context.raw_sha256, token_id
+        "{}\0{}\0{}\0{}\0{}",
+        config.scope_id, NORMALIZER_VERSION, context.raw_sha256, token_id, receipt_boundary
     )));
     let delay_ms = context
         .received_at
@@ -1045,7 +1057,11 @@ mod tests {
     #[test]
     fn connection_gap_is_a_durable_fail_closed_event_until_full_book() {
         let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
-        writer.apply(snapshot(1)).unwrap();
+        let initial = snapshot(1);
+        let initial_event_id = initial.event_id.clone();
+        let initial_raw_sha256 = initial.source.raw_sha256.clone();
+        let recovery_payload = initial.raw_payload.as_ref().clone();
+        writer.apply(initial).unwrap();
         let gap = normalize_frame(
             &config(),
             serde_json::json!({
@@ -1063,16 +1079,14 @@ mod tests {
         assert!(outcome.projection.unresolved_gaps.contains("yes-1"));
         let recovered = normalize_frame(
             &config(),
-            serde_json::json!({
-                "event_type":"book", "asset_id":"yes-1", "timestamp":"1785729603001",
-                "tick_size":"0.01", "bids":[{"price":"0.40","size":"10"}],
-                "asks":[{"price":"0.42","size":"11"}]
-            }),
-            at(),
+            recovery_payload,
+            at() + chrono::Duration::milliseconds(1),
             3,
         )
         .unwrap()
         .remove(0);
+        assert_ne!(recovered.event_id, initial_event_id);
+        assert_eq!(recovered.source.raw_sha256, initial_raw_sha256);
         assert!(writer.apply(recovered).unwrap().projection.ready);
     }
 
