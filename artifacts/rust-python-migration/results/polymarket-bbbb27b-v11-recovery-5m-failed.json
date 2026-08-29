@@ -1,0 +1,70 @@
+{
+  "schema_version": "marketcow.dynamic-universe.live-gate.v1",
+  "verdict": "failed",
+  "observed_at": "2026-08-29T19:54:22+08:00",
+  "runtime": {
+    "launchd_label": "com.marketcow.rust-polymarket-dynamic-bbbb27b-shadow-v11",
+    "pid": 74432,
+    "commit": "bbbb27b3cd201a86ec71dcbe9ccb631823a64895",
+    "binary_sha256": "3262b74d34e5d3385a711668c7bfd16a070fe42bb223078b38f45e899320f54e",
+    "bind": "127.0.0.1:18872",
+    "listen_verified": true,
+    "real_order_submission_enabled": false
+  },
+  "expected": {
+    "generation": 2,
+    "market_count": 100,
+    "token_count": 200,
+    "maximum_capital_lock_seconds": 2592000,
+    "ready": true,
+    "full_sync_http_status": 200
+  },
+  "observed": {
+    "schema_version": "marketcow.polymarket.scope-discovery.v3",
+    "universe_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "generation": 2,
+    "market_count": 100,
+    "token_count": 200,
+    "maximum_capital_lock_seconds": 2592000,
+    "ready": false,
+    "scope_status": "unready",
+    "boundary_cursor": 1572515,
+    "full_sync_http_status": 503,
+    "full_sync_error_code": "polymarket_projection_unready_or_stale",
+    "readiness_fail_closed_reason": "unresolved_gap",
+    "unresolved_gap_count": 2,
+    "unresolved_token_ids": [
+      "69041918862230770338367885738103882164723166524950967553005740340075212688169",
+      "96851982316864441012765715893812831329802013339937303857390603808636751753379"
+    ],
+    "affected_market_id": "2849008",
+    "latest_checkpoint_cursor_during_diagnosis": 1575952,
+    "latest_checkpoint_sha256": "1a169bf4db645f9fbe576e85ac82a45621d589b9cb577c476ef8c07a70bd63f3",
+    "wal_anchor_segment_first_cursor": 1575953,
+    "wal_anchor_segment_header_sha256": "093340896a296efddec52c3aff8415bbd6bdf04fd39d3cb77fae4dbaccbccf5c"
+  },
+  "root_cause": {
+    "summary": "Restart persisted an upstream_connection_boundary gap for every active token. WebSocket full-book recovery closed 198 of 200 gaps, but both outcome tokens for market 2849008 never received a recovery full book, so the projection correctly remained fail-closed.",
+    "rest_book_probe_http_status": 200,
+    "remediation": "Build a fresh generation from current REST full books, isolate or replace incomplete markets atomically, and activate only with the compact WAL-fork runtime. Do not clear gaps or relax readiness."
+  },
+  "preserved_prior_failures": [
+    "d8effd9 five-minute restart gate failed; late recovery was approximately 1030 seconds",
+    "generation-3 activation returned HTTP 504 after 10.261742 seconds",
+    "old-connection observer r1 failed with ModuleNotFoundError",
+    "old-connection observer r2 closed with WebSocket 1013 full_sync_required",
+    "old-connection observer r3 was incorrectly restarted by inferred launchd keepalive",
+    "generation-3 physical fork failed with ENOSPC and was quarantined"
+  ],
+  "gate_verdicts": {
+    "runtime_identity": "passed",
+    "loopback_listener": "passed",
+    "scope_contract_and_counts": "passed",
+    "maximum_capital_lock": "passed",
+    "scope_ready": "failed",
+    "full_sync_atomic_snapshot": "failed",
+    "websocket_continuity": "not_run_due_to_fail_closed",
+    "read_only_surface": "not_rerun_after_upstream_failure",
+    "generation_3_activation": "not_run"
+  }
+}
