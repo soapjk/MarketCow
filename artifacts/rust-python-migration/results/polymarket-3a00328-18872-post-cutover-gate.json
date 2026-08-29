@@ -1,0 +1,171 @@
+{
+  "schema_version": "marketcow.polymarket.post-cutover-gate.v1",
+  "recorded_at": "2026-08-29T02:07:39Z",
+  "verdict": "passed",
+  "runtime_identity": {
+    "bind": "127.0.0.1:18872",
+    "pid": 57128,
+    "launchd_label": "com.marketcow.rust-polymarket-3a00328-shadow-v1",
+    "binary_path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-3a00328",
+    "binary_commit": "3a0032879f3a43e3b4b86813d60c0836c8d89ecb",
+    "binary_sha256": "06c8c8edc0d7dcc766afbad611922e4a747fdb041bfb0db8fd79f905f277937a",
+    "storage_root": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage",
+    "process_log": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-3a00328-18872.log"
+  },
+  "scope_gate": {
+    "verdict": "passed",
+    "schema_version": "marketcow.polymarket.scope-discovery.v2",
+    "active_scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "scope_status": "ready",
+    "ready": true,
+    "market_count": 100,
+    "token_count": 200,
+    "boundary_cursor": 69058,
+    "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038"
+  },
+  "full_sync_gate": {
+    "verdict": "passed",
+    "http_status": 200,
+    "schema_version": "marketcow.polymarket.live.v2",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "boundary_cursor": 69058,
+    "projection_generation": 69058,
+    "ready": true,
+    "snapshot_status": "ready",
+    "book_count": 200,
+    "market_count": 100,
+    "negative_risk_relation_count": 4,
+    "unresolved_gap_count": 0,
+    "catalog_revision_non_null": true,
+    "checkpoint_state_sha256_non_null": true
+  },
+  "atomic_facts_gate": {
+    "verdict": "passed",
+    "unique_market_count": 100,
+    "outcome_count": 200,
+    "unique_token_count": 200,
+    "unique_instrument_count": 200,
+    "unique_book_token_count": 200,
+    "books_exactly_match_outcome_tokens": true,
+    "markets_with_missing_atomic_facts": [],
+    "negative_risk_relation_failures": [],
+    "all_books_have_tick_and_version": true,
+    "all_financial_book_decimals_are_strings": true
+  },
+  "websocket_gate": {
+    "verdict": "passed",
+    "protocol_version": "marketcow.market-stream.v1",
+    "mode": "resume",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "full_sync_boundary": 71074,
+    "subscription_boundary": 71074,
+    "first_event_cursor": 71075,
+    "last_event_cursor": 71075,
+    "all_contiguous": true,
+    "crossed_live_boundary": true,
+    "expired_cursor_frame": {
+      "type": "resync_required",
+      "reason": "event_cursor_expired",
+      "retryable": true
+    }
+  },
+  "durability_gate": {
+    "verdict": "passed",
+    "pre_cutover_checkpoint_cursor": 58375,
+    "verified_checkpoint_cursor": 72424,
+    "verified_checkpoint_persisted_cursor": 72424,
+    "recovered_beyond_pre_cutover": true,
+    "checkpoint_path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket-scopes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34/checkpoints/00000000000000072424.json",
+    "checkpoint_raw_sha256": "d48a3ba767119cb7215318ffc46ea7c47234b9697a50c8d21d3e7808f58565e1",
+    "manifest_projection_sha256": "d48a3ba767119cb7215318ffc46ea7c47234b9697a50c8d21d3e7808f58565e1",
+    "checkpoint_hash_matches_manifest": true,
+    "checkpoint_ready": true,
+    "checkpoint_book_count": 200,
+    "checkpoint_market_count": 100,
+    "checkpoint_negative_risk_relation_count": 4,
+    "checkpoint_unresolved_gaps": [],
+    "wal_magic": "MCWAL1",
+    "wal_version": 1,
+    "wal_first_cursor": 1,
+    "wal_last_observed_batch_cursor": 72768,
+    "wal_batch_count": 37016,
+    "wal_chain_contiguous": true,
+    "wal_payload_ranges_match": true,
+    "wal_covers_manifest": true
+  },
+  "failure_semantics_gate": {
+    "verdict": "passed",
+    "http_expired_event_cursor_status": 410,
+    "http_expired_event_cursor_code": "event_cursor_expired",
+    "websocket_future_cursor_status": 422,
+    "unauthenticated_checkpoint_status": 401,
+    "unauthenticated_checkpoint_code": "authentication_required",
+    "unready_projection_http_503_test": "passed",
+    "stale_projection_fail_closed_test": "passed",
+    "websocket_resume_and_resync_test": "passed"
+  },
+  "read_only_surface_gate": {
+    "verdict": "passed",
+    "probed_trading_paths": 14,
+    "all_probed_trading_paths_http_404": true,
+    "architecture_tests_passed": 6,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  },
+  "health_gate": {
+    "verdict": "passed",
+    "endpoint": "/v1/health",
+    "status": "healthy",
+    "wal": "healthy",
+    "shadow_mode": true,
+    "real_order_submission_enabled": false,
+    "python_workers": "disabled_optional"
+  },
+  "test_gate": {
+    "verdict": "passed",
+    "rust_workspace": {
+      "passed": 116,
+      "failed": 0,
+      "ignored": 5,
+      "ignored_reason": "external PostgreSQL and ClickHouse endpoints were not configured"
+    },
+    "rust_workspace_clippy_deny_warnings": "passed",
+    "python_tests": {
+      "passed": 8,
+      "failed": 0
+    }
+  },
+  "preserved_non_gate_probe_failures": [
+    {
+      "probe": "HTTP events future cursor diagnostic",
+      "observation": "after_cursor=999999999999 returned HTTP 200 with an empty page instead of the diagnostic script's assumed 422",
+      "impact": "not an acceptance failure: the published contract requires expired cursor resync, while WebSocket future cursor is explicitly rejected with 422; behavior is retained for audit"
+    },
+    {
+      "probe": "pytest from clean source export",
+      "observation": "Xcode system Python had no pytest module",
+      "impact": "environment-selection failure; rerun from the project Python environment passed 8 tests"
+    },
+    {
+      "probe": "health response assertion",
+      "observation": "initial jq assertion expected status=ok while the contract returns status=healthy",
+      "impact": "probe assertion failure; corrected contract assertion passed"
+    }
+  ],
+  "reproducible_commands": [
+    "ps -p 57128 -o pid=,lstart=,command= && shasum -a 256 /tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-3a00328",
+    "curl --noproxy '*' -fsS http://127.0.0.1:18872/v1/prediction-markets/polymarket/live/scope",
+    "curl --noproxy '*' -fsS http://127.0.0.1:18872/v1/prediction-markets/polymarket/live/full-sync",
+    "python3 websocket probe using websockets.connect(..., proxy=None) after_cursor=full_sync.boundary_cursor and after_cursor=0",
+    "python3 checkpoint/WAL verifier over /tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket-scopes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/cargo-target cargo test --manifest-path /Volumes/T9/.marketcow-builds/3a00328.xsewfJ/Cargo.toml --workspace",
+    "CARGO_TARGET_DIR=/Volumes/T9/.marketcow-builds/cargo-target cargo clippy --manifest-path /Volumes/T9/.marketcow-builds/3a00328.xsewfJ/Cargo.toml --workspace --all-targets -- -D warnings",
+    "python3 -m pytest -q tests/test_refresh_polymarket_rust_scope.py tests/test_rust_migration_architecture.py"
+  ],
+  "safety": {
+    "market_data_read_service_only": true,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false,
+    "overall_rust_python_migration_complete": false
+  }
+}
