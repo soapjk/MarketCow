@@ -19,7 +19,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub const REALTIME_WAL_VERSION: &str = "marketcow.realtime.wal.v1";
 pub const REALTIME_WAL_BATCH_VERSION: &str = "marketcow.realtime.wal-batch.v1";
 pub const REALTIME_WAL_SEGMENT_VERSION: &str = "marketcow.realtime.wal-segment.v1";
-pub const REALTIME_CHECKPOINT_VERSION: &str = "marketcow.realtime.checkpoint.v1";
+const REALTIME_CHECKPOINT_V1: &str = "marketcow.realtime.checkpoint.v1";
+pub const REALTIME_CHECKPOINT_VERSION: &str = "marketcow.realtime.checkpoint.v2";
 pub const REALTIME_SPARSE_INDEX_VERSION: &str = "marketcow.realtime.sparse-index.v1";
 const SPARSE_INDEX_STRIDE: u64 = 1_024;
 const SPARSE_INDEX_FILENAME: &str = "cursor-index.json";
@@ -56,6 +57,12 @@ pub struct RealtimeCheckpoint {
     pub last_record_sha256: Option<String>,
     pub replay_capacity: usize,
     pub replay: Vec<StreamEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sparse_index_state_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_segment_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_byte_offset: Option<u64>,
     pub created_at: DateTime<Utc>,
     pub state_sha256: String,
 }
@@ -154,7 +161,7 @@ struct BatchIntegrity<'a> {
 }
 
 #[derive(Serialize)]
-struct CheckpointIntegrity<'a> {
+struct CheckpointIntegrityV1<'a> {
     schema_version: &'a str,
     stream_id: &'a str,
     config_revision: &'a str,
@@ -163,6 +170,22 @@ struct CheckpointIntegrity<'a> {
     last_record_sha256: &'a Option<String>,
     replay_capacity: usize,
     replay: &'a [StreamEvent],
+    created_at: &'a DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct CheckpointIntegrityV2<'a> {
+    schema_version: &'a str,
+    stream_id: &'a str,
+    config_revision: &'a str,
+    wal_cursor: u64,
+    public_sequence: u64,
+    last_record_sha256: &'a Option<String>,
+    replay_capacity: usize,
+    replay: &'a [StreamEvent],
+    sparse_index_state_sha256: &'a Option<String>,
+    boundary_segment_id: Option<u64>,
+    boundary_byte_offset: Option<u64>,
     created_at: &'a DateTime<Utc>,
 }
 
@@ -522,6 +545,7 @@ impl DurableRealtimeWriter {
             config_revision,
             replay_capacity,
             wal.records(),
+            wal.sparse_index(),
         )?;
         Ok(Self {
             root: root.to_path_buf(),
@@ -626,11 +650,16 @@ impl DurableRealtimeWriter {
             return Err(DurabilityError::WriterPoisoned);
         }
         let (_, _, public_sequence, replay) = self.replay.snapshot();
+        let wal_cursor = self.wal.wal_cursor();
+        let boundary = self.wal.sparse_index().locate(wal_cursor);
+        if wal_cursor > 0 && boundary.is_none() {
+            return Err(DurabilityError::CorruptWal);
+        }
         let mut checkpoint = RealtimeCheckpoint {
             schema_version: REALTIME_CHECKPOINT_VERSION.into(),
             stream_id: self.stream_id.clone(),
             config_revision: self.config_revision.clone(),
-            wal_cursor: self.wal.wal_cursor(),
+            wal_cursor,
             public_sequence,
             last_record_sha256: self
                 .wal
@@ -639,6 +668,12 @@ impl DurableRealtimeWriter {
                 .map(|record| record.record_sha256.clone()),
             replay_capacity: self.replay_capacity,
             replay,
+            sparse_index_state_sha256: Some(sparse_index_prefix_digest(
+                self.wal.sparse_index(),
+                wal_cursor,
+            )?),
+            boundary_segment_id: boundary.map(|entry| entry.segment_id),
+            boundary_byte_offset: boundary.map(|entry| entry.byte_offset),
             created_at: Utc::now(),
             state_sha256: String::new(),
         };
@@ -682,6 +717,7 @@ fn recover_replay(
     config_revision: &str,
     replay_capacity: usize,
     records: &[PersistedRealtimeEvent],
+    sparse_index: &RealtimeSparseIndex,
 ) -> Result<(SequencedReplay, Option<u64>), DurabilityError> {
     let checkpoint_root = root.join("checkpoints");
     let candidates = [
@@ -706,6 +742,7 @@ fn recover_replay(
                 config_revision,
                 replay_capacity,
                 records,
+                sparse_index,
             ) {
                 selected = Some(checkpoint);
                 break;
@@ -748,15 +785,33 @@ fn checkpoint_matches(
     config_revision: &str,
     replay_capacity: usize,
     records: &[PersistedRealtimeEvent],
+    sparse_index: &RealtimeSparseIndex,
 ) -> bool {
     let integrity_matches = checkpoint_integrity_bytes(checkpoint)
         .map(|bytes| digest(&bytes) == checkpoint.state_sha256)
         .unwrap_or(false);
-    if checkpoint.schema_version != REALTIME_CHECKPOINT_VERSION
-        || checkpoint.stream_id != stream_id
+    if !matches!(
+        checkpoint.schema_version.as_str(),
+        REALTIME_CHECKPOINT_V1 | REALTIME_CHECKPOINT_VERSION
+    ) || checkpoint.stream_id != stream_id
         || checkpoint.config_revision != config_revision
         || checkpoint.replay_capacity != replay_capacity
         || !integrity_matches
+    {
+        return false;
+    }
+    if checkpoint.schema_version == REALTIME_CHECKPOINT_VERSION {
+        let boundary = sparse_index.locate(checkpoint.wal_cursor);
+        if checkpoint.sparse_index_state_sha256
+            != sparse_index_prefix_digest(sparse_index, checkpoint.wal_cursor).ok()
+            || checkpoint.boundary_segment_id != boundary.map(|entry| entry.segment_id)
+            || checkpoint.boundary_byte_offset != boundary.map(|entry| entry.byte_offset)
+        {
+            return false;
+        }
+    } else if checkpoint.sparse_index_state_sha256.is_some()
+        || checkpoint.boundary_segment_id.is_some()
+        || checkpoint.boundary_byte_offset.is_some()
     {
         return false;
     }
@@ -1020,17 +1075,34 @@ fn batch_integrity_bytes(batch: &WalBatchRecord) -> Result<Vec<u8>, DurabilityEr
 }
 
 fn checkpoint_integrity_bytes(checkpoint: &RealtimeCheckpoint) -> Result<Vec<u8>, DurabilityError> {
-    Ok(serde_json::to_vec(&CheckpointIntegrity {
-        schema_version: &checkpoint.schema_version,
-        stream_id: &checkpoint.stream_id,
-        config_revision: &checkpoint.config_revision,
-        wal_cursor: checkpoint.wal_cursor,
-        public_sequence: checkpoint.public_sequence,
-        last_record_sha256: &checkpoint.last_record_sha256,
-        replay_capacity: checkpoint.replay_capacity,
-        replay: &checkpoint.replay,
-        created_at: &checkpoint.created_at,
-    })?)
+    match checkpoint.schema_version.as_str() {
+        REALTIME_CHECKPOINT_V1 => Ok(serde_json::to_vec(&CheckpointIntegrityV1 {
+            schema_version: &checkpoint.schema_version,
+            stream_id: &checkpoint.stream_id,
+            config_revision: &checkpoint.config_revision,
+            wal_cursor: checkpoint.wal_cursor,
+            public_sequence: checkpoint.public_sequence,
+            last_record_sha256: &checkpoint.last_record_sha256,
+            replay_capacity: checkpoint.replay_capacity,
+            replay: &checkpoint.replay,
+            created_at: &checkpoint.created_at,
+        })?),
+        REALTIME_CHECKPOINT_VERSION => Ok(serde_json::to_vec(&CheckpointIntegrityV2 {
+            schema_version: &checkpoint.schema_version,
+            stream_id: &checkpoint.stream_id,
+            config_revision: &checkpoint.config_revision,
+            wal_cursor: checkpoint.wal_cursor,
+            public_sequence: checkpoint.public_sequence,
+            last_record_sha256: &checkpoint.last_record_sha256,
+            replay_capacity: checkpoint.replay_capacity,
+            replay: &checkpoint.replay,
+            sparse_index_state_sha256: &checkpoint.sparse_index_state_sha256,
+            boundary_segment_id: checkpoint.boundary_segment_id,
+            boundary_byte_offset: checkpoint.boundary_byte_offset,
+            created_at: &checkpoint.created_at,
+        })?),
+        _ => Err(DurabilityError::CorruptCheckpoint),
+    }
 }
 
 fn sparse_index_integrity_bytes(index: &RealtimeSparseIndex) -> Result<Vec<u8>, DurabilityError> {
@@ -1041,6 +1113,22 @@ fn sparse_index_integrity_bytes(index: &RealtimeSparseIndex) -> Result<Vec<u8>, 
         stride: index.stride,
         entries: &index.entries,
     })?)
+}
+
+fn sparse_index_prefix_digest(
+    index: &RealtimeSparseIndex,
+    wal_cursor: u64,
+) -> Result<String, DurabilityError> {
+    let boundary = index
+        .entries
+        .partition_point(|entry| entry.first_wal_cursor <= wal_cursor);
+    Ok(digest(&serde_json::to_vec(&SparseIndexIntegrity {
+        schema_version: &index.schema_version,
+        stream_id: &index.stream_id,
+        config_revision: &index.config_revision,
+        stride: index.stride,
+        entries: &index.entries[..boundary],
+    })?))
 }
 
 fn seal_sparse_index(index: &mut RealtimeSparseIndex) -> Result<(), DurabilityError> {
@@ -1387,6 +1475,50 @@ mod tests {
         assert_eq!(persisted.entries.len(), 2);
         assert_eq!(persisted.entries[0].first_wal_cursor, 1);
         assert_eq!(persisted.entries[1].first_wal_cursor, 2);
+    }
+
+    #[test]
+    fn checkpoint_v1_uses_verified_full_wal_compatibility_fallback() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("runtime");
+        let mut writer = open(&root);
+        writer.apply(event(1, "65000.10000000")).unwrap();
+        let checkpoint = writer.checkpoint().unwrap();
+        assert_eq!(checkpoint.schema_version, REALTIME_CHECKPOINT_VERSION);
+        drop(writer);
+
+        let path = root.join("checkpoints/current.json");
+        let mut legacy = read_checkpoint(&path).unwrap();
+        legacy.schema_version = REALTIME_CHECKPOINT_V1.into();
+        legacy.sparse_index_state_sha256 = None;
+        legacy.boundary_segment_id = None;
+        legacy.boundary_byte_offset = None;
+        legacy.state_sha256 = digest(&checkpoint_integrity_bytes(&legacy).unwrap());
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let recovered = open(&root);
+        assert_eq!(recovered.recovered_checkpoint_cursor(), Some(1));
+        assert_eq!(recovered.sequence(), 1);
+    }
+
+    #[test]
+    fn checkpoint_v2_rejects_rehashed_sparse_boundary_mixing() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("runtime");
+        let mut writer = open(&root);
+        writer.apply(event(1, "65000.10000000")).unwrap();
+        writer.checkpoint().unwrap();
+        drop(writer);
+
+        let path = root.join("checkpoints/current.json");
+        let mut mixed = read_checkpoint(&path).unwrap();
+        mixed.boundary_byte_offset = mixed.boundary_byte_offset.map(|offset| offset + 1);
+        mixed.state_sha256 = digest(&checkpoint_integrity_bytes(&mixed).unwrap());
+        fs::write(&path, serde_json::to_vec(&mixed).unwrap()).unwrap();
+        assert!(matches!(
+            DurableRealtimeWriter::open(&root, "hyperliquid-main", "config-v1", 1_024, 2),
+            Err(DurabilityError::CheckpointWalDivergence)
+        ));
     }
 
     #[test]

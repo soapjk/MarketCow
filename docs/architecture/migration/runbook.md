@@ -141,6 +141,13 @@ does not block authoritative WAL append or realtime publication; the next append
 atomic index replacement. Unsafe symlinks/file types remain a security failure and are not treated
 as ordinary degradation.
 
+New realtime checkpoints use `marketcow.realtime.checkpoint.v2` and bind the sparse-index prefix
+hash at the checkpoint cursor plus its boundary segment and byte offset. Later WAL/index append
+may extend that prefix without invalidating the checkpoint. A rehashed checkpoint that mixes a
+different boundary is rejected. Existing v1 checkpoints remain readable through the conservative
+full-WAL verification path. The v2 format is not yet a startup fast path: closed-segment manifest
+binding and tail-only reader tests must land before the daemon may skip the full integrity scan.
+
 This is shadow evidence only. It does not enable a writer cutover, does not submit orders, and
 does not authorize Tradude to start, stop, restart, or supervise MarketCow. LongPort remains an
 owner-only UDS typed raw-push bridge; it has no Python public listener and is not yet wired to the
