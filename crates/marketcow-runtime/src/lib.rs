@@ -15,13 +15,15 @@ use serde_json::Value;
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
 pub const CHECKPOINT_MANIFEST_VERSION: &str = "marketcow.polymarket.checkpoint-manifest.v1";
+const CANDIDATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -75,6 +77,10 @@ pub enum RuntimeError {
     CheckpointBeyondWal,
     #[error("all checkpoint candidates failed boundary verification")]
     NoValidCheckpoint,
+    #[error("candidate physical copy failed byte verification")]
+    PhysicalCopyMismatch,
+    #[error("candidate preparation exceeded five-minute deadline")]
+    CandidatePreparationTimeout,
     #[error(transparent)]
     Core(#[from] marketcow_core::CoreError),
     #[error(transparent)]
@@ -126,22 +132,47 @@ impl PolymarketRuntime {
         if config.root.exists() && config.root.read_dir()?.next().is_some() {
             return Err(RuntimeError::InvalidConfig);
         }
-        self.checkpoint()?;
+        let deadline = Instant::now() + CANDIDATE_PREPARATION_TIMEOUT;
+        let manifest = self.checkpoint()?;
+        let projection = self.writer.projection();
         fs::create_dir_all(config.root.join("wal"))?;
         fs::create_dir_all(config.root.join("checkpoints"))?;
-        copy_regular_files(&self.config.root.join("wal"), &config.root.join("wal"))?;
-        copy_regular_files(
-            &self.config.root.join("checkpoints"),
-            &config.root.join("checkpoints"),
+        copy_regular_files_verified(
+            &self.config.root.join("wal"),
+            &config.root.join("wal"),
+            deadline,
         )?;
-        fs::copy(
+        for reference in std::iter::once(&manifest.current).chain(manifest.previous.iter()) {
+            copy_regular_file_verified(
+                self.config.root.join(&reference.path),
+                config.root.join(&reference.path),
+                deadline,
+            )?;
+        }
+        copy_regular_file_verified(
             self.config.root.join("checkpoint-manifest.json"),
             config.root.join("checkpoint-manifest.json"),
+            deadline,
         )?;
         File::open(config.root.join("wal"))?.sync_all()?;
         File::open(config.root.join("checkpoints"))?.sync_all()?;
         File::open(&config.root)?.sync_all()?;
-        Self::open(config)
+        let copied_checkpoint = load_checkpoint_candidate(&config, &manifest.current)?;
+        if copied_checkpoint.hash() != projection.hash() {
+            return Err(RuntimeError::PhysicalCopyMismatch);
+        }
+        let wal = SegmentedWal::open_verified_copy(
+            config.root.join("wal"),
+            &config.scope_id,
+            config.wal_segment_bytes,
+        )?;
+        let writer = SingleWriter::resume(projection.as_ref().clone(), wal)?;
+        Ok(Self {
+            config,
+            writer,
+            recent_events: self.recent_events.clone(),
+            last_manifest: Some(manifest),
+        })
     }
 
     pub fn projection(&self) -> Arc<Projection> {
@@ -213,11 +244,13 @@ impl PolymarketRuntime {
             projection_sha256,
             cursor: projection.cursor,
         };
-        let previous = self
-            .last_manifest
-            .as_ref()
-            .map(|manifest| manifest.current.clone())
-            .filter(|reference| reference.cursor != current.cursor);
+        let previous = self.last_manifest.as_ref().and_then(|manifest| {
+            if manifest.current.cursor != current.cursor {
+                Some(manifest.current.clone())
+            } else {
+                manifest.previous.clone()
+            }
+        });
         let manifest = CheckpointManifest {
             schema_version: CHECKPOINT_MANIFEST_VERSION.into(),
             scope_id: self.config.scope_id.clone(),
@@ -275,16 +308,72 @@ fn verified_book_tick(
         })
 }
 
-fn copy_regular_files(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
+fn copy_regular_files_verified(
+    source: &Path,
+    destination: &Path,
+    deadline: Instant,
+) -> Result<(), RuntimeError> {
     for entry in fs::read_dir(source)? {
+        ensure_candidate_deadline(deadline)?;
         let entry = entry?;
         let metadata = entry.file_type()?;
         if !metadata.is_file() || metadata.is_symlink() {
             return Err(RuntimeError::InvalidConfig);
         }
-        fs::copy(entry.path(), destination.join(entry.file_name()))?;
+        copy_regular_file_verified(entry.path(), destination.join(entry.file_name()), deadline)?;
     }
     Ok(())
+}
+
+fn copy_regular_file_verified(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+    deadline: Instant,
+) -> Result<(), RuntimeError> {
+    let source = source.as_ref();
+    let destination = destination.as_ref();
+    ensure_candidate_deadline(deadline)?;
+    let mut source_file = File::open(source)?;
+    let mut destination_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)?;
+    let mut copy_buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        ensure_candidate_deadline(deadline)?;
+        let bytes = source_file.read(&mut copy_buffer)?;
+        if bytes == 0 {
+            break;
+        }
+        destination_file.write_all(&copy_buffer[..bytes])?;
+    }
+    destination_file.sync_all()?;
+    if fs::metadata(source)?.len() != fs::metadata(destination)?.len() {
+        return Err(RuntimeError::PhysicalCopyMismatch);
+    }
+    let mut left = File::open(source)?;
+    let mut right = File::open(destination)?;
+    let mut left_buffer = vec![0_u8; 1024 * 1024];
+    let mut right_buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        ensure_candidate_deadline(deadline)?;
+        let left_bytes = left.read(&mut left_buffer)?;
+        let right_bytes = right.read(&mut right_buffer)?;
+        if left_bytes != right_bytes || left_buffer[..left_bytes] != right_buffer[..right_bytes] {
+            return Err(RuntimeError::PhysicalCopyMismatch);
+        }
+        if left_bytes == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn ensure_candidate_deadline(deadline: Instant) -> Result<(), RuntimeError> {
+    if Instant::now() >= deadline {
+        Err(RuntimeError::CandidatePreparationTimeout)
+    } else {
+        Ok(())
+    }
 }
 
 fn load_manifest(config: &RuntimeConfig) -> Result<Option<CheckpointManifest>, RuntimeError> {
@@ -526,6 +615,56 @@ mod tests {
                 .get("tick_size")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn candidate_fork_reuses_verified_projection_and_retains_only_recovery_checkpoints() {
+        let source = tempdir().unwrap();
+        let candidate = tempdir().unwrap();
+        let mut runtime = PolymarketRuntime::open(config(source.path())).unwrap();
+        for index in 0..3 {
+            runtime
+                .apply_raw(snapshot(&format!("token-{index}"), index), at(index))
+                .unwrap();
+            runtime.checkpoint().unwrap();
+        }
+        assert_eq!(
+            fs::read_dir(source.path().join("checkpoints"))
+                .unwrap()
+                .count(),
+            3
+        );
+        let expected = runtime.projection().hash();
+
+        let mut fork = runtime.fork_candidate(config(candidate.path())).unwrap();
+
+        assert_eq!(fork.projection().hash(), expected);
+        assert_eq!(
+            fs::read_dir(candidate.path().join("checkpoints"))
+                .unwrap()
+                .count(),
+            2
+        );
+        fork.apply_raw(snapshot("candidate-only", 3), at(3))
+            .unwrap();
+        assert_eq!(fork.projection().cursor, 4);
+        assert_eq!(runtime.projection().cursor, 3);
+        drop(fork);
+        let recovered = PolymarketRuntime::open(config(candidate.path())).unwrap();
+        assert_eq!(recovered.projection().cursor, 4);
+    }
+
+    #[test]
+    fn candidate_copy_fails_closed_after_deadline() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source.wal");
+        let destination = directory.path().join("candidate.wal");
+        fs::write(&source, b"authoritative").unwrap();
+
+        let error = copy_regular_file_verified(&source, &destination, Instant::now()).unwrap_err();
+
+        assert!(matches!(error, RuntimeError::CandidatePreparationTimeout));
+        assert!(!destination.exists());
     }
 
     #[test]

@@ -1382,7 +1382,27 @@ impl SegmentedWal {
         stream_id: &str,
         max_segment_bytes: u64,
     ) -> Result<Self, CoreError> {
-        let root = root.as_ref();
+        Self::open_inner(root.as_ref(), stream_id, max_segment_bytes, true)
+    }
+
+    /// Opens an exact, byte-verified physical copy of a WAL already owned by a live
+    /// `SegmentedWal`. The caller must verify every copied regular file before calling this
+    /// method. This avoids parsing the entire authoritative history a second time while
+    /// preparing an isolated hot-switch candidate.
+    pub fn open_verified_copy(
+        root: impl AsRef<Path>,
+        stream_id: &str,
+        max_segment_bytes: u64,
+    ) -> Result<Self, CoreError> {
+        Self::open_inner(root.as_ref(), stream_id, max_segment_bytes, false)
+    }
+
+    fn open_inner(
+        root: &Path,
+        stream_id: &str,
+        max_segment_bytes: u64,
+        verify_chain: bool,
+    ) -> Result<Self, CoreError> {
         if !root.is_absolute() {
             return Err(CoreError::PathMustBeAbsolute);
         }
@@ -1394,7 +1414,9 @@ impl SegmentedWal {
         let (segment_first_cursor, current_path, file, bytes) = match paths.pop() {
             Some(path) => {
                 // Refuse to append to an unverified chain or a different stream.
-                Self::verify(root)?;
+                if verify_chain {
+                    Self::verify(root)?;
+                }
                 let header = read_wal_header(&path)?;
                 if header.get("stream_id").and_then(|value| value.as_str()) != Some(stream_id) {
                     return Err(CoreError::WalStreamMismatch);
