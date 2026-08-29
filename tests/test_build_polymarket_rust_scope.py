@@ -10,6 +10,36 @@ import pytest
 
 from scripts.migration.build_polymarket_rust_scope import build_scope, write_atomic_json
 from scripts.migration.build_polymarket_dynamic_universe import build_dynamic_universe
+from scripts.migration.refresh_polymarket_dynamic_universe_books import refresh_candidate
+
+
+class _BookResponse:
+    def __init__(self, payload: list[dict[str, object]]) -> None:
+        self._payload = payload
+        self.content = json.dumps(payload, separators=(",", ":")).encode()
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self, **_: object) -> list[dict[str, object]]:
+        return self._payload
+
+
+class _BookPoster:
+    def __init__(self, books: dict[str, dict[str, object]]) -> None:
+        self.books = books
+        self.requests: list[list[dict[str, str]]] = []
+
+    def post(
+        self, _: str, *, json: list[dict[str, str]], timeout: float
+    ) -> _BookResponse:
+        assert timeout > 0
+        self.requests.append(json)
+        return _BookResponse([
+            self.books[item["token_id"]]
+            for item in json
+            if item["token_id"] in self.books
+        ])
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
@@ -355,3 +385,73 @@ def test_dynamic_universe_rejects_capital_lock_policy_above_thirty_days(tmp_path
             maximum_capital_lock_seconds=30 * 24 * 60 * 60 + 1,
             validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
         )
+
+
+def _clob_books() -> dict[str, dict[str, object]]:
+    return {
+        token: {
+            "market": f"condition-{token}",
+            "asset_id": token,
+            "timestamp": "1787976000000",
+            "hash": f"hash-{token}",
+            "bids": [{"price": "0.40", "size": "10.00"}],
+            "asks": [{"price": "0.60", "size": "11.00"}],
+            "min_order_size": "5",
+            "tick_size": "0.01",
+            "neg_risk": False,
+        }
+        for token in ("10", "20", "30", "40")
+    }
+
+
+def test_dynamic_universe_book_refresh_is_exact_complete_and_auditable(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    candidate = build_dynamic_universe(
+        manifest, index, catalog, registry, _books(tmp_path),
+        universe_id="f" * 64,
+        generation=2,
+        target_market_count=2,
+        minimum_market_count=2,
+        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    poster = _BookPoster(_clob_books())
+
+    refreshed = refresh_candidate(
+        candidate,
+        poster=poster,
+        batch_size=2,
+        observed_at=datetime(2026, 8, 29, 1, 2, 3, tzinfo=timezone.utc),
+    )
+
+    assert len(poster.requests) == 2
+    assert [book["asset_id"] for book in refreshed["initial_book_frames"]] == candidate["token_ids"]
+    assert all(book["event_type"] == "book" for book in refreshed["initial_book_frames"])
+    assert refreshed["initial_book_frames"][0]["bids"][0]["price"] == "0.40"
+    assert refreshed["universe"]["validated_at"] == "2026-08-29T01:02:03Z"
+    assert refreshed["source"]["book_snapshot_observed_at"] == "2026-08-29T01:02:03Z"
+    assert len(refreshed["source"]["book_snapshot_sha256"]) == 64
+
+
+def test_dynamic_universe_book_refresh_fails_closed_on_missing_or_float_facts(
+    tmp_path: Path,
+) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    candidate = build_dynamic_universe(
+        manifest, index, catalog, registry, _books(tmp_path),
+        universe_id="1" * 64,
+        generation=2,
+        target_market_count=2,
+        minimum_market_count=2,
+        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    missing = _clob_books()
+    missing.pop("40")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        refresh_candidate(candidate, poster=_BookPoster(missing))
+
+    floating = _clob_books()
+    floating["40"]["bids"] = [{"price": 0.40, "size": "10.00"}]
+    with pytest.raises(ValueError, match="exact decimal string"):
+        refresh_candidate(candidate, poster=_BookPoster(floating))
