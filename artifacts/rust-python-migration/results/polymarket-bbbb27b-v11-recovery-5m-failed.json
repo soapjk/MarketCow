@@ -43,6 +43,15 @@
     "wal_anchor_segment_first_cursor": 1575953,
     "wal_anchor_segment_header_sha256": "093340896a296efddec52c3aff8415bbd6bdf04fd39d3cb77fae4dbaccbccf5c"
   },
+  "process_exit": {
+    "verdict": "preserved_failure_not_success",
+    "shutdown_draining_at": "2026-08-29T11:58:26.676869Z",
+    "stopped_at": "2026-08-29T11:58:26.813614Z",
+    "launchd_label_present_after_exit": false,
+    "log_path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-dynamic-bbbb27b-v11-18872.log",
+    "storage_preserved": true,
+    "generation_3_activated_by_this_gate": false
+  },
   "root_cause": {
     "summary": "Restart persisted an upstream_connection_boundary gap for every active token. WebSocket full-book recovery closed 198 of 200 gaps, but both outcome tokens for market 2849008 never received a recovery full book, so the projection correctly remained fail-closed.",
     "rest_book_probe_http_status": 200,
