@@ -2776,8 +2776,20 @@ async fn serve() -> Result<()> {
 }
 
 fn runtime_config(config: &Config, config_revision: &str) -> marketcow_runtime::RuntimeConfig {
+    let root = if config
+        .polymarket_live
+        .as_ref()
+        .is_some_and(|live| live.scope_file_sha256.is_some())
+    {
+        config
+            .storage_root
+            .join("polymarket-scopes")
+            .join(&config.scope_id)
+    } else {
+        config.storage_root.join("polymarket")
+    };
     marketcow_runtime::RuntimeConfig {
-        root: config.storage_root.join("polymarket"),
+        root,
         scope_id: config.scope_id.clone(),
         config_revision: config_revision.into(),
         wal_segment_bytes: 256 * 1024 * 1024,
@@ -6875,6 +6887,25 @@ mod tests {
             catalog_sha256: Some("d".repeat(64)),
             registry_sha256: Some("e".repeat(64)),
         }
+    }
+
+    #[test]
+    fn startup_reopens_hash_pinned_scope_from_dynamic_runtime_root() {
+        let (_dir, state) = test_state();
+        let mut config = state.config.clone();
+        config.scope_id = "next-scope".into();
+        config.polymarket_live = Some(dynamic_live_scope("next-scope", "2", "30", "40"));
+
+        let runtime = runtime_config(&config, "test-config-v1");
+
+        assert_eq!(
+            runtime.root,
+            config
+                .storage_root
+                .join("polymarket-scopes")
+                .join("next-scope")
+        );
+        assert_eq!(runtime.scope_id, "next-scope");
     }
 
     #[tokio::test]
