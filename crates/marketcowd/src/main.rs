@@ -498,7 +498,7 @@ fn load_polymarket_scope_file_at(
     let scope_file_sha256 = hex::encode(Sha256::digest(&encoded));
     let scope: PolymarketLiveScopeFile = serde_json::from_slice(&encoded)
         .context("MARKETCOW_POLYMARKET_SCOPE_FILE must be valid JSON")?;
-    if scope.schema_version != "marketcow.polymarket.rust-live-scope.v2" {
+    if scope.schema_version != "marketcow.polymarket.rust-live-scope.v3" {
         bail!("unsupported Polymarket Rust live scope schema");
     }
     if scope.scope_id != expected_scope_id {
@@ -542,10 +542,14 @@ fn load_polymarket_scope_file_at(
         || catalog.catalog_revision != scope.catalog_revision
         || catalog_markets != markets
         || catalog_tokens != token_ids.iter().cloned().collect()
-        || catalog
-            .markets
-            .iter()
-            .any(|market| market.instrument_facts.is_none())
+        || catalog.markets.iter().any(|market| {
+            market.instrument_facts.as_ref().is_none_or(|facts| {
+                facts
+                    .fee_schedule
+                    .as_ref()
+                    .is_none_or(|schedule| !schedule.is_complete())
+            })
+        })
     {
         bail!("Polymarket scope catalog frame does not exactly cover the declared scope");
     }
@@ -2507,6 +2511,8 @@ async fn commit_polymarket_scope_switch(
     activated: PolymarketLiveConfig,
     candidate_runtime: marketcow_runtime::PolymarketRuntime,
 ) -> Result<(PolymarketLiveConfig, PolymarketScopeSwitchReceipt), String> {
+    let previous_cursor = state.projection.load().cursor;
+    let same_scope = current.scope_id == activated.scope_id;
     checkpoint_polymarket_runtime(state)
         .await
         .map_err(|error| format!("old_scope_checkpoint_failed:{error}"))?;
@@ -2517,10 +2523,31 @@ async fn commit_polymarket_scope_switch(
     state
         .recent_events
         .store(Arc::new(clone_polymarket_recent_events(&runtime)));
+    let catalog_changes = if same_scope {
+        clone_polymarket_recent_events(&runtime)
+            .into_iter()
+            .filter(|record| {
+                record.event.cursor > previous_cursor
+                    && matches!(
+                        &record.event.kind,
+                        marketcow_core::EventKind::CatalogSnapshot { .. }
+                    )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     drop(runtime);
     state
         .active_polymarket_scope
         .store(Some(Arc::new(activated.clone())));
+    // A same-scope artifact refresh (for example, a fee schedule revision) preserves the cursor
+    // domain. Publish its catalog event after the atomic projection swap so existing consumers
+    // either apply the new generation or fail closed on a cursor gap. Different scope IDs are
+    // handled by the existing `scope_changed` resync path.
+    for record in catalog_changes {
+        let _ = state.stream.send(record);
+    }
     let boundary_cursor = state.projection.load().cursor;
     let receipt = PolymarketScopeSwitchReceipt {
         previous_scope_id,
@@ -2536,6 +2563,24 @@ fn projection_matches_polymarket_scope(
     projection: &marketcow_core::Projection,
     require_books: bool,
 ) -> bool {
+    projection_catalog_identity_matches_scope(live, projection)
+        && projection.markets.values().all(|market| {
+            market.instrument_facts.as_ref().is_some_and(|facts| {
+                facts
+                    .fee_schedule
+                    .as_ref()
+                    .is_some_and(marketcow_core::MarketFeeSchedule::is_complete)
+            })
+        })
+        && (!require_books
+            || projection.books.keys().cloned().collect::<BTreeSet<_>>()
+                == live.token_ids.iter().cloned().collect())
+}
+
+fn projection_catalog_identity_matches_scope(
+    live: &PolymarketLiveConfig,
+    projection: &marketcow_core::Projection,
+) -> bool {
     let expected_markets = live.market_ids.iter().cloned().collect::<BTreeSet<_>>();
     let expected_tokens = live.token_ids.iter().cloned().collect::<BTreeSet<_>>();
     let actual_markets = projection.markets.keys().cloned().collect::<BTreeSet<_>>();
@@ -2549,15 +2594,9 @@ fn projection_matches_polymarket_scope(
                 .map(|outcome| outcome.token_id.clone())
         })
         .collect::<BTreeSet<_>>();
-    let books = projection.books.keys().cloned().collect::<BTreeSet<_>>();
     live.catalog_revision.as_ref() == projection.catalog_revision.as_ref()
         && expected_markets == actual_markets
         && expected_tokens == catalog_tokens
-        && projection
-            .markets
-            .values()
-            .all(|market| market.instrument_facts.is_some())
-        && (!require_books || books == expected_tokens)
 }
 
 fn seed_polymarket_scope_catalog(
@@ -2574,7 +2613,9 @@ fn seed_polymarket_scope_catalog(
     if projection_matches_polymarket_scope(live, &projection, false) {
         return Ok(());
     }
-    if projection.catalog_revision.is_some() {
+    if projection.catalog_revision.is_some()
+        && !projection_catalog_identity_matches_scope(live, &projection)
+    {
         bail!("persisted Polymarket catalog does not match configured exact scope");
     }
     runtime.apply_raw(catalog_frame.clone(), Utc::now())?;
@@ -6777,7 +6818,7 @@ mod tests {
         fs::write(
             &path,
             serde_json::to_vec(&json!({
-                "schema_version":"marketcow.polymarket.rust-live-scope.v2",
+                "schema_version":"marketcow.polymarket.rust-live-scope.v3",
                 "scope_id":"scope-100",
                 "market_count":2,
                 "token_count":4,
@@ -6818,6 +6859,10 @@ mod tests {
             Some("b".repeat(64).as_str())
         );
         assert_eq!(loaded.scope_file_sha256.as_deref().map(str::len), Some(64));
+        let fee = &loaded.catalog_frame.as_ref().unwrap()["markets"][0]["instrument_facts"]["fee_schedule"];
+        assert_eq!(fee["taker_rate"], "0.05");
+        assert_eq!(fee["calculation_status"], "informational_only");
+        assert_eq!(fee["revision"].as_str().map(str::len), Some(64));
         assert!(load_polymarket_scope_file("wrong-scope", path.to_str().unwrap()).is_err());
     }
 
@@ -6830,7 +6875,7 @@ mod tests {
         fs::write(
             &path,
             serde_json::to_vec(&json!({
-                "schema_version":"marketcow.polymarket.rust-live-scope.v2",
+                "schema_version":"marketcow.polymarket.rust-live-scope.v3",
                 "scope_id":"expired-scope",
                 "market_count":1,
                 "token_count":2,
@@ -6865,7 +6910,7 @@ mod tests {
     }
 
     fn test_scope_market(market_id: &str, yes: &str, no: &str) -> serde_json::Value {
-        json!({
+        let mut market = json!({
             "market_id":market_id,
             "condition_id":format!("condition-{market_id}"),
             "outcomes":[
@@ -6887,6 +6932,37 @@ mod tests {
                 "end_at":"2027-01-01T00:00:00Z",
                 "revision":format!("instrument-{market_id}")
             }
+        });
+        market["instrument_facts"]["fee_schedule"] = test_fee_schedule("0.05", "e");
+        market
+    }
+
+    fn test_fee_schedule(taker_rate: &str, revision_character: &str) -> serde_json::Value {
+        json!({
+            "schedule_id":"f".repeat(64),
+            "revision":revision_character.repeat(64),
+            "schedule_version":"polymarket-fees-v1",
+            "currency":"USDC",
+            "maker_rate":"0",
+            "taker_rate":taker_rate,
+            "formula_id":"polymarket_probability_fee.v1",
+            "formula":"fee = C * feeRate * p * (1 - p)",
+            "exponent":"1",
+            "quantum":"0.00001",
+            "rounding_mode":"UNSPECIFIED",
+            "tie_semantics":"unspecified",
+            "calculation_status":"informational_only",
+            "effective_from":"2026-01-01T00:00:00Z",
+            "effective_to":null,
+            "observed_at":"2026-08-28T00:00:00Z",
+            "provenance":[{
+                "source":"polymarket_docs",
+                "source_url":"https://docs.polymarket.com/trading/fees",
+                "revision":"fees-docs-v1",
+                "payload_sha256":"d".repeat(64),
+                "observed_at":"2026-08-28T00:00:00Z",
+                "field_paths":["fee_structure","fee_precision"]
+            }]
         })
     }
 
@@ -6935,6 +7011,49 @@ mod tests {
         assert_eq!(runtime.scope_id, "next-scope");
     }
 
+    #[test]
+    fn same_catalog_revision_upgrades_legacy_projection_with_atomic_fee_facts() {
+        let dir = tempdir().unwrap();
+        let live = dynamic_live_scope("fee-upgrade-scope", "1", "10", "20");
+        let mut runtime =
+            marketcow_runtime::PolymarketRuntime::open(marketcow_runtime::RuntimeConfig {
+                root: dir.path().join("fee-upgrade-scope"),
+                scope_id: live.scope_id.clone(),
+                config_revision: "test-config-v1".into(),
+                wal_segment_bytes: 1_024,
+                recent_event_capacity: 100,
+            })
+            .unwrap();
+        let mut legacy = live.catalog_frame.clone().unwrap();
+        legacy["markets"][0]["instrument_facts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fee_schedule");
+        runtime.apply_raw(legacy, Utc::now()).unwrap();
+        runtime.checkpoint().unwrap();
+        assert!(
+            runtime.projection().markets["1"]
+                .instrument_facts
+                .as_ref()
+                .unwrap()
+                .fee_schedule
+                .is_none()
+        );
+
+        seed_polymarket_scope_catalog(&mut runtime, Some(&live)).unwrap();
+        let projection = runtime.projection();
+        assert_eq!(projection.cursor, 2);
+        assert!(
+            projection.markets["1"]
+                .instrument_facts
+                .as_ref()
+                .unwrap()
+                .fee_schedule
+                .as_ref()
+                .is_some_and(marketcow_core::MarketFeeSchedule::is_complete)
+        );
+    }
+
     #[tokio::test]
     async fn dynamic_polymarket_scope_switch_is_atomic_unready_and_checkpointed() {
         let (dir, state) = test_state();
@@ -6942,7 +7061,11 @@ mod tests {
         state
             .active_polymarket_scope
             .store(Some(Arc::new(current.clone())));
-        let activated = dynamic_live_scope("next-scope", "2", "30", "40");
+        let mut activated = dynamic_live_scope("next-scope", "2", "30", "40");
+        let fee = &mut activated.catalog_frame.as_mut().unwrap()["markets"][0]["instrument_facts"]
+            ["fee_schedule"];
+        fee["taker_rate"] = json!("0.07");
+        fee["revision"] = json!("c".repeat(64));
         let mut candidate =
             marketcow_runtime::PolymarketRuntime::open(marketcow_runtime::RuntimeConfig {
                 root: dir.path().join("next-scope"),
@@ -6967,6 +7090,20 @@ mod tests {
             Some("catalog-next-scope")
         );
         assert_eq!(projection.markets.len(), 1);
+        let published_fee = projection.markets["2"]
+            .instrument_facts
+            .as_ref()
+            .unwrap()
+            .fee_schedule
+            .as_ref()
+            .unwrap();
+        assert_eq!(published_fee.taker_rate.to_string(), "0.07");
+        assert_eq!(published_fee.revision, "c".repeat(64));
+        let catalog_event = state.recent_events.load();
+        assert!(matches!(
+            &catalog_event[0].event.kind,
+            marketcow_core::EventKind::CatalogSnapshot { .. }
+        ));
         assert!(projection.books.is_empty());
         assert!(!polymarket_projection_ready(&state, &projection));
         assert_eq!(activated.scope_id, "next-scope");
@@ -6975,6 +7112,56 @@ mod tests {
                 .join("polymarket/checkpoint-manifest.json")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn same_scope_fee_revision_is_atomically_published_as_catalog_change() {
+        let (dir, state) = test_state();
+        let scope_id = state.config.scope_id.clone();
+        let current = dynamic_live_scope(&scope_id, "1", "10", "20");
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(current.clone())));
+        let mut activated = current.clone();
+        activated.scope_file_sha256 = Some("9".repeat(64));
+        let fee = &mut activated.catalog_frame.as_mut().unwrap()["markets"][0]["instrument_facts"]
+            ["fee_schedule"];
+        fee["taker_rate"] = json!("0.07");
+        fee["revision"] = json!("c".repeat(64));
+
+        let mut candidate =
+            marketcow_runtime::PolymarketRuntime::open(marketcow_runtime::RuntimeConfig {
+                root: dir.path().join("same-scope-fee-refresh"),
+                scope_id: scope_id.clone(),
+                config_revision: "test-config-v1".into(),
+                wal_segment_bytes: 1_024,
+                recent_event_capacity: 100,
+            })
+            .unwrap();
+        seed_polymarket_scope_catalog(&mut candidate, Some(&activated)).unwrap();
+        let mut stream = state.stream.subscribe();
+
+        commit_polymarket_scope_switch(&state, &current, activated, candidate)
+            .await
+            .unwrap();
+
+        let event = stream.try_recv().expect("catalog change must be published");
+        assert!(matches!(
+            &event.event.kind,
+            marketcow_core::EventKind::CatalogSnapshot { .. }
+        ));
+        assert_eq!(event.event.cursor, 1);
+        let projection = state.projection.load_full();
+        let schedule = projection.markets["1"]
+            .instrument_facts
+            .as_ref()
+            .unwrap()
+            .fee_schedule
+            .as_ref()
+            .unwrap();
+        assert_eq!(schedule.taker_rate.to_string(), "0.07");
+        assert_eq!(schedule.revision, "c".repeat(64));
+        assert_eq!(projection.generation, event.event.cursor);
     }
 
     #[tokio::test]

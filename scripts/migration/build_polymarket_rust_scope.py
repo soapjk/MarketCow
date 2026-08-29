@@ -10,11 +10,12 @@ import os
 import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "marketcow.polymarket.rust-live-scope.v2"
+SCHEMA_VERSION = "marketcow.polymarket.rust-live-scope.v3"
 
 
 def sha256_file(path: Path) -> str:
@@ -29,6 +30,133 @@ def _required_string(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a non-empty string")
     return value
+
+
+def _decimal_string(value: Any, name: str, *, positive: bool = False) -> str:
+    encoded = _required_string(value, name)
+    try:
+        parsed = Decimal(encoded)
+    except InvalidOperation as error:
+        raise ValueError(f"{name} must be an exact decimal string") from error
+    if not parsed.is_finite() or parsed < 0 or (positive and parsed == 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be a {qualifier} exact decimal string")
+    return encoded
+
+
+def _timestamp(value: Any, name: str) -> tuple[str, datetime]:
+    encoded = _required_string(value, name)
+    try:
+        parsed = datetime.fromisoformat(encoded.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"{name} must include a timezone")
+    return encoded, parsed
+
+
+def _fee_schedule(value: Any, market_id: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("complete") is not True:
+        raise ValueError(f"{market_id}.fee_schedule must be explicitly complete")
+    if value.get("missing_fields") not in (None, []):
+        raise ValueError(f"{market_id}.fee_schedule contains missing fields")
+    schedule_id = _required_string(value.get("schedule_id"), f"{market_id}.fee.schedule_id")
+    if len(schedule_id) != 64 or any(character not in "0123456789abcdefABCDEF" for character in schedule_id):
+        raise ValueError(f"{market_id}.fee.schedule_id must be a SHA-256 hex digest")
+    effective_from, effective_from_at = _timestamp(
+        value.get("effective_from"), f"{market_id}.fee.effective_from"
+    )
+    effective_to_value = value.get("effective_to")
+    effective_to = None
+    if effective_to_value is not None:
+        effective_to, effective_to_at = _timestamp(
+            effective_to_value, f"{market_id}.fee.effective_to"
+        )
+        if effective_to_at <= effective_from_at:
+            raise ValueError(f"{market_id}.fee effective interval is invalid")
+    calculation_status = _required_string(
+        value.get("calculation_status"), f"{market_id}.fee.calculation_status"
+    )
+    if calculation_status not in {"executable", "informational_only"}:
+        raise ValueError(f"{market_id}.fee.calculation_status is unsupported")
+    rounding_mode = _required_string(
+        value.get("rounding_mode"), f"{market_id}.fee.rounding_mode"
+    )
+    tie_semantics = _required_string(
+        value.get("tie_semantics"), f"{market_id}.fee.tie_semantics"
+    )
+    if calculation_status == "executable" and (
+        rounding_mode.upper() == "UNSPECIFIED" or tie_semantics.lower() == "unspecified"
+    ):
+        raise ValueError(f"{market_id}.fee executable schedule lacks deterministic rounding")
+    provenance_value = value.get("provenance")
+    if not isinstance(provenance_value, list) or not provenance_value:
+        raise ValueError(f"{market_id}.fee.provenance must be non-empty")
+    provenance: list[dict[str, Any]] = []
+    observed_values: list[datetime] = []
+    for index, item in enumerate(provenance_value):
+        if not isinstance(item, dict):
+            raise ValueError(f"{market_id}.fee.provenance[{index}] must be an object")
+        payload_sha256 = _required_string(
+            item.get("payload_sha256"), f"{market_id}.fee.provenance[{index}].payload_sha256"
+        )
+        if len(payload_sha256) != 64 or any(
+            character not in "0123456789abcdefABCDEF" for character in payload_sha256
+        ):
+            raise ValueError(
+                f"{market_id}.fee.provenance[{index}].payload_sha256 must be a SHA-256 hex digest"
+            )
+        observed_at, observed = _timestamp(
+            item.get("observed_at"), f"{market_id}.fee.provenance[{index}].observed_at"
+        )
+        observed_values.append(observed)
+        field_paths = item.get("field_paths")
+        if not isinstance(field_paths, list) or not field_paths:
+            raise ValueError(f"{market_id}.fee.provenance[{index}].field_paths must be non-empty")
+        provenance.append(
+            {
+                "source": _required_string(
+                    item.get("source"), f"{market_id}.fee.provenance[{index}].source"
+                ),
+                "source_url": _required_string(
+                    item.get("source_url"), f"{market_id}.fee.provenance[{index}].source_url"
+                ),
+                "revision": _required_string(
+                    item.get("revision"), f"{market_id}.fee.provenance[{index}].revision"
+                ),
+                "payload_sha256": payload_sha256.lower(),
+                "observed_at": observed_at,
+                "field_paths": [
+                    _required_string(path, f"{market_id}.fee.provenance[{index}].field_paths[]")
+                    for path in field_paths
+                ],
+            }
+        )
+    schedule = {
+        "schedule_id": schedule_id.lower(),
+        "schedule_version": _required_string(
+            value.get("schedule_version"), f"{market_id}.fee.schedule_version"
+        ),
+        "currency": _required_string(value.get("currency"), f"{market_id}.fee.currency"),
+        "maker_rate": _decimal_string(value.get("maker_rate"), f"{market_id}.fee.maker_rate"),
+        "taker_rate": _decimal_string(value.get("taker_rate"), f"{market_id}.fee.taker_rate"),
+        "formula_id": "polymarket_probability_fee.v1",
+        "formula": _required_string(value.get("formula"), f"{market_id}.fee.formula"),
+        "exponent": _decimal_string(value.get("exponent"), f"{market_id}.fee.exponent"),
+        "quantum": _decimal_string(
+            value.get("quantum"), f"{market_id}.fee.quantum", positive=True
+        ),
+        "rounding_mode": rounding_mode,
+        "tie_semantics": tie_semantics,
+        "calculation_status": calculation_status,
+        "effective_from": effective_from,
+        "effective_to": effective_to,
+        "observed_at": max(observed_values).isoformat().replace("+00:00", "Z"),
+        "provenance": provenance,
+    }
+    revision_material = json.dumps(schedule, sort_keys=True, separators=(",", ":")).encode()
+    schedule["revision"] = hashlib.sha256(revision_material).hexdigest()
+    return schedule
 
 
 def _decimal_ids(value: Any, name: str) -> list[str]:
@@ -141,6 +269,19 @@ def build_scope(
                     "revision",
                 )
             }
+            fee_schedule = _fee_schedule(rules.get("fee_schedule"), market_id)
+            _, fee_effective_from = _timestamp(
+                fee_schedule["effective_from"], f"{market_id}.fee.effective_from"
+            )
+            fee_effective_to = None
+            if fee_schedule["effective_to"] is not None:
+                _, fee_effective_to = _timestamp(
+                    fee_schedule["effective_to"], f"{market_id}.fee.effective_to"
+                )
+            if fee_effective_from > observed_at or (
+                fee_effective_to is not None and fee_effective_to <= observed_at
+            ):
+                raise ValueError(f"{market_id}.fee schedule is not effective at validation time")
             start_at = _required_string(row.get("start_at"), f"{market_id}.start_at")
             end_at = _required_string(row.get("end_at"), f"{market_id}.end_at")
             try:
@@ -184,6 +325,7 @@ def build_scope(
                         **required_facts,
                         "start_at": start_at,
                         "end_at": end_at,
+                        "fee_schedule": fee_schedule,
                     },
                 }
             )

@@ -190,6 +190,84 @@ pub struct MarketInstrumentFacts {
     pub start_at: DateTime<Utc>,
     pub end_at: DateTime<Utc>,
     pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_schedule: Option<MarketFeeSchedule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeCalculationStatus {
+    Executable,
+    InformationalOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketFeeProvenance {
+    pub source: String,
+    pub source_url: String,
+    pub revision: String,
+    pub payload_sha256: String,
+    pub observed_at: DateTime<Utc>,
+    pub field_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketFeeSchedule {
+    pub schedule_id: String,
+    pub revision: String,
+    pub schedule_version: String,
+    pub currency: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub maker_rate: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub taker_rate: Decimal,
+    pub formula_id: String,
+    pub formula: String,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub exponent: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub quantum: Decimal,
+    pub rounding_mode: String,
+    pub tie_semantics: String,
+    pub calculation_status: FeeCalculationStatus,
+    pub effective_from: DateTime<Utc>,
+    pub effective_to: Option<DateTime<Utc>>,
+    pub observed_at: DateTime<Utc>,
+    pub provenance: Vec<MarketFeeProvenance>,
+}
+
+impl MarketFeeSchedule {
+    pub fn is_complete(&self) -> bool {
+        let digest =
+            |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        digest(&self.schedule_id)
+            && digest(&self.revision)
+            && !self.schedule_version.is_empty()
+            && !self.currency.is_empty()
+            && self.maker_rate >= Decimal::ZERO
+            && self.taker_rate >= Decimal::ZERO
+            && !self.formula_id.is_empty()
+            && !self.formula.is_empty()
+            && self.exponent >= Decimal::ZERO
+            && self.quantum > Decimal::ZERO
+            && !self.rounding_mode.is_empty()
+            && !self.tie_semantics.is_empty()
+            && !(self.calculation_status == FeeCalculationStatus::Executable
+                && (self.rounding_mode.eq_ignore_ascii_case("UNSPECIFIED")
+                    || self.tie_semantics.eq_ignore_ascii_case("unspecified")))
+            && self
+                .effective_to
+                .is_none_or(|effective_to| effective_to > self.effective_from)
+            && !self.provenance.is_empty()
+            && self.provenance.iter().all(|item| {
+                !item.source.is_empty()
+                    && !item.source_url.is_empty()
+                    && !item.revision.is_empty()
+                    && digest(&item.payload_sha256)
+                    && !item.field_paths.is_empty()
+                    && item.field_paths.iter().all(|path| !path.is_empty())
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2329,6 +2407,61 @@ mod tests {
         }
     }
 
+    fn fee_schedule(taker_rate: &str) -> MarketFeeSchedule {
+        MarketFeeSchedule {
+            schedule_id: "a".repeat(64),
+            revision: "b".repeat(64),
+            schedule_version: "polymarket-fees-v1".into(),
+            currency: "USDC".into(),
+            maker_rate: Decimal::ZERO,
+            taker_rate: Decimal::from_str(taker_rate).unwrap(),
+            formula_id: "polymarket_probability_fee.v1".into(),
+            formula: "fee = C * feeRate * p * (1 - p)".into(),
+            exponent: Decimal::ONE,
+            quantum: Decimal::from_str("0.00001").unwrap(),
+            rounding_mode: "UNSPECIFIED".into(),
+            tie_semantics: "unspecified".into(),
+            calculation_status: FeeCalculationStatus::InformationalOnly,
+            effective_from: "2026-01-01T00:00:00Z".parse().unwrap(),
+            effective_to: None,
+            observed_at: "2026-08-28T00:00:00Z".parse().unwrap(),
+            provenance: vec![MarketFeeProvenance {
+                source: "polymarket_docs".into(),
+                source_url: "https://docs.polymarket.com/trading/fees".into(),
+                revision: "fees-docs-v1".into(),
+                payload_sha256: "c".repeat(64),
+                observed_at: "2026-08-28T00:00:00Z".parse().unwrap(),
+                field_paths: vec!["fee_structure".into(), "fee_precision".into()],
+            }],
+        }
+    }
+
+    #[test]
+    fn fee_schedule_is_exact_auditable_and_fails_closed_on_ambiguity() {
+        for rate in ["0", "0.05"] {
+            let schedule = fee_schedule(rate);
+            assert!(schedule.is_complete());
+            let encoded = serde_json::to_value(&schedule).unwrap();
+            assert_eq!(encoded["maker_rate"], "0");
+            assert_eq!(encoded["taker_rate"], rate);
+            assert_eq!(encoded["exponent"], "1");
+            assert_eq!(encoded["quantum"], "0.00001");
+            assert!(encoded["maker_rate"].is_string());
+        }
+
+        let mut invalid_interval = fee_schedule("0.05");
+        invalid_interval.effective_to = Some(invalid_interval.effective_from);
+        assert!(!invalid_interval.is_complete());
+
+        let mut ambiguous_execution = fee_schedule("0.05");
+        ambiguous_execution.calculation_status = FeeCalculationStatus::Executable;
+        assert!(!ambiguous_execution.is_complete());
+
+        let mut missing_provenance = fee_schedule("0");
+        missing_provenance.provenance.clear();
+        assert!(!missing_provenance.is_complete());
+    }
+
     #[test]
     fn catalog_requires_every_active_book_and_resolution_is_durably_fail_closed() {
         struct MemoryLog(Vec<PersistedEvent>);
@@ -2428,6 +2561,7 @@ mod tests {
             start_at: Utc::now(),
             end_at: Utc::now() + chrono::Duration::days(1),
             revision: "catalog-facts-v1".into(),
+            fee_schedule: None,
         });
         writer
             .apply(event(

@@ -53,11 +53,38 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                         {"token_id": tokens[1], "outcome": "No", "instrument_id": f"POLY:{market_id}:{tokens[1]}"},
                     ],
                 },
-                "rules": {"instrument": {
-                    "price_increment": "0.01", "size_increment": "0.01",
-                    "minimum_order_size": "5", "settlement_currency": "pUSD",
-                    "revision": f"instrument-{market_id}",
-                }},
+                "rules": {
+                    "instrument": {
+                        "price_increment": "0.01", "size_increment": "0.01",
+                        "minimum_order_size": "5", "settlement_currency": "pUSD",
+                        "revision": f"instrument-{market_id}",
+                    },
+                    "fee_schedule": {
+                        "schedule_id": market_id * 64,
+                        "schedule_version": "polymarket-fees-v1",
+                        "currency": "USDC",
+                        "maker_rate": "0",
+                        "taker_rate": "0" if market_id == "1" else "0.05",
+                        "formula": "fee = C * feeRate * p * (1 - p)",
+                        "exponent": "1",
+                        "quantum": "0.00001",
+                        "rounding_mode": "UNSPECIFIED",
+                        "tie_semantics": "unspecified",
+                        "calculation_status": "informational_only",
+                        "effective_from": "2026-01-01T00:00:00Z",
+                        "effective_to": None,
+                        "complete": True,
+                        "missing_fields": [],
+                        "provenance": [{
+                            "source": "polymarket_docs",
+                            "source_url": "https://docs.polymarket.com/trading/fees",
+                            "revision": "fees-docs-v1",
+                            "payload_sha256": market_id * 64,
+                            "observed_at": "2026-08-28T00:00:00Z",
+                            "field_paths": ["fee_structure", "fee_precision"],
+                        }],
+                    },
+                },
                 "start_at": "2026-01-01T00:00:00Z",
                 "end_at": "2027-01-01T00:00:00Z",
                 "lifecycle_state": "active", "resolution": None,
@@ -87,13 +114,21 @@ def test_build_scope_is_deterministic_and_hash_pinned(tmp_path: Path) -> None:
         expected_manifest_sha256=manifest_sha256,
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
-    assert scope["schema_version"] == "marketcow.polymarket.rust-live-scope.v2"
+    assert scope["schema_version"] == "marketcow.polymarket.rust-live-scope.v3"
     assert scope["market_ids"] == ["1", "2"]
     assert scope["token_ids"] == ["10", "20", "30", "40"]
     assert scope["source"]["manifest_sha256"] == manifest_sha256
     assert len(scope["source"]["catalog_index_sha256"]) == 64
     assert len(scope["catalog_frame"]["markets"]) == 2
     assert scope["catalog_frame"]["markets"][0]["instrument_facts"]["price_increment"] == "0.01"
+    fees = [
+        market["instrument_facts"]["fee_schedule"]
+        for market in scope["catalog_frame"]["markets"]
+    ]
+    assert [fee["taker_rate"] for fee in fees] == ["0", "0.05"]
+    assert all(len(fee["revision"]) == 64 for fee in fees)
+    assert all(fee["formula_id"] == "polymarket_probability_fee.v1" for fee in fees)
+    assert all(fee["calculation_status"] == "informational_only" for fee in fees)
 
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
@@ -142,4 +177,60 @@ def test_build_scope_fails_closed_on_expired_active_market(tmp_path: Path) -> No
             expected_market_count=2,
             expected_token_count=4,
             validated_at=datetime(2028, 1, 1, tzinfo=timezone.utc),
+        )
+
+
+def test_build_scope_fails_closed_on_missing_fee_facts(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    rows = [json.loads(line) for line in catalog.read_text().splitlines()]
+    rows[0]["rules"].pop("fee_schedule")
+    catalog.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows))
+    with sqlite3.connect(index) as connection:
+        connection.execute("DELETE FROM markets")
+        offset = 0
+        for row in rows:
+            encoded = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+            connection.execute(
+                "INSERT INTO markets VALUES (?, ?, ?)",
+                (row["identity"]["market_id"], offset, len(encoded)),
+            )
+            offset += len(encoded)
+    with pytest.raises(ValueError, match="fee_schedule must be explicitly complete"):
+        build_scope(
+            manifest,
+            index,
+            catalog,
+            registry,
+            expected_market_count=2,
+            expected_token_count=4,
+            validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
+
+
+def test_build_scope_fails_closed_outside_fee_effective_interval(tmp_path: Path) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    rows = [json.loads(line) for line in catalog.read_text().splitlines()]
+    rows[0]["rules"]["fee_schedule"]["effective_to"] = "2026-08-28T12:00:00Z"
+    encoded_rows = [
+        (json.dumps(row, separators=(",", ":")) + "\n").encode() for row in rows
+    ]
+    catalog.write_bytes(b"".join(encoded_rows))
+    with sqlite3.connect(index) as connection:
+        connection.execute("DELETE FROM markets")
+        offset = 0
+        for row, encoded in zip(rows, encoded_rows, strict=True):
+            connection.execute(
+                "INSERT INTO markets VALUES (?, ?, ?)",
+                (row["identity"]["market_id"], offset, len(encoded)),
+            )
+            offset += len(encoded)
+    with pytest.raises(ValueError, match="not effective at validation time"):
+        build_scope(
+            manifest,
+            index,
+            catalog,
+            registry,
+            expected_market_count=2,
+            expected_token_count=4,
+            validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
         )
