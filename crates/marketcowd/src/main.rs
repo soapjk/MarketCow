@@ -119,7 +119,19 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WalCommand {
-    Verify { path: PathBuf },
+    Verify {
+        path: PathBuf,
+    },
+    AnchorLegacyCheckpoint {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        scope_id: String,
+        #[arg(long)]
+        expected_manifest_sha256: String,
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        wal_segment_bytes: u64,
+    },
 }
 
 #[derive(Clone, Serialize)]
@@ -2319,15 +2331,33 @@ async fn main() -> Result<()> {
             }
             println!("{{\"status\":\"dry_run_ok\",\"destructive\":false}}");
         }
-        Command::Wal {
-            command: WalCommand::Verify { path },
-        } => {
-            let events = marketcow_core::SegmentedWal::verify(path)?;
-            println!(
-                "{}",
-                json!({"status":"ok","records":events.len(),"last_cursor":events.last().map(|x|x.event.cursor)})
-            );
-        }
+        Command::Wal { command } => match command {
+            WalCommand::Verify { path } => {
+                let events = marketcow_core::SegmentedWal::verify(path)?;
+                println!(
+                    "{}",
+                    json!({"status":"ok","records":events.len(),"last_cursor":events.last().map(|x|x.event.cursor)})
+                );
+            }
+            WalCommand::AnchorLegacyCheckpoint {
+                root,
+                scope_id,
+                expected_manifest_sha256,
+                wal_segment_bytes,
+            } => {
+                let manifest = marketcow_runtime::anchor_verified_legacy_checkpoint(
+                    marketcow_runtime::RuntimeConfig {
+                        root,
+                        scope_id,
+                        config_revision: "legacy-checkpoint-anchor-migration-v1".into(),
+                        wal_segment_bytes,
+                        recent_event_capacity: 1,
+                    },
+                    &expected_manifest_sha256,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            }
+        },
         Command::Replay { input, checkpoint } => {
             let config = Config::load()?;
             preflight(&config)?;

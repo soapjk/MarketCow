@@ -12,6 +12,7 @@ use marketcow_polymarket::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::VecDeque,
     fs::{self, File, OpenOptions},
@@ -101,6 +102,54 @@ pub struct PolymarketRuntime {
     writer: SingleWriter<SegmentedWal>,
     recent_events: VecDeque<PersistedEvent>,
     last_manifest: Option<CheckpointManifest>,
+}
+
+/// Upgrades a legacy checkpoint only after an older runtime completed full semantic recovery and
+/// shut down cleanly. The caller pins the exact manifest bytes observed after shutdown. Requiring
+/// the checkpoint cursor to equal the verified WAL tail prevents an anchor from being inserted
+/// into the middle of a live history.
+pub fn anchor_verified_legacy_checkpoint(
+    config: RuntimeConfig,
+    expected_manifest_sha256: &str,
+) -> Result<CheckpointManifest, RuntimeError> {
+    config.validate()?;
+    let manifest_path = config.root.join("checkpoint-manifest.json");
+    let manifest_bytes = fs::read(&manifest_path)?;
+    if expected_manifest_sha256.len() != 64
+        || !expected_manifest_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || hex::encode(Sha256::digest(&manifest_bytes))
+            != expected_manifest_sha256.to_ascii_lowercase()
+    {
+        return Err(RuntimeError::PhysicalCopyMismatch);
+    }
+    let mut manifest: CheckpointManifest = serde_json::from_slice(&manifest_bytes)?;
+    if manifest.schema_version != CHECKPOINT_MANIFEST_V1 || manifest.scope_id != config.scope_id {
+        return Err(RuntimeError::CheckpointScopeMismatch);
+    }
+    let verified_wal = SegmentedWal::verify_with_anchors(config.root.join("wal"))?;
+    let wal_last_cursor = verified_wal
+        .records
+        .last()
+        .map_or(0, |record| record.event.cursor);
+    if manifest.current.cursor != wal_last_cursor || manifest.wal_last_cursor != wal_last_cursor {
+        return Err(RuntimeError::CheckpointBeyondWal);
+    }
+    load_checkpoint_candidate(&config, &manifest.current)?;
+    let mut wal = SegmentedWal::open_after_verification(
+        config.root.join("wal"),
+        &config.scope_id,
+        config.wal_segment_bytes,
+    )?;
+    let anchor =
+        wal.anchor_checkpoint(manifest.current.cursor, &manifest.current.projection_sha256)?;
+    manifest.schema_version = CHECKPOINT_MANIFEST_VERSION.into();
+    manifest.current.wal_anchor_segment_first_cursor = Some(anchor.segment_first_cursor);
+    manifest.current.wal_anchor_segment_header_sha256 = Some(anchor.segment_header_sha256);
+    manifest.created_at = Utc::now();
+    atomic_json_write(&manifest_path, &manifest)?;
+    Ok(manifest)
 }
 
 impl PolymarketRuntime {
@@ -765,6 +814,61 @@ mod tests {
         let recovered = PolymarketRuntime::open(config(dir.path())).unwrap();
         assert!(recovered.projection().ready);
         assert!(recovered.projection().books.contains_key("yes"));
+    }
+
+    #[test]
+    fn stopped_verified_legacy_checkpoint_is_anchored_without_consuming_cursor() {
+        let dir = tempdir().unwrap();
+        let config = config(dir.path());
+        let mut runtime = PolymarketRuntime::open(config.clone()).unwrap();
+        runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+        let mut manifest = runtime.checkpoint().unwrap();
+        drop(runtime);
+
+        let anchor_path = dir
+            .path()
+            .join("wal")
+            .join(format!("scope-{:020}.wal", manifest.current.cursor + 1));
+        fs::remove_file(anchor_path).unwrap();
+        manifest.schema_version = CHECKPOINT_MANIFEST_V1.into();
+        manifest.current.wal_anchor_segment_first_cursor = None;
+        manifest.current.wal_anchor_segment_header_sha256 = None;
+        atomic_json_write(&dir.path().join("checkpoint-manifest.json"), &manifest).unwrap();
+        let manifest_bytes = fs::read(dir.path().join("checkpoint-manifest.json")).unwrap();
+        let expected_manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+
+        let upgraded =
+            anchor_verified_legacy_checkpoint(config.clone(), &expected_manifest_sha256).unwrap();
+
+        assert_eq!(upgraded.schema_version, CHECKPOINT_MANIFEST_VERSION);
+        assert_eq!(upgraded.current.cursor, 1);
+        assert_eq!(upgraded.current.wal_anchor_segment_first_cursor, Some(2));
+        let recovered = PolymarketRuntime::open(config).unwrap();
+        assert_eq!(recovered.projection().cursor, 1);
+        assert!(recovered.projection().ready);
+    }
+
+    #[test]
+    fn legacy_checkpoint_anchor_rejects_a_checkpoint_behind_the_wal_tail() {
+        let dir = tempdir().unwrap();
+        let config = config(dir.path());
+        let mut runtime = PolymarketRuntime::open(config.clone()).unwrap();
+        runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+        let mut manifest = runtime.checkpoint().unwrap();
+        runtime.apply_raw(snapshot("no", 1), at(1)).unwrap();
+        drop(runtime);
+
+        manifest.schema_version = CHECKPOINT_MANIFEST_V1.into();
+        manifest.current.wal_anchor_segment_first_cursor = None;
+        manifest.current.wal_anchor_segment_header_sha256 = None;
+        atomic_json_write(&dir.path().join("checkpoint-manifest.json"), &manifest).unwrap();
+        let manifest_bytes = fs::read(dir.path().join("checkpoint-manifest.json")).unwrap();
+        let expected_manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+
+        assert!(matches!(
+            anchor_verified_legacy_checkpoint(config, &expected_manifest_sha256),
+            Err(RuntimeError::CheckpointBeyondWal)
+        ));
     }
 
     #[test]
