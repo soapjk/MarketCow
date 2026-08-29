@@ -133,6 +133,18 @@ def test_no_change_is_idempotent_and_does_not_activate(tmp_path, monkeypatch):
     assert session.posts == []
 
 
+def test_outcome_token_order_is_not_a_universe_identity_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARKETCOW_RUST_ADMIN_TOKEN", "secret")
+    session = Session()
+    reordered = {**IDENTITY, "token_ids": list(reversed(IDENTITY["token_ids"]))}
+    result = refresh_once(
+        _config(tmp_path), session=session, book_snapshot_builder=_books,
+        universe_builder=lambda *_args, **_kwargs: _candidate(reordered),
+    )
+    assert result["status"] == "no_change"
+    assert session.posts == []
+
+
 def test_changed_membership_registers_and_atomically_activates(tmp_path, monkeypatch):
     monkeypatch.setenv("MARKETCOW_RUST_ADMIN_TOKEN", "secret")
     replacement = {**IDENTITY, "market_id": "2"}

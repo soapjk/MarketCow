@@ -93,7 +93,12 @@ def _sha256(path: Path) -> str:
 
 def _identity_set(values: list[dict[str, Any]]) -> set[tuple[str, str, tuple[str, ...], str]]:
     return {
-        (value["market_id"], value["condition_id"], tuple(value["token_ids"]), value["end_at"])
+        (
+            value["market_id"],
+            value["condition_id"],
+            tuple(sorted(value["token_ids"])),
+            value["end_at"],
+        )
         for value in values
     }
 
