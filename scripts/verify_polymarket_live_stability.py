@@ -30,7 +30,13 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def validate_boundary(payload: dict[str, Any], scope_id: str) -> dict[str, Any]:
+def validate_boundary(
+    payload: dict[str, Any],
+    scope_id: str,
+    expected_market_count: int,
+    expected_relation_count: int,
+    expected_universe_generation: int | None,
+) -> dict[str, Any]:
     snapshot = payload.get("snapshot") or {}
     checkpoint = payload.get("checkpoint") or {}
     health = payload.get("health") or {}
@@ -41,12 +47,22 @@ def validate_boundary(payload: dict[str, Any], scope_id: str) -> dict[str, Any]:
     mismatches = []
     missing = []
     bad_revisions = []
+    bad_fee_schedules = []
     tokens = []
     for market in markets:
         facts = market.get("instrument_facts") or {}
         market_id = str(market.get("market_id"))
         if re.fullmatch(r"[0-9a-f]{64}", str(facts.get("revision", ""))) is None:
             bad_revisions.append(market_id)
+        fee = facts.get("fee_schedule") or {}
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", str(fee.get("revision", ""))) is None
+            or not isinstance(fee.get("maker_rate"), str)
+            or not isinstance(fee.get("taker_rate"), str)
+            or fee.get("calculation_status") not in {"executable", "informational_only"}
+            or not fee.get("provenance")
+        ):
+            bad_fee_schedules.append(market_id)
         outcomes = market.get("outcomes") or []
         if len(outcomes) != 2:
             missing.append({"market_id": market_id, "reason": "outcome_count"})
@@ -73,19 +89,38 @@ def validate_boundary(payload: dict[str, Any], scope_id: str) -> dict[str, Any]:
         checkpoint.get("checkpoint_cursor"),
         checkpoint.get("persisted_cursor"),
     }
+    universe = payload.get("universe") or {}
+    dynamic_universe_valid = expected_universe_generation is None or (
+        payload.get("universe_schema_version") == "marketcow.polymarket.universe.v1"
+        and payload.get("universe_id") == scope_id
+        and payload.get("universe_generation") == expected_universe_generation
+        and universe.get("universe_id") == scope_id
+        and universe.get("generation") == expected_universe_generation
+        and len(universe.get("active_markets") or []) == expected_market_count
+        and universe.get("minimum_market_count") <= expected_market_count
+        and universe.get("target_market_count") >= expected_market_count
+        and all(
+            item.get("market_id") and item.get("reason_code")
+            and isinstance(item.get("retryable"), bool)
+            and (item.get("retry_after") is not None) == item.get("retryable")
+            for item in universe.get("excluded_markets") or []
+        )
+    )
     passed = (
         payload.get("schema_version") == "marketcow.polymarket.live.v2"
         and payload.get("scope_id") == scope_id
         and health.get("ready") is True
         and health.get("unresolved_gap_count") == 0
         and snapshot.get("status") == "ready"
-        and len(markets) == 100
-        and len(books) == 200
-        and len(set(tokens)) == 200
-        and len(relations) == 4
+        and len(markets) == expected_market_count
+        and len(books) == expected_market_count * 2
+        and len(set(tokens)) == expected_market_count * 2
+        and len(relations) == expected_relation_count
         and not mismatches
         and not missing
         and not bad_revisions
+        and not bad_fee_schedules
+        and dynamic_universe_valid
         and len(atomic_values) == 1
         and re.fullmatch(r"[0-9a-f]{64}", str(snapshot.get("catalog_revision", ""))) is not None
         and re.fullmatch(r"[0-9a-f]{64}", str(checkpoint.get("state_sha256", ""))) is not None
@@ -100,6 +135,9 @@ def validate_boundary(payload: dict[str, Any], scope_id: str) -> dict[str, Any]:
         "tick_mismatch_count": len(mismatches),
         "missing_count": len(missing),
         "bad_revision_count": len(bad_revisions),
+        "bad_fee_schedule_count": len(bad_fee_schedules),
+        "universe_generation": payload.get("universe_generation"),
+        "dynamic_universe_valid": dynamic_universe_valid,
         "catalog_revision": snapshot.get("catalog_revision"),
         "checkpoint_state_sha256": checkpoint.get("state_sha256"),
         "fail_closed_reason": health.get("fail_closed_reason"),
@@ -163,6 +201,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Verify a sustained Rust Polymarket live window")
     parser.add_argument("--base-url", default="http://127.0.0.1:18872")
     parser.add_argument("--expected-scope-id", required=True)
+    parser.add_argument("--expected-scope-schema", default="marketcow.polymarket.scope-discovery.v2")
+    parser.add_argument("--expected-market-count", type=int, default=100)
+    parser.add_argument("--expected-relation-count", type=int, default=4)
+    parser.add_argument("--expected-universe-generation", type=int)
     parser.add_argument("--duration-seconds", type=int, default=300)
     parser.add_argument("--startup-timeout-seconds", type=int, default=180)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
@@ -197,15 +239,22 @@ def main() -> None:
                 full_response = client.get(arguments.base_url + "/v1/prediction-markets/polymarket/live/full-sync")
                 scope = scope_response.json()
                 full = full_response.json()
-                boundary = validate_boundary(full, arguments.expected_scope_id) if full_response.status_code == 200 else None
+                boundary = validate_boundary(
+                    full, arguments.expected_scope_id, arguments.expected_market_count,
+                    arguments.expected_relation_count, arguments.expected_universe_generation,
+                ) if full_response.status_code == 200 else None
                 ready = (
                     scope_response.status_code == 200
-                    and scope.get("schema_version") == "marketcow.polymarket.scope-discovery.v2"
+                    and scope.get("schema_version") == arguments.expected_scope_schema
                     and scope.get("active_scope_id") == arguments.expected_scope_id
                     and scope.get("ready") is True
                     and scope.get("scope_status") == "ready"
-                    and scope.get("market_count") == 100
-                    and scope.get("token_count") == 200
+                    and scope.get("market_count") == arguments.expected_market_count
+                    and scope.get("token_count") == arguments.expected_market_count * 2
+                    and (
+                        arguments.expected_universe_generation is None
+                        or scope.get("generation") == arguments.expected_universe_generation
+                    )
                     and scope.get("real_order_submission_enabled") is False
                     and full_response.status_code == 200
                     and boundary is not None
@@ -242,13 +291,22 @@ def main() -> None:
                 scope_response = client.get(arguments.base_url + "/v1/prediction-markets/polymarket/live/scope")
                 full_response = client.get(arguments.base_url + "/v1/prediction-markets/polymarket/live/full-sync")
                 scope = scope_response.json()
-                boundary = validate_boundary(full_response.json(), arguments.expected_scope_id) if full_response.status_code == 200 else None
+                boundary = validate_boundary(
+                    full_response.json(), arguments.expected_scope_id,
+                    arguments.expected_market_count, arguments.expected_relation_count,
+                    arguments.expected_universe_generation,
+                ) if full_response.status_code == 200 else None
                 passed = (
                     scope_response.status_code == 200
                     and scope.get("ready") is True
                     and scope.get("scope_status") == "ready"
-                    and scope.get("market_count") == 100
-                    and scope.get("token_count") == 200
+                    and scope.get("schema_version") == arguments.expected_scope_schema
+                    and scope.get("market_count") == arguments.expected_market_count
+                    and scope.get("token_count") == arguments.expected_market_count * 2
+                    and (
+                        arguments.expected_universe_generation is None
+                        or scope.get("generation") == arguments.expected_universe_generation
+                    )
                     and scope.get("real_order_submission_enabled") is False
                     and full_response.status_code == 200
                     and boundary is not None
