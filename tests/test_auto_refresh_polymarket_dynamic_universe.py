@@ -145,6 +145,18 @@ def test_outcome_token_order_is_not_a_universe_identity_change(tmp_path, monkeyp
     assert session.posts == []
 
 
+def test_equivalent_rfc3339_precision_is_not_an_identity_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARKETCOW_RUST_ADMIN_TOKEN", "secret")
+    session = Session()
+    equivalent = {**IDENTITY, "end_at": "2026-08-30T00:00:00.000000Z"}
+    result = refresh_once(
+        _config(tmp_path), session=session, book_snapshot_builder=_books,
+        universe_builder=lambda *_args, **_kwargs: _candidate(equivalent),
+    )
+    assert result["status"] == "no_change"
+    assert session.posts == []
+
+
 def test_changed_membership_registers_and_atomically_activates(tmp_path, monkeypatch):
     monkeypatch.setenv("MARKETCOW_RUST_ADMIN_TOKEN", "secret")
     replacement = {**IDENTITY, "market_id": "2"}

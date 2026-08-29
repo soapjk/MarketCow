@@ -91,13 +91,22 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _identity_set(values: list[dict[str, Any]]) -> set[tuple[str, str, tuple[str, ...], str]]:
+def _canonical_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("universe identity timestamp must be timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _identity_set(
+    values: list[dict[str, Any]],
+) -> set[tuple[str, str, tuple[str, ...], datetime]]:
     return {
         (
             value["market_id"],
             value["condition_id"],
             tuple(sorted(value["token_ids"])),
-            value["end_at"],
+            _canonical_timestamp(value["end_at"]),
         )
         for value in values
     }
