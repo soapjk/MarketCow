@@ -1,0 +1,121 @@
+{
+  "schema_version": "marketcow.dynamic-universe.live-recovery-gate.v1",
+  "verdict": "passed",
+  "overall_migration_complete": false,
+  "runtime": {
+    "launchd_label": "com.marketcow.rust-polymarket-dynamic-87135c2-shadow-v14",
+    "pid": 37961,
+    "runs": 1,
+    "process_start": "2026-08-29T20:41:01+08:00",
+    "ready_log_at": "2026-08-29T12:41:02.827910Z",
+    "recovery_seconds_approx": 1.82791,
+    "commit": "87135c2cb1fd7898de2b683b574715970a2ba284",
+    "binary_sha256": "ea64fd9d043e9ea6c4ecd16cabab241a3f8f8c56a947ded0557f17929bfc8495",
+    "bind": "127.0.0.1:18872",
+    "listen_verified": true,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  },
+  "scope": {
+    "http_status": 200,
+    "schema_version": "marketcow.polymarket.scope-discovery.v3",
+    "universe_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "generation": 4,
+    "ready": true,
+    "scope_status": "ready",
+    "target_market_count": 100,
+    "minimum_market_count": 80,
+    "market_count": 100,
+    "token_count": 200,
+    "active_market_count": 100,
+    "excluded_market_count": 400,
+    "maximum_capital_lock_seconds": 2592000,
+    "added_markets": ["2911874"],
+    "removed_markets": ["3055022"],
+    "real_order_submission_enabled": false
+  },
+  "full_sync": {
+    "http_status": 200,
+    "schema_version": "marketcow.polymarket.live.v2",
+    "generation": 4,
+    "status": "ready",
+    "market_count": 100,
+    "book_count": 200,
+    "relation_count": 5,
+    "unresolved_gap_count": 0,
+    "tick_mismatch_count": 0,
+    "bad_instrument_revision_count": 0,
+    "bad_fee_schedule_count": 0,
+    "catalog_revision": "76ebc558f824f0cdfa7c7ebd579f5034f5ce7f58120a23b98ea0e474d2373003",
+    "added_market_identity": {
+      "market_id": "2911874",
+      "condition_id": "0x31327c6fbdc70a44d97f8e8973f536b6a748e01b4c0ca5549ed0910c703b1d7b",
+      "token_ids": [
+        "30774565298935121666763850272423963284589055313497974568971929195252437852383",
+        "8310650677069487821478025416478130051168635736368290554555541536659374960027"
+      ],
+      "end_at": "2026-08-31T00:00:00Z"
+    },
+    "removed_market_identity": {
+      "market_id": "3055022",
+      "condition_id": "0xaff0aedf83c0531388d22c302f8fd64ea3eb00aa822fbc57fedd0f7867d0d467",
+      "token_ids": [
+        "23339199211540021670118016596636314587869304333969151798245425102191313291003",
+        "51828736259384973741087760200703482075261154192254123762265203110469756668625"
+      ],
+      "end_at": "2026-08-29T23:59:00Z"
+    }
+  },
+  "checkpoint_and_wal": {
+    "pre_restart_checkpoint_cursor": 1713537,
+    "manifest_schema_version": "marketcow.polymarket.checkpoint-manifest.v2",
+    "checkpoint_cursor": 1729552,
+    "checkpoint_path": "checkpoints/00000000000001729552.json",
+    "checkpoint_projection_sha256": "63baffab25b5678946084611aff2c5eac5b45bcdbbcb186bddc37a618c643093",
+    "checkpoint_hash_match": true,
+    "parent_lineage_manifest_sha256": "4bbc70a5d1a92895de839e3059f37081884fc74ae70092ddc694e0d216024d42",
+    "parent_checkpoint_cursor": 1702951,
+    "parent_checkpoint_sha256": "90dc6cea382a96bb78f9f247b397c2cd6845abe26fa4f1d145dc901c139ed1b2",
+    "parent_lineage_file_hash_match": true,
+    "child_wal_status": "ok",
+    "child_wal_records": 27077,
+    "child_wal_last_cursor": 1730028
+  },
+  "continuity_and_surface": {
+    "smoke_window_seconds": 5.128803250001511,
+    "sample_count": 5,
+    "failed_sample_count": 0,
+    "cursor_start": 1730026,
+    "cursor_finish": 1730248,
+    "websocket_event_cursors": [1730249, 1730250, 1730251, 1730252, 1730253],
+    "websocket_contiguous": true,
+    "expired_cursor_resync_required": true,
+    "expired_cursor_close_code": 1008,
+    "expired_cursor_close_reason": "full_sync_required",
+    "read_only_paths_checked": 14,
+    "read_only_paths_all_404": true,
+    "orders_enabled": false
+  },
+  "gate_verdicts": {
+    "runtime_identity": "passed",
+    "no_restart_identity": "passed",
+    "real_loopback_listener": "passed",
+    "dynamic_membership_recovery": "passed",
+    "scope_and_full_sync": "passed",
+    "checkpoint_restart_recovery": "passed",
+    "checkpoint_and_lineage_hashes": "passed",
+    "child_wal_integrity": "passed",
+    "websocket_continuity": "passed",
+    "expired_cursor_resync": "passed",
+    "read_only_surface": "passed",
+    "real_orders_disabled": "passed"
+  },
+  "preserved_prior_failures": [
+    "bbbb27b v11 unresolved market 2849008",
+    "d8effd9 five-minute restart gate and approximately 1030-second late recovery",
+    "pre-fix generation-3 activation HTTP 504 after 10.261742 seconds",
+    "observer r1 ModuleNotFoundError, r2 WebSocket 1013, and r3 inferred keepalive restart",
+    "pre-fix generation-3 ENOSPC fork quarantined",
+    "generation-4 first activation request returned HTTP 422 because versioned request fields were omitted"
+  ]
+}
