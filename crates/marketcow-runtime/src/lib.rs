@@ -69,6 +69,18 @@ pub struct CheckpointManifest {
     pub previous: Option<CheckpointReference>,
     pub wal_last_cursor: u64,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_lineage: Option<CheckpointLineageReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointLineageReference {
+    pub manifest_path: PathBuf,
+    pub manifest_sha256: String,
+    pub checkpoint_cursor: u64,
+    pub checkpoint_sha256: String,
+    pub wal_anchor_segment_first_cursor: u64,
+    pub wal_anchor_segment_header_sha256: String,
 }
 
 #[derive(Debug, Error)]
@@ -183,9 +195,9 @@ impl PolymarketRuntime {
         })
     }
 
-    /// Copies the verified active WAL/checkpoint chain into an isolated candidate root. The copy
-    /// is deliberately physical: candidate appends must never mutate a hard-linked active WAL.
-    /// Callers stop ingress before invoking this method, then fully validate the fork before swap.
+    /// Forks an isolated generation from a WAL-anchored checkpoint. Historical WAL remains in the
+    /// immutable parent generation and is content-addressed through `parent_lineage`; the child
+    /// stores only its baseline checkpoint and post-switch WAL.
     pub fn fork_candidate(&mut self, config: RuntimeConfig) -> Result<Self, RuntimeError> {
         config.validate()?;
         if config.scope_id != self.config.scope_id {
@@ -199,41 +211,72 @@ impl PolymarketRuntime {
         let projection = self.writer.projection();
         fs::create_dir_all(config.root.join("wal"))?;
         fs::create_dir_all(config.root.join("checkpoints"))?;
-        copy_regular_files_verified(
-            &self.config.root.join("wal"),
-            &config.root.join("wal"),
-            deadline,
-        )?;
-        for reference in std::iter::once(&manifest.current).chain(manifest.previous.iter()) {
-            copy_regular_file_verified(
-                self.config.root.join(&reference.path),
-                config.root.join(&reference.path),
-                deadline,
-            )?;
-        }
+        fs::create_dir_all(config.root.join("lineage"))?;
+        let parent_manifest_path = PathBuf::from("lineage/parent-checkpoint-manifest.json");
         copy_regular_file_verified(
             self.config.root.join("checkpoint-manifest.json"),
-            config.root.join("checkpoint-manifest.json"),
+            config.root.join(&parent_manifest_path),
             deadline,
         )?;
-        File::open(config.root.join("wal"))?.sync_all()?;
-        File::open(config.root.join("checkpoints"))?.sync_all()?;
-        File::open(&config.root)?.sync_all()?;
-        let copied_checkpoint = load_checkpoint_candidate(&config, &manifest.current)?;
-        if copied_checkpoint.hash() != projection.hash() {
+        let parent_manifest_sha256 = hex::encode(Sha256::digest(fs::read(
+            config.root.join(&parent_manifest_path),
+        )?));
+        let relative_checkpoint =
+            PathBuf::from(format!("checkpoints/{:020}.json", projection.cursor));
+        let projection_sha256 =
+            write_checkpoint(&config.root.join(&relative_checkpoint), &projection)?;
+        if projection_sha256 != manifest.current.projection_sha256 {
             return Err(RuntimeError::PhysicalCopyMismatch);
         }
-        let wal = SegmentedWal::open_verified_copy(
+        let mut wal = SegmentedWal::open(
             config.root.join("wal"),
             &config.scope_id,
             config.wal_segment_bytes,
         )?;
+        let anchor = wal.anchor_checkpoint(projection.cursor, &projection_sha256)?;
+        let candidate_manifest = CheckpointManifest {
+            schema_version: CHECKPOINT_MANIFEST_VERSION.into(),
+            scope_id: config.scope_id.clone(),
+            current: CheckpointReference {
+                path: relative_checkpoint,
+                projection_sha256,
+                cursor: projection.cursor,
+                wal_anchor_segment_first_cursor: Some(anchor.segment_first_cursor),
+                wal_anchor_segment_header_sha256: Some(anchor.segment_header_sha256),
+            },
+            previous: None,
+            wal_last_cursor: projection.persisted_cursor,
+            created_at: Utc::now(),
+            parent_lineage: Some(CheckpointLineageReference {
+                manifest_path: parent_manifest_path,
+                manifest_sha256: parent_manifest_sha256,
+                checkpoint_cursor: manifest.current.cursor,
+                checkpoint_sha256: manifest.current.projection_sha256,
+                wal_anchor_segment_first_cursor: manifest
+                    .current
+                    .wal_anchor_segment_first_cursor
+                    .ok_or(RuntimeError::NoValidCheckpoint)?,
+                wal_anchor_segment_header_sha256: manifest
+                    .current
+                    .wal_anchor_segment_header_sha256
+                    .ok_or(RuntimeError::NoValidCheckpoint)?,
+            }),
+        };
+        atomic_json_write(
+            &config.root.join("checkpoint-manifest.json"),
+            &candidate_manifest,
+        )?;
+        File::open(config.root.join("wal"))?.sync_all()?;
+        File::open(config.root.join("checkpoints"))?.sync_all()?;
+        File::open(config.root.join("lineage"))?.sync_all()?;
+        File::open(&config.root)?.sync_all()?;
+        ensure_candidate_deadline(deadline)?;
         let writer = SingleWriter::resume(projection.as_ref().clone(), wal)?;
         Ok(Self {
             config,
             writer,
             recent_events: self.recent_events.clone(),
-            last_manifest: Some(manifest),
+            last_manifest: Some(candidate_manifest),
         })
     }
 
@@ -326,6 +369,10 @@ impl PolymarketRuntime {
             previous,
             wal_last_cursor: projection.persisted_cursor,
             created_at: Utc::now(),
+            parent_lineage: self
+                .last_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.parent_lineage.clone()),
         };
         atomic_json_write(
             &self.config.root.join("checkpoint-manifest.json"),
@@ -374,23 +421,6 @@ fn verified_book_tick(
                 }
             })
         })
-}
-
-fn copy_regular_files_verified(
-    source: &Path,
-    destination: &Path,
-    deadline: Instant,
-) -> Result<(), RuntimeError> {
-    for entry in fs::read_dir(source)? {
-        ensure_candidate_deadline(deadline)?;
-        let entry = entry?;
-        let metadata = entry.file_type()?;
-        if !metadata.is_file() || metadata.is_symlink() {
-            return Err(RuntimeError::InvalidConfig);
-        }
-        copy_regular_file_verified(entry.path(), destination.join(entry.file_name()), deadline)?;
-    }
-    Ok(())
 }
 
 fn copy_regular_file_verified(
@@ -457,7 +487,43 @@ fn load_manifest(config: &RuntimeConfig) -> Result<Option<CheckpointManifest>, R
     {
         return Err(RuntimeError::CheckpointScopeMismatch);
     }
+    validate_parent_lineage(config, &manifest)?;
     Ok(Some(manifest))
+}
+
+fn validate_parent_lineage(
+    config: &RuntimeConfig,
+    manifest: &CheckpointManifest,
+) -> Result<(), RuntimeError> {
+    let Some(lineage) = &manifest.parent_lineage else {
+        return Ok(());
+    };
+    if manifest.schema_version != CHECKPOINT_MANIFEST_VERSION
+        || lineage.manifest_path.is_absolute()
+        || lineage
+            .manifest_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(RuntimeError::CheckpointPathEscape);
+    }
+    let bytes = fs::read(config.root.join(&lineage.manifest_path))?;
+    if hex::encode(Sha256::digest(&bytes)) != lineage.manifest_sha256 {
+        return Err(RuntimeError::PhysicalCopyMismatch);
+    }
+    let parent: CheckpointManifest = serde_json::from_slice(&bytes)?;
+    if parent.scope_id != manifest.scope_id
+        || parent.current.cursor != lineage.checkpoint_cursor
+        || parent.current.projection_sha256 != lineage.checkpoint_sha256
+        || parent.current.wal_anchor_segment_first_cursor
+            != Some(lineage.wal_anchor_segment_first_cursor)
+        || parent.current.wal_anchor_segment_header_sha256.as_deref()
+            != Some(lineage.wal_anchor_segment_header_sha256.as_str())
+        || parent.current.cursor > manifest.current.cursor
+    {
+        return Err(RuntimeError::CheckpointScopeMismatch);
+    }
+    Ok(())
 }
 
 fn recover_projection(
@@ -469,7 +535,9 @@ fn recover_projection(
     let last_wal_cursor = records.last().map_or(0, |record| record.event.cursor);
     if let Some(manifest) = manifest {
         for candidate in std::iter::once(&manifest.current).chain(manifest.previous.iter()) {
-            if candidate.cursor > last_wal_cursor {
+            let anchored = manifest.schema_version == CHECKPOINT_MANIFEST_VERSION
+                && checkpoint_anchor_matches(candidate, wal_anchors);
+            if candidate.cursor > last_wal_cursor && !anchored {
                 continue;
             }
             if let Ok(checkpoint) = load_checkpoint_candidate(config, candidate)
@@ -486,7 +554,9 @@ fn recover_projection(
             }
         }
         // Keeping the full WAL permits a safe origin replay when both retained checkpoints fail.
-        if records.first().map(|record| record.event.cursor) != Some(1) && !records.is_empty() {
+        let origin_replay_available = records.first().map(|record| record.event.cursor) == Some(1)
+            || records.is_empty() && manifest.current.cursor == 0;
+        if !origin_replay_available {
             return Err(RuntimeError::NoValidCheckpoint);
         }
     }
@@ -526,6 +596,9 @@ fn checkpoint_boundary_matches(
     records: &[PersistedEvent],
     wal_anchors: &[WalCheckpointAnchor],
 ) -> Result<bool, RuntimeError> {
+    if manifest_schema_version == CHECKPOINT_MANIFEST_VERSION {
+        return Ok(checkpoint_anchor_matches(reference, wal_anchors));
+    }
     let boundary = records.partition_point(|record| record.event.cursor <= checkpoint.cursor);
     if checkpoint.cursor > 0
         && records
@@ -535,25 +608,29 @@ fn checkpoint_boundary_matches(
     {
         return Err(RuntimeError::CheckpointBeyondWal);
     }
-    if manifest_schema_version == CHECKPOINT_MANIFEST_VERSION {
-        let Some(segment_first_cursor) = reference.wal_anchor_segment_first_cursor else {
-            return Ok(false);
-        };
-        let Some(segment_header_sha256) = &reference.wal_anchor_segment_header_sha256 else {
-            return Ok(false);
-        };
-        return Ok(wal_anchors.iter().any(|anchor| {
-            anchor.checkpoint_cursor == checkpoint.cursor
-                && anchor.checkpoint_sha256 == reference.projection_sha256
-                && anchor.segment_first_cursor == segment_first_cursor
-                && anchor.segment_header_sha256 == *segment_header_sha256
-        }));
-    }
     let rebuilt = replay_after_checkpoint(
         Projection::bootstrap(config.scope_id.clone()),
         &records[..boundary],
     )?;
     Ok(rebuilt.hash() == checkpoint.hash())
+}
+
+fn checkpoint_anchor_matches(
+    reference: &CheckpointReference,
+    wal_anchors: &[WalCheckpointAnchor],
+) -> bool {
+    let Some(segment_first_cursor) = reference.wal_anchor_segment_first_cursor else {
+        return false;
+    };
+    let Some(segment_header_sha256) = &reference.wal_anchor_segment_header_sha256 else {
+        return false;
+    };
+    wal_anchors.iter().any(|anchor| {
+        anchor.checkpoint_cursor == reference.cursor
+            && anchor.checkpoint_sha256 == reference.projection_sha256
+            && anchor.segment_first_cursor == segment_first_cursor
+            && anchor.segment_header_sha256 == *segment_header_sha256
+    })
 }
 
 fn atomic_json_write(path: &Path, value: &impl Serialize) -> Result<(), RuntimeError> {
@@ -723,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_fork_reuses_verified_projection_and_retains_only_recovery_checkpoints() {
+    fn candidate_fork_uses_compact_lineage_and_recovers_post_switch_wal() {
         let source = tempdir().unwrap();
         let candidate = tempdir().unwrap();
         let mut runtime = PolymarketRuntime::open(config(source.path())).unwrap();
@@ -748,15 +825,59 @@ mod tests {
             fs::read_dir(candidate.path().join("checkpoints"))
                 .unwrap()
                 .count(),
-            2
+            1
+        );
+        let candidate_manifest: CheckpointManifest = serde_json::from_slice(
+            &fs::read(candidate.path().join("checkpoint-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let parent_manifest: CheckpointManifest = serde_json::from_slice(
+            &fs::read(source.path().join("checkpoint-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let lineage = candidate_manifest.parent_lineage.as_ref().unwrap();
+        assert_eq!(lineage.checkpoint_cursor, 3);
+        assert_eq!(
+            lineage.checkpoint_sha256,
+            parent_manifest.current.projection_sha256
+        );
+        assert_eq!(
+            candidate_manifest.current.projection_sha256,
+            lineage.checkpoint_sha256
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(
+                fs::read(candidate.path().join(&lineage.manifest_path)).unwrap()
+            )),
+            lineage.manifest_sha256
+        );
+        assert_eq!(
+            SegmentedWal::verify(candidate.path().join("wal"))
+                .unwrap()
+                .len(),
+            0
         );
         fork.apply_raw(snapshot("candidate-only", 3), at(3))
             .unwrap();
         assert_eq!(fork.projection().cursor, 4);
         assert_eq!(runtime.projection().cursor, 3);
+        let candidate_records = SegmentedWal::verify(candidate.path().join("wal")).unwrap();
+        assert_eq!(candidate_records.len(), 1);
+        assert_eq!(candidate_records[0].event.cursor, 4);
         drop(fork);
         let recovered = PolymarketRuntime::open(config(candidate.path())).unwrap();
         assert_eq!(recovered.projection().cursor, 4);
+        drop(recovered);
+
+        fs::write(
+            candidate.path().join(&lineage.manifest_path),
+            b"tampered lineage",
+        )
+        .unwrap();
+        assert!(matches!(
+            PolymarketRuntime::open(config(candidate.path())),
+            Err(RuntimeError::PhysicalCopyMismatch)
+        ));
     }
 
     #[test]
