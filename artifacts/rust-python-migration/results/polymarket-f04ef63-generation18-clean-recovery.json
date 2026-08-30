@@ -1,0 +1,81 @@
+{
+  "schema_version": "marketcow.polymarket.clean-recovery-evidence.v1",
+  "recorded_at": "2026-08-30T19:52:13+08:00",
+  "verdict": "passed_immediate_live_smoke_pending_multi_refresh_gate",
+  "history_policy": {
+    "authoritative_old_history_required": false,
+    "decision": "preserve_corrupt_generation_17_for_forensics_but_start_a_clean_generation_18_lineage",
+    "retained_corrupt_storage": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage/polymarket-universes/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34/generation-00000000000000000017",
+    "consumer_recovery": "cursors from the retired lineage receive resync_required/event_cursor_expired and must perform full-sync"
+  },
+  "runtime": {
+    "base_url": "http://127.0.0.1:18872",
+    "launchd_label": "com.marketcow.rust-polymarket-clean-f04ef63-gen18-live",
+    "pid": 31068,
+    "commit": "f04ef635c7cb8beb07e83bf16226a36389117ee9",
+    "binary": "/tmp/marketcow-generation18-clean.rcdEVy/marketcow-f04ef63",
+    "binary_sha256": "4caaf86b2a80034bc4cdad131c828be30b4c6a46ccbfbcc089d102e099daffae",
+    "storage_root": "/tmp/marketcow-generation18-clean.rcdEVy/storage",
+    "scope_document": "/tmp/marketcow-generation18-clean.rcdEVy/registry/scope-gen18.json",
+    "scope_document_sha256": "81fa40492a716a57df62a388d6b89f87e9771c151df5d73581bf55c97288e470",
+    "real_order_submission_enabled": false,
+    "lifecycle_owner": "MarketCow launchd; not Tradude"
+  },
+  "contract": {
+    "scope_schema": "marketcow.polymarket.scope-discovery.v3",
+    "universe_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "generation": 18,
+    "ready": true,
+    "scope_status": "ready",
+    "target_market_count": 100,
+    "minimum_market_count": 80,
+    "market_count": 100,
+    "token_count": 200,
+    "book_count": 200,
+    "negative_risk_relation_count": 5,
+    "maximum_capital_lock_seconds": 2592000,
+    "catalog_revision": "efee86151894c0124cd830af4667cc4aa16ba1b4b83ae167f7b1531a3eba4c82",
+    "tick_mismatch_count": 0
+  },
+  "immediate_live_gate": {
+    "result": "artifacts/rust-python-migration/results/polymarket-f04ef63-generation18-live-smoke-60s.json",
+    "source_sha256": "cd4e26d1a3406a2fe670bf5c60715a988c77115eabf6edb8442b1465e30df141",
+    "elapsed_seconds": 60.12390599999344,
+    "events": 2477,
+    "failures": 0,
+    "resync_reasons": {},
+    "universe_changes": 0,
+    "cursor_discontinuities": 0,
+    "ordinary_gap_frames": 0,
+    "ordinary_unapplied_frames": 0,
+    "expired_retired_cursor": 2586976,
+    "expired_cursor_verdict": "resync_required/event_cursor_expired",
+    "read_only_paths_checked": 14,
+    "read_only_status": "all_404"
+  },
+  "architecture_controls": {
+    "rest_books_role": "validation and freshness evidence only; never mutates the WebSocket projection, WAL, cursor, or stream",
+    "wal_writer_control": "exclusive nonblocking writer.lock lease",
+    "cross_process_overlap": "fail-closed with WriterAlreadyActive",
+    "financial_numbers": "contract continues to use exact decimal string semantics"
+  },
+  "verification": [
+    {
+      "command": "cargo test --workspace",
+      "result": "passed: 181 tests; 5 external-database integration tests ignored; 0 failed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "pending": [
+    "scheduled 12-minute gate crossing at least two five-minute authoritative REST validation cycles",
+    "checkpoint/WAL restart recovery after the 12-minute gate",
+    "scheduled strict 30-minute live gate"
+  ]
+}
