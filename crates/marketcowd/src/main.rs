@@ -6518,17 +6518,6 @@ async fn market_data_stream(
             &request_id,
         );
     }
-    if query
-        .after_cursor
-        .is_some_and(|cursor| cursor > projection.cursor)
-    {
-        return error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "stream_cursor_ahead_of_projection",
-            false,
-            &request_id,
-        );
-    }
     // Subscribe before capturing the immutable replay views. Events visible in both are skipped by
     // cursor, while an event landing between the reads remains in at least one source.
     let receiver = state.stream.subscribe();
@@ -6589,6 +6578,19 @@ async fn serve_market_data_stream(
     let mut last_cursor = after_cursor.unwrap_or(boundary);
 
     if let Some(resume_cursor) = after_cursor {
+        if resume_cursor > boundary {
+            // A clean lineage replacement can intentionally restart the local cursor while
+            // retaining the stable scope/universe identity. An old consumer cursor is therefore
+            // expired evidence from the retired lineage, not a malformed WebSocket request.
+            let frame = marketcow_api::stream_resync_required(
+                &subscription_scope_id,
+                resume_cursor,
+                "event_cursor_expired",
+            );
+            let _ = send_stream_frame(&mut socket, &frame).await;
+            close_stream(&mut socket, close_code::POLICY, "full_sync_required").await;
+            return;
+        }
         let earliest = records.first().map(|record| record.event.cursor);
         if resume_cursor < boundary
             && earliest.is_some_and(|cursor| cursor > resume_cursor.saturating_add(1))
@@ -11347,6 +11349,20 @@ mod tests {
         assert!(matches!(
             replayed.payload,
             marketcow_api::StreamPayload::Event { ref event } if event.cursor == 2
+        ));
+
+        let (mut retired_lineage, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{address}/v1/market-data/stream?after_cursor=999999"
+        ))
+        .await
+        .unwrap();
+        let retired_resync = next_stream_frame(&mut retired_lineage).await;
+        assert!(matches!(
+            retired_resync.payload,
+            marketcow_api::StreamPayload::ResyncRequired {
+                ref reason,
+                retryable: true,
+            } if reason == "event_cursor_expired"
         ));
         let mut unavailable = (*state.projection.load_full()).clone();
         unavailable.ready = false;
