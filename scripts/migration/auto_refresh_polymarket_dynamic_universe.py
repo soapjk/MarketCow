@@ -267,6 +267,7 @@ def refresh_once(
         minimum_market_count=config.minimum_market_count,
         maximum_capital_lock_seconds=config.maximum_capital_lock_seconds,
         previous_market_ids=[value["market_id"] for value in current_identities],
+        previous_market_identities=current_identities,
         retry_seconds=config.retry_seconds,
     )
     write_atomic_json(candidate_path, candidate)

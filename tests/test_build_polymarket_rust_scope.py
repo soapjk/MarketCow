@@ -333,6 +333,31 @@ def test_dynamic_universe_records_capacity_exclusion(tmp_path: Path) -> None:
     }]
 
 
+def test_dynamic_universe_preserves_removed_identity_when_catalog_member_is_unbuildable(
+    tmp_path: Path,
+) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    previous_identity = {
+        "market_id": "999",
+        "condition_id": "condition-expired",
+        "token_ids": ["991", "992"],
+        "end_at": "2026-08-28T00:00:00Z",
+    }
+    result = build_dynamic_universe(
+        manifest, index, catalog, registry, _books(tmp_path),
+        universe_id="9" * 64,
+        generation=8,
+        target_market_count=1,
+        minimum_market_count=1,
+        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
+        previous_market_ids=["999"],
+        previous_market_identities=[previous_identity],
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    assert result["universe"]["removed_markets"] == ["999"]
+    assert result["universe"]["removed_market_identities"] == [previous_identity]
+
+
 def test_dynamic_universe_accepts_atomic_two_token_tick_change(tmp_path: Path) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
     books = _books(tmp_path)

@@ -89,6 +89,7 @@ def build_dynamic_universe(
     minimum_market_count: int,
     maximum_capital_lock_seconds: int,
     previous_market_ids: list[str] | None = None,
+    previous_market_identities: list[dict[str, Any]] | None = None,
     validated_at: datetime | None = None,
     retry_seconds: int = 60,
 ) -> dict[str, Any]:
@@ -185,10 +186,45 @@ def build_dynamic_universe(
             f"qualified market count below minimum: {len(active)} < {minimum_market_count}; exclusions={counts}"
         )
     active_ids = [market["market_id"] for market in active]
-    previous = set(previous_market_ids or [])
+    previous_identity_by_id: dict[str, dict[str, Any]] = {}
+    for identity in previous_market_identities or []:
+        if not isinstance(identity, dict) or set(identity) != {
+            "market_id", "condition_id", "token_ids", "end_at"
+        }:
+            raise ValueError("previous market identity is invalid")
+        market_id = identity["market_id"]
+        token_ids_value = identity["token_ids"]
+        if (
+            not isinstance(market_id, str)
+            or not market_id.isascii()
+            or not market_id.isdecimal()
+            or not isinstance(identity["condition_id"], str)
+            or not identity["condition_id"]
+            or not isinstance(token_ids_value, list)
+            or len(token_ids_value) != 2
+            or any(
+                not isinstance(token, str) or not token.isascii() or not token.isdecimal()
+                for token in token_ids_value
+            )
+            or len(set(token_ids_value)) != 2
+            or not isinstance(identity["end_at"], str)
+        ):
+            raise ValueError("previous market identity is invalid")
+        _canonical_end = datetime.fromisoformat(identity["end_at"].replace("Z", "+00:00"))
+        if _canonical_end.tzinfo is None or market_id in previous_identity_by_id:
+            raise ValueError("previous market identity is invalid")
+        previous_identity_by_id[market_id] = {
+            "market_id": market_id,
+            "condition_id": identity["condition_id"],
+            "token_ids": list(token_ids_value),
+            "end_at": identity["end_at"],
+        }
+    previous = set(previous_market_ids or previous_identity_by_id)
+    if previous_identity_by_id and previous != set(previous_identity_by_id):
+        raise ValueError("previous market ids and identities disagree")
     current = set(active_ids)
     removed = previous - current
-    if not removed.issubset(known_markets):
+    if not removed.issubset(set(known_markets) | set(previous_identity_by_id)):
         raise ValueError("removed market identity is unavailable; refusing to forget token identity")
     token_ids = sorted(
         outcome["token_id"] for market in active for outcome in market["outcomes"]
@@ -264,14 +300,17 @@ def build_dynamic_universe(
                 "token_ids": [outcome["token_id"] for outcome in market["outcomes"]],
                 "end_at": market["instrument_facts"]["end_at"],
             } for market in active if market["market_id"] in current - previous],
-            "removed_market_identities": [{
-                "market_id": known_markets[market_id]["market_id"],
-                "condition_id": known_markets[market_id]["condition_id"],
-                "token_ids": [
-                    outcome["token_id"] for outcome in known_markets[market_id]["outcomes"]
-                ],
-                "end_at": known_markets[market_id]["instrument_facts"]["end_at"],
-            } for market_id in sorted(removed)],
+            "removed_market_identities": [
+                previous_identity_by_id.get(market_id) or {
+                    "market_id": known_markets[market_id]["market_id"],
+                    "condition_id": known_markets[market_id]["condition_id"],
+                    "token_ids": [
+                        outcome["token_id"] for outcome in known_markets[market_id]["outcomes"]
+                    ],
+                    "end_at": known_markets[market_id]["instrument_facts"]["end_at"],
+                }
+                for market_id in sorted(removed)
+            ],
             "excluded_markets": excluded,
             "validated_at": now.isoformat().replace("+00:00", "Z"),
         },
@@ -300,6 +339,7 @@ def main() -> int:
     parser.add_argument("--minimum-market-count", type=int, required=True)
     parser.add_argument("--maximum-capital-lock-seconds", type=int, required=True)
     parser.add_argument("--previous-market-id", action="append", default=[])
+    parser.add_argument("--previous-market-identities", type=Path)
     arguments = parser.parse_args()
     result = build_dynamic_universe(
         arguments.candidates, arguments.catalog_index, arguments.catalog, arguments.registry,
@@ -307,7 +347,12 @@ def main() -> int:
         target_market_count=arguments.target_market_count,
         minimum_market_count=arguments.minimum_market_count,
         maximum_capital_lock_seconds=arguments.maximum_capital_lock_seconds,
-        previous_market_ids=arguments.previous_market_id,
+        previous_market_ids=arguments.previous_market_id or None,
+        previous_market_identities=(
+            json.loads(arguments.previous_market_identities.read_bytes())
+            if arguments.previous_market_identities
+            else None
+        ),
     )
     write_atomic_json(arguments.output, result)
     print(json.dumps({"output": str(arguments.output.resolve()), "sha256": sha256_file(arguments.output),
