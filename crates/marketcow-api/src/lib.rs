@@ -293,8 +293,54 @@ pub fn events_page(
 }
 
 pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, ReadApiError> {
-    let canonical_payload =
-        serde_json::to_value(&record.event.kind).map_err(|_| ReadApiError::Serialization)?;
+    // Last-trade and best-bid/ask observations are durably authoritative but do not change the
+    // strategy book projection. Preserve their cursor and raw evidence while exposing an explicit
+    // no-op atomic delta, so strict consumers can advance without treating metadata-only traffic
+    // as an instrument-facts change.
+    let (canonical_payload, public_event_type) = match &record.event.kind {
+        EventKind::LastTradePrice { token_id, .. } => (
+            serde_json::json!({
+                "event_type":"atomic_delta", "token_id":token_id, "changes":[],
+                "source_event_type":"last_trade_price"
+            }),
+            "delta",
+        ),
+        EventKind::BestBidAsk { token_id, .. } => (
+            serde_json::json!({
+                "event_type":"atomic_delta", "token_id":token_id, "changes":[],
+                "source_event_type":"best_bid_ask"
+            }),
+            "delta",
+        ),
+        EventKind::Delta {
+            token_id,
+            side,
+            levels,
+        } => (
+            serde_json::json!({
+                "event_type":"atomic_delta", "token_id":token_id,
+                "changes":[{"side":side,"levels":levels}],
+                "source_event_type":"delta"
+            }),
+            "delta",
+        ),
+        kind => (
+            serde_json::to_value(kind).map_err(|_| ReadApiError::Serialization)?,
+            match kind {
+                EventKind::CatalogSnapshot { .. } => "catalog_revision",
+                EventKind::NewMarket { .. } => "new_market",
+                EventKind::MarketResolved { .. } if record.applied => "market_terminal",
+                EventKind::MarketResolved { .. } => "market_resolved",
+                EventKind::FullBook { .. } => "full_book",
+                EventKind::AtomicDelta { .. } => "delta",
+                EventKind::TickSizeChange { .. } => "tick_size_change",
+                EventKind::SourceGap { .. } => "source_gap",
+                EventKind::Delta { .. }
+                | EventKind::BestBidAsk { .. }
+                | EventKind::LastTradePrice { .. } => unreachable!(),
+            },
+        ),
+    };
     let canonical_bytes =
         serde_json::to_vec(&canonical_payload).map_err(|_| ReadApiError::Serialization)?;
     let gaps = record
@@ -305,20 +351,7 @@ pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, Re
     Ok(EventContractFields {
         cursor: record.event.cursor,
         event_id: record.event.event_id.clone(),
-        event_type: match &record.event.kind {
-            EventKind::CatalogSnapshot { .. } => "catalog_revision",
-            EventKind::NewMarket { .. } => "new_market",
-            EventKind::MarketResolved { .. } if record.applied => "market_terminal",
-            EventKind::MarketResolved { .. } => "market_resolved",
-            EventKind::FullBook { .. } => "full_book",
-            EventKind::Delta { .. } => "delta",
-            EventKind::AtomicDelta { .. } => "delta",
-            EventKind::BestBidAsk { .. } => "best_bid_ask",
-            EventKind::LastTradePrice { .. } => "last_trade_price",
-            EventKind::TickSizeChange { .. } => "tick_size_change",
-            EventKind::SourceGap { .. } => "source_gap",
-        }
-        .into(),
+        event_type: public_event_type.into(),
         canonical_payload,
         canonical_payload_sha256: hex::encode(Sha256::digest(canonical_bytes)),
         raw_payload: (*record.event.raw_payload).clone(),
@@ -479,6 +512,36 @@ mod tests {
         ));
         assert_eq!(events_page(&records, 3, 2).unwrap().next_cursor, 3);
         assert_eq!(events_page(&records, 0, 0), Err(ReadApiError::InvalidLimit));
+    }
+
+    #[test]
+    fn metadata_only_market_events_advance_as_explicit_noop_deltas() {
+        let record = PersistedEvent {
+            event: event(
+                2,
+                EventKind::LastTradePrice {
+                    token_id: "yes".into(),
+                    price: marketcow_core::Price::parse("0.41").unwrap(),
+                },
+            ),
+            applied: true,
+            fail_closed_reason: None,
+        };
+        let contract = event_contract(&record).unwrap();
+        assert_eq!(contract.event_type, "delta");
+        assert_eq!(contract.canonical_payload["event_type"], "atomic_delta");
+        assert_eq!(contract.canonical_payload["token_id"], "yes");
+        assert_eq!(contract.canonical_payload["changes"], serde_json::json!([]));
+        assert_eq!(
+            contract.canonical_payload["source_event_type"],
+            "last_trade_price"
+        );
+        assert_eq!(
+            contract.canonical_payload_sha256,
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&contract.canonical_payload).unwrap()
+            ))
+        );
     }
 
     #[test]

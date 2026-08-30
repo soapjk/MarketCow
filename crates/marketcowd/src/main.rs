@@ -45,11 +45,13 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const STREAM_CHANNEL_CAPACITY: usize = 256;
-// A 200-token scope may receive one full-book message per token during bootstrap. Keep the queue
-// bounded while allowing that verified atomic recovery burst; sustained pressure still fails
-// closed through `try_send` in the transport.
-const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 256;
+const STREAM_CHANNEL_CAPACITY: usize = 16_384;
+// A 200-token scope may receive a full-book burst plus incremental traffic during bootstrap. The
+// transport awaits this bounded queue, applying TCP backpressure without dropping or reconnecting
+// merely because durable storage is briefly slower than the venue.
+const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 4_096;
+const POLYMARKET_RECENT_EVENT_CAPACITY: usize = 100_000;
+const POLYMARKET_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const POLYMARKET_TRANSPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
 const HYPERLIQUID_TRANSPORT_CHANNEL_CAPACITY: usize = 64;
 const HYPERLIQUID_GATEWAY_CHANNEL_CAPACITY: usize = 4_096;
@@ -1001,7 +1003,6 @@ struct AppState {
     audit: Arc<AuditCoordinator>,
     metrics: Arc<Metrics>,
     projection: Arc<ArcSwap<marketcow_core::Projection>>,
-    recent_events: Arc<ArcSwap<Vec<marketcow_core::PersistedEvent>>>,
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
     active_polymarket_scope: Arc<ArcSwapOption<PolymarketLiveConfig>>,
     polymarket_scope_switch: Option<mpsc::Sender<PolymarketScopeSwitchRequest>>,
@@ -2962,6 +2963,9 @@ fn start_polymarket_live(
                 .await
             });
             let mut events_since_checkpoint = 0_usize;
+            let mut checkpoint_tick = tokio::time::interval(POLYMARKET_CHECKPOINT_INTERVAL);
+            checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            checkpoint_tick.tick().await;
             loop {
                 tokio::select! {
                     changed = shutdown.changed() => {
@@ -3021,9 +3025,6 @@ fn start_polymarket_live(
                     }
                     frames = receiver.recv() => {
                         let Some(frames) = frames else {
-                            if let Err(error) = apply_polymarket_terminal_gaps(&state, &live.token_ids).await {
-                                warn!(error=%error, "polymarket_terminal_gap_failed_closed");
-                            }
                             match (&mut transport).await {
                                 Ok(Ok(())) => warn!("polymarket_transport_ended_without_shutdown"),
                                 Ok(Err(error)) => warn!(
@@ -3053,7 +3054,7 @@ fn start_polymarket_live(
                         match apply_polymarket_transport_frames(&state, frames).await {
                             Ok(events) => {
                                 events_since_checkpoint += events;
-                                if events_since_checkpoint >= 1_000 {
+                                if events_since_checkpoint >= 50_000 {
                                     if let Err(error) = checkpoint_polymarket_runtime(&state).await {
                                         warn!(error=%error, "polymarket_live_checkpoint_failed_closed");
                                         let _ = transport_shutdown_tx.send(true);
@@ -3067,7 +3068,6 @@ fn start_polymarket_live(
                                 warn!(error=%error, "polymarket_live_owner_failed_closed");
                                 let _ = transport_shutdown_tx.send(true);
                                 let _ = (&mut transport).await;
-                                let _ = apply_polymarket_terminal_gaps(&state, &live.token_ids).await;
                                 let _ = checkpoint_polymarket_runtime(&state).await;
                                 match wait_for_polymarket_retry_or_scope_recovery(
                                     &state,
@@ -3085,6 +3085,17 @@ fn start_polymarket_live(
                                     None => break 'service,
                                 }
                             }
+                        }
+                    }
+                    _ = checkpoint_tick.tick() => {
+                        if events_since_checkpoint > 0 {
+                            if let Err(error) = checkpoint_polymarket_runtime(&state).await {
+                                warn!(error=%error, "polymarket_live_checkpoint_failed_closed");
+                                let _ = transport_shutdown_tx.send(true);
+                                let _ = (&mut transport).await;
+                                break 'service;
+                            }
+                            events_since_checkpoint = 0;
                         }
                     }
                 }
@@ -3147,10 +3158,6 @@ async fn commit_polymarket_scope_switch(
     let previous_scope_id = current.scope_id.clone();
     let mut runtime = state.runtime.lock().await;
     *runtime = candidate_runtime;
-    state.projection.store(runtime.projection());
-    state
-        .recent_events
-        .store(Arc::new(clone_polymarket_recent_events(&runtime)));
     let catalog_changes = if same_scope {
         clone_polymarket_recent_events(&runtime)
             .into_iter()
@@ -3165,7 +3172,9 @@ async fn commit_polymarket_scope_switch(
     } else {
         Vec::new()
     };
+    let activated_projection = runtime.projection();
     drop(runtime);
+    state.projection.store(activated_projection);
     state
         .active_polymarket_scope
         .store(Some(Arc::new(activated.clone())));
@@ -3340,9 +3349,6 @@ async fn apply_polymarket_transport_frames(
         }
     }
     state.projection.store(runtime.projection());
-    state
-        .recent_events
-        .store(Arc::new(clone_polymarket_recent_events(&runtime)));
     drop(runtime);
     for outcome in &published {
         let _ = state.stream.send(outcome.persisted.clone());
@@ -3351,23 +3357,6 @@ async fn apply_polymarket_transport_frames(
         return Err(error.into());
     }
     Ok(published.len())
-}
-
-async fn apply_polymarket_terminal_gaps(state: &AppState, tokens: &[String]) -> Result<()> {
-    let received_at = Utc::now();
-    let timestamp = received_at.timestamp_millis().to_string();
-    let frames = tokens
-        .iter()
-        .map(|token_id| marketcow_polymarket::RawTransportFrame {
-            raw_payload: json!({
-                "event_type":"source_gap", "asset_id":token_id,
-                "reason":"rust_transport_terminal", "timestamp":timestamp,
-            }),
-            received_at,
-        })
-        .collect();
-    apply_polymarket_transport_frames(state, frames).await?;
-    Ok(())
 }
 
 async fn wait_for_polymarket_retry_or_scope_recovery(
@@ -3419,9 +3408,6 @@ async fn checkpoint_polymarket_runtime(state: &AppState) -> Result<()> {
     let mut runtime = state.runtime.lock().await;
     runtime.checkpoint()?;
     state.projection.store(runtime.projection());
-    state
-        .recent_events
-        .store(Arc::new(clone_polymarket_recent_events(&runtime)));
     Ok(())
 }
 
@@ -3445,7 +3431,6 @@ async fn serve() -> Result<()> {
     ))?;
     seed_polymarket_scope_catalog(&mut runtime, config.polymarket_live.as_ref())?;
     let projection = runtime.projection();
-    let recent_events = clone_polymarket_recent_events(&runtime);
     let jobs = Arc::new(
         DurableJobCoordinator::open(
             &config.profile,
@@ -3478,7 +3463,6 @@ async fn serve() -> Result<()> {
         audit,
         metrics: Arc::new(Metrics::default()),
         projection: Arc::new(ArcSwap::from(projection)),
-        recent_events: Arc::new(ArcSwap::from_pointee(recent_events)),
         runtime: Arc::new(AsyncMutex::new(runtime)),
         active_polymarket_scope,
         polymarket_scope_switch: config
@@ -3590,7 +3574,7 @@ fn runtime_config(config: &Config, config_revision: &str) -> marketcow_runtime::
         scope_id: config.scope_id.clone(),
         config_revision: config_revision.into(),
         wal_segment_bytes: 256 * 1024 * 1024,
-        recent_event_capacity: 10_000,
+        recent_event_capacity: POLYMARKET_RECENT_EVENT_CAPACITY,
     }
 }
 
@@ -6066,7 +6050,10 @@ async fn live_events(
             &request_id,
         );
     }
-    let records = state.recent_events.load_full();
+    let records = {
+        let runtime = state.runtime.lock().await;
+        clone_polymarket_recent_events(&runtime)
+    };
     match marketcow_api::events_page(&records, query.after_cursor, query.limit) {
         Ok(response) => Json(response).into_response(),
         Err(marketcow_api::ReadApiError::InvalidLimit) => error(
@@ -6210,8 +6197,15 @@ async fn market_data_stream(
     // Subscribe before capturing the immutable replay views. Events visible in both are skipped by
     // cursor, while an event landing between the reads remains in at least one source.
     let receiver = state.stream.subscribe();
-    let records = state.recent_events.load_full();
-    let projection = state.projection.load_full();
+    // The single-writer lock is the atomic replay boundary. Capturing both views here avoids a
+    // projection-new/replay-old window without copying the replay buffer on every hot-path event.
+    let (projection, records) = {
+        let runtime = state.runtime.lock().await;
+        (
+            runtime.projection(),
+            Arc::new(clone_polymarket_recent_events(&runtime)),
+        )
+    };
     if !polymarket_projection_ready(&state, &projection) {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6294,6 +6288,10 @@ async fn serve_market_data_stream(
                 send_resync_and_close(&mut socket, &state, last_cursor, "stream_replay_gap").await;
                 return;
             }
+            if let Some(reason) = polymarket_stream_resync_reason(record) {
+                send_resync_and_close(&mut socket, &state, last_cursor, reason).await;
+                return;
+            }
             let Ok(frame) = marketcow_api::stream_event(&subscription_scope_id, record) else {
                 close_stream(&mut socket, close_code::ERROR, "serialization_failed").await;
                 return;
@@ -6354,6 +6352,10 @@ async fn serve_market_data_stream(
                     if current.scope_id != subscription_scope_id {
                         send_resync_and_close(&mut socket, &state, last_cursor, "scope_changed")
                             .await;
+                        return;
+                    }
+                    if let Some(reason) = polymarket_stream_resync_reason(&record) {
+                        send_resync_and_close(&mut socket, &state, last_cursor, reason).await;
                         return;
                     }
                     if record.event.cursor != last_cursor.saturating_add(1) {
@@ -6422,6 +6424,26 @@ async fn serve_market_data_stream(
                 }
             }
         }
+    }
+}
+
+fn polymarket_stream_resync_reason(
+    record: &marketcow_core::PersistedEvent,
+) -> Option<&'static str> {
+    if !record.applied || record.fail_closed_reason.is_some() {
+        return Some("upstream_projection_gap");
+    }
+    match &record.event.kind {
+        marketcow_core::EventKind::CatalogSnapshot { .. }
+        | marketcow_core::EventKind::NewMarket { .. }
+        | marketcow_core::EventKind::MarketResolved { .. }
+        | marketcow_core::EventKind::TickSizeChange { .. } => Some("instrument_facts_changed"),
+        marketcow_core::EventKind::SourceGap { .. } => Some("upstream_projection_gap"),
+        marketcow_core::EventKind::FullBook { .. }
+        | marketcow_core::EventKind::Delta { .. }
+        | marketcow_core::EventKind::AtomicDelta { .. }
+        | marketcow_core::EventKind::BestBidAsk { .. }
+        | marketcow_core::EventKind::LastTradePrice { .. } => None,
     }
 }
 
@@ -6570,7 +6592,7 @@ fn runtime_config_for_dynamic_scope(
         scope_id: scope_id.to_owned(),
         config_revision: config_revision.to_owned(),
         wal_segment_bytes: 256 * 1024 * 1024,
-        recent_event_capacity: 10_000,
+        recent_event_capacity: POLYMARKET_RECENT_EVENT_CAPACITY,
     }
 }
 
@@ -6636,7 +6658,7 @@ async fn prepare_polymarket_scope_candidate(
             scope_id: activated.scope_id.clone(),
             config_revision: state.control_plane.config_revision.clone(),
             wal_segment_bytes: 256 * 1024 * 1024,
-            recent_event_capacity: 10_000,
+            recent_event_capacity: POLYMARKET_RECENT_EVENT_CAPACITY,
         };
         state
             .runtime
@@ -7174,9 +7196,6 @@ async fn admin_checkpoint(
     match runtime.checkpoint() {
         Ok(manifest) => {
             state.projection.store(runtime.projection());
-            state
-                .recent_events
-                .store(Arc::new(clone_polymarket_recent_events(&runtime)));
             Json(json!({
                 "status":"checkpoint_written",
                 "cursor":manifest.current.cursor,
@@ -7252,9 +7271,6 @@ async fn admin_shadow_ingest(
                     .fetch_max(publication_latency_us, Ordering::Relaxed);
             }
             state.projection.store(runtime.projection());
-            state
-                .recent_events
-                .store(Arc::new(clone_polymarket_recent_events(&runtime)));
             let projection = runtime.projection();
             // Publication is deliberately last: every delivered frame is already WAL-persisted
             // and visible through the immutable projection/replay views.
@@ -8211,7 +8227,6 @@ mod tests {
                 audit,
                 metrics: Arc::new(Metrics::default()),
                 projection: Arc::new(ArcSwap::from_pointee(bootstrap_projection("s".into()))),
-                recent_events: Arc::new(ArcSwap::from_pointee(Vec::new())),
                 runtime: Arc::new(AsyncMutex::new(runtime)),
                 active_polymarket_scope: Arc::new(ArcSwapOption::empty()),
                 polymarket_scope_switch: None,
@@ -8856,7 +8871,10 @@ mod tests {
             .unwrap();
         assert_eq!(published_fee.taker_rate.to_string(), "0.07");
         assert_eq!(published_fee.revision, "c".repeat(64));
-        let catalog_event = state.recent_events.load();
+        let catalog_event = {
+            let runtime = state.runtime.lock().await;
+            clone_polymarket_recent_events(&runtime)
+        };
         assert!(matches!(
             &catalog_event[0].event.kind,
             marketcow_core::EventKind::CatalogSnapshot { .. }
@@ -10922,7 +10940,7 @@ mod tests {
         assert!(response["apply_latency_us"].as_u64().is_some());
         assert_eq!(state.projection.load().cursor, 1);
         assert!(state.projection.load().ready);
-        assert_eq!(state.recent_events.load().len(), 1);
+        assert_eq!(state.runtime.lock().await.recent_events().len(), 1);
 
         let metrics_response = metrics(State(state)).await.into_response();
         let body = to_bytes(metrics_response.into_body(), 16_384)
@@ -11068,7 +11086,10 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::OK);
         }
-        let mut records = state.recent_events.load_full().as_ref().clone();
+        let mut records = {
+            let runtime = state.runtime.lock().await;
+            clone_polymarket_recent_events(&runtime)
+        };
         assert_eq!(records.len(), 3);
         records[0].event.cursor = 1_239_461;
         records[1].event.cursor = 1_239_471;
@@ -11090,6 +11111,51 @@ mod tests {
         assert_eq!(
             polymarket_replay_window(&records, requested, 1_239_472),
             Err("stream_replay_gap")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_stream_converts_real_projection_failures_to_control_resync() {
+        let (_dir, state) = test_state();
+        let now = Utc::now();
+        let response = admin_shadow_ingest(
+            State(state.clone()),
+            Extension("resync-reason-seed".into()),
+            Json(ShadowIngestRequest {
+                received_at: Some(now),
+                raw_payload: json!({
+                    "event_type":"book", "asset_id":"yes",
+                    "timestamp":now.to_rfc3339(), "tick_size":"0.01",
+                    "bids":[{"price":"0.40","size":"10"}],
+                    "asks":[{"price":"0.60","size":"11"}]
+                }),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut applied = state.runtime.lock().await.recent_events()[0].clone();
+        applied.applied = true;
+        applied.fail_closed_reason = None;
+        assert_eq!(polymarket_stream_resync_reason(&applied), None);
+
+        let mut rejected = applied.clone();
+        rejected.applied = false;
+        rejected.fail_closed_reason = Some("crossed_or_locked_atomic_delta".into());
+        assert_eq!(
+            polymarket_stream_resync_reason(&rejected),
+            Some("upstream_projection_gap")
+        );
+
+        let mut facts = applied;
+        facts.event.kind = marketcow_core::EventKind::TickSizeChange {
+            token_id: "yes".into(),
+            old_tick_size: Some(marketcow_core::Price::parse_tick("0.01").unwrap()),
+            new_tick_size: marketcow_core::Price::parse_tick("0.001").unwrap(),
+            tick_version: "tick-v2".into(),
+        };
+        assert_eq!(
+            polymarket_stream_resync_reason(&facts),
+            Some("instrument_facts_changed")
         );
     }
 

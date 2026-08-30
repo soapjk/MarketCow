@@ -183,7 +183,9 @@ pub async fn run_polymarket_transport(
         if *shutdown.borrow() {
             return Ok(());
         }
-        publish_connection_gaps(&tokens, attempt, &output)?;
+        if !publish_connection_gaps(&tokens, attempt, &output, &mut shutdown).await? {
+            return Ok(());
+        }
         match run_polymarket_connection(&config, &tokens, &output, &mut shutdown).await {
             Ok(ConnectionEnd::Shutdown) => return Ok(()),
             Ok(ConnectionEnd::Disconnected) => {
@@ -229,11 +231,12 @@ enum ConnectionEnd {
     Disconnected,
 }
 
-fn publish_connection_gaps(
+async fn publish_connection_gaps(
     tokens: &BTreeSet<String>,
     attempt: u32,
     output: &mpsc::Sender<Vec<RawTransportFrame>>,
-) -> Result<(), TransportError> {
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<bool, TransportError> {
     let received_at = Utc::now();
     let timestamp = received_at.timestamp_millis().to_string();
     let frames = tokens
@@ -247,9 +250,27 @@ fn publish_connection_gaps(
             received_at,
         })
         .collect();
-    output
-        .try_send(frames)
-        .map_err(|_| TransportError::Backpressure)
+    send_bounded(output, frames, shutdown).await
+}
+
+async fn send_bounded(
+    output: &mpsc::Sender<Vec<RawTransportFrame>>,
+    frames: Vec<RawTransportFrame>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<bool, TransportError> {
+    tokio::select! {
+        permit = output.reserve() => {
+            permit.map_err(|_| TransportError::Backpressure)?.send(frames);
+            Ok(true)
+        }
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() {
+                Ok(false)
+            } else {
+                Err(TransportError::Backpressure)
+            }
+        }
+    }
 }
 
 async fn run_polymarket_connection(
@@ -305,7 +326,10 @@ async fn run_polymarket_connection(
                     let frames = values.into_iter().map(|raw_payload| RawTransportFrame {
                         raw_payload, received_at,
                     }).collect();
-                    output.try_send(frames).map_err(|_| TransportError::Backpressure)?;
+                    if !send_bounded(output, frames, shutdown).await? {
+                        let _ = socket.close(None).await;
+                        return Ok(ConnectionEnd::Shutdown);
+                    }
                 }
                 Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await
                     .map_err(|_| TransportError::SendFailed)?,
@@ -1156,6 +1180,40 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         assert_eq!(transport.await.unwrap(), Ok(()));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_transport_waits_for_capacity_and_shutdown_without_dropping() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(Vec::new()).await.unwrap();
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let pending_sender = sender.clone();
+        let pending = tokio::spawn(async move {
+            send_bounded(
+                &pending_sender,
+                vec![RawTransportFrame {
+                    raw_payload: serde_json::json!({"event_type":"test"}),
+                    received_at: at(),
+                }],
+                &mut shutdown_rx,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        receiver.recv().await.unwrap();
+        assert_eq!(pending.await.unwrap(), Ok(true));
+        assert_eq!(receiver.recv().await.unwrap().len(), 1);
+
+        sender.send(Vec::new()).await.unwrap();
+        let (shutdown_tx2, mut shutdown_rx2) = watch::channel(false);
+        let pending_sender = sender.clone();
+        let pending = tokio::spawn(async move {
+            send_bounded(&pending_sender, Vec::new(), &mut shutdown_rx2).await
+        });
+        tokio::task::yield_now().await;
+        shutdown_tx2.send(true).unwrap();
+        assert_eq!(pending.await.unwrap(), Ok(false));
     }
 
     #[test]
