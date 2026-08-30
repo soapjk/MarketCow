@@ -518,6 +518,28 @@ impl Projection {
                     })
                 })
     }
+
+    /// Verifies that every active catalog instrument still has an executable two-sided book.
+    ///
+    /// Dynamic-universe activation validates the initial books, but that qualification is not a
+    /// lifetime property: a later authoritative full-book can legitimately remove the last level
+    /// from one side.  A projection containing such a market must stop being public-ready until a
+    /// fresh universe generation isolates/replaces it (or the same book becomes two-sided again).
+    /// Keeping this check on the immutable projection also prevents an older checkpoint whose
+    /// persisted `ready` bit predates this invariant from being exposed after restart.
+    pub fn active_market_books_two_sided(&self) -> bool {
+        self.catalog_revision.is_none()
+            || self
+                .markets
+                .values()
+                .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                .flat_map(|market| market.outcomes.iter())
+                .all(|outcome| {
+                    self.books
+                        .get(&outcome.token_id)
+                        .is_some_and(|book| !book.bids.is_empty() && !book.asks.is_empty())
+                })
+    }
 }
 
 /// Reconciles the catalog's market-level executable price increment with the two authoritative
@@ -1326,15 +1348,18 @@ impl<L: DurableLog> SingleWriter<L> {
                 .flat_map(|market| market.outcomes.iter())
                 .all(|outcome| next.books.contains_key(&outcome.token_id));
         let instrument_ticks_consistent = reconcile_active_market_instrument_ticks(&mut next);
+        let active_market_books_two_sided = next.active_market_books_two_sided();
         next.ready = next.unresolved_gaps.is_empty()
             && !next.books.is_empty()
             && catalog_books_complete
-            && instrument_ticks_consistent;
+            && instrument_ticks_consistent
+            && active_market_books_two_sided;
         next.fail_closed_reason = rejected
             .clone()
             .or_else(|| {
                 (!instrument_ticks_consistent).then(|| "instrument_tick_inconsistent".into())
             })
+            .or_else(|| (!active_market_books_two_sided).then(|| "one_sided_active_book".into()))
             .or_else(|| (!next.ready).then(|| "unresolved_gap".into()));
         let event_cursor = event.cursor;
         let persisted = PersistedEvent {
@@ -2851,6 +2876,82 @@ mod tests {
         assert!(refreshed.persisted.applied);
         assert!(refreshed.projection.markets.contains_key("m1"));
         assert!(!refreshed.projection.ready);
+    }
+
+    #[test]
+    fn active_catalog_book_becoming_one_sided_is_durably_fail_closed() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!()
+            }
+            fn append_outcome(&mut self, _: &PersistedEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog);
+        writer
+            .apply(event(
+                1,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-1".into(),
+                    markets: vec![market("m1", "condition-1", None)],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+        for (cursor, token_id) in [(2, "m1-yes"), (3, "m1-no")] {
+            writer
+                .apply(event(
+                    cursor,
+                    EventKind::FullBook {
+                        token_id: token_id.into(),
+                        bids: levels("0.4", "10"),
+                        asks: levels("0.6", "10"),
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v1".into(),
+                    },
+                ))
+                .unwrap();
+        }
+        assert!(writer.projection().ready);
+        assert!(writer.projection().active_market_books_two_sided());
+
+        let one_sided = writer
+            .apply(event(
+                4,
+                EventKind::FullBook {
+                    token_id: "m1-yes".into(),
+                    bids: levels("0.4", "10"),
+                    asks: Vec::new(),
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
+                },
+            ))
+            .unwrap();
+        assert!(one_sided.persisted.applied);
+        assert!(!one_sided.projection.ready);
+        assert!(!one_sided.projection.active_market_books_two_sided());
+        assert_eq!(
+            one_sided.projection.fail_closed_reason.as_deref(),
+            Some("one_sided_active_book")
+        );
+
+        let recovered = writer
+            .apply(event(
+                5,
+                EventKind::FullBook {
+                    token_id: "m1-yes".into(),
+                    bids: levels("0.4", "10"),
+                    asks: levels("0.6", "10"),
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
+                },
+            ))
+            .unwrap();
+        assert!(recovered.projection.ready);
+        assert_eq!(recovered.projection.fail_closed_reason, None);
     }
 
     #[test]

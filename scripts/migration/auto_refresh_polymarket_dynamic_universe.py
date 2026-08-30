@@ -149,8 +149,60 @@ def _validate_live_boundary(scope: dict[str, Any], full_sync: dict[str, Any]) ->
         )
 
 
-def _read_ready_boundary(config: RefreshConfig, session: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Take a bounded coherent read while allowing a short transport recovery barrier."""
+def _validate_scope_identity(scope: dict[str, Any]) -> None:
+    """Validate the durable universe identity even when its live books are fail-closed.
+
+    A one-sided active book must make `/full-sync` unavailable, but the MarketCow-owned refresh
+    controller still needs the last atomically published membership in order to build its
+    replacement generation from a fresh, independent CLOB snapshot.  The public `/scope` identity
+    is sufficient for that purpose as long as every count and stable identity is internally
+    consistent; no unready book state is reused.
+    """
+    active = scope.get("active_markets")
+    if not isinstance(active, list):
+        raise RuntimeError("live scope active_markets is unavailable")
+    try:
+        generation = int(scope.get("generation", 0))
+        market_count = int(scope.get("market_count", -1))
+        token_count = int(scope.get("token_count", -1))
+        target_count = int(scope.get("target_market_count", -1))
+        minimum_count = int(scope.get("minimum_market_count", -1))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("live scope counts are invalid") from error
+    identities = _identity_set(active)
+    tokens = [token for identity in active for token in identity.get("token_ids", [])]
+    ready = scope.get("ready") is True
+    checks = {
+        "schema": scope.get("schema_version") == SCOPE_SCHEMA_VERSION,
+        "read_only": scope.get("real_order_submission_enabled") is False,
+        "scope_identity": scope.get("active_scope_id") == scope.get("universe_id"),
+        "universe_id": isinstance(scope.get("universe_id"), str)
+        and len(scope["universe_id"]) == 64
+        and all(value in "0123456789abcdefABCDEF" for value in scope["universe_id"]),
+        "generation": generation > 0,
+        "status": scope.get("scope_status") == ("ready" if ready else "unready"),
+        "market_count": market_count == len(active) == len(identities),
+        "token_count": token_count == len(tokens) == 2 * market_count,
+        "unique_tokens": len(tokens) == len(set(tokens)),
+        "capacity": 0 < minimum_count <= market_count <= target_count <= 250,
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise RuntimeError(f"live scope identity is invalid: failed={failed}")
+
+
+def _read_ready_boundary(
+    config: RefreshConfig,
+    session: Any,
+    *,
+    allow_unready_identity: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Take a bounded coherent read while allowing a short transport recovery barrier.
+
+    When `allow_unready_identity` is true, a strictly valid `/scope` with `ready=false` can seed
+    only the previous membership identity. Candidate books are always fetched independently and
+    candidate activation still has to return `activated_ready` before publication.
+    """
     last_error: Exception | None = None
     for attempt in range(10):
         scope_status, scope = _get_json(
@@ -158,6 +210,17 @@ def _read_ready_boundary(config: RefreshConfig, session: Any) -> tuple[dict[str,
             f"{config.service_url}/v1/prediction-markets/polymarket/live/scope",
             config.request_timeout_seconds,
         )
+        try:
+            if scope_status != 200:
+                raise RuntimeError(f"live scope is unavailable: HTTP {scope_status}")
+            _validate_scope_identity(scope)
+            if allow_unready_identity and scope.get("ready") is not True:
+                return scope, {}
+        except RuntimeError as error:
+            last_error = error
+            if attempt < 9:
+                time.sleep(0.25)
+            continue
         full_status, full_sync = _get_json(
             session,
             f"{config.service_url}/v1/prediction-markets/polymarket/live/full-sync",
@@ -240,7 +303,8 @@ def refresh_once(
     token = os.environ.get("MARKETCOW_RUST_ADMIN_TOKEN", "")
     if not token:
         raise RuntimeError("MARKETCOW_RUST_ADMIN_TOKEN is required")
-    scope, full_sync = _read_ready_boundary(config, session)
+    scope, _ = _read_ready_boundary(config, session, allow_unready_identity=True)
+    recovery_from_unready = scope.get("ready") is not True
     universe_id = scope["universe_id"]
     current_generation = int(scope["generation"])
     current_identities = scope["active_markets"]
@@ -272,6 +336,16 @@ def refresh_once(
     )
     write_atomic_json(candidate_path, candidate)
     changed = _identity_set(current_identities) != _identity_set(candidate["universe"]["active_markets"])
+    latest_scope, _ = _read_ready_boundary(
+        config, session, allow_unready_identity=True
+    )
+    if (
+        latest_scope.get("universe_id") != universe_id
+        or int(latest_scope.get("generation", -1)) != current_generation
+        or _identity_set(latest_scope.get("active_markets", []))
+        != _identity_set(current_identities)
+    ):
+        raise RuntimeError("live universe changed while candidate was being built")
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "started_at": started.isoformat().replace("+00:00", "Z"),
@@ -288,6 +362,7 @@ def refresh_once(
         "excluded_market_count": len(candidate["universe"]["excluded_markets"]),
         "added_markets": candidate["universe"]["added_markets"],
         "removed_markets": candidate["universe"]["removed_markets"],
+        "recovery_from_unready": recovery_from_unready,
         "candidate_path": str(candidate_path.resolve()),
         "candidate_sha256": _sha256(candidate_path),
         "book_snapshot_path": str(books_path.resolve()),

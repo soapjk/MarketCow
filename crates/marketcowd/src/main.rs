@@ -3754,6 +3754,7 @@ fn projection_fresh(state: &AppState, projection: &marketcow_core::Projection) -
 fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Projection) -> bool {
     projection.ready
         && projection.instrument_ticks_consistent()
+        && projection.active_market_books_two_sided()
         && projection_fresh(state, projection)
         && state
             .active_polymarket_scope
@@ -11685,6 +11686,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn recovered_ready_bit_cannot_expose_one_sided_dynamic_universe_book() {
+        let (dir, state) = test_state();
+        let universe_id = "f".repeat(64);
+        let live = dynamic_universe_live(&universe_id, 1, "1", "10", "20", None);
+        let mut runtime =
+            marketcow_runtime::PolymarketRuntime::open(marketcow_runtime::RuntimeConfig {
+                root: dir.path().join("one-sided-public-boundary"),
+                scope_id: universe_id,
+                config_revision: "test-config-v1".into(),
+                wal_segment_bytes: 1_024,
+                recent_event_capacity: 100,
+            })
+            .unwrap();
+        seed_polymarket_scope_catalog(&mut runtime, Some(&live)).unwrap();
+        let mut legacy_checkpoint = (*runtime.projection()).clone();
+        legacy_checkpoint.books.get_mut("10").unwrap().asks.clear();
+        legacy_checkpoint.ready = true;
+        legacy_checkpoint.fail_closed_reason = None;
+        state.projection.store(Arc::new(legacy_checkpoint));
+        state.active_polymarket_scope.store(Some(Arc::new(live)));
+
+        let scope = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/scope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scope.status(), StatusCode::OK);
+        let scope: serde_json::Value =
+            serde_json::from_slice(&to_bytes(scope.into_body(), 128 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(scope["ready"], false);
+        assert_eq!(scope["scope_status"], "unready");
+
+        let full_sync = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/full-sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full_sync.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
     #[test]
     fn equality_does_not_accept_prefixes() {

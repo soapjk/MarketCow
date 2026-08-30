@@ -31,8 +31,9 @@ class Response:
 
 
 class Session:
-    def __init__(self, *, changed: bool = False):
+    def __init__(self, *, changed: bool = False, ready: bool = True):
         self.changed = changed
+        self.ready = ready
         self.posts: list[dict] = []
         self.generation = 1
 
@@ -40,8 +41,8 @@ class Session:
         identity = {**IDENTITY, "market_id": "2"} if self.generation == 2 else IDENTITY
         return {
             "schema_version": "marketcow.polymarket.scope-discovery.v3",
-            "ready": True,
-            "scope_status": "ready",
+            "ready": self.ready,
+            "scope_status": "ready" if self.ready else "unready",
             "active_scope_id": "a" * 64,
             "universe_id": "a" * 64,
             "generation": self.generation,
@@ -49,6 +50,9 @@ class Session:
             "token_count": 2,
             "active_markets": [identity],
             "scope_file_sha256": "b" * 64,
+            "target_market_count": 1,
+            "minimum_market_count": 1,
+            "real_order_submission_enabled": False,
         }
 
     def _full(self) -> dict:
@@ -62,11 +66,16 @@ class Session:
         }
 
     def get(self, url, **_kwargs):
-        return Response(200, self._scope() if url.endswith("/scope") else self._full())
+        if url.endswith("/scope"):
+            return Response(200, self._scope())
+        if not self.ready:
+            return Response(503, {"detail": {"code": "polymarket_projection_unready_or_stale"}})
+        return Response(200, self._full())
 
     def post(self, _url, **kwargs):
         self.posts.append(kwargs)
         self.generation = 2
+        self.ready = True
         return Response(200, {
             "status": "activated_ready",
             "active_generation": 2,
@@ -175,6 +184,23 @@ def test_changed_membership_registers_and_atomically_activates(tmp_path, monkeyp
     assert request["json"]["scope_file_sha256"] == result["candidate_sha256"]
     registered = json.loads((config.scope_registry_root / f"{'a' * 64}.json").read_text())
     assert registered["universe"]["generation"] == 2
+
+
+def test_unready_live_books_can_be_isolated_by_fresh_candidate_activation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MARKETCOW_RUST_ADMIN_TOKEN", "secret")
+    replacement = {**IDENTITY, "market_id": "2"}
+    session = Session(changed=True, ready=False)
+    result = refresh_once(
+        _config(tmp_path), session=session, book_snapshot_builder=_books,
+        universe_builder=lambda *_args, **_kwargs: _candidate(replacement),
+    )
+    assert result["status"] == "activated_ready"
+    assert result["recovery_from_unready"] is True
+    assert result["removed_markets"] == ["1"]
+    assert result["added_markets"] == ["2"]
+    assert len(session.posts) == 1
 
 
 def test_missing_admin_token_fails_before_external_read(tmp_path, monkeypatch):
