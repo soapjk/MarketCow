@@ -461,23 +461,23 @@ pub struct MarketProjectionHealth {
     pub market_id: String,
     pub projection_status: MarketProjectionStatus,
     pub last_market_sequence: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub gap_from: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub gap_to: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub reason_code: Option<String>,
     pub retryable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub retry_after: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub source_observed_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub last_recovered_at: Option<DateTime<Utc>>,
     pub projection_generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub catalog_revision: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub last_event_revision: Option<String>,
 }
 
@@ -4002,5 +4002,37 @@ mod tests {
             read_checkpoint(&path, &hash),
             Err(CoreError::CheckpointHash)
         ));
+    }
+
+    #[test]
+    fn market_health_serializes_every_contract_field_even_when_clear() {
+        let health = MarketProjectionHealth {
+            market_id: "m1".into(),
+            projection_status: MarketProjectionStatus::Ready,
+            last_market_sequence: 7,
+            gap_from: None,
+            gap_to: None,
+            reason_code: None,
+            retryable: false,
+            retry_after: None,
+            source_observed_at: None,
+            last_recovered_at: None,
+            projection_generation: 3,
+            catalog_revision: None,
+            last_event_revision: None,
+        };
+        let value = serde_json::to_value(health).unwrap();
+        for field in [
+            "gap_from",
+            "gap_to",
+            "reason_code",
+            "retry_after",
+            "source_observed_at",
+            "last_recovered_at",
+            "catalog_revision",
+            "last_event_revision",
+        ] {
+            assert_eq!(value.get(field), Some(&serde_json::Value::Null), "{field}");
+        }
     }
 }

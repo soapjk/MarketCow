@@ -104,6 +104,23 @@ fully validates a replacement candidate, then atomically activates it; this is t
 localized. The consumer must discard the scan projection and start again at a new full-sync
 boundary.
 
+## Hot-refresh staging
+
+The single live owner prepares a requested universe generation before stopping the current
+transport. Checkpoint/fork, catalog seed, book seed and candidate checkpoint run on a blocking
+worker while HTTP continues to serve the last verified immutable projection. The owner pauses old
+generation event application at one exact cursor while the connected transport applies bounded
+backpressure; this prevents candidate and old-generation events from racing or mixing. Candidate
+preparation failure leaves the transport and active generation unchanged.
+
+After complete candidate validation, transport shutdown has a two-second bound. The ingress task
+owns no WAL or projection state, so a stuck upstream close handshake is aborted after that bound;
+the candidate writer is then swapped atomically and `universe_changed` requires consumer full-sync.
+An activation client that times out must probe the hash-pinned active scope before deciding whether
+to retry or restore its registered candidate; the controller treats that outcome as ambiguous, not
+failed. A queued follow-up request is revalidated relative to the generation that is active when
+the owner handles it.
+
 ## Availability and audit metrics
 
 The live gate must report, per market and globally:

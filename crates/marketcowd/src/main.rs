@@ -53,6 +53,7 @@ const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 16_384;
 const POLYMARKET_RECENT_EVENT_CAPACITY: usize = 100_000;
 const POLYMARKET_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const POLYMARKET_TRANSPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
+const POLYMARKET_TRANSPORT_SCOPE_SWITCH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const POLYMARKET_BOOK_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const POLYMARKET_BOOK_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 const POLYMARKET_BOOK_REFRESH_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
@@ -2960,6 +2961,32 @@ fn start_hyperliquid_shadow(
     }))
 }
 
+async fn stop_polymarket_transport_for_scope_switch(
+    shutdown: &watch::Sender<bool>,
+    transport: &mut tokio::task::JoinHandle<
+        std::result::Result<(), marketcow_polymarket::TransportError>,
+    >,
+) {
+    let _ = shutdown.send(true);
+    if tokio::time::timeout(
+        POLYMARKET_TRANSPORT_SCOPE_SWITCH_STOP_TIMEOUT,
+        &mut *transport,
+    )
+    .await
+    .is_err()
+    {
+        // The ingress task does not own the WAL or projection writer. Once its bounded sender is
+        // stopped, aborting a stuck upstream close handshake cannot create a partial durable
+        // event. This keeps the already-prepared atomic generation swap bounded.
+        transport.abort();
+        let _ = transport.await;
+        warn!(
+            timeout_ms = POLYMARKET_TRANSPORT_SCOPE_SWITCH_STOP_TIMEOUT.as_millis(),
+            "polymarket_transport_scope_switch_forced_abort"
+        );
+    }
+}
+
 fn start_polymarket_live(
     state: AppState,
     mut shutdown: watch::Receiver<bool>,
@@ -3023,17 +3050,37 @@ fn start_polymarket_live(
                             let _ = checkpoint_polymarket_runtime(&state).await;
                             break 'service;
                         };
-                        let _ = transport_shutdown_tx.send(true);
-                        let _ = (&mut transport).await;
-                        let PolymarketScopeSwitchRequest { live: requested_live, response } = request;
-                        let candidate = prepare_polymarket_scope_candidate(&state, &live, &requested_live).await;
+                        let PolymarketScopeSwitchRequest {
+                            live: requested_live,
+                            response,
+                        } = request;
+                        // Keep the old transport connected and its bounded ingress queue alive
+                        // while the candidate is prepared off the async request workers. This
+                        // owner intentionally pauses application at a precise cursor boundary;
+                        // consumers keep the last verified projection, and no old-generation
+                        // frames can race the candidate. Only a validated candidate reaches the
+                        // bounded transport stop and atomic writer/projection swap.
+                        let candidate = prepare_polymarket_scope_candidate(
+                            &state,
+                            &live,
+                            &requested_live,
+                        )
+                        .await;
                         let result = match candidate {
-                            Ok(runtime) => commit_polymarket_scope_switch(
-                                &state,
-                                &live,
-                                requested_live,
-                                runtime,
-                            ).await,
+                            Ok(candidate_runtime) => {
+                                stop_polymarket_transport_for_scope_switch(
+                                    &transport_shutdown_tx,
+                                    &mut transport,
+                                )
+                                .await;
+                                commit_polymarket_scope_switch(
+                                    &state,
+                                    &live,
+                                    requested_live,
+                                    candidate_runtime,
+                                )
+                                .await
+                            }
                             Err(error) => Err(error),
                         };
                         match result {
@@ -3998,10 +4045,15 @@ async fn wait_for_polymarket_retry_or_scope_recovery(
                 }
             }
             request = scope_switches.recv() => {
-                let PolymarketScopeSwitchRequest { live, response } = request?;
+                let PolymarketScopeSwitchRequest {
+                    live,
+                    response,
+                } = request?;
                 let candidate = prepare_polymarket_scope_candidate(state, current, &live).await;
                 match match candidate {
-                    Ok(runtime) => commit_polymarket_scope_switch(state, current, live, runtime).await,
+                    Ok(runtime) => {
+                        commit_polymarket_scope_switch(state, current, live, runtime).await
+                    }
                     Err(error) => Err(error),
                 } {
                     Ok((activated, receipt)) => {
@@ -4074,7 +4126,9 @@ async fn serve() -> Result<()> {
         .map(LegacyMcpProxy::new)
         .transpose()?;
     let (stream, _) = broadcast::channel(STREAM_CHANNEL_CAPACITY);
-    let (polymarket_scope_switch_tx, polymarket_scope_switch_rx) = mpsc::channel(8);
+    // The single live owner serializes candidate preparation and the final swap. Retain at most
+    // one queued follow-up request; a larger generation backlog would be stale by construction.
+    let (polymarket_scope_switch_tx, polymarket_scope_switch_rx) = mpsc::channel(1);
     let active_polymarket_scope = Arc::new(ArcSwapOption::from(
         config.polymarket_live.clone().map(Arc::new),
     ));
@@ -7543,48 +7597,53 @@ async fn prepare_polymarket_scope_candidate(
     activated: &PolymarketLiveConfig,
 ) -> std::result::Result<marketcow_runtime::PolymarketRuntime, String> {
     validate_polymarket_universe_transition(current, activated)?;
-    let mut runtime = if let Some(universe) = activated.universe.as_ref() {
-        let root = state
-            .config
-            .storage_root
-            .join("polymarket-universes")
-            .join(&universe.universe_id)
-            .join(format!("generation-{:020}", universe.generation));
-        let config = marketcow_runtime::RuntimeConfig {
-            root,
-            scope_id: activated.scope_id.clone(),
-            config_revision: state.control_plane.config_revision.clone(),
-            wal_segment_bytes: 256 * 1024 * 1024,
-            recent_event_capacity: POLYMARKET_RECENT_EVENT_CAPACITY,
+    let activated = activated.clone();
+    let config = state.config.clone();
+    let config_revision = state.control_plane.config_revision.clone();
+    let active_runtime = state.runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut runtime = if let Some(universe) = activated.universe.as_ref() {
+            let root = config
+                .storage_root
+                .join("polymarket-universes")
+                .join(&universe.universe_id)
+                .join(format!("generation-{:020}", universe.generation));
+            let candidate_config = marketcow_runtime::RuntimeConfig {
+                root,
+                scope_id: activated.scope_id.clone(),
+                config_revision: config_revision.clone(),
+                wal_segment_bytes: 256 * 1024 * 1024,
+                recent_event_capacity: POLYMARKET_RECENT_EVENT_CAPACITY,
+            };
+            active_runtime
+                .blocking_lock()
+                .fork_candidate(candidate_config)
+                .map_err(|error| format!("universe_candidate_fork_failed:{error}"))?
+        } else {
+            marketcow_runtime::PolymarketRuntime::open(runtime_config_for_dynamic_scope(
+                &config,
+                &config_revision,
+                &activated.scope_id,
+            ))
+            .map_err(|error| format!("scope_runtime_open_failed:{error}"))?
         };
-        state
-            .runtime
-            .lock()
-            .await
-            .fork_candidate(config)
-            .map_err(|error| format!("universe_candidate_fork_failed:{error}"))?
-    } else {
-        marketcow_runtime::PolymarketRuntime::open(runtime_config_for_dynamic_scope(
-            &state.config,
-            &state.control_plane.config_revision,
-            &activated.scope_id,
-        ))
-        .map_err(|error| format!("scope_runtime_open_failed:{error}"))?
-    };
-    seed_polymarket_scope_catalog(&mut runtime, Some(activated))
-        .map_err(|error| format!("scope_catalog_seed_failed:{error}"))?;
-    let projection = runtime.projection();
-    if activated.universe.is_some()
-        && (!projection.ready
-            || !projection.instrument_ticks_consistent()
-            || !projection_matches_polymarket_scope(activated, &projection, true))
-    {
-        return Err("universe_candidate_not_ready".into());
-    }
-    runtime
-        .checkpoint()
-        .map_err(|error| format!("universe_candidate_checkpoint_failed:{error}"))?;
-    Ok(runtime)
+        seed_polymarket_scope_catalog(&mut runtime, Some(&activated))
+            .map_err(|error| format!("scope_catalog_seed_failed:{error}"))?;
+        let projection = runtime.projection();
+        if activated.universe.is_some()
+            && (!projection.ready
+                || !projection.instrument_ticks_consistent()
+                || !projection_matches_polymarket_scope(&activated, &projection, true))
+        {
+            return Err("universe_candidate_not_ready".into());
+        }
+        runtime
+            .checkpoint()
+            .map_err(|error| format!("universe_candidate_checkpoint_failed:{error}"))?;
+        Ok(runtime)
+    })
+    .await
+    .map_err(|error| format!("universe_candidate_preparation_task_failed:{error}"))?
 }
 
 async fn admin_activate_polymarket_scope(
@@ -7661,22 +7720,23 @@ async fn admin_activate_polymarket_scope(
         }))
         .into_response();
     }
+    let permit = match sender.clone().try_reserve_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "scope_switch_queue_full",
+                true,
+                &request_id,
+            );
+        }
+    };
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-    if sender
-        .try_send(PolymarketScopeSwitchRequest {
-            live,
-            response: response_tx,
-        })
-        .is_err()
-    {
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "scope_switch_queue_full",
-            true,
-            &request_id,
-        );
-    }
-    match tokio::time::timeout(Duration::from_secs(10), response_rx).await {
+    permit.send(PolymarketScopeSwitchRequest {
+        live,
+        response: response_tx,
+    });
+    match tokio::time::timeout(Duration::from_secs(30), response_rx).await {
         Ok(Ok(Ok(receipt))) => Json(json!({
             "schema_version":if receipt.active_generation.is_some() {
                 "marketcow.polymarket.universe-activation-receipt.v1"
@@ -10306,6 +10366,24 @@ mod tests {
         assert_eq!(recovered.scope_id, current.scope_id);
         assert_eq!(recovered.token_ids, current.token_ids);
         assert_eq!(recovered.scope_file_sha256, current.scope_file_sha256);
+    }
+
+    #[tokio::test]
+    async fn scope_switch_bounds_a_stuck_upstream_close_handshake() {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let mut transport = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            Ok::<(), marketcow_polymarket::TransportError>(())
+        });
+        let started = std::time::Instant::now();
+
+        stop_polymarket_transport_for_scope_switch(&shutdown_tx, &mut transport).await;
+
+        assert!(transport.is_finished());
+        assert!(
+            started.elapsed()
+                < POLYMARKET_TRANSPORT_SCOPE_SWITCH_STOP_TIMEOUT + Duration::from_secs(1)
+        );
     }
 
     fn instrument_fixture() -> marketcow_storage::InstrumentRecord {
