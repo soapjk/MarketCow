@@ -1,6 +1,7 @@
 # Polymarket authoritative refresh architecture review
 
-Status: implementation paused after the failed `a904e13` strict 30-minute gate.
+Status: architecture corrected locally after the failed `a904e13` strict 30-minute gate; live
+candidate validation remains pending.
 
 ## Evidence
 
@@ -60,3 +61,28 @@ A periodic freshness check must not silently become a mixed-transport state repl
 
 MarketCow remains read-only. Real-order submission remains disabled and Tradude does not manage the
 MarketCow lifecycle.
+
+## Implemented correction
+
+- `PolymarketRuntime::validate_full_book_observation` normalizes and compares one REST full book
+  against the current WS-owned projection without invoking the single writer. It cannot change the
+  projection hash, cursor, recent-event buffer, WAL, checkpoint, or public stream.
+- A complete REST batch produces a separate immutable validation projection. Only exact matches
+  receive a validation timestamp, and that projection is published only after the append-only
+  lifecycle audit record is durably accepted.
+- Effective freshness is the newer of the WS causal observation and an exact REST validation for
+  the same token and scope. Consequently, a moving book can remain fresh through WS even if a REST
+  comparison races; a quiet stale book must match REST exactly or the service fails closed on age.
+- A malformed REST response or comparison failure cannot restart or overwrite a healthy WS state.
+  It supplies no freshness, so repeated failure still reaches the existing fail-closed age gate.
+- Scope/generation activation atomically clears the separate validation projection. Evidence from
+  an old scope can never make a new scope ready.
+- Historical WAL/checkpoint replay compatibility is retained for older builds that wrote periodic
+  HTTP refresh events. New normal operation no longer emits those events.
+
+Local verification at this revision:
+
+- `cargo test --workspace`: passed (179 passed, 5 environment-gated integration tests ignored).
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed.
+- Deterministic runtime tests prove exact validation and mismatch validation are non-mutating and
+  that two WS deltas around REST validation retain contiguous WS-only cursors.

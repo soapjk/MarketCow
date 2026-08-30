@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -114,6 +114,17 @@ pub struct PolymarketRuntime {
     writer: SingleWriter<SegmentedWal>,
     recent_events: VecDeque<PersistedEvent>,
     last_manifest: Option<CheckpointManifest>,
+}
+
+/// Read-only evidence produced by comparing one authoritative HTTP book observation with the
+/// current WS-owned projection. Validation never advances the public cursor or writes the WAL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookObservationValidation {
+    pub token_id: String,
+    pub matches_projection: bool,
+    pub observed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub raw_sha256: String,
 }
 
 /// Upgrades a legacy checkpoint only after an older runtime completed full semantic recovery and
@@ -339,14 +350,16 @@ impl PolymarketRuntime {
         Ok(outcomes)
     }
 
-    /// Applies one authoritative periodic full-book observation. Unlike ordinary WS ingestion,
-    /// byte-identical content is not discarded: the HTTP response proves current freshness and
-    /// receives an observation-bound identity. Incremental-event idempotency remains unchanged.
-    pub fn apply_full_book_refresh(
-        &mut self,
+    /// Compares one authoritative HTTP book observation with the live WS projection without
+    /// mutating the single writer. REST and WS do not expose a shared venue sequence, so applying
+    /// this snapshot followed by queued WS deltas would invent an ordering that the venue did not
+    /// provide. An exact match is freshness evidence only; a mismatch is diagnostic evidence and
+    /// cannot refresh the book.
+    pub fn validate_full_book_observation(
+        &self,
         raw_payload: Value,
         received_at: DateTime<Utc>,
-    ) -> Result<Vec<ApplyOutcome>, RuntimeError> {
+    ) -> Result<BookObservationValidation, RuntimeError> {
         let projection = self.writer.projection();
         let next_cursor = projection.cursor + 1;
         let normalizer = NormalizerConfig::new(
@@ -368,14 +381,40 @@ impl PolymarketRuntime {
                 ),
             ));
         }
-        let outcomes = self.writer.apply_batch(events)?;
-        for outcome in &outcomes {
-            self.recent_events.push_back(outcome.persisted.clone());
-            if self.recent_events.len() > self.config.recent_event_capacity {
-                self.recent_events.pop_front();
-            }
-        }
-        Ok(outcomes)
+        let event = events.pop().expect("one full-book event was checked");
+        let EventKind::FullBook {
+            token_id,
+            bids,
+            asks,
+            tick_size,
+            tick_version,
+        } = &event.kind
+        else {
+            unreachable!("refresh identity is only bound to a full-book event");
+        };
+        let incoming_bids = bids
+            .iter()
+            .filter(|level| !level.quantity.is_zero())
+            .map(|level| (level.price.clone(), level.quantity))
+            .collect::<BTreeMap<_, _>>();
+        let incoming_asks = asks
+            .iter()
+            .filter(|level| !level.quantity.is_zero())
+            .map(|level| (level.price.clone(), level.quantity))
+            .collect::<BTreeMap<_, _>>();
+        let matches_projection = projection.books.get(token_id).is_some_and(|book| {
+            book.bids == incoming_bids
+                && book.asks == incoming_asks
+                && book.tick_size.as_ref() == Some(tick_size)
+                && book.tick_version == *tick_version
+        });
+        Ok(BookObservationValidation {
+            token_id: token_id.clone(),
+            matches_projection,
+            observed_at: event.source_observed_at,
+            received_at,
+            raw_sha256: event.source.raw_sha256,
+        })
     }
 
     pub fn checkpoint(&mut self) -> Result<CheckpointManifest, RuntimeError> {
@@ -768,27 +807,91 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_refresh_advances_freshness_for_an_identical_quiet_book() {
+    fn authoritative_observation_validates_without_mutating_the_ws_projection() {
         let dir = tempdir().unwrap();
         let mut runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
-        let first = runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
-        let first_event_id = first[0].persisted.event.event_id.clone();
+        runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+        let expected_hash = runtime.projection().hash();
+        let expected_cursor = runtime.projection().cursor;
+        let expected_recent_events = runtime.recent_events().len();
 
-        let refreshed = runtime
-            .apply_full_book_refresh(snapshot("yes", 0), at(10))
+        let validation = runtime
+            .validate_full_book_observation(snapshot("yes", 0), at(10))
             .unwrap();
 
-        assert_eq!(refreshed.len(), 1);
-        assert!(refreshed[0].persisted.applied);
-        assert_ne!(refreshed[0].persisted.event.event_id, first_event_id);
+        assert!(validation.matches_projection);
+        assert_eq!(validation.token_id, "yes");
+        assert_eq!(validation.received_at, at(10));
+        assert_eq!(runtime.projection().cursor, expected_cursor);
+        assert_eq!(runtime.projection().hash(), expected_hash);
+        assert_eq!(runtime.recent_events().len(), expected_recent_events);
+    }
+
+    #[test]
+    fn mismatched_authoritative_observation_is_evidence_without_mutation() {
+        let dir = tempdir().unwrap();
+        let mut runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
+        runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+        let expected_hash = runtime.projection().hash();
+        let expected_cursor = runtime.projection().cursor;
+        let mut mismatched = snapshot("yes", 1);
+        mismatched["bids"][0]["size"] = serde_json::Value::String("12".into());
+
+        let validation = runtime
+            .validate_full_book_observation(mismatched, at(10))
+            .unwrap();
+
+        assert!(!validation.matches_projection);
+        assert_eq!(runtime.projection().cursor, expected_cursor);
+        assert_eq!(runtime.projection().hash(), expected_hash);
+        assert_eq!(runtime.recent_events().len(), 1);
+    }
+
+    #[test]
+    fn ws_deltas_remain_the_only_causal_sequence_around_rest_validation() {
+        let dir = tempdir().unwrap();
+        let mut runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
+        runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+        let cursor_before_validation = runtime.projection().cursor;
+
+        let validation = runtime
+            .validate_full_book_observation(snapshot("yes", 0), at(10))
+            .unwrap();
+        assert!(validation.matches_projection);
+        assert_eq!(runtime.projection().cursor, cursor_before_validation);
+
+        let first_delta = runtime
+            .apply_raw(
+                serde_json::json!({
+                    "event_type":"price_change", "timestamp":"2026-08-03T04:00:11Z",
+                    "price_changes":[{"asset_id":"yes","side":"BUY","price":"0.41","size":"2"}]
+                }),
+                at(11),
+            )
+            .unwrap();
+        let second_delta = runtime
+            .apply_raw(
+                serde_json::json!({
+                    "event_type":"price_change", "timestamp":"2026-08-03T04:00:12Z",
+                    "price_changes":[{"asset_id":"yes","side":"BUY","price":"0.42","size":"3"}]
+                }),
+                at(12),
+            )
+            .unwrap();
+
         assert_eq!(
-            refreshed[0].persisted.event.source.source,
-            "polymarket_clob_http"
+            first_delta[0].persisted.event.cursor,
+            cursor_before_validation + 1
         );
-        assert_eq!(runtime.projection().cursor, 2);
         assert_eq!(
-            runtime.projection().books["yes"].source_observed_at,
-            Some(at(10))
+            second_delta[0].persisted.event.cursor,
+            cursor_before_validation + 2
+        );
+        assert_eq!(runtime.projection().cursor, cursor_before_validation + 2);
+        assert!(
+            runtime.projection().books["yes"]
+                .bids
+                .contains_key(&marketcow_core::Price::parse("0.42").unwrap())
         );
     }
 

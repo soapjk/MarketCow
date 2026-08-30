@@ -1008,6 +1008,7 @@ struct AppState {
     projection: Arc<ArcSwap<marketcow_core::Projection>>,
     runtime: Arc<AsyncMutex<marketcow_runtime::PolymarketRuntime>>,
     active_polymarket_scope: Arc<ArcSwapOption<PolymarketLiveConfig>>,
+    polymarket_book_validations: Arc<ArcSwap<PolymarketBookValidationProjection>>,
     polymarket_scope_switch: Option<mpsc::Sender<PolymarketScopeSwitchRequest>>,
     jobs: Arc<DurableJobCoordinator>,
     instruments: Arc<InstrumentCoordinator>,
@@ -1020,6 +1021,17 @@ struct AppState {
     hyperliquid_queues: Option<HyperliquidQueueProbe>,
     worker_status: Arc<PythonWorkerStatus>,
     legacy_mcp: Option<LegacyMcpProxy>,
+}
+
+#[derive(Clone, Default)]
+struct PolymarketBookValidationProjection {
+    scope_id: String,
+    verified_at: BTreeMap<String, DateTime<Utc>>,
+}
+
+struct PolymarketBookValidationSummary {
+    matched_books: usize,
+    mismatched_books: usize,
 }
 
 struct PolymarketScopeSwitchRequest {
@@ -3121,35 +3133,21 @@ fn start_polymarket_live(
                     }
                     _ = refresh_tick.tick() => {
                         match fetch_polymarket_book_refreshes(&refresh_client, &live.token_ids).await {
-                            Ok(frames) => match apply_polymarket_book_refreshes(&state, frames).await {
-                                Ok(events) => {
-                                    events_since_checkpoint += events;
+                            Ok(frames) => match validate_polymarket_book_refreshes(&state, &live, frames).await {
+                                Ok(summary) => {
                                     info!(
-                                        refreshed_books=events,
+                                        matched_books=summary.matched_books,
+                                        mismatched_books=summary.mismatched_books,
                                         interval_ms=refresh_interval.as_millis(),
-                                        "polymarket_authoritative_books_refreshed"
+                                        "polymarket_authoritative_books_validated"
                                     );
                                 }
                                 Err(error) => {
-                                    warn!(error=%error, "polymarket_book_refresh_owner_failed_closed");
-                                    let _ = transport_shutdown_tx.send(true);
-                                    let _ = (&mut transport).await;
-                                    let _ = checkpoint_polymarket_runtime(&state).await;
-                                    match wait_for_polymarket_retry_or_scope_recovery(
-                                        &state,
-                                        &live,
-                                        &mut shutdown,
-                                        &mut scope_switches,
-                                        POLYMARKET_TRANSPORT_RESTART_DELAY,
-                                    )
-                                    .await
-                                    {
-                                        Some(activated) => {
-                                            live = activated;
-                                            continue 'service;
-                                        }
-                                        None => break 'service,
-                                    }
+                                    // Validation is deliberately outside the WS causal state
+                                    // machine. A malformed or mismatched REST observation cannot
+                                    // mutate the projection or restart a healthy stream. The
+                                    // existing age gate fails closed if no exact evidence arrives.
+                                    warn!(error=%error, "polymarket_book_validation_retryable_failure");
                                 }
                             },
                             Err(error) => {
@@ -3369,6 +3367,7 @@ async fn commit_polymarket_scope_switch(
     state
         .active_polymarket_scope
         .store(Some(Arc::new(activated.clone())));
+    reset_polymarket_book_validations(state, &activated.scope_id);
     if let Some(universe) = activated.universe.as_ref()
         && let Err(error) = state.audit.record_lifecycle(
             "polymarket_universe",
@@ -3563,30 +3562,120 @@ async fn apply_polymarket_transport_frames(
     Ok(published.len())
 }
 
-async fn apply_polymarket_book_refreshes(
+async fn validate_polymarket_book_refreshes(
     state: &AppState,
+    live: &PolymarketLiveConfig,
     frames: Vec<marketcow_polymarket::RawTransportFrame>,
-) -> Result<usize> {
+) -> Result<PolymarketBookValidationSummary> {
     if frames.is_empty() {
-        bail!("Polymarket authoritative book refresh emitted an empty batch");
+        bail!("Polymarket authoritative book validation emitted an empty batch");
     }
-    let mut runtime = state.runtime.lock().await;
-    let mut published = Vec::with_capacity(frames.len());
+    let runtime = state.runtime.lock().await;
+    if runtime.projection().scope_id != live.scope_id {
+        bail!("Polymarket book validation crossed a scope boundary");
+    }
+    let mut validations = Vec::with_capacity(frames.len());
     for frame in frames {
-        published.extend(runtime.apply_full_book_refresh(frame.raw_payload, frame.received_at)?);
+        validations
+            .push(runtime.validate_full_book_observation(frame.raw_payload, frame.received_at)?);
     }
-    if published
-        .iter()
-        .any(|outcome| !outcome.persisted.applied || outcome.persisted.fail_closed_reason.is_some())
-    {
-        bail!("Polymarket authoritative book refresh was rejected");
-    }
-    state.projection.store(runtime.projection());
+    let projection_cursor = runtime.projection().cursor;
     drop(runtime);
-    for outcome in &published {
-        let _ = state.stream.send(outcome.persisted.clone());
+    if state
+        .active_polymarket_scope
+        .load_full()
+        .is_none_or(|active| active.scope_id != live.scope_id)
+    {
+        bail!("Polymarket book validation completed after a scope transition");
     }
-    Ok(published.len())
+    let verified_at = validations
+        .iter()
+        .filter(|validation| validation.matches_projection)
+        .map(|validation| (validation.token_id.clone(), validation.received_at))
+        .collect::<BTreeMap<_, _>>();
+    let matched_books = verified_at.len();
+    let mismatched_books = validations.len().saturating_sub(matched_books);
+    let evidence_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&validations)?));
+    state.audit.record_lifecycle(
+        "polymarket_book_validation",
+        "observed",
+        json!({
+            "scope_id":live.scope_id,
+            "generation":live.universe.as_ref().map(|universe| universe.generation),
+            "projection_cursor":projection_cursor,
+            "observed_books":validations.len(),
+            "matched_books":matched_books,
+            "mismatched_books":mismatched_books,
+            "evidence_sha256":evidence_sha256,
+            "projection_mutated":false,
+            "public_cursor_advanced":false,
+            "real_order_submission_enabled":false
+        }),
+    )?;
+    state
+        .polymarket_book_validations
+        .store(Arc::new(PolymarketBookValidationProjection {
+            scope_id: live.scope_id.clone(),
+            verified_at,
+        }));
+    Ok(PolymarketBookValidationSummary {
+        matched_books,
+        mismatched_books,
+    })
+}
+
+fn reset_polymarket_book_validations(state: &AppState, scope_id: &str) {
+    state
+        .polymarket_book_validations
+        .store(Arc::new(PolymarketBookValidationProjection {
+            scope_id: scope_id.into(),
+            verified_at: BTreeMap::new(),
+        }));
+}
+
+fn projection_maximum_effective_book_age_ms(
+    state: &AppState,
+    projection: &marketcow_core::Projection,
+) -> u64 {
+    let validations = state.polymarket_book_validations.load();
+    projection
+        .books
+        .iter()
+        .map(|(token_id, book)| {
+            let validated_at = (validations.scope_id == projection.scope_id)
+                .then(|| validations.verified_at.get(token_id).copied())
+                .flatten();
+            let observed_at = match (book.source_observed_at, validated_at) {
+                (Some(causal), Some(validated)) => Some(causal.max(validated)),
+                (causal, validated) => causal.or(validated),
+            };
+            observed_at.map_or(u64::MAX, |observed_at| {
+                Utc::now()
+                    .signed_duration_since(observed_at)
+                    .num_milliseconds()
+                    .max(0) as u64
+            })
+        })
+        .max()
+        .unwrap_or(u64::MAX)
+}
+
+fn projection_fresh(state: &AppState, projection: &marketcow_core::Projection) -> bool {
+    projection_maximum_effective_book_age_ms(state, projection) <= state.config.maximum_book_age_ms
+}
+
+fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Projection) -> bool {
+    projection.ready
+        && projection.instrument_ticks_consistent()
+        && projection_fresh(state, projection)
+        && state
+            .active_polymarket_scope
+            .load()
+            .as_ref()
+            .is_none_or(|live| {
+                live.catalog_frame.is_none()
+                    || projection_matches_polymarket_scope(live, projection, true)
+            })
 }
 
 async fn wait_for_polymarket_retry_or_scope_recovery(
@@ -3694,6 +3783,10 @@ async fn serve() -> Result<()> {
     let active_polymarket_scope = Arc::new(ArcSwapOption::from(
         config.polymarket_live.clone().map(Arc::new),
     ));
+    let initial_validation_scope = config
+        .polymarket_live
+        .as_ref()
+        .map_or_else(|| config.scope_id.clone(), |live| live.scope_id.clone());
     let state = AppState {
         config: config.clone(),
         audit,
@@ -3701,6 +3794,12 @@ async fn serve() -> Result<()> {
         projection: Arc::new(ArcSwap::from(projection)),
         runtime: Arc::new(AsyncMutex::new(runtime)),
         active_polymarket_scope,
+        polymarket_book_validations: Arc::new(ArcSwap::from_pointee(
+            PolymarketBookValidationProjection {
+                scope_id: initial_validation_scope,
+                verified_at: BTreeMap::new(),
+            },
+        )),
         polymarket_scope_switch: config
             .polymarket_live
             .as_ref()
@@ -6166,7 +6265,7 @@ fn mcp_error(request_id: serde_json::Value, code: i64, message: &str) -> serde_j
 
 async fn readiness(State(state): State<AppState>) -> Response {
     let projection = state.projection.load_full();
-    let fresh = projection_fresh(&state.config, &projection);
+    let fresh = projection_fresh(&state, &projection);
     let hyperliquid_ready = state.hyperliquid_shadow.as_ref().is_none_or(|reader| {
         matches!(
             reader.snapshot().health,
@@ -7539,39 +7638,6 @@ async fn admin_shadow_ingest(
     }
 }
 
-fn projection_maximum_book_age_ms(projection: &marketcow_core::Projection) -> u64 {
-    projection
-        .books
-        .values()
-        .filter_map(|book| book.source_observed_at)
-        .map(|observed_at| {
-            Utc::now()
-                .signed_duration_since(observed_at)
-                .num_milliseconds()
-                .max(0) as u64
-        })
-        .max()
-        .unwrap_or(u64::MAX)
-}
-
-fn projection_fresh(config: &Config, projection: &marketcow_core::Projection) -> bool {
-    projection_maximum_book_age_ms(projection) <= config.maximum_book_age_ms
-}
-
-fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Projection) -> bool {
-    projection.ready
-        && projection.instrument_ticks_consistent()
-        && projection_fresh(&state.config, projection)
-        && state
-            .active_polymarket_scope
-            .load()
-            .as_ref()
-            .is_none_or(|live| {
-                live.catalog_frame.is_none()
-                    || projection_matches_polymarket_scope(live, projection, true)
-            })
-}
-
 fn polymarket_atomic_view(
     state: &AppState,
 ) -> Option<(
@@ -7602,7 +7668,7 @@ fn polymarket_atomic_view(
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let projection = state.projection.load_full();
-    let maximum_book_age_ms = projection_maximum_book_age_ms(&projection);
+    let maximum_book_age_ms = projection_maximum_effective_book_age_ms(&state, &projection);
     let hyperliquid = state
         .hyperliquid_shadow
         .as_ref()
@@ -8465,6 +8531,12 @@ mod tests {
                 projection: Arc::new(ArcSwap::from_pointee(bootstrap_projection("s".into()))),
                 runtime: Arc::new(AsyncMutex::new(runtime)),
                 active_polymarket_scope: Arc::new(ArcSwapOption::empty()),
+                polymarket_book_validations: Arc::new(ArcSwap::from_pointee(
+                    PolymarketBookValidationProjection {
+                        scope_id: "s".into(),
+                        verified_at: BTreeMap::new(),
+                    },
+                )),
                 polymarket_scope_switch: None,
                 jobs: Arc::new(DurableJobCoordinator::memory()),
                 instruments: Arc::new(InstrumentCoordinator::memory()),
@@ -11589,7 +11661,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_book_refresh_is_bounded_well_inside_the_age_gate() {
+    fn authoritative_book_validation_is_bounded_well_inside_the_age_gate() {
         assert_eq!(
             polymarket_book_refresh_interval(3_600_000),
             Duration::from_secs(5 * 60)
@@ -11605,7 +11677,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_book_refresh_requires_one_exact_book_per_token() {
+    fn authoritative_book_validation_requires_one_exact_book_per_token() {
         let received_at = Utc::now();
         let tokens = vec!["2".to_string(), "1".to_string()];
         let book = |token: &str| {
@@ -11639,5 +11711,42 @@ mod tests {
             "asks":[{"price":"0.60","size":"11"}]
         }, book("2")]);
         assert!(validate_polymarket_book_refresh_response(inexact, &tokens, received_at).is_err());
+    }
+
+    #[test]
+    fn exact_validation_evidence_refreshes_age_without_mutating_projection_time() {
+        let (_dir, state) = test_state();
+        let causal_time = Utc::now() - chrono::Duration::minutes(2);
+        let mut projection = bootstrap_projection("s".into());
+        projection.books.insert(
+            "token-1".into(),
+            marketcow_core::Book {
+                source_observed_at: Some(causal_time),
+                ..Default::default()
+            },
+        );
+        assert!(!projection_fresh(&state, &projection));
+
+        state
+            .polymarket_book_validations
+            .store(Arc::new(PolymarketBookValidationProjection {
+                scope_id: "s".into(),
+                verified_at: BTreeMap::from([("token-1".into(), Utc::now())]),
+            }));
+
+        assert!(projection_fresh(&state, &projection));
+        assert_eq!(
+            projection.books["token-1"].source_observed_at,
+            Some(causal_time)
+        );
+        assert_eq!(projection.cursor, 0);
+
+        state
+            .polymarket_book_validations
+            .store(Arc::new(PolymarketBookValidationProjection {
+                scope_id: "different-scope".into(),
+                verified_at: BTreeMap::from([("token-1".into(), Utc::now())]),
+            }));
+        assert!(!projection_fresh(&state, &projection));
     }
 }

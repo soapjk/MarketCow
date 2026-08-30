@@ -906,9 +906,10 @@ pub fn bind_full_book_recovery_identity(event: &mut CanonicalEvent) -> bool {
     true
 }
 
-/// Rebinds an authoritative HTTP full-book snapshot to its observation boundary. The venue can
-/// return byte-identical content for a quiet token, but that successful response is still fresh
-/// evidence and must advance the book's freshness without weakening normal WS-frame deduplication.
+/// Rebinds an authoritative HTTP full-book snapshot to its observation boundary. This only marks
+/// normalized evidence as HTTP-derived; callers decide whether it is a historical state event or
+/// a read-only validation. The current live runtime never writes periodic observations into the
+/// WS-owned projection or public cursor.
 pub fn bind_full_book_refresh_identity(event: &mut CanonicalEvent) -> bool {
     if !matches!(&event.kind, EventKind::FullBook { .. }) {
         return false;
