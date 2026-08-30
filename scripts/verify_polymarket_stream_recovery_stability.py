@@ -160,6 +160,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
         "failures": [],
         "passed": False,
     }
+    atomic_write(arguments.output, report)
     if report["runtime"]["binary_sha256"] != arguments.expected_binary_sha256:
         report["failures"].append({"gate": "binary_identity", "observed": report["runtime"]["binary_sha256"]})
         return report
@@ -174,12 +175,14 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
     last_sample_at = 0.0
     ws_url = arguments.base_url.replace("http://", "ws://") + "/v1/market-data/stream"
     async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-        while time.monotonic() < deadline and not report["failures"]:
+        while time.monotonic() < deadline:
             try:
                 scope, _full, boundary = await read_boundary(client, arguments.base_url)
             except Exception as error:
                 report["failures"].append({"gate": "full_sync", "observed_at": utc_now(), "error": f"{type(error).__name__}: {error}"})
-                break
+                atomic_write(arguments.output, report)
+                await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
+                continue
             report["samples"].append({"observed_at": utc_now(), **boundary})
             connection_generation = int(scope["generation"])
             connection_markets = set(boundary["active_market_ids"])
@@ -202,9 +205,18 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
                     while time.monotonic() < deadline:
                         now_monotonic = time.monotonic()
                         if now_monotonic - last_sample_at >= arguments.sample_interval_seconds:
-                            _sample_scope, _sample_full, sample = await read_boundary(client, arguments.base_url)
-                            report["samples"].append({"observed_at": utc_now(), **sample})
+                            try:
+                                _sample_scope, _sample_full, sample = await read_boundary(
+                                    client, arguments.base_url
+                                )
+                                report["samples"].append({"observed_at": utc_now(), **sample})
+                            except Exception as error:
+                                report["failures"].append({
+                                    "gate": "http_sample", "observed_at": utc_now(),
+                                    "error": f"{type(error).__name__}: {error}",
+                                })
                             last_sample_at = now_monotonic
+                            atomic_write(arguments.output, report)
                         try:
                             frame = json.loads(await asyncio.wait_for(socket.recv(), 5))
                         except TimeoutError:

@@ -333,6 +333,25 @@ def test_dynamic_universe_records_capacity_exclusion(tmp_path: Path) -> None:
     }]
 
 
+def test_dynamic_universe_keeps_qualified_incumbent_ahead_of_ranked_replacement(
+    tmp_path: Path,
+) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    result = build_dynamic_universe(
+        manifest, index, catalog, registry, _books(tmp_path),
+        universe_id="8" * 64,
+        generation=2,
+        target_market_count=1,
+        minimum_market_count=1,
+        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
+        previous_market_ids=["1"],
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+    assert result["market_ids"] == ["1"]
+    assert result["universe"]["added_markets"] == []
+    assert result["universe"]["removed_markets"] == []
+
+
 def test_dynamic_universe_preserves_removed_identity_when_catalog_member_is_unbuildable(
     tmp_path: Path,
 ) -> None:

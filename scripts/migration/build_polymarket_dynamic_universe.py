@@ -76,6 +76,45 @@ def _valid_two_sided_book(frame: dict[str, Any]) -> bool:
         return False
 
 
+def _previous_identity_map(
+    identities: list[dict[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for identity in identities or []:
+        if not isinstance(identity, dict) or set(identity) != {
+            "market_id", "condition_id", "token_ids", "end_at"
+        }:
+            raise ValueError("previous market identity is invalid")
+        market_id = identity["market_id"]
+        token_ids = identity["token_ids"]
+        if (
+            not isinstance(market_id, str)
+            or not market_id.isascii()
+            or not market_id.isdecimal()
+            or not isinstance(identity["condition_id"], str)
+            or not identity["condition_id"]
+            or not isinstance(token_ids, list)
+            or len(token_ids) != 2
+            or any(
+                not isinstance(token, str) or not token.isascii() or not token.isdecimal()
+                for token in token_ids
+            )
+            or len(set(token_ids)) != 2
+            or not isinstance(identity["end_at"], str)
+        ):
+            raise ValueError("previous market identity is invalid")
+        canonical_end = datetime.fromisoformat(identity["end_at"].replace("Z", "+00:00"))
+        if canonical_end.tzinfo is None or market_id in result:
+            raise ValueError("previous market identity is invalid")
+        result[market_id] = {
+            "market_id": market_id,
+            "condition_id": identity["condition_id"],
+            "token_ids": list(token_ids),
+            "end_at": identity["end_at"],
+        }
+    return result
+
+
 def build_dynamic_universe(
     candidate_manifest_path: Path,
     catalog_index_path: Path,
@@ -117,6 +156,24 @@ def build_dynamic_universe(
         raise ValueError("candidate market identifiers must be decimal strings")
     if len(set(candidates)) != len(candidates):
         raise ValueError("candidate market identifiers must be unique")
+    previous_identity_by_id = _previous_identity_map(previous_market_identities)
+    previous_order = list(previous_market_ids or previous_identity_by_id)
+    if (
+        len(previous_order) != len(set(previous_order))
+        or any(
+            not isinstance(value, str) or not value.isascii() or not value.isdecimal()
+            for value in previous_order
+        )
+        or (previous_identity_by_id and set(previous_order) != set(previous_identity_by_id))
+    ):
+        raise ValueError("previous market ids and identities disagree")
+    # Keep every still-qualified incumbent before considering ranked replacements. This prevents
+    # a temporarily ineligible high-ranked market from repeatedly evicting its healthy replacement
+    # when a later snapshot happens to make it eligible again.
+    candidate_set = set(candidates)
+    incumbent_ids = [market_id for market_id in previous_order if market_id in candidate_set]
+    incumbent_set = set(incumbent_ids)
+    candidates = incumbent_ids + [market_id for market_id in candidates if market_id not in incumbent_set]
     books = _book_frames(book_snapshot_path)
     active: list[dict[str, Any]] = []
     active_books: list[dict[str, Any]] = []
@@ -186,42 +243,7 @@ def build_dynamic_universe(
             f"qualified market count below minimum: {len(active)} < {minimum_market_count}; exclusions={counts}"
         )
     active_ids = [market["market_id"] for market in active]
-    previous_identity_by_id: dict[str, dict[str, Any]] = {}
-    for identity in previous_market_identities or []:
-        if not isinstance(identity, dict) or set(identity) != {
-            "market_id", "condition_id", "token_ids", "end_at"
-        }:
-            raise ValueError("previous market identity is invalid")
-        market_id = identity["market_id"]
-        token_ids_value = identity["token_ids"]
-        if (
-            not isinstance(market_id, str)
-            or not market_id.isascii()
-            or not market_id.isdecimal()
-            or not isinstance(identity["condition_id"], str)
-            or not identity["condition_id"]
-            or not isinstance(token_ids_value, list)
-            or len(token_ids_value) != 2
-            or any(
-                not isinstance(token, str) or not token.isascii() or not token.isdecimal()
-                for token in token_ids_value
-            )
-            or len(set(token_ids_value)) != 2
-            or not isinstance(identity["end_at"], str)
-        ):
-            raise ValueError("previous market identity is invalid")
-        _canonical_end = datetime.fromisoformat(identity["end_at"].replace("Z", "+00:00"))
-        if _canonical_end.tzinfo is None or market_id in previous_identity_by_id:
-            raise ValueError("previous market identity is invalid")
-        previous_identity_by_id[market_id] = {
-            "market_id": market_id,
-            "condition_id": identity["condition_id"],
-            "token_ids": list(token_ids_value),
-            "end_at": identity["end_at"],
-        }
-    previous = set(previous_market_ids or previous_identity_by_id)
-    if previous_identity_by_id and previous != set(previous_identity_by_id):
-        raise ValueError("previous market ids and identities disagree")
+    previous = set(previous_order)
     current = set(active_ids)
     removed = previous - current
     if not removed.issubset(set(known_markets) | set(previous_identity_by_id)):
