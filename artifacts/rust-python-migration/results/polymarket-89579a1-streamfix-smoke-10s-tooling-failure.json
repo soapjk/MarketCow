@@ -1,0 +1,16 @@
+{
+  "schema_version": "marketcow.tooling-failure.v1",
+  "verdict": "failed",
+  "classification": "invalid_verifier_duration",
+  "runtime_commit": "89579a1a4f5c5a3fbe8ac42fade14950a873a8a3",
+  "requested_duration_seconds": 10,
+  "verifier_minimum_duration_seconds": 60,
+  "command": "python3 scripts/verify_polymarket_stream_recovery_stability.py --duration-seconds 10 ...",
+  "error": "duration must be >=60 seconds and sample interval positive",
+  "service_verdict": "unknown",
+  "summary": "The verifier rejected the requested 10-second duration before probing the service. This is preserved as a tooling/parameter failure and is not evidence that MarketCow passed or failed.",
+  "safety": {
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  }
+}
