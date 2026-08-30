@@ -289,7 +289,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
             response = await client.get(arguments.base_url + path)
             report["read_only"][path] = response.status_code
         try:
-            expired_uri = ws_url + "?after_cursor=0"
+            expired_uri = ws_url + f"?after_cursor={arguments.expired_cursor}"
             async with websockets.connect(expired_uri, open_timeout=10, close_timeout=3, proxy=None) as socket:
                 first = json.loads(await asyncio.wait_for(socket.recv(), 10))
                 report["expired_cursor"] = {"frame": first, "passed": first.get("type") == "resync_required" and first.get("reason") == "event_cursor_expired"}
@@ -321,9 +321,19 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--expected-binary-sha256", required=True)
     parser.add_argument("--launchd-label", required=True)
+    parser.add_argument(
+        "--expired-cursor",
+        type=int,
+        default=0,
+        help="cursor from a retired/expired lineage that must force full-sync",
+    )
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
-    if arguments.duration_seconds < 60 or arguments.sample_interval_seconds <= 0:
+    if (
+        arguments.duration_seconds < 60
+        or arguments.sample_interval_seconds <= 0
+        or arguments.expired_cursor < 0
+    ):
         parser.error("duration must be >=60 seconds and sample interval positive")
     report = asyncio.run(main_async(arguments))
     report["runtime"]["process_command"] = subprocess.run(
