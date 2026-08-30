@@ -6704,6 +6704,7 @@ async fn scope(
         "market_count":active_market_count,
         "token_count":active_token_count,
         "catalog_revision":live.as_ref().and_then(|value| value.catalog_revision.clone()),
+        "scope_file_sha256":live.as_ref().and_then(|value| value.scope_file_sha256.clone()),
         "boundary_cursor":projection.cursor,
         "target_market_count":universe.as_ref().map(|value| value.target_market_count),
         "minimum_market_count":universe.as_ref().map(|value| value.minimum_market_count),
@@ -9772,6 +9773,19 @@ mod tests {
         assert_eq!(scope["token_count"], 2);
         assert_eq!(scope["active_market_ids"], json!(["2"]));
         assert_eq!(scope["quarantined_market_ids"], json!(["1"]));
+        assert_eq!(scope["scope_file_sha256"].as_str().map(str::len), Some(64));
+        for field in [
+            "gap_from",
+            "gap_to",
+            "reason_code",
+            "retry_after",
+            "source_observed_at",
+            "last_recovered_at",
+            "catalog_revision",
+            "last_event_revision",
+        ] {
+            assert!(scope["market_health"][0].get(field).is_some(), "{field}");
+        }
 
         let full_response = app(state.clone())
             .oneshot(
