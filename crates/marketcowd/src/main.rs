@@ -3543,18 +3543,105 @@ async fn apply_polymarket_transport_frames(
     for outcome in &published {
         let _ = state.stream.send(outcome.persisted.clone());
     }
-    if published.iter().any(|outcome| {
-        (!outcome.persisted.applied || outcome.persisted.fail_closed_reason.is_some())
-            && !matches!(
-                &outcome.persisted.event.kind,
-                marketcow_core::EventKind::SourceGap { .. }
-            )
-    }) {
+    let recovery_records = published
+        .iter()
+        .filter(|outcome| {
+            (!outcome.persisted.applied || outcome.persisted.fail_closed_reason.is_some())
+                && !matches!(
+                    &outcome.persisted.event.kind,
+                    marketcow_core::EventKind::SourceGap { .. }
+                )
+        })
+        .collect::<Vec<_>>();
+    if !recovery_records.is_empty() {
         // An incremental projection rejection cannot heal through further deltas. Force a
         // controlled reconnect so the venue supplies authoritative full books. A SourceGap is
         // itself the first half of that recovery protocol and must be followed by those books on
         // the same connection rather than recursively restarting at the boundary.
-        bail!("polymarket_projection_recovery_required");
+        let reason_codes = recovery_records
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .persisted
+                    .fail_closed_reason
+                    .as_deref()
+                    .unwrap_or("unapplied_without_reason")
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        let affected_token_ids = recovery_records
+            .iter()
+            .map(|outcome| outcome.persisted.event.kind.token_id().to_owned())
+            .collect::<BTreeSet<_>>();
+        let projection = state.projection.load();
+        let affected_market_ids = projection
+            .markets
+            .values()
+            .filter(|market| {
+                market
+                    .outcomes
+                    .iter()
+                    .any(|outcome| affected_token_ids.contains(&outcome.token_id))
+            })
+            .map(|market| market.market_id.clone())
+            .collect::<BTreeSet<_>>();
+        let maximum_observed_source_delay_ms = recovery_records
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .persisted
+                    .event
+                    .received_at
+                    .signed_duration_since(outcome.persisted.event.source_observed_at)
+                    .num_milliseconds()
+                    .max(0)
+            })
+            .max()
+            .unwrap_or_default();
+        let first_cursor = recovery_records
+            .first()
+            .map(|outcome| outcome.persisted.event.cursor)
+            .unwrap_or_default();
+        let last_cursor = recovery_records
+            .last()
+            .map(|outcome| outcome.persisted.event.cursor)
+            .unwrap_or(first_cursor);
+        let recovery_scope = if reason_codes.iter().all(|reason| {
+            matches!(
+                reason.as_str(),
+                "source_data_delayed" | "source_data_missing"
+            )
+        }) {
+            "transport_connection"
+        } else {
+            "projection"
+        };
+        let details = json!({
+            "scope_id":projection.scope_id,
+            "recovery_scope":recovery_scope,
+            "reason_codes":reason_codes,
+            "affected_token_ids":affected_token_ids,
+            "affected_token_count":affected_token_ids.len(),
+            "affected_market_ids":affected_market_ids,
+            "affected_market_count":affected_market_ids.len(),
+            "maximum_observed_source_delay_ms":maximum_observed_source_delay_ms,
+            "first_cursor":first_cursor,
+            "last_cursor":last_cursor,
+            "action":"same_scope_authoritative_websocket_reconnect",
+            "periodic_http_snapshot_used_for_repair":false,
+            "real_order_submission_enabled":false
+        });
+        if let Err(error) = state.audit.record_lifecycle(
+            "polymarket_transport",
+            "recovery_required",
+            details.clone(),
+        ) {
+            warn!(error=%error, "polymarket_transport_recovery_audit_failed");
+        }
+        bail!(
+            "polymarket_projection_recovery_required:{}",
+            serde_json::to_string(&details)?
+        );
     }
     if let Some(error) = failure {
         return Err(error.into());
@@ -8566,6 +8653,67 @@ mod tests {
         );
         assert!(validate_polymarket_token_ids(vec!["10".into(), "10".into()]).is_err());
         assert!(validate_polymarket_token_ids(vec!["not-a-token".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn delayed_polymarket_frame_records_machine_readable_connection_recovery() {
+        let (dir, state) = test_state();
+        let received_at = Utc::now();
+        let observed_at = received_at - chrono::Duration::milliseconds(7_294);
+        let error = apply_polymarket_transport_frames(
+            &state,
+            vec![marketcow_polymarket::RawTransportFrame {
+                raw_payload: json!({
+                    "event_type":"price_change",
+                    "timestamp":observed_at.timestamp_millis().to_string(),
+                    "price_changes":[
+                        {
+                            "asset_id":"20",
+                            "side":"BUY",
+                            "price":"0.40",
+                            "size":"10",
+                            "best_bid":"0.40",
+                            "best_ask":"0.60"
+                        },
+                        {
+                            "asset_id":"10",
+                            "side":"SELL",
+                            "price":"0.60",
+                            "size":"11",
+                            "best_bid":"0.40",
+                            "best_ask":"0.60"
+                        }
+                    ]
+                }),
+                received_at,
+            }],
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("polymarket_projection_recovery_required:"));
+        assert!(message.contains("\"recovery_scope\":\"transport_connection\""));
+        assert!(message.contains("\"reason_codes\":[\"source_data_delayed\"]"));
+        assert!(message.contains("\"affected_token_ids\":[\"10\",\"20\"]"));
+        assert!(message.contains("\"maximum_observed_source_delay_ms\":7294"));
+        assert!(message.contains("\"periodic_http_snapshot_used_for_repair\":false"));
+
+        let audit = fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        let recovery = audit
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| {
+                record["domain"] == "polymarket_transport"
+                    && record["transition"] == "recovery_required"
+            })
+            .unwrap();
+        assert_eq!(recovery["details"]["affected_token_count"], 2);
+        assert_eq!(recovery["details"]["affected_market_count"], 0);
+        assert_eq!(
+            recovery["details"]["action"],
+            "same_scope_authoritative_websocket_reconnect"
+        );
+        assert_eq!(recovery["real_order_submission_enabled"], false);
     }
 
     #[test]
