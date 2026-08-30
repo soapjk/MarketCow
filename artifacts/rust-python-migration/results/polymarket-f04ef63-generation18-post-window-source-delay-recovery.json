@@ -1,0 +1,60 @@
+{
+  "schema_version": "marketcow.polymarket.post-gate-failure-evidence.v1",
+  "verdict": "architecture_remediation_required",
+  "runtime_commit": "f04ef635c7cb8beb07e83bf16226a36389117ee9",
+  "runtime_binary_sha256": "4caaf86b2a80034bc4cdad131c828be30b4c6a46ccbfbcc089d102e099daffae",
+  "runtime_pid": 2578,
+  "generation": 18,
+  "strict_30_minute_gate": {
+    "started_at": "2026-08-30T12:07:35.544068Z",
+    "finished_at": "2026-08-30T12:37:40.181413Z",
+    "passed": true,
+    "events": 129901,
+    "failures": 0,
+    "cursor_discontinuities": 0,
+    "resync_reasons": {},
+    "result": "artifacts/rust-python-migration/results/polymarket-f04ef63-generation18-streamfix-stability-30m.json",
+    "sha256": "85265ee33d0d9601fbc1adc86f3e0f67bb56303c62bf34baa02c0a28f62731da"
+  },
+  "post_window_failure": {
+    "source_received_at": "2026-08-30T12:44:47.616345Z",
+    "source_observed_at": "2026-08-30T12:44:40.322Z",
+    "source_delay_milliseconds": 7294,
+    "configured_maximum_source_delay_milliseconds": 5000,
+    "rejected_cursor_range": [265426, 265427],
+    "fail_closed_reason": "source_data_delayed",
+    "owner_failed_closed_at": "2026-08-30T12:44:52.524678Z",
+    "transport_retry_at": "2026-08-30T12:44:54.206320Z",
+    "recovery_seconds_approx": 1.7,
+    "affected_token_ids": [
+      "110825236555365665539127189112348149920900293738433019893936505711582554741482",
+      "94396338618357131937565462245007962004459378930118372070127867015460858756221"
+    ],
+    "recovery_protocol": "durable rejection, upstream_connection_boundary gaps for the scope, same-scope reconnect, authoritative full books"
+  },
+  "current_runtime_after_recovery": {
+    "ready": true,
+    "scope_status": "ready",
+    "market_count": 100,
+    "token_count": 200,
+    "book_count": 200,
+    "unresolved_gap_count": 0,
+    "full_sync_boundary_cursor": 269497,
+    "real_order_submission_enabled": false
+  },
+  "architecture_assessment": {
+    "data_corruption": false,
+    "fail_closed_preserved": true,
+    "problem": "one delayed two-token batch causes recovery of the complete 200-token scope",
+    "preferred_boundary": "isolate the affected market or tokens, obtain authoritative repair books, validate them, and atomically re-admit them without invalidating unaffected books; escalate to global resync only when the atomic generation or complete projection cannot be trusted",
+    "formal_acceptance_blocked": true
+  },
+  "scheduler_failure": {
+    "verifier_scheduled_and_executed": true,
+    "launchd_runs": 1,
+    "launchd_exit_code": 0,
+    "session_reactivation_automation_created": false,
+    "impact": "the verifier completed at 20:37 Asia/Shanghai but this Session was not reactivated until the user asked at 20:45",
+    "classification": "missing_process_exit_reactivation_hook"
+  }
+}
