@@ -1,0 +1,68 @@
+{
+  "schema_version": "marketcow.polymarket.bounded-readiness-gate.v1",
+  "observed_at": "2026-08-30T03:57:30Z",
+  "passed": false,
+  "runtime": {
+    "pid": 72741,
+    "launchd_label": "com.marketcow.rust-polymarket-recovery-06c0415-shadow-v19",
+    "launchd_runs": 1,
+    "commit": "06c04153278c2ff2fe1dd9cf656bcdce7d3f40ad",
+    "binary_path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-06c0415",
+    "binary_sha256": "93f521f7845fe9400c11363a4fee6cb0f1d3eb4de8b86aff1f4d75cbb2750541",
+    "listen": "127.0.0.1:18872",
+    "real_order_submission_enabled": false
+  },
+  "scope": {
+    "http_status": 200,
+    "schema_version": "marketcow.polymarket.scope-discovery.v3",
+    "universe_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "generation": 15,
+    "ready": false,
+    "scope_status": "unready",
+    "market_count": 100,
+    "token_count": 200,
+    "boundary_cursor": 945418,
+    "maximum_capital_lock_seconds": 2592000
+  },
+  "full_sync": {
+    "http_status": 503,
+    "passed": false,
+    "reason": "polymarket_projection_unready_or_stale"
+  },
+  "websocket_continuity": {
+    "passed": false,
+    "skipped_fail_closed": true,
+    "reason": "full_sync_not_ready"
+  },
+  "wal": {
+    "status": "ok",
+    "last_cursor": 945642,
+    "minimum_required_cursor": 924970,
+    "record_count": 303831,
+    "checkpoint_cursor": 945642,
+    "checkpoint_projection_sha256": "9c8aec26ffd5c1ca88da0ee4cd258c407d84379cdae322ca40e4d6d6e5e60c6c",
+    "checkpoint_manifest_sha256": "3c6092a82d801a9f9faadd50ad7b2201e3f6e7999d0c3b4172cb17dde0b0f535"
+  },
+  "recovery_loop": {
+    "preserved": true,
+    "post_baseline_failures": {
+      "source_gap_upstream_connection_boundary": 1400,
+      "full_book_recovery_required": 0,
+      "source_data_delayed": 8,
+      "best_bid_ask_source_mismatch": 4
+    },
+    "diagnosis": "Recovery full books can close the connection boundary, but subsequent delayed or BBO-mismatched incremental frames immediately reopen a durable gap and trigger another controlled reconnect."
+  },
+  "failed_gates": [
+    "scope_ready",
+    "full_sync_100_200_5",
+    "websocket_after_boundary_continuity"
+  ],
+  "passed_gates": [
+    "exact_runtime_identity",
+    "listener_identity",
+    "generation_and_counts_declared",
+    "wal_cursor_and_hash_chain",
+    "orders_disabled"
+  ]
+}
