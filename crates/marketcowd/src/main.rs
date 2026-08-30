@@ -45,12 +45,15 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const STREAM_CHANNEL_CAPACITY: usize = 16_384;
+// The public broadcast ring stores full audited events, including raw venue evidence. Keep roughly
+// one minute at the observed 100-market rate; a lag beyond this verified in-memory window replays
+// from the runtime journal or requires full-sync instead of allowing unbounded payload retention.
+const STREAM_CHANNEL_CAPACITY: usize = 4_096;
 // A 200-token scope may receive a full-book burst plus incremental traffic during bootstrap. The
 // transport awaits this bounded queue, applying TCP backpressure without dropping or reconnecting
 // merely because durable storage is briefly slower than the venue.
-const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 16_384;
-const POLYMARKET_RECENT_EVENT_CAPACITY: usize = 100_000;
+const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 2_048;
+const POLYMARKET_RECENT_EVENT_CAPACITY: usize = 5_000;
 const POLYMARKET_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const POLYMARKET_TRANSPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
 const POLYMARKET_TRANSPORT_SCOPE_SWITCH_STOP_TIMEOUT: Duration = Duration::from_secs(2);

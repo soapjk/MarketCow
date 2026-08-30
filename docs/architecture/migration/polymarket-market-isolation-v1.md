@@ -42,6 +42,13 @@ received. It cannot invent a venue event that never reached MarketCow. An upstre
 therefore repaired with an authoritative two-token market snapshot or remains quarantined. Cursor
 fabrication, event skipping, and stale-book continuation are forbidden.
 
+The in-memory verified journal retains the latest 5,000 persisted events and the public broadcast
+ring retains 4,096. At the observed 100-market rate this is approximately one minute of bounded
+fast replay without retaining hundreds of megabytes of duplicated raw venue payload. Falling
+outside that window is explicit cursor expiry and requires full-sync; the complete segmented WAL
+remains append-only and authoritative. Ingress applies strict backpressure through a 2,048-batch
+queue rather than dropping, fabricating, or silently skipping frames.
+
 The transport's `upstream_connection_boundary` is always global even though the wire adapter emits
 one token-shaped audit record per subscription. A token identifier on a connection-wide gap is not
 evidence of market-local scope. Only an independently attributable market validation failure or an
