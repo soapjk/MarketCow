@@ -23,6 +23,11 @@ use std::{
 };
 use thiserror::Error;
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 const CHECKPOINT_MANIFEST_V1: &str = "marketcow.polymarket.checkpoint-manifest.v1";
 pub const CHECKPOINT_MANIFEST_VERSION: &str = "marketcow.polymarket.checkpoint-manifest.v2";
 const CANDIDATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -99,6 +104,10 @@ pub enum RuntimeError {
     PhysicalCopyMismatch,
     #[error("candidate preparation exceeded five-minute deadline")]
     CandidatePreparationTimeout,
+    #[error("another Polymarket WAL writer already owns this generation")]
+    WriterAlreadyActive,
+    #[error("Polymarket writer lease is not a private regular file")]
+    InsecureWriterLease,
     #[error(transparent)]
     Core(#[from] marketcow_core::CoreError),
     #[error(transparent)]
@@ -111,6 +120,7 @@ pub enum RuntimeError {
 
 pub struct PolymarketRuntime {
     config: RuntimeConfig,
+    _writer_lock: File,
     writer: SingleWriter<SegmentedWal>,
     recent_events: VecDeque<PersistedEvent>,
     last_manifest: Option<CheckpointManifest>,
@@ -178,6 +188,8 @@ pub fn anchor_verified_legacy_checkpoint(
 impl PolymarketRuntime {
     pub fn open(config: RuntimeConfig) -> Result<Self, RuntimeError> {
         config.validate()?;
+        fs::create_dir_all(&config.root)?;
+        let writer_lock = acquire_writer_lock(&config.root.join("writer.lock"))?;
         fs::create_dir_all(config.root.join("wal"))?;
         fs::create_dir_all(config.root.join("checkpoints"))?;
         let verified_wal = SegmentedWal::verify_with_anchors(config.root.join("wal"))?;
@@ -200,6 +212,7 @@ impl PolymarketRuntime {
             .saturating_sub(config.recent_event_capacity);
         Ok(Self {
             config,
+            _writer_lock: writer_lock,
             writer,
             recent_events: verified_wal.records[start..].iter().cloned().collect(),
             last_manifest: manifest,
@@ -220,6 +233,8 @@ impl PolymarketRuntime {
         let deadline = Instant::now() + CANDIDATE_PREPARATION_TIMEOUT;
         let manifest = self.checkpoint()?;
         let projection = self.writer.projection();
+        fs::create_dir_all(&config.root)?;
+        let writer_lock = acquire_writer_lock(&config.root.join("writer.lock"))?;
         fs::create_dir_all(config.root.join("wal"))?;
         fs::create_dir_all(config.root.join("checkpoints"))?;
         fs::create_dir_all(config.root.join("lineage"))?;
@@ -285,6 +300,7 @@ impl PolymarketRuntime {
         let writer = SingleWriter::resume(projection.as_ref().clone(), wal)?;
         Ok(Self {
             config,
+            _writer_lock: writer_lock,
             writer,
             recent_events: self.recent_events.clone(),
             last_manifest: Some(candidate_manifest),
@@ -459,6 +475,48 @@ impl PolymarketRuntime {
         self.last_manifest = Some(manifest.clone());
         Ok(manifest)
     }
+}
+
+#[cfg(unix)]
+impl Drop for PolymarketRuntime {
+    fn drop(&mut self) {
+        // Closing the descriptor also releases the lease. Explicit unlock makes the handoff
+        // boundary visible and lets the replacement writer acquire immediately after drop.
+        unsafe {
+            libc::flock(self._writer_lock.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn acquire_writer_lock(path: &Path) -> Result<File, RuntimeError> {
+    if path.exists() && fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(RuntimeError::InsecureWriterLease);
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RuntimeError::InsecureWriterLease);
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(RuntimeError::InsecureWriterLease);
+    }
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(RuntimeError::WriterAlreadyActive);
+            }
+            return Err(RuntimeError::Io(error));
+        }
+    }
+    Ok(file)
 }
 
 fn verified_book_tick(
@@ -804,6 +862,34 @@ mod tests {
         assert_eq!(runtime.projection().cursor, 1);
         assert_eq!(runtime.projection().hash(), expected_hash);
         assert_eq!(runtime.recent_events().len(), 1);
+    }
+
+    #[test]
+    fn writer_lease_fences_overlapping_process_lifetimes() {
+        let dir = tempdir().unwrap();
+        let runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
+
+        assert!(matches!(
+            PolymarketRuntime::open(config(dir.path())),
+            Err(RuntimeError::WriterAlreadyActive)
+        ));
+
+        drop(runtime);
+        assert!(PolymarketRuntime::open(config(dir.path())).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_lease_rejects_symlink_substitution() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"not-a-lock").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("writer.lock")).unwrap();
+
+        assert!(matches!(
+            PolymarketRuntime::open(config(dir.path())),
+            Err(RuntimeError::InsecureWriterLease)
+        ));
     }
 
     #[test]

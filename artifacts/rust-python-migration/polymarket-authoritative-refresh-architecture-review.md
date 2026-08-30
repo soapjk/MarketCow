@@ -114,3 +114,11 @@ No further restart or WAL repair is permitted until the remediation design cover
    new scope generation only from independently verifiable state;
 4. fault tests for overlapping launchd processes, stale file descriptors, empty checkpoint-anchor
    segments, and crash during writer handoff.
+
+The first remediation layer is now implemented locally: every `PolymarketRuntime` owns a private
+`writer.lock` descriptor and acquires non-blocking `flock(LOCK_EX)` before WAL verification/open.
+Candidate generations acquire a separate lease for their isolated root. A second runtime for the
+same generation fails with `WriterAlreadyActive`; symlink or non-private lease substitution fails
+closed. Dropping the old runtime explicitly releases the lease. Runtime tests cover overlap,
+release/reacquire, and symlink substitution. This prevents future chain corruption but deliberately
+does not bless or repair generation 17; its non-destructive recovery design remains pending.
