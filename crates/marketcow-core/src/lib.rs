@@ -41,6 +41,14 @@ impl Price {
         }
         Ok(tick)
     }
+
+    pub fn is_zero(&self) -> bool {
+        self.0.is_zero()
+    }
+
+    pub fn is_one(&self) -> bool {
+        self.0 == Decimal::ONE
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +341,10 @@ pub enum EventKind {
         best_bid: Option<Price>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         best_ask: Option<Price>,
+        /// Distinguishes a legacy frame with no venue BBO from a frame where the venue explicitly
+        /// reported an empty side using its `bid=0` / `ask=1` sentinel values.
+        #[serde(default)]
+        bbo_observed: bool,
     },
     BestBidAsk {
         token_id: String,
@@ -906,7 +918,15 @@ impl<L: DurableLog> SingleWriter<L> {
         next.published_at = Utc::now();
         let mut applied = true;
         let mut rejected = None;
-        if event.source.missing || event.source.delayed {
+        let delayed_atomic_delta_superseded_by_book = event.source.delayed
+            && matches!(event.kind, EventKind::AtomicDelta { .. })
+            && next
+                .books
+                .get(event.kind.token_id())
+                .and_then(|book| book.source_observed_at)
+                .is_some_and(|book_at| event.source_observed_at <= book_at);
+        if event.source.missing || event.source.delayed && !delayed_atomic_delta_superseded_by_book
+        {
             next.unresolved_gaps.insert(event.kind.token_id().into());
             applied = false;
             rejected = Some(if event.source.missing {
@@ -914,6 +934,10 @@ impl<L: DurableLog> SingleWriter<L> {
             } else {
                 "source_data_delayed".into()
             });
+        } else if delayed_atomic_delta_superseded_by_book {
+            // The delayed frame is older than an already applied authoritative full book. Keep
+            // its durable cursor/evidence, but do not mutate the recovered projection or reopen
+            // the gap. The public API exposes this as an explicit no-op delta.
         } else {
             match &event.kind {
                 EventKind::CatalogSnapshot {
@@ -1121,6 +1145,7 @@ impl<L: DurableLog> SingleWriter<L> {
                     changes,
                     best_bid,
                     best_ask,
+                    bbo_observed,
                 } => {
                     if changes.is_empty()
                         || next.unresolved_gaps.contains(token_id)
@@ -1148,24 +1173,29 @@ impl<L: DurableLog> SingleWriter<L> {
                                 .as_ref()
                                 .zip(best_ask.as_ref())
                                 .is_some_and(|(bid, ask)| bid >= ask);
-                            if let Some(expected) = best_bid.as_ref() {
-                                // A venue BBO proves that any locally retained bid above it is
-                                // stale even when the incremental frame omitted that deletion.
-                                book.bids.retain(|price, _| price <= expected);
-                            }
-                            if let Some(expected) = best_ask.as_ref() {
-                                // Likewise, asks below the venue BBO cannot remain in the atomic
-                                // post-frame projection.
-                                book.asks.retain(|price, _| price >= expected);
+                            if *bbo_observed {
+                                if let Some(expected) = best_bid.as_ref() {
+                                    // A venue BBO proves that any locally retained bid above it is
+                                    // stale even when the incremental frame omitted that deletion.
+                                    book.bids.retain(|price, _| price <= expected);
+                                } else {
+                                    // Polymarket reports an empty bid side as `best_bid=0`.
+                                    book.bids.clear();
+                                }
+                                if let Some(expected) = best_ask.as_ref() {
+                                    // Likewise, asks below the venue BBO cannot remain in the atomic
+                                    // post-frame projection.
+                                    book.asks.retain(|price, _| price >= expected);
+                                } else {
+                                    // Polymarket reports an empty ask side as `best_ask=1`.
+                                    book.asks.clear();
+                                }
                             }
                             let projected_bid = book.bids.last_key_value().map(|(price, _)| price);
                             let projected_ask = book.asks.first_key_value().map(|(price, _)| price);
-                            let source_quote_mismatch = best_bid
-                                .as_ref()
-                                .is_some_and(|expected| projected_bid != Some(expected))
-                                || best_ask
-                                    .as_ref()
-                                    .is_some_and(|expected| projected_ask != Some(expected));
+                            let source_quote_mismatch = *bbo_observed
+                                && (projected_bid != best_bid.as_ref()
+                                    || projected_ask != best_ask.as_ref());
                             if invalid_source_quote || source_quote_mismatch {
                                 next.unresolved_gaps.insert(token_id.clone());
                                 applied = false;

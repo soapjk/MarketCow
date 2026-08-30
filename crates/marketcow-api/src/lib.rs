@@ -324,6 +324,17 @@ pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, Re
             }),
             "delta",
         ),
+        EventKind::AtomicDelta { token_id, .. }
+            if record.applied && record.event.source.delayed =>
+        {
+            (
+                serde_json::json!({
+                    "event_type":"atomic_delta", "token_id":token_id, "changes":[],
+                    "source_event_type":"stale_delayed_atomic_delta"
+                }),
+                "delta",
+            )
+        }
         EventKind::AtomicDelta {
             token_id, changes, ..
         } => (
@@ -550,6 +561,33 @@ mod tests {
             hex::encode(Sha256::digest(
                 serde_json::to_vec(&contract.canonical_payload).unwrap()
             ))
+        );
+    }
+
+    #[test]
+    fn superseded_delayed_atomic_delta_is_exposed_as_an_explicit_noop() {
+        let mut event = event(
+            2,
+            EventKind::AtomicDelta {
+                token_id: "yes".into(),
+                changes: vec![],
+                best_bid: None,
+                best_ask: None,
+                bbo_observed: false,
+            },
+        );
+        event.source.delayed = true;
+        let contract = event_contract(&PersistedEvent {
+            event,
+            applied: true,
+            fail_closed_reason: None,
+        })
+        .unwrap();
+        assert_eq!(contract.event_type, "delta");
+        assert_eq!(contract.canonical_payload["changes"], serde_json::json!([]));
+        assert_eq!(
+            contract.canonical_payload["source_event_type"],
+            "stale_delayed_atomic_delta"
         );
     }
 

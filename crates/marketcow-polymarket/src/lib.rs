@@ -524,6 +524,7 @@ struct AtomicPriceChanges {
     changes: Vec<SideLevels>,
     best_bid: Option<Price>,
     best_ask: Option<Price>,
+    bbo_observed: bool,
 }
 
 pub fn normalize_frame(
@@ -701,8 +702,16 @@ pub fn normalize_frame_with_book_tick(
                     value_text(item.get("size")).ok_or(NormalizeError::MissingField("size"))?;
                 let level =
                     Level::new(&price, &size).map_err(|_| NormalizeError::InvalidDecimal)?;
-                let best_bid = optional_price(item.get("best_bid"))?;
-                let best_ask = optional_price(item.get("best_ask"))?;
+                let best_bid_present = item.contains_key("best_bid");
+                let best_ask_present = item.contains_key("best_ask");
+                if best_bid_present != best_ask_present {
+                    return Err(NormalizeError::MissingField("best_bid/best_ask"));
+                }
+                let bbo_observed = best_bid_present;
+                let best_bid =
+                    optional_price(item.get("best_bid"))?.filter(|price| !price.is_zero());
+                let best_ask =
+                    optional_price(item.get("best_ask"))?.filter(|price| !price.is_one());
                 if best_bid
                     .as_ref()
                     .zip(best_ask.as_ref())
@@ -716,8 +725,12 @@ pub fn normalize_frame_with_book_tick(
                         changes: Vec::new(),
                         best_bid: best_bid.clone(),
                         best_ask: best_ask.clone(),
+                        bbo_observed,
                     });
-                if entry.best_bid != best_bid || entry.best_ask != best_ask {
+                if entry.best_bid != best_bid
+                    || entry.best_ask != best_ask
+                    || entry.bbo_observed != bbo_observed
+                {
                     return Err(NormalizeError::InvalidLevels);
                 }
                 entry.changes.push(SideLevels {
@@ -742,6 +755,7 @@ pub fn normalize_frame_with_book_tick(
                             changes: atomic.changes,
                             best_bid: atomic.best_bid,
                             best_ask: atomic.best_ask,
+                            bbo_observed: atomic.bbo_observed,
                         },
                     ))
                 })
@@ -1081,6 +1095,7 @@ mod tests {
         let EventKind::AtomicDelta {
             ref best_bid,
             ref best_ask,
+            bbo_observed,
             ..
         } = event.kind
         else {
@@ -1088,6 +1103,7 @@ mod tests {
         };
         assert_eq!(best_bid.as_ref().unwrap().0.to_string(), "0.38");
         assert_eq!(best_ask.as_ref().unwrap().0.to_string(), "0.39");
+        assert!(bbo_observed);
 
         let outcome = writer.apply(event).unwrap();
         assert!(outcome.persisted.applied);
@@ -1095,6 +1111,46 @@ mod tests {
         assert_eq!(book.bids.last_key_value().unwrap().0.0.to_string(), "0.38");
         assert_eq!(book.asks.first_key_value().unwrap().0.0.to_string(), "0.39");
         assert!(!outcome.projection.unresolved_gaps.contains("yes-1"));
+    }
+
+    #[test]
+    fn atomic_price_change_treats_zero_and_one_bbo_as_empty_side_sentinels() {
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        writer.apply(snapshot(1)).unwrap();
+        let event = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"price_change", "timestamp":"2026-08-03T04:00:01Z",
+                "price_changes":[
+                    {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"0",
+                     "best_bid":"0","best_ask":"1"},
+                    {"asset_id":"yes-1","side":"SELL","price":"0.42","size":"0",
+                     "best_bid":"0","best_ask":"1"}
+                ]
+            }),
+            at(),
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        let EventKind::AtomicDelta {
+            ref best_bid,
+            ref best_ask,
+            bbo_observed,
+            ..
+        } = event.kind
+        else {
+            panic!("expected atomic delta")
+        };
+        assert!(bbo_observed);
+        assert!(best_bid.is_none());
+        assert!(best_ask.is_none());
+
+        let outcome = writer.apply(event).unwrap();
+        assert!(outcome.persisted.applied);
+        assert!(outcome.projection.books["yes-1"].bids.is_empty());
+        assert!(outcome.projection.books["yes-1"].asks.is_empty());
+        assert!(outcome.projection.ready);
     }
 
     #[test]
@@ -1110,6 +1166,7 @@ mod tests {
             EventKind::AtomicDelta {
                 best_bid: None,
                 best_ask: None,
+                bbo_observed: false,
                 ..
             }
         ));
@@ -1504,6 +1561,45 @@ mod tests {
         assert_eq!(outcome.projection.persisted_cursor, 2);
         assert!(!outcome.projection.ready);
         assert!(outcome.projection.unresolved_gaps.contains("yes-1"));
+    }
+
+    #[test]
+    fn delayed_atomic_delta_older_than_recovery_book_is_an_auditable_noop() {
+        let mut strict = config();
+        strict.maximum_source_delay_ms = 1_000;
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        writer.apply(snapshot(1)).unwrap();
+        let normalized = normalize_frame(
+            &strict,
+            serde_json::json!({
+                "event_type":"price_change", "timestamp":"2026-08-03T03:59:59Z",
+                "price_changes":[
+                    {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"0",
+                     "best_bid":"0.40","best_ask":"0.42"}
+                ]
+            }),
+            at(),
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(normalized.source.delayed);
+
+        let outcome = writer.apply(normalized).unwrap();
+        assert!(outcome.persisted.applied);
+        assert_eq!(outcome.persisted.fail_closed_reason, None);
+        assert_eq!(
+            outcome.projection.books["yes-1"]
+                .bids
+                .last_key_value()
+                .unwrap()
+                .0
+                .0
+                .to_string(),
+            "0.4"
+        );
+        assert!(outcome.projection.ready);
+        assert!(!outcome.projection.unresolved_gaps.contains("yes-1"));
     }
 
     #[test]
