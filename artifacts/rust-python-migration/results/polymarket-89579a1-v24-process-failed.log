@@ -1,0 +1,6 @@
+{"timestamp":"2026-08-30T06:49:15.618119Z","level":"INFO","fields":{"message":"marketcowd_ready","bind":"127.0.0.1:18872","shadow":true},"target":"marketcow"}
+{"timestamp":"2026-08-30T06:54:17.426684Z","level":"INFO","fields":{"message":"polymarket_authoritative_books_refreshed","refreshed_books":200,"interval_ms":"300000"},"target":"marketcow"}
+{"timestamp":"2026-08-30T06:54:17.767314Z","level":"WARN","fields":{"message":"polymarket_live_owner_failed_closed","error":"polymarket_projection_recovery_required"},"target":"marketcow"}
+{"timestamp":"2026-08-30T06:54:18.799139Z","level":"WARN","fields":{"message":"polymarket_transport_retrying_same_scope","scope_id":"cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34","retry_delay_ms":"1000"},"target":"marketcow"}
+{"timestamp":"2026-08-30T06:59:05.429503Z","level":"WARN","fields":{"message":"shutdown_draining"},"target":"marketcow"}
+{"timestamp":"2026-08-30T06:59:06.054088Z","level":"INFO","fields":{"message":"marketcowd_stopped"},"target":"marketcow"}
