@@ -1,0 +1,1 @@
+{"elapsed_seconds": 1800.1791040419776, "events": 131450, "failures": 8, "output": "/private/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/polymarket-a904e13-streamfix-stability-30m.json", "passed": false, "resync_reasons": {"projection_unready_or_stale": 2, "upstream_projection_gap": 1}, "universe_changes": 0}
