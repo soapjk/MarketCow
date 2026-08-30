@@ -49,7 +49,7 @@ const STREAM_CHANNEL_CAPACITY: usize = 16_384;
 // A 200-token scope may receive a full-book burst plus incremental traffic during bootstrap. The
 // transport awaits this bounded queue, applying TCP backpressure without dropping or reconnecting
 // merely because durable storage is briefly slower than the venue.
-const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 4_096;
+const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 16_384;
 const POLYMARKET_RECENT_EVENT_CAPACITY: usize = 100_000;
 const POLYMARKET_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const POLYMARKET_TRANSPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -3353,6 +3353,14 @@ async fn apply_polymarket_transport_frames(
     for outcome in &published {
         let _ = state.stream.send(outcome.persisted.clone());
     }
+    if published
+        .iter()
+        .any(|outcome| !outcome.persisted.applied || outcome.persisted.fail_closed_reason.is_some())
+    {
+        // A durable projection rejection cannot heal through further deltas. Force a controlled
+        // reconnect so the venue supplies authoritative full books for the pinned token set.
+        bail!("polymarket_projection_recovery_required");
+    }
     if let Some(error) = failure {
         return Err(error.into());
     }
@@ -3405,9 +3413,15 @@ async fn wait_for_polymarket_retry_or_scope_recovery(
 }
 
 async fn checkpoint_polymarket_runtime(state: &AppState) -> Result<()> {
-    let mut runtime = state.runtime.lock().await;
-    runtime.checkpoint()?;
-    state.projection.store(runtime.projection());
+    let runtime = state.runtime.clone();
+    let projection = tokio::task::spawn_blocking(move || {
+        let mut runtime = runtime.blocking_lock();
+        runtime.checkpoint()?;
+        Ok::<_, marketcow_runtime::RuntimeError>(runtime.projection())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("polymarket checkpoint task failed: {error}"))??;
+    state.projection.store(projection);
     Ok(())
 }
 

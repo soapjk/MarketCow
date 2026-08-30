@@ -520,6 +520,12 @@ struct FrameContext {
     observed_at: DateTime<Utc>,
 }
 
+struct AtomicPriceChanges {
+    changes: Vec<SideLevels>,
+    best_bid: Option<Price>,
+    best_ask: Option<Price>,
+}
+
 pub fn normalize_frame(
     config: &NormalizerConfig,
     raw_payload: Value,
@@ -674,7 +680,7 @@ pub fn normalize_frame_with_book_tick(
             if changes.is_empty() {
                 return Err(NormalizeError::InvalidLevels);
             }
-            let mut by_token: BTreeMap<String, Vec<SideLevels>> = BTreeMap::new();
+            let mut by_token: BTreeMap<String, AtomicPriceChanges> = BTreeMap::new();
             for change in changes {
                 let item = change.as_object().ok_or(NormalizeError::InvalidLevels)?;
                 let token_id = string_alias(item, &["asset_id", "token_id"])
@@ -695,7 +701,26 @@ pub fn normalize_frame_with_book_tick(
                     value_text(item.get("size")).ok_or(NormalizeError::MissingField("size"))?;
                 let level =
                     Level::new(&price, &size).map_err(|_| NormalizeError::InvalidDecimal)?;
-                by_token.entry(token_id).or_default().push(SideLevels {
+                let best_bid = optional_price(item.get("best_bid"))?;
+                let best_ask = optional_price(item.get("best_ask"))?;
+                if best_bid
+                    .as_ref()
+                    .zip(best_ask.as_ref())
+                    .is_some_and(|(bid, ask)| bid >= ask)
+                {
+                    return Err(NormalizeError::InvalidLevels);
+                }
+                let entry = by_token
+                    .entry(token_id)
+                    .or_insert_with(|| AtomicPriceChanges {
+                        changes: Vec::new(),
+                        best_bid: best_bid.clone(),
+                        best_ask: best_ask.clone(),
+                    });
+                if entry.best_bid != best_bid || entry.best_ask != best_ask {
+                    return Err(NormalizeError::InvalidLevels);
+                }
+                entry.changes.push(SideLevels {
                     side,
                     levels: vec![level],
                 });
@@ -703,7 +728,7 @@ pub fn normalize_frame_with_book_tick(
             by_token
                 .into_iter()
                 .enumerate()
-                .map(|(offset, (token_id, changes))| {
+                .map(|(offset, (token_id, atomic))| {
                     let cursor = first_cursor
                         .checked_add(offset as u64)
                         .ok_or(NormalizeError::InvalidConfig)?;
@@ -714,7 +739,9 @@ pub fn normalize_frame_with_book_tick(
                         &token_id,
                         EventKind::AtomicDelta {
                             token_id: token_id.clone(),
-                            changes,
+                            changes: atomic.changes,
+                            best_bid: atomic.best_bid,
+                            best_ask: atomic.best_ask,
                         },
                     ))
                 })
@@ -1035,6 +1062,57 @@ mod tests {
         let book = &outcome.projection.books["yes-1"];
         assert_eq!(book.bids.last_key_value().unwrap().0.0.to_string(), "0.43");
         assert_eq!(book.asks.first_key_value().unwrap().0.0.to_string(), "0.44");
+    }
+
+    #[test]
+    fn atomic_price_change_uses_venue_bbo_to_remove_stale_crossing_levels() {
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        writer.apply(snapshot(1)).unwrap();
+        let raw = serde_json::json!({
+            "event_type":"price_change", "timestamp":"2026-08-03T04:00:01Z",
+            "price_changes":[
+                {"asset_id":"yes-1","side":"SELL","price":"0.39","size":"2",
+                 "best_bid":"0.38","best_ask":"0.39"},
+                {"asset_id":"yes-1","side":"BUY","price":"0.38","size":"1",
+                 "best_bid":"0.38","best_ask":"0.39"}
+            ]
+        });
+        let event = normalize_frame(&config(), raw, at(), 2).unwrap().remove(0);
+        let EventKind::AtomicDelta {
+            ref best_bid,
+            ref best_ask,
+            ..
+        } = event.kind
+        else {
+            panic!("expected atomic delta")
+        };
+        assert_eq!(best_bid.as_ref().unwrap().0.to_string(), "0.38");
+        assert_eq!(best_ask.as_ref().unwrap().0.to_string(), "0.39");
+
+        let outcome = writer.apply(event).unwrap();
+        assert!(outcome.persisted.applied);
+        let book = &outcome.projection.books["yes-1"];
+        assert_eq!(book.bids.last_key_value().unwrap().0.0.to_string(), "0.38");
+        assert_eq!(book.asks.first_key_value().unwrap().0.0.to_string(), "0.39");
+        assert!(!outcome.projection.unresolved_gaps.contains("yes-1"));
+    }
+
+    #[test]
+    fn legacy_atomic_delta_without_bbo_remains_replay_compatible() {
+        let kind: EventKind = serde_json::from_value(serde_json::json!({
+            "event_type":"atomic_delta",
+            "token_id":"yes-1",
+            "changes":[{"side":"bid","levels":[{"price":"0.40","quantity":"1"}]}]
+        }))
+        .unwrap();
+        assert!(matches!(
+            kind,
+            EventKind::AtomicDelta {
+                best_bid: None,
+                best_ask: None,
+                ..
+            }
+        ));
     }
 
     #[test]

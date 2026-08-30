@@ -324,6 +324,15 @@ pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, Re
             }),
             "delta",
         ),
+        EventKind::AtomicDelta {
+            token_id, changes, ..
+        } => (
+            serde_json::json!({
+                "event_type":"atomic_delta", "token_id":token_id,
+                "changes":changes, "source_event_type":"atomic_delta"
+            }),
+            "delta",
+        ),
         kind => (
             serde_json::to_value(kind).map_err(|_| ReadApiError::Serialization)?,
             match kind {
@@ -332,10 +341,10 @@ pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, Re
                 EventKind::MarketResolved { .. } if record.applied => "market_terminal",
                 EventKind::MarketResolved { .. } => "market_resolved",
                 EventKind::FullBook { .. } => "full_book",
-                EventKind::AtomicDelta { .. } => "delta",
                 EventKind::TickSizeChange { .. } => "tick_size_change",
                 EventKind::SourceGap { .. } => "source_gap",
                 EventKind::Delta { .. }
+                | EventKind::AtomicDelta { .. }
                 | EventKind::BestBidAsk { .. }
                 | EventKind::LastTradePrice { .. } => unreachable!(),
             },

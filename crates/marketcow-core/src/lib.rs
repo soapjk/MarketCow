@@ -326,6 +326,13 @@ pub enum EventKind {
     AtomicDelta {
         token_id: String,
         changes: Vec<SideLevels>,
+        /// Venue-reported top of book for the same atomic price-change boundary. These fields are
+        /// internal recovery evidence: the public stream contract deliberately continues to
+        /// expose only `changes`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        best_bid: Option<Price>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        best_ask: Option<Price>,
     },
     BestBidAsk {
         token_id: String,
@@ -1109,7 +1116,12 @@ impl<L: DurableLog> SingleWriter<L> {
                         }
                     }
                 }
-                EventKind::AtomicDelta { token_id, changes } => {
+                EventKind::AtomicDelta {
+                    token_id,
+                    changes,
+                    best_bid,
+                    best_ask,
+                } => {
                     if changes.is_empty()
                         || next.unresolved_gaps.contains(token_id)
                         || !next.books.contains_key(token_id)
@@ -1132,7 +1144,33 @@ impl<L: DurableLog> SingleWriter<L> {
                             book.apply_batch(changes, event.source_observed_at);
                         }
                         if applied {
-                            if book.crossed_or_locked() {
+                            let invalid_source_quote = best_bid
+                                .as_ref()
+                                .zip(best_ask.as_ref())
+                                .is_some_and(|(bid, ask)| bid >= ask);
+                            if let Some(expected) = best_bid.as_ref() {
+                                // A venue BBO proves that any locally retained bid above it is
+                                // stale even when the incremental frame omitted that deletion.
+                                book.bids.retain(|price, _| price <= expected);
+                            }
+                            if let Some(expected) = best_ask.as_ref() {
+                                // Likewise, asks below the venue BBO cannot remain in the atomic
+                                // post-frame projection.
+                                book.asks.retain(|price, _| price >= expected);
+                            }
+                            let projected_bid = book.bids.last_key_value().map(|(price, _)| price);
+                            let projected_ask = book.asks.first_key_value().map(|(price, _)| price);
+                            let source_quote_mismatch = best_bid
+                                .as_ref()
+                                .is_some_and(|expected| projected_bid != Some(expected))
+                                || best_ask
+                                    .as_ref()
+                                    .is_some_and(|expected| projected_ask != Some(expected));
+                            if invalid_source_quote || source_quote_mismatch {
+                                next.unresolved_gaps.insert(token_id.clone());
+                                applied = false;
+                                rejected = Some("best_bid_ask_source_mismatch".into());
+                            } else if book.crossed_or_locked() {
                                 next.unresolved_gaps.insert(token_id.clone());
                                 applied = false;
                                 rejected = Some("crossed_or_locked_atomic_delta".into());
