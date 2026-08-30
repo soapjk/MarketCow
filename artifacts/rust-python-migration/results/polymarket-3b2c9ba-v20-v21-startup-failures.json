@@ -1,0 +1,24 @@
+{
+  "schema_version": "marketcow.polymarket.startup-failure-evidence.v1",
+  "preserved_at": "2026-08-30T05:35:00Z",
+  "real_order_submission_enabled": false,
+  "failures": [
+    {
+      "label": "com.marketcow.rust-polymarket-recovery-35f534d-shadow-v20",
+      "log": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-recovery-35f534d-v20-18872.log",
+      "log_sha256": "fa861f5f3de57f16c0498992629b596aa4881d4c14705827ec94c1e3a266ca0b",
+      "observed_failures": [
+        "initial legacy scope rejected expired market 2491448",
+        "additive bbo_observed field changed old WAL canonical serialization and was rejected as corrupt WAL"
+      ],
+      "remediation": "Use active generation-16 registry scope and version new recovery semantics without changing the persisted EventKind shape."
+    },
+    {
+      "label": "com.marketcow.rust-polymarket-recovery-3b2c9ba-shadow-v21",
+      "log": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-recovery-3b2c9ba-v21-18872.log",
+      "log_sha256": "641d932d73abd3f26a0cca7c9fc1881e96f5888721669605f20915a10b321a75",
+      "observed_failure": "MARKETCOW_BINARY_COMMIT did not equal git rev-parse HEAD; the process was intentionally stopped and never accepted as evidence.",
+      "remediation": "v22 uses exact commit 3b2c9ba2841f051f688d10d383a2a2a337b7afda."
+    }
+  ]
+}

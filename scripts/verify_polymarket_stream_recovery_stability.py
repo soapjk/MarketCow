@@ -219,7 +219,11 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
                             atomic_write(arguments.output, report)
                         try:
                             frame = json.loads(await asyncio.wait_for(socket.recv(), 5))
-                        except TimeoutError:
+                        # Python 3.9 raises asyncio.TimeoutError here (it is only an alias of the
+                        # built-in TimeoutError on newer runtimes). A quiet five-second market
+                        # interval is not a stream failure; keep the same verified connection and
+                        # continue sampling its atomic boundary.
+                        except asyncio.TimeoutError:
                             continue
                         frame_type = frame.get("type")
                         if frame_type == "event":
