@@ -1,0 +1,49 @@
+{
+  "schema_version": "marketcow.polymarket.restart-gate.v1",
+  "observed_at": "2026-08-30T10:55:41Z",
+  "verdict": "failed",
+  "candidate": {
+    "commit": "160875184017723067a229dbb888351ea3a8c4d4",
+    "binary_sha256": "6656ca62b09fdc1f1da8cdf976d7cbe8ae86f0872db47c449208e1bbcd20339b",
+    "launchd_label": "com.marketcow.rust-polymarket-validation-1608751-shadow-v26",
+    "initial_pid": 86951,
+    "runs_before_bootout": 2,
+    "listen_18872": false,
+    "startup_error": "corrupt WAL"
+  },
+  "rollback": {
+    "commit": "a904e1312aeffb3b3cc9770a65c1a4f6da20762a",
+    "launchd_label": "com.marketcow.rust-polymarket-refresh-a904e13-shadow-v25",
+    "runs_before_bootout": 12,
+    "listen_18872": false,
+    "startup_error": "corrupt WAL",
+    "final_state": "booted_out_fail_closed"
+  },
+  "checkpoint": {
+    "generation": 17,
+    "cursor": 2586976,
+    "projection_sha256": "49d900faab89bad98da1173c416eda069794ab01b30be388660942625262c55a",
+    "wal_anchor_first_cursor": 2586977,
+    "wal_anchor_header_sha256": "27afa9ce190ebe842350f8c87344f2d925eb7c9e55a2c46a83de3c8d0dfdf997"
+  },
+  "first_verified_chain_failure": {
+    "predecessor_first_cursor": 1778832,
+    "predecessor_current_sha256": "d40b17ea715e28b31749a101a174af48edb55242dc720b4182793a25dab67ecf",
+    "successor_first_cursor": 1779432,
+    "successor_declared_previous_sha256": "7c7e9fc2fbc782155cfe156479a4dc114f080d9dd7db6432ce19f9febd075c00",
+    "successor_checkpoint_cursor": 1779431,
+    "successor_checkpoint_sha256": "9aac3ef9a8afb6fb67e381f2d0aa4052b55e525fd5dd4fdb748b60549f1bd6b6",
+    "interpretation": "the predecessor changed after its hash was committed into the successor header"
+  },
+  "safety": {
+    "authoritative_wal_deleted_or_modified": false,
+    "checkpoint_deleted_or_modified": false,
+    "real_order_submission_enabled": false,
+    "tradude_managed_lifecycle": false,
+    "overall_migration_complete": false
+  },
+  "process_log": {
+    "path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-validation-1608751-v26-18872.log",
+    "sha256": "7463cfa528134c33ae5523c66d1ac16ebc4efbdb67e5538aea6b2bb6b18675bd"
+  }
+}

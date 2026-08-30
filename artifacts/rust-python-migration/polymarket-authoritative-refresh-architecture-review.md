@@ -86,3 +86,31 @@ Local verification at this revision:
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
 - Deterministic runtime tests prove exact validation and mismatch validation are non-mutating and
   that two WS deltas around REST validation retain contiguous WS-only cursors.
+
+## Restart gate blocker discovered after implementation
+
+The `1608751` release candidate did not reach LISTEN on 18872. Both the candidate and the exact
+`a904e13` rollback binary rejected retained generation 17 with `corrupt WAL`; both restart loops were
+booted out and the service remains fail-closed. No WAL or checkpoint was modified or removed.
+
+The first cryptographically reproducible failure is between segments 1778832 and 1779432. The
+successor header commits predecessor SHA-256
+`7c7e9fc2fbc782155cfe156479a4dc114f080d9dd7db6432ce19f9febd075c00`, while the retained
+predecessor now hashes to
+`d40b17ea715e28b31749a101a174af48edb55242dc720b4182793a25dab67ecf`. File timestamps and
+content show that records were appended to the predecessor after the successor anchor existed.
+
+This reveals a second architectural issue: the Rust Polymarket "single writer" is enforced only by
+an in-process mutex. Unlike the newer realtime durability layer, the Polymarket segmented WAL has
+no cross-process advisory lock or writer lease. An overlapping cutover/restart can therefore retain
+two append handles to the same generation and invalidate the immutable segment hash chain.
+
+No further restart or WAL repair is permitted until the remediation design covers:
+
+1. an OS-enforced exclusive writer lease held for the lifetime of a Polymarket runtime;
+2. cutover fencing that proves the old writer exited and released the lease before the new writer
+   opens the generation;
+3. a non-destructive recovery path that preserves corrupt generation 17 as evidence and starts a
+   new scope generation only from independently verifiable state;
+4. fault tests for overlapping launchd processes, stale file descriptors, empty checkpoint-anchor
+   segments, and crash during writer handoff.
