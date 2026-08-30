@@ -1,7 +1,10 @@
 //! Pure read-model builders for the Rust public API. No socket, runtime, or database dependency.
 
 use marketcow_contracts::{EventContractFields, LIVE_SCHEMA_VERSION};
-use marketcow_core::{Book, EventKind, Level, PersistedEvent, Projection};
+use marketcow_core::{
+    Book, EventKind, Level, MarketEventMetadata, MarketProjectionHealth, MarketTransitionKind,
+    PersistedEvent, Projection,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -9,7 +12,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub const MAX_EVENT_PAGE: usize = 1_000;
-pub const STREAM_PROTOCOL_VERSION: &str = "marketcow.market-stream.v2";
+pub const STREAM_PROTOCOL_VERSION: &str = "marketcow.market-stream.v3";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorWatermarks {
@@ -42,6 +45,27 @@ pub struct SnapshotResponse {
     pub catalog_revision: Option<String>,
     pub markets: Vec<marketcow_core::MarketRecord>,
     pub negative_risk_relations: Vec<marketcow_core::NegativeRiskRelation>,
+    pub active_market_ids: Vec<String>,
+    pub quarantined_market_ids: Vec<String>,
+    pub market_health: Vec<MarketProjectionHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketSnapshotResponse {
+    pub schema_version: String,
+    pub scope_id: String,
+    pub projection_generation: u64,
+    pub boundary_cursor: u64,
+    pub catalog_revision: String,
+    pub market_sequence_boundary: u64,
+    pub market: marketcow_core::MarketRecord,
+    pub books: Vec<BookView>,
+    pub negative_risk_relation: Option<marketcow_core::NegativeRiskRelation>,
+    pub health: MarketProjectionHealth,
+    pub atomic: bool,
+    pub scan_universe_membership: bool,
+    pub usable_for_new_opportunities: bool,
+    pub stable_identity_for_position_monitoring: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +91,8 @@ pub struct CheckpointResponse {
 pub struct FullSyncHealth {
     pub ready: bool,
     pub book_count: usize,
+    pub active_market_count: usize,
+    pub quarantined_market_count: usize,
     pub unresolved_gap_count: usize,
     pub fail_closed_reason: Option<String>,
 }
@@ -104,9 +130,10 @@ pub enum StreamPayload {
     Event {
         event: EventContractFields,
     },
-    ResyncRequired {
+    GlobalResyncRequired {
         reason: String,
         retryable: bool,
+        full_sync_required: bool,
     },
     UniverseChanged {
         universe_id: String,
@@ -117,6 +144,42 @@ pub enum StreamPayload {
         switch_boundary_cursor: u64,
         full_sync_required: bool,
     },
+    MarketQuarantined {
+        #[serde(flatten)]
+        control: MarketControlFields,
+    },
+    MarketRecoveryStarted {
+        #[serde(flatten)]
+        control: MarketControlFields,
+    },
+    MarketRecovered {
+        #[serde(flatten)]
+        control: MarketControlFields,
+    },
+    MarketReplaced {
+        #[serde(flatten)]
+        control: MarketControlFields,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketControlFields {
+    pub global_cursor: u64,
+    pub market_id: String,
+    pub market_sequence: u64,
+    pub projection_generation: u64,
+    pub catalog_revision: String,
+    pub event_revision: String,
+    pub old_generation: u64,
+    pub new_generation: u64,
+    pub affected_market_ids: Vec<String>,
+    pub added_market_ids: Vec<String>,
+    pub removed_market_ids: Vec<String>,
+    pub replacement_market_id: Option<String>,
+    pub reason_code: Option<String>,
+    pub recovery_boundary: u64,
+    pub full_sync_required: bool,
+    pub market_snapshot_required: bool,
 }
 
 pub fn stream_universe_changed(
@@ -168,6 +231,56 @@ pub fn stream_event(scope_id: &str, record: &PersistedEvent) -> Result<StreamFra
     })
 }
 
+pub fn stream_record(scope_id: &str, record: &PersistedEvent) -> Result<StreamFrame, ReadApiError> {
+    let Some(market) = record.market.as_ref() else {
+        return stream_event(scope_id, record);
+    };
+    let Some(transition) = market.transition else {
+        return stream_event(scope_id, record);
+    };
+    let control = market_control(record, market);
+    let payload = match transition {
+        MarketTransitionKind::Quarantined => StreamPayload::MarketQuarantined { control },
+        MarketTransitionKind::RecoveryStarted => StreamPayload::MarketRecoveryStarted { control },
+        MarketTransitionKind::Recovered => StreamPayload::MarketRecovered { control },
+    };
+    Ok(StreamFrame {
+        protocol_version: STREAM_PROTOCOL_VERSION.into(),
+        scope_id: scope_id.into(),
+        cursor: record.event.cursor,
+        payload,
+    })
+}
+
+fn market_control(record: &PersistedEvent, market: &MarketEventMetadata) -> MarketControlFields {
+    let quarantined = market.transition == Some(MarketTransitionKind::Quarantined);
+    let recovered = market.transition == Some(MarketTransitionKind::Recovered);
+    MarketControlFields {
+        global_cursor: record.event.cursor,
+        market_id: market.market_id.clone(),
+        market_sequence: market.market_sequence,
+        projection_generation: market.projection_generation,
+        catalog_revision: market.catalog_revision.clone(),
+        event_revision: market.event_revision.clone(),
+        old_generation: market.projection_generation.saturating_sub(1),
+        new_generation: market.projection_generation,
+        affected_market_ids: vec![market.market_id.clone()],
+        added_market_ids: recovered
+            .then(|| market.market_id.clone())
+            .into_iter()
+            .collect(),
+        removed_market_ids: quarantined
+            .then(|| market.market_id.clone())
+            .into_iter()
+            .collect(),
+        replacement_market_id: None,
+        reason_code: market.reason_code.clone(),
+        recovery_boundary: record.event.cursor,
+        full_sync_required: false,
+        market_snapshot_required: recovered,
+    }
+}
+
 pub fn stream_resync_required(
     scope_id: &str,
     cursor: u64,
@@ -177,9 +290,10 @@ pub fn stream_resync_required(
         protocol_version: STREAM_PROTOCOL_VERSION.into(),
         scope_id: scope_id.into(),
         cursor,
-        payload: StreamPayload::ResyncRequired {
+        payload: StreamPayload::GlobalResyncRequired {
             reason: reason.into(),
             retryable: true,
+            full_sync_required: true,
         },
     }
 }
@@ -198,6 +312,9 @@ pub enum ReadApiError {
 }
 
 pub fn snapshot(projection: &Projection) -> SnapshotResponse {
+    let active_market_ids = projection.active_market_ids();
+    let active_token_ids = projection.active_token_ids();
+    let quarantined_market_ids = projection.quarantined_market_ids();
     SnapshotResponse {
         schema_version: LIVE_SCHEMA_VERSION.into(),
         scope_id: projection.scope_id.clone(),
@@ -212,16 +329,88 @@ pub fn snapshot(projection: &Projection) -> SnapshotResponse {
         books: projection
             .books
             .iter()
+            .filter(|(token_id, _)| active_token_ids.contains(*token_id))
             .map(|(token_id, book)| book_view(token_id, book))
             .collect(),
         catalog_revision: projection.catalog_revision.clone(),
-        markets: projection.markets.values().cloned().collect(),
+        markets: projection
+            .markets
+            .iter()
+            .filter(|(market_id, _)| active_market_ids.contains(*market_id))
+            .map(|(_, market)| market.clone())
+            .collect(),
         negative_risk_relations: projection
             .negative_risk_relations
             .values()
+            .filter(|relation| relation.member_market_ids.is_subset(&active_market_ids))
             .cloned()
             .collect(),
+        active_market_ids: active_market_ids.into_iter().collect(),
+        quarantined_market_ids: quarantined_market_ids.into_iter().collect(),
+        market_health: projection.market_health.values().cloned().collect(),
     }
+}
+
+pub fn market_snapshot(projection: &Projection, market_id: &str) -> Option<MarketSnapshotResponse> {
+    let scan_universe_membership = projection.markets.contains_key(market_id);
+    let market = projection
+        .markets
+        .get(market_id)
+        .or_else(|| projection.monitoring_markets.get(market_id))?
+        .clone();
+    let health = projection
+        .market_health
+        .get(market_id)
+        .cloned()
+        .unwrap_or_else(|| MarketProjectionHealth {
+            market_id: market_id.into(),
+            projection_status: marketcow_core::MarketProjectionStatus::Ready,
+            last_market_sequence: 0,
+            gap_from: None,
+            gap_to: None,
+            reason_code: None,
+            retryable: false,
+            retry_after: None,
+            source_observed_at: None,
+            last_recovered_at: None,
+            projection_generation: projection.generation,
+            catalog_revision: projection.catalog_revision.clone(),
+            last_event_revision: None,
+        });
+    let books = market
+        .outcomes
+        .iter()
+        .filter_map(|outcome| {
+            projection
+                .books
+                .get(&outcome.token_id)
+                .or_else(|| projection.monitoring_books.get(&outcome.token_id))
+                .map(|book| book_view(&outcome.token_id, book))
+        })
+        .collect::<Vec<_>>();
+    let negative_risk_relation = market
+        .negative_risk_group
+        .as_ref()
+        .and_then(|group_id| projection.negative_risk_relations.get(group_id))
+        .cloned();
+    let usable_for_new_opportunities =
+        scan_universe_membership && projection.market_is_public(market_id) && books.len() == 2;
+    Some(MarketSnapshotResponse {
+        schema_version: "marketcow.polymarket.market-snapshot.v1".into(),
+        scope_id: projection.scope_id.clone(),
+        projection_generation: projection.generation,
+        boundary_cursor: projection.cursor,
+        catalog_revision: projection.catalog_revision.clone().unwrap_or_default(),
+        market_sequence_boundary: health.last_market_sequence,
+        market,
+        books,
+        negative_risk_relation,
+        health,
+        atomic: true,
+        scan_universe_membership,
+        usable_for_new_opportunities,
+        stable_identity_for_position_monitoring: true,
+    })
 }
 
 fn book_view(token_id: &str, book: &Book) -> BookView {
@@ -371,6 +560,23 @@ pub fn event_contract(record: &PersistedEvent) -> Result<EventContractFields, Re
     Ok(EventContractFields {
         cursor: record.event.cursor,
         event_id: record.event.event_id.clone(),
+        event_revision: record.market.as_ref().map_or_else(
+            || record.event.event_id.clone(),
+            |market| market.event_revision.clone(),
+        ),
+        market_id: record
+            .market
+            .as_ref()
+            .map(|market| market.market_id.clone()),
+        market_sequence: record.market.as_ref().map(|market| market.market_sequence),
+        projection_generation: record
+            .market
+            .as_ref()
+            .map_or(record.event.cursor, |market| market.projection_generation),
+        catalog_revision: record
+            .market
+            .as_ref()
+            .map_or_else(String::new, |market| market.catalog_revision.clone()),
         event_type: public_event_type.into(),
         canonical_payload,
         canonical_payload_sha256: hex::encode(Sha256::digest(canonical_bytes)),
@@ -397,6 +603,9 @@ pub fn checkpoint(projection: &Projection) -> CheckpointResponse {
 /// Builds every recovery view from one immutable projection reference. Callers must perform
 /// freshness validation before invoking this function; no storage or second state read occurs.
 pub fn full_sync(projection: &Projection) -> FullSyncResponse {
+    let active_market_count = projection.active_market_ids().len();
+    let quarantined_market_count = projection.quarantined_market_ids().len();
+    let active_book_count = projection.active_token_ids().len();
     FullSyncResponse {
         schema_version: LIVE_SCHEMA_VERSION.into(),
         scope_id: projection.scope_id.clone(),
@@ -404,7 +613,9 @@ pub fn full_sync(projection: &Projection) -> FullSyncResponse {
         boundary_cursor: projection.cursor,
         health: FullSyncHealth {
             ready: projection.ready,
-            book_count: projection.books.len(),
+            book_count: active_book_count,
+            active_market_count,
+            quarantined_market_count,
             unresolved_gap_count: projection.unresolved_gaps.len(),
             fail_closed_reason: projection.fail_closed_reason.clone(),
         },
@@ -510,6 +721,7 @@ mod tests {
                 event: book(cursor),
                 applied: true,
                 fail_closed_reason: None,
+                market: None,
             })
             .collect();
         let first = events_page(&records, 0, 2).unwrap();
@@ -546,6 +758,7 @@ mod tests {
             ),
             applied: true,
             fail_closed_reason: None,
+            market: None,
         };
         let contract = event_contract(&record).unwrap();
         assert_eq!(contract.event_type, "delta");
@@ -580,6 +793,7 @@ mod tests {
             event,
             applied: true,
             fail_closed_reason: None,
+            market: None,
         })
         .unwrap();
         assert_eq!(contract.event_type, "delta");
@@ -602,6 +816,7 @@ mod tests {
             ),
             applied: false,
             fail_closed_reason: Some("source_gap:disconnect".into()),
+            market: None,
         };
         let response = events_page(&[record], 0, 1).unwrap();
         assert!(!response.events[0].applied);
@@ -637,8 +852,9 @@ mod tests {
         ));
         assert!(matches!(
             stream_resync_required("scope-1", 6, "slow_consumer").payload,
-            StreamPayload::ResyncRequired {
+            StreamPayload::GlobalResyncRequired {
                 retryable: true,
+                full_sync_required: true,
                 ..
             }
         ));
@@ -666,5 +882,110 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn market_fault_and_recovery_are_cursor_advancing_local_controls() {
+        let record = PersistedEvent {
+            event: event(
+                11,
+                EventKind::SourceGap {
+                    token_id: "yes".into(),
+                    reason: "injected".into(),
+                },
+            ),
+            applied: false,
+            fail_closed_reason: None,
+            market: Some(MarketEventMetadata {
+                market_id: "m1".into(),
+                market_sequence: 7,
+                projection_generation: 11,
+                catalog_revision: "catalog-1".into(),
+                event_revision: "e".repeat(64),
+                projection_status: marketcow_core::MarketProjectionStatus::Quarantined,
+                reason_code: Some("source_gap:injected".into()),
+                transition: Some(MarketTransitionKind::Quarantined),
+            }),
+        };
+        let frame = stream_record("scope", &record).unwrap();
+        assert_eq!(frame.cursor, 11);
+        assert!(matches!(
+            frame.payload,
+            StreamPayload::MarketQuarantined {
+                control: MarketControlFields {
+                    global_cursor: 11,
+                    market_sequence: 7,
+                    full_sync_required: false,
+                    market_snapshot_required: false,
+                    ref market_id,
+                    ..
+                }
+            } if market_id == "m1"
+        ));
+    }
+
+    #[test]
+    fn removed_scan_market_remains_queryable_for_position_monitoring_only() {
+        let mut projection = Projection::bootstrap("scope");
+        projection.cursor = 12;
+        projection.persisted_cursor = 12;
+        projection.catalog_revision = Some("catalog-2".into());
+        projection.monitoring_markets.insert(
+            "m1".into(),
+            marketcow_core::MarketRecord {
+                market_id: "m1".into(),
+                condition_id: "condition-1".into(),
+                outcomes: [
+                    marketcow_core::OutcomeToken {
+                        token_id: "m1-yes".into(),
+                        outcome: "Yes".into(),
+                        instrument_id: "POLY.m1.YES".into(),
+                    },
+                    marketcow_core::OutcomeToken {
+                        token_id: "m1-no".into(),
+                        outcome: "No".into(),
+                        instrument_id: "POLY.m1.NO".into(),
+                    },
+                ],
+                negative_risk_group: None,
+                lifecycle_state: marketcow_core::MarketLifecycleState::Active,
+                resolution: None,
+                metadata_revision: "metadata-1".into(),
+                observed_at: Utc::now(),
+                terminal_at: None,
+                instrument_facts: None,
+            },
+        );
+        projection
+            .monitoring_books
+            .insert("m1-yes".into(), Book::default());
+        projection
+            .monitoring_books
+            .insert("m1-no".into(), Book::default());
+        projection.market_health.insert(
+            "m1".into(),
+            MarketProjectionHealth {
+                market_id: "m1".into(),
+                projection_status: marketcow_core::MarketProjectionStatus::TemporarilyUnavailable,
+                last_market_sequence: 9,
+                gap_from: None,
+                gap_to: None,
+                reason_code: Some("removed_from_scan_universe".into()),
+                retryable: false,
+                retry_after: None,
+                source_observed_at: Some(Utc::now()),
+                last_recovered_at: None,
+                projection_generation: 12,
+                catalog_revision: Some("catalog-2".into()),
+                last_event_revision: Some("event-12".into()),
+            },
+        );
+
+        let response = market_snapshot(&projection, "m1").unwrap();
+        assert_eq!(response.market.condition_id, "condition-1");
+        assert_eq!(response.books.len(), 2);
+        assert!(!response.scan_universe_membership);
+        assert!(!response.usable_for_new_opportunities);
+        assert!(response.stable_identity_for_position_monitoring);
     }
 }

@@ -86,7 +86,7 @@ pub struct Book {
 }
 
 impl Book {
-    fn levels_tick_aligned(tick_size: &Price, levels: &[Level]) -> bool {
+    pub fn levels_tick_aligned(tick_size: &Price, levels: &[Level]) -> bool {
         !tick_size.0.is_zero()
             && levels
                 .iter()
@@ -421,6 +421,84 @@ pub struct PersistedEvent {
     pub event: CanonicalEvent,
     pub applied: bool,
     pub fail_closed_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market: Option<MarketEventMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketProjectionStatus {
+    Recovering,
+    Ready,
+    TemporarilyUnavailable,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketTransitionKind {
+    Quarantined,
+    RecoveryStarted,
+    Recovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketEventMetadata {
+    pub market_id: String,
+    pub market_sequence: u64,
+    pub projection_generation: u64,
+    pub catalog_revision: String,
+    pub event_revision: String,
+    pub projection_status: MarketProjectionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<MarketTransitionKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarketProjectionHealth {
+    pub market_id: String,
+    pub projection_status: MarketProjectionStatus,
+    pub last_market_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_from: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_to: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_observed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recovered_at: Option<DateTime<Utc>>,
+    pub projection_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_revision: Option<String>,
+}
+
+impl MarketProjectionHealth {
+    fn recovering(market_id: String, generation: u64, catalog_revision: Option<String>) -> Self {
+        Self {
+            market_id,
+            projection_status: MarketProjectionStatus::Recovering,
+            last_market_sequence: 0,
+            gap_from: None,
+            gap_to: None,
+            reason_code: Some("initial_snapshot_required".into()),
+            retryable: true,
+            retry_after: None,
+            source_observed_at: None,
+            last_recovered_at: None,
+            projection_generation: generation,
+            catalog_revision,
+            last_event_revision: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -446,6 +524,14 @@ pub struct Projection {
     pub condition_to_market: BTreeMap<String, String>,
     #[serde(default)]
     pub negative_risk_relations: BTreeMap<String, NegativeRiskRelation>,
+    #[serde(default)]
+    pub monitoring_markets: BTreeMap<String, MarketRecord>,
+    #[serde(default)]
+    pub monitoring_books: BTreeMap<String, Book>,
+    #[serde(default)]
+    pub market_health: BTreeMap<String, MarketProjectionHealth>,
+    #[serde(default)]
+    pub quarantined_token_ids: BTreeSet<String>,
     pub unresolved_gaps: BTreeSet<String>,
     pub recent_event_ids: VecDeque<String>,
     pub ready: bool,
@@ -465,6 +551,10 @@ impl Projection {
             markets: BTreeMap::new(),
             condition_to_market: BTreeMap::new(),
             negative_risk_relations: BTreeMap::new(),
+            monitoring_markets: BTreeMap::new(),
+            monitoring_books: BTreeMap::new(),
+            market_health: BTreeMap::new(),
+            quarantined_token_ids: BTreeSet::new(),
             unresolved_gaps: BTreeSet::new(),
             recent_event_ids: VecDeque::new(),
             ready: false,
@@ -485,6 +575,10 @@ impl Projection {
             "markets": self.markets,
             "condition_to_market": self.condition_to_market,
             "negative_risk_relations": self.negative_risk_relations,
+            "monitoring_markets": self.monitoring_markets,
+            "monitoring_books": self.monitoring_books,
+            "market_health": self.market_health,
+            "quarantined_token_ids": self.quarantined_token_ids,
             "unresolved_gaps": self.unresolved_gaps,
             "recent_event_ids": self.recent_event_ids,
             "ready": self.ready,
@@ -503,6 +597,7 @@ impl Projection {
                 .markets
                 .values()
                 .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                .filter(|market| self.market_is_public(&market.market_id))
                 .filter_map(|market| {
                     market
                         .instrument_facts
@@ -533,6 +628,7 @@ impl Projection {
                 .markets
                 .values()
                 .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                .filter(|market| self.market_is_public(&market.market_id))
                 .flat_map(|market| market.outcomes.iter())
                 .all(|outcome| {
                     self.books
@@ -540,6 +636,192 @@ impl Projection {
                         .is_some_and(|book| !book.bids.is_empty() && !book.asks.is_empty())
                 })
     }
+
+    pub fn market_id_for_token(&self, token_id: &str) -> Option<&str> {
+        self.markets.values().find_map(|market| {
+            market
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.token_id == token_id)
+                .then_some(market.market_id.as_str())
+        })
+    }
+
+    pub fn market_is_public(&self, market_id: &str) -> bool {
+        self.market_health
+            .get(market_id)
+            .is_none_or(|health| health.projection_status == MarketProjectionStatus::Ready)
+    }
+
+    pub fn active_market_ids(&self) -> BTreeSet<String> {
+        self.markets
+            .values()
+            .filter(|market| {
+                market.lifecycle_state == MarketLifecycleState::Active
+                    && self.market_is_public(&market.market_id)
+            })
+            .map(|market| market.market_id.clone())
+            .collect()
+    }
+
+    pub fn quarantined_market_ids(&self) -> BTreeSet<String> {
+        self.market_health
+            .iter()
+            .filter(|(market_id, health)| {
+                self.markets
+                    .get(*market_id)
+                    .is_some_and(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                    && health.projection_status != MarketProjectionStatus::Ready
+            })
+            .map(|(market_id, _)| market_id.clone())
+            .collect()
+    }
+
+    pub fn active_token_ids(&self) -> BTreeSet<String> {
+        if self.catalog_revision.is_none() {
+            return self.books.keys().cloned().collect();
+        }
+        self.markets
+            .values()
+            .filter(|market| {
+                market.lifecycle_state == MarketLifecycleState::Active
+                    && self.market_is_public(&market.market_id)
+            })
+            .flat_map(|market| {
+                market
+                    .outcomes
+                    .iter()
+                    .map(|outcome| outcome.token_id.clone())
+            })
+            .collect()
+    }
+
+    pub fn token_has_recovery_gap(&self, token_id: &str) -> bool {
+        self.unresolved_gaps.contains(token_id) || self.quarantined_token_ids.contains(token_id)
+    }
+}
+
+fn event_market_id(projection: &Projection, kind: &EventKind) -> Option<String> {
+    match kind {
+        EventKind::CatalogSnapshot { .. } | EventKind::NewMarket { .. } => None,
+        EventKind::MarketResolved { condition_id, .. } => {
+            projection.condition_to_market.get(condition_id).cloned()
+        }
+        EventKind::SourceGap { reason, .. }
+            if matches!(reason.as_str(), "upstream_connection_boundary") =>
+        {
+            // The transport emits one token-shaped record per subscription at a connection
+            // boundary, but the missing interval is connection-wide. Token shape is not proof
+            // of market-local attribution, so this must remain a global fail-closed boundary.
+            None
+        }
+        EventKind::FullBook { token_id, .. }
+        | EventKind::Delta { token_id, .. }
+        | EventKind::AtomicDelta { token_id, .. }
+        | EventKind::BestBidAsk { token_id, .. }
+        | EventKind::LastTradePrice { token_id, .. }
+        | EventKind::TickSizeChange { token_id, .. }
+        | EventKind::SourceGap { token_id, .. } => {
+            projection.market_id_for_token(token_id).map(str::to_owned)
+        }
+    }
+}
+
+fn market_event_is_locally_recoverable(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::FullBook { .. }
+            | EventKind::Delta { .. }
+            | EventKind::AtomicDelta { .. }
+            | EventKind::BestBidAsk { .. }
+            | EventKind::LastTradePrice { .. }
+            | EventKind::SourceGap { .. }
+    )
+}
+
+fn market_books_are_executable(projection: &Projection, market_id: &str) -> bool {
+    let Some(market) = projection.markets.get(market_id) else {
+        return false;
+    };
+    if market.lifecycle_state != MarketLifecycleState::Active {
+        return false;
+    }
+    if let Some(facts) = market.instrument_facts.as_ref()
+        && (facts
+            .fee_schedule
+            .as_ref()
+            .is_some_and(|schedule| !schedule.is_complete())
+            || market.outcomes.iter().any(|outcome| {
+                projection
+                    .books
+                    .get(&outcome.token_id)
+                    .is_none_or(|book| book.tick_size.as_ref() != Some(&facts.price_increment))
+            }))
+    {
+        return false;
+    }
+    if let Some(group_id) = market.negative_risk_group.as_ref()
+        && projection
+            .negative_risk_relations
+            .get(group_id)
+            .is_none_or(|relation| {
+                !relation.complete
+                    || relation.revision.is_empty()
+                    || !relation.member_market_ids.contains(market_id)
+            })
+    {
+        return false;
+    }
+    market.outcomes.iter().all(|outcome| {
+        !projection.quarantined_token_ids.contains(&outcome.token_id)
+            && projection.books.get(&outcome.token_id).is_some_and(|book| {
+                !book.bids.is_empty()
+                    && !book.asks.is_empty()
+                    && book.tick_size.is_some()
+                    && !book.tick_version.is_empty()
+                    && !book.crossed_or_locked()
+            })
+    })
+}
+
+fn quarantine_market(
+    projection: &mut Projection,
+    market_id: &str,
+    sequence: u64,
+    reason: &str,
+    event: &CanonicalEvent,
+) {
+    let token_ids = projection
+        .markets
+        .get(market_id)
+        .map(|market| {
+            market
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.token_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for token_id in token_ids {
+        projection.unresolved_gaps.remove(&token_id);
+        projection.quarantined_token_ids.insert(token_id);
+    }
+    let health = projection
+        .market_health
+        .entry(market_id.to_owned())
+        .or_insert_with(|| {
+            MarketProjectionHealth::recovering(
+                market_id.to_owned(),
+                projection.generation,
+                projection.catalog_revision.clone(),
+            )
+        });
+    health.projection_status = MarketProjectionStatus::Quarantined;
+    health.gap_from.get_or_insert(sequence);
+    health.gap_to = Some(sequence);
+    health.reason_code = Some(reason.to_owned());
+    health.retryable = true;
+    health.retry_after = Some(event.received_at + chrono::Duration::seconds(1));
 }
 
 /// Reconciles the catalog's market-level executable price increment with the two authoritative
@@ -558,6 +840,7 @@ fn reconcile_active_market_instrument_ticks(projection: &mut Projection) -> bool
         .values()
         .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
     {
+        let public_market = projection.market_is_public(&market.market_id);
         let Some(facts) = market.instrument_facts.as_ref() else {
             // Generic catalog users may not publish strategy facts. Exact Rust Polymarket scopes
             // separately require them at configuration and readiness boundaries.
@@ -565,19 +848,23 @@ fn reconcile_active_market_instrument_ticks(projection: &mut Projection) -> bool
         };
         let mut common_tick: Option<Price> = None;
         let mut token_ticks = BTreeMap::new();
+        let mut complete = true;
         for outcome in &market.outcomes {
             let Some(book) = projection.books.get(&outcome.token_id) else {
-                return false;
+                complete = false;
+                break;
             };
             let Some(tick_size) = book.tick_size.as_ref() else {
-                return false;
+                complete = false;
+                break;
             };
             if book.tick_version.is_empty()
                 || common_tick
                     .as_ref()
                     .is_some_and(|expected| expected != tick_size)
             {
-                return false;
+                complete = false;
+                break;
             }
             common_tick.get_or_insert_with(|| tick_size.clone());
             token_ticks.insert(
@@ -588,8 +875,17 @@ fn reconcile_active_market_instrument_ticks(projection: &mut Projection) -> bool
                 }),
             );
         }
+        if !complete {
+            if public_market {
+                return false;
+            }
+            continue;
+        }
         let Some(price_increment) = common_tick else {
-            return false;
+            if public_market {
+                return false;
+            }
+            continue;
         };
         // This revision is independently reproducible from the same immutable projection. It
         // binds every market fact plus both token-level tick revisions without relying on wall
@@ -936,6 +1232,30 @@ impl<L: DurableLog> SingleWriter<L> {
         next.generation += 1;
         next.cursor = event.cursor;
         next.published_at = Utc::now();
+        let event_market_id = event_market_id(&next, &event.kind);
+        if let Some(market_id) = event_market_id.as_ref()
+            && !next.market_health.contains_key(market_id)
+            && market_books_are_executable(&next, market_id)
+        {
+            let mut health = MarketProjectionHealth::recovering(
+                market_id.clone(),
+                next.generation,
+                next.catalog_revision.clone(),
+            );
+            health.projection_status = MarketProjectionStatus::Ready;
+            health.reason_code = None;
+            health.retryable = false;
+            next.market_health.insert(market_id.clone(), health);
+        }
+        let market_sequence = event_market_id.as_ref().map(|market_id| {
+            next.market_health
+                .get(market_id)
+                .map_or(1, |health| health.last_market_sequence.saturating_add(1))
+        });
+        let previous_market_status = event_market_id
+            .as_ref()
+            .and_then(|market_id| next.market_health.get(market_id))
+            .map(|health| health.projection_status);
         let mut applied = true;
         let mut rejected = None;
         let delayed_atomic_delta_superseded_by_book = event.source.delayed
@@ -999,12 +1319,87 @@ impl<L: DurableLog> SingleWriter<L> {
                     } else if let Some((catalog, conditions, relations, active_tokens)) =
                         validated_catalog(&combined, negative_risk_relations)
                     {
+                        // A dynamic-universe replacement removes a market from opportunity
+                        // scanning, but that must not erase the stable identities and last
+                        // authoritative books a position owner needs for settlement monitoring.
+                        // These retained records never participate in public readiness or
+                        // opportunity generation.
+                        let next_catalog_ids = catalog.keys().cloned().collect::<BTreeSet<_>>();
+                        let removed_active_markets = next
+                            .markets
+                            .values()
+                            .filter(|market| {
+                                market.lifecycle_state == MarketLifecycleState::Active
+                                    && !next_catalog_ids.contains(&market.market_id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for market in removed_active_markets {
+                            for outcome in &market.outcomes {
+                                if let Some(book) = next.books.get(&outcome.token_id) {
+                                    next.monitoring_books
+                                        .insert(outcome.token_id.clone(), book.clone());
+                                }
+                            }
+                            let health = next
+                                .market_health
+                                .entry(market.market_id.clone())
+                                .or_insert_with(|| {
+                                    MarketProjectionHealth::recovering(
+                                        market.market_id.clone(),
+                                        next.generation,
+                                        Some(catalog_revision.clone()),
+                                    )
+                                });
+                            health.projection_status =
+                                MarketProjectionStatus::TemporarilyUnavailable;
+                            health.reason_code = Some("removed_from_scan_universe".into());
+                            health.retryable = false;
+                            health.retry_after = None;
+                            health.projection_generation = next.generation;
+                            health.catalog_revision = Some(catalog_revision.clone());
+                            next.monitoring_markets
+                                .insert(market.market_id.clone(), market);
+                        }
+                        // If a retained identity becomes active again, its new catalog facts and
+                        // live books are authoritative. Drop only the stale monitoring copy.
+                        for market in catalog.values() {
+                            if let Some(retained) =
+                                next.monitoring_markets.remove(&market.market_id)
+                            {
+                                for outcome in retained.outcomes {
+                                    next.monitoring_books.remove(&outcome.token_id);
+                                }
+                            }
+                        }
                         next.catalog_revision = Some(catalog_revision.clone());
                         next.markets = catalog;
                         next.condition_to_market = conditions;
                         next.negative_risk_relations = relations;
                         next.books
                             .retain(|token_id, _| active_tokens.contains(token_id));
+                        next.quarantined_token_ids
+                            .retain(|token_id| active_tokens.contains(token_id));
+                        next.market_health.retain(|market_id, _| {
+                            next.markets.get(market_id).is_some_and(|market| {
+                                market.lifecycle_state == MarketLifecycleState::Active
+                            }) || next.monitoring_markets.contains_key(market_id)
+                        });
+                        for market in next
+                            .markets
+                            .values()
+                            .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                        {
+                            next.market_health
+                                .entry(market.market_id.clone())
+                                .or_insert_with(|| {
+                                    MarketProjectionHealth::recovering(
+                                        market.market_id.clone(),
+                                        next.generation,
+                                        next.catalog_revision.clone(),
+                                    )
+                                });
+                        }
                         next.unresolved_gaps.retain(|gap| {
                             !gap.starts_with("catalog:") && !gap.starts_with("negative_risk:")
                         });
@@ -1149,8 +1544,7 @@ impl<L: DurableLog> SingleWriter<L> {
                     side,
                     levels,
                 } => {
-                    if next.unresolved_gaps.contains(token_id) || !next.books.contains_key(token_id)
-                    {
+                    if next.token_has_recovery_gap(token_id) || !next.books.contains_key(token_id) {
                         next.unresolved_gaps.insert(token_id.clone());
                         applied = false;
                         rejected = Some("full_book_recovery_required".into());
@@ -1185,7 +1579,7 @@ impl<L: DurableLog> SingleWriter<L> {
                     best_ask,
                 } => {
                     if changes.is_empty()
-                        || next.unresolved_gaps.contains(token_id)
+                        || next.token_has_recovery_gap(token_id)
                         || !next.books.contains_key(token_id)
                     {
                         next.unresolved_gaps.insert(token_id.clone());
@@ -1259,8 +1653,7 @@ impl<L: DurableLog> SingleWriter<L> {
                     best_bid,
                     best_ask,
                 } => {
-                    if next.unresolved_gaps.contains(token_id) || !next.books.contains_key(token_id)
-                    {
+                    if next.token_has_recovery_gap(token_id) || !next.books.contains_key(token_id) {
                         next.unresolved_gaps.insert(token_id.clone());
                         applied = false;
                         rejected = Some("full_book_recovery_required".into());
@@ -1279,8 +1672,7 @@ impl<L: DurableLog> SingleWriter<L> {
                     }
                 }
                 EventKind::LastTradePrice { token_id, price } => {
-                    if next.unresolved_gaps.contains(token_id) || !next.books.contains_key(token_id)
-                    {
+                    if next.token_has_recovery_gap(token_id) || !next.books.contains_key(token_id) {
                         next.unresolved_gaps.insert(token_id.clone());
                         applied = false;
                         rejected = Some("full_book_recovery_required".into());
@@ -1307,7 +1699,7 @@ impl<L: DurableLog> SingleWriter<L> {
                     tick_version,
                 } => {
                     if tick_version.is_empty()
-                        || next.unresolved_gaps.contains(token_id)
+                        || next.token_has_recovery_gap(token_id)
                         || !next.books.contains_key(token_id)
                     {
                         next.unresolved_gaps.insert(token_id.clone());
@@ -1340,17 +1732,101 @@ impl<L: DurableLog> SingleWriter<L> {
                 }
             }
         }
+        let mut market_transition = None;
+        let mut market_reason_code = None;
+        if let (Some(market_id), Some(sequence), Some(reason)) = (
+            event_market_id.as_deref(),
+            market_sequence,
+            rejected.clone(),
+        ) && market_event_is_locally_recoverable(&event.kind)
+        {
+            quarantine_market(&mut next, market_id, sequence, &reason, &event);
+            market_transition = Some(MarketTransitionKind::Quarantined);
+            market_reason_code = Some(reason);
+            // This is a durably recorded market fault, not a global projection fault. Consumers
+            // receive a market control frame and may continue using independently healthy markets.
+            rejected = None;
+        }
+
+        let instrument_ticks_consistent = reconcile_active_market_instrument_ticks(&mut next);
+        if let (Some(market_id), Some(sequence)) = (event_market_id.as_deref(), market_sequence) {
+            if let EventKind::FullBook { token_id, .. } = &event.kind
+                && applied
+                && rejected.is_none()
+                && market_reason_code.is_none()
+            {
+                next.quarantined_token_ids.remove(token_id);
+                if market_books_are_executable(&next, market_id) {
+                    if previous_market_status != Some(MarketProjectionStatus::Ready) {
+                        market_transition = Some(MarketTransitionKind::Recovered);
+                    }
+                    let generation = next.generation;
+                    let catalog_revision = next.catalog_revision.clone();
+                    let health = next
+                        .market_health
+                        .entry(market_id.to_owned())
+                        .or_insert_with(|| {
+                            MarketProjectionHealth::recovering(
+                                market_id.to_owned(),
+                                generation,
+                                catalog_revision,
+                            )
+                        });
+                    health.projection_status = MarketProjectionStatus::Ready;
+                    health.gap_from = None;
+                    health.gap_to = None;
+                    health.reason_code = None;
+                    health.retryable = false;
+                    health.retry_after = None;
+                    health.last_recovered_at = Some(event.received_at);
+                } else if previous_market_status != Some(MarketProjectionStatus::Ready) {
+                    market_transition = Some(MarketTransitionKind::RecoveryStarted);
+                    market_reason_code = Some("atomic_market_snapshot_incomplete".into());
+                    let generation = next.generation;
+                    let catalog_revision = next.catalog_revision.clone();
+                    let health = next
+                        .market_health
+                        .entry(market_id.to_owned())
+                        .or_insert_with(|| {
+                            MarketProjectionHealth::recovering(
+                                market_id.to_owned(),
+                                generation,
+                                catalog_revision,
+                            )
+                        });
+                    health.projection_status = MarketProjectionStatus::Recovering;
+                    health.reason_code = market_reason_code.clone();
+                }
+            }
+            if market_reason_code.is_none()
+                && rejected.is_none()
+                && previous_market_status == Some(MarketProjectionStatus::Ready)
+                && market_event_is_locally_recoverable(&event.kind)
+                && !market_books_are_executable(&next, market_id)
+            {
+                let reason = "market_book_not_executable";
+                quarantine_market(&mut next, market_id, sequence, reason, &event);
+                market_transition = Some(MarketTransitionKind::Quarantined);
+                market_reason_code = Some(reason.into());
+            }
+        }
+
         let catalog_books_complete = next.catalog_revision.is_none()
             || next
                 .markets
                 .values()
                 .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                .filter(|market| next.market_is_public(&market.market_id))
                 .flat_map(|market| market.outcomes.iter())
                 .all(|outcome| next.books.contains_key(&outcome.token_id));
-        let instrument_ticks_consistent = reconcile_active_market_instrument_ticks(&mut next);
         let active_market_books_two_sided = next.active_market_books_two_sided();
+        let usable_projection = if next.catalog_revision.is_none() {
+            !next.books.is_empty()
+        } else {
+            !next.active_market_ids().is_empty()
+        };
         next.ready = next.unresolved_gaps.is_empty()
-            && !next.books.is_empty()
+            && usable_projection
             && catalog_books_complete
             && instrument_ticks_consistent
             && active_market_books_two_sided;
@@ -1360,12 +1836,54 @@ impl<L: DurableLog> SingleWriter<L> {
                 (!instrument_ticks_consistent).then(|| "instrument_tick_inconsistent".into())
             })
             .or_else(|| (!active_market_books_two_sided).then(|| "one_sided_active_book".into()))
-            .or_else(|| (!next.ready).then(|| "unresolved_gap".into()));
+            .or_else(|| {
+                (!next.ready).then(|| {
+                    if next.unresolved_gaps.is_empty() {
+                        "no_healthy_markets".into()
+                    } else {
+                        "unresolved_gap".into()
+                    }
+                })
+            });
+        let market_metadata =
+            event_market_id
+                .as_ref()
+                .zip(market_sequence)
+                .map(|(market_id, sequence)| {
+                    let generation = next.generation;
+                    let catalog_revision = next.catalog_revision.clone();
+                    let health = next
+                        .market_health
+                        .entry(market_id.clone())
+                        .or_insert_with(|| {
+                            MarketProjectionHealth::recovering(
+                                market_id.clone(),
+                                generation,
+                                catalog_revision.clone(),
+                            )
+                        });
+                    health.last_market_sequence = sequence;
+                    health.source_observed_at = Some(event.source_observed_at);
+                    health.projection_generation = generation;
+                    health.catalog_revision = catalog_revision.clone();
+                    health.last_event_revision = Some(event.event_id.clone());
+                    MarketEventMetadata {
+                        market_id: market_id.clone(),
+                        market_sequence: sequence,
+                        projection_generation: generation,
+                        catalog_revision: catalog_revision.unwrap_or_default(),
+                        event_revision: event.event_id.clone(),
+                        projection_status: health.projection_status,
+                        reason_code: market_reason_code.clone(),
+                        transition: market_transition,
+                    }
+                });
         let event_cursor = event.cursor;
         let persisted = PersistedEvent {
             event,
             applied,
             fail_closed_reason: rejected,
+            market: market_metadata,
         };
         next.persisted_cursor = event_cursor;
         next.recent_event_ids
@@ -1440,6 +1958,8 @@ struct WalPersistedEventV2<'a> {
     event: WalCanonicalEventV2<'a>,
     applied: bool,
     fail_closed_reason: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    market: &'a Option<MarketEventMetadata>,
 }
 
 impl<'a> From<&'a PersistedEvent> for WalPersistedEventV2<'a> {
@@ -1461,6 +1981,7 @@ impl<'a> From<&'a PersistedEvent> for WalPersistedEventV2<'a> {
             },
             applied: persisted.applied,
             fail_closed_reason: &persisted.fail_closed_reason,
+            market: &persisted.market,
         }
     }
 }
@@ -1878,6 +2399,7 @@ impl DurableLog for SegmentedWal {
             event: event.clone(),
             applied: true,
             fail_closed_reason: None,
+            market: None,
         })
     }
 
@@ -1986,6 +2508,7 @@ pub fn replay_after_checkpoint(
         let replayed = writer.apply(persisted.event.clone())?.persisted;
         if replayed.applied != persisted.applied
             || replayed.fail_closed_reason != persisted.fail_closed_reason
+            || persisted.market.is_some() && replayed.market != persisted.market
         {
             return Err(CoreError::ReplayDivergence {
                 cursor: persisted.event.cursor,
@@ -2512,6 +3035,7 @@ mod tests {
             ),
             applied: false,
             fail_closed_reason: Some("fixture".into()),
+            market: None,
         }];
         let mut record = WalBatchRecord {
             batch_version: 1,
@@ -2879,7 +3403,84 @@ mod tests {
     }
 
     #[test]
-    fn active_catalog_book_becoming_one_sided_is_durably_fail_closed() {
+    fn universe_replacement_retains_removed_market_identity_for_position_monitoring() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!()
+            }
+            fn append_outcome(&mut self, _: &PersistedEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog);
+        writer
+            .apply(event(
+                1,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-1".into(),
+                    markets: vec![
+                        market("m1", "condition-1", None),
+                        market("m2", "condition-2", None),
+                    ],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+        for (cursor, token_id) in [(2, "m1-yes"), (3, "m1-no"), (4, "m2-yes"), (5, "m2-no")] {
+            writer
+                .apply(event(
+                    cursor,
+                    EventKind::FullBook {
+                        token_id: token_id.into(),
+                        bids: levels("0.4", "10"),
+                        asks: levels("0.6", "10"),
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v1".into(),
+                    },
+                ))
+                .unwrap();
+        }
+        assert!(writer.projection().ready);
+
+        let replaced = writer
+            .apply(event(
+                6,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-2".into(),
+                    markets: vec![market("m2", "condition-2", None)],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+        assert!(replaced.persisted.applied);
+        assert!(replaced.projection.ready);
+        assert_eq!(
+            replaced.projection.active_market_ids(),
+            BTreeSet::from(["m2".into()])
+        );
+        assert!(!replaced.projection.markets.contains_key("m1"));
+        assert_eq!(
+            replaced.projection.monitoring_markets["m1"].condition_id,
+            "condition-1"
+        );
+        assert!(replaced.projection.monitoring_books.contains_key("m1-yes"));
+        assert!(replaced.projection.monitoring_books.contains_key("m1-no"));
+        assert_eq!(
+            replaced.projection.market_health["m1"].projection_status,
+            MarketProjectionStatus::TemporarilyUnavailable
+        );
+        assert_eq!(
+            replaced.projection.market_health["m1"]
+                .reason_code
+                .as_deref(),
+            Some("removed_from_scan_universe")
+        );
+    }
+
+    #[test]
+    fn active_catalog_book_becoming_one_sided_is_quarantined_until_atomic_market_recovery() {
         struct MemoryLog;
         impl DurableLog for MemoryLog {
             fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
@@ -2932,13 +3533,21 @@ mod tests {
             .unwrap();
         assert!(one_sided.persisted.applied);
         assert!(!one_sided.projection.ready);
-        assert!(!one_sided.projection.active_market_books_two_sided());
+        assert!(one_sided.projection.active_market_books_two_sided());
+        assert_eq!(
+            one_sided.persisted.market.as_ref().unwrap().transition,
+            Some(MarketTransitionKind::Quarantined)
+        );
+        assert_eq!(
+            one_sided.projection.quarantined_market_ids(),
+            BTreeSet::from(["m1".to_owned()])
+        );
         assert_eq!(
             one_sided.projection.fail_closed_reason.as_deref(),
-            Some("one_sided_active_book")
+            Some("no_healthy_markets")
         );
 
-        let recovered = writer
+        let recovery_started = writer
             .apply(event(
                 5,
                 EventKind::FullBook {
@@ -2950,8 +3559,214 @@ mod tests {
                 },
             ))
             .unwrap();
+        assert_eq!(
+            recovery_started
+                .persisted
+                .market
+                .as_ref()
+                .unwrap()
+                .transition,
+            Some(MarketTransitionKind::RecoveryStarted)
+        );
+        let recovered = writer
+            .apply(event(
+                6,
+                EventKind::FullBook {
+                    token_id: "m1-no".into(),
+                    bids: levels("0.4", "10"),
+                    asks: levels("0.6", "10"),
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
+                },
+            ))
+            .unwrap();
         assert!(recovered.projection.ready);
         assert_eq!(recovered.projection.fail_closed_reason, None);
+        assert_eq!(
+            recovered.persisted.market.as_ref().unwrap().transition,
+            Some(MarketTransitionKind::Recovered)
+        );
+    }
+
+    #[test]
+    fn one_market_gap_does_not_stop_an_independent_healthy_market() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!()
+            }
+            fn append_outcome(&mut self, _: &PersistedEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog);
+        writer
+            .apply(event(
+                1,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-1".into(),
+                    markets: vec![
+                        market("m1", "condition-1", None),
+                        market("m2", "condition-2", None),
+                    ],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+        for (cursor, token_id) in [(2, "m1-yes"), (3, "m1-no"), (4, "m2-yes"), (5, "m2-no")] {
+            writer
+                .apply(event(
+                    cursor,
+                    EventKind::FullBook {
+                        token_id: token_id.into(),
+                        bids: levels("0.4", "10"),
+                        asks: levels("0.6", "10"),
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v1".into(),
+                    },
+                ))
+                .unwrap();
+        }
+        assert!(writer.projection().ready);
+
+        let quarantined = writer
+            .apply(event(
+                6,
+                EventKind::SourceGap {
+                    token_id: "m1-yes".into(),
+                    reason: "injected_single_market_loss".into(),
+                },
+            ))
+            .unwrap();
+        assert!(!quarantined.persisted.applied);
+        assert_eq!(quarantined.persisted.fail_closed_reason, None);
+        assert!(quarantined.projection.unresolved_gaps.is_empty());
+        assert!(quarantined.projection.ready);
+        assert_eq!(
+            quarantined.projection.active_market_ids(),
+            BTreeSet::from(["m2".to_owned()])
+        );
+        assert_eq!(
+            quarantined.persisted.market.as_ref().unwrap().transition,
+            Some(MarketTransitionKind::Quarantined)
+        );
+
+        for (cursor, token_id) in [(7, "m1-yes"), (8, "m1-no")] {
+            writer
+                .apply(event(
+                    cursor,
+                    EventKind::FullBook {
+                        token_id: token_id.into(),
+                        bids: levels("0.4", "10"),
+                        asks: levels("0.6", "10"),
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v2".into(),
+                    },
+                ))
+                .unwrap();
+        }
+        let recovered = writer.projection();
+        assert!(recovered.ready);
+        assert_eq!(
+            recovered.active_market_ids(),
+            BTreeSet::from(["m1".to_owned(), "m2".to_owned()])
+        );
+        assert!(recovered.quarantined_market_ids().is_empty());
+    }
+
+    #[test]
+    fn unknown_gap_remains_a_global_fail_closed_boundary() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog);
+        writer
+            .apply(event(
+                1,
+                EventKind::FullBook {
+                    token_id: "known".into(),
+                    bids: levels("0.4", "1"),
+                    asks: levels("0.6", "1"),
+                    tick_size: Price::parse_tick("0.01").unwrap(),
+                    tick_version: "tick-v1".into(),
+                },
+            ))
+            .unwrap();
+        let failed = writer
+            .apply(event(
+                2,
+                EventKind::SourceGap {
+                    token_id: "unknown".into(),
+                    reason: "unattributed".into(),
+                },
+            ))
+            .unwrap();
+        assert!(!failed.projection.ready);
+        assert_eq!(
+            failed.persisted.fail_closed_reason.as_deref(),
+            Some("source_gap:unattributed")
+        );
+        assert!(failed.persisted.market.is_none());
+    }
+
+    #[test]
+    fn connection_wide_gap_is_global_even_when_record_names_a_known_token() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!()
+            }
+            fn append_outcome(&mut self, _: &PersistedEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog);
+        writer
+            .apply(event(
+                1,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-1".into(),
+                    markets: vec![market("m1", "condition-1", None)],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+        for (cursor, token_id) in [(2, "m1-yes"), (3, "m1-no")] {
+            writer
+                .apply(event(
+                    cursor,
+                    EventKind::FullBook {
+                        token_id: token_id.into(),
+                        bids: levels("0.4", "10"),
+                        asks: levels("0.6", "10"),
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v1".into(),
+                    },
+                ))
+                .unwrap();
+        }
+        assert!(writer.projection().ready);
+
+        let failed = writer
+            .apply(event(
+                4,
+                EventKind::SourceGap {
+                    token_id: "m1-yes".into(),
+                    reason: "upstream_connection_boundary".into(),
+                },
+            ))
+            .unwrap();
+        assert!(!failed.projection.ready);
+        assert!(failed.persisted.market.is_none());
+        assert_eq!(
+            failed.persisted.fail_closed_reason.as_deref(),
+            Some("source_gap:upstream_connection_boundary")
+        );
+        assert!(failed.projection.quarantined_market_ids().is_empty());
     }
 
     #[test]
@@ -3005,7 +3820,7 @@ mod tests {
         assert!(!yes.projection.ready);
         assert_eq!(
             yes.projection.fail_closed_reason.as_deref(),
-            Some("instrument_tick_inconsistent")
+            Some("no_healthy_markets")
         );
         assert_eq!(
             yes.projection.markets["m1"]

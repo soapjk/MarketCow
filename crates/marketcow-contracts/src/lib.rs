@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const PREDICTION_MARKET_CONTRACT: &str = "marketcow.prediction_market.v1";
-pub const LIVE_SCHEMA_VERSION: &str = "marketcow.polymarket.live.v2";
+pub const LIVE_SCHEMA_VERSION: &str = "marketcow.polymarket.live.v3";
 pub const WORKER_PROTOCOL_VERSION: &str = "marketcow.worker.v1";
 pub const MAX_WORKER_FRAME_BYTES: usize = 1_048_576;
 pub const MCP_LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -176,6 +176,13 @@ impl ScopeDiscovery {
 pub struct EventContractFields {
     pub cursor: u64,
     pub event_id: String,
+    pub event_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_sequence: Option<u64>,
+    pub projection_generation: u64,
+    pub catalog_revision: String,
     pub event_type: String,
     pub canonical_payload: serde_json::Value,
     pub canonical_payload_sha256: String,
@@ -268,7 +275,13 @@ pub fn validate_provider_neutral_fixture(value: &serde_json::Value) -> Result<()
     {
         return Err("prediction-market contract version mismatch".into());
     }
-    if value.get("schema_version").and_then(|item| item.as_str()) != Some(LIVE_SCHEMA_VERSION) {
+    // v3 is additive at the event-envelope level and retains the v2 provider-neutral financial
+    // facts. Keep accepting the pinned Python v2 golden while v3 consumers additionally require
+    // market identity/sequence/revision fields and the v3 stream controls.
+    if !matches!(
+        value.get("schema_version").and_then(|item| item.as_str()),
+        Some(LIVE_SCHEMA_VERSION) | Some("marketcow.polymarket.live.v2")
+    ) {
         return Err("live schema version mismatch".into());
     }
     let required = value

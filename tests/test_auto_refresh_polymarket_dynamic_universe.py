@@ -40,7 +40,7 @@ class Session:
     def _scope(self) -> dict:
         identity = {**IDENTITY, "market_id": "2"} if self.generation == 2 else IDENTITY
         return {
-            "schema_version": "marketcow.polymarket.scope-discovery.v3",
+            "schema_version": "marketcow.polymarket.scope-discovery.v4",
             "ready": self.ready,
             "scope_status": "ready" if self.ready else "unready",
             "active_scope_id": "a" * 64,
@@ -184,6 +184,81 @@ def test_changed_membership_registers_and_atomically_activates(tmp_path, monkeyp
     assert request["json"]["scope_file_sha256"] == result["candidate_sha256"]
     registered = json.loads((config.scope_registry_root / f"{'a' * 64}.json").read_text())
     assert registered["universe"]["generation"] == 2
+
+
+def test_below_target_quarantine_view_is_automatically_replenished(tmp_path, monkeypatch):
+    monkeypatch.setenv("MARKETCOW_RUST_ADMIN_TOKEN", "secret")
+    replacement = {
+        **IDENTITY,
+        "market_id": "2",
+        "condition_id": "0x" + "2" * 64,
+        "token_ids": ["21", "22"],
+    }
+
+    class PartialSession(Session):
+        expanded = False
+
+        def _scope(self) -> dict:
+            scope = super()._scope()
+            active = [IDENTITY, replacement] if self.expanded else [IDENTITY]
+            scope.update({
+                "market_count": len(active),
+                "token_count": 2 * len(active),
+                "active_markets": active,
+                "active_market_ids": [item["market_id"] for item in active],
+                "quarantined_market_ids": [] if self.expanded else ["retired-bad-market"],
+                "target_market_count": 2,
+                "minimum_market_count": 1,
+            })
+            return scope
+
+        def _full(self) -> dict:
+            scope = self._scope()
+            return {
+                "scope_id": scope["active_scope_id"],
+                "universe_id": scope["universe_id"],
+                "universe_generation": scope["generation"],
+                "universe": {
+                    "generation": scope["generation"],
+                    "active_markets": scope["active_markets"],
+                },
+                "snapshot": {
+                    "books": [{} for _ in range(scope["token_count"])],
+                    "markets": [{} for _ in range(scope["market_count"])],
+                    "unresolved_gaps": [],
+                },
+            }
+
+        def post(self, url, **kwargs):
+            response = super().post(url, **kwargs)
+            self.expanded = True
+            return response
+
+    candidate = _candidate(IDENTITY)
+    candidate.update({
+        "market_count": 2,
+        "token_count": 4,
+        "market_ids": ["1", "2"],
+        "token_ids": ["11", "12", "21", "22"],
+    })
+    candidate["universe"].update({
+        "active_markets": [IDENTITY, replacement],
+        "added_markets": ["2"],
+        "removed_markets": [],
+    })
+    config = _config(tmp_path)
+    config = RefreshConfig(**{**config.__dict__, "target_market_count": 2})
+    session = PartialSession(changed=True)
+    result = refresh_once(
+        config,
+        session=session,
+        book_snapshot_builder=_books,
+        universe_builder=lambda *_args, **_kwargs: candidate,
+    )
+    assert result["status"] == "activated_ready"
+    assert result["added_markets"] == ["2"]
+    assert result["removed_markets"] == []
+    assert len(session.posts) == 1
 
 
 def test_unready_live_books_can_be_isolated_by_fresh_candidate_activation(

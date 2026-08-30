@@ -75,22 +75,33 @@ def validate_boundary(scope: dict[str, Any], full: dict[str, Any]) -> dict[str, 
         checkpoint.get("persisted_cursor"),
     }
     generation = scope.get("generation")
+    market_count = int(scope.get("market_count", -1))
+    token_count = int(scope.get("token_count", -1))
+    minimum_market_count = int(scope.get("minimum_market_count", -1))
+    target_market_count = int(scope.get("target_market_count", -1))
+    active_scope_ids = set(map(str, scope.get("active_market_ids") or []))
+    active_universe_ids = {
+        str(item.get("market_id")) for item in universe.get("active_markets") or []
+    }
+    quarantined_market_ids = set(map(str, scope.get("quarantined_market_ids") or []))
     passed = (
-        scope.get("schema_version") == "marketcow.polymarket.scope-discovery.v3"
+        scope.get("schema_version") == "marketcow.polymarket.scope-discovery.v4"
         and scope.get("ready") is True
         and scope.get("scope_status") == "ready"
-        and scope.get("market_count") == 100
-        and scope.get("token_count") == 200
+        and 0 < minimum_market_count <= market_count <= target_market_count <= 250
+        and token_count == 2 * market_count
         and scope.get("real_order_submission_enabled") is False
-        and full.get("schema_version") == "marketcow.polymarket.live.v2"
+        and full.get("schema_version") == "marketcow.polymarket.live.v3"
         and full.get("scope_id") == scope.get("active_scope_id")
         and full.get("universe_id") == scope.get("universe_id")
         and full.get("universe_generation") == generation
         and universe.get("generation") == generation
-        and len(universe.get("active_markets") or []) == 100
-        and len(markets) == 100
-        and len(books) == 200
-        and len(set(tokens)) == 200
+        and len(universe.get("active_markets") or []) == market_count
+        and active_scope_ids == active_universe_ids
+        and not (active_scope_ids & quarantined_market_ids)
+        and len(markets) == market_count
+        and len(books) == token_count
+        and len(set(tokens)) == token_count
         and not tick_mismatches
         and not bad_revisions
         and not snapshot.get("unresolved_gaps")
@@ -113,6 +124,9 @@ def validate_boundary(scope: dict[str, Any], full: dict[str, Any]) -> dict[str, 
         "bad_revision_count": len(bad_revisions),
         "gap_count": len(snapshot.get("unresolved_gaps") or []),
         "active_market_ids": sorted(str(item["market_id"]) for item in universe.get("active_markets") or []),
+        "quarantined_market_ids": sorted(quarantined_market_ids),
+        "minimum_market_count": minimum_market_count,
+        "target_market_count": target_market_count,
     }
 
 
@@ -134,7 +148,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
     started = time.monotonic()
     deadline = started + arguments.duration_seconds
     report: dict[str, Any] = {
-        "schema_version": "marketcow.polymarket.stream-recovery-stability.v1",
+        "schema_version": "marketcow.polymarket.market-isolation-stability.v2",
         "started_at": utc_now(),
         "duration_seconds": arguments.duration_seconds,
         "base_url": arguments.base_url,
@@ -152,6 +166,14 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
             "source_event_types": {},
             "resync_reasons": {},
             "universe_changes": [],
+            "market_quarantined": 0,
+            "market_recovery_started": 0,
+            "market_recovered": 0,
+            "market_replaced": 0,
+            "local_unavailable_windows": [],
+            "maximum_local_unavailable_seconds": 0.0,
+            "minimum_healthy_market_count": None,
+            "unaffected_market_cursor_continuous": True,
             "connections": 0,
             "ordinary_unapplied_frames": 0,
             "ordinary_gap_frames": 0,
@@ -172,6 +194,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
     event_types: Counter[str] = Counter()
     source_types: Counter[str] = Counter()
     resync_reasons: Counter[str] = Counter()
+    quarantined_since: dict[str, float] = {}
     last_sample_at = 0.0
     ws_url = arguments.base_url.replace("http://", "ws://") + "/v1/market-data/stream"
     async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
@@ -184,6 +207,11 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
                 await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
                 continue
             report["samples"].append({"observed_at": utc_now(), **boundary})
+            healthy_count = int(boundary["market_count"])
+            current_minimum = report["stream"]["minimum_healthy_market_count"]
+            report["stream"]["minimum_healthy_market_count"] = (
+                healthy_count if current_minimum is None else min(current_minimum, healthy_count)
+            )
             connection_generation = int(scope["generation"])
             connection_markets = set(boundary["active_market_ids"])
             after_cursor = int(boundary["boundary_cursor"])
@@ -197,7 +225,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
                     subscription = json.loads(await asyncio.wait_for(socket.recv(), 10))
                     if (
                         subscription.get("type") != "subscription"
-                        or subscription.get("protocol_version") != "marketcow.market-stream.v2"
+                        or subscription.get("protocol_version") != "marketcow.market-stream.v3"
                         or int(subscription.get("boundary_cursor", -1)) < after_cursor
                     ):
                         raise RuntimeError(f"invalid subscription: {subscription}")
@@ -247,6 +275,48 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
                             if payload.get("source_event_type"):
                                 source_types[str(payload["source_event_type"])] += 1
                             report["stream"]["event_count"] += 1
+                        elif frame_type in {
+                            "market_quarantined", "market_recovery_started", "market_recovered",
+                            "market_replaced",
+                        }:
+                            observed_cursor = int(frame.get("cursor", -1))
+                            if observed_cursor != cursor + 1:
+                                report["stream"]["cursor_discontinuities"] += 1
+                                report["stream"]["unaffected_market_cursor_continuous"] = False
+                                raise RuntimeError(
+                                    f"control cursor discontinuity {cursor}->{observed_cursor}"
+                                )
+                            cursor = observed_cursor
+                            market_id = str(frame.get("market_id", ""))
+                            required = {
+                                "global_cursor", "market_sequence", "projection_generation",
+                                "catalog_revision", "event_revision", "old_generation",
+                                "new_generation", "affected_market_ids", "reason_code",
+                                "recovery_boundary", "full_sync_required",
+                            }
+                            if (
+                                not market_id
+                                or any(name not in frame for name in required)
+                                or int(frame.get("global_cursor", -1)) != observed_cursor
+                                or frame.get("full_sync_required") is not False
+                            ):
+                                raise RuntimeError(f"invalid local market control: {frame}")
+                            report["stream"][frame_type] += 1
+                            if frame_type == "market_quarantined":
+                                quarantined_since.setdefault(market_id, time.monotonic())
+                            elif frame_type in {"market_recovered", "market_replaced"}:
+                                started_at = quarantined_since.pop(market_id, None)
+                                if started_at is not None:
+                                    elapsed = time.monotonic() - started_at
+                                    report["stream"]["local_unavailable_windows"].append({
+                                        "market_id": market_id,
+                                        "recovered_at": utc_now(),
+                                        "duration_seconds": elapsed,
+                                        "recovery_type": frame_type,
+                                    })
+                                    report["stream"]["maximum_local_unavailable_seconds"] = max(
+                                        report["stream"]["maximum_local_unavailable_seconds"], elapsed
+                                    )
                         elif frame_type == "universe_changed":
                             new_generation = int(frame.get("new_generation", -1))
                             added = set(map(str, frame.get("added_markets") or []))
@@ -266,10 +336,10 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
                             })
                             controlled_transition = True
                             break
-                        elif frame_type == "resync_required":
+                        elif frame_type == "global_resync_required":
                             reason = str(frame.get("reason"))
                             resync_reasons[reason] += 1
-                            raise RuntimeError(f"unexpected resync_required: {reason}")
+                            raise RuntimeError(f"unexpected global_resync_required: {reason}")
                         else:
                             raise RuntimeError(f"unsupported stream frame: {frame_type}")
             except Exception as error:
@@ -282,8 +352,21 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
         report["stream"]["event_types"] = dict(sorted(event_types.items()))
         report["stream"]["source_event_types"] = dict(sorted(source_types.items()))
         report["stream"]["resync_reasons"] = dict(sorted(resync_reasons.items()))
+        report["stream"]["global_resync_count"] = sum(resync_reasons.values())
+        report["stream"]["outstanding_quarantined_markets"] = sorted(quarantined_since)
         report["finished_at"] = utc_now()
         report["elapsed_seconds"] = time.monotonic() - started
+        report["availability"] = {
+            "ready_sample_count": sum(1 for sample in report["samples"] if sample.get("passed")),
+            "sample_count": len(report["samples"]),
+            "overall_ready_ratio": (
+                sum(1 for sample in report["samples"] if sample.get("passed"))
+                / max(1, len(report["samples"]))
+            ),
+            "unaffected_market_cursor_continuous": report["stream"][
+                "unaffected_market_cursor_continuous"
+            ],
+        }
         report["read_only"] = {}
         for path in READ_ONLY_PATHS:
             response = await client.get(arguments.base_url + path)
@@ -292,7 +375,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
             expired_uri = ws_url + f"?after_cursor={arguments.expired_cursor}"
             async with websockets.connect(expired_uri, open_timeout=10, close_timeout=3, proxy=None) as socket:
                 first = json.loads(await asyncio.wait_for(socket.recv(), 10))
-                report["expired_cursor"] = {"frame": first, "passed": first.get("type") == "resync_required" and first.get("reason") == "event_cursor_expired"}
+                report["expired_cursor"] = {"frame": first, "passed": first.get("type") == "global_resync_required" and first.get("reason") == "event_cursor_expired" and first.get("full_sync_required") is True}
         except websockets.ConnectionClosed as error:
             report.setdefault("expired_cursor", {})["close"] = {"code": error.code, "reason": error.reason}
         except Exception as error:

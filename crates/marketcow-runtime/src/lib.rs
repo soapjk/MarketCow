@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -108,6 +108,8 @@ pub enum RuntimeError {
     WriterAlreadyActive,
     #[error("Polymarket writer lease is not a private regular file")]
     InsecureWriterLease,
+    #[error("atomic market recovery snapshot is incomplete or crosses a market boundary")]
+    InvalidMarketRecovery,
     #[error(transparent)]
     Core(#[from] marketcow_core::CoreError),
     #[error(transparent)]
@@ -337,9 +339,7 @@ impl PolymarketRuntime {
         for event in &mut events {
             let duplicate = projection.recent_event_ids.contains(&event.event_id);
             let closes_durable_gap = match &event.kind {
-                EventKind::FullBook { token_id, .. } => {
-                    projection.unresolved_gaps.contains(token_id)
-                }
+                EventKind::FullBook { token_id, .. } => projection.token_has_recovery_gap(token_id),
                 _ => false,
             };
             if duplicate && closes_durable_gap {
@@ -355,6 +355,165 @@ impl PolymarketRuntime {
         }
         if events.is_empty() {
             return Ok(Vec::new());
+        }
+        let outcomes = self.writer.apply_batch(events)?;
+        for outcome in &outcomes {
+            self.recent_events.push_back(outcome.persisted.clone());
+            if self.recent_events.len() > self.config.recent_event_capacity {
+                self.recent_events.pop_front();
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Atomically repairs one quarantined binary market from one authoritative two-token HTTP
+    /// response. Incremental frames for the market remain rejected while it is quarantined; the
+    /// single writer publishes neither token until both books and all bound facts validate.
+    pub fn apply_market_recovery_snapshot(
+        &mut self,
+        raw_payloads: Vec<Value>,
+        received_at: DateTime<Utc>,
+    ) -> Result<Vec<ApplyOutcome>, RuntimeError> {
+        if raw_payloads.len() != 2 {
+            return Err(RuntimeError::InvalidMarketRecovery);
+        }
+        let projection = self.writer.projection();
+        let normalizer = NormalizerConfig::new(
+            self.config.scope_id.clone(),
+            self.config.config_revision.clone(),
+        );
+        let mut normalized = Vec::with_capacity(2);
+        for raw_payload in &raw_payloads {
+            let verified_book_tick = verified_book_tick(&projection, raw_payload);
+            let mut events = normalize_frame_with_book_tick(
+                &normalizer,
+                raw_payload.clone(),
+                received_at,
+                0,
+                verified_book_tick,
+            )?;
+            if events.len() != 1 || !bind_full_book_refresh_identity(&mut events[0]) {
+                return Err(RuntimeError::InvalidMarketRecovery);
+            }
+            let event = events.pop().expect("one recovery event checked");
+            let EventKind::FullBook {
+                token_id,
+                bids,
+                asks,
+                tick_size,
+                tick_version,
+            } = &event.kind
+            else {
+                return Err(RuntimeError::InvalidMarketRecovery);
+            };
+            if bids.is_empty()
+                || asks.is_empty()
+                || tick_version.is_empty()
+                || !marketcow_core::Book::levels_tick_aligned(tick_size, bids)
+                || !marketcow_core::Book::levels_tick_aligned(tick_size, asks)
+            {
+                return Err(RuntimeError::InvalidMarketRecovery);
+            }
+            let market_id = projection
+                .market_id_for_token(token_id)
+                .ok_or(RuntimeError::InvalidMarketRecovery)?
+                .to_owned();
+            normalized.push((market_id, token_id.clone(), raw_payload.clone(), event));
+        }
+        normalized.sort_by(|left, right| left.1.cmp(&right.1));
+        let market_ids = normalized
+            .iter()
+            .map(|item| item.0.as_str())
+            .collect::<BTreeSet<_>>();
+        let token_ids = normalized
+            .iter()
+            .map(|item| item.1.clone())
+            .collect::<BTreeSet<_>>();
+        if market_ids.len() != 1 {
+            return Err(RuntimeError::InvalidMarketRecovery);
+        }
+        let market_id = (*market_ids
+            .first()
+            .ok_or(RuntimeError::InvalidMarketRecovery)?)
+        .to_owned();
+        let market = projection
+            .markets
+            .get(&market_id)
+            .ok_or(RuntimeError::InvalidMarketRecovery)?;
+        let expected_tokens = market
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.token_id.clone())
+            .collect::<BTreeSet<_>>();
+        let common_tick = normalized.first().and_then(|item| match &item.3.kind {
+            EventKind::FullBook { tick_size, .. } => Some(tick_size),
+            _ => None,
+        });
+        let ticks_match = normalized.iter().all(|item| match &item.3.kind {
+            EventKind::FullBook { tick_size, .. } => Some(tick_size) == common_tick,
+            _ => false,
+        });
+        let facts_complete = market.instrument_facts.as_ref().is_none_or(|facts| {
+            facts
+                .fee_schedule
+                .as_ref()
+                .is_none_or(marketcow_core::MarketFeeSchedule::is_complete)
+        });
+        let relation_complete = market.negative_risk_group.as_ref().is_none_or(|group_id| {
+            projection
+                .negative_risk_relations
+                .get(group_id)
+                .is_some_and(|relation| {
+                    relation.complete
+                        && !relation.revision.is_empty()
+                        && relation.member_market_ids.contains(&market_id)
+                })
+        });
+        if token_ids != expected_tokens
+            || !ticks_match
+            || !facts_complete
+            || !relation_complete
+            || projection.market_is_public(&market_id)
+        {
+            return Err(RuntimeError::InvalidMarketRecovery);
+        }
+
+        let combined_raw = Arc::new(serde_json::json!({
+            "event_type":"atomic_market_recovery_snapshot",
+            "market_id":market_id,
+            "received_at":received_at,
+            "books":normalized.iter().map(|item| item.2.clone()).collect::<Vec<_>>(),
+        }));
+        let combined_sha256 =
+            hex::encode(Sha256::digest(serde_json::to_vec(combined_raw.as_ref())?));
+        let next_cursor = projection.cursor.saturating_add(1);
+        let mut events = normalized
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (_, token_id, _, mut event))| {
+                event.cursor = next_cursor + u64::try_from(offset).expect("two-event batch");
+                event.received_at = received_at;
+                event.raw_payload = combined_raw.clone();
+                event.source.raw_sha256 = combined_sha256.clone();
+                event.source.source = "polymarket_clob_http".into();
+                event.source.source_url =
+                    Some(marketcow_polymarket::CLOB_BOOK_SNAPSHOT_SOURCE_URL.into());
+                event.source.revision = "marketcow.atomic-market-recovery.v1".into();
+                event.source.update_frequency = "on_demand_market_recovery".into();
+                event.event_id = hex::encode(Sha256::digest(format!(
+                    "{}\0{}\0{}\0{}",
+                    self.config.scope_id, market_id, token_id, combined_sha256
+                )));
+                event
+            })
+            .collect::<Vec<_>>();
+        if events
+            .iter()
+            .any(|event| projection.recent_event_ids.contains(&event.event_id))
+        {
+            for event in &mut events {
+                bind_full_book_recovery_identity(event);
+            }
         }
         let outcomes = self.writer.apply_batch(events)?;
         for outcome in &outcomes {

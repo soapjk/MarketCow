@@ -1133,6 +1133,13 @@ struct Metrics {
     stream_clients: AtomicU64,
     stream_disconnects: AtomicU64,
     stream_slow_consumer_disconnects: AtomicU64,
+    polymarket_market_quarantines: AtomicU64,
+    polymarket_market_recovery_started: AtomicU64,
+    polymarket_market_recovered: AtomicU64,
+    polymarket_wal_replay_attempts: AtomicU64,
+    polymarket_wal_replay_successes: AtomicU64,
+    polymarket_wal_replay_failures: AtomicU64,
+    polymarket_global_resyncs: AtomicU64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3133,21 +3140,44 @@ fn start_polymarket_live(
                     }
                     _ = refresh_tick.tick() => {
                         match fetch_polymarket_book_refreshes(&refresh_client, &live.token_ids).await {
-                            Ok(frames) => match validate_polymarket_book_refreshes(&state, &live, frames).await {
-                                Ok(summary) => {
-                                    info!(
-                                        matched_books=summary.matched_books,
-                                        mismatched_books=summary.mismatched_books,
-                                        interval_ms=refresh_interval.as_millis(),
-                                        "polymarket_authoritative_books_validated"
-                                    );
+                            Ok(frames) => {
+                                match recover_quarantined_polymarket_markets(&state, &live, &frames).await {
+                                    Ok(recovery) => {
+                                        if recovery.attempted > 0 {
+                                            info!(
+                                                attempted_markets=recovery.attempted,
+                                                recovered_markets=recovery.recovered,
+                                                rejected_markets=recovery.rejected,
+                                                "polymarket_market_recovery_snapshot_processed"
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        // A durability or publication failure is global. Invalid
+                                        // market snapshots are returned as rejected local attempts
+                                        // and never reach this branch.
+                                        warn!(error=%error, "polymarket_market_recovery_failed_closed");
+                                        let _ = transport_shutdown_tx.send(true);
+                                        let _ = (&mut transport).await;
+                                        let _ = checkpoint_polymarket_runtime(&state).await;
+                                        break 'service;
+                                    }
                                 }
-                                Err(error) => {
-                                    // Validation is deliberately outside the WS causal state
-                                    // machine. A malformed or mismatched REST observation cannot
-                                    // mutate the projection or restart a healthy stream. The
-                                    // existing age gate fails closed if no exact evidence arrives.
-                                    warn!(error=%error, "polymarket_book_validation_retryable_failure");
+                                match validate_polymarket_book_refreshes(&state, &live, frames).await {
+                                    Ok(summary) => {
+                                        info!(
+                                            matched_books=summary.matched_books,
+                                            mismatched_books=summary.mismatched_books,
+                                            interval_ms=refresh_interval.as_millis(),
+                                            "polymarket_authoritative_books_validated"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        // Healthy books remain read-only freshness observations.
+                                        // Only explicitly quarantined markets may use the atomic
+                                        // two-token repair path above.
+                                        warn!(error=%error, "polymarket_book_validation_retryable_failure");
+                                    }
                                 }
                             },
                             Err(error) => {
@@ -3540,17 +3570,15 @@ async fn apply_polymarket_transport_frames(
     }
     state.projection.store(runtime.projection());
     drop(runtime);
-    for outcome in &published {
-        let _ = state.stream.send(outcome.persisted.clone());
-    }
+    publish_polymarket_outcomes(state, &published);
     let recovery_records = published
         .iter()
         .filter(|outcome| {
-            (!outcome.persisted.applied || outcome.persisted.fail_closed_reason.is_some())
-                && !matches!(
-                    &outcome.persisted.event.kind,
-                    marketcow_core::EventKind::SourceGap { .. }
-                )
+            !matches!(
+                outcome.persisted.event.kind,
+                marketcow_core::EventKind::SourceGap { .. }
+            ) && (outcome.persisted.fail_closed_reason.is_some()
+                || !outcome.persisted.applied && outcome.persisted.market.is_none())
         })
         .collect::<Vec<_>>();
     if !recovery_records.is_empty() {
@@ -3649,6 +3677,69 @@ async fn apply_polymarket_transport_frames(
     Ok(published.len())
 }
 
+fn publish_polymarket_outcomes(state: &AppState, published: &[marketcow_core::ApplyOutcome]) {
+    for outcome in published {
+        let _ = state.stream.send(outcome.persisted.clone());
+    }
+    for outcome in published.iter().filter(|outcome| {
+        outcome
+            .persisted
+            .market
+            .as_ref()
+            .is_some_and(|market| market.transition.is_some())
+    }) {
+        let market = outcome.persisted.market.as_ref().expect("filtered market");
+        match market.transition {
+            Some(marketcow_core::MarketTransitionKind::Quarantined) => {
+                state
+                    .metrics
+                    .polymarket_market_quarantines
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(marketcow_core::MarketTransitionKind::RecoveryStarted) => {
+                state
+                    .metrics
+                    .polymarket_market_recovery_started
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(marketcow_core::MarketTransitionKind::Recovered) => {
+                state
+                    .metrics
+                    .polymarket_market_recovered
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => unreachable!("filtered transition"),
+        }
+        if let Err(error) = state.audit.record_lifecycle(
+            "polymarket_market_projection",
+            match market.transition {
+                Some(marketcow_core::MarketTransitionKind::Quarantined) => "market_quarantined",
+                Some(marketcow_core::MarketTransitionKind::RecoveryStarted) => {
+                    "market_recovery_started"
+                }
+                Some(marketcow_core::MarketTransitionKind::Recovered) => "market_recovered",
+                None => unreachable!("filtered transition"),
+            },
+            json!({
+                "scope_id":outcome.projection.scope_id,
+                "global_cursor":outcome.persisted.event.cursor,
+                "market_id":market.market_id,
+                "market_sequence":market.market_sequence,
+                "projection_generation":market.projection_generation,
+                "catalog_revision":market.catalog_revision,
+                "event_revision":market.event_revision,
+                "projection_status":market.projection_status,
+                "reason_code":market.reason_code,
+                "retryable":true,
+                "full_sync_required":false,
+                "real_order_submission_enabled":false
+            }),
+        ) {
+            warn!(error=%error, "polymarket_market_transition_audit_failed");
+        }
+    }
+}
+
 async fn validate_polymarket_book_refreshes(
     state: &AppState,
     live: &PolymarketLiveConfig,
@@ -3711,6 +3802,114 @@ async fn validate_polymarket_book_refreshes(
     })
 }
 
+#[derive(Default)]
+struct PolymarketMarketRecoverySummary {
+    attempted: usize,
+    recovered: usize,
+    rejected: usize,
+}
+
+async fn recover_quarantined_polymarket_markets(
+    state: &AppState,
+    live: &PolymarketLiveConfig,
+    frames: &[marketcow_polymarket::RawTransportFrame],
+) -> Result<PolymarketMarketRecoverySummary> {
+    let mut by_token = BTreeMap::new();
+    for frame in frames {
+        let token_id = frame
+            .raw_payload
+            .get("asset_id")
+            .or_else(|| frame.raw_payload.get("token_id"))
+            .and_then(serde_json::Value::as_str)
+            .context("authoritative recovery book is missing token identity")?;
+        if by_token.insert(token_id.to_owned(), frame).is_some() {
+            bail!("authoritative recovery response contains a duplicate token");
+        }
+    }
+
+    let mut runtime = state.runtime.lock().await;
+    if runtime.projection().scope_id != live.scope_id {
+        bail!("Polymarket market recovery crossed a scope boundary");
+    }
+    let projection = runtime.projection();
+    let quarantined = projection.quarantined_market_ids();
+    let recovery_markets = projection
+        .markets
+        .values()
+        .filter(|market| quarantined.contains(&market.market_id))
+        .map(|market| {
+            (
+                market.market_id.clone(),
+                market
+                    .outcomes
+                    .iter()
+                    .map(|outcome| outcome.token_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(projection);
+
+    let mut summary = PolymarketMarketRecoverySummary::default();
+    let mut published = Vec::new();
+    for (market_id, token_ids) in recovery_markets {
+        summary.attempted += 1;
+        let Some(pair) = token_ids
+            .iter()
+            .map(|token_id| by_token.get(token_id).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            summary.rejected += 1;
+            continue;
+        };
+        let received_at = pair
+            .iter()
+            .map(|frame| frame.received_at)
+            .max()
+            .unwrap_or_else(Utc::now);
+        match runtime.apply_market_recovery_snapshot(
+            pair.iter().map(|frame| frame.raw_payload.clone()).collect(),
+            received_at,
+        ) {
+            Ok(outcomes) => {
+                if outcomes
+                    .last()
+                    .is_some_and(|outcome| outcome.projection.market_is_public(&market_id))
+                {
+                    summary.recovered += 1;
+                } else {
+                    summary.rejected += 1;
+                }
+                published.extend(outcomes);
+            }
+            Err(marketcow_runtime::RuntimeError::InvalidMarketRecovery) => {
+                summary.rejected += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    state.projection.store(runtime.projection());
+    drop(runtime);
+    publish_polymarket_outcomes(state, &published);
+    if summary.attempted > 0 {
+        state.audit.record_lifecycle(
+            "polymarket_market_recovery",
+            "atomic_snapshot_batch",
+            json!({
+                "scope_id":live.scope_id,
+                "attempted_markets":summary.attempted,
+                "recovered_markets":summary.recovered,
+                "rejected_markets":summary.rejected,
+                "source":"polymarket_clob_http",
+                "atomic_two_token_boundary":true,
+                "healthy_markets_unchanged":true,
+                "real_order_submission_enabled":false
+            }),
+        )?;
+    }
+    Ok(summary)
+}
+
 fn reset_polymarket_book_validations(state: &AppState, scope_id: &str) {
     state
         .polymarket_book_validations
@@ -3725,9 +3924,11 @@ fn projection_maximum_effective_book_age_ms(
     projection: &marketcow_core::Projection,
 ) -> u64 {
     let validations = state.polymarket_book_validations.load();
+    let active_token_ids = projection.active_token_ids();
     projection
         .books
         .iter()
+        .filter(|(token_id, _)| active_token_ids.contains(*token_id))
         .map(|(token_id, book)| {
             let validated_at = (validations.scope_id == projection.scope_id)
                 .then(|| validations.verified_at.get(token_id).copied())
@@ -3752,6 +3953,7 @@ fn projection_fresh(state: &AppState, projection: &marketcow_core::Projection) -
 }
 
 fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Projection) -> bool {
+    let active_market_count = projection.active_market_ids().len();
     projection.ready
         && projection.instrument_ticks_consistent()
         && projection.active_market_books_two_sided()
@@ -3761,8 +3963,13 @@ fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Pr
             .load()
             .as_ref()
             .is_none_or(|live| {
-                live.catalog_frame.is_none()
-                    || projection_matches_polymarket_scope(live, projection, true)
+                let capacity_ready = live
+                    .universe
+                    .as_ref()
+                    .is_none_or(|universe| active_market_count >= universe.minimum_market_count);
+                capacity_ready
+                    && (live.catalog_frame.is_none()
+                        || projection_matches_polymarket_scope(live, projection, true))
             })
 }
 
@@ -4289,6 +4496,10 @@ fn app(state: AppState) -> Router {
         .route(
             "/v1/prediction-markets/polymarket/live/snapshot",
             get(live_snapshot),
+        )
+        .route(
+            "/v1/prediction-markets/polymarket/live/markets/{market_id}/snapshot",
+            get(live_market_snapshot),
         )
         .route(
             "/v1/prediction-markets/polymarket/live/events",
@@ -6403,9 +6614,30 @@ async fn scope(
     };
     let ready = polymarket_projection_ready(&state, &projection);
     let universe = live.as_ref().and_then(|value| value.universe.clone());
+    let active_market_ids = projection.active_market_ids();
+    let quarantined_market_ids = projection.quarantined_market_ids();
+    let active_markets = universe.as_ref().map(|value| {
+        value
+            .active_markets
+            .iter()
+            .filter(|market| active_market_ids.contains(&market.market_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let effective_exclusions = universe
+        .as_ref()
+        .map(|value| effective_polymarket_exclusions(value, &projection));
+    let active_market_count = active_markets.as_ref().map_or_else(
+        || live.as_ref().and_then(|value| value.market_count),
+        |value| Some(value.len()),
+    );
+    let active_token_count = active_markets.as_ref().map_or_else(
+        || live.as_ref().map(|value| value.token_ids.len()),
+        |value| Some(value.len() * 2),
+    );
     Json(json!({
         "schema_version":if universe.is_some() {
-            "marketcow.polymarket.scope-discovery.v3"
+            "marketcow.polymarket.scope-discovery.v4"
         } else {
             "marketcow.polymarket.scope-discovery.v2"
         },
@@ -6415,20 +6647,90 @@ async fn scope(
         "scope_status":if ready { "ready" } else { "unready" },
         "mode":"shadow",
         "ready":ready,
-        "market_count":live.as_ref().and_then(|value| value.market_count),
-        "token_count":live.as_ref().map(|value| value.token_ids.len()),
+        "market_count":active_market_count,
+        "token_count":active_token_count,
         "catalog_revision":live.as_ref().and_then(|value| value.catalog_revision.clone()),
         "boundary_cursor":projection.cursor,
         "target_market_count":universe.as_ref().map(|value| value.target_market_count),
         "minimum_market_count":universe.as_ref().map(|value| value.minimum_market_count),
-        "active_markets":universe.as_ref().map(|value| value.active_markets.clone()),
+        "active_markets":active_markets,
+        "active_market_ids":active_market_ids,
+        "quarantined_market_ids":quarantined_market_ids,
+        "market_health":projection.market_health.values().cloned().collect::<Vec<_>>(),
         "added_markets":universe.as_ref().map(|value| value.added_markets.clone()),
         "removed_markets":universe.as_ref().map(|value| value.removed_markets.clone()),
-        "excluded_markets":universe.as_ref().map(|value| value.excluded_markets.clone()),
+        "excluded_markets":effective_exclusions,
         "filters":universe.as_ref().map(|value| value.filters.clone()),
         "real_order_submission_enabled":false,
     }))
     .into_response()
+}
+
+fn effective_polymarket_exclusions(
+    universe: &PolymarketUniverseContract,
+    projection: &marketcow_core::Projection,
+) -> Vec<serde_json::Value> {
+    let mut exclusions = universe
+        .excluded_markets
+        .iter()
+        .map(|value| serde_json::to_value(value).expect("universe exclusion serializes"))
+        .collect::<Vec<_>>();
+    for market_id in projection.quarantined_market_ids() {
+        let health = projection.market_health.get(&market_id);
+        exclusions.push(json!({
+            "market_id":market_id,
+            "reason_code":health.and_then(|value| value.reason_code.clone()).unwrap_or_else(|| "market_quarantined".into()),
+            "retryable":health.is_none_or(|value| value.retryable),
+            "retry_after":health.and_then(|value| value.retry_after),
+            "observed_at":health.and_then(|value| value.source_observed_at),
+            "projection_status":health.map(|value| value.projection_status),
+            "last_market_sequence":health.map(|value| value.last_market_sequence),
+            "last_recovered_at":health.and_then(|value| value.last_recovered_at),
+        }));
+    }
+    exclusions
+}
+
+fn effective_polymarket_universe(
+    universe: &PolymarketUniverseContract,
+    projection: &marketcow_core::Projection,
+) -> serde_json::Value {
+    let active_market_ids = projection.active_market_ids();
+    let active_markets = universe
+        .active_markets
+        .iter()
+        .filter(|market| active_market_ids.contains(&market.market_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut payload = serde_json::to_value(universe).expect("universe serializes");
+    let object = payload.as_object_mut().expect("universe is an object");
+    object.insert(
+        "schema_version".into(),
+        json!("marketcow.polymarket.universe.v2"),
+    );
+    object.insert("active_markets".into(), json!(active_markets));
+    object.insert("active_market_ids".into(), json!(active_market_ids));
+    object.insert(
+        "quarantined_market_ids".into(),
+        json!(projection.quarantined_market_ids()),
+    );
+    object.insert(
+        "market_health".into(),
+        json!(
+            projection
+                .market_health
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        ),
+    );
+    object.insert(
+        "excluded_markets".into(),
+        json!(effective_polymarket_exclusions(universe, projection)),
+    );
+    object.insert("projection_generation".into(), json!(projection.generation));
+    object.insert("boundary_cursor".into(), json!(projection.cursor));
+    payload
 }
 
 async fn live_snapshot(
@@ -6445,6 +6747,38 @@ async fn live_snapshot(
         );
     }
     Json(marketcow_api::snapshot(&projection)).into_response()
+}
+
+async fn live_market_snapshot(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<String>,
+    AxumPath(market_id): AxumPath<String>,
+) -> Response {
+    let Some((projection, _)) = polymarket_atomic_view(&state) else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_generation_transition_in_progress",
+            true,
+            &request_id,
+        );
+    };
+    if projection.catalog_revision.is_none() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "polymarket_catalog_unavailable",
+            true,
+            &request_id,
+        );
+    }
+    match marketcow_api::market_snapshot(&projection, &market_id) {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "polymarket_market_not_found",
+            false,
+            &request_id,
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -6541,11 +6875,14 @@ async fn live_full_sync(
             .expect("full-sync response is an object");
         object.insert(
             "universe_schema_version".into(),
-            json!("marketcow.polymarket.universe.v1"),
+            json!("marketcow.polymarket.universe.v2"),
         );
         object.insert("universe_id".into(), json!(universe.universe_id));
         object.insert("universe_generation".into(), json!(universe.generation));
-        object.insert("universe".into(), json!(universe));
+        object.insert(
+            "universe".into(),
+            effective_polymarket_universe(&universe, &projection),
+        );
     }
     Json(payload).into_response()
 }
@@ -6717,7 +7054,7 @@ async fn serve_market_data_stream(
                 send_resync_and_close(&mut socket, &state, last_cursor, reason).await;
                 return;
             }
-            let Ok(frame) = marketcow_api::stream_event(&subscription_scope_id, record) else {
+            let Ok(frame) = marketcow_api::stream_record(&subscription_scope_id, record) else {
                 close_stream(&mut socket, close_code::ERROR, "serialization_failed").await;
                 return;
             };
@@ -6779,24 +7116,40 @@ async fn serve_market_data_stream(
                             .await;
                         return;
                     }
-                    if let Some(reason) = polymarket_stream_resync_reason(&record) {
-                        send_resync_and_close(&mut socket, &state, last_cursor, reason).await;
-                        return;
-                    }
-                    if record.event.cursor != last_cursor.saturating_add(1) {
-                        send_resync_and_close(&mut socket, &state, last_cursor, "stream_live_gap")
-                            .await;
-                        return;
-                    }
-                    let Ok(frame) = marketcow_api::stream_event(&subscription_scope_id, &record)
-                    else {
-                        close_stream(&mut socket, close_code::ERROR, "serialization_failed").await;
-                        return;
+                    let records = if record.event.cursor == last_cursor.saturating_add(1) {
+                        vec![record]
+                    } else {
+                        match polymarket_wal_replay_records(
+                            &state,
+                            last_cursor,
+                            record.event.cursor,
+                        )
+                        .await
+                        {
+                            Ok(records) => records,
+                            Err(reason) => {
+                                send_resync_and_close(&mut socket, &state, last_cursor, reason)
+                                    .await;
+                                return;
+                            }
+                        }
                     };
-                    if !deliver_stream_frame(&mut socket, &state, &frame).await {
-                        return;
+                    match deliver_polymarket_records(
+                        &mut socket,
+                        &state,
+                        &subscription_scope_id,
+                        &records,
+                        &mut last_cursor,
+                    )
+                    .await
+                    {
+                        StreamRecordDelivery::Delivered => {}
+                        StreamRecordDelivery::ClientClosed => return,
+                        StreamRecordDelivery::GlobalResync(reason) => {
+                            send_resync_and_close(&mut socket, &state, last_cursor, reason).await;
+                            return;
+                        }
                     }
-                    last_cursor = record.event.cursor;
                     if !polymarket_projection_ready(&state, &current) {
                         send_resync_and_close(
                             &mut socket,
@@ -6809,13 +7162,49 @@ async fn serve_market_data_stream(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    state
-                        .metrics
-                        .stream_slow_consumer_disconnects
-                        .fetch_add(1, Ordering::Relaxed);
-                    send_resync_and_close(&mut socket, &state, last_cursor, "slow_consumer_lagged")
-                        .await;
-                    return;
+                    let current = state.projection.load_full();
+                    let records =
+                        match polymarket_wal_replay_records(&state, last_cursor, current.cursor)
+                            .await
+                        {
+                            Ok(records) => records,
+                            Err(reason) => {
+                                state
+                                    .metrics
+                                    .stream_slow_consumer_disconnects
+                                    .fetch_add(1, Ordering::Relaxed);
+                                send_resync_and_close(&mut socket, &state, last_cursor, reason)
+                                    .await;
+                                return;
+                            }
+                        };
+                    match deliver_polymarket_records(
+                        &mut socket,
+                        &state,
+                        &subscription_scope_id,
+                        &records,
+                        &mut last_cursor,
+                    )
+                    .await
+                    {
+                        StreamRecordDelivery::Delivered
+                            if polymarket_projection_ready(&state, &current) => {}
+                        StreamRecordDelivery::Delivered => {
+                            send_resync_and_close(
+                                &mut socket,
+                                &state,
+                                last_cursor,
+                                "projection_unready_or_stale",
+                            )
+                            .await;
+                            return;
+                        }
+                        StreamRecordDelivery::ClientClosed => return,
+                        StreamRecordDelivery::GlobalResync(reason) => {
+                            send_resync_and_close(&mut socket, &state, last_cursor, reason).await;
+                            return;
+                        }
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     close_stream(&mut socket, close_code::RESTART, "server_shutdown").await;
@@ -6852,9 +7241,87 @@ async fn serve_market_data_stream(
     }
 }
 
+enum StreamRecordDelivery {
+    Delivered,
+    ClientClosed,
+    GlobalResync(&'static str),
+}
+
+async fn polymarket_wal_replay_records(
+    state: &AppState,
+    after_cursor: u64,
+    boundary: u64,
+) -> std::result::Result<Vec<marketcow_core::PersistedEvent>, &'static str> {
+    state
+        .metrics
+        .polymarket_wal_replay_attempts
+        .fetch_add(1, Ordering::Relaxed);
+    let runtime = state.runtime.lock().await;
+    if runtime.projection().cursor < boundary {
+        state
+            .metrics
+            .polymarket_wal_replay_failures
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("stream_replay_incomplete");
+    }
+    // `recent_events` is populated only after the append-only WAL barrier and rebuilt from the
+    // verified WAL on restart. It is therefore the bounded authoritative event-journal replay
+    // window, not an uncommitted transport cache.
+    let records = runtime.recent_events().iter().cloned().collect::<Vec<_>>();
+    drop(runtime);
+    let window = match polymarket_replay_window(&records, after_cursor, boundary) {
+        Ok(window) => window,
+        Err(reason) => {
+            state
+                .metrics
+                .polymarket_wal_replay_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(reason);
+        }
+    };
+    state
+        .metrics
+        .polymarket_wal_replay_successes
+        .fetch_add(1, Ordering::Relaxed);
+    Ok(records[window].to_vec())
+}
+
+async fn deliver_polymarket_records(
+    socket: &mut WebSocket,
+    state: &AppState,
+    scope_id: &str,
+    records: &[marketcow_core::PersistedEvent],
+    last_cursor: &mut u64,
+) -> StreamRecordDelivery {
+    for record in records {
+        if record.event.cursor != last_cursor.saturating_add(1) {
+            return StreamRecordDelivery::GlobalResync("stream_replay_gap");
+        }
+        if let Some(reason) = polymarket_stream_resync_reason(record) {
+            return StreamRecordDelivery::GlobalResync(reason);
+        }
+        let Ok(frame) = marketcow_api::stream_record(scope_id, record) else {
+            close_stream(socket, close_code::ERROR, "serialization_failed").await;
+            return StreamRecordDelivery::ClientClosed;
+        };
+        if !deliver_stream_frame(socket, state, &frame).await {
+            return StreamRecordDelivery::ClientClosed;
+        }
+        *last_cursor = record.event.cursor;
+    }
+    StreamRecordDelivery::Delivered
+}
+
 fn polymarket_stream_resync_reason(
     record: &marketcow_core::PersistedEvent,
 ) -> Option<&'static str> {
+    if record
+        .market
+        .as_ref()
+        .is_some_and(|market| market.transition.is_some() && record.fail_closed_reason.is_none())
+    {
+        return None;
+    }
     if !record.applied || record.fail_closed_reason.is_some() {
         return Some("upstream_projection_gap");
     }
@@ -6863,6 +7330,7 @@ fn polymarket_stream_resync_reason(
         | marketcow_core::EventKind::NewMarket { .. }
         | marketcow_core::EventKind::MarketResolved { .. }
         | marketcow_core::EventKind::TickSizeChange { .. } => Some("instrument_facts_changed"),
+        marketcow_core::EventKind::SourceGap { .. } if record.market.is_some() => None,
         marketcow_core::EventKind::SourceGap { .. } => Some("upstream_projection_gap"),
         marketcow_core::EventKind::FullBook { .. }
         | marketcow_core::EventKind::Delta { .. }
@@ -6974,6 +7442,10 @@ async fn send_resync_and_close(
     cursor: u64,
     reason: &str,
 ) {
+    state
+        .metrics
+        .polymarket_global_resyncs
+        .fetch_add(1, Ordering::Relaxed);
     let active_scope_id = state.projection.load().scope_id.clone();
     let frame = marketcow_api::stream_resync_required(&active_scope_id, cursor, reason);
     let _ = send_stream_frame(socket, &frame).await;
@@ -7799,6 +8271,11 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
              marketcow_stream_channel_depth {}\n\
              marketcow_stream_channel_capacity {}\nmarketcow_stream_slow_consumer_disconnects_total {}\n\
              marketcow_persistence_latency_us {}\nmarketcow_publication_latency_us {}\n\
+             marketcow_polymarket_active_markets {}\nmarketcow_polymarket_quarantined_markets {}\n\
+             marketcow_polymarket_market_quarantines_total {}\nmarketcow_polymarket_market_recovery_started_total {}\n\
+             marketcow_polymarket_market_recovered_total {}\nmarketcow_polymarket_wal_replay_attempts_total {}\n\
+             marketcow_polymarket_wal_replay_successes_total {}\nmarketcow_polymarket_wal_replay_failures_total {}\n\
+             marketcow_polymarket_global_resyncs_total {}\n\
              marketcow_python_workers_configured {}\nmarketcow_python_workers_live {}\n\
              marketcow_python_worker_restarts_total {}\nmarketcow_python_worker_restart_budget_exhaustions_total {}\n\
              marketcow_python_worker_memory_limit_kills_total {}\nmarketcow_python_worker_memory_monitor_failures_total {}\n\
@@ -7825,6 +8302,36 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
                 .load(Ordering::Relaxed),
             state.metrics.persistence_latency_us.load(Ordering::Relaxed),
             state.metrics.publication_latency_us.load(Ordering::Relaxed),
+            projection.active_market_ids().len(),
+            projection.quarantined_market_ids().len(),
+            state
+                .metrics
+                .polymarket_market_quarantines
+                .load(Ordering::Relaxed),
+            state
+                .metrics
+                .polymarket_market_recovery_started
+                .load(Ordering::Relaxed),
+            state
+                .metrics
+                .polymarket_market_recovered
+                .load(Ordering::Relaxed),
+            state
+                .metrics
+                .polymarket_wal_replay_attempts
+                .load(Ordering::Relaxed),
+            state
+                .metrics
+                .polymarket_wal_replay_successes
+                .load(Ordering::Relaxed),
+            state
+                .metrics
+                .polymarket_wal_replay_failures
+                .load(Ordering::Relaxed),
+            state
+                .metrics
+                .polymarket_global_resyncs
+                .load(Ordering::Relaxed),
             state.config.python_workers.pool_size,
             state.worker_status.live.load(Ordering::Relaxed),
             state.worker_status.restarts.load(Ordering::Relaxed),
@@ -8971,6 +9478,72 @@ mod tests {
         live
     }
 
+    fn two_market_dynamic_live() -> PolymarketLiveConfig {
+        let active_markets = vec![
+            PolymarketUniverseMarket {
+                market_id: "1".into(),
+                condition_id: "condition-1".into(),
+                token_ids: vec!["10".into(), "20".into()],
+                end_at: "2026-09-01T00:00:00Z".parse().unwrap(),
+            },
+            PolymarketUniverseMarket {
+                market_id: "2".into(),
+                condition_id: "condition-2".into(),
+                token_ids: vec!["30".into(), "40".into()],
+                end_at: "2026-09-01T00:00:00Z".parse().unwrap(),
+            },
+        ];
+        let initial_book_frames = ["10", "20", "30", "40"]
+            .into_iter()
+            .map(|token| {
+                json!({
+                    "event_type":"book", "asset_id":token, "tick_size":"0.01",
+                    "bids":[{"price":"0.40","size":"10"}],
+                    "asks":[{"price":"0.60","size":"10"}],
+                    "timestamp":"2026-08-30T00:00:00Z"
+                })
+            })
+            .collect::<Vec<_>>();
+        PolymarketLiveConfig {
+            scope_id: "s".into(),
+            token_ids: vec!["10".into(), "20".into(), "30".into(), "40".into()],
+            market_ids: vec!["1".into(), "2".into()],
+            market_count: Some(2),
+            catalog_revision: Some("catalog-s".into()),
+            catalog_frame: Some(json!({
+                "event_type":"catalog_revision", "catalog_revision":"catalog-s",
+                "markets":[test_scope_market("1", "10", "20"), test_scope_market("2", "30", "40")],
+                "negative_risk_relations":[]
+            })),
+            scope_file_sha256: Some("a".repeat(64)),
+            scope_file_path: None,
+            source_manifest_sha256: Some("b".repeat(64)),
+            catalog_index_sha256: Some("c".repeat(64)),
+            catalog_sha256: Some("d".repeat(64)),
+            registry_sha256: Some("e".repeat(64)),
+            universe: Some(PolymarketUniverseContract {
+                schema_version: "marketcow.polymarket.universe.v1".into(),
+                universe_id: "s".into(),
+                generation: 1,
+                target_market_count: 2,
+                minimum_market_count: 1,
+                filters: PolymarketUniverseFilters {
+                    require_two_sided_books: true,
+                    require_complete_instrument_facts: true,
+                    maximum_capital_lock_seconds: 30 * 24 * 60 * 60,
+                },
+                active_markets: active_markets.clone(),
+                added_markets: vec!["1".into(), "2".into()],
+                removed_markets: Vec::new(),
+                added_market_identities: active_markets,
+                removed_market_identities: Vec::new(),
+                excluded_markets: Vec::new(),
+                validated_at: "2026-08-30T00:00:00Z".parse().unwrap(),
+            }),
+            initial_book_frames,
+        }
+    }
+
     #[test]
     fn dynamic_universe_transition_is_monotonic_and_delta_exact() {
         let universe_id = "a".repeat(64);
@@ -8990,6 +9563,321 @@ mod tests {
             validate_polymarket_universe_transition(&current, &mixed),
             Err("universe_membership_delta_mismatch".into())
         );
+    }
+
+    #[tokio::test]
+    async fn connection_boundary_stays_global_without_recursive_transport_restart() {
+        let (_dir, state) = test_state();
+        let live = two_market_dynamic_live();
+        {
+            let mut runtime = state.runtime.lock().await;
+            seed_polymarket_scope_catalog(&mut runtime, Some(&live)).unwrap();
+            state.projection.store(runtime.projection());
+        }
+        state.active_polymarket_scope.store(Some(Arc::new(live)));
+        assert!(polymarket_projection_ready(
+            &state,
+            &state.projection.load_full()
+        ));
+
+        let mut published = state.stream.subscribe();
+        let received_at = Utc::now();
+        let applied = apply_polymarket_transport_frames(
+            &state,
+            vec![marketcow_polymarket::RawTransportFrame {
+                raw_payload: json!({
+                    "event_type":"source_gap", "asset_id":"10",
+                    "reason":"upstream_connection_boundary", "attempt":2,
+                    "timestamp":received_at.timestamp_millis().to_string()
+                }),
+                received_at,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied, 1);
+        let record = published.recv().await.unwrap();
+        assert!(record.market.is_none());
+        assert_eq!(
+            record.fail_closed_reason.as_deref(),
+            Some("source_gap:upstream_connection_boundary")
+        );
+        assert!(!state.projection.load().ready);
+        assert!(matches!(
+            marketcow_api::stream_record("s", &record).unwrap().payload,
+            marketcow_api::StreamPayload::Event { .. }
+        ));
+        assert_eq!(
+            polymarket_stream_resync_reason(&record),
+            Some("upstream_projection_gap")
+        );
+    }
+
+    #[tokio::test]
+    async fn single_market_fault_is_local_and_recovers_from_two_token_atomic_snapshot() {
+        let (_dir, state) = test_state();
+        let live = two_market_dynamic_live();
+        {
+            let mut runtime = state.runtime.lock().await;
+            seed_polymarket_scope_catalog(&mut runtime, Some(&live)).unwrap();
+            state.projection.store(runtime.projection());
+        }
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(live.clone())));
+        assert!(polymarket_projection_ready(
+            &state,
+            &state.projection.load_full()
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app(server_state)).await.unwrap();
+        });
+        let (mut stream_client, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/v1/market-data/stream"))
+                .await
+                .unwrap();
+        let subscription = next_stream_frame(&mut stream_client).await;
+        let initial_boundary = subscription.cursor;
+        assert!(matches!(
+            subscription.payload,
+            marketcow_api::StreamPayload::Subscription { .. }
+        ));
+
+        let mut published = state.stream.subscribe();
+        let received_at = Utc::now();
+        let applied = apply_polymarket_transport_frames(
+            &state,
+            vec![marketcow_polymarket::RawTransportFrame {
+                raw_payload: json!({
+                    "event_type":"source_gap", "asset_id":"10",
+                    "reason":"injected_single_market_loss",
+                    "timestamp":received_at.timestamp_millis().to_string()
+                }),
+                received_at,
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied, 1);
+        let quarantined = published.recv().await.unwrap();
+        assert_eq!(
+            quarantined
+                .market
+                .as_ref()
+                .map(|market| market.market_id.as_str()),
+            Some("1")
+        );
+        assert!(matches!(
+            marketcow_api::stream_record("s", &quarantined).unwrap().payload,
+            marketcow_api::StreamPayload::MarketQuarantined { ref control }
+                if control.market_id == "1" && !control.full_sync_required
+        ));
+        let live_quarantine = next_stream_frame(&mut stream_client).await;
+        assert_eq!(live_quarantine.cursor, initial_boundary + 1);
+        assert!(matches!(
+            live_quarantine.payload,
+            marketcow_api::StreamPayload::MarketQuarantined { ref control }
+                if control.market_id == "1"
+        ));
+        let projection = state.projection.load_full();
+        assert!(polymarket_projection_ready(&state, &projection));
+        assert_eq!(projection.active_market_ids(), BTreeSet::from(["2".into()]));
+        assert!(projection.unresolved_gaps.is_empty());
+
+        let scope_response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/scope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(scope_response.status(), StatusCode::OK);
+        let scope: serde_json::Value = serde_json::from_slice(
+            &to_bytes(scope_response.into_body(), 256 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            scope["schema_version"],
+            "marketcow.polymarket.scope-discovery.v4"
+        );
+        assert_eq!(scope["market_count"], 1);
+        assert_eq!(scope["token_count"], 2);
+        assert_eq!(scope["active_market_ids"], json!(["2"]));
+        assert_eq!(scope["quarantined_market_ids"], json!(["1"]));
+
+        let full_response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/full-sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full_response.status(), StatusCode::OK);
+        let full: serde_json::Value = serde_json::from_slice(
+            &to_bytes(full_response.into_body(), 512 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(full["snapshot"]["markets"].as_array().unwrap().len(), 1);
+        assert_eq!(full["snapshot"]["books"].as_array().unwrap().len(), 2);
+        assert_eq!(full["health"]["quarantined_market_count"], 1);
+
+        let held_market_response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/live/markets/1/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(held_market_response.status(), StatusCode::OK);
+        let held_market: serde_json::Value = serde_json::from_slice(
+            &to_bytes(held_market_response.into_body(), 256 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(held_market["market"]["market_id"], "1");
+        assert_eq!(held_market["books"].as_array().unwrap().len(), 2);
+        assert_eq!(held_market["usable_for_new_opportunities"], false);
+        assert_eq!(held_market["stable_identity_for_position_monitoring"], true);
+
+        let healthy_event_at = Utc::now();
+        apply_polymarket_transport_frames(
+            &state,
+            vec![marketcow_polymarket::RawTransportFrame {
+                raw_payload: json!({
+                    "event_type":"price_change",
+                    "timestamp":healthy_event_at.timestamp_millis().to_string(),
+                    "price_changes":[{
+                        "asset_id":"30", "side":"BUY", "price":"0.39", "size":"1",
+                        "best_bid":"0.40", "best_ask":"0.60"
+                    }]
+                }),
+                received_at: healthy_event_at,
+            }],
+        )
+        .await
+        .unwrap();
+        let healthy_record = published.recv().await.unwrap();
+        assert_eq!(
+            healthy_record
+                .market
+                .as_ref()
+                .map(|market| market.market_id.as_str()),
+            Some("2")
+        );
+        let live_healthy_event = next_stream_frame(&mut stream_client).await;
+        assert_eq!(live_healthy_event.cursor, initial_boundary + 2);
+        assert!(matches!(
+            live_healthy_event.payload,
+            marketcow_api::StreamPayload::Event { ref event }
+                if event.market_id.as_deref() == Some("2") && event.market_sequence.is_some()
+        ));
+
+        let recovery_frames = ["10", "20"]
+            .into_iter()
+            .map(|token_id| {
+                let received_at = Utc::now();
+                marketcow_polymarket::RawTransportFrame {
+                    raw_payload: json!({
+                        "event_type":"book", "asset_id":token_id, "tick_size":"0.01",
+                        "bids":[{"price":"0.40","size":"10"}],
+                        "asks":[{"price":"0.60","size":"10"}],
+                        "timestamp":received_at.timestamp_millis().to_string()
+                    }),
+                    received_at,
+                }
+            })
+            .collect::<Vec<_>>();
+        let recovery = recover_quarantined_polymarket_markets(&state, &live, &recovery_frames)
+            .await
+            .unwrap();
+        assert_eq!(recovery.attempted, 1);
+        assert_eq!(recovery.recovered, 1);
+        assert_eq!(recovery.rejected, 0);
+        let first_recovery = published.recv().await.unwrap();
+        let second_recovery = published.recv().await.unwrap();
+        assert!(matches!(
+            marketcow_api::stream_record("s", &first_recovery)
+                .unwrap()
+                .payload,
+            marketcow_api::StreamPayload::MarketRecoveryStarted { .. }
+        ));
+        assert!(matches!(
+            marketcow_api::stream_record("s", &second_recovery).unwrap().payload,
+            marketcow_api::StreamPayload::MarketRecovered { ref control }
+                if control.market_snapshot_required && !control.full_sync_required
+        ));
+        assert!(matches!(
+            next_stream_frame(&mut stream_client).await.payload,
+            marketcow_api::StreamPayload::MarketRecoveryStarted { .. }
+        ));
+        assert!(matches!(
+            next_stream_frame(&mut stream_client).await.payload,
+            marketcow_api::StreamPayload::MarketRecovered { .. }
+        ));
+        assert_eq!(
+            state.projection.load().active_market_ids(),
+            BTreeSet::from(["1".into(), "2".into()])
+        );
+
+        let boundary = state.projection.load().cursor;
+        let replay = polymarket_wal_replay_records(&state, boundary - 3, boundary)
+            .await
+            .unwrap();
+        assert_eq!(replay.len(), 3);
+        assert_eq!(replay.first().unwrap().event.cursor, boundary - 2);
+        assert_eq!(replay.last().unwrap().event.cursor, boundary);
+
+        let mut minimum_two = live;
+        minimum_two.universe.as_mut().unwrap().minimum_market_count = 2;
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(minimum_two)));
+        let below_minimum_at = Utc::now();
+        apply_polymarket_transport_frames(
+            &state,
+            vec![marketcow_polymarket::RawTransportFrame {
+                raw_payload: json!({
+                    "event_type":"source_gap", "asset_id":"10",
+                    "reason":"injected_below_minimum",
+                    "timestamp":below_minimum_at.timestamp_millis().to_string()
+                }),
+                received_at: below_minimum_at,
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(!polymarket_projection_ready(
+            &state,
+            &state.projection.load_full()
+        ));
+        assert!(matches!(
+            next_stream_frame(&mut stream_client).await.payload,
+            marketcow_api::StreamPayload::MarketQuarantined { .. }
+        ));
+        assert!(matches!(
+            next_stream_frame(&mut stream_client).await.payload,
+            marketcow_api::StreamPayload::GlobalResyncRequired {
+                ref reason,
+                full_sync_required: true,
+                ..
+            } if reason == "projection_unready_or_stale"
+        ));
+        server.abort();
     }
 
     fn write_dynamic_universe_scope(path: &Path, live: &PolymarketLiveConfig) -> String {
@@ -9186,7 +10074,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             scope_body["schema_version"],
-            "marketcow.polymarket.scope-discovery.v3"
+            "marketcow.polymarket.scope-discovery.v4"
         );
         assert_eq!(scope_body["universe_id"], universe_id);
         assert_eq!(scope_body["generation"], 2);
@@ -9209,7 +10097,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             full_sync["universe_schema_version"],
-            "marketcow.polymarket.universe.v1"
+            "marketcow.polymarket.universe.v2"
         );
         assert_eq!(full_sync["universe_generation"], 2);
         assert_eq!(
@@ -11508,9 +12396,10 @@ mod tests {
         let retired_resync = next_stream_frame(&mut retired_lineage).await;
         assert!(matches!(
             retired_resync.payload,
-            marketcow_api::StreamPayload::ResyncRequired {
+            marketcow_api::StreamPayload::GlobalResyncRequired {
                 ref reason,
                 retryable: true,
+                ..
             } if reason == "event_cursor_expired"
         ));
         let mut unavailable = (*state.projection.load_full()).clone();
@@ -11520,9 +12409,10 @@ mod tests {
         let resync = next_stream_frame(&mut resumed).await;
         assert!(matches!(
             resync.payload,
-            marketcow_api::StreamPayload::ResyncRequired {
+            marketcow_api::StreamPayload::GlobalResyncRequired {
                 ref reason,
                 retryable: true,
+                ..
             } if reason == "projection_unready_or_stale"
         ));
         let close = tokio::time::timeout(std::time::Duration::from_secs(2), resumed.next())

@@ -33,7 +33,7 @@ from scripts.migration.fetch_polymarket_dynamic_candidate_books import (
 SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh.v1"
 CONFIG_SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh-config.v1"
 ACTIVATION_SCHEMA_VERSION = "marketcow.polymarket.scope-activation.v1"
-SCOPE_SCHEMA_VERSION = "marketcow.polymarket.scope-discovery.v3"
+SCOPE_SCHEMA_VERSION = "marketcow.polymarket.scope-discovery.v4"
 
 
 @dataclass(frozen=True)
