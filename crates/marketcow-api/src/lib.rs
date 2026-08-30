@@ -573,7 +573,6 @@ mod tests {
                 changes: vec![],
                 best_bid: None,
                 best_ask: None,
-                bbo_observed: false,
             },
         );
         event.source.delayed = true;

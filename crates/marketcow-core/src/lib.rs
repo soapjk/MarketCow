@@ -341,10 +341,6 @@ pub enum EventKind {
         best_bid: Option<Price>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         best_ask: Option<Price>,
-        /// Distinguishes a legacy frame with no venue BBO from a frame where the venue explicitly
-        /// reported an empty side using its `bid=0` / `ask=1` sentinel values.
-        #[serde(default)]
-        bbo_observed: bool,
     },
     BestBidAsk {
         token_id: String,
@@ -919,6 +915,7 @@ impl<L: DurableLog> SingleWriter<L> {
         let mut applied = true;
         let mut rejected = None;
         let delayed_atomic_delta_superseded_by_book = event.source.delayed
+            && event.normalizer_version == "marketcow.polymarket.normalizer.v2"
             && matches!(event.kind, EventKind::AtomicDelta { .. })
             && next
                 .books
@@ -1145,7 +1142,6 @@ impl<L: DurableLog> SingleWriter<L> {
                     changes,
                     best_bid,
                     best_ask,
-                    bbo_observed,
                 } => {
                     if changes.is_empty()
                         || next.unresolved_gaps.contains(token_id)
@@ -1169,12 +1165,20 @@ impl<L: DurableLog> SingleWriter<L> {
                             book.apply_batch(changes, event.source_observed_at);
                         }
                         if applied {
-                            let invalid_source_quote = best_bid
+                            let corrected_bbo_semantics =
+                                event.normalizer_version == "marketcow.polymarket.normalizer.v2";
+                            let expected_bid = best_bid
                                 .as_ref()
-                                .zip(best_ask.as_ref())
+                                .filter(|price| !corrected_bbo_semantics || !price.is_zero());
+                            let expected_ask = best_ask
+                                .as_ref()
+                                .filter(|price| !corrected_bbo_semantics || !price.is_one());
+                            let bbo_observed = best_bid.is_some() || best_ask.is_some();
+                            let invalid_source_quote = expected_bid
+                                .zip(expected_ask)
                                 .is_some_and(|(bid, ask)| bid >= ask);
-                            if *bbo_observed {
-                                if let Some(expected) = best_bid.as_ref() {
+                            if bbo_observed {
+                                if let Some(expected) = expected_bid {
                                     // A venue BBO proves that any locally retained bid above it is
                                     // stale even when the incremental frame omitted that deletion.
                                     book.bids.retain(|price, _| price <= expected);
@@ -1182,7 +1186,7 @@ impl<L: DurableLog> SingleWriter<L> {
                                     // Polymarket reports an empty bid side as `best_bid=0`.
                                     book.bids.clear();
                                 }
-                                if let Some(expected) = best_ask.as_ref() {
+                                if let Some(expected) = expected_ask {
                                     // Likewise, asks below the venue BBO cannot remain in the atomic
                                     // post-frame projection.
                                     book.asks.retain(|price, _| price >= expected);
@@ -1193,9 +1197,8 @@ impl<L: DurableLog> SingleWriter<L> {
                             }
                             let projected_bid = book.bids.last_key_value().map(|(price, _)| price);
                             let projected_ask = book.asks.first_key_value().map(|(price, _)| price);
-                            let source_quote_mismatch = *bbo_observed
-                                && (projected_bid != best_bid.as_ref()
-                                    || projected_ask != best_ask.as_ref());
+                            let source_quote_mismatch = bbo_observed
+                                && (projected_bid != expected_bid || projected_ask != expected_ask);
                             if invalid_source_quote || source_quote_mismatch {
                                 next.unresolved_gaps.insert(token_id.clone());
                                 applied = false;

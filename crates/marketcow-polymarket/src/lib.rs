@@ -23,7 +23,7 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
-pub const NORMALIZER_VERSION: &str = "marketcow.polymarket.normalizer.v1";
+pub const NORMALIZER_VERSION: &str = "marketcow.polymarket.normalizer.v2";
 pub const CLOB_MARKET_STREAM_SOURCE_URL: &str =
     "https://ws-subscriptions-clob.polymarket.com/ws/market";
 
@@ -524,7 +524,6 @@ struct AtomicPriceChanges {
     changes: Vec<SideLevels>,
     best_bid: Option<Price>,
     best_ask: Option<Price>,
-    bbo_observed: bool,
 }
 
 pub fn normalize_frame(
@@ -707,11 +706,8 @@ pub fn normalize_frame_with_book_tick(
                 if best_bid_present != best_ask_present {
                     return Err(NormalizeError::MissingField("best_bid/best_ask"));
                 }
-                let bbo_observed = best_bid_present;
-                let best_bid =
-                    optional_price(item.get("best_bid"))?.filter(|price| !price.is_zero());
-                let best_ask =
-                    optional_price(item.get("best_ask"))?.filter(|price| !price.is_one());
+                let best_bid = optional_price(item.get("best_bid"))?;
+                let best_ask = optional_price(item.get("best_ask"))?;
                 if best_bid
                     .as_ref()
                     .zip(best_ask.as_ref())
@@ -725,12 +721,8 @@ pub fn normalize_frame_with_book_tick(
                         changes: Vec::new(),
                         best_bid: best_bid.clone(),
                         best_ask: best_ask.clone(),
-                        bbo_observed,
                     });
-                if entry.best_bid != best_bid
-                    || entry.best_ask != best_ask
-                    || entry.bbo_observed != bbo_observed
-                {
+                if entry.best_bid != best_bid || entry.best_ask != best_ask {
                     return Err(NormalizeError::InvalidLevels);
                 }
                 entry.changes.push(SideLevels {
@@ -755,7 +747,6 @@ pub fn normalize_frame_with_book_tick(
                             changes: atomic.changes,
                             best_bid: atomic.best_bid,
                             best_ask: atomic.best_ask,
-                            bbo_observed: atomic.bbo_observed,
                         },
                     ))
                 })
@@ -1095,7 +1086,6 @@ mod tests {
         let EventKind::AtomicDelta {
             ref best_bid,
             ref best_ask,
-            bbo_observed,
             ..
         } = event.kind
         else {
@@ -1103,7 +1093,6 @@ mod tests {
         };
         assert_eq!(best_bid.as_ref().unwrap().0.to_string(), "0.38");
         assert_eq!(best_ask.as_ref().unwrap().0.to_string(), "0.39");
-        assert!(bbo_observed);
 
         let outcome = writer.apply(event).unwrap();
         assert!(outcome.persisted.applied);
@@ -1136,15 +1125,13 @@ mod tests {
         let EventKind::AtomicDelta {
             ref best_bid,
             ref best_ask,
-            bbo_observed,
             ..
         } = event.kind
         else {
             panic!("expected atomic delta")
         };
-        assert!(bbo_observed);
-        assert!(best_bid.is_none());
-        assert!(best_ask.is_none());
+        assert!(best_bid.as_ref().unwrap().is_zero());
+        assert!(best_ask.as_ref().unwrap().is_one());
 
         let outcome = writer.apply(event).unwrap();
         assert!(outcome.persisted.applied);
@@ -1166,7 +1153,6 @@ mod tests {
             EventKind::AtomicDelta {
                 best_bid: None,
                 best_ask: None,
-                bbo_observed: false,
                 ..
             }
         ));
