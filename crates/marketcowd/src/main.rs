@@ -3353,12 +3353,17 @@ async fn apply_polymarket_transport_frames(
     for outcome in &published {
         let _ = state.stream.send(outcome.persisted.clone());
     }
-    if published
-        .iter()
-        .any(|outcome| !outcome.persisted.applied || outcome.persisted.fail_closed_reason.is_some())
-    {
-        // A durable projection rejection cannot heal through further deltas. Force a controlled
-        // reconnect so the venue supplies authoritative full books for the pinned token set.
+    if published.iter().any(|outcome| {
+        (!outcome.persisted.applied || outcome.persisted.fail_closed_reason.is_some())
+            && !matches!(
+                &outcome.persisted.event.kind,
+                marketcow_core::EventKind::SourceGap { .. }
+            )
+    }) {
+        // An incremental projection rejection cannot heal through further deltas. Force a
+        // controlled reconnect so the venue supplies authoritative full books. A SourceGap is
+        // itself the first half of that recovery protocol and must be followed by those books on
+        // the same connection rather than recursively restarting at the boundary.
         bail!("polymarket_projection_recovery_required");
     }
     if let Some(error) = failure {
