@@ -1,0 +1,36 @@
+{
+  "schema_version": "marketcow.polymarket.failure-analysis.v1",
+  "verdict": "failed",
+  "runtime_commit": "5a5c393db269f6c214a04d1f1b81f034a9938220",
+  "runtime_binary_sha256": "4caa990b038e649f37add161a8faf14ff7b280d36fe547552ffd8c36f8c818d3",
+  "observed_at": "2026-08-30T06:35:54Z",
+  "failed_gate": "strict_30_minute_stream_recovery",
+  "failures": [
+    "scope HTTP 200 while full-sync HTTP 503",
+    "WebSocket resync_required reason=projection_unready_or_stale",
+    "full-sync recovery probe HTTP 503"
+  ],
+  "root_cause": {
+    "classification": "authoritative_http_refresh_ws_queue_ordering_race",
+    "summary": "After 200 authoritative HTTP books were committed, WebSocket atomic deltas received before the refresh boundary were drained from the queue and applied to the newer books. Two deltas then failed best-bid/ask validation, opened durable gaps, and forced the live owner to reconnect fail-closed.",
+    "http_refresh_cursor_range": [1448786, 1448985],
+    "rejected_atomic_delta_cursors": [1449006, 1449007],
+    "rejection_reason": "best_bid_ask_source_mismatch",
+    "affected_token_ids": [
+      "114449433793804741152636616815602958764078116393062159633554356421277316208723",
+      "45054334791785955338129151496390506320914171997631804192679411510002144323106"
+    ]
+  },
+  "service_log_evidence": {
+    "path": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-refresh-5a5c393-v23-18872.log",
+    "refresh": "2026-08-30T06:35:53.160454Z refreshed_books=200",
+    "fail_closed": "2026-08-30T06:35:53.219774Z polymarket_projection_recovery_required",
+    "retry": "2026-08-30T06:35:54.253568Z retry_delay_ms=1000"
+  },
+  "raw_verifier_evidence": "artifacts/rust-python-migration/results/polymarket-5a5c393-stream-recovery-stability-30m-failed.json",
+  "safety": {
+    "failure_preserved": true,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  }
+}

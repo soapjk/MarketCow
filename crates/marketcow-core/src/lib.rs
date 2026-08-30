@@ -79,6 +79,8 @@ pub struct Book {
     pub tick_size: Option<Price>,
     pub tick_version: String,
     pub source_observed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authoritative_refresh_received_at: Option<DateTime<Utc>>,
     pub last_trade_price: Option<Price>,
     pub last_trade_observed_at: Option<DateTime<Utc>>,
 }
@@ -922,8 +924,17 @@ impl<L: DurableLog> SingleWriter<L> {
                 .get(event.kind.token_id())
                 .and_then(|book| book.source_observed_at)
                 .is_some_and(|book_at| event.source_observed_at <= book_at);
-        if event.source.missing || event.source.delayed && !delayed_atomic_delta_superseded_by_book
-        {
+        let queued_atomic_delta_superseded_by_refresh = event.normalizer_version
+            == "marketcow.polymarket.normalizer.v2"
+            && matches!(event.kind, EventKind::AtomicDelta { .. })
+            && next
+                .books
+                .get(event.kind.token_id())
+                .and_then(|book| book.authoritative_refresh_received_at)
+                .is_some_and(|refresh_at| event.received_at < refresh_at);
+        let atomic_delta_superseded_by_book =
+            delayed_atomic_delta_superseded_by_book || queued_atomic_delta_superseded_by_refresh;
+        if event.source.missing || event.source.delayed && !atomic_delta_superseded_by_book {
             next.unresolved_gaps.insert(event.kind.token_id().into());
             applied = false;
             rejected = Some(if event.source.missing {
@@ -931,10 +942,11 @@ impl<L: DurableLog> SingleWriter<L> {
             } else {
                 "source_data_delayed".into()
             });
-        } else if delayed_atomic_delta_superseded_by_book {
-            // The delayed frame is older than an already applied authoritative full book. Keep
-            // its durable cursor/evidence, but do not mutate the recovered projection or reopen
-            // the gap. The public API exposes this as an explicit no-op delta.
+        } else if atomic_delta_superseded_by_book {
+            // The frame is older than an already applied authoritative full book. This includes
+            // WS frames queued while a periodic HTTP snapshot was in flight. Keep its durable
+            // cursor/evidence, but do not mutate the newer projection or reopen the gap. The
+            // public API exposes this as an explicit no-op delta.
         } else {
             match &event.kind {
                 EventKind::CatalogSnapshot {
@@ -1093,6 +1105,9 @@ impl<L: DurableLog> SingleWriter<L> {
                             tick_version,
                             event.source_observed_at,
                         );
+                        book.authoritative_refresh_received_at = (event.source.source
+                            == "polymarket_clob_http")
+                            .then_some(event.received_at);
                         if book.crossed_or_locked() {
                             next.unresolved_gaps.insert(token_id.clone());
                             applied = false;

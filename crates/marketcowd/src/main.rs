@@ -11107,6 +11107,7 @@ mod tests {
         projection.books.insert(
             "yes".into(),
             marketcow_core::Book {
+                authoritative_refresh_received_at: None,
                 bids: [(
                     marketcow_core::Price::parse("0.4").unwrap(),
                     "2".parse().unwrap(),
@@ -11419,6 +11420,7 @@ mod tests {
         projection.books.insert(
             "yes".into(),
             marketcow_core::Book {
+                authoritative_refresh_received_at: None,
                 bids: [(
                     marketcow_core::Price::parse("0.4").unwrap(),
                     "1".parse().unwrap(),
