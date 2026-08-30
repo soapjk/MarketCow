@@ -1,0 +1,83 @@
+{
+  "schema_version": "marketcow.polymarket.restart-recovery-evidence.v1",
+  "recorded_at": "2026-08-30T20:08:04+08:00",
+  "passed": true,
+  "runtime": {
+    "base_url": "http://127.0.0.1:18872",
+    "commit": "f04ef635c7cb8beb07e83bf16226a36389117ee9",
+    "binary_sha256": "4caaf86b2a80034bc4cdad131c828be30b4c6a46ccbfbcc089d102e099daffae",
+    "launchd_label": "com.marketcow.rust-polymarket-clean-f04ef63-gen18-live",
+    "pre_restart_pid": 31068,
+    "post_restart_pid": 2578,
+    "generation": 18,
+    "real_order_submission_enabled": false
+  },
+  "pre_restart": {
+    "scope_boundary_cursor": 91155,
+    "full_sync_boundary_cursor": 91283,
+    "checkpoint_cursor": 89764,
+    "checkpoint_projection_sha256": "d4093e0290f5a0328bc3fb90a4157add454922c03d295414bcdb8553d184e0f4",
+    "checkpoint_wal_anchor_first_cursor": 89765,
+    "checkpoint_wal_anchor_header_sha256": "17ade8f435b131325b5f97db2a700195f4bdaf3836f37be24b0c511404bad7fb",
+    "wal_verified_last_cursor": 91389,
+    "wal_verdict": "ok"
+  },
+  "restart": {
+    "old_process_and_writer_lease_released_seconds_approx": 1,
+    "overlapping_writer_started": false,
+    "ready_seconds": 17,
+    "first_ready_cursor": 94033,
+    "cursor_not_regressed_below_checkpoint": true,
+    "cursor_advanced_beyond_pre_restart_wal": true
+  },
+  "post_restart": {
+    "scope_ready": true,
+    "scope_status": "ready",
+    "market_count": 100,
+    "token_count": 200,
+    "book_count": 200,
+    "negative_risk_relation_count": 5,
+    "catalog_revision": "efee86151894c0124cd830af4667cc4aa16ba1b4b83ae167f7b1531a3eba4c82",
+    "checkpoint_cursor": 99444,
+    "checkpoint_projection_sha256": "12c186c4f2ce59db9e08ec2fdbc9653d3dfec2e569488286ea3a632ffc3720af",
+    "checkpoint_wal_anchor_first_cursor": 99445,
+    "checkpoint_wal_anchor_header_sha256": "c1e10bcc09b6dd1f29ac6af1d53379da74bd8656dd6a4250f9fc4e7fda34a824",
+    "wal_verified_last_cursor": 103796,
+    "wal_verdict": "ok"
+  },
+  "multi_refresh_gate": {
+    "result": "artifacts/rust-python-migration/results/polymarket-f04ef63-generation18-streamfix-stability-12m.json",
+    "sha256": "1686d83f4b5b94989faf0ea7e58587c823029b2071a58bff5df98bf1760f9f82",
+    "elapsed_seconds": 720.0743427920097,
+    "samples": 661,
+    "events": 51620,
+    "first_boundary_cursor": 27804,
+    "last_boundary_cursor": 79409,
+    "failures": 0,
+    "cursor_discontinuities": 0,
+    "ordinary_gap_frames": 0,
+    "ordinary_unapplied_frames": 0,
+    "resync_reasons": {},
+    "universe_changes": 0,
+    "authoritative_rest_validation_events_observed": 3
+  },
+  "post_restart_gate": {
+    "result": "artifacts/rust-python-migration/results/polymarket-f04ef63-generation18-post-restart-smoke-60s.json",
+    "sha256": "22989bf9e584ad703649cf39d7a27451a0a7837847097e379ec46682f9a92834",
+    "elapsed_seconds": 60.121297708014026,
+    "events": 5278,
+    "failures": 0,
+    "resync_reasons": {},
+    "universe_changes": 0,
+    "expired_retired_cursor_verdict": "resync_required/event_cursor_expired",
+    "read_only_paths": "14/14 returned 404"
+  },
+  "next_gate": {
+    "label": "com.marketcow.verify-f04ef63-gen18-streamfix-30m-once",
+    "verifier_pid_at_launch": 3138,
+    "duration_seconds": 1800,
+    "keep_alive": false,
+    "result": "/tmp/marketcow-generation18-clean.rcdEVy/gen18-live-streamfix-30m.json",
+    "status_at_recording": "running"
+  }
+}
