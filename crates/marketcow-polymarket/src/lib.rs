@@ -1658,6 +1658,62 @@ mod tests {
     }
 
     #[test]
+    fn network_delivered_atomic_delta_with_older_source_boundary_is_an_auditable_noop() {
+        let mut tolerant = config();
+        tolerant.maximum_source_delay_ms = 10_000;
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        let mut refreshed = snapshot(1);
+        assert!(bind_full_book_refresh_identity(&mut refreshed));
+        refreshed.received_at += chrono::Duration::seconds(1);
+        refreshed.source_observed_at = refreshed.received_at;
+        writer.apply(refreshed).unwrap();
+        let mut normalized = normalize_frame(
+            &tolerant,
+            serde_json::json!({
+                "event_type":"price_change", "timestamp":"2026-08-03T04:00:02Z",
+                "price_changes":[
+                    {"asset_id":"yes-1","side":"BUY","price":"0.39","size":"10",
+                     "best_bid":"0.39","best_ask":"0.42"}
+                ]
+            }),
+            at(),
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        normalized.received_at += chrono::Duration::seconds(2);
+        assert!(!normalized.source.delayed);
+        assert!(
+            normalized.received_at
+                > writer.projection().books["yes-1"]
+                    .authoritative_refresh_received_at
+                    .unwrap()
+        );
+        assert!(
+            normalized.source_observed_at
+                < writer.projection().books["yes-1"]
+                    .source_observed_at
+                    .unwrap()
+        );
+
+        let outcome = writer.apply(normalized).unwrap();
+        assert!(outcome.persisted.applied);
+        assert_eq!(outcome.persisted.fail_closed_reason, None);
+        assert_eq!(
+            outcome.projection.books["yes-1"]
+                .bids
+                .last_key_value()
+                .unwrap()
+                .0
+                .0
+                .to_string(),
+            "0.4"
+        );
+        assert!(outcome.projection.ready);
+        assert!(!outcome.projection.unresolved_gaps.contains("yes-1"));
+    }
+
+    #[test]
     fn quiet_market_full_book_freshness_is_anchored_to_receipt() {
         let mut strict = config();
         strict.maximum_source_delay_ms = 1_000;

@@ -927,11 +927,15 @@ impl<L: DurableLog> SingleWriter<L> {
         let queued_atomic_delta_superseded_by_refresh = event.normalizer_version
             == "marketcow.polymarket.normalizer.v2"
             && matches!(event.kind, EventKind::AtomicDelta { .. })
-            && next
-                .books
-                .get(event.kind.token_id())
-                .and_then(|book| book.authoritative_refresh_received_at)
-                .is_some_and(|refresh_at| event.received_at < refresh_at);
+            && next.books.get(event.kind.token_id()).is_some_and(|book| {
+                book.authoritative_refresh_received_at
+                    .is_some_and(|refresh_at| {
+                        event.received_at < refresh_at
+                            || book
+                                .source_observed_at
+                                .is_some_and(|book_at| event.source_observed_at < book_at)
+                    })
+            });
         let atomic_delta_superseded_by_book =
             delayed_atomic_delta_superseded_by_book || queued_atomic_delta_superseded_by_refresh;
         if event.source.missing || event.source.delayed && !atomic_delta_superseded_by_book {

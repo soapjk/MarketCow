@@ -1,0 +1,34 @@
+{
+  "schema_version": "marketcow.polymarket.failure-analysis.v1",
+  "verdict": "failed",
+  "runtime_commit": "89579a1a4f5c5a3fbe8ac42fade14950a873a8a3",
+  "runtime_binary_sha256": "6b7755c2621b1a932a7bb413b8910d186e6c6213e78897458ad054ddd99e5e12",
+  "failed_gate": "strict_12_minute_stream_recovery",
+  "observed_at": "2026-08-30T06:54:17Z",
+  "failures": [
+    "WebSocket resync_required reason=projection_unready_or_stale",
+    "full-sync HTTP 503"
+  ],
+  "root_cause": {
+    "classification": "authoritative_http_refresh_network_delivery_ordering_race",
+    "summary": "The first ingress-queued WebSocket frame was correctly retained as an applied no-op. A second frame arrived roughly one millisecond after the HTTP refresh receipt while carrying an older venue observation timestamp, bypassed the receipt-only fence, and failed BBO validation against the newer authoritative books.",
+    "refresh_received_at": "2026-08-30T06:54:15.937397Z",
+    "refresh_last_cursor": 1515777,
+    "first_correctly_fenced_ws_cursors": [1515778, 1515779],
+    "rejected_ws_received_at": "2026-08-30T06:54:15.938448Z",
+    "rejected_ws_source_observed_at": "2026-08-30T06:54:15.922Z",
+    "rejected_ws_cursors": [1515878, 1515879],
+    "rejection_reason": "best_bid_ask_source_mismatch",
+    "affected_token_ids": [
+      "12767765616920589565062438904358677497090798471382328663954564139295400346923",
+      "16761048781816001813741494528202648670168724379644245951857829460168400316547"
+    ]
+  },
+  "raw_verifier_evidence": "artifacts/rust-python-migration/results/polymarket-89579a1-streamfix-stability-12m-failed.json",
+  "safety": {
+    "failure_preserved": true,
+    "full_sync_failed_closed": true,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  }
+}
