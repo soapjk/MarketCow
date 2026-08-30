@@ -1,0 +1,107 @@
+{
+  "schema_version": "marketcow.polymarket.one-sided-universe-fix-evidence.v1",
+  "verdict": "passed_with_preserved_recovery_tooling_failure",
+  "observed_at": "2026-08-30T13:55:39Z",
+  "failure_preserved": {
+    "runtime_pid": 41775,
+    "generation": 18,
+    "incorrect_ready": true,
+    "tradude_samples": 5,
+    "tradude_cursor_start": 399558,
+    "tradude_cursor_end": 400190,
+    "affected_market_ids": [
+      "2253999",
+      "3145217"
+    ],
+    "direct_reproduction": {
+      "market_id": "3145217",
+      "yes_token_bid_levels": 33,
+      "yes_token_ask_levels": 0,
+      "no_token_bid_levels": 0,
+      "no_token_ask_levels": 33
+    },
+    "root_cause": "dynamic-universe activation validated only initial books; subsequent authoritative full-book updates did not include active-market two-sidedness in Projection.ready, and the refresh controller could not build a replacement while /full-sync was fail-closed"
+  },
+  "implementation": {
+    "commit": "581fd1d06ef5a14d21b33897de81cd088c099b17",
+    "binary_path": "/tmp/marketcow-generation18-clean.rcdEVy/marketcow-581fd1d",
+    "binary_sha256": "6918c5c42d5b225925f30a04864d7eee79861548b4bd003a0390537bbc23bc4d",
+    "runtime_pid": 61812,
+    "launchd_label": "com.marketcow.rust-polymarket-581fd1d-gen18-live",
+    "runtime_changes": [
+      "every active outcome token must retain nonempty bids and asks before Projection.ready can be true",
+      "the public readiness boundary independently rechecks two-sidedness so a legacy checkpoint ready bit cannot expose an invalid full-sync",
+      "an unready but internally coherent scope can seed only previous membership identity; replacement books are fetched independently and activation still requires activated_ready",
+      "membership is rechecked immediately before activation to reject concurrent generation mixing"
+    ]
+  },
+  "live_transitions": [
+    {
+      "old_generation": 18,
+      "new_generation": 19,
+      "removed_markets": ["3145217"],
+      "added_markets": ["3257332"],
+      "recovery_from_unready": true,
+      "activation_status": "activated_ready",
+      "boundary_cursor": 519607
+    },
+    {
+      "old_generation": 19,
+      "new_generation": 20,
+      "removed_markets": ["3017684"],
+      "added_markets": ["3257334"],
+      "recovery_from_unready": true,
+      "activation_status": "activated_ready",
+      "boundary_cursor": 527536
+    }
+  ],
+  "live_gate": {
+    "generation": 20,
+    "ready": true,
+    "market_count": 100,
+    "book_count": 200,
+    "relation_count": 5,
+    "one_sided_book_count": 0,
+    "tick_mismatch_count": 0,
+    "unresolved_gap_count": 0,
+    "maximum_capital_lock_seconds": 2592000,
+    "duration_seconds": 60.228261000011116,
+    "stream_events": 3690,
+    "cursor_discontinuities": 0,
+    "resync_reasons": {},
+    "expired_cursor_resync": true,
+    "read_only_404_path_count": 14,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  },
+  "tests": {
+    "cargo_test_workspace": {
+      "passed": 184,
+      "failed": 0,
+      "ignored_external_database": 5
+    },
+    "cargo_clippy_workspace_all_targets_deny_warnings": "passed",
+    "python_focused": {
+      "passed": 24,
+      "failed": 0
+    }
+  },
+  "recovery_evidence": {
+    "strict_static_tool_passed": false,
+    "failure_preserved": "the live clone contained four valid post-checkpoint WAL records, so the static-soak verifier's equality-to-checkpoint assertions failed",
+    "checkpoint_cursor": 537131,
+    "wal_verified": true,
+    "wal_last_cursor": 537135,
+    "isolated_recovered_daemon_ready": true,
+    "isolated_recovered_full_sync_cursor": 537135,
+    "isolated_recovered_book_count": 200,
+    "isolated_recovered_unresolved_gap_count": 0,
+    "interpretation": "replay correctly recovered checkpoint plus WAL tail; the preserved failure is a verifier assumption mismatch, not a WAL or recovery failure"
+  },
+  "evidence_files": [
+    "artifacts/rust-python-migration/results/polymarket-581fd1d-generation18-runtime-fail-closed.json",
+    "artifacts/rust-python-migration/results/polymarket-581fd1d-generation20-auto-refresh-result.json",
+    "artifacts/rust-python-migration/results/polymarket-581fd1d-one-sided-hot-replacement-60s.json",
+    "artifacts/rust-python-migration/results/polymarket-581fd1d-recovery-static-tooling-failure.json"
+  ]
+}
