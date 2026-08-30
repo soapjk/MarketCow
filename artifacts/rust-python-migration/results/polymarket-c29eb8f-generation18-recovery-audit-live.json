@@ -1,0 +1,78 @@
+{
+  "schema_version": "marketcow.polymarket.recovery-audit-live-evidence.v1",
+  "recorded_at": "2026-08-30T21:10:12+08:00",
+  "passed": true,
+  "runtime": {
+    "base_url": "http://127.0.0.1:18872",
+    "pid": 41775,
+    "commit": "c29eb8f7691ba41db22b8de3f2790bc5a0a85a43",
+    "binary_sha256": "feba546cf36ab686b6e9a9a951bb6961ef40ad8aad4aa38c405a77f9707436e9",
+    "launchd_label": "com.marketcow.rust-polymarket-c29eb8f-gen18-live",
+    "generation": 18,
+    "ready_seconds_after_restart": 26,
+    "first_ready_cursor": 354765,
+    "real_order_submission_enabled": false
+  },
+  "change": {
+    "classification": "observability_and_audit_boundary",
+    "behavior": "connection-level causal uncertainty continues to fail closed and recover from authoritative WebSocket full books",
+    "periodic_http_snapshot_used_for_repair": false,
+    "new_audit_fields": [
+      "recovery_scope",
+      "reason_codes",
+      "affected_token_ids",
+      "affected_market_ids",
+      "affected_token_count",
+      "affected_market_count",
+      "maximum_observed_source_delay_ms",
+      "first_cursor",
+      "last_cursor",
+      "action"
+    ]
+  },
+  "live_smoke": {
+    "result": "artifacts/rust-python-migration/results/polymarket-c29eb8f-generation18-recovery-audit-smoke-60s.json",
+    "sha256": "ed7496549686be462829b8b3caf06fc5ffc0cccd74aeae8f8f0fe58760d8a7a9",
+    "elapsed_seconds": 60.16191916700336,
+    "events": 3909,
+    "failures": 0,
+    "cursor_discontinuities": 0,
+    "ordinary_gap_frames": 0,
+    "ordinary_unapplied_frames": 0,
+    "resync_reasons": {},
+    "universe_changes": 0,
+    "market_count": 100,
+    "book_count": 200,
+    "negative_risk_relation_count": 5,
+    "full_sync_boundary_cursor": 361224,
+    "unresolved_gap_count": 0,
+    "expired_retired_cursor": "resync_required/event_cursor_expired",
+    "read_only_paths": "14/14 returned 404"
+  },
+  "durability": {
+    "checkpoint_cursor": 358896,
+    "checkpoint_projection_sha256": "0f8b81a032b867c0b9e99677866255574ccff8bea076de9b28b08076a152c014",
+    "checkpoint_wal_anchor_first_cursor": 358897,
+    "checkpoint_wal_anchor_header_sha256": "65d8ab41ad28cf05f1bbdbe7c2147db1d949062b7472c268e29d93b920570e4b",
+    "wal_verified_last_cursor": 361663,
+    "wal_verdict": "ok"
+  },
+  "verification": [
+    {
+      "command": "cargo test --workspace",
+      "result": "passed; 182 tests passed, 5 external-database integration tests ignored, 0 failed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test -p marketcowd delayed_polymarket_frame_records_machine_readable_connection_recovery",
+      "result": "passed"
+    }
+  ],
+  "scheduling": {
+    "automation_used": false,
+    "verification_mode": "direct bounded foreground gate"
+  }
+}
