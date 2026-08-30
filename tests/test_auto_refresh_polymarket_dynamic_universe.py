@@ -66,6 +66,23 @@ class Session:
         }
 
     def get(self, url, **_kwargs):
+        if "/live/markets/" in url and url.endswith("/snapshot"):
+            market_id = url.rsplit("/", 2)[-2]
+            return Response(200, {
+                "schema_version": "marketcow.polymarket.market-snapshot.v1",
+                "scan_universe_membership": True,
+                "stable_identity_for_position_monitoring": True,
+                "usable_for_new_opportunities": False,
+                "market": {
+                    "market_id": market_id,
+                    "condition_id": "0x" + "3" * 64,
+                    "outcomes": [
+                        {"token_id": "31", "outcome": "Yes", "instrument_id": "YES"},
+                        {"token_id": "32", "outcome": "No", "instrument_id": "NO"},
+                    ],
+                    "instrument_facts": {"end_at": "2026-08-31T00:00:00Z"},
+                },
+            })
         if url.endswith("/scope"):
             return Response(200, self._scope())
         if not self.ready:
@@ -244,7 +261,7 @@ def test_below_target_quarantine_view_is_automatically_replenished(tmp_path, mon
     candidate["universe"].update({
         "active_markets": [IDENTITY, replacement],
         "added_markets": ["2"],
-        "removed_markets": [],
+        "removed_markets": ["retired-bad-market"],
     })
     config = _config(tmp_path)
     config = RefreshConfig(**{**config.__dict__, "target_market_count": 2})
@@ -257,7 +274,115 @@ def test_below_target_quarantine_view_is_automatically_replenished(tmp_path, mon
     )
     assert result["status"] == "activated_ready"
     assert result["added_markets"] == ["2"]
-    assert result["removed_markets"] == []
+    assert result["removed_markets"] == ["retired-bad-market"]
+    assert len(session.posts) == 1
+
+
+def test_concurrent_quarantine_does_not_mix_or_invalidate_configured_generation(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MARKETCOW_RUST_ADMIN_TOKEN", "secret")
+    second = {
+        **IDENTITY,
+        "market_id": "2",
+        "condition_id": "0x" + "2" * 64,
+        "token_ids": ["21", "22"],
+    }
+    replacement = {
+        **IDENTITY,
+        "market_id": "3",
+        "condition_id": "0x" + "3" * 64,
+        "token_ids": ["31", "32"],
+    }
+
+    class ConcurrentQuarantineSession(Session):
+        quarantined_during_build = False
+
+        def _scope(self) -> dict:
+            scope = super()._scope()
+            if self.generation == 2:
+                active = [IDENTITY, replacement]
+                quarantined = []
+            elif self.quarantined_during_build:
+                active = [IDENTITY]
+                quarantined = ["2"]
+            else:
+                active = [IDENTITY, second]
+                quarantined = []
+            scope.update({
+                "market_count": len(active),
+                "token_count": len(active) * 2,
+                "active_markets": active,
+                "active_market_ids": [value["market_id"] for value in active],
+                "quarantined_market_ids": quarantined,
+                "target_market_count": 2,
+                "minimum_market_count": 1,
+            })
+            return scope
+
+        def _full(self) -> dict:
+            scope = self._scope()
+            return {
+                "scope_id": scope["active_scope_id"],
+                "universe_id": scope["universe_id"],
+                "universe_generation": scope["generation"],
+                "universe": {
+                    "generation": scope["generation"],
+                    "active_markets": scope["active_markets"],
+                },
+                "snapshot": {
+                    "books": [{} for _ in range(scope["token_count"])],
+                    "markets": [{} for _ in range(scope["market_count"])],
+                    "unresolved_gaps": [],
+                },
+            }
+
+        def get(self, url, **kwargs):
+            if "/live/markets/2/snapshot" in url:
+                return Response(200, {
+                    "scan_universe_membership": True,
+                    "stable_identity_for_position_monitoring": True,
+                    "market": {
+                        "market_id": "2",
+                        "condition_id": second["condition_id"],
+                        "outcomes": [
+                            {"token_id": "21", "outcome": "Yes"},
+                            {"token_id": "22", "outcome": "No"},
+                        ],
+                        "instrument_facts": {"end_at": second["end_at"]},
+                    },
+                })
+            return super().get(url, **kwargs)
+
+    candidate = _candidate(IDENTITY)
+    candidate.update({
+        "market_count": 2,
+        "token_count": 4,
+        "market_ids": ["1", "3"],
+        "token_ids": ["11", "12", "31", "32"],
+    })
+    candidate["universe"].update({
+        "active_markets": [IDENTITY, replacement],
+        "added_markets": ["3"],
+        "removed_markets": ["2"],
+    })
+    session = ConcurrentQuarantineSession(changed=True)
+
+    def build_candidate(*_args, **_kwargs):
+        session.quarantined_during_build = True
+        return candidate
+
+    config = _config(tmp_path)
+    config = RefreshConfig(**{**config.__dict__, "target_market_count": 2})
+    result = refresh_once(
+        config,
+        session=session,
+        book_snapshot_builder=_books,
+        universe_builder=build_candidate,
+    )
+    assert result["status"] == "activated_ready"
+    assert result["added_markets"] == ["3"]
+    assert result["removed_markets"] == ["2"]
     assert len(session.posts) == 1
 
 

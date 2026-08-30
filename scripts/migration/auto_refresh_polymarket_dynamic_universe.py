@@ -240,6 +240,58 @@ def _read_ready_boundary(
     raise last_error or RuntimeError("live boundary unavailable")
 
 
+def _configured_market_identities(
+    config: RefreshConfig, session: Any, scope: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Reconstruct the configured generation, not only its currently executable subset.
+
+    Scope v4 deliberately removes quarantined markets from `active_markets`. Universe delta
+    validation, however, is relative to the complete configured generation. The read-only
+    per-market snapshot retains the exact stable identity needed to include every quarantined
+    member in that baseline without reusing its book for opportunities.
+    """
+    identities = [dict(value) for value in scope.get("active_markets") or []]
+    active_ids = {str(value.get("market_id")) for value in identities}
+    quarantined = sorted(map(str, scope.get("quarantined_market_ids") or []))
+    if active_ids.intersection(quarantined):
+        raise RuntimeError("quarantined market is also present in the active universe")
+    for market_id in quarantined:
+        status, payload = _get_json(
+            session,
+            f"{config.service_url}/v1/prediction-markets/polymarket/live/markets/{market_id}/snapshot",
+            config.request_timeout_seconds,
+        )
+        market = payload.get("market") or {}
+        facts = market.get("instrument_facts") or {}
+        outcomes = market.get("outcomes") or []
+        token_ids = [str(value.get("token_id", "")) for value in outcomes]
+        if (
+            status != 200
+            or payload.get("stable_identity_for_position_monitoring") is not True
+            or payload.get("scan_universe_membership") is not True
+            or str(market.get("market_id")) != market_id
+            or not market.get("condition_id")
+            or len(token_ids) != 2
+            or len(set(token_ids)) != 2
+            or any(not value for value in token_ids)
+            or not facts.get("end_at")
+        ):
+            raise RuntimeError(
+                f"quarantined market identity is unavailable: market_id={market_id}"
+            )
+        identities.append(
+            {
+                "market_id": market_id,
+                "condition_id": str(market["condition_id"]),
+                "token_ids": token_ids,
+                "end_at": str(facts["end_at"]),
+            }
+        )
+    if len(_identity_set(identities)) != len(identities):
+        raise RuntimeError("configured market identities are duplicated")
+    return identities
+
+
 def _activate(
     config: RefreshConfig,
     session: Any,
@@ -307,7 +359,7 @@ def refresh_once(
     recovery_from_unready = scope.get("ready") is not True
     universe_id = scope["universe_id"]
     current_generation = int(scope["generation"])
-    current_identities = scope["active_markets"]
+    current_identities = _configured_market_identities(config, session, scope)
     next_generation = current_generation + 1
     config.work_root.mkdir(parents=True, exist_ok=True)
     books_path = config.work_root / f"generation-{next_generation:020d}-candidate-books.json"
@@ -339,11 +391,11 @@ def refresh_once(
     latest_scope, _ = _read_ready_boundary(
         config, session, allow_unready_identity=True
     )
+    latest_identities = _configured_market_identities(config, session, latest_scope)
     if (
         latest_scope.get("universe_id") != universe_id
         or int(latest_scope.get("generation", -1)) != current_generation
-        or _identity_set(latest_scope.get("active_markets", []))
-        != _identity_set(current_identities)
+        or _identity_set(latest_identities) != _identity_set(current_identities)
     ):
         raise RuntimeError("live universe changed while candidate was being built")
     result: dict[str, Any] = {
