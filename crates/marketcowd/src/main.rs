@@ -53,6 +53,9 @@ const POLYMARKET_TRANSPORT_CHANNEL_CAPACITY: usize = 16_384;
 const POLYMARKET_RECENT_EVENT_CAPACITY: usize = 100_000;
 const POLYMARKET_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const POLYMARKET_TRANSPORT_RESTART_DELAY: Duration = Duration::from_secs(1);
+const POLYMARKET_BOOK_REFRESH_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const POLYMARKET_BOOK_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+const POLYMARKET_BOOK_REFRESH_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 const HYPERLIQUID_TRANSPORT_CHANNEL_CAPACITY: usize = 64;
 const HYPERLIQUID_GATEWAY_CHANNEL_CAPACITY: usize = 4_096;
 const HYPERLIQUID_PUBLIC_CHANNEL_CAPACITY: usize = 4_096;
@@ -2949,6 +2952,19 @@ fn start_polymarket_live(
         .as_deref()
         .cloned()?;
     Some(tokio::spawn(async move {
+        let refresh_client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(POLYMARKET_BOOK_REFRESH_TIMEOUT)
+            .https_only(true)
+            .user_agent("MarketCow-Rust/Polymarket-authoritative-book-refresh")
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(error=%error, "polymarket_book_refresh_client_failed_closed");
+                return;
+            }
+        };
         'service: loop {
             let (sender, mut receiver) = mpsc::channel(POLYMARKET_TRANSPORT_CHANNEL_CAPACITY);
             let (transport_shutdown_tx, transport_shutdown_rx) = watch::channel(false);
@@ -2966,6 +2982,11 @@ fn start_polymarket_live(
             let mut checkpoint_tick = tokio::time::interval(POLYMARKET_CHECKPOINT_INTERVAL);
             checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             checkpoint_tick.tick().await;
+            let refresh_interval =
+                polymarket_book_refresh_interval(state.config.maximum_book_age_ms);
+            let mut refresh_tick = tokio::time::interval(refresh_interval);
+            refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            refresh_tick.tick().await;
             loop {
                 tokio::select! {
                     changed = shutdown.changed() => {
@@ -3098,10 +3119,180 @@ fn start_polymarket_live(
                             events_since_checkpoint = 0;
                         }
                     }
+                    _ = refresh_tick.tick() => {
+                        match fetch_polymarket_book_refreshes(&refresh_client, &live.token_ids).await {
+                            Ok(frames) => match apply_polymarket_book_refreshes(&state, frames).await {
+                                Ok(events) => {
+                                    events_since_checkpoint += events;
+                                    info!(
+                                        refreshed_books=events,
+                                        interval_ms=refresh_interval.as_millis(),
+                                        "polymarket_authoritative_books_refreshed"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(error=%error, "polymarket_book_refresh_owner_failed_closed");
+                                    let _ = transport_shutdown_tx.send(true);
+                                    let _ = (&mut transport).await;
+                                    let _ = checkpoint_polymarket_runtime(&state).await;
+                                    match wait_for_polymarket_retry_or_scope_recovery(
+                                        &state,
+                                        &live,
+                                        &mut shutdown,
+                                        &mut scope_switches,
+                                        POLYMARKET_TRANSPORT_RESTART_DELAY,
+                                    )
+                                    .await
+                                    {
+                                        Some(activated) => {
+                                            live = activated;
+                                            continue 'service;
+                                        }
+                                        None => break 'service,
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                // A transient HTTP failure never fabricates freshness. The last
+                                // verified books remain published and the existing age gate will
+                                // fail closed if retries cannot refresh them before expiry.
+                                warn!(error=%error, "polymarket_book_refresh_retryable_failure");
+                            }
+                        }
+                    }
                 }
             }
         }
     }))
+}
+
+fn polymarket_book_refresh_interval(maximum_book_age_ms: u64) -> Duration {
+    let quarter_age_ms = maximum_book_age_ms
+        .saturating_add(3)
+        .saturating_div(4)
+        .max(1);
+    Duration::from_millis(quarter_age_ms).min(POLYMARKET_BOOK_REFRESH_MAX_INTERVAL)
+}
+
+async fn fetch_polymarket_book_refreshes(
+    client: &reqwest::Client,
+    token_ids: &[String],
+) -> Result<Vec<marketcow_polymarket::RawTransportFrame>> {
+    if token_ids.is_empty() || token_ids.len() > 500 {
+        bail!("Polymarket book refresh token scope is invalid");
+    }
+    let request = token_ids
+        .iter()
+        .map(|token_id| json!({"token_id":token_id}))
+        .collect::<Vec<_>>();
+    let response = client
+        .post(marketcow_polymarket::CLOB_BOOK_SNAPSHOT_SOURCE_URL)
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > POLYMARKET_BOOK_REFRESH_MAX_RESPONSE_BYTES)
+    {
+        bail!("Polymarket book refresh response exceeds the bounded limit");
+    }
+    let bytes = response.bytes().await?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > POLYMARKET_BOOK_REFRESH_MAX_RESPONSE_BYTES {
+        bail!("Polymarket book refresh response exceeds the bounded limit");
+    }
+    validate_polymarket_book_refresh_response(
+        serde_json::from_slice(&bytes)?,
+        token_ids,
+        Utc::now(),
+    )
+}
+
+fn validate_polymarket_book_refresh_response(
+    payload: serde_json::Value,
+    token_ids: &[String],
+    received_at: DateTime<Utc>,
+) -> Result<Vec<marketcow_polymarket::RawTransportFrame>> {
+    let requested = token_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if requested.len() != token_ids.len()
+        || requested.iter().any(|token| {
+            token.is_empty()
+                || token.len() > 128
+                || !token.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        bail!("Polymarket book refresh token scope is invalid");
+    }
+    let books = payload
+        .as_array()
+        .context("Polymarket book refresh response must be an array")?;
+    let mut validated = BTreeMap::new();
+    for value in books {
+        let mut book = value
+            .as_object()
+            .cloned()
+            .context("Polymarket book refresh item must be an object")?;
+        let token_id = book
+            .get("asset_id")
+            .and_then(serde_json::Value::as_str)
+            .context("Polymarket book refresh asset_id must be a string")?
+            .to_owned();
+        if !requested.contains(&token_id) || validated.contains_key(&token_id) {
+            bail!("Polymarket book refresh returned unexpected or duplicate token");
+        }
+        let timestamp = book
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .context("Polymarket book refresh timestamp must be an exact string")?;
+        if timestamp.is_empty() || !timestamp.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("Polymarket book refresh timestamp is invalid");
+        }
+        validate_polymarket_book_refresh_decimal(book.get("tick_size"), "tick_size")?;
+        for side in ["bids", "asks"] {
+            let levels = book
+                .get(side)
+                .and_then(serde_json::Value::as_array)
+                .with_context(|| format!("Polymarket book refresh {side} must be an array"))?;
+            for level in levels {
+                let level = level
+                    .as_object()
+                    .context("Polymarket book refresh level must be an object")?;
+                validate_polymarket_book_refresh_decimal(level.get("price"), "price")?;
+                validate_polymarket_book_refresh_decimal(level.get("size"), "size")?;
+            }
+        }
+        book.insert(
+            "event_type".into(),
+            serde_json::Value::String("book".into()),
+        );
+        validated.insert(
+            token_id,
+            marketcow_polymarket::RawTransportFrame {
+                raw_payload: serde_json::Value::Object(book),
+                received_at,
+            },
+        );
+    }
+    if validated.keys().cloned().collect::<BTreeSet<_>>() != requested {
+        bail!("Polymarket book refresh response is missing requested tokens");
+    }
+    Ok(validated.into_values().collect())
+}
+
+fn validate_polymarket_book_refresh_decimal(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+) -> Result<()> {
+    let text = value
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("Polymarket book refresh {field} must be an exact string"))?;
+    let decimal = text
+        .parse::<rust_decimal::Decimal>()
+        .with_context(|| format!("Polymarket book refresh {field} is invalid"))?;
+    if decimal <= rust_decimal::Decimal::ZERO {
+        bail!("Polymarket book refresh {field} must be positive");
+    }
+    Ok(())
 }
 
 async fn commit_polymarket_scope_switch(
@@ -3368,6 +3559,32 @@ async fn apply_polymarket_transport_frames(
     }
     if let Some(error) = failure {
         return Err(error.into());
+    }
+    Ok(published.len())
+}
+
+async fn apply_polymarket_book_refreshes(
+    state: &AppState,
+    frames: Vec<marketcow_polymarket::RawTransportFrame>,
+) -> Result<usize> {
+    if frames.is_empty() {
+        bail!("Polymarket authoritative book refresh emitted an empty batch");
+    }
+    let mut runtime = state.runtime.lock().await;
+    let mut published = Vec::with_capacity(frames.len());
+    for frame in frames {
+        published.extend(runtime.apply_full_book_refresh(frame.raw_payload, frame.received_at)?);
+    }
+    if published
+        .iter()
+        .any(|outcome| !outcome.persisted.applied || outcome.persisted.fail_closed_reason.is_some())
+    {
+        bail!("Polymarket authoritative book refresh was rejected");
+    }
+    state.projection.store(runtime.projection());
+    drop(runtime);
+    for outcome in &published {
+        let _ = state.stream.send(outcome.persisted.clone());
     }
     Ok(published.len())
 }
@@ -11367,5 +11584,58 @@ mod tests {
             marketcow_runtime::PolymarketRuntime::open(runtime_config(&config, &revision)).unwrap();
         assert_eq!(recovered.projection().cursor, 4);
         assert!(recovered.projection().ready);
+    }
+
+    #[test]
+    fn authoritative_book_refresh_is_bounded_well_inside_the_age_gate() {
+        assert_eq!(
+            polymarket_book_refresh_interval(3_600_000),
+            Duration::from_secs(5 * 60)
+        );
+        assert_eq!(
+            polymarket_book_refresh_interval(30_000),
+            Duration::from_millis(7_500)
+        );
+        assert_eq!(
+            polymarket_book_refresh_interval(1),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn authoritative_book_refresh_requires_one_exact_book_per_token() {
+        let received_at = Utc::now();
+        let tokens = vec!["2".to_string(), "1".to_string()];
+        let book = |token: &str| {
+            json!({
+                "asset_id":token,
+                "timestamp":"1788069600000",
+                "tick_size":"0.01",
+                "bids":[{"price":"0.40","size":"10"}],
+                "asks":[{"price":"0.60","size":"11"}]
+            })
+        };
+        let frames = validate_polymarket_book_refresh_response(
+            json!([book("2"), book("1")]),
+            &tokens,
+            received_at,
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].raw_payload["asset_id"], "1");
+        assert_eq!(frames[1].raw_payload["asset_id"], "2");
+        assert_eq!(frames[0].raw_payload["event_type"], "book");
+        assert_eq!(frames[0].received_at, received_at);
+
+        assert!(
+            validate_polymarket_book_refresh_response(json!([book("1")]), &tokens, received_at,)
+                .is_err()
+        );
+        let inexact = json!([{
+            "asset_id":"1", "timestamp":"1788069600000", "tick_size":0.01,
+            "bids":[{"price":"0.40","size":"10"}],
+            "asks":[{"price":"0.60","size":"11"}]
+        }, book("2")]);
+        assert!(validate_polymarket_book_refresh_response(inexact, &tokens, received_at).is_err());
     }
 }

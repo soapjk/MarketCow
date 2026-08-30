@@ -8,7 +8,7 @@ use marketcow_core::{
 };
 use marketcow_polymarket::{
     NormalizeError, NormalizerConfig, bind_full_book_recovery_identity,
-    normalize_frame_with_book_tick,
+    bind_full_book_refresh_identity, normalize_frame_with_book_tick,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -328,6 +328,45 @@ impl PolymarketRuntime {
         }
         if events.is_empty() {
             return Ok(Vec::new());
+        }
+        let outcomes = self.writer.apply_batch(events)?;
+        for outcome in &outcomes {
+            self.recent_events.push_back(outcome.persisted.clone());
+            if self.recent_events.len() > self.config.recent_event_capacity {
+                self.recent_events.pop_front();
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Applies one authoritative periodic full-book observation. Unlike ordinary WS ingestion,
+    /// byte-identical content is not discarded: the HTTP response proves current freshness and
+    /// receives an observation-bound identity. Incremental-event idempotency remains unchanged.
+    pub fn apply_full_book_refresh(
+        &mut self,
+        raw_payload: Value,
+        received_at: DateTime<Utc>,
+    ) -> Result<Vec<ApplyOutcome>, RuntimeError> {
+        let projection = self.writer.projection();
+        let next_cursor = projection.cursor + 1;
+        let normalizer = NormalizerConfig::new(
+            self.config.scope_id.clone(),
+            self.config.config_revision.clone(),
+        );
+        let verified_book_tick = verified_book_tick(&projection, &raw_payload);
+        let mut events = normalize_frame_with_book_tick(
+            &normalizer,
+            raw_payload,
+            received_at,
+            next_cursor,
+            verified_book_tick,
+        )?;
+        if events.len() != 1 || !bind_full_book_refresh_identity(&mut events[0]) {
+            return Err(RuntimeError::Normalize(
+                NormalizeError::UnsupportedEventType(
+                    "periodic_refresh_requires_one_full_book".into(),
+                ),
+            ));
         }
         let outcomes = self.writer.apply_batch(events)?;
         for outcome in &outcomes {
@@ -726,6 +765,31 @@ mod tests {
         assert_eq!(runtime.projection().cursor, 1);
         assert_eq!(runtime.projection().hash(), expected_hash);
         assert_eq!(runtime.recent_events().len(), 1);
+    }
+
+    #[test]
+    fn authoritative_refresh_advances_freshness_for_an_identical_quiet_book() {
+        let dir = tempdir().unwrap();
+        let mut runtime = PolymarketRuntime::open(config(dir.path())).unwrap();
+        let first = runtime.apply_raw(snapshot("yes", 0), at(0)).unwrap();
+        let first_event_id = first[0].persisted.event.event_id.clone();
+
+        let refreshed = runtime
+            .apply_full_book_refresh(snapshot("yes", 0), at(10))
+            .unwrap();
+
+        assert_eq!(refreshed.len(), 1);
+        assert!(refreshed[0].persisted.applied);
+        assert_ne!(refreshed[0].persisted.event.event_id, first_event_id);
+        assert_eq!(
+            refreshed[0].persisted.event.source.source,
+            "polymarket_clob_http"
+        );
+        assert_eq!(runtime.projection().cursor, 2);
+        assert_eq!(
+            runtime.projection().books["yes"].source_observed_at,
+            Some(at(10))
+        );
     }
 
     #[test]

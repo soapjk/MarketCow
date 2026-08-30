@@ -26,6 +26,7 @@ use url::Url;
 pub const NORMALIZER_VERSION: &str = "marketcow.polymarket.normalizer.v2";
 pub const CLOB_MARKET_STREAM_SOURCE_URL: &str =
     "https://ws-subscriptions-clob.polymarket.com/ws/market";
+pub const CLOB_BOOK_SNAPSHOT_SOURCE_URL: &str = "https://clob.polymarket.com/books";
 
 #[derive(Debug, Clone)]
 pub struct PolymarketTransportConfig {
@@ -902,6 +903,26 @@ pub fn bind_full_book_recovery_identity(event: &mut CanonicalEvent) -> bool {
             .received_at
             .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
     )));
+    true
+}
+
+/// Rebinds an authoritative HTTP full-book snapshot to its observation boundary. The venue can
+/// return byte-identical content for a quiet token, but that successful response is still fresh
+/// evidence and must advance the book's freshness without weakening normal WS-frame deduplication.
+pub fn bind_full_book_refresh_identity(event: &mut CanonicalEvent) -> bool {
+    if !matches!(&event.kind, EventKind::FullBook { .. }) {
+        return false;
+    }
+    event.event_id = hex::encode(Sha256::digest(format!(
+        "{}\0full_book_refresh\0{}",
+        event.event_id,
+        event
+            .received_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    )));
+    event.source.source = "polymarket_clob_http".into();
+    event.source.source_url = Some(CLOB_BOOK_SNAPSHOT_SOURCE_URL.into());
+    event.source.update_frequency = "periodic_authoritative_refresh".into();
     true
 }
 
