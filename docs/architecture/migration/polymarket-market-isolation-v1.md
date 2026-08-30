@@ -117,3 +117,18 @@ The live gate must report, per market and globally:
 No live duration or process exit implies success. The one-hour acceptance gate remains outstanding
 until it produces a reproducible result Artifact with zero unexplained resyncs and proves that
 unaffected markets remain continuously usable during injected single-market failures.
+
+## Release rollback boundary
+
+An older binary must never be pointed at a WAL lineage after a newer binary has appended a record
+whose canonical persistence schema it does not understand. The append-only hash chain correctly
+rejects that combination as corrupt; deleting, rewriting, truncating, or rehashing the new records
+would destroy the authoritative audit history and is forbidden.
+
+Before a binary cutover, the MarketCow operator therefore records the checkpoint cursor, checkpoint
+state hash, WAL anchor, active scope artifact, binary hash, and storage root, then creates a
+generation-specific immutable storage fork at that verified boundary. A release rollback switches
+the listener and single-writer lease to that fork. It does not reuse the storage lineage mutated by
+the newer binary. A same-version process restart continues to use the current lineage and must
+prove checkpoint/WAL recovery before readiness. Binary compatibility in the forward direction
+(new reader over old lineage) does not imply reverse compatibility.

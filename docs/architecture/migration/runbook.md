@@ -205,9 +205,20 @@ has not produced the raw r2, 24-hour and 7-day release evidence.
 
 ## Rollback
 
-Stop Rust writer, flush/hash its tail, verify the exact cursor boundary and compatible schema,
-start Python from that boundary, revalidate exact scope and append an audit event. Do not
-delete WAL, reset cursor or relax freshness/gap checks. `rollback.sh` is similarly guarded.
+Before switching binaries, persist a cutover receipt containing the exact binary SHA, scope and
+universe generation, checkpoint cursor/state hash, WAL anchor, and storage root. Create and verify
+an immutable storage fork at that boundary. Stop the active writer, flush/hash its tail, verify the
+single-writer lease, and switch the listener to the recorded fork. Revalidate the exact scope,
+checkpoint and append-only hash chain before restoring consumers and append an audit event to the
+new active lineage.
+
+Never start an older binary against a lineage after a newer binary has appended a persistence
+schema it cannot decode. That combination must fail closed as a corrupt/incompatible WAL; do not
+delete, truncate, rewrite or rehash the authoritative tail to make it start. Forward readability
+does not prove reverse readability. A same-version restart may reuse the current lineage only after
+checkpoint/WAL recovery succeeds. `rollback.sh` remains guarded because this repository has not yet
+automated all of these lease and immutable-fork checks. Do not reset cursors or relax freshness/gap
+checks.
 
 ## Recovery
 
