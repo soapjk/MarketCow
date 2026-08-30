@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 from collections import Counter
@@ -41,6 +42,59 @@ def atomic_write(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
+
+
+def verify_runtime_identity(arguments: argparse.Namespace) -> dict[str, Any]:
+    try:
+        os.kill(arguments.expected_pid, 0)
+    except OSError as error:
+        raise RuntimeError(f"expected service PID is unavailable: {error}") from error
+    command = subprocess.run(
+        ["ps", "-p", str(arguments.expected_pid), "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    declared_binary = str(arguments.binary.absolute())
+    expected_binary = str(arguments.binary.resolve())
+    command_parts = shlex.split(command)
+    if (
+        len(command_parts) != 2
+        or str(Path(command_parts[0]).resolve()) != expected_binary
+        or command_parts[1] != "serve"
+    ):
+        raise RuntimeError(f"service process command changed: {command}")
+    launchd = subprocess.run(
+        [
+            "launchctl",
+            "print",
+            f"gui/{os.getuid()}/{arguments.launchd_label}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = launchd.stdout
+    required = [
+        "state = running",
+        f"pid = {arguments.expected_pid}",
+        f"program = {declared_binary}",
+        f"MARKETCOW_BINARY_COMMIT => {arguments.expected_commit}",
+        "last exit code = (never exited)",
+    ]
+    missing = [value for value in required if value not in output]
+    if launchd.returncode != 0 or missing:
+        raise RuntimeError(
+            f"launchd service identity changed: returncode={launchd.returncode} missing={missing}"
+        )
+    return {
+        "observed_at": utc_now(),
+        "pid": arguments.expected_pid,
+        "process_command": command,
+        "launchd_label": arguments.launchd_label,
+        "commit": arguments.expected_commit,
+        "no_restart": True,
+    }
 
 
 def validate_boundary(scope: dict[str, Any], full: dict[str, Any]) -> dict[str, Any]:
@@ -158,6 +212,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
             "binary_path": str(arguments.binary.resolve()),
             "binary_sha256": hashlib.sha256(arguments.binary.read_bytes()).hexdigest(),
             "launchd_label": arguments.launchd_label,
+            "identity_samples": [],
         },
         "samples": [],
         "stream": {
@@ -187,15 +242,18 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
         report["failures"].append({"gate": "binary_identity", "observed": report["runtime"]["binary_sha256"]})
         return report
     try:
-        os.kill(arguments.expected_pid, 0)
-    except OSError as error:
-        report["failures"].append({"gate": "pid_identity", "error": str(error)})
+        report["runtime"]["identity_samples"].append(verify_runtime_identity(arguments))
+    except Exception as error:
+        report["failures"].append({
+            "gate": "runtime_identity", "error": f"{type(error).__name__}: {error}"
+        })
         return report
     event_types: Counter[str] = Counter()
     source_types: Counter[str] = Counter()
     resync_reasons: Counter[str] = Counter()
     quarantined_since: dict[str, float] = {}
     last_sample_at = 0.0
+    fatal_runtime_identity_failure = False
     ws_url = arguments.base_url.replace("http://", "ws://") + "/v1/market-data/stream"
     async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
         while time.monotonic() < deadline:
@@ -232,7 +290,22 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
                     cursor = after_cursor
                     while time.monotonic() < deadline:
                         now_monotonic = time.monotonic()
-                        if now_monotonic - last_sample_at >= arguments.sample_interval_seconds:
+                        if (
+                            now_monotonic - last_sample_at
+                            >= arguments.sample_interval_seconds
+                        ):
+                            try:
+                                report["runtime"]["identity_samples"].append(
+                                    verify_runtime_identity(arguments)
+                                )
+                            except Exception as error:
+                                report["failures"].append({
+                                    "gate": "runtime_identity",
+                                    "observed_at": utc_now(),
+                                    "error": f"{type(error).__name__}: {error}",
+                                })
+                                fatal_runtime_identity_failure = True
+                                raise
                             try:
                                 _sample_scope, _sample_full, sample = await read_boundary(
                                     client, arguments.base_url
@@ -345,9 +418,13 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
             except Exception as error:
                 if controlled_transition:
                     pass
+                elif fatal_runtime_identity_failure:
+                    pass
                 else:
                     report["failures"].append({"gate": "stream", "observed_at": utc_now(), "error": f"{type(error).__name__}: {error}"})
             atomic_write(arguments.output, report)
+            if fatal_runtime_identity_failure:
+                break
 
         report["stream"]["event_types"] = dict(sorted(event_types.items()))
         report["stream"]["source_event_types"] = dict(sorted(source_types.items()))
