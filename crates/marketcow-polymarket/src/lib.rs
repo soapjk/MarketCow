@@ -1125,6 +1125,58 @@ mod tests {
     }
 
     #[test]
+    fn public_atomic_delta_materializes_bbo_pruning_for_deterministic_replay() {
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        writer.apply(snapshot(1)).unwrap();
+        let preceding = writer.projection().books["yes-1"].clone();
+        let raw = serde_json::json!({
+            "event_type":"price_change", "timestamp":"2026-08-03T04:00:01Z",
+            "price_changes":[
+                {"asset_id":"yes-1","side":"BUY","price":"0.43","size":"1",
+                 "best_bid":"0.43","best_ask":"0.44"},
+                {"asset_id":"yes-1","side":"SELL","price":"0.44","size":"2",
+                 "best_bid":"0.43","best_ask":"0.44"}
+            ]
+        });
+        let event = normalize_frame(&config(), raw, at(), 2).unwrap().remove(0);
+
+        let outcome = writer.apply(event).unwrap();
+        assert!(outcome.persisted.applied);
+        let EventKind::AtomicDelta { changes, .. } = &outcome.persisted.event.kind else {
+            panic!("expected atomic delta")
+        };
+        assert!(changes.iter().any(|change| {
+            change.side == Side::Ask
+                && change
+                    .levels
+                    .iter()
+                    .any(|level| level.price.0.to_string() == "0.42" && level.quantity.is_zero())
+        }));
+
+        // A consumer starting from the preceding full-sync and applying only the public canonical
+        // changes must derive the exact same book as the authoritative server projection.
+        let mut replay_bids = preceding.bids;
+        let mut replay_asks = preceding.asks;
+        for change in changes {
+            let target = match change.side {
+                Side::Bid => &mut replay_bids,
+                Side::Ask => &mut replay_asks,
+            };
+            for level in &change.levels {
+                if level.quantity.is_zero() {
+                    target.remove(&level.price);
+                } else {
+                    target.insert(level.price.clone(), level.quantity);
+                }
+            }
+        }
+        let projected = &outcome.projection.books["yes-1"];
+        assert_eq!(replay_bids, projected.bids);
+        assert_eq!(replay_asks, projected.asks);
+        assert!(replay_bids.last_key_value().unwrap().0 < replay_asks.first_key_value().unwrap().0);
+    }
+
+    #[test]
     fn atomic_price_change_treats_zero_and_one_bbo_as_empty_side_sentinels() {
         let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
         writer.apply(snapshot(1)).unwrap();
@@ -1700,6 +1752,10 @@ mod tests {
         let outcome = writer.apply(normalized).unwrap();
         assert!(outcome.persisted.applied);
         assert_eq!(outcome.persisted.fail_closed_reason, None);
+        assert!(matches!(
+            outcome.persisted.event.kind,
+            EventKind::AtomicDelta { ref changes, .. } if changes.is_empty()
+        ));
         assert_eq!(
             outcome.projection.books["yes-1"]
                 .bids

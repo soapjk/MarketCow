@@ -137,6 +137,77 @@ impl Book {
         }
     }
 
+    /// Expands the venue BBO post-condition into explicit zero-quantity level removals.
+    ///
+    /// Polymarket price-change frames can omit stale levels that are nevertheless proven absent
+    /// by the frame's post-change best bid/ask. The in-process projection uses that BBO to prune
+    /// those levels. Persisting only the raw changes would therefore make the public delta
+    /// impossible to replay deterministically from the preceding full-sync. Materializing the
+    /// removals keeps the canonical delta self-contained while preserving the immutable raw frame
+    /// as its audit evidence.
+    fn replay_complete_atomic_changes(
+        &self,
+        changes: &[SideLevels],
+        best_bid: Option<&Price>,
+        best_ask: Option<&Price>,
+    ) -> Vec<SideLevels> {
+        if best_bid.is_none() && best_ask.is_none() {
+            return changes.to_vec();
+        }
+
+        let mut candidate_bids = self.bids.clone();
+        let mut candidate_asks = self.asks.clone();
+        for change in changes {
+            let target = match change.side {
+                Side::Bid => &mut candidate_bids,
+                Side::Ask => &mut candidate_asks,
+            };
+            for level in &change.levels {
+                if level.quantity.is_zero() {
+                    target.remove(&level.price);
+                } else {
+                    target.insert(level.price.clone(), level.quantity);
+                }
+            }
+        }
+
+        let expected_bid = best_bid.filter(|price| !price.is_zero());
+        let expected_ask = best_ask.filter(|price| !price.is_one());
+        let bid_removals = candidate_bids
+            .keys()
+            .filter(|price| expected_bid.is_none_or(|expected| *price > expected))
+            .cloned()
+            .map(|price| Level {
+                price,
+                quantity: Decimal::ZERO,
+            })
+            .collect::<Vec<_>>();
+        let ask_removals = candidate_asks
+            .keys()
+            .filter(|price| expected_ask.is_none_or(|expected| *price < expected))
+            .cloned()
+            .map(|price| Level {
+                price,
+                quantity: Decimal::ZERO,
+            })
+            .collect::<Vec<_>>();
+
+        let mut replay_complete = changes.to_vec();
+        if !bid_removals.is_empty() {
+            replay_complete.push(SideLevels {
+                side: Side::Bid,
+                levels: bid_removals,
+            });
+        }
+        if !ask_removals.is_empty() {
+            replay_complete.push(SideLevels {
+                side: Side::Ask,
+                levels: ask_removals,
+            });
+        }
+        replay_complete
+    }
+
     pub fn crossed_or_locked(&self) -> bool {
         match (self.bids.last_key_value(), self.asks.first_key_value()) {
             (Some((bid, _)), Some((ask, _))) => bid >= ask,
@@ -1195,7 +1266,7 @@ impl<L: DurableLog> SingleWriter<L> {
 
     fn evaluate_event(
         mut next: Projection,
-        event: CanonicalEvent,
+        mut event: CanonicalEvent,
         validate_raw_payload: bool,
         validate_duplicate: bool,
     ) -> Result<(Projection, PersistedEvent), CoreError> {
@@ -1280,6 +1351,21 @@ impl<L: DurableLog> SingleWriter<L> {
             });
         let atomic_delta_superseded_by_book =
             delayed_atomic_delta_superseded_by_book || queued_atomic_delta_superseded_by_refresh;
+        if !event.source.missing
+            && !event.source.delayed
+            && !atomic_delta_superseded_by_book
+            && event.normalizer_version == "marketcow.polymarket.normalizer.v2"
+            && let EventKind::AtomicDelta {
+                token_id,
+                changes,
+                best_bid,
+                best_ask,
+            } = &mut event.kind
+            && let Some(book) = next.books.get(token_id)
+        {
+            *changes =
+                book.replay_complete_atomic_changes(changes, best_bid.as_ref(), best_ask.as_ref());
+        }
         if event.source.missing || event.source.delayed && !atomic_delta_superseded_by_book {
             next.unresolved_gaps.insert(event.kind.token_id().into());
             applied = false;
@@ -1293,6 +1379,9 @@ impl<L: DurableLog> SingleWriter<L> {
             // WS frames queued while a periodic HTTP snapshot was in flight. Keep its durable
             // cursor/evidence, but do not mutate the newer projection or reopen the gap. The
             // public API exposes this as an explicit no-op delta.
+            if let EventKind::AtomicDelta { changes, .. } = &mut event.kind {
+                changes.clear();
+            }
         } else {
             match &event.kind {
                 EventKind::CatalogSnapshot {
