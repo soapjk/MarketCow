@@ -1,0 +1,93 @@
+{
+  "schema_version": "marketcow.polymarket.replay-complete-delta-live-evidence.v1",
+  "verdict": "passed_short_live_smoke",
+  "scope": {
+    "service_url": "http://127.0.0.1:18872",
+    "scope_id": "cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34",
+    "universe_generation": 34,
+    "market_count": 100,
+    "book_count": 200,
+    "relation_count": 4,
+    "real_order_submission_enabled": false,
+    "tradude_manages_marketcow_lifecycle": false
+  },
+  "runtime": {
+    "commit": "7f3370028551b1524446d60cef2a7e1eb81359c9",
+    "binary_path": "/tmp/marketcow-7f33700-replay-complete/marketcow-7f33700",
+    "binary_sha256": "f6add78fddfbfbda407b9530c3cd69dc3b5ba3d876d8912659f6bfbebf6c8889",
+    "launchd_label": "com.marketcow.rust-polymarket-7f33700-replay-complete-live",
+    "pid": 24864,
+    "restart_count": 0,
+    "ready_after_restart_seconds": 7.573709249991225
+  },
+  "implementation": {
+    "problem": "The internal projection used venue best_bid/best_ask to prune stale levels, but the public canonical atomic_delta exposed only raw changes, allowing a strict consumer to derive a crossed or locked book.",
+    "resolution": "Materialize every BBO-implied stale level removal as an exact zero-quantity canonical change and expose refresh-superseded queued deltas as explicit no-ops.",
+    "raw_evidence_preserved": true,
+    "decimal_encoding": "exact decimal strings"
+  },
+  "tests": [
+    {
+      "command": "cargo test --workspace",
+      "result": "passed; 5 external PostgreSQL/ClickHouse integration tests ignored because their explicit environment endpoints were not configured"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test -p marketcow-core -p marketcow-polymarket -p marketcow-runtime -p marketcow-api",
+      "result": "76 passed"
+    }
+  ],
+  "public_delta_differential_gate": {
+    "duration_seconds": 60,
+    "boundary_cursor": 3445430,
+    "last_cursor": 3449789,
+    "event_count": 4359,
+    "delta_count": 4355,
+    "full_book_count": 4,
+    "explicit_noop_delta_count": 2,
+    "observed_bbo_materialized_removal_count": 2,
+    "cursor_discontinuity_count": 0,
+    "crossed_or_locked_count": 0,
+    "one_sided_count": 0,
+    "verdict": "passed"
+  },
+  "standard_live_gate": {
+    "result_path": "/tmp/marketcow-7f33700-replay-complete/retry-live-60s.json",
+    "duration_seconds": 60.385040917,
+    "sample_count": 26,
+    "ready_ratio": 1.0,
+    "event_count": 5053,
+    "cursor_discontinuity_count": 0,
+    "ordinary_gap_frame_count": 0,
+    "ordinary_unapplied_frame_count": 0,
+    "global_resync_count": 0,
+    "quarantined_market_count": 0,
+    "tick_mismatch_count": 0,
+    "bad_revision_count": 0,
+    "expired_cursor_resync_passed": true,
+    "read_only_404_path_count": 14,
+    "verdict": "passed"
+  },
+  "preserved_failures": [
+    {
+      "stage": "first launchd activation",
+      "binary_path": "/Volumes/T9/.marketcow-builds/7f33700/marketcow-7f33700",
+      "result": "failed",
+      "launchd_last_exit_code": "78: EX_CONFIG",
+      "listen_observed": false,
+      "diagnosis": "launchd rejected the executable/log paths on the external volume before MarketCow started; no service log was created"
+    },
+    {
+      "stage": "30-second verifier request",
+      "result": "tooling_rejected",
+      "diagnosis": "the verifier enforces a minimum duration of 60 seconds; the corrected 60-second run passed"
+    }
+  ],
+  "limitations": [
+    "This is a deterministic regression plus two 60-second live gates, not the requested formal one-hour shadow evidence.",
+    "The overall Rust plus Python migration is not declared complete."
+  ]
+}
