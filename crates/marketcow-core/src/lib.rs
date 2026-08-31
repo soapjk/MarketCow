@@ -552,6 +552,22 @@ pub struct MarketProjectionHealth {
     pub last_event_revision: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenProjectionHealth {
+    pub token_id: String,
+    pub market_id: String,
+    pub reason_code: String,
+    pub retryable: bool,
+    #[serde(default)]
+    pub retry_after: Option<DateTime<Utc>>,
+    pub unavailable_since: DateTime<Utc>,
+    pub source_observed_at: DateTime<Utc>,
+    pub projection_generation: u64,
+    #[serde(default)]
+    pub catalog_revision: Option<String>,
+    pub availability_revision: String,
+}
+
 impl MarketProjectionHealth {
     fn recovering(market_id: String, generation: u64, catalog_revision: Option<String>) -> Self {
         Self {
@@ -603,6 +619,10 @@ pub struct Projection {
     pub market_health: BTreeMap<String, MarketProjectionHealth>,
     #[serde(default)]
     pub quarantined_token_ids: BTreeSet<String>,
+    #[serde(default)]
+    pub token_health: BTreeMap<String, TokenProjectionHealth>,
+    #[serde(default)]
+    pub market_recovery_token_ids: BTreeMap<String, BTreeSet<String>>,
     pub unresolved_gaps: BTreeSet<String>,
     pub recent_event_ids: VecDeque<String>,
     pub ready: bool,
@@ -626,6 +646,8 @@ impl Projection {
             monitoring_books: BTreeMap::new(),
             market_health: BTreeMap::new(),
             quarantined_token_ids: BTreeSet::new(),
+            token_health: BTreeMap::new(),
+            market_recovery_token_ids: BTreeMap::new(),
             unresolved_gaps: BTreeSet::new(),
             recent_event_ids: VecDeque::new(),
             ready: false,
@@ -650,6 +672,8 @@ impl Projection {
             "monitoring_books": self.monitoring_books,
             "market_health": self.market_health,
             "quarantined_token_ids": self.quarantined_token_ids,
+            "token_health": self.token_health,
+            "market_recovery_token_ids": self.market_recovery_token_ids,
             "unresolved_gaps": self.unresolved_gaps,
             "recent_event_ids": self.recent_event_ids,
             "ready": self.ready,
@@ -732,6 +756,49 @@ impl Projection {
                     && self.market_is_public(&market.market_id)
             })
             .map(|market| market.market_id.clone())
+            .collect()
+    }
+
+    /// Every active market configured in the current atomic catalog generation, including a
+    /// market that is temporarily excluded from new opportunities by a token-local fault.
+    pub fn configured_market_ids(&self) -> BTreeSet<String> {
+        self.markets
+            .values()
+            .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+            .map(|market| market.market_id.clone())
+            .collect()
+    }
+
+    /// Every outcome token configured in the current atomic catalog generation.  This is the
+    /// stable identity set consumers intersect with `available_token_ids`; it deliberately does
+    /// not disappear merely because one token is quarantined.
+    pub fn configured_token_ids(&self) -> BTreeSet<String> {
+        self.markets
+            .values()
+            .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+            .flat_map(|market| {
+                market
+                    .outcomes
+                    .iter()
+                    .map(|outcome| outcome.token_id.clone())
+            })
+            .collect()
+    }
+
+    /// Token-level availability mask.  A market may remain in the configured identity set while
+    /// exactly one of its outcomes is unavailable; consumers must require every strategy token to
+    /// be present in this set before opening a new opportunity.
+    pub fn available_token_ids(&self) -> BTreeSet<String> {
+        self.configured_token_ids()
+            .difference(&self.quarantined_token_ids)
+            .cloned()
+            .collect()
+    }
+
+    pub fn unavailable_token_ids(&self) -> BTreeSet<String> {
+        self.configured_token_ids()
+            .intersection(&self.quarantined_token_ids)
+            .cloned()
             .collect()
     }
 
@@ -858,25 +925,36 @@ fn market_books_are_executable(projection: &Projection, market_id: &str) -> bool
 fn quarantine_market(
     projection: &mut Projection,
     market_id: &str,
+    affected_token_id: &str,
     sequence: u64,
     reason: &str,
     event: &CanonicalEvent,
 ) {
-    let token_ids = projection
-        .markets
-        .get(market_id)
-        .map(|market| {
-            market
-                .outcomes
-                .iter()
-                .map(|outcome| outcome.token_id.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for token_id in token_ids {
-        projection.unresolved_gaps.remove(&token_id);
-        projection.quarantined_token_ids.insert(token_id);
-    }
+    // Attribution is token-local.  The containing market is excluded from *new* opportunities
+    // because a binary strategy requires both outcomes, but the healthy sibling token remains
+    // explicitly available for stable identity/position monitoring.
+    projection.unresolved_gaps.remove(affected_token_id);
+    projection
+        .quarantined_token_ids
+        .insert(affected_token_id.to_owned());
+    projection.token_health.insert(
+        affected_token_id.to_owned(),
+        TokenProjectionHealth {
+            token_id: affected_token_id.to_owned(),
+            market_id: market_id.to_owned(),
+            reason_code: reason.to_owned(),
+            retryable: true,
+            retry_after: Some(event.received_at + chrono::Duration::seconds(1)),
+            unavailable_since: event.received_at,
+            source_observed_at: event.source_observed_at,
+            projection_generation: projection.generation,
+            catalog_revision: projection.catalog_revision.clone(),
+            availability_revision: event.event_id.clone(),
+        },
+    );
+    projection
+        .market_recovery_token_ids
+        .insert(market_id.to_owned(), BTreeSet::new());
     let health = projection
         .market_health
         .entry(market_id.to_owned())
@@ -1469,6 +1547,10 @@ impl<L: DurableLog> SingleWriter<L> {
                             .retain(|token_id, _| active_tokens.contains(token_id));
                         next.quarantined_token_ids
                             .retain(|token_id| active_tokens.contains(token_id));
+                        next.token_health
+                            .retain(|token_id, _| active_tokens.contains(token_id));
+                        next.market_recovery_token_ids
+                            .retain(|market_id, _| next.markets.contains_key(market_id));
                         next.market_health.retain(|market_id, _| {
                             next.markets.get(market_id).is_some_and(|market| {
                                 market.lifecycle_state == MarketLifecycleState::Active
@@ -1829,7 +1911,14 @@ impl<L: DurableLog> SingleWriter<L> {
             rejected.clone(),
         ) && market_event_is_locally_recoverable(&event.kind)
         {
-            quarantine_market(&mut next, market_id, sequence, &reason, &event);
+            quarantine_market(
+                &mut next,
+                market_id,
+                event.kind.token_id(),
+                sequence,
+                &reason,
+                &event,
+            );
             market_transition = Some(MarketTransitionKind::Quarantined);
             market_reason_code = Some(reason);
             // This is a durably recorded market fault, not a global projection fault. Consumers
@@ -1844,8 +1933,38 @@ impl<L: DurableLog> SingleWriter<L> {
                 && rejected.is_none()
                 && market_reason_code.is_none()
             {
-                next.quarantined_token_ids.remove(token_id);
-                if market_books_are_executable(&next, market_id) {
+                let recovering = previous_market_status != Some(MarketProjectionStatus::Ready);
+                let complete_recovery_boundary = if recovering {
+                    let expected_tokens = next
+                        .markets
+                        .get(market_id)
+                        .map(|market| {
+                            market
+                                .outcomes
+                                .iter()
+                                .map(|outcome| outcome.token_id.clone())
+                                .collect::<BTreeSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    let observed_tokens = next
+                        .market_recovery_token_ids
+                        .entry(market_id.to_owned())
+                        .or_default();
+                    observed_tokens.insert(token_id.clone());
+                    !expected_tokens.is_empty() && expected_tokens.is_subset(observed_tokens)
+                } else {
+                    true
+                };
+                if complete_recovery_boundary {
+                    if let Some(market) = next.markets.get(market_id) {
+                        for outcome in &market.outcomes {
+                            next.quarantined_token_ids.remove(&outcome.token_id);
+                            next.token_health.remove(&outcome.token_id);
+                        }
+                    }
+                    next.market_recovery_token_ids.remove(market_id);
+                }
+                if complete_recovery_boundary && market_books_are_executable(&next, market_id) {
                     if previous_market_status != Some(MarketProjectionStatus::Ready) {
                         market_transition = Some(MarketTransitionKind::Recovered);
                     }
@@ -1868,7 +1987,7 @@ impl<L: DurableLog> SingleWriter<L> {
                     health.retryable = false;
                     health.retry_after = None;
                     health.last_recovered_at = Some(event.received_at);
-                } else if previous_market_status != Some(MarketProjectionStatus::Ready) {
+                } else if recovering {
                     market_transition = Some(MarketTransitionKind::RecoveryStarted);
                     market_reason_code = Some("atomic_market_snapshot_incomplete".into());
                     let generation = next.generation;
@@ -1894,7 +2013,14 @@ impl<L: DurableLog> SingleWriter<L> {
                 && !market_books_are_executable(&next, market_id)
             {
                 let reason = "market_book_not_executable";
-                quarantine_market(&mut next, market_id, sequence, reason, &event);
+                quarantine_market(
+                    &mut next,
+                    market_id,
+                    event.kind.token_id(),
+                    sequence,
+                    reason,
+                    &event,
+                );
                 market_transition = Some(MarketTransitionKind::Quarantined);
                 market_reason_code = Some(reason.into());
             }
@@ -3735,6 +3861,18 @@ mod tests {
         assert_eq!(
             quarantined.projection.active_market_ids(),
             BTreeSet::from(["m2".to_owned()])
+        );
+        assert_eq!(
+            quarantined.projection.configured_market_ids(),
+            BTreeSet::from(["m1".to_owned(), "m2".to_owned()])
+        );
+        assert_eq!(
+            quarantined.projection.unavailable_token_ids(),
+            BTreeSet::from(["m1-yes".to_owned()])
+        );
+        assert_eq!(
+            quarantined.projection.available_token_ids(),
+            BTreeSet::from(["m1-no".to_owned(), "m2-no".to_owned(), "m2-yes".to_owned(),])
         );
         assert_eq!(
             quarantined.persisted.market.as_ref().unwrap().transition,

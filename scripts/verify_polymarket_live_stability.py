@@ -91,7 +91,7 @@ def validate_boundary(
     }
     universe = payload.get("universe") or {}
     dynamic_universe_valid = expected_universe_generation is None or (
-        payload.get("universe_schema_version") == "marketcow.polymarket.universe.v2"
+        payload.get("universe_schema_version") == "marketcow.polymarket.universe.v3"
         and payload.get("universe_id") == scope_id
         and payload.get("universe_generation") == expected_universe_generation
         and universe.get("universe_id") == scope_id
@@ -107,7 +107,7 @@ def validate_boundary(
         )
     )
     passed = (
-        payload.get("schema_version") == "marketcow.polymarket.live.v3"
+        payload.get("schema_version") == "marketcow.polymarket.live.v4"
         and payload.get("scope_id") == scope_id
         and health.get("ready") is True
         and health.get("unresolved_gap_count") == 0
@@ -201,7 +201,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Verify a sustained Rust Polymarket live window")
     parser.add_argument("--base-url", default="http://127.0.0.1:18872")
     parser.add_argument("--expected-scope-id", required=True)
-    parser.add_argument("--expected-scope-schema", default="marketcow.polymarket.scope-discovery.v4")
+    parser.add_argument("--expected-scope-schema", default="marketcow.polymarket.scope-discovery.v5")
     parser.add_argument("--expected-market-count", type=int, default=100)
     parser.add_argument("--expected-relation-count", type=int, default=4)
     parser.add_argument("--expected-universe-generation", type=int)

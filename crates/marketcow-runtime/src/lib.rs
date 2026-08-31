@@ -420,7 +420,16 @@ impl PolymarketRuntime {
                 .to_owned();
             normalized.push((market_id, token_id.clone(), raw_payload.clone(), event));
         }
-        normalized.sort_by(|left, right| left.1.cmp(&right.1));
+        // A token-local fault marks only the affected token unavailable. Apply the healthy
+        // sibling first and the quarantined token last so the market cannot transition back to
+        // Ready until the complete two-book recovery batch has reached its final event.
+        normalized.sort_by(|left, right| {
+            projection
+                .quarantined_token_ids
+                .contains(&left.1)
+                .cmp(&projection.quarantined_token_ids.contains(&right.1))
+                .then_with(|| left.1.cmp(&right.1))
+        });
         let market_ids = normalized
             .iter()
             .map(|item| item.0.as_str())

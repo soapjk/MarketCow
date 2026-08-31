@@ -1036,6 +1036,7 @@ struct PolymarketBookValidationProjection {
 struct PolymarketBookValidationSummary {
     matched_books: usize,
     mismatched_books: usize,
+    quarantine_token_ids: Vec<String>,
 }
 
 struct PolymarketScopeSwitchRequest {
@@ -3035,7 +3036,9 @@ fn start_polymarket_live(
                 polymarket_book_refresh_interval(state.config.maximum_book_age_ms);
             let mut refresh_tick = tokio::time::interval(refresh_interval);
             refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            refresh_tick.tick().await;
+            // The first authoritative validation is intentionally immediate.  A checkpoint may
+            // contain one stale token even though the remaining universe is healthy; waiting a
+            // full refresh interval would unnecessarily keep the public API globally unready.
             loop {
                 tokio::select! {
                     changed = shutdown.changed() => {
@@ -3193,6 +3196,7 @@ fn start_polymarket_live(
                             Ok(frames) => {
                                 match recover_quarantined_polymarket_markets(&state, &live, &frames).await {
                                     Ok(recovery) => {
+                                        events_since_checkpoint += recovery.applied_events;
                                         if recovery.attempted > 0 {
                                             info!(
                                                 attempted_markets=recovery.attempted,
@@ -3213,14 +3217,54 @@ fn start_polymarket_live(
                                         break 'service;
                                     }
                                 }
-                                match validate_polymarket_book_refreshes(&state, &live, frames).await {
+                                match validate_polymarket_book_refreshes(&state, &live, &frames).await {
                                     Ok(summary) => {
                                         info!(
                                             matched_books=summary.matched_books,
                                             mismatched_books=summary.mismatched_books,
+                                            quarantine_token_count=summary.quarantine_token_ids.len(),
                                             interval_ms=refresh_interval.as_millis(),
                                             "polymarket_authoritative_books_validated"
                                         );
+                                        if !summary.quarantine_token_ids.is_empty() {
+                                            match quarantine_polymarket_tokens_from_authoritative_mismatch(
+                                                &state,
+                                                &summary.quarantine_token_ids,
+                                            ).await {
+                                                Ok(events) => {
+                                                    events_since_checkpoint += events;
+                                                    match recover_quarantined_polymarket_markets(
+                                                        &state,
+                                                        &live,
+                                                        &frames,
+                                                    ).await {
+                                                        Ok(recovery) => {
+                                                            events_since_checkpoint += recovery.applied_events;
+                                                            info!(
+                                                                attempted_markets=recovery.attempted,
+                                                                recovered_markets=recovery.recovered,
+                                                                rejected_markets=recovery.rejected,
+                                                                "polymarket_token_local_recovery_processed"
+                                                            );
+                                                        }
+                                                        Err(error) => {
+                                                            warn!(error=%error, "polymarket_token_local_recovery_failed_closed");
+                                                            let _ = transport_shutdown_tx.send(true);
+                                                            let _ = (&mut transport).await;
+                                                            let _ = checkpoint_polymarket_runtime(&state).await;
+                                                            break 'service;
+                                                        }
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    warn!(error=%error, "polymarket_token_quarantine_failed_closed");
+                                                    let _ = transport_shutdown_tx.send(true);
+                                                    let _ = (&mut transport).await;
+                                                    let _ = checkpoint_polymarket_runtime(&state).await;
+                                                    break 'service;
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(error) => {
                                         // Healthy books remain read-only freshness observations.
@@ -3793,7 +3837,7 @@ fn publish_polymarket_outcomes(state: &AppState, published: &[marketcow_core::Ap
 async fn validate_polymarket_book_refreshes(
     state: &AppState,
     live: &PolymarketLiveConfig,
-    frames: Vec<marketcow_polymarket::RawTransportFrame>,
+    frames: &[marketcow_polymarket::RawTransportFrame],
 ) -> Result<PolymarketBookValidationSummary> {
     if frames.is_empty() {
         bail!("Polymarket authoritative book validation emitted an empty batch");
@@ -3804,10 +3848,31 @@ async fn validate_polymarket_book_refreshes(
     }
     let mut validations = Vec::with_capacity(frames.len());
     for frame in frames {
-        validations
-            .push(runtime.validate_full_book_observation(frame.raw_payload, frame.received_at)?);
+        validations.push(
+            runtime.validate_full_book_observation(frame.raw_payload.clone(), frame.received_at)?,
+        );
     }
     let projection_cursor = runtime.projection().cursor;
+    let quarantine_token_ids = validations
+        .iter()
+        .filter(|validation| !validation.matches_projection)
+        .filter(|validation| {
+            runtime
+                .projection()
+                .books
+                .get(&validation.token_id)
+                .and_then(|book| book.source_observed_at)
+                .is_none_or(|observed_at| {
+                    validation
+                        .received_at
+                        .signed_duration_since(observed_at)
+                        .num_milliseconds()
+                        .max(0) as u64
+                        >= state.config.maximum_book_age_ms
+                })
+        })
+        .map(|validation| validation.token_id.clone())
+        .collect::<Vec<_>>();
     drop(runtime);
     if state
         .active_polymarket_scope
@@ -3834,6 +3899,7 @@ async fn validate_polymarket_book_refreshes(
             "observed_books":validations.len(),
             "matched_books":matched_books,
             "mismatched_books":mismatched_books,
+            "quarantine_token_ids":quarantine_token_ids,
             "evidence_sha256":evidence_sha256,
             "projection_mutated":false,
             "public_cursor_advanced":false,
@@ -3849,7 +3915,39 @@ async fn validate_polymarket_book_refreshes(
     Ok(PolymarketBookValidationSummary {
         matched_books,
         mismatched_books,
+        quarantine_token_ids,
     })
+}
+
+async fn quarantine_polymarket_tokens_from_authoritative_mismatch(
+    state: &AppState,
+    token_ids: &[String],
+) -> Result<usize> {
+    let projection = state.projection.load_full();
+    let frames = token_ids
+        .iter()
+        .filter(|token_id| {
+            projection.market_id_for_token(token_id).is_some()
+                && !projection.quarantined_token_ids.contains(*token_id)
+        })
+        .map(|token_id| {
+            let received_at = Utc::now();
+            marketcow_polymarket::RawTransportFrame {
+                raw_payload: json!({
+                    "event_type":"source_gap",
+                    "asset_id":token_id,
+                    "reason":"authoritative_book_mismatch_after_freshness_deadline",
+                    "timestamp":received_at.timestamp_millis().to_string(),
+                }),
+                received_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    drop(projection);
+    if frames.is_empty() {
+        return Ok(0);
+    }
+    apply_polymarket_transport_frames(state, frames).await
 }
 
 #[derive(Default)]
@@ -3857,6 +3955,7 @@ struct PolymarketMarketRecoverySummary {
     attempted: usize,
     recovered: usize,
     rejected: usize,
+    applied_events: usize,
 }
 
 async fn recover_quarantined_polymarket_markets(
@@ -3922,6 +4021,7 @@ async fn recover_quarantined_polymarket_markets(
             received_at,
         ) {
             Ok(outcomes) => {
+                summary.applied_events += outcomes.len();
                 if outcomes
                     .last()
                     .is_some_and(|outcome| outcome.projection.market_is_public(&market_id))
@@ -6672,6 +6772,11 @@ async fn scope(
     let ready = polymarket_projection_ready(&state, &projection);
     let universe = live.as_ref().and_then(|value| value.universe.clone());
     let active_market_ids = projection.active_market_ids();
+    let active_token_ids = projection.active_token_ids();
+    let configured_market_ids = projection.configured_market_ids();
+    let configured_token_ids = projection.configured_token_ids();
+    let available_token_ids = projection.available_token_ids();
+    let unavailable_token_ids = projection.unavailable_token_ids();
     let quarantined_market_ids = projection.quarantined_market_ids();
     let active_markets = universe.as_ref().map(|value| {
         value
@@ -6694,7 +6799,7 @@ async fn scope(
     );
     Json(json!({
         "schema_version":if universe.is_some() {
-            "marketcow.polymarket.scope-discovery.v4"
+            "marketcow.polymarket.scope-discovery.v5"
         } else {
             "marketcow.polymarket.scope-discovery.v2"
         },
@@ -6706,6 +6811,10 @@ async fn scope(
         "ready":ready,
         "market_count":active_market_count,
         "token_count":active_token_count,
+        "configured_market_count":configured_market_ids.len(),
+        "configured_token_count":configured_token_ids.len(),
+        "available_token_count":available_token_ids.len(),
+        "unavailable_token_count":unavailable_token_ids.len(),
         "catalog_revision":live.as_ref().and_then(|value| value.catalog_revision.clone()),
         "scope_file_sha256":live.as_ref().and_then(|value| value.scope_file_sha256.clone()),
         "boundary_cursor":projection.cursor,
@@ -6713,6 +6822,16 @@ async fn scope(
         "minimum_market_count":universe.as_ref().map(|value| value.minimum_market_count),
         "active_markets":active_markets,
         "active_market_ids":active_market_ids,
+        "tradable_market_ids":projection.active_market_ids(),
+        "tradable_token_ids":active_token_ids,
+        "configured_markets":universe.as_ref().map(|value| value.active_markets.clone()),
+        "configured_market_ids":configured_market_ids,
+        "configured_token_ids":configured_token_ids,
+        "available_token_ids":available_token_ids,
+        "unavailable_token_ids":unavailable_token_ids,
+        "unavailable_tokens":marketcow_api::unavailable_tokens(&projection),
+        "availability_mask_semantics":"configured_token_ids_intersect_available_token_ids",
+        "new_opportunity_requires_all_market_tokens_available":true,
         "quarantined_market_ids":quarantined_market_ids,
         "market_health":projection.market_health.values().cloned().collect::<Vec<_>>(),
         "added_markets":universe.as_ref().map(|value| value.added_markets.clone()),
@@ -6764,10 +6883,47 @@ fn effective_polymarket_universe(
     let object = payload.as_object_mut().expect("universe is an object");
     object.insert(
         "schema_version".into(),
-        json!("marketcow.polymarket.universe.v2"),
+        json!("marketcow.polymarket.universe.v3"),
     );
     object.insert("active_markets".into(), json!(active_markets));
     object.insert("active_market_ids".into(), json!(active_market_ids));
+    object.insert(
+        "tradable_market_ids".into(),
+        json!(projection.active_market_ids()),
+    );
+    object.insert(
+        "tradable_token_ids".into(),
+        json!(projection.active_token_ids()),
+    );
+    object.insert("configured_markets".into(), json!(universe.active_markets));
+    object.insert(
+        "configured_market_ids".into(),
+        json!(projection.configured_market_ids()),
+    );
+    object.insert(
+        "configured_token_ids".into(),
+        json!(projection.configured_token_ids()),
+    );
+    object.insert(
+        "available_token_ids".into(),
+        json!(projection.available_token_ids()),
+    );
+    object.insert(
+        "unavailable_token_ids".into(),
+        json!(projection.unavailable_token_ids()),
+    );
+    object.insert(
+        "unavailable_tokens".into(),
+        json!(marketcow_api::unavailable_tokens(projection)),
+    );
+    object.insert(
+        "availability_mask_semantics".into(),
+        json!("configured_token_ids_intersect_available_token_ids"),
+    );
+    object.insert(
+        "new_opportunity_requires_all_market_tokens_available".into(),
+        json!(true),
+    );
     object.insert(
         "quarantined_market_ids".into(),
         json!(projection.quarantined_market_ids()),
@@ -6933,7 +7089,7 @@ async fn live_full_sync(
             .expect("full-sync response is an object");
         object.insert(
             "universe_schema_version".into(),
-            json!("marketcow.polymarket.universe.v2"),
+            json!("marketcow.polymarket.universe.v3"),
         );
         object.insert("universe_id".into(), json!(universe.universe_id));
         object.insert("universe_generation".into(), json!(universe.generation));
@@ -9678,6 +9834,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_authoritative_mismatch_quarantines_only_the_affected_token() {
+        let (_dir, state) = test_state();
+        let live = two_market_dynamic_live();
+        {
+            let mut runtime = state.runtime.lock().await;
+            seed_polymarket_scope_catalog(&mut runtime, Some(&live)).unwrap();
+            let stale_at = Utc::now() - chrono::Duration::seconds(31);
+            runtime
+                .apply_raw(
+                    json!({
+                        "event_type":"book", "asset_id":"10", "tick_size":"0.01",
+                        "bids":[{"price":"0.40","size":"10"}],
+                        "asks":[{"price":"0.60","size":"10"}],
+                        "timestamp":stale_at.timestamp_millis().to_string()
+                    }),
+                    stale_at,
+                )
+                .unwrap();
+            state.projection.store(runtime.projection());
+        }
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(live.clone())));
+
+        let frames = ["10", "20", "30", "40"]
+            .into_iter()
+            .map(|token_id| {
+                let received_at = Utc::now();
+                marketcow_polymarket::RawTransportFrame {
+                    raw_payload: json!({
+                        "event_type":"book", "asset_id":token_id, "tick_size":"0.01",
+                        "bids":[{"price":"0.40","size":"10"}],
+                        "asks":[{
+                            "price":"0.60",
+                            "size":if token_id == "10" { "11" } else { "10" }
+                        }],
+                        "timestamp":received_at.timestamp_millis().to_string()
+                    }),
+                    received_at,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let validation = validate_polymarket_book_refreshes(&state, &live, &frames)
+            .await
+            .unwrap();
+        assert_eq!(validation.matched_books, 3);
+        assert_eq!(validation.mismatched_books, 1);
+        assert_eq!(validation.quarantine_token_ids, ["10"]);
+
+        let persisted = quarantine_polymarket_tokens_from_authoritative_mismatch(
+            &state,
+            &validation.quarantine_token_ids,
+        )
+        .await
+        .unwrap();
+        assert_eq!(persisted, 1);
+        let projection = state.projection.load_full();
+        assert!(polymarket_projection_ready(&state, &projection));
+        assert_eq!(projection.active_market_ids(), BTreeSet::from(["2".into()]));
+        assert_eq!(
+            projection.unavailable_token_ids(),
+            BTreeSet::from(["10".into()])
+        );
+        assert_eq!(
+            projection.available_token_ids(),
+            BTreeSet::from(["20".into(), "30".into(), "40".into()])
+        );
+        assert_eq!(
+            projection.market_health["1"].reason_code.as_deref(),
+            Some("source_gap:authoritative_book_mismatch_after_freshness_deadline")
+        );
+    }
+
+    #[tokio::test]
     async fn single_market_fault_is_local_and_recovers_from_two_token_atomic_snapshot() {
         let (_dir, state) = test_state();
         let live = two_market_dynamic_live();
@@ -9738,7 +9969,9 @@ mod tests {
         assert!(matches!(
             marketcow_api::stream_record("s", &quarantined).unwrap().payload,
             marketcow_api::StreamPayload::MarketQuarantined { ref control }
-                if control.market_id == "1" && !control.full_sync_required
+                if control.market_id == "1"
+                    && control.affected_token_ids == ["10"]
+                    && !control.full_sync_required
         ));
         let live_quarantine = next_stream_frame(&mut stream_client).await;
         assert_eq!(live_quarantine.cursor, initial_boundary + 1);
@@ -9770,11 +10003,41 @@ mod tests {
         .unwrap();
         assert_eq!(
             scope["schema_version"],
-            "marketcow.polymarket.scope-discovery.v4"
+            "marketcow.polymarket.scope-discovery.v5"
         );
         assert_eq!(scope["market_count"], 1);
         assert_eq!(scope["token_count"], 2);
+        assert_eq!(scope["configured_market_count"], 2);
+        assert_eq!(scope["configured_token_count"], 4);
+        assert_eq!(scope["available_token_count"], 3);
+        assert_eq!(scope["unavailable_token_count"], 1);
         assert_eq!(scope["active_market_ids"], json!(["2"]));
+        assert_eq!(scope["tradable_market_ids"], json!(["2"]));
+        assert_eq!(scope["tradable_token_ids"], json!(["30", "40"]));
+        assert_eq!(scope["configured_market_ids"], json!(["1", "2"]));
+        assert_eq!(
+            scope["configured_token_ids"],
+            json!(["10", "20", "30", "40"])
+        );
+        assert_eq!(scope["available_token_ids"], json!(["20", "30", "40"]));
+        assert_eq!(scope["unavailable_token_ids"], json!(["10"]));
+        assert_eq!(scope["unavailable_tokens"][0]["token_id"], "10");
+        assert_eq!(scope["unavailable_tokens"][0]["market_id"], "1");
+        assert_eq!(
+            scope["unavailable_tokens"][0]["availability_status"],
+            "temporarily_unavailable"
+        );
+        assert_eq!(
+            scope["unavailable_tokens"][0]["reason_code"],
+            "source_gap:injected_single_market_loss"
+        );
+        assert!(scope["unavailable_tokens"][0]["unavailable_since"].is_string());
+        assert_eq!(
+            scope["unavailable_tokens"][0]["availability_revision"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
         assert_eq!(scope["quarantined_market_ids"], json!(["1"]));
         assert_eq!(scope["scope_file_sha256"].as_str().map(str::len), Some(64));
         for field in [
@@ -9808,6 +10071,18 @@ mod tests {
         .unwrap();
         assert_eq!(full["snapshot"]["markets"].as_array().unwrap().len(), 1);
         assert_eq!(full["snapshot"]["books"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            full["snapshot"]["configured_markets"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            full["snapshot"]["available_token_ids"],
+            json!(["20", "30", "40"])
+        );
+        assert_eq!(full["snapshot"]["unavailable_token_ids"], json!(["10"]));
         assert_eq!(full["health"]["quarantined_market_count"], 1);
 
         let held_market_response = app(state.clone())
@@ -10151,7 +10426,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             scope_body["schema_version"],
-            "marketcow.polymarket.scope-discovery.v4"
+            "marketcow.polymarket.scope-discovery.v5"
         );
         assert_eq!(scope_body["universe_id"], universe_id);
         assert_eq!(scope_body["generation"], 2);
@@ -10174,7 +10449,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             full_sync["universe_schema_version"],
-            "marketcow.polymarket.universe.v2"
+            "marketcow.polymarket.universe.v3"
         );
         assert_eq!(full_sync["universe_generation"], 2);
         assert_eq!(

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const PREDICTION_MARKET_CONTRACT: &str = "marketcow.prediction_market.v1";
-pub const LIVE_SCHEMA_VERSION: &str = "marketcow.polymarket.live.v3";
+pub const LIVE_SCHEMA_VERSION: &str = "marketcow.polymarket.live.v4";
 pub const WORKER_PROTOCOL_VERSION: &str = "marketcow.worker.v1";
 pub const MAX_WORKER_FRAME_BYTES: usize = 1_048_576;
 pub const MCP_LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -280,7 +280,9 @@ pub fn validate_provider_neutral_fixture(value: &serde_json::Value) -> Result<()
     // market identity/sequence/revision fields and the v3 stream controls.
     if !matches!(
         value.get("schema_version").and_then(|item| item.as_str()),
-        Some(LIVE_SCHEMA_VERSION) | Some("marketcow.polymarket.live.v2")
+        Some(LIVE_SCHEMA_VERSION)
+            | Some("marketcow.polymarket.live.v3")
+            | Some("marketcow.polymarket.live.v2")
     ) {
         return Err("live schema version mismatch".into());
     }

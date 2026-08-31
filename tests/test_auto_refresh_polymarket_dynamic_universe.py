@@ -40,7 +40,7 @@ class Session:
     def _scope(self) -> dict:
         identity = {**IDENTITY, "market_id": "2"} if self.generation == 2 else IDENTITY
         return {
-            "schema_version": "marketcow.polymarket.scope-discovery.v4",
+            "schema_version": "marketcow.polymarket.scope-discovery.v5",
             "ready": self.ready,
             "scope_status": "ready" if self.ready else "unready",
             "active_scope_id": "a" * 64,

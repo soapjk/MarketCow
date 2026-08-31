@@ -12,7 +12,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub const MAX_EVENT_PAGE: usize = 1_000;
-pub const STREAM_PROTOCOL_VERSION: &str = "marketcow.market-stream.v3";
+pub const STREAM_PROTOCOL_VERSION: &str = "marketcow.market-stream.v4";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorWatermarks {
@@ -32,6 +32,26 @@ pub struct BookView {
     pub last_trade_observed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Machine-readable token mask entry for a token-local projection fault.  The containing market
+/// remains present in `configured_markets` so downstream position monitoring never loses stable
+/// identities, while new-opportunity scanners intersect configured tokens with
+/// `available_token_ids`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnavailableToken {
+    pub token_id: String,
+    pub market_id: String,
+    pub availability_status: String,
+    pub reason_code: String,
+    pub retryable: bool,
+    pub retry_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub unavailable_since: Option<chrono::DateTime<chrono::Utc>>,
+    pub source_observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_recovered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub projection_generation: u64,
+    pub catalog_revision: Option<String>,
+    pub availability_revision: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotResponse {
     pub schema_version: String,
@@ -43,8 +63,22 @@ pub struct SnapshotResponse {
     pub unresolved_gaps: Vec<String>,
     pub books: Vec<BookView>,
     pub catalog_revision: Option<String>,
+    /// Tradable subset. Every outcome token has passed the availability mask.
     pub markets: Vec<marketcow_core::MarketRecord>,
     pub negative_risk_relations: Vec<marketcow_core::NegativeRiskRelation>,
+    /// Full configured identity/facts set at this same atomic boundary, including quarantined
+    /// markets.  Books for unavailable tokens are intentionally not published as tradable.
+    pub configured_markets: Vec<marketcow_core::MarketRecord>,
+    pub configured_negative_risk_relations: Vec<marketcow_core::NegativeRiskRelation>,
+    pub configured_market_ids: Vec<String>,
+    pub configured_token_ids: Vec<String>,
+    pub available_token_ids: Vec<String>,
+    pub unavailable_token_ids: Vec<String>,
+    pub unavailable_tokens: Vec<UnavailableToken>,
+    pub availability_mask_semantics: String,
+    pub new_opportunity_requires_all_market_tokens_available: bool,
+    pub tradable_market_ids: Vec<String>,
+    pub tradable_token_ids: Vec<String>,
     pub active_market_ids: Vec<String>,
     pub quarantined_market_ids: Vec<String>,
     pub market_health: Vec<MarketProjectionHealth>,
@@ -173,6 +207,7 @@ pub struct MarketControlFields {
     pub old_generation: u64,
     pub new_generation: u64,
     pub affected_market_ids: Vec<String>,
+    pub affected_token_ids: Vec<String>,
     pub added_market_ids: Vec<String>,
     pub removed_market_ids: Vec<String>,
     pub replacement_market_id: Option<String>,
@@ -265,6 +300,7 @@ fn market_control(record: &PersistedEvent, market: &MarketEventMetadata) -> Mark
         old_generation: market.projection_generation.saturating_sub(1),
         new_generation: market.projection_generation,
         affected_market_ids: vec![market.market_id.clone()],
+        affected_token_ids: vec![record.event.kind.token_id().to_owned()],
         added_market_ids: recovered
             .then(|| market.market_id.clone())
             .into_iter()
@@ -314,7 +350,12 @@ pub enum ReadApiError {
 pub fn snapshot(projection: &Projection) -> SnapshotResponse {
     let active_market_ids = projection.active_market_ids();
     let active_token_ids = projection.active_token_ids();
+    let configured_market_ids = projection.configured_market_ids();
+    let configured_token_ids = projection.configured_token_ids();
+    let available_token_ids = projection.available_token_ids();
+    let unavailable_token_ids = projection.unavailable_token_ids();
     let quarantined_market_ids = projection.quarantined_market_ids();
+    let unavailable_tokens = unavailable_tokens(projection);
     SnapshotResponse {
         schema_version: LIVE_SCHEMA_VERSION.into(),
         scope_id: projection.scope_id.clone(),
@@ -345,10 +386,74 @@ pub fn snapshot(projection: &Projection) -> SnapshotResponse {
             .filter(|relation| relation.member_market_ids.is_subset(&active_market_ids))
             .cloned()
             .collect(),
+        configured_markets: projection
+            .markets
+            .iter()
+            .filter(|(market_id, _)| configured_market_ids.contains(*market_id))
+            .map(|(_, market)| market.clone())
+            .collect(),
+        configured_negative_risk_relations: projection
+            .negative_risk_relations
+            .values()
+            .cloned()
+            .collect(),
+        configured_market_ids: configured_market_ids.into_iter().collect(),
+        configured_token_ids: configured_token_ids.into_iter().collect(),
+        available_token_ids: available_token_ids.into_iter().collect(),
+        unavailable_token_ids: unavailable_token_ids.into_iter().collect(),
+        unavailable_tokens,
+        availability_mask_semantics: "configured_token_ids_intersect_available_token_ids".into(),
+        new_opportunity_requires_all_market_tokens_available: true,
+        tradable_market_ids: active_market_ids.iter().cloned().collect(),
+        tradable_token_ids: active_token_ids.iter().cloned().collect(),
         active_market_ids: active_market_ids.into_iter().collect(),
         quarantined_market_ids: quarantined_market_ids.into_iter().collect(),
         market_health: projection.market_health.values().cloned().collect(),
     }
+}
+
+pub fn unavailable_tokens(projection: &Projection) -> Vec<UnavailableToken> {
+    projection
+        .unavailable_token_ids()
+        .into_iter()
+        .filter_map(|token_id| {
+            let market_id = projection.market_id_for_token(&token_id)?.to_owned();
+            let health = projection.market_health.get(&market_id);
+            let token_health = projection.token_health.get(&token_id);
+            Some(UnavailableToken {
+                token_id,
+                market_id,
+                availability_status: "temporarily_unavailable".into(),
+                reason_code: token_health
+                    .map(|value| value.reason_code.clone())
+                    .or_else(|| health.and_then(|value| value.reason_code.clone()))
+                    .unwrap_or_else(|| "token_quarantined".into()),
+                retryable: token_health.map_or_else(
+                    || health.is_none_or(|value| value.retryable),
+                    |value| value.retryable,
+                ),
+                retry_after: token_health
+                    .and_then(|value| value.retry_after)
+                    .or_else(|| health.and_then(|value| value.retry_after)),
+                unavailable_since: token_health.map(|value| value.unavailable_since),
+                source_observed_at: token_health
+                    .map(|value| value.source_observed_at)
+                    .or_else(|| health.and_then(|value| value.source_observed_at)),
+                last_recovered_at: health.and_then(|value| value.last_recovered_at),
+                projection_generation: token_health.map_or_else(
+                    || health.map_or(projection.generation, |value| value.projection_generation),
+                    |value| value.projection_generation,
+                ),
+                catalog_revision: token_health
+                    .and_then(|value| value.catalog_revision.clone())
+                    .or_else(|| health.and_then(|value| value.catalog_revision.clone()))
+                    .or_else(|| projection.catalog_revision.clone()),
+                availability_revision: token_health
+                    .map(|value| value.availability_revision.clone())
+                    .or_else(|| health.and_then(|value| value.last_event_revision.clone())),
+            })
+        })
+        .collect()
 }
 
 pub fn market_snapshot(projection: &Projection, market_id: &str) -> Option<MarketSnapshotResponse> {

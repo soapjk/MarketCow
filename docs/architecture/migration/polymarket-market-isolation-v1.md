@@ -17,14 +17,14 @@ All prices, sizes, rates, and quanta retain exact decimal-string semantics. Time
 
 ## Versions
 
-- full sync and snapshots: `marketcow.polymarket.live.v3`
-- scope discovery: `marketcow.polymarket.scope-discovery.v4`
-- effective dynamic universe: `marketcow.polymarket.universe.v2`
-- WebSocket: `marketcow.market-stream.v3`
+- full sync and snapshots: `marketcow.polymarket.live.v4`
+- scope discovery: `marketcow.polymarket.scope-discovery.v5`
+- effective dynamic universe: `marketcow.polymarket.universe.v3`
+- WebSocket: `marketcow.market-stream.v4`
 - per-market snapshot: `marketcow.polymarket.market-snapshot.v1`
 
 Scope artifacts remain hash-pinned `rust-live-scope.v4` inputs containing a
-`marketcow.polymarket.universe.v1` candidate. The daemon publishes the effective v2 view after
+`marketcow.polymarket.universe.v1` candidate. The daemon publishes the effective v3 view after
 atomically overlaying the same-boundary market health projection.
 
 ## Gap classification
@@ -74,10 +74,16 @@ Every ordinary market event includes:
 - `source_observed_at` and `last_recovered_at`
 - `projection_generation`, `catalog_revision`, and `last_event_revision`
 
-The full-sync snapshot contains only markets usable for new opportunities. It also exposes
-`active_market_ids`, `quarantined_market_ids`, and all health records. Relations whose complete
-member set is not active are omitted, preventing a partial negative-risk group from being treated
-as executable.
+The full-sync `markets`, `books`, `tradable_market_ids`, and `tradable_token_ids` fields contain
+only instruments usable for new opportunities. `configured_markets`, `configured_market_ids`, and
+`configured_token_ids` preserve the complete same-generation identity/facts set. Consumers form
+their executable mask by intersecting configured outcome tokens with `available_token_ids` and
+must require both binary outcomes; `unavailable_tokens` identifies exactly the affected token with
+its market, reason, retry timing, generation, catalog revision, and availability revision. A
+single token fault therefore excludes its containing market from new opportunities without
+claiming that the healthy sibling token disappeared. Relations whose complete member set is not
+tradable are omitted from the executable relation list, while
+`configured_negative_risk_relations` preserves the audited configured facts.
 
 `GET /v1/prediction-markets/polymarket/live/markets/{market_id}/snapshot` remains available for a
 quarantined market and for a market removed from the scan universe. It returns stable
@@ -101,8 +107,8 @@ Local controls advance the same global cursor as ordinary events and set
 - `market_recovered`
 
 Each carries global cursor, market sequence, projection/catalog revision, old/new projection
-generation, affected/added/removed identities, reason, recovery boundary, and whether a per-market
-snapshot is required. `universe_changed` remains the atomic replacement-generation boundary. The
+generation, `affected_token_ids`, affected/added/removed market identities, reason, recovery
+boundary, and whether a per-market snapshot is required. `universe_changed` remains the atomic replacement-generation boundary. The
 periodic MarketCow-owned refresh controller observes a below-target effective universe, builds and
 fully validates a replacement candidate, then atomically activates it; this is the
 `market_replaced` equivalent at universe scope.

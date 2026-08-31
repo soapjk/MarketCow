@@ -139,13 +139,13 @@ def validate_boundary(scope: dict[str, Any], full: dict[str, Any]) -> dict[str, 
     }
     quarantined_market_ids = set(map(str, scope.get("quarantined_market_ids") or []))
     passed = (
-        scope.get("schema_version") == "marketcow.polymarket.scope-discovery.v4"
+        scope.get("schema_version") == "marketcow.polymarket.scope-discovery.v5"
         and scope.get("ready") is True
         and scope.get("scope_status") == "ready"
         and 0 < minimum_market_count <= market_count <= target_market_count <= 250
         and token_count == 2 * market_count
         and scope.get("real_order_submission_enabled") is False
-        and full.get("schema_version") == "marketcow.polymarket.live.v3"
+        and full.get("schema_version") == "marketcow.polymarket.live.v4"
         and full.get("scope_id") == scope.get("active_scope_id")
         and full.get("universe_id") == scope.get("universe_id")
         and full.get("universe_generation") == generation
@@ -283,7 +283,7 @@ async def main_async(arguments: argparse.Namespace) -> dict[str, Any]:
                     subscription = json.loads(await asyncio.wait_for(socket.recv(), 10))
                     if (
                         subscription.get("type") != "subscription"
-                        or subscription.get("protocol_version") != "marketcow.market-stream.v3"
+                        or subscription.get("protocol_version") != "marketcow.market-stream.v4"
                         or int(subscription.get("boundary_cursor", -1)) < after_cursor
                     ):
                         raise RuntimeError(f"invalid subscription: {subscription}")
