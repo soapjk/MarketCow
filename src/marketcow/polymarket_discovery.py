@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -32,6 +33,7 @@ DISCOVERY_SCHEMA_VERSION = "marketcow.polymarket.discovery.v2"
 DISCOVERY_EVENT_SCHEMA_VERSION = "marketcow.polymarket.discovery-events.v2"
 DISCOVERY_RELATION_SCHEMA_VERSION = "marketcow.polymarket.discovery-relation.v2"
 LIFECYCLE_HISTORY_SCHEMA_VERSION = "marketcow.polymarket.lifecycle-history.v2"
+LOGGER = logging.getLogger(__name__)
 
 
 def install_discovery_openapi_extension(app: FastAPI) -> None:
@@ -1305,6 +1307,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 with self._lock:
                     self._materialization_state = "failed"
                     self._materialization_error = f"{type(exc).__name__}: {exc}"
+                LOGGER.exception("polymarket_discovery_materialization_failed")
             self._wake.wait(self.refresh_interval_seconds)
             self._wake.clear()
 

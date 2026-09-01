@@ -339,6 +339,10 @@ def create_polymarket_live_read_app(
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
 
+    @app.get("/v1/prediction-markets/polymarket/live/discovery/status")
+    async def discovery_status():
+        return discovery.materialization_status()
+
     @app.get(
         "/v1/prediction-markets/polymarket/live/discovery/events",
         response_model=DiscoveryEventPage,

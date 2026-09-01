@@ -1755,6 +1755,13 @@ def create_app(
             _raise_polymarket_read_error(exc)
 
     @app.get(
+        "/v1/prediction-markets/polymarket/live/discovery/status",
+        summary="Read background discovery materialization status",
+    )
+    async def polymarket_discovery_status():
+        return require_polymarket_discovery().materialization_status()
+
+    @app.get(
         "/v1/prediction-markets/polymarket/live/discovery/events",
         response_model=DiscoveryEventPage,
         summary="Resume changed full-market lightweight quotes",
