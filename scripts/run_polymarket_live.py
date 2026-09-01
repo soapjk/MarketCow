@@ -29,6 +29,33 @@ def effective_snapshot_refresh_seconds(
     return min(requested, 1.0)
 
 
+def refresh_catalog_or_reuse_published(
+    collector: PolymarketLiveCollector,
+) -> dict:
+    """Keep startup available across a transient catalog-source failure.
+
+    LiveStateStore has already integrity-checked its durable catalog. Reuse is
+    permitted only when that verified catalog is non-empty; an uninitialized
+    collector still fails closed.
+    """
+    try:
+        return collector.refresh_catalog()
+    except Exception as exc:
+        catalog = getattr(collector.store, "catalog", None)
+        if not catalog:
+            raise
+        LOGGER.warning(
+            "polymarket_catalog_startup_refresh_failed_reusing_published "
+            "market_count=%d error=%s detail=%s",
+            len(catalog), type(exc).__name__, str(exc)[:500],
+        )
+        return {
+            "status": "published_catalog_reused",
+            "market_count": len(catalog),
+            "refresh_error": type(exc).__name__,
+        }
+
+
 async def bootstrap_books_until_ready(
     collector: PolymarketLiveCollector,
     *,
@@ -140,7 +167,7 @@ def main() -> None:
                 "starting_cursor": store.cursor,
             })
         else:
-            evidence = collector.refresh_catalog()
+            evidence = refresh_catalog_or_reuse_published(collector)
             print(evidence)
         if arguments.catalog_only:
             return

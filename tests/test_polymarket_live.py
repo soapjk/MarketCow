@@ -20,7 +20,10 @@ from scripts.run_polymarket_scoped_manifest import (
     validate_scope_lifetime,
     validate_snapshot_refresh_seconds,
 )
-from scripts.run_polymarket_live import effective_snapshot_refresh_seconds
+from scripts.run_polymarket_live import (
+    effective_snapshot_refresh_seconds,
+    refresh_catalog_or_reuse_published,
+)
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.polymarket_contracts import content_sha256
@@ -130,6 +133,22 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertIsNone(
             effective_snapshot_refresh_seconds(None, bounded_scope=True)
         )
+
+    def test_startup_catalog_refresh_reuses_only_a_published_catalog(self):
+        class Collector:
+            def __init__(self, catalog):
+                self.store = type("Store", (), {"catalog": catalog})()
+
+            def refresh_catalog(self):
+                raise ConnectionError("transient Gamma TLS failure")
+
+        result = refresh_catalog_or_reuse_published(
+            Collector({"market-1": object()})
+        )
+        self.assertEqual(result["status"], "published_catalog_reused")
+        self.assertEqual(result["market_count"], 1)
+        with self.assertRaises(ConnectionError):
+            refresh_catalog_or_reuse_published(Collector({}))
 
     def setUp(self):
         self.folder = TemporaryDirectory()
