@@ -1,0 +1,3 @@
+   36774 /Users/androidjk/Library/Logs/MarketCow/production.log
+  545283 /Users/androidjk/Library/Logs/MarketCow/production.error.log
+  582057 total
