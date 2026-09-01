@@ -161,16 +161,28 @@ def _validate_scope_identity(scope: dict[str, Any]) -> None:
     active = scope.get("active_markets")
     if not isinstance(active, list):
         raise RuntimeError("live scope active_markets is unavailable")
+    configured = scope.get("configured_markets")
+    if not isinstance(configured, list):
+        raise RuntimeError("live scope configured_markets is unavailable")
     try:
         generation = int(scope.get("generation", 0))
         market_count = int(scope.get("market_count", -1))
         token_count = int(scope.get("token_count", -1))
+        configured_market_count = int(scope.get("configured_market_count", -1))
+        configured_token_count = int(scope.get("configured_token_count", -1))
         target_count = int(scope.get("target_market_count", -1))
         minimum_count = int(scope.get("minimum_market_count", -1))
     except (TypeError, ValueError) as error:
         raise RuntimeError("live scope counts are invalid") from error
     identities = _identity_set(active)
     tokens = [token for identity in active for token in identity.get("token_ids", [])]
+    configured_identities = _identity_set(configured)
+    configured_tokens = [
+        token for identity in configured for token in identity.get("token_ids", [])
+    ]
+    active_ids = {identity[0] for identity in identities}
+    configured_ids = {identity[0] for identity in configured_identities}
+    quarantined_ids = set(map(str, scope.get("quarantined_market_ids") or []))
     ready = scope.get("ready") is True
     checks = {
         "schema": scope.get("schema_version") == SCOPE_SCHEMA_VERSION,
@@ -184,7 +196,21 @@ def _validate_scope_identity(scope: dict[str, Any]) -> None:
         "market_count": market_count == len(active) == len(identities),
         "token_count": token_count == len(tokens) == 2 * market_count,
         "unique_tokens": len(tokens) == len(set(tokens)),
-        "capacity": 0 < minimum_count <= market_count <= target_count <= 250,
+        "configured_market_count": configured_market_count
+        == len(configured)
+        == len(configured_identities),
+        "configured_token_count": configured_token_count
+        == len(configured_tokens)
+        == 2 * configured_market_count,
+        "configured_unique_tokens": len(configured_tokens)
+        == len(set(configured_tokens)),
+        "active_subset": active_ids <= configured_ids,
+        "quarantine_partition": quarantined_ids == configured_ids - active_ids,
+        "capacity": 0
+        < minimum_count
+        <= configured_market_count
+        <= target_count
+        <= 250,
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
@@ -245,48 +271,12 @@ def _configured_market_identities(
 ) -> list[dict[str, Any]]:
     """Reconstruct the configured generation, not only its currently executable subset.
 
-    Scope v4 deliberately removes quarantined markets from `active_markets`. Universe delta
-    validation, however, is relative to the complete configured generation. The read-only
-    per-market snapshot retains the exact stable identity needed to include every quarantined
-    member in that baseline without reusing its book for opportunities.
+    Scope v5 publishes the complete configured identity separately from its currently executable
+    subset. Universe delta validation is relative to that complete generation; no quarantined book
+    state is reused for opportunities or candidate activation.
     """
-    identities = [dict(value) for value in scope.get("active_markets") or []]
-    active_ids = {str(value.get("market_id")) for value in identities}
-    quarantined = sorted(map(str, scope.get("quarantined_market_ids") or []))
-    if active_ids.intersection(quarantined):
-        raise RuntimeError("quarantined market is also present in the active universe")
-    for market_id in quarantined:
-        status, payload = _get_json(
-            session,
-            f"{config.service_url}/v1/prediction-markets/polymarket/live/markets/{market_id}/snapshot",
-            config.request_timeout_seconds,
-        )
-        market = payload.get("market") or {}
-        facts = market.get("instrument_facts") or {}
-        outcomes = market.get("outcomes") or []
-        token_ids = [str(value.get("token_id", "")) for value in outcomes]
-        if (
-            status != 200
-            or payload.get("stable_identity_for_position_monitoring") is not True
-            or payload.get("scan_universe_membership") is not True
-            or str(market.get("market_id")) != market_id
-            or not market.get("condition_id")
-            or len(token_ids) != 2
-            or len(set(token_ids)) != 2
-            or any(not value for value in token_ids)
-            or not facts.get("end_at")
-        ):
-            raise RuntimeError(
-                f"quarantined market identity is unavailable: market_id={market_id}"
-            )
-        identities.append(
-            {
-                "market_id": market_id,
-                "condition_id": str(market["condition_id"]),
-                "token_ids": token_ids,
-                "end_at": str(facts["end_at"]),
-            }
-        )
+    del config, session
+    identities = [dict(value) for value in scope.get("configured_markets") or []]
     if len(_identity_set(identities)) != len(identities):
         raise RuntimeError("configured market identities are duplicated")
     return identities

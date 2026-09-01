@@ -1036,7 +1036,13 @@ struct PolymarketBookValidationProjection {
 struct PolymarketBookValidationSummary {
     matched_books: usize,
     mismatched_books: usize,
+    missing_books: usize,
     quarantine_token_ids: Vec<String>,
+}
+
+struct PolymarketBookRefreshBatch {
+    frames: Vec<marketcow_polymarket::RawTransportFrame>,
+    missing_token_ids: Vec<String>,
 }
 
 struct PolymarketScopeSwitchRequest {
@@ -3193,8 +3199,8 @@ fn start_polymarket_live(
                     }
                     _ = refresh_tick.tick() => {
                         match fetch_polymarket_book_refreshes(&refresh_client, &live.token_ids).await {
-                            Ok(frames) => {
-                                match recover_quarantined_polymarket_markets(&state, &live, &frames).await {
+                            Ok(batch) => {
+                                match recover_quarantined_polymarket_markets(&state, &live, &batch.frames).await {
                                     Ok(recovery) => {
                                         events_since_checkpoint += recovery.applied_events;
                                         if recovery.attempted > 0 {
@@ -3217,17 +3223,23 @@ fn start_polymarket_live(
                                         break 'service;
                                     }
                                 }
-                                match validate_polymarket_book_refreshes(&state, &live, &frames).await {
+                                match validate_polymarket_book_refreshes(
+                                    &state,
+                                    &live,
+                                    &batch.frames,
+                                    &batch.missing_token_ids,
+                                ).await {
                                     Ok(summary) => {
                                         info!(
                                             matched_books=summary.matched_books,
                                             mismatched_books=summary.mismatched_books,
+                                            missing_books=summary.missing_books,
                                             quarantine_token_count=summary.quarantine_token_ids.len(),
                                             interval_ms=refresh_interval.as_millis(),
                                             "polymarket_authoritative_books_validated"
                                         );
                                         if !summary.quarantine_token_ids.is_empty() {
-                                            match quarantine_polymarket_tokens_from_authoritative_mismatch(
+                                            match quarantine_polymarket_tokens_from_authoritative_refresh(
                                                 &state,
                                                 &summary.quarantine_token_ids,
                                             ).await {
@@ -3236,7 +3248,7 @@ fn start_polymarket_live(
                                                     match recover_quarantined_polymarket_markets(
                                                         &state,
                                                         &live,
-                                                        &frames,
+                                                        &batch.frames,
                                                     ).await {
                                                         Ok(recovery) => {
                                                             events_since_checkpoint += recovery.applied_events;
@@ -3299,7 +3311,7 @@ fn polymarket_book_refresh_interval(maximum_book_age_ms: u64) -> Duration {
 async fn fetch_polymarket_book_refreshes(
     client: &reqwest::Client,
     token_ids: &[String],
-) -> Result<Vec<marketcow_polymarket::RawTransportFrame>> {
+) -> Result<PolymarketBookRefreshBatch> {
     if token_ids.is_empty() || token_ids.len() > 500 {
         bail!("Polymarket book refresh token scope is invalid");
     }
@@ -3334,7 +3346,7 @@ fn validate_polymarket_book_refresh_response(
     payload: serde_json::Value,
     token_ids: &[String],
     received_at: DateTime<Utc>,
-) -> Result<Vec<marketcow_polymarket::RawTransportFrame>> {
+) -> Result<PolymarketBookRefreshBatch> {
     let requested = token_ids.iter().cloned().collect::<BTreeSet<_>>();
     if requested.len() != token_ids.len()
         || requested.iter().any(|token| {
@@ -3395,10 +3407,11 @@ fn validate_polymarket_book_refresh_response(
             },
         );
     }
-    if validated.keys().cloned().collect::<BTreeSet<_>>() != requested {
-        bail!("Polymarket book refresh response is missing requested tokens");
-    }
-    Ok(validated.into_values().collect())
+    let returned = validated.keys().cloned().collect::<BTreeSet<_>>();
+    Ok(PolymarketBookRefreshBatch {
+        frames: validated.into_values().collect(),
+        missing_token_ids: requested.difference(&returned).cloned().collect(),
+    })
 }
 
 fn validate_polymarket_book_refresh_decimal(
@@ -3838,8 +3851,9 @@ async fn validate_polymarket_book_refreshes(
     state: &AppState,
     live: &PolymarketLiveConfig,
     frames: &[marketcow_polymarket::RawTransportFrame],
+    missing_token_ids: &[String],
 ) -> Result<PolymarketBookValidationSummary> {
-    if frames.is_empty() {
+    if frames.is_empty() && missing_token_ids.is_empty() {
         bail!("Polymarket authoritative book validation emitted an empty batch");
     }
     let runtime = state.runtime.lock().await;
@@ -3853,7 +3867,11 @@ async fn validate_polymarket_book_refreshes(
         );
     }
     let projection_cursor = runtime.projection().cursor;
-    let quarantine_token_ids = validations
+    let observed = validations
+        .iter()
+        .map(|validation| validation.token_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut quarantine_token_ids = validations
         .iter()
         .filter(|validation| !validation.matches_projection)
         .filter(|validation| {
@@ -3872,7 +3890,45 @@ async fn validate_polymarket_book_refreshes(
                 })
         })
         .map(|validation| validation.token_id.clone())
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    let requested = live.token_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let missing = missing_token_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if missing.len() != missing_token_ids.len()
+        || !observed.is_disjoint(&missing)
+        || observed.union(&missing).cloned().collect::<BTreeSet<_>>() != requested
+    {
+        bail!("Polymarket authoritative book validation missing-token scope is invalid");
+    }
+    let previous_validations = state.polymarket_book_validations.load_full();
+    let previous_verified_at = (previous_validations.scope_id == live.scope_id)
+        .then_some(&previous_validations.verified_at);
+    let now = Utc::now();
+    let missing_quarantine_token_ids = missing
+        .iter()
+        .filter(|token_id| {
+            let source_observed_at = runtime
+                .projection()
+                .books
+                .get(*token_id)
+                .and_then(|book| book.source_observed_at);
+            let previously_verified_at = previous_verified_at
+                .and_then(|verified| verified.get(*token_id))
+                .copied();
+            source_observed_at
+                .into_iter()
+                .chain(previously_verified_at)
+                .max()
+                .is_none_or(|observed_at| {
+                    now.signed_duration_since(observed_at)
+                        .num_milliseconds()
+                        .max(0) as u64
+                        >= state.config.maximum_book_age_ms
+                })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    quarantine_token_ids.extend(missing_quarantine_token_ids.iter().cloned());
+    let quarantine_token_ids = quarantine_token_ids.into_iter().collect::<Vec<_>>();
     drop(runtime);
     if state
         .active_polymarket_scope
@@ -3881,14 +3937,35 @@ async fn validate_polymarket_book_refreshes(
     {
         bail!("Polymarket book validation completed after a scope transition");
     }
-    let verified_at = validations
+    let mut verified_at = validations
         .iter()
         .filter(|validation| validation.matches_projection)
         .map(|validation| (validation.token_id.clone(), validation.received_at))
         .collect::<BTreeMap<_, _>>();
-    let matched_books = verified_at.len();
-    let mismatched_books = validations.len().saturating_sub(matched_books);
-    let evidence_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&validations)?));
+    if let Some(previous) = previous_verified_at {
+        verified_at.extend(
+            missing
+                .difference(&missing_quarantine_token_ids)
+                .filter_map(|token_id| {
+                    previous
+                        .get(token_id)
+                        .copied()
+                        .map(|verified_at| (token_id.clone(), verified_at))
+                }),
+        );
+    }
+    let matched_books = validations
+        .iter()
+        .filter(|validation| validation.matches_projection)
+        .count();
+    let mismatched_books = validations
+        .iter()
+        .filter(|validation| !validation.matches_projection)
+        .count();
+    let evidence_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&json!({
+        "validations":validations,
+        "missing_token_ids":missing,
+    }))?));
     state.audit.record_lifecycle(
         "polymarket_book_validation",
         "observed",
@@ -3899,6 +3976,8 @@ async fn validate_polymarket_book_refreshes(
             "observed_books":validations.len(),
             "matched_books":matched_books,
             "mismatched_books":mismatched_books,
+            "missing_books":missing.len(),
+            "missing_token_ids":missing,
             "quarantine_token_ids":quarantine_token_ids,
             "evidence_sha256":evidence_sha256,
             "projection_mutated":false,
@@ -3915,11 +3994,12 @@ async fn validate_polymarket_book_refreshes(
     Ok(PolymarketBookValidationSummary {
         matched_books,
         mismatched_books,
+        missing_books: missing.len(),
         quarantine_token_ids,
     })
 }
 
-async fn quarantine_polymarket_tokens_from_authoritative_mismatch(
+async fn quarantine_polymarket_tokens_from_authoritative_refresh(
     state: &AppState,
     token_ids: &[String],
 ) -> Result<usize> {
@@ -3936,7 +4016,7 @@ async fn quarantine_polymarket_tokens_from_authoritative_mismatch(
                 raw_payload: json!({
                     "event_type":"source_gap",
                     "asset_id":token_id,
-                    "reason":"authoritative_book_mismatch_after_freshness_deadline",
+                    "reason":"authoritative_book_unavailable_after_freshness_deadline",
                     "timestamp":received_at.timestamp_millis().to_string(),
                 }),
                 received_at,
@@ -9562,7 +9642,7 @@ mod tests {
                 "minimum_order_size":"5",
                 "settlement_currency":"pUSD",
                 "start_at":"2026-01-01T00:00:00Z",
-                "end_at":"2026-09-01T00:00:00Z",
+                "end_at":"2099-09-01T00:00:00Z",
                 "revision":format!("instrument-{market_id}")
             }
         });
@@ -9637,6 +9717,15 @@ mod tests {
         previous_market: Option<&str>,
     ) -> PolymarketLiveConfig {
         let mut live = dynamic_live_scope(universe_id, market_id, yes, no);
+        let today = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        let validated_at = today - chrono::Duration::days(1);
+        let end_at = today + chrono::Duration::days(10);
+        live.catalog_frame.as_mut().unwrap()["markets"][0]["instrument_facts"]["end_at"] =
+            json!(end_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         live.initial_book_frames = vec![yes, no]
             .into_iter()
             .map(|token| {
@@ -9646,7 +9735,7 @@ mod tests {
                     "tick_size":"0.01",
                     "bids":[{"price":"0.40","size":"10"}],
                     "asks":[{"price":"0.60","size":"10"}],
-                    "timestamp":"2026-08-29T00:00:00Z"
+                    "timestamp":validated_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                 })
             })
             .collect();
@@ -9654,7 +9743,7 @@ mod tests {
             market_id: market_id.into(),
             condition_id: format!("condition-{market_id}"),
             token_ids: vec![yes.into(), no.into()],
-            end_at: "2026-09-01T00:00:00Z".parse().unwrap(),
+            end_at,
         };
         let removed_identities = previous_market
             .filter(|previous| *previous != market_id)
@@ -9663,7 +9752,7 @@ mod tests {
                     market_id: previous.into(),
                     condition_id: format!("condition-{previous}"),
                     token_ids: vec!["10".into(), "20".into()],
-                    end_at: "2026-09-01T00:00:00Z".parse().unwrap(),
+                    end_at,
                 }]
             });
         live.universe = Some(PolymarketUniverseContract {
@@ -9693,7 +9782,7 @@ mod tests {
                 .collect(),
             removed_market_identities: removed_identities,
             excluded_markets: Vec::new(),
-            validated_at: "2026-08-29T00:00:00Z".parse().unwrap(),
+            validated_at,
         });
         live
     }
@@ -9877,14 +9966,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let validation = validate_polymarket_book_refreshes(&state, &live, &frames)
+        let validation = validate_polymarket_book_refreshes(&state, &live, &frames, &[])
             .await
             .unwrap();
         assert_eq!(validation.matched_books, 3);
         assert_eq!(validation.mismatched_books, 1);
         assert_eq!(validation.quarantine_token_ids, ["10"]);
 
-        let persisted = quarantine_polymarket_tokens_from_authoritative_mismatch(
+        let persisted = quarantine_polymarket_tokens_from_authoritative_refresh(
             &state,
             &validation.quarantine_token_ids,
         )
@@ -9904,7 +9993,95 @@ mod tests {
         );
         assert_eq!(
             projection.market_health["1"].reason_code.as_deref(),
-            Some("source_gap:authoritative_book_mismatch_after_freshness_deadline")
+            Some("source_gap:authoritative_book_unavailable_after_freshness_deadline")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_token_missing_from_partial_refresh_is_quarantined_locally() {
+        let (_dir, state) = test_state();
+        let live = two_market_dynamic_live();
+        {
+            let mut runtime = state.runtime.lock().await;
+            seed_polymarket_scope_catalog(&mut runtime, Some(&live)).unwrap();
+            let stale_at = Utc::now() - chrono::Duration::seconds(31);
+            runtime
+                .apply_raw(
+                    json!({
+                        "event_type":"book", "asset_id":"10", "tick_size":"0.01",
+                        "bids":[{"price":"0.40","size":"10"}],
+                        "asks":[{"price":"0.60","size":"10"}],
+                        "timestamp":stale_at.timestamp_millis().to_string()
+                    }),
+                    stale_at,
+                )
+                .unwrap();
+            state.projection.store(runtime.projection());
+        }
+        state
+            .active_polymarket_scope
+            .store(Some(Arc::new(live.clone())));
+        state
+            .polymarket_book_validations
+            .store(Arc::new(PolymarketBookValidationProjection {
+                scope_id: live.scope_id.clone(),
+                verified_at: BTreeMap::from([("10".into(), Utc::now())]),
+            }));
+
+        let frames = ["20", "30", "40"]
+            .into_iter()
+            .map(|token_id| {
+                let received_at = Utc::now();
+                marketcow_polymarket::RawTransportFrame {
+                    raw_payload: json!({
+                        "event_type":"book", "asset_id":token_id, "tick_size":"0.01",
+                        "bids":[{"price":"0.40","size":"10"}],
+                        "asks":[{"price":"0.60","size":"10"}],
+                        "timestamp":received_at.timestamp_millis().to_string()
+                    }),
+                    received_at,
+                }
+            })
+            .collect::<Vec<_>>();
+        let transient = validate_polymarket_book_refreshes(&state, &live, &frames, &["10".into()])
+            .await
+            .unwrap();
+        assert!(transient.quarantine_token_ids.is_empty());
+        assert!(
+            state
+                .polymarket_book_validations
+                .load()
+                .verified_at
+                .contains_key("10")
+        );
+
+        state
+            .polymarket_book_validations
+            .store(Arc::new(PolymarketBookValidationProjection {
+                scope_id: live.scope_id.clone(),
+                verified_at: BTreeMap::from([(
+                    "10".into(),
+                    Utc::now() - chrono::Duration::seconds(31),
+                )]),
+            }));
+        let validation = validate_polymarket_book_refreshes(&state, &live, &frames, &["10".into()])
+            .await
+            .unwrap();
+        assert_eq!(validation.matched_books, 3);
+        assert_eq!(validation.mismatched_books, 0);
+        assert_eq!(validation.missing_books, 1);
+        assert_eq!(validation.quarantine_token_ids, ["10"]);
+
+        let persisted = quarantine_polymarket_tokens_from_authoritative_refresh(
+            &state,
+            &validation.quarantine_token_ids,
+        )
+        .await
+        .unwrap();
+        assert_eq!(persisted, 1);
+        assert_eq!(
+            state.projection.load().active_market_ids(),
+            BTreeSet::from(["2".into()])
         );
     }
 
@@ -10261,15 +10438,13 @@ mod tests {
         let (dir, mut state) = test_state();
         let universe_id = "c".repeat(64);
         let live = dynamic_universe_live(&universe_id, 1, "1", "10", "20", None);
+        let activated_at = Utc::now();
         let source = dir.path().join("generation-1.json");
         let digest = write_dynamic_universe_scope(&source, &live);
-        let loaded = load_polymarket_scope_file_at(
-            &universe_id,
-            &source.to_string_lossy(),
-            "2026-08-29T00:00:01Z".parse().unwrap(),
-        )
-        .unwrap()
-        .unwrap();
+        let loaded =
+            load_polymarket_scope_file_at(&universe_id, &source.to_string_lossy(), activated_at)
+                .unwrap()
+                .unwrap();
         assert_eq!(loaded.scope_file_sha256.as_deref(), Some(digest.as_str()));
         assert_eq!(loaded.universe.as_ref().unwrap().generation, 1);
         assert_eq!(loaded.initial_book_frames.len(), 2);
@@ -10294,7 +10469,7 @@ mod tests {
             load_polymarket_scope_file_at(
                 &universe_id,
                 &invalid_path.to_string_lossy(),
-                "2026-08-29T00:00:01Z".parse().unwrap(),
+                activated_at,
             )
             .is_err()
         );
@@ -10312,7 +10487,7 @@ mod tests {
             load_polymarket_scope_file_at(
                 &universe_id,
                 &excessive_lock_path.to_string_lossy(),
-                "2026-08-29T00:00:01Z".parse().unwrap(),
+                activated_at,
             )
             .is_err()
         );
@@ -13152,7 +13327,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_book_validation_requires_one_exact_book_per_token() {
+    fn authoritative_book_validation_accepts_exact_partial_response() {
         let received_at = Utc::now();
         let tokens = vec!["2".to_string(), "1".to_string()];
         let book = |token: &str| {
@@ -13164,22 +13339,24 @@ mod tests {
                 "asks":[{"price":"0.60","size":"11"}]
             })
         };
-        let frames = validate_polymarket_book_refresh_response(
+        let batch = validate_polymarket_book_refresh_response(
             json!([book("2"), book("1")]),
             &tokens,
             received_at,
         )
         .unwrap();
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].raw_payload["asset_id"], "1");
-        assert_eq!(frames[1].raw_payload["asset_id"], "2");
-        assert_eq!(frames[0].raw_payload["event_type"], "book");
-        assert_eq!(frames[0].received_at, received_at);
+        assert_eq!(batch.frames.len(), 2);
+        assert!(batch.missing_token_ids.is_empty());
+        assert_eq!(batch.frames[0].raw_payload["asset_id"], "1");
+        assert_eq!(batch.frames[1].raw_payload["asset_id"], "2");
+        assert_eq!(batch.frames[0].raw_payload["event_type"], "book");
+        assert_eq!(batch.frames[0].received_at, received_at);
 
-        assert!(
-            validate_polymarket_book_refresh_response(json!([book("1")]), &tokens, received_at,)
-                .is_err()
-        );
+        let partial =
+            validate_polymarket_book_refresh_response(json!([book("1")]), &tokens, received_at)
+                .unwrap();
+        assert_eq!(partial.frames.len(), 1);
+        assert_eq!(partial.missing_token_ids, ["2"]);
         let inexact = json!([{
             "asset_id":"1", "timestamp":"1788069600000", "tick_size":0.01,
             "bids":[{"price":"0.40","size":"10"}],

@@ -9,6 +9,7 @@ from scripts.migration.auto_refresh_polymarket_dynamic_universe import (
     CONFIG_SCHEMA_VERSION,
     RefreshConfig,
     _load_config,
+    _validate_scope_identity,
     refresh_once,
 )
 
@@ -48,7 +49,11 @@ class Session:
             "generation": self.generation,
             "market_count": 1,
             "token_count": 2,
+            "configured_market_count": 1,
+            "configured_token_count": 2,
             "active_markets": [identity],
+            "configured_markets": [identity],
+            "quarantined_market_ids": [],
             "scope_file_sha256": "b" * 64,
             "target_market_count": 1,
             "minimum_market_count": 1,
@@ -147,6 +152,18 @@ def _candidate(identity: dict) -> dict:
     }
 
 
+def test_unready_scope_below_minimum_preserves_valid_configured_identity():
+    scope = Session(ready=False)._scope()
+    scope.update(
+        market_count=0,
+        token_count=0,
+        active_markets=[],
+        quarantined_market_ids=["1"],
+    )
+
+    _validate_scope_identity(scope)
+
+
 def test_no_change_is_idempotent_and_does_not_activate(tmp_path, monkeypatch):
     monkeypatch.setenv("MARKETCOW_RUST_ADMIN_TOKEN", "secret")
     session = Session()
@@ -211,6 +228,13 @@ def test_below_target_quarantine_view_is_automatically_replenished(tmp_path, mon
         "condition_id": "0x" + "2" * 64,
         "token_ids": ["21", "22"],
     }
+    retired = {
+        **IDENTITY,
+        "market_id": "retired-bad-market",
+        "condition_id": "0x" + "3" * 64,
+        "token_ids": ["31", "32"],
+        "end_at": "2026-08-31T00:00:00Z",
+    }
 
     class PartialSession(Session):
         expanded = False
@@ -218,11 +242,15 @@ def test_below_target_quarantine_view_is_automatically_replenished(tmp_path, mon
         def _scope(self) -> dict:
             scope = super()._scope()
             active = [IDENTITY, replacement] if self.expanded else [IDENTITY]
+            configured = active if self.expanded else [IDENTITY, retired]
             scope.update({
                 "market_count": len(active),
                 "token_count": 2 * len(active),
                 "active_markets": active,
                 "active_market_ids": [item["market_id"] for item in active],
+                "configured_market_count": len(configured),
+                "configured_token_count": 2 * len(configured),
+                "configured_markets": configured,
                 "quarantined_market_ids": [] if self.expanded else ["retired-bad-market"],
                 "target_market_count": 2,
                 "minimum_market_count": 1,
@@ -309,11 +337,19 @@ def test_concurrent_quarantine_does_not_mix_or_invalidate_configured_generation(
             else:
                 active = [IDENTITY, second]
                 quarantined = []
+            configured = (
+                [IDENTITY, replacement]
+                if self.generation == 2
+                else [IDENTITY, second]
+            )
             scope.update({
                 "market_count": len(active),
                 "token_count": len(active) * 2,
                 "active_markets": active,
                 "active_market_ids": [value["market_id"] for value in active],
+                "configured_market_count": len(configured),
+                "configured_token_count": len(configured) * 2,
+                "configured_markets": configured,
                 "quarantined_market_ids": quarantined,
                 "target_market_count": 2,
                 "minimum_market_count": 1,
