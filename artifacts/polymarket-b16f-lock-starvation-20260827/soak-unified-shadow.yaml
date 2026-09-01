@@ -1,0 +1,103 @@
+schema: tradude.polymarket.live_trading.v10
+mode: shadow
+multi_strategy_config: /Volumes/T9/projects/marketcow-workitem-collaboration-7424ef29-33e7-418f-8df0-83afc6caf0/artifacts/polymarket-b16f-lock-starvation-20260827/soak-multi-strategy.yaml
+venue_config: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-r2-config-20260827T165938CST/unified-clob.yaml
+canary_config: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-r2-config-20260827T165938CST/canary.yaml
+planner:
+  planner_version: tradude-polymarket-executable-planner-v81-b16f-thirty-day-lock
+  risk_budget_semantics: combined_basket_worst_case_entry_capital_including_fees_friction_and_unwind_reserve
+  execution_policy: all_fok
+  failure_policy: unwind_filled
+  approved_entry_notional_budgets:
+  - '5'
+  - '6'
+  - '7'
+  - '8'
+  - '9'
+  - '10'
+  absolute_entry_notional_ceiling: '10'
+  minimum_net_edge: '0'
+  minimum_net_edge_per_capital: '0'
+  maximum_visible_participation: '0.25'
+  price_friction_per_share: '0.01'
+  unwind_reserve_rate: '0.01'
+  unwind_reserve_fixed: '0'
+  maximum_capital_lock_duration_ns: 2592000000000000
+paper_fok:
+  submit_latency_ns: 100000000
+  acknowledgement_latency_ns: 100000000
+  maximum_book_age_ns: 5000000000
+  checkpoint_path: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-r2-formal-20260827T165938CST/state/paper-fok-state.json
+  fault_scenarios: []
+  unknown_resolution_timeout_ns: 500000000
+  unknown_poll_interval_ns: 10000000
+shadow_account:
+  checkpoint_path: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-r2-formal-20260827T165938CST/state/shadow-account.json
+  settlement_currency: USDC
+  starting_balance: '10'
+  reject_relation_overlap: true
+  complete_set_exit_mode: hold_to_resolution
+  merge_fee: '0'
+  merge_payout_per_set: '1'
+episodes:
+  unchanged_heartbeat_interval_seconds: 30
+  terminal_retention_seconds: 3600
+  maximum_active_episodes: 1000
+audit:
+  decision_path: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-r2-formal-20260827T165938CST/artifacts/decision.jsonl
+  plan_path: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-r2-formal-20260827T165938CST/artifacts/plans.jsonl
+  reconciliation_path: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-r2-formal-20260827T165938CST/artifacts/reconciliation.jsonl
+  maximum_bytes: 536870912
+  lock_timeout_seconds: 10
+  async_writer:
+    critical_capacity: 1000
+    observational_capacity: 10000
+    batch_size: 256
+    flush_interval_seconds: 0.1
+    shutdown_flush_timeout_seconds: 10
+arrival_replay:
+  scenarios:
+  - scenario_id: low-latency-100ms
+    decision_to_submit_ns: 50000000
+    transport_ns: 0
+    acknowledgement_ns: 50000000
+    leg_scheduling_policy: simultaneous_fok
+    maximum_completion_ns: 2000000000
+  - scenario_id: modeled-paper-200ms
+    decision_to_submit_ns: 100000000
+    transport_ns: 0
+    acknowledgement_ns: 100000000
+    leg_scheduling_policy: simultaneous_fok
+    maximum_completion_ns: 2000000000
+  - scenario_id: stressed-500ms
+    decision_to_submit_ns: 250000000
+    transport_ns: 0
+    acknowledgement_ns: 250000000
+    leg_scheduling_policy: simultaneous_fok
+    maximum_completion_ns: 2000000000
+  maximum_book_age_ns: 5000000000
+  queue_capacity: 1000
+  history_retention_events: 10000
+  shutdown_timeout_seconds: 30
+acceptance:
+  duration_seconds: 3600
+  minimum_executable_episodes: 1
+  minimum_paper_submissions: 1
+  minimum_all_legs_paper_fills: 1
+  maximum_failed_check_frames: 0
+  maximum_hot_path_latency_ms: 100
+  maximum_audit_lag_records: 1000
+runtime:
+  event_page_limit: 1000
+  maximum_event_batches: 100000
+  run_duration_seconds: 3600
+  poll_interval_seconds: 0.5
+  runtime_status_path: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-r2-config-20260827T165938CST/runtime-status-v81-b16f-r2.json
+  unavailable_retry:
+    interval_seconds: 1
+    maximum_consecutive_seconds: 30
+versions:
+  fee_model_version: polymarket-probability-fee-v1
+  friction_model_version: explicit-price-latency-unwind-v2
+  reserve_model_version: explicit-unwind-reserve-v2-account-lifecycle
+  runner_version: tradude-polymarket-live-trading-v81-b16f
