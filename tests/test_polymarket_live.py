@@ -138,15 +138,17 @@ class PolymarketLiveTest(unittest.TestCase):
         class Collector:
             def __init__(self, catalog):
                 self.store = type("Store", (), {"catalog": catalog})()
+                self.refresh_calls = 0
 
             def refresh_catalog(self):
+                self.refresh_calls += 1
                 raise ConnectionError("transient Gamma TLS failure")
 
-        result = refresh_catalog_or_reuse_published(
-            Collector({"market-1": object()})
-        )
+        published = Collector({"market-1": object()})
+        result = refresh_catalog_or_reuse_published(published)
         self.assertEqual(result["status"], "published_catalog_reused")
         self.assertEqual(result["market_count"], 1)
+        self.assertEqual(published.refresh_calls, 0)
         with self.assertRaises(ConnectionError):
             refresh_catalog_or_reuse_published(Collector({}))
 
