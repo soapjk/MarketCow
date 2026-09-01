@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.marketcow.rust-polymarket-universe-auto-refresh-t9</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/androidjk/Library/Application Support/MarketCow/polymarket-universe-refresh/t9-external-7f33700/run-one-refresh.sh</string>
+  </array>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardErrorPath</key>
+  <string>/Volumes/T9/MarketCow/logs/universe-auto-refresh.error.log</string>
+  <key>StandardOutPath</key>
+  <string>/Volumes/T9/MarketCow/logs/universe-auto-refresh.log</string>
+</dict>
+</plist>

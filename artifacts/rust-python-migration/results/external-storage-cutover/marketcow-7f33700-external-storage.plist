@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.marketcow.rust-polymarket-7f33700-external-storage-live</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/androidjk/Library/Application Support/MarketCow/runtime/7f33700-external-storage/run-marketcow.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HTTPS_PROXY</key>
+    <string>http://127.0.0.1:7890</string>
+    <key>MARKETCOW_BINARY_COMMIT</key>
+    <string>7f3370028551b1524446d60cef2a7e1eb81359c9</string>
+    <key>MARKETCOW_POLYMARKET_LIVE_ENABLED</key>
+    <string>true</string>
+    <key>MARKETCOW_POLYMARKET_SCOPE_FILE</key>
+    <string>/Volumes/T9/MarketCow/runtime/registry/cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34.json</string>
+    <key>MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT</key>
+    <string>/Volumes/T9/MarketCow/runtime/registry</string>
+    <key>MARKETCOW_REAL_ORDER_SUBMISSION_ENABLED</key>
+    <string>false</string>
+    <key>MARKETCOW_RUST_ADMIN_TOKEN</key>
+    <string>marketcow-rust-clean-generation18-local</string>
+    <key>MARKETCOW_RUST_BIND</key>
+    <string>127.0.0.1:18872</string>
+    <key>MARKETCOW_RUST_MAX_BOOK_AGE_MS</key>
+    <string>3600000</string>
+    <key>MARKETCOW_RUST_PROFILE</key>
+    <string>test</string>
+    <key>MARKETCOW_RUST_SCOPE_ID</key>
+    <string>cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34</string>
+    <key>MARKETCOW_RUST_SHADOW</key>
+    <string>true</string>
+    <key>MARKETCOW_RUST_STORAGE_ROOT</key>
+    <string>/Volumes/T9/MarketCow/runtime/storage</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardErrorPath</key>
+  <string>/Users/androidjk/Library/Application Support/MarketCow/runtime/7f33700-external-storage/launchd-bootstrap.log</string>
+  <key>StandardOutPath</key>
+  <string>/Users/androidjk/Library/Application Support/MarketCow/runtime/7f33700-external-storage/launchd-bootstrap.log</string>
+</dict>
+</plist>

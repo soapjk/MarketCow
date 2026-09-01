@@ -1,0 +1,17 @@
+{
+  "schema_version": "marketcow.polymarket.universe-auto-refresh-config.v1",
+  "service_url": "http://127.0.0.1:18872",
+  "candidate_manifest": "/Volumes/T9/MarketCow/refresh/data/candidates.json",
+  "catalog_index": "/Volumes/T9/MarketCow/refresh/data/catalog-index.sqlite3",
+  "catalog": "/Volumes/T9/MarketCow/refresh/data/catalog.jsonl",
+  "fee_registry": "/Volumes/T9/MarketCow/refresh/data/negative-risk-registry.json",
+  "scope_registry_root": "/Volumes/T9/MarketCow/runtime/registry",
+  "work_root": "/Volumes/T9/MarketCow/refresh/work",
+  "audit_result": "/Volumes/T9/MarketCow/refresh/audit/latest-result.json",
+  "target_market_count": 100,
+  "minimum_market_count": 80,
+  "maximum_capital_lock_seconds": 2592000,
+  "clob_books_endpoint": "https://clob.polymarket.com/books",
+  "request_timeout_seconds": 60,
+  "retry_seconds": 60
+}
