@@ -1696,6 +1696,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                         (relation_id, content_sha256(raw)),
                     )
             connection.commit()
+            observed_at = self.reader.now_provider()
+            active_count = 0
             with normalized_path.open("rb") as stream:
                 for line_number, line in enumerate(stream, 1):
                     body = line.removesuffix(b"\n")
@@ -1751,50 +1753,79 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                                 "member_disagreement=member_disagreement OR ? WHERE relation_id=?",
                                 (int(first["revision"] != current["revision"]), int(first["outcome_pairs"] != current["outcome_pairs"]), relation.relation_id),
                             )
-                    if line_number % 500 == 0:
-                        connection.commit()
-            relation_count = self._finalize_relations(connection, catalog_revision)
-            observed_at = self.reader.now_provider()
-            active_count = 0
-            market_rows = connection.execute(
-                "SELECT market_id, static_payload FROM markets ORDER BY market_id"
-            )
-            while batch := market_rows.fetchmany(250):
-                for market_row in batch:
-                    market = LiveMarket.model_validate_json(bytes(market_row["static_payload"]))
-                    by_outcome = {item.outcome.casefold(): item for item in market.identity.outcomes}
                     books = {}
-                    for outcome in by_outcome.values():
+                    for outcome in market.identity.outcomes:
                         book_row = connection.execute(
-                            "SELECT * FROM source_books WHERE token_id=?", (outcome.token_id,)
+                            "SELECT * FROM source_books WHERE token_id=?",
+                            (outcome.token_id,),
                         ).fetchone()
-                        books[outcome.token_id] = self._book_from_materialized_row(book_row)
-                    relation_id = next((item.relation_id for item in market.relations if item.relation_type == "standard_negative_risk"), None)
-                    relation_row = (
-                        connection.execute(
-                            "SELECT complete FROM relations WHERE relation_id=?",
-                            (relation_id,),
-                        ).fetchone()
-                        if relation_id else None
-                    )
-                    relation_complete = (
-                        not market.identity.neg_risk
-                        or bool(relation_row and relation_row[0])
-                    )
+                        books[outcome.token_id] = self._book_from_materialized_row(
+                            book_row
+                        )
+                    relation_id = next((
+                        item.relation_id for item in market.relations
+                        if item.relation_type == "standard_negative_risk"
+                    ), None)
                     has_gap = connection.execute(
-                        "SELECT 1 FROM gap_markets WHERE market_id=?", (market.identity.market_id,)
+                        "SELECT 1 FROM gap_markets WHERE market_id=?",
+                        (market.identity.market_id,),
                     ).fetchone() is not None
                     quote = self._market_quote(
-                        market, books, relation_complete=relation_complete,
-                        has_gap=has_gap, catalog_revision=catalog_revision,
-                        boundary_cursor=boundary_cursor, observed_at=observed_at,
+                        market,
+                        books,
+                        relation_complete=(
+                            not market.identity.neg_risk or relation_id is not None
+                        ),
+                        has_gap=has_gap,
+                        catalog_revision=catalog_revision,
+                        boundary_cursor=boundary_cursor,
+                        observed_at=observed_at,
                     )
                     connection.execute(
                         "INSERT INTO quote_versions VALUES (?,?,?,?,?,?)",
-                        (quote.market_id, boundary_cursor, quote.model_dump_json().encode(), quote.metadata_revision, quote.book_revision, quote.book_status),
+                        (
+                            quote.market_id, boundary_cursor,
+                            quote.model_dump_json().encode(),
+                            quote.metadata_revision, quote.book_revision,
+                            quote.book_status,
+                        ),
                     )
                     active_count += 1
-                connection.commit()
+                    if line_number % 500 == 0:
+                        connection.commit()
+            relation_count = self._finalize_relations(connection, catalog_revision)
+            for relation_row in connection.execute(
+                "SELECT payload_json FROM relations WHERE complete=0"
+            ):
+                relation = DiscoveryRelation.model_validate_json(
+                    bytes(relation_row[0])
+                )
+                for market_id in relation.member_market_ids:
+                    quote_row = connection.execute(
+                        "SELECT payload_json FROM quote_versions WHERE market_id=? AND cursor=?",
+                        (market_id, boundary_cursor),
+                    ).fetchone()
+                    if quote_row is None:
+                        continue
+                    quote = DiscoveryMarketQuote.model_validate_json(
+                        bytes(quote_row[0])
+                    )
+                    missing_fields = sorted(set(
+                        quote.missing_fields + ["complete_negative_risk_relation"]
+                    ))
+                    quote = quote.model_copy(update={
+                        "book_status": "incomplete_relation",
+                        "missing_fields": missing_fields,
+                    })
+                    connection.execute(
+                        "UPDATE quote_versions SET payload_json=?, book_status=? "
+                        "WHERE market_id=? AND cursor=?",
+                        (
+                            quote.model_dump_json().encode(),
+                            quote.book_status, market_id, boundary_cursor,
+                        ),
+                    )
+            connection.commit()
             digest = hashlib.sha256()
             digest.update(DISCOVERY_SCHEMA_VERSION.encode())
             digest.update(catalog_revision.encode())
