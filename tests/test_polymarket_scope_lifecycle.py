@@ -24,7 +24,7 @@ from marketcow.polymarket_live_read_api import create_polymarket_live_read_app
 from marketcow.polymarket_scopes import (
     PolymarketScopeRegistry,
     ScopeTransitionError,
-    build_replacement_scope_manifest,
+    build_explicit_scope_manifest,
     scope_content_id,
     write_scope_runtime,
 )
@@ -98,19 +98,20 @@ def test_clob_omission_is_typed_and_preserves_missing_token_ids() -> None:
     assert raised.value.missing_token_ids == ("a", "b")
 
 
-def test_elapsed_gamma_end_time_is_auditable_terminal_evidence() -> None:
+def test_elapsed_gamma_end_time_is_not_fabricated_terminal_evidence() -> None:
     row = gamma_row()
     row["endDate"] = "2026-08-01T00:00:00Z"
     market = GammaLiveNormalizer.normalize([row], NOW)[0]
-    assert market.lifecycle_state == "closed"
-    assert market.active is False
-    assert market.accepting_orders is False
-    assert market.terminal_at == datetime(2026, 8, 1, tzinfo=timezone.utc)
-    assert market.lifecycle_source == "polymarket_gamma"
-    assert market.lifecycle_evidence_sha256
+    assert market.lifecycle_state == "active"
+    assert market.active is True
+    assert market.accepting_orders is True
+    assert market.end_at == datetime(2026, 8, 1, tzinfo=timezone.utc)
+    assert market.terminal_at is None
+    assert market.lifecycle_source is None
+    assert market.lifecycle_evidence_sha256 is None
 
 
-def test_startup_reconciles_elapsed_pinned_market_without_clob_omission() -> None:
+def test_startup_refreshes_but_does_not_close_elapsed_market_without_source_fact() -> None:
     with TemporaryDirectory() as folder:
         earlier = NOW - timedelta(hours=2)
         row = gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1"))
@@ -128,13 +129,12 @@ def test_startup_reconciles_elapsed_pinned_market_without_clob_omission() -> Non
             reason="startup:elapsed_end"
         )
 
-        assert reconciled == {"m1"}
+        assert reconciled == set()
         assert catalog.exact_requests == [{"m1"}]
-        assert store.catalog["m1"].lifecycle_state == "closed"
-        assert store.catalog["m1"].terminal_at == NOW - timedelta(hours=1)
-        assert store.catalog["m1"].lifecycle_source == "polymarket_gamma"
-        assert store.catalog["m1"].lifecycle_evidence_sha256
-        assert "yes-1" not in store.token_to_market
+        assert store.catalog["m1"].lifecycle_state == "active"
+        assert store.catalog["m1"].terminal_at is None
+        assert store.catalog["m1"].lifecycle_source is None
+        assert "yes-1" in store.token_to_market
 
 
 def test_terminal_omission_is_isolated_and_retains_audit_and_last_books() -> None:
@@ -385,40 +385,44 @@ def test_candidate_requires_both_exact_advancing_endpoints_before_atomic_switch(
         assert retired.value.code == "polymarket_scope_retired"
 
 
-def test_background_replacement_generation_keeps_immutable_members_and_fills_terminal() -> None:
-    current = {
-        "scope_id": "f" * 64,
-        "market_ids": [f"m{index:03d}" for index in range(100)],
+def test_scope_generation_preserves_tradude_explicit_order_without_ranking() -> None:
+    selection = {
+        "schema": "tradude.prediction_market.scope_selection.v2",
+        "discovery_snapshot_id": "a" * 64,
+        "catalog_revision": "b" * 64,
+        "selection_evidence_sha256": "c" * 64,
+        "replaces_scope_id": "f" * 64,
+        "market_ids": [f"m{index:03d}" for index in reversed(range(100))],
+        "relations": [],
     }
-    candidates = {
-        "schema": "tradude.prediction_market.scope_candidates.v1",
-        "snapshot_id": "candidate-next",
-        "catalog_revision": "catalog-next",
-        "markets": [
-            {
-                "market_id": f"m{index:03d}",
-                "active": True,
-                "accepting_orders": True,
-                "closed": False,
-                "binary_yes_no": True,
-                "rules_complete": True,
-                "end_at_ns": 20_000_000_000,
-                "yes_outcome_id": f"pm:m{index:03d}:yes",
-                "no_outcome_id": f"pm:m{index:03d}:no",
-                "liquidity_num": str(index),
-            }
-            for index in range(1, 101)
-        ],
-    }
-    replacement = build_replacement_scope_manifest(
-        current, candidates, generated_at_ns=1_000_000_000,
+    replacement = build_explicit_scope_manifest(
+        selection, generated_at_ns=1_000_000_000,
     )
     assert len(replacement["market_ids"]) == 100
-    assert "m000" not in replacement["market_ids"]
-    assert "m100" in replacement["market_ids"]
-    assert replacement["market_ids"][:99] == current["market_ids"][1:]
+    assert replacement["market_ids"] == selection["market_ids"]
     assert replacement["scope_id"] == scope_content_id(replacement)
-    assert replacement["replaces_scope_id"] == current["scope_id"]
+    assert replacement["replaces_scope_id"] == selection["replaces_scope_id"]
+
+
+def test_explicit_scope_rejects_partial_relation_members() -> None:
+    selection = {
+        "schema": "tradude.prediction_market.scope_selection.v2",
+        "discovery_snapshot_id": "a" * 64,
+        "catalog_revision": "b" * 64,
+        "selection_evidence_sha256": "c" * 64,
+        "replaces_scope_id": "f" * 64,
+        "market_ids": ["m1", "m2"],
+        "relations": [{
+            "relation_id": "neg-risk:g1",
+            "member_market_ids": ["m1"],
+            "expected_member_count": 2,
+            "actual_member_count": 1,
+            "complete": False,
+        }],
+    }
+    with pytest.raises(ScopeTransitionError) as raised:
+        build_explicit_scope_manifest(selection, generated_at_ns=1)
+    assert raised.value.code == "polymarket_scope_relation_incomplete"
 
 
 def test_prepared_scope_artifacts_are_immutable() -> None:
@@ -441,10 +445,13 @@ def test_scope_discovery_and_stale_scope_id_return_stable_410() -> None:
         )
         app = create_polymarket_live_read_app(
             root=root,
+            discovery_root=root,
             stable_snapshot_max_book_age_seconds=5,
             stable_read_wait_seconds=1,
             stable_read_poll_seconds=0.01,
             executor_workers=2,
+            discovery_depth_notionals=("10", "50", "100", "500"),
+            discovery_maximum_book_age_ms=5000,
         )
         with TestClient(app) as client:
             discovery = client.get(

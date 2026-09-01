@@ -78,6 +78,7 @@ class Settings:
     polymarket_live_stream_replay_capacity: int = 10_000
     polymarket_consumer_maximum_book_age_seconds: float = 5.0
     polymarket_minimum_delivery_headroom_seconds: float = 1.0
+    polymarket_discovery_depth_notionals: tuple[str, ...] = ()
     sec_user_agent: str = "MarketCow toczx@outlook.com"
     dividend_cache_ttl_seconds: int = 21600
     dividend_empty_cache_ttl_seconds: int = 900
@@ -242,6 +243,13 @@ class Settings:
             polymarket_minimum_delivery_headroom_seconds=float(os.getenv(
                 "MARKETCOW_POLYMARKET_MINIMUM_DELIVERY_HEADROOM_SECONDS", "1.0"
             )),
+            polymarket_discovery_depth_notionals=tuple(
+                value.strip()
+                for value in os.getenv(
+                    "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS", ""
+                ).split(",")
+                if value.strip()
+            ),
             sec_user_agent=os.getenv(
                 "MARKETCOW_SEC_USER_AGENT", "MarketCow toczx@outlook.com"
             ).strip(),

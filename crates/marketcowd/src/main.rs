@@ -220,7 +220,6 @@ struct PolymarketUniverseContract {
 struct PolymarketUniverseFilters {
     require_two_sided_books: bool,
     require_complete_instrument_facts: bool,
-    maximum_capital_lock_seconds: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,8 +757,7 @@ fn validate_polymarket_universe_contract(
     initial_book_frames: &[serde_json::Value],
     activated_at: DateTime<Utc>,
 ) -> Result<()> {
-    const MAXIMUM_CAPITAL_LOCK_SECONDS: u64 = 30 * 24 * 60 * 60;
-    if universe.schema_version != "marketcow.polymarket.universe.v1"
+    if universe.schema_version != "marketcow.polymarket.universe.v2"
         || universe.universe_id != scope_id
         || universe.universe_id.len() != 64
         || !universe
@@ -774,8 +772,6 @@ fn validate_polymarket_universe_contract(
         || universe.active_markets.len() > universe.target_market_count
         || !universe.filters.require_two_sided_books
         || !universe.filters.require_complete_instrument_facts
-        || universe.filters.maximum_capital_lock_seconds == 0
-        || universe.filters.maximum_capital_lock_seconds > MAXIMUM_CAPITAL_LOCK_SECONDS
         || universe.validated_at > activated_at
     {
         bail!("dynamic Polymarket universe contract is invalid");
@@ -811,19 +807,13 @@ fn validate_polymarket_universe_contract(
             .instrument_facts
             .as_ref()
             .context("dynamic universe market lacks instrument facts")?;
-        let maximum_end = universe.validated_at
-            + chrono::Duration::seconds(
-                i64::try_from(universe.filters.maximum_capital_lock_seconds)
-                    .context("maximum capital lock exceeds signed duration")?,
-            );
         if active.condition_id != market.condition_id
             || active.token_ids.len() != 2
             || declared_tokens != expected_tokens
             || active.end_at != facts.end_at
             || active.end_at <= activated_at
-            || active.end_at > maximum_end
         {
-            bail!("dynamic universe market identity or capital-lock boundary is invalid");
+            bail!("dynamic universe market identity or lifecycle boundary is invalid");
         }
     }
     let added = universe
@@ -878,9 +868,7 @@ fn validate_polymarket_universe_contract(
         "book_missing",
         "instrument_facts_missing",
         "instrument_facts_invalid",
-        "capital_lock_exceeded",
         "fee_facts_unavailable",
-        "target_capacity",
     ];
     let mut excluded_ids = BTreeSet::new();
     for excluded in &universe.excluded_markets {
@@ -9756,7 +9744,7 @@ mod tests {
                 }]
             });
         live.universe = Some(PolymarketUniverseContract {
-            schema_version: "marketcow.polymarket.universe.v1".into(),
+            schema_version: "marketcow.polymarket.universe.v2".into(),
             universe_id: universe_id.into(),
             generation,
             target_market_count: 1,
@@ -9764,7 +9752,6 @@ mod tests {
             filters: PolymarketUniverseFilters {
                 require_two_sided_books: true,
                 require_complete_instrument_facts: true,
-                maximum_capital_lock_seconds: 30 * 24 * 60 * 60,
             },
             active_markets: vec![active_identity.clone()],
             added_markets: previous_market
@@ -9831,7 +9818,7 @@ mod tests {
             catalog_sha256: Some("d".repeat(64)),
             registry_sha256: Some("e".repeat(64)),
             universe: Some(PolymarketUniverseContract {
-                schema_version: "marketcow.polymarket.universe.v1".into(),
+                schema_version: "marketcow.polymarket.universe.v2".into(),
                 universe_id: "s".into(),
                 generation: 1,
                 target_market_count: 2,
@@ -9839,7 +9826,6 @@ mod tests {
                 filters: PolymarketUniverseFilters {
                     require_two_sided_books: true,
                     require_complete_instrument_facts: true,
-                    maximum_capital_lock_seconds: 30 * 24 * 60 * 60,
                 },
                 active_markets: active_markets.clone(),
                 added_markets: vec!["1".into(), "2".into()],
@@ -10469,24 +10455,6 @@ mod tests {
             load_polymarket_scope_file_at(
                 &universe_id,
                 &invalid_path.to_string_lossy(),
-                activated_at,
-            )
-            .is_err()
-        );
-
-        let mut excessive_lock = loaded;
-        excessive_lock
-            .universe
-            .as_mut()
-            .unwrap()
-            .filters
-            .maximum_capital_lock_seconds = 30 * 24 * 60 * 60 + 1;
-        let excessive_lock_path = dir.path().join("excessive-lock-generation.json");
-        write_dynamic_universe_scope(&excessive_lock_path, &excessive_lock);
-        assert!(
-            load_polymarket_scope_file_at(
-                &universe_id,
-                &excessive_lock_path.to_string_lossy(),
                 activated_at,
             )
             .is_err()

@@ -44,10 +44,13 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
     def app(self):
         app = create_polymarket_live_read_app(
             root=self.root,
+            discovery_root=self.root,
             stable_snapshot_max_book_age_seconds=3.5,
             stable_read_wait_seconds=6,
             stable_read_poll_seconds=0.025,
             executor_workers=4,
+            discovery_depth_notionals=("10", "50", "100", "500"),
+            discovery_maximum_book_age_ms=5000,
         )
         app.state.polymarket_live_read.now_provider = lambda: NOW
         return app
@@ -132,10 +135,13 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
     def test_stream_health_returns_503_when_projected_books_are_stale(self):
         app = create_polymarket_live_read_app(
             root=self.root,
+            discovery_root=self.root,
             stable_snapshot_max_book_age_seconds=3.5,
             stable_read_wait_seconds=6,
             stable_read_poll_seconds=0.025,
             executor_workers=4,
+            discovery_depth_notionals=("10", "50", "100", "500"),
+            discovery_maximum_book_age_ms=5000,
             live_stream_uri="ws://127.0.0.1:1",
         )
         reader = app.state.polymarket_live_read
@@ -179,10 +185,13 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
     def test_slow_snapshot_client_write_does_not_block_projection_ingestion(self):
         app = create_polymarket_live_read_app(
             root=self.root,
+            discovery_root=self.root,
             stable_snapshot_max_book_age_seconds=5,
             stable_read_wait_seconds=6,
             stable_read_poll_seconds=0.025,
             executor_workers=4,
+            discovery_depth_notionals=("10", "50", "100", "500"),
+            discovery_maximum_book_age_ms=5000,
             live_stream_uri="ws://127.0.0.1:1",
         )
         reader = app.state.polymarket_live_read
@@ -267,10 +276,13 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
     def test_atomic_full_sync_contract_and_server_timing(self):
         app = create_polymarket_live_read_app(
             root=self.root,
+            discovery_root=self.root,
             stable_snapshot_max_book_age_seconds=5,
             stable_read_wait_seconds=6,
             stable_read_poll_seconds=0.025,
             executor_workers=4,
+            discovery_depth_notionals=("10", "50", "100", "500"),
+            discovery_maximum_book_age_ms=5000,
             live_stream_uri="ws://127.0.0.1:1",
             consumer_maximum_book_age_seconds=5,
             minimum_delivery_headroom_seconds=1,
@@ -358,10 +370,13 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
     def test_full_sync_rejects_insufficient_delivery_headroom(self):
         app = create_polymarket_live_read_app(
             root=self.root,
+            discovery_root=self.root,
             stable_snapshot_max_book_age_seconds=5,
             stable_read_wait_seconds=6,
             stable_read_poll_seconds=0.025,
             executor_workers=4,
+            discovery_depth_notionals=("10", "50", "100", "500"),
+            discovery_maximum_book_age_ms=5000,
             live_stream_uri="ws://127.0.0.1:1",
             consumer_maximum_book_age_seconds=5,
             minimum_delivery_headroom_seconds=1,

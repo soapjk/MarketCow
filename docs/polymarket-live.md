@@ -179,6 +179,10 @@ GET /v1/prediction-markets/polymarket/live/public-data/{kind}
 WS  /v1/prediction-markets/polymarket/live/stream?market_id=m1&after_cursor=123
 ```
 
+Full-market lightweight discovery is a separate v2 protocol and storage boundary;
+see [polymarket-discovery-v2.md](polymarket-discovery-v2.md). It is not subject to the
+hot Scope's 100-market full-L2 limit.
+
 Bootstrap requires 1–100 explicit `market_id` values and returns those canonical
 markets, typed instrument/fee facts, relations/pairs, catalog revision, active tokens,
 sequence semantics, and recovery contract. An unscoped request returns

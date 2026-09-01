@@ -40,8 +40,7 @@ health 和 full-sync 都能返回 manifest 的内容寻址 `scope_id`。
 ```bash
 PYTHONPATH=src python scripts/manage_polymarket_scopes.py \
   --registry-root /absolute/polymarket-scope-registry generate \
-  --current-manifest /absolute/active-manifest.json \
-  --candidate-snapshot /absolute/candidates.json \
+  --selection /absolute/tradude-scope-selection-v2.json \
   --output /absolute/candidate-manifest.json
 
 PYTHONPATH=src python scripts/manage_polymarket_scopes.py \
@@ -63,9 +62,8 @@ PYTHONPATH=src python scripts/manage_polymarket_scopes.py \
   activate --scope-id '<sha256>' --grace-seconds 300
 ```
 
-生成器保留仍符合 active、accepting-orders、规则完整、未到期条件的旧成员，再按十进制
-`liquidity_num`、到期时间和 market ID 的确定性顺序补足空位；不足 100 时以
-`polymarket_replacement_scope_insufficient` 失败，不发布残缺 candidate。
+生成器只验证 Tradude 显式给出的 1–100 个市场和完整关系成员，并原样保留市场顺序。
+MarketCow 不保留旧成员、不按流动性或结束时间排序，也不自动补足 Top 100。
 
 验收器要求两端均为 HTTP 200 / `index_ready`，100 markets、200 books、100 complete、
 tick 200/200、gap 0、disconnect 0，并至少两轮 cursor 推进。任何一项不满足都不会生成

@@ -164,6 +164,7 @@ class LaunchdStartupTest(unittest.TestCase):
                 "MARKETCOW_POLYMARKET_SELECTION_REPORT": str(report),
                 "MARKETCOW_POLYMARKET_CANDIDATE_SNAPSHOT": str(candidates),
                 "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE": str(tradude),
+                "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS": "10,50,100,500",
             }
 
             services = RUNNER.build_services(
@@ -174,7 +175,12 @@ class LaunchdStartupTest(unittest.TestCase):
 
             self.assertEqual(
                 [service.name for service in services],
-                ["polymarket-collector", "shared-api", "polymarket-read-api"],
+                [
+                    "polymarket-discovery-collector",
+                    "polymarket-collector",
+                    "shared-api",
+                    "polymarket-read-api",
+                ],
             )
             commands = {service.name: service.command for service in services}
             self.assertIn(
@@ -182,6 +188,12 @@ class LaunchdStartupTest(unittest.TestCase):
                 commands["polymarket-collector"],
             )
             self.assertIn("8794", commands["polymarket-read-api"][-1])
+            self.assertIn(
+                "8795", commands["polymarket-discovery-collector"]
+            )
+            self.assertIn(
+                "--discovery-root", commands["polymarket-read-api"]
+            )
             self.assertIn("8790", commands["shared-api"])
             self.assertIn("8791", commands["polymarket-read-api"])
             self.assertNotIn("0.0.0.0", " ".join(sum(commands.values(), ())))

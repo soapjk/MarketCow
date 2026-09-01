@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Build one atomically publishable Polymarket universe generation.
-
-The input manifest is a ranked candidate set, not a fixed strategy-owned market list. Invalid
-members are isolated with machine-readable reasons and later eligible candidates automatically
-fill the target. No output is written when the minimum runnable count cannot be met.
-"""
+"""Build one atomically publishable generation from a Tradude-owned exact selection."""
 
 from __future__ import annotations
 
@@ -21,8 +16,7 @@ from scripts.migration.build_polymarket_rust_scope import build_scope, sha256_fi
 
 
 SCHEMA_VERSION = "marketcow.polymarket.rust-live-scope.v4"
-UNIVERSE_SCHEMA_VERSION = "marketcow.polymarket.universe.v1"
-MAXIMUM_CAPITAL_LOCK_SECONDS = 30 * 24 * 60 * 60
+UNIVERSE_SCHEMA_VERSION = "marketcow.polymarket.universe.v2"
 
 
 def _reason(error: Exception) -> tuple[str, bool]:
@@ -126,7 +120,6 @@ def build_dynamic_universe(
     generation: int,
     target_market_count: int,
     minimum_market_count: int,
-    maximum_capital_lock_seconds: int,
     previous_market_ids: list[str] | None = None,
     previous_market_identities: list[dict[str, Any]] | None = None,
     validated_at: datetime | None = None,
@@ -137,10 +130,8 @@ def build_dynamic_universe(
         or any(value not in "0123456789abcdefABCDEF" for value in universe_id)
         or generation <= 0
         or minimum_market_count <= 0
-        or minimum_market_count > target_market_count
+        or minimum_market_count != target_market_count
         or target_market_count > 250
-        or maximum_capital_lock_seconds <= 0
-        or maximum_capital_lock_seconds > MAXIMUM_CAPITAL_LOCK_SECONDS
         or retry_seconds <= 0
     ):
         raise ValueError("dynamic universe configuration is invalid")
@@ -149,13 +140,20 @@ def build_dynamic_universe(
         raise ValueError("validated_at must be timezone-aware")
     manifest_bytes = candidate_manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
-    candidates = manifest.get("market_ids") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != "tradude.prediction_market.scope_selection.v2"
+    ):
+        raise ValueError("candidate manifest must be a Tradude scope selection v2")
+    candidates = manifest.get("market_ids")
     if not isinstance(candidates, list) or not candidates:
-        raise ValueError("candidate manifest must contain ranked market_ids")
+        raise ValueError("selection manifest must contain explicit market_ids")
     if any(not isinstance(value, str) or not value.isascii() or not value.isdecimal() for value in candidates):
         raise ValueError("candidate market identifiers must be decimal strings")
     if len(set(candidates)) != len(candidates):
         raise ValueError("candidate market identifiers must be unique")
+    if len(candidates) != target_market_count:
+        raise ValueError("explicit selection count must equal target market count")
     previous_identity_by_id = _previous_identity_map(previous_market_identities)
     previous_order = list(previous_market_ids or previous_identity_by_id)
     if (
@@ -167,13 +165,6 @@ def build_dynamic_universe(
         or (previous_identity_by_id and set(previous_order) != set(previous_identity_by_id))
     ):
         raise ValueError("previous market ids and identities disagree")
-    # Keep every still-qualified incumbent before considering ranked replacements. This prevents
-    # a temporarily ineligible high-ranked market from repeatedly evicting its healthy replacement
-    # when a later snapshot happens to make it eligible again.
-    candidate_set = set(candidates)
-    incumbent_ids = [market_id for market_id in previous_order if market_id in candidate_set]
-    incumbent_set = set(incumbent_ids)
-    candidates = incumbent_ids + [market_id for market_id in candidates if market_id not in incumbent_set]
     books = _book_frames(book_snapshot_path)
     active: list[dict[str, Any]] = []
     active_books: list[dict[str, Any]] = []
@@ -202,11 +193,6 @@ def build_dynamic_universe(
                 )
                 market = built["catalog_frame"]["markets"][0]
                 known_markets[market_id] = market
-                end_at = datetime.fromisoformat(
-                    market["instrument_facts"]["end_at"].replace("Z", "+00:00")
-                )
-                if end_at > now + timedelta(seconds=maximum_capital_lock_seconds):
-                    raise ValueError("capital lock exceeds configured maximum")
                 token_ids = [outcome["token_id"] for outcome in market["outcomes"]]
                 frames = [books.get(token) for token in token_ids]
                 if any(frame is None for frame in frames):
@@ -217,16 +203,12 @@ def build_dynamic_universe(
                     # The runtime can atomically reconcile a catalog tick to a newer
                     # authoritative book tick, but the two outcome tokens must agree.
                     reason, retryable = "instrument_facts_invalid", True
-                elif len(active) >= target_market_count:
-                    reason, retryable = "target_capacity", False
                 else:
                     active.append(market)
                     active_books.extend(frame for frame in frames if frame)
                     continue
             except Exception as error:  # isolate one candidate; global checks remain below
                 reason, retryable = _reason(error)
-                if "capital lock" in str(error):
-                    reason, retryable = "capital_lock_exceeded", False
             excluded.append({
                 "market_id": market_id,
                 "reason_code": reason,
@@ -235,12 +217,13 @@ def build_dynamic_universe(
                 "observed_at": now.isoformat().replace("+00:00", "Z"),
             })
 
-    if len(active) < minimum_market_count:
+    if len(active) != target_market_count:
         counts: dict[str, int] = {}
         for item in excluded:
             counts[item["reason_code"]] = counts.get(item["reason_code"], 0) + 1
         raise ValueError(
-            f"qualified market count below minimum: {len(active)} < {minimum_market_count}; exclusions={counts}"
+            "Tradude selection is not atomically ready: "
+            f"{len(active)} != {target_market_count}; exclusions={counts}"
         )
     active_ids = [market["market_id"] for market in active]
     previous = set(previous_order)
@@ -288,7 +271,7 @@ def build_dynamic_universe(
         "scope_id": universe_id.lower(),
         "market_count": len(active),
         "token_count": len(token_ids),
-        "market_ids": sorted(active_ids),
+        "market_ids": active_ids,
         "token_ids": token_ids,
         "catalog_revision": catalog_revision,
         "catalog_frame": {
@@ -306,7 +289,6 @@ def build_dynamic_universe(
             "filters": {
                 "require_two_sided_books": True,
                 "require_complete_instrument_facts": True,
-                "maximum_capital_lock_seconds": maximum_capital_lock_seconds,
             },
             "active_markets": [{
                 "market_id": market["market_id"],
@@ -359,7 +341,6 @@ def main() -> int:
     parser.add_argument("--generation", type=int, required=True)
     parser.add_argument("--target-market-count", type=int, required=True)
     parser.add_argument("--minimum-market-count", type=int, required=True)
-    parser.add_argument("--maximum-capital-lock-seconds", type=int, required=True)
     parser.add_argument("--previous-market-id", action="append", default=[])
     parser.add_argument("--previous-market-identities", type=Path)
     arguments = parser.parse_args()
@@ -368,7 +349,6 @@ def main() -> int:
         arguments.books, universe_id=arguments.universe_id, generation=arguments.generation,
         target_market_count=arguments.target_market_count,
         minimum_market_count=arguments.minimum_market_count,
-        maximum_capital_lock_seconds=arguments.maximum_capital_lock_seconds,
         previous_market_ids=arguments.previous_market_id or None,
         previous_market_identities=(
             json.loads(arguments.previous_market_identities.read_bytes())

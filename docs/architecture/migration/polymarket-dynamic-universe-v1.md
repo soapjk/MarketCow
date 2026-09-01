@@ -1,11 +1,12 @@
-# Polymarket dynamic universe v1
+# Polymarket dynamic universe v2 ownership model
 
 Status: implemented locally; production activation requires a separately approved deployment.
 
 ## Decision
 
-MarketCow owns read-only market discovery, eligibility checks, subscription membership and atomic
-market-data publication. Tradude owns positions, accounts, risk and orders. MarketCow exposes no
+MarketCow owns read-only market discovery, source-fact validation, Scope preheating and atomic
+market-data publication. Tradude owns candidate selection, opportunity ranking, projected capital
+release, positions, accounts, risk and orders. MarketCow exposes no
 order, cancellation, signing, wallet or execution operation, and
 `real_order_submission_enabled` remains `false`.
 
@@ -18,26 +19,26 @@ is checkpointed before publication. The active writer is never modified in place
 ## Artifact and discovery schemas
 
 - generation artifact: `marketcow.polymarket.rust-live-scope.v4`
-- universe object: `marketcow.polymarket.universe.v1`
+- universe object: `marketcow.polymarket.universe.v2`
 - scope discovery: `marketcow.polymarket.scope-discovery.v3`
 - WebSocket: `marketcow.market-stream.v2`
 
 The universe object contains:
 
 - `universe_id`, `generation`, `target_market_count`, `minimum_market_count`, `validated_at`;
-- filters `require_two_sided_books`, `require_complete_instrument_facts`, and
-  `maximum_capital_lock_seconds`;
+- fail-closed filters `require_two_sided_books` and `require_complete_instrument_facts`;
 - complete `active_markets`, each retaining stable `market_id`, `condition_id`, two `token_ids`,
   and `end_at` identities;
 - exact `added_markets` and `removed_markets` IDs relative to the preceding generation, plus
   `added_market_identities` and `removed_market_identities` carrying condition/token/end-time facts;
-- every evaluated but inactive candidate in `excluded_markets`, with `reason_code`, `retryable`,
-  `retry_after`, and `observed_at`.
+- any explicitly selected market that cannot be activated in `excluded_markets`, with
+  `reason_code`, `retryable`, `retry_after`, and `observed_at`.
 
 Machine exclusion reasons are `market_expired`, `market_not_found`, `one_sided_book`,
 `token_missing`, `book_missing`, `instrument_facts_missing`, `instrument_facts_invalid`,
-`capital_lock_exceeded`, `fee_facts_unavailable`, and `target_capacity`. Retryable exclusions must
-have a future `retry_after`; non-retryable exclusions must not.
+and `fee_facts_unavailable`. Retryable exclusions must have a future `retry_after`;
+non-retryable exclusions must not. MarketCow does not replace an invalid selection with another
+market and does not apply a capital-lock horizon.
 
 `/v1/prediction-markets/polymarket/live/full-sync` retains its existing live schema and adds the
 independently versioned `universe_schema_version`, `universe_id`, `universe_generation`, and full
@@ -47,12 +48,15 @@ independently versioned `universe_schema_version`, `universe_id`, `universe_gene
 
 ## Refresh and failure semantics
 
-`build_polymarket_dynamic_universe.py` scans a ranked MarketCow candidate manifest. A single
-expired/404-equivalent, one-sided, missing-token/book/facts, excessive-lock, or unavailable-fee
-candidate is excluded and the next eligible candidate fills the target. No artifact is emitted
-when qualified markets fall below `minimum_market_count`.
+`build_polymarket_dynamic_universe.py` consumes exactly one
+`tradude.prediction_market.scope_selection.v2` manifest. It preserves Tradude's market order and
+validates the complete selected set. An expired/404-equivalent, one-sided, missing-token/book/facts,
+unavailable-fee market, or incomplete selected relation fails the candidate closed. MarketCow does
+not rank, replenish, truncate, or fill the selection. No artifact is emitted unless the exact
+selection is atomically ready.
 
-`auto_refresh_polymarket_dynamic_universe.py` is the MarketCow-owned, one-shot refresh
+`auto_refresh_polymarket_dynamic_universe.py` is the MarketCow validation and publication one-shot
+refresh
 transaction intended for a five-minute service-manager schedule. It takes an advisory lock,
 requires a coherent ready scope/full-sync boundary, fetches an auditable exact-decimal CLOB book
 snapshot, builds and validates `generation + 1`, and compares stable market/condition/token/end

@@ -554,18 +554,22 @@ class PolymarketLiveTest(unittest.TestCase):
                 spool_root=spool_root,
             ).fetch_all()
 
-    def test_legacy_gamma_bps_is_exactly_normalized_with_official_fee_facts(self):
+    def test_legacy_gamma_bps_does_not_fill_missing_fee_facts_from_defaults(self):
         row = gamma_row()
         row["fee_schedule"] = {
             "maker_fee_bps": "0", "taker_fee_bps": "20",
         }
         fee = GammaLiveNormalizer.normalize([row], NOW)[0].rules.fee_schedule
-        self.assertTrue(fee.complete)
+        self.assertFalse(fee.complete)
         self.assertEqual(fee.maker_rate, "0")
         self.assertEqual(fee.taker_rate, "0.002")
-        self.assertEqual(fee.currency, "USDC")
-        self.assertEqual(fee.exponent, "1")
-        self.assertEqual(fee.quantum, "0.00001")
+        self.assertIsNone(fee.currency)
+        self.assertIsNone(fee.exponent)
+        self.assertIsNone(fee.quantum)
+        self.assertEqual(
+            fee.missing_fields,
+            ["currency", "effective_from", "exponent", "formula", "quantum"],
+        )
         self.assertEqual(
             {item.source for item in fee.provenance},
             {"polymarket_gamma", "polymarket_docs"},

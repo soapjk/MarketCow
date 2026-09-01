@@ -122,7 +122,6 @@ def _config(tmp_path: Path) -> RefreshConfig:
         audit_result=tmp_path / "audit.json",
         target_market_count=1,
         minimum_market_count=1,
-        maximum_capital_lock_seconds=2_592_000,
     )
 
 
@@ -458,7 +457,6 @@ def test_config_rejects_non_loopback_activation(tmp_path):
         "audit_result": "g",
         "target_market_count": 100,
         "minimum_market_count": 80,
-        "maximum_capital_lock_seconds": 2_592_000,
     }
     path = tmp_path / "config.json"
     path.write_text(json.dumps(payload))

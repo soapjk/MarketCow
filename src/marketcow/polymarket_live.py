@@ -1588,7 +1588,8 @@ class LiveEventEnvelope(BaseModel):
         "book", "price_change", "best_bid_ask", "last_trade_price",
         "tick_size_change", "new_market", "market_resolved", "catalog_revision",
         "recovery_started", "recovery_completed", "subscription_change",
-        "market_terminal",
+        "market_terminal", "resolution_proposed", "resolution_disputed",
+        "redemption_available",
     ]
     market_id: str | None = None
     condition_id: str | None = None
@@ -4467,7 +4468,7 @@ class GammaLiveNormalizer:
             taker_rate = fee_schedule.get("taker_rate") or fee_schedule.get("takerRate")
             if maker_rate is None:
                 maker_bps = fee_schedule.get("maker_fee_bps") or fee_schedule.get("makerFeeBps")
-                maker_rate = _bps_rate(maker_bps, "maker_fee_bps") if maker_bps is not None else "0"
+                maker_rate = _bps_rate(maker_bps, "maker_fee_bps") if maker_bps is not None else None
             if taker_rate is None:
                 taker_rate = fee_schedule.get("rate")
             if taker_rate is None:
@@ -4480,17 +4481,17 @@ class GammaLiveNormalizer:
                     taker_rate = _bps_rate(taker_bps, "taker_fee_bps")
             if taker_rate is None and row.get("feesEnabled") is False:
                 taker_rate = "0"
-            fee_currency = fee_schedule.get("currency") or "USDC"
-            fee_formula = fee_schedule.get("formula") or "fee = C * feeRate * p * (1 - p)"
-            fee_exponent = fee_schedule.get("exponent") or "1"
-            fee_quantum = fee_schedule.get("quantum") or "0.00001"
+            fee_currency = fee_schedule.get("currency")
+            fee_formula = fee_schedule.get("formula")
+            fee_exponent = fee_schedule.get("exponent")
+            fee_quantum = fee_schedule.get("quantum")
             fee_version = str(
                 fee_schedule.get("version") or fee_schedule.get("scheduleVersion")
-                or "gamma-plus-polymarket-fees-docs-v1"
+                or f"gamma-unversioned:{revision}"
             )
             effective_from = (
                 _instant(fee_schedule["effectiveFrom"])
-                if fee_schedule.get("effectiveFrom") else start_at
+                if fee_schedule.get("effectiveFrom") else None
             )
             effective_to = (
                 _instant(fee_schedule["effectiveTo"])
@@ -4557,10 +4558,25 @@ class GammaLiveNormalizer:
             )
             closed = bool(row.get("closed"))
             resolution = row.get("resolution")
-            expired = end_at is not None and end_at <= observed_at
+            explicit_closed_at = (
+                _instant(
+                    row.get("closedTime")
+                    or row.get("closedAt")
+                    or row.get("closed_at")
+                )
+                if (
+                    row.get("closedTime")
+                    or row.get("closedAt")
+                    or row.get("closed_at")
+                ) else None
+            )
+            explicit_resolved_at = (
+                _instant(row.get("resolvedAt") or row.get("resolved_at"))
+                if row.get("resolvedAt") or row.get("resolved_at") else None
+            )
             lifecycle = (
                 "resolved" if resolution not in {None, ""}
-                else "closed" if closed or expired
+                else "closed" if closed
                 else "active"
             )
             terminal = lifecycle in {"closed", "resolved", "invalid"}
@@ -4577,7 +4593,10 @@ class GammaLiveNormalizer:
                 ),
                 lifecycle_state=lifecycle,
                 resolution=str(resolution) if resolution not in {None, ""} else None,
-                terminal_at=(end_at if expired and not resolution else observed_at) if terminal else None,
+                terminal_at=(
+                    explicit_resolved_at or explicit_closed_at or observed_at
+                    if terminal else None
+                ),
                 lifecycle_source="polymarket_gamma" if terminal else None,
                 lifecycle_source_url=GammaKeysetCatalog.endpoint if terminal else None,
                 lifecycle_evidence_sha256=raw_hash if terminal else None,
@@ -5415,12 +5434,25 @@ class LiveStateStore:
         raw_rows: Iterable[dict[str, Any]] | GammaCatalogRows,
     ) -> dict[str, Any]:
         self._ensure_loaded()
+        def relation_revisions(values: Iterable[LiveMarket]) -> dict[str, str]:
+            grouped: dict[str, set[str]] = defaultdict(set)
+            for value in values:
+                for relation in value.relations:
+                    if relation.relation_type == "standard_negative_risk":
+                        grouped[relation.relation_id].add(relation.revision)
+            return {
+                relation_id: content_sha256(sorted(revisions))
+                for relation_id, revisions in grouped.items()
+            }
+
+        previous_relation_revisions = relation_revisions(self.catalog.values())
         by_id = {market.identity.market_id: market for market in markets}
         for market_id, previous in self.catalog.items():
             if market_id not in by_id and previous.lifecycle_state == "resolved":
                 by_id[market_id] = previous
         markets = list(by_id.values())
         markets.sort(key=lambda item: item.identity.market_id)
+        next_relation_revisions = relation_revisions(markets)
         revision = _market_sequence_sha256(markets)
         previous_tokens = set(self.token_to_market)
         next_token_to_market = {
@@ -5478,15 +5510,83 @@ class LiveStateStore:
                 "removed_sha256": content_sha256(removed_tokens),
                 "requires_bootstrap": True,
             }
+            relation_changes = {
+                "added_relation_ids": sorted(
+                    set(next_relation_revisions) - set(previous_relation_revisions)
+                ),
+                "removed_relation_ids": sorted(
+                    set(previous_relation_revisions) - set(next_relation_revisions)
+                ),
+                "changed_relation_ids": sorted(
+                    relation_id
+                    for relation_id in set(previous_relation_revisions)
+                    & set(next_relation_revisions)
+                    if previous_relation_revisions[relation_id]
+                    != next_relation_revisions[relation_id]
+                ),
+            }
             self._emit(
                 "catalog_revision",
-                {"catalog_revision": revision, "token_changes": token_changes},
+                {
+                    "catalog_revision": revision,
+                    "token_changes": token_changes,
+                    "relation_changes": relation_changes,
+                },
                 {
                     "catalog_source": self.catalog_source,
                     "market_count": raw_market_count,
                 },
                 applied=True, _publication_locked=True,
             )
+            for raw_body, raw in _iter_raw_catalog_rows(
+                next_raw_catalog_path, raw_format
+            ):
+                market_id = str(raw.get("id") or "")
+                condition_id = str(
+                    raw.get("conditionId") or raw.get("condition_id") or ""
+                ) or None
+                if not market_id:
+                    continue
+                lifecycle_facts = (
+                    ("resolution_proposed", raw.get("resolutionProposedAt") or raw.get("resolution_proposed_at")),
+                    ("resolution_disputed", raw.get("disputedAt") or raw.get("disputed_at")),
+                    ("market_resolved", raw.get("resolvedAt") or raw.get("resolved_at")),
+                    ("redemption_available", raw.get("redeemableAt") or raw.get("redeemable_at")),
+                    ("market_terminal", raw.get("closedTime") or raw.get("closedAt") or raw.get("closed_at")),
+                )
+                for event_type, source_at in lifecycle_facts:
+                    if source_at in {None, ""}:
+                        continue
+                    raw_fact = {
+                        "source": "polymarket_gamma",
+                        "source_event_id": str(
+                            raw.get("resolutionEventId")
+                            or raw.get("resolution_event_id")
+                            or f"gamma:{market_id}:{event_type}:{source_at}"
+                        ),
+                        "source_observed_at": str(source_at),
+                        "market_id": market_id,
+                        "event_type": event_type,
+                        "resolution": raw.get("resolution"),
+                        "raw_market_payload_sha256": hashlib.sha256(raw_body).hexdigest(),
+                    }
+                    if content_sha256(raw_fact) in self.seen_raw_hashes:
+                        continue
+                    self._emit(
+                        event_type,
+                        {
+                            "source_event_id": raw_fact["source_event_id"],
+                            "source_observed_at": str(source_at),
+                            "resolution": raw.get("resolution"),
+                        },
+                        raw_fact,
+                        applied=True,
+                        market_id=market_id,
+                        condition_id=condition_id,
+                        exchange_at=_instant(source_at),
+                        received_at=self.now_provider(),
+                        _publication_locked=True,
+                    )
         return {"catalog_revision": revision, "token_changes": token_changes}
 
     def _emit(

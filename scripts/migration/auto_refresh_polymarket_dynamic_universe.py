@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run one fail-closed MarketCow-owned dynamic-universe refresh transaction.
+"""Warm and activate one fail-closed Tradude-owned exact Scope selection.
 
 This command is intentionally one-shot. A service manager or scheduler may invoke it periodically;
-an advisory lock prevents overlapping refreshes. Tradude is never involved in discovery, activation,
-or MarketCow lifecycle management.
+an advisory lock prevents overlapping refreshes. Tradude owns membership selection; MarketCow owns
+data validation, warmup, and atomic publication.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ from scripts.migration.fetch_polymarket_dynamic_candidate_books import (
 )
 
 
-SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh.v1"
-CONFIG_SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh-config.v1"
+SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh.v2"
+CONFIG_SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh-config.v2"
 ACTIVATION_SCHEMA_VERSION = "marketcow.polymarket.scope-activation.v1"
 SCOPE_SCHEMA_VERSION = "marketcow.polymarket.scope-discovery.v5"
 
@@ -48,7 +48,6 @@ class RefreshConfig:
     audit_result: Path
     target_market_count: int
     minimum_market_count: int
-    maximum_capital_lock_seconds: int
     clob_books_endpoint: str = "https://clob.polymarket.com/books"
     request_timeout_seconds: float = 60.0
     retry_seconds: int = 60
@@ -59,7 +58,7 @@ def _load_config(path: Path) -> RefreshConfig:
     expected = {
         "schema_version", "service_url", "candidate_manifest", "catalog_index", "catalog",
         "fee_registry", "scope_registry_root", "work_root", "audit_result",
-        "target_market_count", "minimum_market_count", "maximum_capital_lock_seconds",
+        "target_market_count", "minimum_market_count",
         "clob_books_endpoint", "request_timeout_seconds", "retry_seconds",
     }
     if not isinstance(payload, dict) or set(payload) - expected:
@@ -80,7 +79,6 @@ def _load_config(path: Path) -> RefreshConfig:
         audit_result=Path(payload["audit_result"]),
         target_market_count=int(payload["target_market_count"]),
         minimum_market_count=int(payload["minimum_market_count"]),
-        maximum_capital_lock_seconds=int(payload["maximum_capital_lock_seconds"]),
         clob_books_endpoint=payload.get("clob_books_endpoint", "https://clob.polymarket.com/books"),
         request_timeout_seconds=float(payload.get("request_timeout_seconds", 60)),
         retry_seconds=int(payload.get("retry_seconds", 60)),
@@ -152,9 +150,9 @@ def _validate_live_boundary(scope: dict[str, Any], full_sync: dict[str, Any]) ->
 def _validate_scope_identity(scope: dict[str, Any]) -> None:
     """Validate the durable universe identity even when its live books are fail-closed.
 
-    A one-sided active book must make `/full-sync` unavailable, but the MarketCow-owned refresh
-    controller still needs the last atomically published membership in order to build its
-    replacement generation from a fresh, independent CLOB snapshot.  The public `/scope` identity
+    A one-sided active book must make `/full-sync` unavailable, but the MarketCow validation and
+    publication controller still needs the last atomically published membership to validate its
+    replacement generation against a fresh, independent CLOB snapshot. The public `/scope` identity
     is sufficient for that purpose as long as every count and stable identity is internally
     consistent; no unready book state is reused.
     """
@@ -371,7 +369,6 @@ def refresh_once(
         generation=next_generation,
         target_market_count=config.target_market_count,
         minimum_market_count=config.minimum_market_count,
-        maximum_capital_lock_seconds=config.maximum_capital_lock_seconds,
         previous_market_ids=[value["market_id"] for value in current_identities],
         previous_market_identities=current_identities,
         retry_seconds=config.retry_seconds,
@@ -399,7 +396,6 @@ def refresh_once(
         "candidate_generation": next_generation,
         "target_market_count": config.target_market_count,
         "minimum_market_count": config.minimum_market_count,
-        "maximum_capital_lock_seconds": config.maximum_capital_lock_seconds,
         "active_market_count": len(candidate["universe"]["active_markets"]),
         "excluded_market_count": len(candidate["universe"]["excluded_markets"]),
         "added_markets": candidate["universe"]["added_markets"],
@@ -410,7 +406,8 @@ def refresh_once(
         "book_snapshot_path": str(books_path.resolve()),
         "book_snapshot_sha256": _sha256(books_path),
         "real_order_submission_enabled": False,
-        "tradude_manages_marketcow_lifecycle": False,
+        "scope_selection_owner": "tradude",
+        "marketcow_computes_market_ranking": False,
     }
     if not changed:
         return result

@@ -73,6 +73,10 @@ git diff --check
 
 更完整的架构边界见 [当前运行架构](docs/architecture/current-runtime.md)。
 
+Polymarket 全市场轻量发现 v2 的原子分页、增量续传、关系和历史事实契约见
+[Polymarket discovery v2](docs/polymarket-discovery-v2.md)。该通道与最多 100 个市场的
+热 Scope 完整 L2 通道相互独立。
+
 ## 管理后台
 
 可视化与管理后台位于 `web/`，使用 React、TypeScript 和 Vite。开发时分别启动

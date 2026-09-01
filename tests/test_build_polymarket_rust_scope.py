@@ -50,6 +50,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     manifest.write_text(
         json.dumps(
             {
+                "schema": "tradude.prediction_market.scope_selection.v2",
+                "discovery_snapshot_id": "a" * 64,
+                "selection_evidence_sha256": "b" * 64,
                 "scope_id": "scope-2",
                 "catalog_revision": "catalog-v1",
                 "market_ids": ["2", "1"],
@@ -284,56 +287,35 @@ def _books(tmp_path: Path, *, one_sided: set[str] | None = None) -> Path:
     return path
 
 
-def test_dynamic_universe_isolates_failure_and_atomically_replenishes(tmp_path: Path) -> None:
+def test_dynamic_universe_does_not_replace_failed_tradude_member(tmp_path: Path) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
-    result = build_dynamic_universe(
-        manifest, index, catalog, registry, _books(tmp_path, one_sided={"10"}),
-        universe_id="a" * 64,
-        generation=7,
-        target_market_count=1,
-        minimum_market_count=1,
-        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
-        previous_market_ids=["1"],
-        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
-    )
-    assert result["schema_version"] == "marketcow.polymarket.rust-live-scope.v4"
-    assert result["scope_id"] == "a" * 64
-    assert result["market_ids"] == ["2"]
-    assert result["universe"]["generation"] == 7
-    assert result["universe"]["added_markets"] == ["2"]
-    assert result["universe"]["removed_markets"] == ["1"]
-    assert result["universe"]["removed_market_identities"] == [{
-        "market_id": "1",
-        "condition_id": "condition-1",
-        "token_ids": ["10", "20"],
-        "end_at": "2026-09-01T00:00:00Z",
-    }]
-    assert result["universe"]["excluded_markets"][0]["reason_code"] == "one_sided_book"
-    assert len(result["initial_book_frames"]) == 2
+    with pytest.raises(ValueError, match="Tradude selection is not atomically ready"):
+        build_dynamic_universe(
+            manifest, index, catalog, registry, _books(tmp_path, one_sided={"10"}),
+            universe_id="a" * 64,
+            generation=7,
+            target_market_count=2,
+            minimum_market_count=2,
+            previous_market_ids=["1"],
+            validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+        )
 
 
-def test_dynamic_universe_records_capacity_exclusion(tmp_path: Path) -> None:
+def test_dynamic_universe_preserves_explicit_selection_order(tmp_path: Path) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
     result = build_dynamic_universe(
         manifest, index, catalog, registry, _books(tmp_path),
         universe_id="b" * 64,
         generation=1,
-        target_market_count=1,
-        minimum_market_count=1,
-        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
+        target_market_count=2,
+        minimum_market_count=2,
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
-    assert result["market_ids"] == ["2"]  # ranked manifest order is [2, 1]
-    assert result["universe"]["excluded_markets"] == [{
-        "market_id": "1",
-        "reason_code": "target_capacity",
-        "retryable": False,
-        "retry_after": None,
-        "observed_at": "2026-08-29T00:00:00Z",
-    }]
+    assert result["market_ids"] == ["2", "1"]
+    assert result["universe"]["excluded_markets"] == []
 
 
-def test_dynamic_universe_keeps_qualified_incumbent_ahead_of_ranked_replacement(
+def test_dynamic_universe_does_not_reorder_for_incumbent(
     tmp_path: Path,
 ) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
@@ -341,14 +323,13 @@ def test_dynamic_universe_keeps_qualified_incumbent_ahead_of_ranked_replacement(
         manifest, index, catalog, registry, _books(tmp_path),
         universe_id="8" * 64,
         generation=2,
-        target_market_count=1,
-        minimum_market_count=1,
-        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
+        target_market_count=2,
+        minimum_market_count=2,
         previous_market_ids=["1"],
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
-    assert result["market_ids"] == ["1"]
-    assert result["universe"]["added_markets"] == []
+    assert result["market_ids"] == ["2", "1"]
+    assert result["universe"]["added_markets"] == ["2"]
     assert result["universe"]["removed_markets"] == []
 
 
@@ -366,9 +347,8 @@ def test_dynamic_universe_preserves_removed_identity_when_catalog_member_is_unbu
         manifest, index, catalog, registry, _books(tmp_path),
         universe_id="9" * 64,
         generation=8,
-        target_market_count=1,
-        minimum_market_count=1,
-        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
+        target_market_count=2,
+        minimum_market_count=2,
         previous_market_ids=["999"],
         previous_market_identities=[previous_identity],
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
@@ -392,11 +372,10 @@ def test_dynamic_universe_accepts_atomic_two_token_tick_change(tmp_path: Path) -
         generation=1,
         target_market_count=2,
         minimum_market_count=2,
-        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
 
-    assert result["market_ids"] == ["1", "2"]
+    assert result["market_ids"] == ["2", "1"]
     changed_ticks = {
         frame["asset_id"]: frame["tick_size"]
         for frame in result["initial_book_frames"]
@@ -407,7 +386,7 @@ def test_dynamic_universe_accepts_atomic_two_token_tick_change(tmp_path: Path) -
 
 def test_dynamic_universe_fails_closed_below_minimum(tmp_path: Path) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
-    with pytest.raises(ValueError, match="below minimum"):
+    with pytest.raises(ValueError, match="not atomically ready"):
         build_dynamic_universe(
             manifest, index, catalog, registry,
             _books(tmp_path, one_sided={"10", "30"}),
@@ -415,21 +394,19 @@ def test_dynamic_universe_fails_closed_below_minimum(tmp_path: Path) -> None:
             generation=1,
             target_market_count=2,
             minimum_market_count=2,
-            maximum_capital_lock_seconds=30 * 24 * 60 * 60,
             validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
         )
 
 
-def test_dynamic_universe_rejects_capital_lock_policy_above_thirty_days(tmp_path: Path) -> None:
+def test_dynamic_universe_requires_exact_tradude_selection_count(tmp_path: Path) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
-    with pytest.raises(ValueError, match="configuration is invalid"):
+    with pytest.raises(ValueError, match="explicit selection count"):
         build_dynamic_universe(
             manifest, index, catalog, registry, _books(tmp_path),
             universe_id="e" * 64,
             generation=1,
             target_market_count=1,
             minimum_market_count=1,
-            maximum_capital_lock_seconds=30 * 24 * 60 * 60 + 1,
             validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
         )
 
@@ -459,7 +436,6 @@ def test_dynamic_universe_book_refresh_is_exact_complete_and_auditable(tmp_path:
         generation=2,
         target_market_count=2,
         minimum_market_count=2,
-        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
     poster = _BookPoster(_clob_books())
@@ -490,7 +466,6 @@ def test_dynamic_universe_book_refresh_fails_closed_on_missing_or_float_facts(
         generation=2,
         target_market_count=2,
         minimum_market_count=2,
-        maximum_capital_lock_seconds=30 * 24 * 60 * 60,
         validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
     )
     missing = _clob_books()

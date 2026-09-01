@@ -24,7 +24,7 @@ All prices, sizes, rates, and quanta retain exact decimal-string semantics. Time
 - per-market snapshot: `marketcow.polymarket.market-snapshot.v1`
 
 Scope artifacts remain hash-pinned `rust-live-scope.v4` inputs containing a
-`marketcow.polymarket.universe.v1` candidate. The daemon publishes the effective v3 view after
+`marketcow.polymarket.universe.v2` candidate. The daemon publishes the effective v3 view after
 atomically overlaying the same-boundary market health projection.
 
 ## Gap classification

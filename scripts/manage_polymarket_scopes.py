@@ -8,7 +8,7 @@ from pathlib import Path
 
 from marketcow.polymarket_scopes import (
     PolymarketScopeRegistry,
-    build_replacement_scope_manifest,
+    build_explicit_scope_manifest,
 )
 
 
@@ -26,8 +26,7 @@ def main() -> None:
     parser.add_argument("--registry-root", required=True, type=Path)
     commands = parser.add_subparsers(dest="command", required=True)
     generate = commands.add_parser("generate")
-    generate.add_argument("--current-manifest", required=True, type=Path)
-    generate.add_argument("--candidate-snapshot", required=True, type=Path)
+    generate.add_argument("--selection", required=True, type=Path)
     generate.add_argument("--output", required=True, type=Path)
     prepare = commands.add_parser("prepare")
     prepare.add_argument("--manifest", required=True, type=Path)
@@ -43,9 +42,8 @@ def main() -> None:
     arguments = parser.parse_args()
     registry = PolymarketScopeRegistry(arguments.registry_root)
     if arguments.command == "generate":
-        result = build_replacement_scope_manifest(
-            _document(arguments.current_manifest),
-            _document(arguments.candidate_snapshot),
+        result = build_explicit_scope_manifest(
+            _document(arguments.selection),
             generated_at_ns=time.time_ns(),
         )
         arguments.output.parent.mkdir(parents=True, exist_ok=True)

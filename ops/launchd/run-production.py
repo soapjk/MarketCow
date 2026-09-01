@@ -46,6 +46,7 @@ def build_services(
     if not data_root.is_absolute():
         raise ValueError("MARKETCOW_HOME must be an absolute path")
     live_root = data_root / "prediction-markets" / "polymarket-live"
+    discovery_root = data_root / "prediction-markets" / "polymarket-discovery"
 
     host = environment.get("MARKETCOW_HOST", "127.0.0.1")
     if host not in LOOPBACK_HOSTS:
@@ -54,14 +55,18 @@ def build_services(
     read_api_port = int(environment.get("MARKETCOW_POLYMARKET_READ_API_PORT", "8791"))
     stream_host = "127.0.0.1"
     stream_port = 8794
+    discovery_stream_port = int(environment.get(
+        "MARKETCOW_POLYMARKET_DISCOVERY_STREAM_PORT", "8795"
+    ))
     for name, port in (
         ("MARKETCOW_PORT", api_port),
         ("MARKETCOW_POLYMARKET_READ_API_PORT", read_api_port),
         ("Polymarket live stream port", stream_port),
+        ("Polymarket discovery stream port", discovery_stream_port),
     ):
         if not 1 <= port <= 65535:
             raise ValueError(f"{name} must be in [1, 65535]")
-    if len({api_port, read_api_port, stream_port}) != 3:
+    if len({api_port, read_api_port, stream_port, discovery_stream_port}) != 4:
         raise ValueError("MarketCow API, read API and live stream ports must differ")
 
     manifest = _required_path(environment, "MARKETCOW_POLYMARKET_SCOPE_MANIFEST")
@@ -71,6 +76,38 @@ def build_services(
     consumer_age = environment.get("MARKETCOW_POLYMARKET_CONSUMER_MAXIMUM_BOOK_AGE_SECONDS", "5.0")
     delivery_headroom = environment.get("MARKETCOW_POLYMARKET_MINIMUM_DELIVERY_HEADROOM_SECONDS", "1.0")
     stream_uri = f"ws://{stream_host}:{stream_port}"
+    depth_notionals = [
+        value.strip() for value in environment.get(
+            "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS", ""
+        ).split(",") if value.strip()
+    ]
+    if not depth_notionals:
+        raise ValueError(
+            "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS is required"
+        )
+    depth_arguments = tuple(
+        argument
+        for value in depth_notionals
+        for argument in ("--discovery-depth-notional", value)
+    )
+
+    discovery_collector = Service(
+        "polymarket-discovery-collector",
+        (
+            python,
+            str(project_dir / "scripts" / "run_polymarket_live.py"),
+            "--root",
+            str(discovery_root),
+            "--shard-size",
+            environment.get("MARKETCOW_POLYMARKET_DISCOVERY_SHARD_SIZE", "500"),
+            "--max-websocket-connections",
+            environment.get(
+                "MARKETCOW_POLYMARKET_DISCOVERY_MAX_WEBSOCKET_CONNECTIONS", "32"
+            ),
+            "--live-stream-port",
+            str(discovery_stream_port),
+        ),
+    )
 
     collector = Service(
         "polymarket-collector",
@@ -113,6 +150,8 @@ def build_services(
             str(project_dir / "scripts" / "run_polymarket_live_read_api.py"),
             "--root",
             str(live_root),
+            "--discovery-root",
+            str(discovery_root),
             "--host",
             "127.0.0.1",
             "--port",
@@ -129,11 +168,14 @@ def build_services(
             environment.get("MARKETCOW_POLYMARKET_STABLE_READ_POLL_SECONDS", "0.025"),
             "--executor-workers",
             environment.get("MARKETCOW_POLYMARKET_READ_EXECUTOR_WORKERS", "4"),
+            *depth_arguments,
+            "--discovery-maximum-book-age-ms",
+            str(int(float(consumer_age) * 1000)),
             "--live-stream-uri",
             stream_uri,
         ),
     )
-    return collector, shared_api, read_api
+    return discovery_collector, collector, shared_api, read_api
 
 
 def supervise(

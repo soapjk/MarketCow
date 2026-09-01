@@ -5,7 +5,6 @@ import json
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
@@ -81,69 +80,83 @@ def write_scope_runtime(
     return descriptor
 
 
-def build_replacement_scope_manifest(
-    current_manifest: dict[str, Any],
-    candidate_snapshot: dict[str, Any],
+def build_explicit_scope_manifest(
+    selection: dict[str, Any],
     *,
     generated_at_ns: int,
 ) -> dict[str, Any]:
-    """Deterministically keep eligible members and fill vacancies to exact 100."""
-    if candidate_snapshot.get("schema") != "tradude.prediction_market.scope_candidates.v1":
+    """Validate a Tradude-owned selection without ranking or filling markets."""
+    if selection.get("schema") != "tradude.prediction_market.scope_selection.v2":
         raise ScopeTransitionError(
-            "polymarket_candidate_snapshot_invalid", "unsupported candidate snapshot schema",
+            "polymarket_scope_selection_invalid", "unsupported selection schema",
         )
-    candidates = []
-    for row in candidate_snapshot.get("markets") or []:
-        if not isinstance(row, dict):
-            continue
-        if not all((
-            row.get("active") is True,
-            row.get("accepting_orders") is True,
-            row.get("closed") is False,
-            row.get("binary_yes_no") is True,
-            row.get("rules_complete") is True,
-            isinstance(row.get("market_id"), str),
-            isinstance(row.get("end_at_ns"), int),
-            row.get("end_at_ns") > generated_at_ns,
-            isinstance(row.get("yes_outcome_id"), str),
-            isinstance(row.get("no_outcome_id"), str),
-            row.get("yes_outcome_id") != row.get("no_outcome_id"),
-        )):
-            continue
-        try:
-            liquidity = Decimal(str(row.get("liquidity_num") or "0"))
-        except InvalidOperation:
-            continue
-        candidates.append((row, liquidity))
-    by_id = {row["market_id"]: (row, liquidity) for row, liquidity in candidates}
-    retained = [
-        str(market_id) for market_id in current_manifest.get("market_ids") or []
-        if str(market_id) in by_id
-    ]
-    replacements = sorted(
-        (
-            (row, liquidity) for row, liquidity in candidates
-            if row["market_id"] not in retained
-        ),
-        key=lambda item: (
-            -item[1], -int(item[0]["end_at_ns"]), str(item[0]["market_id"]),
-        ),
-    )
-    market_ids = retained + [
-        row["market_id"] for row, _ in replacements[: 100 - len(retained)]
-    ]
-    if len(market_ids) != 100 or len(set(market_ids)) != 100:
+    market_ids = selection.get("market_ids")
+    if (
+        not isinstance(market_ids, list)
+        or not 1 <= len(market_ids) <= 100
+        or len(set(market_ids)) != len(market_ids)
+        or any(not isinstance(value, str) or not value for value in market_ids)
+    ):
         raise ScopeTransitionError(
-            "polymarket_replacement_scope_insufficient",
-            "candidate snapshot cannot produce exact 100 eligible markets",
+            "polymarket_scope_selection_invalid",
+            "selection must contain 1-100 explicit unique market IDs",
         )
+    snapshot_id = selection.get("discovery_snapshot_id")
+    catalog_revision = selection.get("catalog_revision")
+    evidence_sha256 = selection.get("selection_evidence_sha256")
+    for name, value in (
+        ("discovery_snapshot_id", snapshot_id),
+        ("catalog_revision", catalog_revision),
+        ("selection_evidence_sha256", evidence_sha256),
+    ):
+        if not isinstance(value, str) or len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ScopeTransitionError(
+                "polymarket_scope_selection_invalid",
+                f"{name} must be a lowercase SHA-256 value",
+            )
+    relations = selection.get("relations")
+    if not isinstance(relations, list):
+        raise ScopeTransitionError(
+            "polymarket_scope_selection_invalid",
+            "selection relations must be explicit",
+        )
+    relation_ids = set()
+    selected = set(market_ids)
+    for relation in relations:
+        if not isinstance(relation, dict):
+            raise ScopeTransitionError(
+                "polymarket_scope_selection_invalid", "relation selection is invalid"
+            )
+        relation_id = relation.get("relation_id")
+        members = relation.get("member_market_ids")
+        if (
+            not isinstance(relation_id, str)
+            or not relation_id
+            or relation_id in relation_ids
+            or relation.get("complete") is not True
+            or not isinstance(members, list)
+            or len(members) < 2
+            or len(set(members)) != len(members)
+            or not set(members).issubset(selected)
+            or relation.get("actual_member_count") != len(members)
+            or relation.get("expected_member_count") != len(members)
+        ):
+            raise ScopeTransitionError(
+                "polymarket_scope_relation_incomplete",
+                "selected relations must include every member exactly once",
+            )
+        relation_ids.add(relation_id)
     manifest = {
         "schema": "tradude.prediction_market.scope_manifest.v1",
-        "catalog_revision": candidate_snapshot.get("catalog_revision"),
-        "candidate_snapshot_id": candidate_snapshot.get("snapshot_id"),
+        "catalog_revision": catalog_revision,
+        "candidate_snapshot_id": snapshot_id,
         "generated_at_ns": generated_at_ns,
-        "market_ids": market_ids,
-        "replaces_scope_id": current_manifest.get("scope_id"),
+        "market_ids": list(market_ids),
+        "relations": relations,
+        "selection_evidence_sha256": evidence_sha256,
+        "replaces_scope_id": selection.get("replaces_scope_id"),
     }
     manifest["scope_id"] = scope_content_id(manifest)
     return manifest
