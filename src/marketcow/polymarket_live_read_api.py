@@ -135,6 +135,7 @@ def create_polymarket_live_read_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         nonlocal stream_task, loop_monitor_task
+        discovery.start_background_materialization()
         if stream_client is not None:
             stream_task = asyncio.create_task(
                 stream_client.run(stream_stop),
@@ -147,6 +148,7 @@ def create_polymarket_live_read_app(
             yield
         finally:
             stream_stop.set()
+            discovery.stop_background_materialization()
             if stream_task is not None:
                 stream_task.cancel()
                 await asyncio.gather(stream_task, return_exceptions=True)
@@ -600,6 +602,8 @@ def _raise_read_error(exc: PolymarketLiveReadError) -> NoReturn:
         if exc.code in {
             "polymarket_state_index_lagging",
             "polymarket_snapshot_freshness_budget_exhausted",
+            "discovery_snapshot_materializing",
+            "discovery_cross_revision_boundary",
         }
         else None
     )

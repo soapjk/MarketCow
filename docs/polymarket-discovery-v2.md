@@ -48,15 +48,26 @@ OpenAPI describes every HTTP operation and model. Because OpenAPI has no standar
 WebSocket operation, `x-websocket-paths` describes its message schema, resume
 parameter, resync frame, and close code.
 
-## Atomic snapshot and pagination
+## Atomic materialization and pagination
 
-The first snapshot request omits `snapshot_id`. MarketCow captures one immutable
-catalog plus SQLite book transaction and returns `snapshot_id`, `catalog_revision`,
+A dedicated single-flight background worker materializes discovery independently of
+HTTP request workers. The initial catalog is parsed one market at a time into a local
+SQLite boundary; it is never retained as one list of Pydantic market objects. Later
+book events append quote versions only for affected markets. Catalog or relation
+membership changes build a replacement database and publish it atomically while the
+preceding boundary remains readable.
+
+The first snapshot request omits `snapshot_id` and reads the latest published boundary.
+It never calls the materializer. Before the first boundary is ready it returns promptly
+with HTTP 503 `discovery_snapshot_materializing`; concurrent requests do not start more
+builders. A successful response contains `snapshot_id`, `catalog_revision`,
 `boundary_cursor`, `observed_at`, explicit depth tiers, counts, items, and an opaque
-`next_page_cursor`.
+`next_page_cursor`. Health does not wait for discovery materialization.
 
 Later pages supply both `snapshot_id` and `page_cursor`. The cursor is validated
 against that snapshot. Book/catalog changes can only appear under a new snapshot ID.
+Quote versions are selected at that snapshot's boundary cursor, so later incremental
+updates cannot alter an earlier page.
 An expired snapshot returns HTTP 410 `discovery_snapshot_expired`; an unbound page
 cursor returns 422.
 
@@ -139,7 +150,8 @@ PYTHONPATH=src python scripts/manage_polymarket_scopes.py \
 ## Verification
 
 `tests/test_polymarket_discovery.py` covers more than 100 active markets, immutable
-pagination, incremental quotes, cursor expiry, WebSocket resync, source-only lifecycle
-history, metadata non-inference, complete relations, and OpenAPI. Existing Python and
-Rust Scope tests cover candidate warmup, atomic activation, cursor continuity,
-`universe_changed`, and scoped full-sync.
+pagination, affected-market-only quote materialization, initial single-flight behavior,
+non-blocking health, cursor expiry, WebSocket resync, source-only lifecycle history,
+metadata non-inference, complete relations, and OpenAPI. Existing Python and Rust Scope
+tests cover candidate warmup, atomic activation, cursor continuity, `universe_changed`,
+and scoped full-sync.

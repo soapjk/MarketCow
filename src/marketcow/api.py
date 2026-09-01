@@ -879,6 +879,8 @@ def create_app(
     async def startup() -> None:
         nonlocal projection_task, polymarket_live_stream_task
         nonlocal polymarket_event_loop_monitor_task
+        if polymarket_discovery is not None:
+            polymarket_discovery.start_background_materialization()
         if polymarket_live_stream_client is not None:
             polymarket_live_stream_task = asyncio.create_task(
                 polymarket_live_stream_client.run(polymarket_live_stream_stop),
@@ -908,6 +910,8 @@ def create_app(
 
     async def shutdown() -> None:
         polymarket_live_stream_stop.set()
+        if polymarket_discovery is not None:
+            polymarket_discovery.stop_background_materialization()
         if polymarket_live_stream_task is not None:
             polymarket_live_stream_task.cancel()
             await asyncio.gather(
@@ -1482,6 +1486,8 @@ def create_app(
             if exc.code in {
                 "polymarket_state_index_lagging",
                 "polymarket_snapshot_freshness_budget_exhausted",
+                "discovery_snapshot_materializing",
+                "discovery_cross_revision_boundary",
             }
             else None
         )

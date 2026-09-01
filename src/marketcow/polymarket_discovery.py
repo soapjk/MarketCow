@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import sqlite3
 import threading
+import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Iterator, Literal
 
 from pydantic import BaseModel, Field, model_validator
 from fastapi import FastAPI
@@ -289,17 +294,17 @@ class _DiscoveryBoundary:
         catalog_revision: str,
         boundary_cursor: int,
         observed_at: datetime,
-        quotes: list[DiscoveryMarketQuote],
-        metadata: list[DiscoveryMetadataFact],
-        relations: dict[str, DiscoveryRelation],
+        database_path: Path,
+        active_market_count: int,
+        relation_count: int,
     ) -> None:
         self.snapshot_id = snapshot_id
         self.catalog_revision = catalog_revision
         self.boundary_cursor = boundary_cursor
         self.observed_at = observed_at
-        self.quotes = quotes
-        self.metadata = metadata
-        self.relations = relations
+        self.database_path = database_path
+        self.active_market_count = active_market_count
+        self.relation_count = relation_count
 
 
 def _decimal_config(values: Iterable[str]) -> tuple[str, ...]:
@@ -1162,4 +1167,1067 @@ class PolymarketDiscoveryStore:
             next_cursor=next_cursor,
             has_more=has_more,
             items=items,
+        )
+
+
+_InMemoryPolymarketDiscoveryStore = PolymarketDiscoveryStore
+
+
+class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
+    """Single-flight, disk-materialized full-market discovery projection.
+
+    The initial catalog is streamed into SQLite one market at a time. Later book
+    changes append only the affected market quote versions. HTTP pagination never
+    invokes materialization and keeps only the requested page of Pydantic objects
+    in memory.
+    """
+
+    def __init__(
+        self,
+        reader: PolymarketLiveReadStore,
+        *,
+        depth_notionals: Iterable[str],
+        maximum_book_age_ms: int,
+        retained_snapshots: int = 8,
+        refresh_interval_seconds: float = 0.5,
+    ) -> None:
+        super().__init__(
+            reader,
+            depth_notionals=depth_notionals,
+            maximum_book_age_ms=maximum_book_age_ms,
+            retained_snapshots=retained_snapshots,
+        )
+        if refresh_interval_seconds <= 0:
+            raise ValueError("discovery refresh interval must be positive")
+        self.refresh_interval_seconds = refresh_interval_seconds
+        self.materialization_root = reader.root / "discovery-materialized-v2"
+        self.materialization_root.mkdir(parents=True, exist_ok=True)
+        self.current_manifest_path = self.materialization_root / "current.json"
+        self._build_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._materialization_state = "not_started"
+        self._materialization_error: str | None = None
+        self._publish_count = 0
+        self._restore_published()
+
+    @staticmethod
+    def _open_database(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
+        if readonly:
+            connection = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, timeout=0.5
+            )
+            connection.execute("PRAGMA query_only=ON")
+        else:
+            connection = sqlite3.connect(path, timeout=1.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=500")
+        connection.execute("PRAGMA cache_size=-16384")
+        connection.execute("PRAGMA temp_store=FILE")
+        return connection
+
+    @classmethod
+    @contextmanager
+    def _database(
+        cls, path: Path, *, readonly: bool = False
+    ) -> Iterator[sqlite3.Connection]:
+        connection = cls._open_database(path, readonly=readonly)
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    def _restore_published(self) -> None:
+        if not self.current_manifest_path.exists():
+            return
+        try:
+            payload = json.loads(self.current_manifest_path.read_bytes())
+            database_path = Path(str(payload["database_path"])).resolve()
+            if not database_path.is_relative_to(self.materialization_root.resolve()):
+                raise ValueError("materialized database escapes its root")
+            with self._database(database_path, readonly=True) as connection:
+                rows = list(connection.execute(
+                    "SELECT snapshot_id, catalog_revision, boundary_cursor, "
+                    "observed_at, active_market_count, relation_count "
+                    "FROM snapshots WHERE boundary_cursor<=? "
+                    "ORDER BY boundary_cursor DESC LIMIT ?",
+                    (
+                        int(payload["boundary_cursor"]),
+                        self.retained_snapshots,
+                    ),
+                ))
+            if not rows or str(rows[0]["snapshot_id"]) != payload["snapshot_id"]:
+                raise ValueError("materialization manifest is not a publication fence")
+            for row in reversed(rows):
+                boundary = _DiscoveryBoundary(
+                    snapshot_id=str(row["snapshot_id"]),
+                    catalog_revision=str(row["catalog_revision"]),
+                    boundary_cursor=int(row["boundary_cursor"]),
+                    observed_at=_raw_instant(row["observed_at"]),
+                    database_path=database_path,
+                    active_market_count=int(row["active_market_count"]),
+                    relation_count=int(row["relation_count"]),
+                )
+                self._snapshots[boundary.snapshot_id] = boundary
+            if rows:
+                self._materialization_state = "ready"
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            self._snapshots.clear()
+
+    def start_background_materialization(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                self._wake.set()
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._materialization_loop,
+                name="marketcow-discovery-materializer",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop_background_materialization(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def _materialization_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.materialize_once()
+            except Exception as exc:
+                with self._lock:
+                    self._materialization_state = "failed"
+                    self._materialization_error = f"{type(exc).__name__}: {exc}"
+            self._wake.wait(self.refresh_interval_seconds)
+            self._wake.clear()
+
+    def materialization_status(self) -> dict[str, Any]:
+        with self._lock:
+            latest = next(reversed(self._snapshots.values()), None)
+            return {
+                "state": self._materialization_state,
+                "error": self._materialization_error,
+                "snapshot_id": latest.snapshot_id if latest else None,
+                "boundary_cursor": latest.boundary_cursor if latest else None,
+            }
+
+    def _catalog_paths(
+        self,
+    ) -> tuple[str, Path, Path, str, str, datetime]:
+        payload, normalized_path, _, _ = self.reader._manifest_binding()
+        source = payload.get("catalog_source")
+        if not isinstance(source, dict):
+            raise PolymarketLiveReadError(
+                "discovery_catalog_source_missing",
+                "Discovery catalog has no authoritative source binding",
+                503,
+            )
+        raw_path = Path(str(source.get("raw_path") or "")).resolve()
+        source_url = str(source.get("source_url") or "")
+        observed_at = _raw_instant(source.get("observed_at"))
+        if not source_url or observed_at is None:
+            raise PolymarketLiveReadError(
+                "discovery_catalog_source_invalid",
+                "Discovery catalog source identity is incomplete",
+                503,
+            )
+        return (
+            str(payload["catalog_revision"]),
+            normalized_path,
+            raw_path,
+            str(source.get("raw_format") or ""),
+            source_url,
+            observed_at,
+        )
+
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            PRAGMA journal_mode=DELETE;
+            PRAGMA synchronous=OFF;
+            CREATE TABLE raw_catalog (
+                market_id TEXT PRIMARY KEY, payload_json BLOB NOT NULL
+            );
+            CREATE TABLE relation_sources (
+                relation_id TEXT NOT NULL, payload_sha256 TEXT NOT NULL
+            );
+            CREATE INDEX relation_sources_id ON relation_sources(relation_id);
+            CREATE TABLE source_books (
+                token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
+                payload_json BLOB NOT NULL, payload_sha256 TEXT NOT NULL,
+                confirmed_exchange_at TEXT, confirmed_received_at TEXT,
+                confirmed_state_checksum TEXT, confirmed_source_hash TEXT,
+                confirmation_sha256 TEXT
+            );
+            CREATE TABLE gap_markets (market_id TEXT PRIMARY KEY);
+            CREATE TABLE markets (
+                market_id TEXT PRIMARY KEY, static_payload BLOB NOT NULL,
+                metadata_payload BLOB NOT NULL
+            );
+            CREATE TABLE tokens (
+                token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
+                outcome TEXT NOT NULL
+            );
+            CREATE TABLE relation_copies (
+                relation_id TEXT PRIMARY KEY, payload_json BLOB NOT NULL,
+                copy_count INTEGER NOT NULL, revision_disagreement INTEGER NOT NULL,
+                member_disagreement INTEGER NOT NULL
+            );
+            CREATE TABLE relations (
+                relation_id TEXT PRIMARY KEY, payload_json BLOB NOT NULL,
+                complete INTEGER NOT NULL
+            );
+            CREATE TABLE quote_versions (
+                market_id TEXT NOT NULL, cursor INTEGER NOT NULL,
+                payload_json BLOB NOT NULL, metadata_revision TEXT NOT NULL,
+                book_revision TEXT, book_status TEXT NOT NULL,
+                PRIMARY KEY (market_id, cursor)
+            );
+            CREATE INDEX quote_versions_cursor ON quote_versions(cursor);
+            CREATE TABLE snapshots (
+                snapshot_id TEXT PRIMARY KEY, catalog_revision TEXT NOT NULL,
+                boundary_cursor INTEGER NOT NULL, observed_at TEXT NOT NULL,
+                active_market_count INTEGER NOT NULL, relation_count INTEGER NOT NULL
+            );
+            CREATE INDEX snapshots_cursor ON snapshots(boundary_cursor);
+            """
+        )
+
+    @staticmethod
+    def _relation_id_from_raw(raw: dict[str, Any]) -> str | None:
+        events = raw.get("events")
+        event = events[0] if isinstance(events, list) and events else {}
+        group_id = str(
+            raw.get("negRiskMarketID")
+            or raw.get("neg_risk_market_id")
+            or event.get("negRiskMarketID")
+            or ""
+        )
+        if bool(raw.get("negRisk") or raw.get("neg_risk")) and group_id:
+            return f"neg-risk:{group_id}"
+        return None
+
+    def _metadata_fact(
+        self,
+        market: LiveMarket,
+        raw: dict[str, Any],
+        *,
+        catalog_revision: str,
+        source_url: str,
+        catalog_observed_at: datetime,
+    ) -> DiscoveryMetadataFact:
+        rules_text = raw.get("rules") or raw.get("description")
+        description = raw.get("description")
+        resolution_source = raw.get("resolutionSource") or raw.get("resolution_source")
+        resolution_url = raw.get("resolutionSourceUrl") or raw.get("resolution_source_url")
+        proposed_at = _raw_instant(raw.get("resolutionProposedAt") or raw.get("resolution_proposed_at"))
+        challenge_at = _raw_instant(raw.get("challengeDeadlineAt") or raw.get("challenge_deadline_at"))
+        disputed_at = _raw_instant(raw.get("disputedAt") or raw.get("disputed_at"))
+        resolved_at = _raw_instant(raw.get("resolvedAt") or raw.get("resolved_at"))
+        redeemable_at = _raw_instant(raw.get("redeemableAt") or raw.get("redeemable_at"))
+        market_close_at = _raw_instant(raw.get("closedTime") or raw.get("closedAt") or raw.get("closed_at"))
+        events = raw.get("events")
+        event = events[0] if isinstance(events, list) and events else {}
+        event_start_at = _raw_instant(event.get("startDate") or raw.get("startDate"))
+        event_end_at = _raw_instant(event.get("endDate") or raw.get("endDate"))
+        redeemable = raw.get("redeemable") if isinstance(raw.get("redeemable"), bool) else None
+        missing = [
+            name for name, value in {
+                "description": description, "rules": rules_text,
+                "resolution_source": resolution_source,
+                "resolution_source_url": resolution_url,
+                "event_start_at": event_start_at, "event_end_at": event_end_at,
+                "market_close_at": market_close_at,
+                "resolution_status": raw.get("resolutionStatus"),
+                "resolution_proposed_at": proposed_at,
+                "challenge_deadline_at": challenge_at, "disputed_at": disputed_at,
+                "resolved_at": resolved_at, "redeemable": redeemable,
+                "redeemable_at": redeemable_at,
+            }.items() if value is None
+        ]
+        rules_revision = (
+            content_sha256({"rules": str(rules_text), "source": market.raw_payload_sha256})
+            if rules_text is not None else None
+        )
+        return DiscoveryMetadataFact(
+            market_id=market.identity.market_id,
+            question=market.question,
+            title=market.title,
+            description=str(description) if description is not None else None,
+            rules=str(rules_text) if rules_text is not None else None,
+            rules_revision=rules_revision,
+            rules_sha256=(hashlib.sha256(str(rules_text).encode()).hexdigest() if rules_text is not None else None),
+            resolution_source=str(resolution_source) if resolution_source is not None else None,
+            resolution_source_url=str(resolution_url) if resolution_url is not None else None,
+            event_id=market.identity.event_id,
+            event_start_at=event_start_at,
+            event_end_at=event_end_at,
+            market_close_at=market_close_at,
+            resolution_status=str(raw["resolutionStatus"]) if raw.get("resolutionStatus") is not None else None,
+            resolution=market.resolution,
+            resolution_proposed_at=proposed_at,
+            challenge_deadline_at=challenge_at,
+            disputed_at=disputed_at,
+            resolved_at=resolved_at,
+            redeemable=redeemable,
+            redeemable_at=redeemable_at,
+            terminal_at=market.terminal_at,
+            observed_at=market.observed_at,
+            missing_fields=sorted(missing),
+            source_revision=market.metadata_revision,
+            source_url=source_url,
+            evidence_sha256=content_sha256({
+                "catalog_revision": catalog_revision,
+                "market_id": market.identity.market_id,
+                "raw_payload_sha256": market.raw_payload_sha256,
+                "observed_at": catalog_observed_at.isoformat(),
+            }),
+        )
+
+    def _market_quote(
+        self,
+        market: LiveMarket,
+        books: dict[str, LiveBook | None],
+        *,
+        relation_complete: bool,
+        has_gap: bool,
+        catalog_revision: str,
+        boundary_cursor: int,
+        observed_at: datetime,
+    ) -> DiscoveryMarketQuote:
+        by_outcome = {item.outcome.casefold(): item for item in market.identity.outcomes}
+        if set(by_outcome) != {"yes", "no"}:
+            raise PolymarketLiveReadError(
+                "discovery_market_identity_invalid",
+                "Discovery market does not have an explicit YES/NO identity",
+                409,
+            )
+        market_books = {name: books.get(by_outcome[name].token_id) for name in ("yes", "no")}
+        outcome_quotes = [
+            _outcome_quote(
+                name.upper(), by_outcome[name].token_id, market_books[name],
+                observed_at=observed_at, notionals=self.depth_notionals,
+            ) for name in ("yes", "no")
+        ]
+        missing: list[str] = []
+        status = "ready"
+        present = [book for book in market_books.values() if book is not None]
+        if len(present) != 2:
+            status = "missing_book"
+            missing.extend(f"book:{name}_token" for name, book in market_books.items() if book is None)
+        elif any(not book.bids or not book.asks for book in present):
+            status = "incomplete_book"
+            missing.append("two_sided_book")
+        elif any(int((observed_at - book.received_at).total_seconds() * 1000) > self.maximum_book_age_ms for book in present):
+            status = "stale_book"
+            missing.append("fresh_book")
+        instrument = market.rules.instrument
+        ticks = {book.tick_size for book in present}
+        if instrument.price_increment is None:
+            status = "missing_tick"
+            missing.append("tick_size")
+        elif present and (len(ticks) != 1 or instrument.price_increment not in ticks):
+            status = "inconsistent_tick"
+            missing.append("atomic_tick_revision")
+        if instrument.minimum_order_size is None:
+            status = "missing_minimum_order_size"
+            missing.append("minimum_order_size")
+        if not market.rules.fee_schedule.complete:
+            status = "missing_fee_schedule"
+            missing.extend(f"fee_schedule:{value}" for value in market.rules.fee_schedule.missing_fields)
+        relation_id = next((item.relation_id for item in market.relations if item.relation_type == "standard_negative_risk"), None)
+        if market.identity.neg_risk and (relation_id is None or not relation_complete):
+            status = "incomplete_relation"
+            missing.append("complete_negative_risk_relation")
+        if has_gap:
+            status = "source_gap"
+            missing.append("unresolved_source_gap")
+        book_observed_at = min((book.received_at for book in present), default=None)
+        book_age_ms = max(0, int((observed_at - book_observed_at).total_seconds() * 1000)) if book_observed_at else None
+        book_revision = content_sha256({book.token_id: book.state_checksum for book in sorted(present, key=lambda value: value.token_id)}) if len(present) == 2 else None
+        return DiscoveryMarketQuote(
+            market_id=market.identity.market_id,
+            condition_id=market.identity.condition_id,
+            event_id=market.identity.event_id,
+            yes_token_id=by_outcome["yes"].token_id,
+            no_token_id=by_outcome["no"].token_id,
+            active=market.active,
+            closed=market.closed,
+            accepting_orders=market.accepting_orders,
+            lifecycle_state=market.lifecycle_state,
+            start_at=market.start_at,
+            end_at=market.end_at,
+            negative_risk=market.identity.neg_risk,
+            negative_risk_relation_id=relation_id,
+            outcomes=outcome_quotes,
+            book_observed_at=book_observed_at,
+            book_age_ms=book_age_ms,
+            book_status=status,
+            tick_size=instrument.price_increment,
+            minimum_order_size=instrument.minimum_order_size,
+            fee_schedule_id=market.rules.fee_schedule.schedule_id if market.rules.fee_schedule.complete else None,
+            missing_fields=sorted(set(missing)),
+            metadata_revision=market.metadata_revision,
+            book_revision=book_revision,
+            catalog_revision=catalog_revision,
+            cursor=boundary_cursor,
+        )
+
+    def _copy_state_boundary(
+        self, connection: sqlite3.Connection, catalog_revision: str
+    ) -> int:
+        with self.reader._state_snapshot() as (_, source, state):
+            if state["catalog_revision"] != catalog_revision:
+                raise PolymarketLiveReadError(
+                    "discovery_cross_revision_boundary",
+                    "Discovery catalog and book revisions disagree",
+                    409,
+                )
+            rows = source.execute(
+                """SELECT b.token_id, b.market_id, b.payload_json, b.payload_sha256,
+                c.exchange_at AS confirmed_exchange_at,
+                c.received_at AS confirmed_received_at,
+                c.state_checksum AS confirmed_state_checksum,
+                c.source_hash AS confirmed_source_hash,
+                c.confirmation_sha256
+                FROM books b LEFT JOIN book_confirmations c ON c.token_id=b.token_id"""
+            )
+            while batch := rows.fetchmany(1000):
+                connection.executemany(
+                    "INSERT INTO source_books VALUES (?,?,?,?,?,?,?,?,?)",
+                    [tuple(row) for row in batch],
+                )
+            gaps = source.execute(
+                "SELECT DISTINCT market_id FROM gaps WHERE resolved=0 AND market_id IS NOT NULL"
+            )
+            while batch := gaps.fetchmany(1000):
+                connection.executemany(
+                    "INSERT OR IGNORE INTO gap_markets VALUES (?)",
+                    [(str(row[0]),) for row in batch],
+                )
+            return int(state["latest_cursor"])
+
+    @staticmethod
+    def _book_from_materialized_row(row: sqlite3.Row | None) -> LiveBook | None:
+        if row is None:
+            return None
+        return PolymarketLiveReadStore._indexed_book(row)
+
+    def _finalize_relations(
+        self, connection: sqlite3.Connection, catalog_revision: str
+    ) -> int:
+        count = 0
+        for row in connection.execute("SELECT * FROM relation_copies ORDER BY relation_id"):
+            source = json.loads(bytes(row["payload_json"]))
+            members = [DiscoveryRelationMember(
+                market_id=item["market_id"], condition_id=item["condition_id"],
+                yes_token_id=item["yes_token_id"], no_token_id=item["no_token_id"],
+                outcome_label=item["outcome_label"], pair_revision=item["pair_revision"],
+            ) for item in sorted(source["outcome_pairs"], key=lambda value: value["market_id"])]
+            source_hashes = [str(value[0]) for value in connection.execute(
+                "SELECT payload_sha256 FROM relation_sources WHERE relation_id=? ORDER BY payload_sha256",
+                (row["relation_id"],),
+            )]
+            expected = len(source_hashes)
+            reasons = set(source.get("missing_fields") or [])
+            if row["revision_disagreement"]:
+                reasons.add("relation_revision_disagreement")
+            if row["member_disagreement"]:
+                reasons.add("relation_member_disagreement")
+            if expected == 0:
+                reasons.add("source_relation_group_missing")
+            if len(members) != expected:
+                reasons.add("member_count_mismatch")
+            if expected < 2:
+                reasons.add("insufficient_members")
+            relation = DiscoveryRelation(
+                relation_id=str(row["relation_id"]),
+                member_market_ids=[item.market_id for item in members],
+                members=members,
+                expected_member_count=expected,
+                actual_member_count=len(members),
+                complete=not reasons and len(members) == expected and expected >= 2,
+                valid_from=source["valid_from"], valid_to=source.get("valid_to"),
+                relation_revision=source["revision"],
+                catalog_revision=catalog_revision,
+                provenance=source["provenance"],
+                evidence_sha256=content_sha256({
+                    "catalog_revision": catalog_revision,
+                    "relation_id": row["relation_id"],
+                    "revision": source["revision"],
+                    "members": [item.model_dump(mode="json") for item in members],
+                    "raw_member_payload_sha256": source_hashes,
+                }),
+                reason_codes=sorted(reasons),
+            )
+            connection.execute(
+                "INSERT INTO relations VALUES (?,?,?)",
+                (relation.relation_id, relation.model_dump_json().encode(), int(relation.complete)),
+            )
+            count += 1
+        return count
+
+    def _full_materialize(self) -> _DiscoveryBoundary:
+        catalog_revision, normalized_path, raw_path, raw_format, source_url, catalog_observed_at = self._catalog_paths()
+        staging = self.materialization_root / f".building-{uuid.uuid4().hex}.sqlite3"
+        connection = self._open_database(staging)
+        try:
+            self._create_schema(connection)
+            boundary_cursor = self._copy_state_boundary(connection, catalog_revision)
+            for _, raw in _iter_raw_catalog_rows(raw_path, raw_format):
+                market_id = str(raw.get("id") or "")
+                if not market_id:
+                    continue
+                raw_body = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+                connection.execute("INSERT OR REPLACE INTO raw_catalog VALUES (?,?)", (market_id, raw_body))
+                if relation_id := self._relation_id_from_raw(raw):
+                    connection.execute(
+                        "INSERT INTO relation_sources VALUES (?,?)",
+                        (relation_id, content_sha256(raw)),
+                    )
+            connection.commit()
+            with normalized_path.open("rb") as stream:
+                for line_number, line in enumerate(stream, 1):
+                    body = line.removesuffix(b"\n")
+                    if not body:
+                        continue
+                    market = LiveMarket.model_validate_json(body)
+                    if not market.active or market.closed:
+                        continue
+                    raw_row = connection.execute(
+                        "SELECT payload_json FROM raw_catalog WHERE market_id=?",
+                        (market.identity.market_id,),
+                    ).fetchone()
+                    if raw_row is None:
+                        raise PolymarketLiveReadError(
+                            "discovery_raw_evidence_missing",
+                            "Discovery metadata lacks its raw source row",
+                            409,
+                        )
+                    raw = json.loads(bytes(raw_row[0]))
+                    metadata = self._metadata_fact(
+                        market, raw, catalog_revision=catalog_revision,
+                        source_url=source_url,
+                        catalog_observed_at=catalog_observed_at,
+                    )
+                    connection.execute(
+                        "INSERT INTO markets VALUES (?,?,?)",
+                        (market.identity.market_id, body, metadata.model_dump_json().encode()),
+                    )
+                    for outcome in market.identity.outcomes:
+                        connection.execute(
+                            "INSERT INTO tokens VALUES (?,?,?)",
+                            (outcome.token_id, market.identity.market_id, outcome.outcome.upper()),
+                        )
+                    for relation in market.relations:
+                        if relation.relation_type != "standard_negative_risk":
+                            continue
+                        relation_body = relation.model_dump_json().encode()
+                        existing = connection.execute(
+                            "SELECT payload_json, copy_count FROM relation_copies WHERE relation_id=?",
+                            (relation.relation_id,),
+                        ).fetchone()
+                        if existing is None:
+                            connection.execute(
+                                "INSERT INTO relation_copies VALUES (?,?,1,0,0)",
+                                (relation.relation_id, relation_body),
+                            )
+                        else:
+                            first = json.loads(bytes(existing["payload_json"]))
+                            current = relation.model_dump(mode="json")
+                            connection.execute(
+                                "UPDATE relation_copies SET copy_count=copy_count+1, "
+                                "revision_disagreement=revision_disagreement OR ?, "
+                                "member_disagreement=member_disagreement OR ? WHERE relation_id=?",
+                                (int(first["revision"] != current["revision"]), int(first["outcome_pairs"] != current["outcome_pairs"]), relation.relation_id),
+                            )
+                    if line_number % 500 == 0:
+                        connection.commit()
+            relation_count = self._finalize_relations(connection, catalog_revision)
+            observed_at = self.reader.now_provider()
+            active_count = 0
+            market_rows = connection.execute(
+                "SELECT market_id, static_payload FROM markets ORDER BY market_id"
+            )
+            while batch := market_rows.fetchmany(250):
+                for market_row in batch:
+                    market = LiveMarket.model_validate_json(bytes(market_row["static_payload"]))
+                    by_outcome = {item.outcome.casefold(): item for item in market.identity.outcomes}
+                    books = {}
+                    for outcome in by_outcome.values():
+                        book_row = connection.execute(
+                            "SELECT * FROM source_books WHERE token_id=?", (outcome.token_id,)
+                        ).fetchone()
+                        books[outcome.token_id] = self._book_from_materialized_row(book_row)
+                    relation_id = next((item.relation_id for item in market.relations if item.relation_type == "standard_negative_risk"), None)
+                    relation_row = (
+                        connection.execute(
+                            "SELECT complete FROM relations WHERE relation_id=?",
+                            (relation_id,),
+                        ).fetchone()
+                        if relation_id else None
+                    )
+                    relation_complete = (
+                        not market.identity.neg_risk
+                        or bool(relation_row and relation_row[0])
+                    )
+                    has_gap = connection.execute(
+                        "SELECT 1 FROM gap_markets WHERE market_id=?", (market.identity.market_id,)
+                    ).fetchone() is not None
+                    quote = self._market_quote(
+                        market, books, relation_complete=relation_complete,
+                        has_gap=has_gap, catalog_revision=catalog_revision,
+                        boundary_cursor=boundary_cursor, observed_at=observed_at,
+                    )
+                    connection.execute(
+                        "INSERT INTO quote_versions VALUES (?,?,?,?,?,?)",
+                        (quote.market_id, boundary_cursor, quote.model_dump_json().encode(), quote.metadata_revision, quote.book_revision, quote.book_status),
+                    )
+                    active_count += 1
+                connection.commit()
+            digest = hashlib.sha256()
+            digest.update(DISCOVERY_SCHEMA_VERSION.encode())
+            digest.update(catalog_revision.encode())
+            digest.update(str(boundary_cursor).encode())
+            digest.update(json.dumps(self.depth_notionals).encode())
+            for row in connection.execute(
+                "SELECT market_id, metadata_revision, book_revision, book_status FROM quote_versions ORDER BY market_id"
+            ):
+                digest.update(json.dumps(tuple(row), separators=(",", ":")).encode())
+            snapshot_id = digest.hexdigest()
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
+                (snapshot_id, catalog_revision, boundary_cursor, observed_at.isoformat(), active_count, relation_count),
+            )
+            connection.executescript(
+                "DROP TABLE raw_catalog; DROP TABLE relation_sources; "
+                "DROP TABLE source_books; DROP TABLE gap_markets; DROP TABLE relation_copies;"
+            )
+            connection.commit()
+        except BaseException:
+            connection.close()
+            staging.unlink(missing_ok=True)
+            raise
+        connection.close()
+        database_path = self.materialization_root / (
+            f"catalog-{catalog_revision}-{uuid.uuid4().hex}.sqlite3"
+        )
+        os.replace(staging, database_path)
+        with self._database(database_path) as published:
+            published.execute("PRAGMA journal_mode=WAL")
+            published.execute("PRAGMA synchronous=NORMAL")
+        return _DiscoveryBoundary(
+            snapshot_id=snapshot_id, catalog_revision=catalog_revision,
+            boundary_cursor=boundary_cursor, observed_at=observed_at,
+            database_path=database_path, active_market_count=active_count,
+            relation_count=relation_count,
+        )
+
+    def _incremental_materialize(self, current: _DiscoveryBoundary) -> _DiscoveryBoundary | None:
+        observed_at = self.reader.now_provider()
+        connection = self._open_database(current.database_path)
+        requires_full_materialization = False
+        changed_market_ids: set[str] = set()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            with self.reader._state_snapshot() as (_, source, state):
+                catalog_revision = str(state["catalog_revision"])
+                boundary_cursor = int(state["latest_cursor"])
+                if catalog_revision != current.catalog_revision:
+                    requires_full_materialization = True
+                elif boundary_cursor <= current.boundary_cursor:
+                    connection.rollback()
+                    return None
+                else:
+                    earliest = source.execute(
+                        "SELECT MIN(cursor) FROM event_offsets"
+                    ).fetchone()[0]
+                    if (
+                        earliest is not None
+                        and current.boundary_cursor < int(earliest) - 1
+                    ):
+                        requires_full_materialization = True
+                    else:
+                        event_rows = source.execute(
+                            """SELECT cursor, byte_offset, byte_length, line_sha256
+                            FROM event_offsets WHERE cursor>? AND cursor<=?
+                            ORDER BY cursor""",
+                            (current.boundary_cursor, boundary_cursor),
+                        )
+                        with self.reader.event_path.open("rb") as stream:
+                            for event_row in event_rows:
+                                stream.seek(int(event_row["byte_offset"]))
+                                line = stream.read(int(event_row["byte_length"]))
+                                if hashlib.sha256(line).hexdigest() != event_row["line_sha256"]:
+                                    raise PolymarketLiveReadError(
+                                        "polymarket_state_integrity_failed",
+                                        "Event hash mismatch",
+                                        409,
+                                    )
+                                event = LiveEventEnvelope.model_validate_json(line)
+                                if event.event_type in {
+                                    "catalog_revision", "market_terminal", "market_resolved"
+                                }:
+                                    requires_full_materialization = True
+                                elif (
+                                    event.market_id is not None
+                                    and event.event_type in {
+                                        "book", "price_change", "best_bid_ask",
+                                        "last_trade_price", "tick_size_change",
+                                    }
+                                ):
+                                    changed_market_ids.add(event.market_id)
+                    if not requires_full_materialization:
+                        for market_id in sorted(changed_market_ids):
+                            market_row = connection.execute(
+                                "SELECT static_payload FROM markets WHERE market_id=?",
+                                (market_id,),
+                            ).fetchone()
+                            if market_row is None:
+                                continue
+                            market = LiveMarket.model_validate_json(
+                                bytes(market_row[0])
+                            )
+                            books = {}
+                            for outcome in market.identity.outcomes:
+                                row = source.execute(
+                                    """SELECT b.token_id, b.market_id,
+                                    b.payload_json, b.payload_sha256,
+                                    c.exchange_at AS confirmed_exchange_at,
+                                    c.received_at AS confirmed_received_at,
+                                    c.state_checksum AS confirmed_state_checksum,
+                                    c.source_hash AS confirmed_source_hash,
+                                    c.confirmation_sha256 FROM books b
+                                    LEFT JOIN book_confirmations c
+                                    ON c.token_id=b.token_id WHERE b.token_id=?""",
+                                    (outcome.token_id,),
+                                ).fetchone()
+                                books[outcome.token_id] = (
+                                    self.reader._indexed_book(row) if row else None
+                                )
+                            relation_id = next((
+                                item.relation_id for item in market.relations
+                                if item.relation_type == "standard_negative_risk"
+                            ), None)
+                            relation_row = (
+                                connection.execute(
+                                    "SELECT complete FROM relations WHERE relation_id=?",
+                                    (relation_id,),
+                                ).fetchone()
+                                if relation_id else None
+                            )
+                            relation_complete = (
+                                not market.identity.neg_risk
+                                or bool(relation_row and relation_row[0])
+                            )
+                            has_gap = source.execute(
+                                "SELECT 1 FROM gaps WHERE resolved=0 AND market_id=? LIMIT 1",
+                                (market_id,),
+                            ).fetchone() is not None
+                            quote = self._market_quote(
+                                market, books,
+                                relation_complete=relation_complete,
+                                has_gap=has_gap,
+                                catalog_revision=catalog_revision,
+                                boundary_cursor=boundary_cursor,
+                                observed_at=observed_at,
+                            )
+                            connection.execute(
+                                "INSERT INTO quote_versions VALUES (?,?,?,?,?,?)",
+                                (
+                                    market_id, boundary_cursor,
+                                    quote.model_dump_json().encode(),
+                                    quote.metadata_revision, quote.book_revision,
+                                    quote.book_status,
+                                ),
+                            )
+            if requires_full_materialization:
+                connection.rollback()
+                return self._full_materialize()
+            snapshot_id = content_sha256({
+                "schema_version": DISCOVERY_SCHEMA_VERSION,
+                "catalog_revision": catalog_revision,
+                "boundary_cursor": boundary_cursor,
+                "previous_snapshot_id": current.snapshot_id,
+                "changed_market_ids": sorted(changed_market_ids),
+            })
+            connection.execute(
+                "INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
+                (snapshot_id, catalog_revision, boundary_cursor, observed_at.isoformat(), current.active_market_count, current.relation_count),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return _DiscoveryBoundary(
+            snapshot_id=snapshot_id, catalog_revision=catalog_revision,
+            boundary_cursor=boundary_cursor, observed_at=observed_at,
+            database_path=current.database_path,
+            active_market_count=current.active_market_count,
+            relation_count=current.relation_count,
+        )
+
+    def _publish(self, boundary: _DiscoveryBoundary) -> None:
+        with self._lock:
+            previous_database_paths = {
+                item.database_path for item in self._snapshots.values()
+            }
+            self._snapshots[boundary.snapshot_id] = boundary
+            self._snapshots.move_to_end(boundary.snapshot_id)
+            while len(self._snapshots) > self.retained_snapshots:
+                self._snapshots.popitem(last=False)
+            retained = list(self._snapshots)
+            retained_database_paths = {
+                item.database_path for item in self._snapshots.values()
+            }
+            self._materialization_state = "ready"
+            self._materialization_error = None
+            self._publish_count += 1
+            publish_count = self._publish_count
+        with self._database(boundary.database_path) as connection:
+            placeholders = ",".join("?" for _ in retained)
+            connection.execute(
+                f"DELETE FROM snapshots WHERE snapshot_id NOT IN ({placeholders})",
+                retained,
+            )
+            if publish_count % self.retained_snapshots == 0:
+                floor_row = connection.execute(
+                    "SELECT MIN(boundary_cursor) FROM snapshots"
+                ).fetchone()
+                if floor_row is not None and floor_row[0] is not None:
+                    floor = int(floor_row[0])
+                    connection.executescript(
+                        "DROP TABLE IF EXISTS temp.retained_quote_floor;"
+                        "CREATE TEMP TABLE retained_quote_floor AS "
+                        "SELECT market_id, MAX(cursor) AS cursor FROM quote_versions "
+                        f"WHERE cursor<={floor} GROUP BY market_id;"
+                        "CREATE INDEX retained_quote_floor_market "
+                        "ON retained_quote_floor(market_id);"
+                    )
+                    connection.execute(
+                        "DELETE FROM quote_versions AS q WHERE q.cursor<? AND NOT EXISTS ("
+                        "SELECT 1 FROM retained_quote_floor k WHERE k.market_id=q.market_id "
+                        "AND k.cursor=q.cursor)",
+                        (floor,),
+                    )
+            connection.commit()
+        manifest = {
+            "schema_version": "marketcow.polymarket.discovery-materialization.v2",
+            "database_path": str(boundary.database_path.resolve()),
+            "snapshot_id": boundary.snapshot_id,
+            "catalog_revision": boundary.catalog_revision,
+            "boundary_cursor": boundary.boundary_cursor,
+        }
+        temporary = self.current_manifest_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(manifest, sort_keys=True))
+        os.replace(temporary, self.current_manifest_path)
+        for database_path in previous_database_paths - retained_database_paths:
+            database_path.unlink(missing_ok=True)
+            Path(str(database_path) + "-wal").unlink(missing_ok=True)
+            Path(str(database_path) + "-shm").unlink(missing_ok=True)
+
+    def materialize_once(self) -> _DiscoveryBoundary | None:
+        if not self._build_lock.acquire(blocking=False):
+            return None
+        try:
+            with self._lock:
+                self._materialization_state = "building"
+                current = next(reversed(self._snapshots.values()), None)
+            boundary = (
+                self._full_materialize()
+                if current is None
+                else self._incremental_materialize(current)
+            )
+            if boundary is not None:
+                self._publish(boundary)
+            else:
+                with self._lock:
+                    self._materialization_state = "ready"
+            return boundary
+        finally:
+            self._build_lock.release()
+
+    def capture(self) -> _DiscoveryBoundary:
+        boundary = self.materialize_once()
+        if boundary is not None:
+            return boundary
+        with self._lock:
+            current = next(reversed(self._snapshots.values()), None)
+        if current is None:
+            raise PolymarketLiveReadError(
+                "discovery_snapshot_materializing",
+                "Discovery snapshot is being materialized",
+                503,
+            )
+        return current
+
+    def boundary(self, snapshot_id: str | None) -> _DiscoveryBoundary:
+        with self._lock:
+            boundary = (
+                self._snapshots.get(snapshot_id)
+                if snapshot_id is not None
+                else next(reversed(self._snapshots.values()), None)
+            )
+        if boundary is None:
+            self.start_background_materialization()
+            code = "discovery_snapshot_expired" if snapshot_id else "discovery_snapshot_materializing"
+            status = 410 if snapshot_id else 503
+            raise PolymarketLiveReadError(
+                code,
+                "Discovery snapshot is not published; retry from the latest snapshot",
+                status,
+            )
+        return boundary
+
+    @staticmethod
+    def _quote_query() -> str:
+        return (
+            "SELECT q.payload_json FROM markets m JOIN quote_versions q "
+            "ON q.market_id=m.market_id WHERE q.cursor=(SELECT MAX(q2.cursor) "
+            "FROM quote_versions q2 WHERE q2.market_id=m.market_id AND q2.cursor<=?) "
+            "ORDER BY m.market_id LIMIT ? OFFSET ?"
+        )
+
+    def snapshot_page(self, *, snapshot_id: str | None, page_cursor: str | None, page_size: int) -> DiscoverySnapshotPage:
+        if not 1 <= page_size <= 1000:
+            raise PolymarketLiveReadError("discovery_page_size_invalid", "page_size must be in [1, 1000]", 422)
+        boundary = self.boundary(snapshot_id)
+        offset = self._page_offset(boundary.snapshot_id, page_cursor)
+        with self._database(boundary.database_path, readonly=True) as connection:
+            rows = list(connection.execute(self._quote_query(), (boundary.boundary_cursor, page_size, offset)))
+        items = [DiscoveryMarketQuote.model_validate_json(bytes(row[0])) for row in rows]
+        next_offset = offset + len(items)
+        return DiscoverySnapshotPage(
+            snapshot_id=boundary.snapshot_id,
+            catalog_revision=boundary.catalog_revision,
+            boundary_cursor=boundary.boundary_cursor,
+            observed_at=boundary.observed_at,
+            depth_notionals=list(self.depth_notionals),
+            active_market_count=boundary.active_market_count,
+            page_size=page_size,
+            page_count=len(items),
+            next_page_cursor=f"{boundary.snapshot_id}:{next_offset}" if next_offset < boundary.active_market_count else None,
+            items=items,
+            relation_count=boundary.relation_count,
+        )
+
+    def metadata_page(self, *, snapshot_id: str, page_cursor: str | None, page_size: int) -> DiscoveryMetadataPage:
+        boundary = self.boundary(snapshot_id)
+        offset = self._page_offset(boundary.snapshot_id, page_cursor)
+        with self._database(boundary.database_path, readonly=True) as connection:
+            rows = list(connection.execute(
+                "SELECT metadata_payload FROM markets ORDER BY market_id LIMIT ? OFFSET ?",
+                (page_size, offset),
+            ))
+        items = [DiscoveryMetadataFact.model_validate_json(bytes(row[0])) for row in rows]
+        next_offset = offset + len(items)
+        return DiscoveryMetadataPage(
+            snapshot_id=boundary.snapshot_id,
+            catalog_revision=boundary.catalog_revision,
+            page_size=page_size,
+            next_page_cursor=f"{boundary.snapshot_id}:{next_offset}" if next_offset < boundary.active_market_count else None,
+            items=items,
+        )
+
+    def relation(self, relation_id: str, snapshot_id: str) -> DiscoveryRelation:
+        boundary = self.boundary(snapshot_id)
+        with self._database(boundary.database_path, readonly=True) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM relations WHERE relation_id=?", (relation_id,)
+            ).fetchone()
+            if row is None:
+                raise PolymarketLiveReadError("discovery_relation_not_found", "Relation is not in this snapshot", 404)
+            relation = DiscoveryRelation.model_validate_json(bytes(row[0]))
+            quotes = []
+            for market_id in relation.member_market_ids:
+                quote_row = connection.execute(
+                    "SELECT payload_json FROM quote_versions WHERE market_id=? AND cursor<=? ORDER BY cursor DESC LIMIT 1",
+                    (market_id, boundary.boundary_cursor),
+                ).fetchone()
+                if quote_row is not None:
+                    quotes.append(DiscoveryMarketQuote.model_validate_json(bytes(quote_row[0])))
+        return relation.model_copy(update={"quotes": quotes})
+
+    def _outcomes_for_tokens(self, catalog_revision: str, token_ids: set[str]) -> dict[str, str]:
+        boundary = self.boundary(None)
+        if boundary.catalog_revision != catalog_revision:
+            raise PolymarketLiveReadError(
+                "discovery_cross_revision_boundary",
+                "Discovery events require a new atomic snapshot",
+                409,
+            )
+        if not token_ids:
+            return {}
+        placeholders = ",".join("?" for _ in token_ids)
+        with self._database(boundary.database_path, readonly=True) as connection:
+            return {str(row[0]): str(row[1]) for row in connection.execute(
+                f"SELECT token_id, outcome FROM tokens WHERE token_id IN ({placeholders})",
+                sorted(token_ids),
+            )}
+
+    def events_page(self, after_cursor: int, limit: int) -> DiscoveryEventPage:
+        events, boundary_cursor, has_more, catalog_revision = self._read_events(after_cursor, limit)
+        resync_required = any(event.event_type in {"catalog_revision", "market_terminal", "market_resolved"} for event in events)
+        token_outcomes = {} if resync_required else self._outcomes_for_tokens(
+            catalog_revision, {event.token_id for event in events if event.token_id}
+        )
+        items: list[DiscoveryEvent] = []
+        for event in events:
+            if event.event_type == "catalog_revision":
+                changes = event.canonical_payload.get("relation_changes") or {}
+                relation_ids = sorted(set((changes.get("added_relation_ids") or []) + (changes.get("removed_relation_ids") or []) + (changes.get("changed_relation_ids") or []))) or [None]
+                for relation_id in relation_ids:
+                    items.append(DiscoveryEvent(
+                        cursor=event.cursor,
+                        event_id=content_sha256({"source_event_id": event.event_id, "relation_id": relation_id}) if relation_id else event.event_id,
+                        event_type="relation_changed", market_id=None, token_id=None,
+                        relation_id=relation_id, catalog_revision=catalog_revision,
+                        observed_at=event.received_at, quote=None,
+                        book_status="resync_required", missing_fields=["atomic_catalog_resync"],
+                        raw_payload_sha256=event.raw_payload_sha256,
+                    ))
+                continue
+            if event.event_type in {"market_terminal", "market_resolved"}:
+                items.append(DiscoveryEvent(
+                    cursor=event.cursor, event_id=event.event_id,
+                    event_type="market_lifecycle_changed", market_id=event.market_id,
+                    token_id=event.token_id, relation_id=None,
+                    catalog_revision=catalog_revision, observed_at=event.received_at,
+                    quote=None, book_status="resync_required",
+                    missing_fields=["atomic_catalog_resync"],
+                    raw_payload_sha256=event.raw_payload_sha256,
+                ))
+                continue
+            if resync_required or event.event_type not in {"book", "price_change", "best_bid_ask", "last_trade_price", "tick_size_change"}:
+                continue
+            quote = None
+            if event.applied and event.token_id and event.token_id in token_outcomes:
+                try:
+                    quote = _outcome_quote(
+                        token_outcomes[event.token_id], event.token_id,
+                        LiveBook.model_validate(event.canonical_payload),
+                        observed_at=event.received_at, notionals=self.depth_notionals,
+                    )
+                except Exception:
+                    quote = None
+            fail_closed = not event.applied or quote is None
+            items.append(DiscoveryEvent(
+                cursor=event.cursor, event_id=event.event_id,
+                event_type="book_fail_closed" if fail_closed else "quote_changed",
+                market_id=event.market_id, token_id=event.token_id, relation_id=None,
+                catalog_revision=catalog_revision, observed_at=event.received_at,
+                quote=quote, book_status="source_gap" if fail_closed else "ready",
+                missing_fields=[event.fail_closed_reason or "authoritative_book_unavailable"] if fail_closed else [],
+                raw_payload_sha256=event.raw_payload_sha256,
+            ))
+        next_cursor = events[-1].cursor if events else after_cursor
+        return DiscoveryEventPage(
+            catalog_revision=catalog_revision, after_cursor=after_cursor,
+            next_cursor=next_cursor, boundary_cursor=boundary_cursor,
+            has_more=has_more, resync_required=resync_required, items=items,
         )

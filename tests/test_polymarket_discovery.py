@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -52,6 +54,18 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         app.state.polymarket_live_read.now_provider = lambda: NOW
         return app
 
+    def ready_snapshot(self, client: TestClient, **params):
+        for _ in range(200):
+            response = client.get(
+                "/v1/prediction-markets/polymarket/live/discovery/snapshot",
+                params=params,
+            )
+            if response.status_code == 200:
+                return response
+            self.assertEqual(response.status_code, 503, response.text)
+            time.sleep(0.01)
+        self.fail("discovery snapshot did not finish materializing")
+
     def test_explicit_depth_configuration_is_mandatory_and_ordered(self):
         rows = [gamma_row()]
         self.writer(rows)
@@ -68,6 +82,82 @@ class PolymarketDiscoveryTest(unittest.TestCase):
                 maximum_book_age_ms=5000,
             )
 
+    def test_initial_materialization_is_single_flight_and_never_blocks_health(self):
+        self.writer([gamma_row()])
+        app = self.app()
+        discovery = app.state.polymarket_discovery
+        original = discovery._full_materialize
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def blocked_materialization():
+            nonlocal calls
+            calls += 1
+            started.set()
+            release.wait(5)
+            return original()
+
+        discovery._full_materialize = blocked_materialization
+        with TestClient(app) as client:
+            self.assertTrue(started.wait(1))
+            requested_at = time.monotonic()
+            responses = [
+                client.get(
+                    "/v1/prediction-markets/polymarket/live/discovery/snapshot",
+                    params={"page_size": 1},
+                )
+                for _ in range(5)
+            ]
+            self.assertLess(time.monotonic() - requested_at, 1)
+            self.assertTrue(all(response.status_code == 503 for response in responses))
+            self.assertTrue(all(
+                response.headers.get("retry-after") == "1"
+                for response in responses
+            ))
+            self.assertTrue(all(
+                response.json()["detail"]["code"]
+                == "discovery_snapshot_materializing"
+                for response in responses
+            ))
+            health_started = time.monotonic()
+            health = client.get(
+                "/v1/prediction-markets/polymarket/live/health"
+            )
+            self.assertLess(time.monotonic() - health_started, 1)
+            self.assertEqual(health.status_code, 200, health.text)
+            self.assertEqual(calls, 1)
+            release.set()
+            for _ in range(100):
+                ready = client.get(
+                    "/v1/prediction-markets/polymarket/live/discovery/snapshot",
+                    params={"page_size": 1},
+                )
+                if ready.status_code == 200:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(ready.status_code, 200, ready.text)
+            boundary = discovery.boundary(ready.json()["snapshot_id"])
+            self.assertFalse(hasattr(boundary, "quotes"))
+
+    def test_published_boundary_is_restored_without_a_request_time_rebuild(self):
+        self.writer([gamma_row()])
+        with TestClient(self.app()) as first_client:
+            first = self.ready_snapshot(first_client, page_size=1).json()
+
+        restored_app = self.app()
+        restored = restored_app.state.polymarket_discovery
+        self.assertEqual(
+            restored.materialization_status()["snapshot_id"], first["snapshot_id"]
+        )
+        with TestClient(restored_app) as client:
+            response = client.get(
+                "/v1/prediction-markets/polymarket/live/discovery/snapshot",
+                params={"page_size": 1},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["snapshot_id"], first["snapshot_id"])
+
     def test_snapshot_exceeds_100_and_pages_remain_on_one_atomic_boundary(self):
         rows = [
             gamma_row(
@@ -79,10 +169,7 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         ]
         writer = self.writer(rows)
         with TestClient(self.app()) as client:
-            first = client.get(
-                "/v1/prediction-markets/polymarket/live/discovery/snapshot",
-                params={"page_size": 60},
-            )
+            first = self.ready_snapshot(client, page_size=60)
             self.assertEqual(first.status_code, 200, first.text)
             first_body = first.json()
             self.assertEqual(first_body["active_market_count"], 101)
@@ -138,18 +225,55 @@ class PolymarketDiscoveryTest(unittest.TestCase):
                 ),
                 old_revision,
             )
-            replacement = client.get(
-                "/v1/prediction-markets/polymarket/live/discovery/snapshot",
-                params={"page_size": 60},
-            ).json()
+            for _ in range(200):
+                replacement_response = client.get(
+                    "/v1/prediction-markets/polymarket/live/discovery/snapshot",
+                    params={"page_size": 60},
+                )
+                replacement = replacement_response.json()
+                if replacement.get("snapshot_id") != snapshot_id:
+                    break
+                time.sleep(0.01)
             self.assertNotEqual(replacement["snapshot_id"], snapshot_id)
+            replacement_boundary = client.app.state.polymarket_discovery.boundary(
+                replacement["snapshot_id"]
+            )
+            with sqlite3.connect(replacement_boundary.database_path) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM quote_versions"
+                    ).fetchone()[0],
+                    102,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM quote_versions WHERE market_id='m000'"
+                    ).fetchone()[0],
+                    2,
+                )
+
+            discovery = client.app.state.polymarket_discovery
+            discovery.stop_background_materialization()
+            original_materialize_once = discovery.materialize_once
+            materialization_calls = []
+            discovery.materialize_once = lambda: materialization_calls.append(True)
+            try:
+                cached_page = client.get(
+                    "/v1/prediction-markets/polymarket/live/discovery/snapshot",
+                    params={
+                        "snapshot_id": replacement["snapshot_id"],
+                        "page_size": 1,
+                    },
+                )
+            finally:
+                discovery.materialize_once = original_materialize_once
+            self.assertEqual(cached_page.status_code, 200, cached_page.text)
+            self.assertEqual(materialization_calls, [])
 
     def test_quote_events_resume_after_snapshot_and_metadata_does_not_invent_resolution(self):
         writer = self.writer([gamma_row()])
         with TestClient(self.app()) as client:
-            snap = client.get(
-                "/v1/prediction-markets/polymarket/live/discovery/snapshot"
-            ).json()
+            snap = self.ready_snapshot(client).json()
             metadata = client.get(
                 "/v1/prediction-markets/polymarket/live/discovery/metadata",
                 params={"snapshot_id": snap["snapshot_id"]},
@@ -184,9 +308,7 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         ]
         self.writer(rows)
         with TestClient(self.app()) as client:
-            snap = client.get(
-                "/v1/prediction-markets/polymarket/live/discovery/snapshot"
-            ).json()
+            snap = self.ready_snapshot(client).json()
             relation = client.get(
                 "/v1/prediction-markets/polymarket/live/discovery/relations/neg-risk:neg-group",
                 params={"snapshot_id": snap["snapshot_id"]},
