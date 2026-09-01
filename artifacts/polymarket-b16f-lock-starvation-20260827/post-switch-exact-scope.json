@@ -1,0 +1,164 @@
+{
+  "activation_evidence": {
+    "endpoints": {
+      "8790": {
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursors": [
+          25323154,
+          25323700
+        ],
+        "disconnect_count": 0,
+        "gap_count": 0,
+        "http_status": 200,
+        "market_count": 100,
+        "status": "index_ready",
+        "tick_consistent_token_count": 200
+      },
+      "8791": {
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursors": [
+          25323159,
+          25323702
+        ],
+        "disconnect_count": 0,
+        "gap_count": 0,
+        "http_status": 200,
+        "market_count": 100,
+        "status": "index_ready",
+        "tick_consistent_token_count": 200
+      }
+    },
+    "real_order_submission_enabled": false
+  },
+  "commit": "b4d31fc609f9264011347a2e291730c2f1925a17",
+  "criteria": {
+    "port_8790_all_rounds_passed": true,
+    "port_8790_cursor_advanced": true,
+    "port_8791_all_rounds_passed": true,
+    "port_8791_cursor_advanced": true
+  },
+  "cursor_ranges": {
+    "8790": {
+      "finish": 25323700,
+      "start": 25323154
+    },
+    "8791": {
+      "finish": 25323702,
+      "start": 25323159
+    }
+  },
+  "failures": [],
+  "finished_at": "2026-08-27T10:57:48.354341+00:00",
+  "market_count": 100,
+  "observations": {
+    "8790": [
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 25323154,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T10:57:42.968513+00:00",
+        "passed": true,
+        "projection_generation": 8468,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 1,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 25323700,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T10:57:48.178502+00:00",
+        "passed": true,
+        "projection_generation": 10552,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 2,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      }
+    ],
+    "8791": [
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 25323159,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T10:57:43.026078+00:00",
+        "passed": true,
+        "projection_generation": 8493,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 1,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 25323702,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T10:57:48.267493+00:00",
+        "passed": true,
+        "projection_generation": 10571,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 2,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      }
+    ]
+  },
+  "passed": true,
+  "ports": [
+    8790,
+    8791
+  ],
+  "round_interval_seconds": 5.0,
+  "rounds": 2,
+  "schema": "marketcow.polymarket.exact-scope-verification.v1",
+  "scope_id": "b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075",
+  "scope_manifest": "/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/marketcow-production-20260827T143700CST/scopes/b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075/manifest.json",
+  "started_at": "2026-08-27T10:57:42.961567+00:00"
+}

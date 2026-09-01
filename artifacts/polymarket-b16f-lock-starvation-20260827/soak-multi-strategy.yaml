@@ -1,0 +1,62 @@
+schema: tradude.prediction_market.multi_strategy_live_paper.v8
+live_paper_config: /Volumes/T9/projects/marketcow-workitem-collaboration-7424ef29-33e7-418f-8df0-83afc6caf0/artifacts/polymarket-b16f-lock-starvation-20260827/soak-live-paper.yaml
+scope_manifest: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/marketcow-production-20260827T143700CST/scopes/b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075/manifest.json
+relation_registry: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/marketcow-production-20260827T143700CST/scopes/b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075/registry.json
+output_root: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-formal-20260827T150900CST/artifacts/multi
+runner_version: tradude-polymarket-multi-strategy-paper-v81-b16f
+code_revision: 1fada4f99f1aca7af1133db90ea195fea8fac744
+preflight_gate:
+  observation_count: 3
+  observation_interval_seconds: 2
+  maximum_book_age_ns: 5000000000
+  event_page_limit: 1000
+  require_cursor_advance: true
+  unavailable_retry:
+    interval_seconds: 1
+    maximum_consecutive_seconds: 30
+discovery:
+  minimum_net_edge:
+    binary_complete_set: '0'
+    reverse_complete_set: '0'
+    standard_negative_risk: '0'
+    logical_implication: '0'
+executable_economics:
+  fee_model_version: polymarket-probability-fee-v1
+  friction_model_version: explicit-price-latency-unwind-v1
+  reserve_model_version: explicit-unwind-reserve-v1
+  maximum_visible_participation: '0.25'
+  price_friction_per_share: '0.01'
+  unwind_reserve_rate: '0.01'
+  unwind_reserve_fixed: '0'
+  minimum_net_edge: '0'
+  minimum_net_edge_per_capital: '0'
+  approved_risk_budgets:
+  - '5'
+  - '6'
+  - '7'
+  - '8'
+  - '9'
+  - '10'
+paper_execution:
+  state_path: /Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/supervised-shadow-v81-b16f-formal-20260827T150900CST/state/legacy-portfolio-paper.json
+  starting_balances:
+    binary_complete_set: '10'
+    reverse_complete_set: '10'
+    standard_negative_risk: '10'
+    logical_implication: '10'
+  minimum_execution_net_edge:
+    binary_complete_set: '0'
+    reverse_complete_set: '0'
+    standard_negative_risk: '0'
+    logical_implication: '0'
+  logical_execution_mode: observe_only
+reverse_complete_set:
+  strategy_id: polymarket-reverse-complete-set-paper
+  strategy_version: v1
+  maximum_quantity: '5'
+  complete_set_collateral: '1'
+logical_arbitrage:
+  strategy_id: polymarket-logical-implication-paper
+  strategy_version: v1
+  maximum_quantity: '5'
+  guaranteed_payout: '1'

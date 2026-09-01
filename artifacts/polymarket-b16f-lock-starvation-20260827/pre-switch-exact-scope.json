@@ -1,0 +1,205 @@
+{
+  "activation_evidence": {
+    "endpoints": {
+      "8790": {
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursors": [
+          25316710,
+          25316899
+        ],
+        "disconnect_count": 2,
+        "gap_count": 0,
+        "http_status": 200,
+        "market_count": 100,
+        "status": "index_ready",
+        "tick_consistent_token_count": 200
+      },
+      "8791": {
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursors": [
+          25316750,
+          25316927
+        ],
+        "disconnect_count": 1,
+        "gap_count": 0,
+        "http_status": 200,
+        "market_count": 100,
+        "status": "index_ready",
+        "tick_consistent_token_count": 200
+      }
+    },
+    "real_order_submission_enabled": false
+  },
+  "commit": "b4d31fc609f9264011347a2e291730c2f1925a17",
+  "criteria": {
+    "port_8790_all_rounds_passed": false,
+    "port_8790_cursor_advanced": true,
+    "port_8791_all_rounds_passed": false,
+    "port_8791_cursor_advanced": true
+  },
+  "cursor_ranges": {
+    "8790": {
+      "finish": 25316899,
+      "start": 25316710
+    },
+    "8791": {
+      "finish": 25316927,
+      "start": 25316750
+    }
+  },
+  "failures": [
+    {
+      "error": "full-sync integrity validation failed",
+      "port": 8790,
+      "round": 1
+    },
+    {
+      "error": "full-sync integrity validation failed",
+      "port": 8791,
+      "round": 1
+    },
+    {
+      "error": "full-sync integrity validation failed",
+      "port": 8790,
+      "round": 2
+    },
+    {
+      "error": "full-sync integrity validation failed",
+      "port": 8791,
+      "round": 2
+    }
+  ],
+  "finished_at": "2026-08-27T10:37:59.857449+00:00",
+  "market_count": 100,
+  "observations": {
+    "8790": [
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 25316710,
+        "derived_index_error": "RuntimeError:derived index backlog exceeded 4 durable batches",
+        "disconnect_count": 2,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {
+          "live_stream_disconnect_count": {
+            "expected": 0,
+            "observed": 2
+          }
+        },
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T10:37:57.482058+00:00",
+        "passed": false,
+        "projection_generation": 1994288,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 1,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 25316899,
+        "derived_index_error": "RuntimeError:derived index backlog exceeded 4 durable batches",
+        "disconnect_count": 2,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {
+          "live_stream_disconnect_count": {
+            "expected": 0,
+            "observed": 2
+          }
+        },
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T10:37:59.275037+00:00",
+        "passed": false,
+        "projection_generation": 1994666,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 2,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      }
+    ],
+    "8791": [
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 25316750,
+        "derived_index_error": "RuntimeError:derived index backlog exceeded 4 durable batches",
+        "disconnect_count": 1,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {
+          "live_stream_disconnect_count": {
+            "expected": 0,
+            "observed": 1
+          }
+        },
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T10:37:57.793066+00:00",
+        "passed": false,
+        "projection_generation": 1985034,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 1,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 25316927,
+        "derived_index_error": "RuntimeError:derived index backlog exceeded 4 durable batches",
+        "disconnect_count": 1,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {
+          "live_stream_disconnect_count": {
+            "expected": 0,
+            "observed": 1
+          }
+        },
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T10:37:59.573295+00:00",
+        "passed": false,
+        "projection_generation": 1985732,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 2,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      }
+    ]
+  },
+  "passed": false,
+  "ports": [
+    8790,
+    8791
+  ],
+  "round_interval_seconds": 1.0,
+  "rounds": 2,
+  "schema": "marketcow.polymarket.exact-scope-verification.v1",
+  "scope_id": "b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075",
+  "scope_manifest": "/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/marketcow-production-20260827T143700CST/scopes/b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075/manifest.json",
+  "started_at": "2026-08-27T10:37:57.478904+00:00"
+}
