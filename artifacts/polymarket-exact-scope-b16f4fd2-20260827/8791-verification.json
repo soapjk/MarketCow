@@ -1,0 +1,143 @@
+{
+  "activation_evidence": {
+    "endpoints": {
+      "8791": {
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursors": [
+          24459097,
+          24459243,
+          24459548,
+          24459757
+        ],
+        "disconnect_count": 0,
+        "gap_count": 0,
+        "http_status": 200,
+        "market_count": 100,
+        "status": "index_ready",
+        "tick_consistent_token_count": 200
+      }
+    },
+    "real_order_submission_enabled": false
+  },
+  "commit": "6041e230ce1b325268ac25f2f00f47ad6c5bcd9c",
+  "criteria": {
+    "port_8791_all_rounds_passed": true,
+    "port_8791_cursor_advanced": true
+  },
+  "cursor_ranges": {
+    "8791": {
+      "finish": 24459757,
+      "start": 24459097
+    }
+  },
+  "failures": [],
+  "finished_at": "2026-08-27T06:44:10.441834+00:00",
+  "market_count": 100,
+  "observations": {
+    "8791": [
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24459097,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:43:57.440048+00:00",
+        "passed": true,
+        "projection_generation": 42672,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 1,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24459243,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:44:01.638565+00:00",
+        "passed": true,
+        "projection_generation": 43704,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 2,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24459548,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:44:05.982616+00:00",
+        "passed": true,
+        "projection_generation": 45354,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 3,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24459757,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:44:10.235746+00:00",
+        "passed": true,
+        "projection_generation": 46170,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 4,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      }
+    ]
+  },
+  "passed": true,
+  "ports": [
+    8791
+  ],
+  "round_interval_seconds": 4.0,
+  "rounds": 4,
+  "schema": "marketcow.polymarket.exact-scope-verification.v1",
+  "scope_id": "b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075",
+  "scope_manifest": "/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/marketcow-production-20260827T143700CST/scopes/b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075/manifest.json",
+  "started_at": "2026-08-27T06:43:57.436120+00:00"
+}

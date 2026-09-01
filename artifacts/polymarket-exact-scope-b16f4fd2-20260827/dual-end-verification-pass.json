@@ -1,0 +1,194 @@
+{
+  "activation_evidence": {
+    "endpoints": {
+      "8790": {
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursors": [
+          24456375,
+          24456748
+        ],
+        "disconnect_count": 0,
+        "gap_count": 0,
+        "http_status": 200,
+        "market_count": 100,
+        "status": "index_ready",
+        "tick_consistent_token_count": 200
+      },
+      "8791": {
+        "book_count": 200,
+        "complete_market_count": 100,
+        "cursors": [
+          24456406,
+          24456750,
+          24457556
+        ],
+        "disconnect_count": 0,
+        "gap_count": 0,
+        "http_status": 200,
+        "market_count": 100,
+        "status": "index_ready",
+        "tick_consistent_token_count": 200
+      }
+    },
+    "real_order_submission_enabled": false
+  },
+  "commit": "6041e230ce1b325268ac25f2f00f47ad6c5bcd9c",
+  "criteria": {
+    "port_8790_all_rounds_passed": false,
+    "port_8790_cursor_advanced": true,
+    "port_8791_all_rounds_passed": true,
+    "port_8791_cursor_advanced": true
+  },
+  "cursor_ranges": {
+    "8790": {
+      "finish": 24456748,
+      "start": 24456375
+    },
+    "8791": {
+      "finish": 24457556,
+      "start": 24456406
+    }
+  },
+  "failures": [
+    {
+      "error": "HTTPStatusError: Server error '503 Service Unavailable' for url 'http://127.0.0.1:8790/v1/prediction-markets/polymarket/live/full-sync?market_id=2232758&market_id=2244513&market_id=2253995&market_id=2253996&market_id=2253997&market_id=2253998&market_id=2253999&market_id=2254000&market_id=2436390&market_id=2487274&market_id=2491448&market_id=2646803&market_id=2658302&market_id=2686766&market_id=2686771&market_id=2732505&market_id=2734399&market_id=2786063&market_id=2849008&market_id=2851406&market_id=2910438&market_id=2911832&market_id=2925999&market_id=2926628&market_id=2928823&market_id=3055020&market_id=3055021&market_id=3055022&market_id=3055023&market_id=3055024&market_id=3089557&market_id=3089566&market_id=3096170&market_id=3096177&market_id=3096357&market_id=3120761&market_id=3143572&market_id=3143584&market_id=3145214&market_id=3145215&market_id=3145216&market_id=3145217&market_id=3145218&market_id=3190237&market_id=3192117&market_id=3204390&market_id=3207825&market_id=3207826&market_id=3207827&market_id=3207828&market_id=3207829&market_id=3208497&market_id=3229133&market_id=3229134&market_id=3229135&market_id=3229136&market_id=3229137&market_id=3240736&market_id=3242235&market_id=3246712&market_id=3246717&market_id=3246731&market_id=3246734&market_id=3246745&market_id=3251608&market_id=3251648&market_id=3253031&market_id=3253032&market_id=3253035&market_id=3275538&market_id=3324625&market_id=3324658&market_id=3344130&market_id=3344131&market_id=3344132&market_id=3344133&market_id=3344134&market_id=3344135&market_id=3348048&market_id=3372767&market_id=3372771&market_id=3379789&market_id=3383654&market_id=3399197&market_id=3409237&market_id=3409238&market_id=3410647&market_id=3422247&market_id=3499774&market_id=3499775&market_id=3499776&market_id=3499777&market_id=3499778&market_id=3501952&market_id=3502066&market_id=3502074&market_id=3502075&market_id=3502548&market_id=3526142&market_id=3542714'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/503",
+      "port": 8790,
+      "round": 3
+    }
+  ],
+  "finished_at": "2026-08-27T06:43:37.683125+00:00",
+  "market_count": 100,
+  "observations": {
+    "8790": [
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24456375,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:43:26.122031+00:00",
+        "passed": true,
+        "projection_generation": 31905,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 1,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24456748,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:43:31.570380+00:00",
+        "passed": true,
+        "projection_generation": 33385,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 2,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      }
+    ],
+    "8791": [
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24456406,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:43:26.282205+00:00",
+        "passed": true,
+        "projection_generation": 31969,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 1,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24456750,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:43:31.795188+00:00",
+        "passed": true,
+        "projection_generation": 33575,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 2,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      },
+      {
+        "book_count": 200,
+        "catalog_revision": "97e04da6d0175cdf9c6c85352a3e267fb49a3cbba6050a9897c3dcdb59cf0038",
+        "complete_market_count": 100,
+        "cursor": 24457556,
+        "derived_index_error": null,
+        "disconnect_count": 0,
+        "events_read_source": "memory_projection",
+        "gap_count": 0,
+        "health_mismatches": {},
+        "http_status": 200,
+        "market_count": 100,
+        "mixed_revision_components": [],
+        "observed_at": "2026-08-27T06:43:37.504066+00:00",
+        "passed": true,
+        "projection_generation": 36089,
+        "realtime_sqlite_query_ms": 0.0,
+        "revision_binding_failure_market_ids": [],
+        "round": 3,
+        "scope_exact": true,
+        "tick_consistent_token_count": 200,
+        "tick_mismatch_token_ids": []
+      }
+    ]
+  },
+  "passed": false,
+  "ports": [
+    8790,
+    8791
+  ],
+  "round_interval_seconds": 5.0,
+  "rounds": 3,
+  "schema": "marketcow.polymarket.exact-scope-verification.v1",
+  "scope_id": "b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075",
+  "scope_manifest": "/Volumes/T9/projects/trade/tradude-worktrees/polymarket-memory-stream-contract/.tradude-local/polymarket-live/marketcow-production-20260827T143700CST/scopes/b16f4fd2f867eb371b3c065791ec2071a263114e7ac31a4d83cb72cdd0556075/manifest.json",
+  "started_at": "2026-08-27T06:43:26.118425+00:00"
+}
