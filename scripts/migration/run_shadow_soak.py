@@ -87,6 +87,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=18870)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--storage-root", type=Path, required=True)
+    parser.add_argument("--process-log", type=Path)
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--expected-binary-sha256", required=True)
     parser.add_argument("--binary-commit", required=True)
@@ -108,6 +109,11 @@ def main() -> None:
     storage_root.mkdir(parents=True, exist_ok=True)
     if any(storage_root.iterdir()):
         parser.error("storage root must be empty")
+    process_log_path = (args.process_log or storage_root.parent / "process.log").resolve()
+    if not process_log_path.is_absolute() or not process_log_path.parent.is_dir():
+        parser.error("process log parent must be an existing absolute directory")
+    if process_log_path.exists() or process_log_path == args.output.resolve():
+        parser.error("process log must be a new file distinct from the result")
     reader_latencies: list[float] = []
     bootstrap_persistence_latencies_us: list[float] = []
     bootstrap_publication_latencies_us: list[float] = []
@@ -142,8 +148,7 @@ def main() -> None:
             "MARKETCOW_RUST_ADMIN_TOKEN": ADMIN_TOKEN,
             "MARKETCOW_RUST_MAX_BOOK_AGE_MS": "5000",
         }
-        log_path = Path(temporary) / "marketcowd.log"
-        with log_path.open("wb") as process_log:
+        with process_log_path.open("xb") as process_log:
             process = subprocess.Popen([binary, "serve"], env=env, stdout=process_log, stderr=process_log)
             started_at = datetime.now(UTC)
             base = f"http://127.0.0.1:{args.port}"
@@ -327,7 +332,7 @@ def main() -> None:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     process.kill()
-        process_log_tail = log_path.read_text(errors="replace")[-4000:]
+        process_log_tail = process_log_path.read_text(errors="replace")[-4000:]
         elapsed_seconds = (datetime.now(UTC) - started_at).total_seconds()
 
     gate_verdicts = {
@@ -365,6 +370,7 @@ def main() -> None:
         "binary_commit": args.binary_commit,
         "binary_sha256": binary_sha256,
         "storage_root": str(storage_root),
+        "process_log_path": str(process_log_path),
         "started_at": started_at.isoformat(),
         "finished_at": datetime.now(UTC).isoformat(),
         "requested_duration_seconds": args.duration_seconds,

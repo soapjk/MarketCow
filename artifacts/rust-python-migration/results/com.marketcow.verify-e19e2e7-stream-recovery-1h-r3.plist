@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.marketcow.verify-e19e2e7-stream-recovery-1h-r3</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/verifier-runtime-5ff3255/verify_polymarket_stream_recovery_stability.py</string>
+    <string>--duration-seconds</string><string>3600</string>
+    <string>--sample-interval-seconds</string><string>5</string>
+    <string>--expected-pid</string><string>86894</string>
+    <string>--expected-commit</string><string>e19e2e79a9d7492bfd300d9a24631f27a876ff54</string>
+    <string>--binary</string><string>/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-e19e2e7</string>
+    <string>--expected-binary-sha256</string><string>f24087368854f3afcd1d8d93b195474430aca3cafeb010b750e77713c0cff559</string>
+    <string>--launchd-label</string><string>com.marketcow.rust-polymarket-streamfix-e19e2e7-shadow-v17</string>
+    <string>--output</string><string>/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/polymarket-e19e2e7-stream-recovery-stability-1h-r3.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/stream-recovery-stability-e19e2e7-1h-r3.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/stream-recovery-stability-e19e2e7-1h-r3.log</string>
+</dict>
+</plist>

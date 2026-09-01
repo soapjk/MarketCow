@@ -1,0 +1,37 @@
+{
+  "schema_version": "marketcow.polymarket.stream-recovery-stability-launch-failure.v1",
+  "observed_at": "2026-08-30T02:42:32Z",
+  "passed": false,
+  "verifier_pid": 96705,
+  "verifier_expected_start_time": "2026-08-30T02:41:40Z",
+  "expected_result": "artifacts/rust-python-migration/results/polymarket-e19e2e7-stream-recovery-stability-1h.json",
+  "result_exists": false,
+  "log": "/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/stream-recovery-stability-e19e2e7-1h.log",
+  "log_bytes": 0,
+  "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "automation_id": "scheduled_task:642fe37e-426f-43d0-a388-f6e0327c4750",
+  "automation_observation": {
+    "state": "exited",
+    "reason": "process_disappeared",
+    "exit_status_kind": "unknown",
+    "exit_code": null,
+    "signal": null
+  },
+  "failure": "nohup verifier disappeared before producing a result or log output; process exit is not acceptance evidence",
+  "service_observation": {
+    "pid": 86894,
+    "listen": "127.0.0.1:18872",
+    "runtime_commit": "e19e2e79a9d7492bfd300d9a24631f27a876ff54",
+    "binary_sha256": "f24087368854f3afcd1d8d93b195474430aca3cafeb010b750e77713c0cff559",
+    "generation": 14,
+    "ready": true,
+    "market_count": 100,
+    "token_count": 200,
+    "real_order_submission_enabled": false
+  },
+  "preserved_prior_failures": [
+    "generation 7 restart rejected expired markets 3055022, 3145216, and 3207827 before generation 8 recovery",
+    "the first 60-second stability gate was false only because cursor 0 remained inside the new 100000-event replay window",
+    "the first one-hour verifier PID 96705 disappeared with no result and a zero-byte log"
+  ]
+}

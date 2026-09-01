@@ -1,0 +1,75 @@
+{
+  "schema_version": "marketcow.shadow-soak-verification.v1",
+  "observed_at": "2026-08-28T09:48:29Z",
+  "passed": false,
+  "result_path": "artifacts/rust-python-migration/results/http-shadow-soak-45m.json",
+  "result_sha256": "9fea40c662d9a456eb20afeed18d420b9f6289d0713536d8bbd677f0f32b6438",
+  "result_schema_version_expected": "marketcow.shadow-soak.v4",
+  "result_schema_version_actual": "marketcow.shadow-soak.v4",
+  "binary_commit_expected": "5f1c4e22da64f50d1d76bbfe30512e0e0a6e922c",
+  "binary_commit_reported": "5f1c4e22da64f50d1d76bbfe30512e0e0a6e922c",
+  "binary_path_verified": "target/release/marketcow",
+  "binary_sha256_expected": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "binary_sha256_reported": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "binary_sha256_actual": "e21f35b6c0b1583e4cb73aeeea0eccfe8fd6d2ba7b094245002d77eec5bbfacb",
+  "storage_root_expected": "/tmp/marketcow-http-shadow-45m-v5.ITWARm/storage",
+  "storage_root_reported": "/private/tmp/marketcow-http-shadow-45m-v5.ITWARm/storage",
+  "storage_root_note": "On this host /tmp resolves to /private/tmp, so the reported and expected roots are filesystem aliases; the retained run directory was absent at verification time.",
+  "process_log_expected": "/tmp/marketcow-http-shadow-45m-v5.ITWARm/process.log",
+  "process_log_available": false,
+  "unified_exec_session_id": 54439,
+  "unified_exec_session_available": false,
+  "requested_duration_seconds": 2700,
+  "elapsed_seconds": 1131.658995,
+  "runner_failures": [
+    {
+      "error": "URLError",
+      "kind": "runner",
+      "message": "<urlopen error [Errno 61] Connection refused>"
+    }
+  ],
+  "gate_verdicts": {
+    "book_age_ms_lte_5000": true,
+    "cursor_lag_zero": true,
+    "disconnect_delta_zero": true,
+    "duration_reached": false,
+    "exact_100_market_200_book_load": false,
+    "four_concurrent_scoped_readers": true,
+    "gap_count_zero": true,
+    "projection_publication_latency_p99_us_lte_5000": true,
+    "queue_depth_zero": true,
+    "readiness_p99_ms_lte_50": true,
+    "real_orders_disabled": true,
+    "runner_failures_zero": false,
+    "tradude_does_not_manage_marketcow": true,
+    "two_independent_consumers": true,
+    "upstream_receive_to_publish_p99_us_lte_20000": false,
+    "wal_persistence_latency_p99_us_lte_20000": true
+  },
+  "gate_summary": {
+    "total": 16,
+    "passed": 12,
+    "failed": 4
+  },
+  "failed_gates": {
+    "duration_reached": "1131.658995 seconds observed; 2700 seconds required",
+    "exact_100_market_200_book_load": "final_book_count was 0 after the HTTP endpoint became unavailable",
+    "runner_failures_zero": "HTTP runner received connection refused",
+    "upstream_receive_to_publish_p99_us_lte_20000": "apply_latency_us.p99 was 37766 microseconds"
+  },
+  "recovery_check": {
+    "performed": false,
+    "reason": "The soak result itself did not pass; the retained storage was also unavailable."
+  },
+  "full_test_suite": {
+    "performed": false,
+    "reason": "The user required recovery and full suites only if the soak result itself passed."
+  },
+  "formal_corptie_artifact": {
+    "created": false,
+    "reason": "The user conditioned formal Artifact creation on the soak result passing."
+  },
+  "real_order_submission_enabled": false,
+  "tradude_manages_marketcow": false,
+  "http_network_soak_gate_passed": false
+}

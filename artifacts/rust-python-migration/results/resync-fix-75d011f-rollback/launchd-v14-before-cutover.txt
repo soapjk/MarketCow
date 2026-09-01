@@ -1,0 +1,87 @@
+gui/501/com.marketcow.rust-polymarket-dynamic-87135c2-shadow-v14 = {
+	active count = 1
+	path = (submitted by launchctl[37960])
+	type = Submitted
+	state = running
+
+	program = /usr/bin/env
+	arguments = {
+		/usr/bin/env
+		MARKETCOW_RUST_PROFILE=test
+		MARKETCOW_RUST_BIND=127.0.0.1:18872
+		MARKETCOW_RUST_STORAGE_ROOT=/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/storage
+		MARKETCOW_RUST_SCOPE_ID=cb61239bf22515153f8bdb8864d401de2197c58f3eb964264ed2eae2861d3d34
+		MARKETCOW_RUST_SHADOW=true
+		MARKETCOW_REAL_ORDER_SUBMISSION_ENABLED=false
+		MARKETCOW_RUST_ADMIN_TOKEN=marketcow-rust-dynamic-87135c2-local
+		MARKETCOW_RUST_MAX_BOOK_AGE_MS=3600000
+		MARKETCOW_POLYMARKET_LIVE_ENABLED=true
+		MARKETCOW_POLYMARKET_SCOPE_FILE=/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/rollback-before-dynamic-v4-ae3006c/scope-v3.json
+		MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT=/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/registry
+		MARKETCOW_BINARY_COMMIT=87135c2cb1fd7898de2b683b574715970a2ba284
+		HTTPS_PROXY=http://127.0.0.1:7890
+		RUST_LOG=info
+		/tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/marketcow-87135c2
+		serve
+	}
+
+	stdout path = /tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-dynamic-87135c2-v14-18872.log
+	stderr path = /tmp/marketcow-4bab164-b16f-preflight-v2.v9vVFY/process-dynamic-87135c2-v14-18872.log
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.eDa6BBfsyZ/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => com.marketcow.rust-polymarket-dynamic-87135c2-shadow-v14
+	}
+
+	domain = gui/501 [100026]
+	asid = 100026
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 37961
+	immediate reason = speculative
+	forks = 0
+	execs = 2
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 1)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = (never exited)
+
+	resource coalition = {
+		ID = 155926
+		type = resource
+		state = active
+		active count = 1
+		name = com.marketcow.rust-polymarket-dynamic-87135c2-shadow-v14
+	}
+
+	jetsam coalition = {
+		ID = 155927
+		type = jetsam
+		state = active
+		active count = 1
+		name = com.marketcow.rust-polymarket-dynamic-87135c2-shadow-v14
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	submitted job. ignore execute allowed
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = keepalive | inferred program
+}
