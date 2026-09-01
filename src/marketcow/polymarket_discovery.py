@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 import uuid
+import fcntl
 from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime
@@ -1203,6 +1204,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         self.materialization_root = reader.root / "discovery-materialized-v2"
         self.materialization_root.mkdir(parents=True, exist_ok=True)
         self.current_manifest_path = self.materialization_root / "current.json"
+        self.materialization_lock_path = self.materialization_root / ".materialization.lock"
         self._build_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -1675,6 +1677,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
 
     def _full_materialize(self) -> _DiscoveryBoundary:
         catalog_revision, normalized_path, raw_path, raw_format, source_url, catalog_observed_at = self._catalog_paths()
+        for stale in self.materialization_root.glob(".building-*.sqlite3*"):
+            stale.unlink(missing_ok=True)
         staging = self.materialization_root / f".building-{uuid.uuid4().hex}.sqlite3"
         connection = self._open_database(staging)
         try:
@@ -2034,7 +2038,14 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
     def materialize_once(self) -> _DiscoveryBoundary | None:
         if not self._build_lock.acquire(blocking=False):
             return None
+        process_lock = self.materialization_lock_path.open("a+b")
         try:
+            try:
+                fcntl.flock(process_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self._restore_published()
+                return None
+            self._restore_published()
             with self._lock:
                 self._materialization_state = "building"
                 current = next(reversed(self._snapshots.values()), None)
@@ -2050,6 +2061,10 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                     self._materialization_state = "ready"
             return boundary
         finally:
+            try:
+                fcntl.flock(process_lock, fcntl.LOCK_UN)
+            finally:
+                process_lock.close()
             self._build_lock.release()
 
     def capture(self) -> _DiscoveryBoundary:

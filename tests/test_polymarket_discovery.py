@@ -158,6 +158,48 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["snapshot_id"], first["snapshot_id"])
 
+    def test_materialization_lock_is_shared_across_api_instances(self):
+        self.writer([gamma_row()])
+        first = self.app().state.polymarket_discovery
+        second = self.app().state.polymarket_discovery
+        original_first = first._full_materialize
+        original_second = second._full_materialize
+        started = threading.Event()
+        release = threading.Event()
+        second_full_builds = 0
+
+        def blocked_first():
+            started.set()
+            release.wait(5)
+            return original_first()
+
+        def counted_second():
+            nonlocal second_full_builds
+            second_full_builds += 1
+            return original_second()
+
+        first._full_materialize = blocked_first
+        second._full_materialize = counted_second
+        first.start_background_materialization()
+        self.assertTrue(started.wait(1))
+        second.start_background_materialization()
+        time.sleep(0.05)
+        self.assertEqual(second_full_builds, 0)
+        release.set()
+        try:
+            for _ in range(200):
+                first_snapshot = first.materialization_status()["snapshot_id"]
+                second_snapshot = second.materialization_status()["snapshot_id"]
+                if first_snapshot and second_snapshot == first_snapshot:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(first_snapshot)
+            self.assertEqual(second_snapshot, first_snapshot)
+            self.assertEqual(second_full_builds, 0)
+        finally:
+            first.stop_background_materialization()
+            second.stop_background_materialization()
+
     def test_snapshot_exceeds_100_and_pages_remain_on_one_atomic_boundary(self):
         rows = [
             gamma_row(
