@@ -71,8 +71,13 @@ updates cannot alter an earlier page.
 An expired snapshot returns HTTP 410 `discovery_snapshot_expired`; an unbound page
 cursor returns 422.
 
-Every market has explicit YES/NO identities and outcome quotes. Each depth tier walks
-asks for `buy_cost_at_notional` and bids for `sell_proceeds_at_notional`.
+Markets with source-backed YES/NO identities expose both token IDs. Some upstream
+binary markets instead publish named outcomes such as team names or `Up`/`Down` and
+provide no auditable YES/NO mapping. They remain in the complete catalog with their
+source outcome/token pairs, but `yes_token_id` and `no_token_id` are null,
+`book_status=missing_outcome_identity`, and both fields appear in `missing_fields`.
+MarketCow never guesses that mapping from outcome order. Each depth tier walks asks
+for `buy_cost_at_notional` and bids for `sell_proceeds_at_notional`.
 `complete`, `insufficient_depth`, and `book_unavailable` distinguish real lack of
 liquidity from missing data. Missing values are never serialized as zero.
 
@@ -150,7 +155,8 @@ PYTHONPATH=src python scripts/manage_polymarket_scopes.py \
 ## Verification
 
 `tests/test_polymarket_discovery.py` covers more than 100 active markets, immutable
-pagination, affected-market-only quote materialization, initial single-flight behavior,
+pagination, per-market missing outcome identity, affected-market-only quote
+materialization, initial single-flight behavior,
 non-blocking health, cursor expiry, WebSocket resync, source-only lifecycle history,
 metadata non-inference, complete relations, and OpenAPI. Existing Python and Rust Scope
 tests cover candidate warmup, atomic activation, cursor continuity, `universe_changed`,

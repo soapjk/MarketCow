@@ -312,6 +312,29 @@ class PolymarketDiscoveryTest(unittest.TestCase):
             self.assertEqual(cached_page.status_code, 200, cached_page.text)
             self.assertEqual(materialization_calls, [])
 
+    def test_non_yes_no_market_is_materialized_and_fails_closed_per_market(self):
+        row = gamma_row(tokens=("team-a-token", "team-b-token"))
+        row["outcomes"] = '["Team A","Team B"]'
+        self.writer([row])
+
+        with TestClient(self.app()) as client:
+            response = self.ready_snapshot(client, page_size=1)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["active_market_count"], 1)
+        quote = body["items"][0]
+        self.assertIsNone(quote["yes_token_id"])
+        self.assertIsNone(quote["no_token_id"])
+        self.assertEqual(quote["book_status"], "missing_outcome_identity")
+        self.assertEqual(
+            {item["outcome"] for item in quote["outcomes"]},
+            {"Team A", "Team B"},
+        )
+        self.assertTrue(
+            {"yes_token_id", "no_token_id"}.issubset(quote["missing_fields"])
+        )
+
     def test_quote_events_resume_after_snapshot_and_metadata_does_not_invent_resolution(self):
         writer = self.writer([gamma_row()])
         with TestClient(self.app()) as client:

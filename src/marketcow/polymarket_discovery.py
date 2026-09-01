@@ -89,8 +89,8 @@ class DiscoveryMarketQuote(BaseModel):
     market_id: str
     condition_id: str
     event_id: str
-    yes_token_id: str
-    no_token_id: str
+    yes_token_id: str | None
+    no_token_id: str | None
     active: bool
     closed: bool
     accepting_orders: bool
@@ -106,6 +106,7 @@ class DiscoveryMarketQuote(BaseModel):
         "ready", "missing_book", "incomplete_book", "stale_book",
         "inconsistent_tick", "missing_tick", "missing_minimum_order_size",
         "missing_fee_schedule", "incomplete_relation", "source_gap",
+        "missing_outcome_identity",
     ]
     tick_size: str | None
     minimum_order_size: str | None
@@ -118,10 +119,18 @@ class DiscoveryMarketQuote(BaseModel):
 
     @model_validator(mode="after")
     def fail_closed_contract(self):
-        if len(self.outcomes) != 2 or {item.outcome.casefold() for item in self.outcomes} != {
-            "yes", "no",
-        }:
-            raise ValueError("discovery quote requires an explicit YES/NO pair")
+        if len(self.outcomes) != 2:
+            raise ValueError("discovery quote requires exactly two source outcomes")
+        has_yes_no = self.yes_token_id is not None and self.no_token_id is not None
+        if has_yes_no != (
+            {item.outcome.casefold() for item in self.outcomes} == {"yes", "no"}
+        ):
+            raise ValueError("YES/NO token identity must match the source outcomes")
+        if not has_yes_no and (
+            self.book_status != "missing_outcome_identity"
+            or not {"yes_token_id", "no_token_id"}.issubset(self.missing_fields)
+        ):
+            raise ValueError("non-YES/NO markets must fail closed explicitly")
         if self.book_status == "ready" and self.missing_fields:
             raise ValueError("ready discovery quote cannot have missing fields")
         if self.book_status != "ready" and not self.missing_fields:
@@ -1507,25 +1516,33 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         observed_at: datetime,
     ) -> DiscoveryMarketQuote:
         by_outcome = {item.outcome.casefold(): item for item in market.identity.outcomes}
-        if set(by_outcome) != {"yes", "no"}:
-            raise PolymarketLiveReadError(
-                "discovery_market_identity_invalid",
-                "Discovery market does not have an explicit YES/NO identity",
-                409,
-            )
-        market_books = {name: books.get(by_outcome[name].token_id) for name in ("yes", "no")}
+        has_yes_no = set(by_outcome) == {"yes", "no"}
+        ordered_outcomes = (
+            [(name, by_outcome[name]) for name in ("yes", "no")]
+            if has_yes_no
+            else [(item.outcome, item) for item in market.identity.outcomes]
+        )
+        market_books = [
+            (name, outcome, books.get(outcome.token_id))
+            for name, outcome in ordered_outcomes
+        ]
         outcome_quotes = [
             _outcome_quote(
-                name.upper(), by_outcome[name].token_id, market_books[name],
+                name.upper() if has_yes_no else name,
+                outcome.token_id,
+                book,
                 observed_at=observed_at, notionals=self.depth_notionals,
-            ) for name in ("yes", "no")
+            ) for name, outcome, book in market_books
         ]
         missing: list[str] = []
         status = "ready"
-        present = [book for book in market_books.values() if book is not None]
+        present = [book for _, _, book in market_books if book is not None]
         if len(present) != 2:
             status = "missing_book"
-            missing.extend(f"book:{name}_token" for name, book in market_books.items() if book is None)
+            missing.extend(
+                f"book:{outcome.token_id}" for _, outcome, book in market_books
+                if book is None
+            )
         elif any(not book.bids or not book.asks for book in present):
             status = "incomplete_book"
             missing.append("two_sided_book")
@@ -1553,6 +1570,9 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         if has_gap:
             status = "source_gap"
             missing.append("unresolved_source_gap")
+        if not has_yes_no:
+            status = "missing_outcome_identity"
+            missing.extend(("yes_token_id", "no_token_id"))
         book_observed_at = min((book.received_at for book in present), default=None)
         book_age_ms = max(0, int((observed_at - book_observed_at).total_seconds() * 1000)) if book_observed_at else None
         book_revision = content_sha256({book.token_id: book.state_checksum for book in sorted(present, key=lambda value: value.token_id)}) if len(present) == 2 else None
@@ -1560,8 +1580,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             market_id=market.identity.market_id,
             condition_id=market.identity.condition_id,
             event_id=market.identity.event_id,
-            yes_token_id=by_outcome["yes"].token_id,
-            no_token_id=by_outcome["no"].token_id,
+            yes_token_id=by_outcome["yes"].token_id if has_yes_no else None,
+            no_token_id=by_outcome["no"].token_id if has_yes_no else None,
             active=market.active,
             closed=market.closed,
             accepting_orders=market.accepting_orders,
