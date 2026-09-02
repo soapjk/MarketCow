@@ -216,6 +216,29 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(result["market_count"], 1)
         self.assertFalse(reader._recovered)
 
+    def test_catalog_only_bootstrap_marks_empty_event_log_recovered(self):
+        root = self.root / "empty-event-bootstrap"
+        writer = LiveStateStore(root)
+        row = gamma_row()
+        writer.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+        writer.event_path.unlink()
+        reader = LiveStateStore(root)
+        reader._recovered = False
+        reader.catalog = {}
+        reader.token_to_market = {}
+        collector = type("Collector", (), {
+            "store": reader,
+            "catalog_client": type("Catalog", (), {
+                "fee_semantics_policy": None,
+            })(),
+        })()
+
+        result = refresh_catalog_or_reuse_published(collector)
+
+        self.assertEqual(result["status"], "published_catalog_reused")
+        self.assertTrue(reader._recovered)
+        self.assertEqual(reader.cursor, 0)
+
     def test_startup_does_not_rebuild_provider_incomplete_fee_facts(self):
         store = LiveStateStore(self.root / "provider-incomplete-fee")
         row = gamma_row()
