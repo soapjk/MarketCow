@@ -283,6 +283,19 @@ def configure(
     )
 
     admin_token = current.get("MARKETCOW_RUST_ADMIN_TOKEN") or secrets.token_urlsafe(48)
+    commit_result = subprocess.run(
+        ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    binary_commit = commit_result.stdout.strip()
+    if commit_result.returncode != 0 or not binary_commit:
+        binary_commit = current.get("MARKETCOW_BINARY_COMMIT", "")
+    if not binary_commit:
+        raise RuntimeError("MarketCow binary commit identity is unavailable")
     updates = {
         "MARKETCOW_PORT": str(api_port),
         "MARKETCOW_POLYMARKET_RUST_PORT": str(rust_port),
@@ -295,6 +308,7 @@ def configure(
         "MARKETCOW_RUST_BINARY": str(rust_binary),
         "MARKETCOW_RUST_SCOPE_ID": scope_id,
         "MARKETCOW_RUST_ADMIN_TOKEN": admin_token,
+        "MARKETCOW_BINARY_COMMIT": binary_commit,
         "MARKETCOW_POLYMARKET_RUST_SCOPE_FILE": str(active_scope),
         "MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT": str(registry_root),
         "MARKETCOW_POLYMARKET_FEE_SEMANTICS_POLICY": str(

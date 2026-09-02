@@ -62,6 +62,7 @@ class ConfigurePolymarketFinalArchitectureTest(unittest.TestCase):
             env_file.write_text(
                 "# keep\n"
                 "MARKETCOW_RUST_ADMIN_TOKEN=preserved-secret\n"
+                "MARKETCOW_BINARY_COMMIT=test-commit\n"
                 f"MARKETCOW_POLYMARKET_TRADUDE_WORKTREE={tradude}\n"
                 f"MARKETCOW_TRADUDE_PYTHON={python}\n"
             )
