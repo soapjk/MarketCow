@@ -196,6 +196,7 @@ class PolymarketLiveTest(unittest.TestCase):
         writer = LiveStateStore(root)
         row = gamma_row()
         writer.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+        expected_cursor = writer.cursor
         reader = LiveStateStore(root)
         reader._recovered = False
         reader.catalog = {}
@@ -213,6 +214,8 @@ class PolymarketLiveTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "published_catalog_reused")
         self.assertEqual(result["market_count"], 1)
+        self.assertEqual(reader.cursor, expected_cursor)
+        self.assertTrue(reader._recovered)
 
     def setUp(self):
         self.folder = TemporaryDirectory()

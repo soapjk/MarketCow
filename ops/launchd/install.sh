@@ -32,7 +32,7 @@ if [ ! -f "$target_env" ] && [ ! -f "$project_dir/.env.production" ]; then
 fi
 
 mkdir -p "$HOME/Library/LaunchAgents" "$support_dir" "$log_dir"
-chmod u+rwx "$log_dir"
+chmod 700 "$log_dir"
 retired_launch_agents="$support_dir/retired-launch-agents"
 mkdir -p "$retired_launch_agents"
 
