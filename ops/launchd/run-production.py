@@ -25,14 +25,18 @@ class Service:
     environment: Mapping[str, str] | None = None
 
 
-def _required_path(environment: Mapping[str, str], name: str) -> Path:
+def _required_path(
+    environment: Mapping[str, str], name: str, *, preserve_executable_symlink: bool = False,
+) -> Path:
     raw = environment.get(name, "").strip()
     if not raw:
         raise ValueError(f"{name} is required for the production Polymarket scope")
     path = Path(raw)
     if not path.is_absolute():
         raise ValueError(f"{name} must be an absolute path")
-    return path.resolve(strict=True)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return path.absolute() if preserve_executable_symlink else path.resolve(strict=True)
 
 
 def build_services(
@@ -76,7 +80,13 @@ def build_services(
         environment, "MARKETCOW_POLYMARKET_FEE_SEMANTICS_POLICY"
     )
     tradude_worktree = _required_path(environment, "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE")
-    tradude_python = _required_path(environment, "MARKETCOW_TRADUDE_PYTHON")
+    tradude_python = _required_path(
+        environment,
+        "MARKETCOW_TRADUDE_PYTHON",
+        preserve_executable_symlink=True,
+    )
+    if not os.access(tradude_python, os.X_OK):
+        raise ValueError("MARKETCOW_TRADUDE_PYTHON must be executable")
     opportunity_config = _required_path(
         environment, "MARKETCOW_POLYMARKET_OPPORTUNITY_CONTROLLER_CONFIG"
     )

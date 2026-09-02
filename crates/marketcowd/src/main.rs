@@ -701,10 +701,11 @@ fn load_polymarket_scope_file_at(
         .iter()
         .filter(|market| {
             market.lifecycle_state != marketcow_core::MarketLifecycleState::Active
-                || market
-                    .instrument_facts
-                    .as_ref()
-                    .is_none_or(|facts| facts.end_at <= activated_at)
+                || (!dynamic_universe
+                    && market
+                        .instrument_facts
+                        .as_ref()
+                        .is_none_or(|facts| facts.end_at <= activated_at))
         })
         .map(|market| market.market_id.clone())
         .collect::<Vec<_>>();
@@ -828,7 +829,7 @@ fn validate_polymarket_universe_contract(
             || active.token_ids.len() != 2
             || declared_tokens != expected_tokens
             || active.end_at != facts.end_at
-            || active.end_at <= activated_at
+            || active.end_at <= universe.validated_at
         {
             bail!("dynamic universe market identity or lifecycle boundary is invalid");
         }
@@ -4280,6 +4281,18 @@ fn clone_polymarket_recent_events(
     runtime.recent_events().iter().cloned().collect()
 }
 
+fn expired_dynamic_scope_tokens(config: &Config, observed_at: DateTime<Utc>) -> Vec<String> {
+    config
+        .polymarket_live
+        .as_ref()
+        .and_then(|live| live.universe.as_ref())
+        .into_iter()
+        .flat_map(|universe| &universe.active_markets)
+        .filter(|market| market.end_at <= observed_at)
+        .flat_map(|market| market.token_ids.iter().cloned())
+        .collect()
+}
+
 async fn serve() -> Result<()> {
     let config = Config::load()?;
     preflight(&config)?;
@@ -4353,6 +4366,17 @@ async fn serve() -> Result<()> {
         worker_status: Arc::new(PythonWorkerStatus::default()),
         legacy_mcp,
     };
+    let expired_tokens = expired_dynamic_scope_tokens(&config, Utc::now());
+    if !expired_tokens.is_empty() {
+        let quarantined =
+            quarantine_polymarket_tokens_from_authoritative_refresh(&state, &expired_tokens)
+                .await?;
+        warn!(
+            expired_token_count = expired_tokens.len(),
+            quarantined_event_count = quarantined,
+            "polymarket_expired_startup_members_quarantined"
+        );
+    }
     let polymarket_live = start_polymarket_live(
         state.clone(),
         service_shutdown_rx,
@@ -10532,6 +10556,23 @@ mod tests {
         assert_eq!(loaded.scope_file_sha256.as_deref(), Some(digest.as_str()));
         assert_eq!(loaded.universe.as_ref().unwrap().generation, 1);
         assert_eq!(loaded.initial_book_frames.len(), 2);
+
+        let restarted = load_polymarket_scope_file_at(
+            &universe_id,
+            &source.to_string_lossy(),
+            activated_at + chrono::Duration::days(20),
+        )
+        .unwrap()
+        .unwrap();
+        let mut restart_config = state.config.clone();
+        restart_config.polymarket_live = Some(restarted);
+        assert_eq!(
+            expired_dynamic_scope_tokens(
+                &restart_config,
+                activated_at + chrono::Duration::days(20),
+            ),
+            vec!["10", "20"],
+        );
 
         state.config.scope_id = universe_id.clone();
         state.config.polymarket_live = Some(loaded.clone());

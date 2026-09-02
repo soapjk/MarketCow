@@ -18,6 +18,20 @@ RUNNER_SPEC.loader.exec_module(RUNNER)
 
 
 class LaunchdStartupTest(unittest.TestCase):
+    def test_required_executable_path_preserves_virtualenv_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target = root / "base-python"
+            link = root / "venv-python"
+            self._write_executable(target, "#!/bin/sh\n")
+            link.symlink_to(target)
+            observed = RUNNER._required_path(
+                {"PYTHON": str(link)},
+                "PYTHON",
+                preserve_executable_symlink=True,
+            )
+            self.assertEqual(observed, link.absolute())
+
     def test_shell_scripts_are_valid(self) -> None:
         for name in (
             "start-production.sh",
@@ -174,6 +188,7 @@ class LaunchdStartupTest(unittest.TestCase):
                 refresh_config, tradude_python,
             ):
                 path.write_text("{}")
+            tradude_python.chmod(0o700)
             environment = {
                 "MARKETCOW_HOME": str(root / "data"),
                 "MARKETCOW_RUST_BINARY": str(rust_binary),
