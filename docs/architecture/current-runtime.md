@@ -31,3 +31,7 @@ the internal Rust data plane.
 
 Ports `8795` (discovery stream) and `8796` (Rust data plane/control plane) are
 loopback implementation details. Consumers use `8790` only.
+
+The discovery API retains 4096 immutable snapshot generations by default. At
+the 0.5-second materialization cadence this gives a full-market consumer about
+34 minutes to finish pagination without crossing or expiring its boundary.

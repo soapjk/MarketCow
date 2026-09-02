@@ -649,6 +649,9 @@ def create_app(
             maximum_book_age_ms=int(
                 settings.polymarket_consumer_maximum_book_age_seconds * 1000
             ),
+            retained_snapshots=(
+                settings.polymarket_discovery_retained_snapshots
+            ),
         )
         if settings.polymarket_discovery_depth_notionals else None
     )

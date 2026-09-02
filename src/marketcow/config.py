@@ -80,6 +80,7 @@ class Settings:
     polymarket_consumer_maximum_book_age_seconds: float = 5.0
     polymarket_minimum_delivery_headroom_seconds: float = 1.0
     polymarket_discovery_depth_notionals: tuple[str, ...] = ()
+    polymarket_discovery_retained_snapshots: int = 4096
     sec_user_agent: str = "MarketCow toczx@outlook.com"
     dividend_cache_ttl_seconds: int = 21600
     dividend_empty_cache_ttl_seconds: int = 900
@@ -254,6 +255,9 @@ class Settings:
                 ).split(",")
                 if value.strip()
             ),
+            polymarket_discovery_retained_snapshots=int(os.getenv(
+                "MARKETCOW_POLYMARKET_DISCOVERY_RETAINED_SNAPSHOTS", "4096"
+            )),
             sec_user_agent=os.getenv(
                 "MARKETCOW_SEC_USER_AGENT", "MarketCow toczx@outlook.com"
             ).strip(),
