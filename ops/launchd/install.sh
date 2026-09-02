@@ -80,6 +80,19 @@ PYTHONPATH="$project_dir/src" "$production_python" \
     --rust-binary "$rust_binary"
 
 launchctl bootout "$domain/$label" 2>/dev/null || true
+# Do not bootstrap a second generation while a child orphan from the previous
+# supervisor still owns a production listener or the Rust WAL lease. launchd
+# can remove the job record slightly before all descendants have been reaped.
+release_attempt=0
+while /usr/sbin/lsof -nP \
+    -iTCP:8790 -iTCP:8795 -iTCP:8796 -sTCP:LISTEN >/dev/null 2>&1; do
+    release_attempt=$((release_attempt + 1))
+    [ "$release_attempt" -lt 30 ] || {
+        echo "Refusing to start while an old MarketCow listener remains" >&2
+        exit 1
+    }
+    sleep 1
+done
 launchctl enable "$domain/$label"
 attempt=0
 until launchctl bootstrap "$domain" "$target_plist"; do
