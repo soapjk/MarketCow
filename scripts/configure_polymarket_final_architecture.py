@@ -136,14 +136,29 @@ def configure(
     registry_scope = registry_root / f"{scope_id}.json"
     _atomic_write(registry_scope, active_scope.read_bytes())
 
-    tradude_root = Path(current.get(
-        "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE",
-        "/Volumes/T9/projects/trade/tradude",
-    )).resolve(strict=True)
-    tradude_python = Path(current.get(
-        "MARKETCOW_TRADUDE_PYTHON",
-        "/Volumes/T9/projects/trade/.venv/bin/python",
-    )).resolve(strict=True)
+    canonical_tradude_root = Path("/Volumes/T9/projects/trade/tradude")
+    configured_tradude_root = Path(current.get(
+        "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE", str(canonical_tradude_root),
+    ))
+    configured_entrypoint = (
+        configured_tradude_root
+        / "examples/polymarket/run_opportunity_scope_controller.py"
+    )
+    tradude_root = (
+        configured_tradude_root
+        if configured_entrypoint.is_file()
+        else canonical_tradude_root
+    ).resolve(strict=True)
+    canonical_tradude_python = Path("/Volumes/T9/projects/trade/.venv/bin/python")
+    configured_tradude_python = Path(current.get(
+        "MARKETCOW_TRADUDE_PYTHON", str(canonical_tradude_python),
+    ))
+    tradude_python = (
+        configured_tradude_python
+        if configured_tradude_python.is_file()
+        and os.access(configured_tradude_python, os.X_OK)
+        else canonical_tradude_python
+    ).resolve(strict=True)
     controller_entrypoint = (
         tradude_root / "examples/polymarket/run_opportunity_scope_controller.py"
     )
