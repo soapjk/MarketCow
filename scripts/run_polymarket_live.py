@@ -57,23 +57,11 @@ def refresh_catalog_or_reuse_published(
         # event-derived SQLite projection and must never trigger its replay.
         load_catalog(catalog_path)
         catalog = getattr(store, "catalog", None)
-        if (
-            isinstance(store, LiveStateStore)
-            and not store._recovered
-            and (
-                not store.event_path.exists()
-                or store.event_path.stat().st_size == 0
-            )
-        ):
-            # A catalog-only bootstrap has no event history to replay. Marking
-            # cursor zero recovered avoids loading the multi-gigabyte catalog a
-            # second time when async persistence starts. Any non-empty log still
-            # takes the strict contiguous recovery path.
-            store.cursor = 0
-            store.persisted_cursor = 0
-            store._last_log_cursor = 0
-            store._event_offset = 0
-            store._recovered = True
+        if isinstance(store, LiveStateStore) and not store._recovered:
+            # The immutable catalog has already passed its complete integrity
+            # checks. Replay every durable event and rebuild its derived index,
+            # but do not parse the multi-gigabyte catalog a second time.
+            store.recover_with_loaded_catalog()
     if catalog:
         policy = getattr(
             getattr(collector, "catalog_client", None),

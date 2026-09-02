@@ -6871,9 +6871,9 @@ class LiveStateStore:
                 self._apply_replayed_event(event)
         self._last_log_cursor = events[-1].cursor if events else 0
 
-    def _recover_unlocked(self) -> None:
+    def _recover_unlocked(self, *, load_catalog: bool = True) -> None:
         """Rebuild state from durable files while the caller holds _sync_lock."""
-        if self.catalog_path.exists():
+        if load_catalog and self.catalog_path.exists():
             self._load_catalog(self.catalog_path)
         checkpoint = None
         if self.checkpoint_path.exists():
@@ -6897,6 +6897,14 @@ class LiveStateStore:
         """Explicitly perform the full deterministic recovery once."""
         with self._sync_lock:
             self._recover_unlocked()
+            self._recovered = True
+
+    def recover_with_loaded_catalog(self) -> None:
+        """Strictly replay durable state without parsing the catalog twice."""
+        with self._sync_lock:
+            if not self.catalog or self.catalog_revision is None:
+                raise RuntimeError("live catalog must be loaded before event recovery")
+            self._recover_unlocked(load_catalog=False)
             self._recovered = True
 
     def _ensure_loaded(self) -> None:

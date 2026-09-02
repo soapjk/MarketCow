@@ -192,17 +192,24 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertTrue(next(iter(store.catalog.values())).rules.fee_schedule.complete)
         self.assertTrue(store.raw_catalog_path.is_file())
 
-    def test_startup_loads_published_catalog_without_event_recovery(self):
+    def test_startup_replays_events_without_loading_catalog_twice(self):
         root = self.root / "catalog-only-load"
         writer = LiveStateStore(root)
         row = gamma_row()
         writer.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+        expected_cursor = writer.cursor
         reader = LiveStateStore(root)
         reader._recovered = False
         reader.catalog = {}
-        reader._recover_unlocked = lambda: self.fail(
-            "published catalog reuse must not replay the event log"
-        )
+        original_load_catalog = reader._load_catalog
+        load_calls = 0
+
+        def counted_load_catalog(path):
+            nonlocal load_calls
+            load_calls += 1
+            original_load_catalog(path)
+
+        reader._load_catalog = counted_load_catalog
         collector = type("Collector", (), {
             "store": reader,
             "catalog_client": type("Catalog", (), {
@@ -214,7 +221,9 @@ class PolymarketLiveTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "published_catalog_reused")
         self.assertEqual(result["market_count"], 1)
-        self.assertFalse(reader._recovered)
+        self.assertTrue(reader._recovered)
+        self.assertEqual(reader.cursor, expected_cursor)
+        self.assertEqual(load_calls, 1)
 
     def test_catalog_only_bootstrap_marks_empty_event_log_recovered(self):
         root = self.root / "empty-event-bootstrap"
