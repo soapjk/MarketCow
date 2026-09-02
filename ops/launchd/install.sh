@@ -24,8 +24,8 @@ if [ ! -x "$production_python" ]; then
     production_python="$managed_python"
 fi
 PYTHONPATH="$project_dir/src" "$production_python" -c 'import marketcow'
-if [ ! -f "$project_dir/.env.production" ]; then
-    echo "Missing production configuration: $project_dir/.env.production" >&2
+if [ ! -f "$target_env" ] && [ ! -f "$project_dir/.env.production" ]; then
+    echo "Missing production configuration: $target_env or $project_dir/.env.production" >&2
     exit 1
 fi
 
@@ -49,7 +49,7 @@ cp "$source_plist" "$target_plist"
 cp "$script_dir/start-production.sh" "$target_launcher"
 cp "$script_dir/ensure-production-storage.sh" "$target_storage_launcher"
 cp "$script_dir/clickhouse-production.xml" "$target_clickhouse_config"
-cp "$project_dir/.env.production" "$target_env"
+[ -f "$target_env" ] || cp "$project_dir/.env.production" "$target_env"
 chmod 700 "$target_launcher" "$target_storage_launcher"
 chmod 600 "$target_clickhouse_config" "$target_env"
 

@@ -142,7 +142,10 @@ class LaunchdStartupTest(unittest.TestCase):
         installer = (LAUNCHD / "install.sh").read_text()
         self.assertIn('cp "$script_dir/ensure-production-storage.sh"', installer)
         self.assertIn('cp "$script_dir/clickhouse-production.xml"', installer)
-        self.assertIn('cp "$project_dir/.env.production" "$target_env"', installer)
+        self.assertIn(
+            '[ -f "$target_env" ] || cp "$project_dir/.env.production" "$target_env"',
+            installer,
+        )
         self.assertNotIn('cp "$script_dir/run-production.py"', installer)
         self.assertIn('com.marketcow.*.plist', installer)
         self.assertIn('retired-launch-agents', installer)

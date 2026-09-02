@@ -19,6 +19,8 @@ Polymarket collector 使用 `8794`、`8795` loopback WebSocket 向统一 API 提
 `ops/launchd/install.sh` 会停用并把旧的 `com.marketcow.*` 独立 LaunchAgent 移至
 `~/Library/Application Support/MarketCow/retired-launch-agents/`。这样旧的 scoped、
 read-api、soak 或 refresh job 不会在登录或重启后与正式服务并行启动。
+首次安装会从仓库的 `.env.production` 初始化运行配置；更新安装会保留 Application
+Support 中现有的 `production.env`，不会用模板或仓库副本覆盖已验证配置与凭证。
 
 开发和迁移脚本仍可用于隔离测试，但不得注册为正式常驻服务。正式服务也不得通过
 `marketcow start`、`run_polymarket_live.py` 或 `run_polymarket_live_read_api.py` 分别启动。
