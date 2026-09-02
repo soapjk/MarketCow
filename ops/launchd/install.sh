@@ -84,7 +84,11 @@ launchctl enable "$domain/$label"
 attempt=0
 until launchctl bootstrap "$domain" "$target_plist"; do
     attempt=$((attempt + 1))
-    [ "$attempt" -lt 5 ] || {
+    # A full discovery collector may need several seconds to finish its
+    # fail-closed persistence flush after bootout. launchd reports EIO while
+    # that previous instance is still being reaped, so allow the local job a
+    # bounded shutdown window before declaring installation failed.
+    [ "$attempt" -lt 30 ] || {
         echo "Unable to bootstrap $label after $attempt attempts" >&2
         exit 1
     }
