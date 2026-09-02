@@ -5107,7 +5107,7 @@ class LiveStateStore:
         # index cannot hold up authoritative fsyncs or grow the collector's hot
         # persistence queue without bound.
         self._index_queue: queue.Queue[list[dict[str, Any]] | None] = queue.Queue(
-            maxsize=4,
+            maxsize=256,
         )
         self._index_thread: threading.Thread | None = None
         self._index_condition = threading.Condition()
@@ -5119,6 +5119,8 @@ class LiveStateStore:
         # stop real-time publication or durable event-log appends.
         self.derived_index_error: str | None = None
         self._state_index_available = True
+        self._index_health_cache: dict[str, Any] | None = None
+        self._index_health_cache_at = 0.0
         # API construction must not deserialize the multi-GB catalog or replay the
         # event log. Stateful operations retain compatibility through _ensure_loaded.
         self._recovered = False
@@ -5259,6 +5261,35 @@ class LiveStateStore:
         }
         if not self._state_index_available:
             return record
+        now = time.monotonic()
+        if (
+            self._index_health_cache is None
+            or now - self._index_health_cache_at >= 0.25
+        ):
+            self._index_health_cache = {
+                "book_token_count": len(self.books),
+                "book_complete_market_count": sum(
+                    all(
+                        outcome.token_id in self.books
+                        and self.books[outcome.token_id].bids
+                        and self.books[outcome.token_id].asks
+                        for outcome in market.identity.outcomes
+                    )
+                    for market in self.catalog.values()
+                    if market.active and not market.closed
+                ),
+                "unresolved_gap_count": sum(
+                    not gap.resolved for gap in self.gaps
+                ),
+                "oldest_book_received_at": (
+                    min(
+                        book.received_at for book in self.books.values()
+                    ).isoformat()
+                    if self.books else ""
+                ),
+            }
+            self._index_health_cache_at = now
+        health = self._index_health_cache
         record.update({
             "book": (
                 self.books[envelope.token_id]
@@ -5266,24 +5297,12 @@ class LiveStateStore:
             ),
             "gaps": [gap.model_copy(deep=True) for gap in index_gaps],
             "catalog_revision": self.catalog_revision,
-            "token_to_market": dict(self.token_to_market),
+            # Catalog publication replaces this mapping as one generation; it
+            # is never mutated on the live path, so retaining the generation
+            # reference is safe and avoids a 350k-entry copy per event.
+            "token_to_market": self.token_to_market,
             "active_recovery_id": self.active_recovery_id,
-            "book_token_count": len(self.books),
-            "book_complete_market_count": sum(
-                all(
-                    outcome.token_id in self.books
-                    and self.books[outcome.token_id].bids
-                    and self.books[outcome.token_id].asks
-                    for outcome in market.identity.outcomes
-                )
-                for market in self.catalog.values()
-                if market.active and not market.closed
-            ),
-            "unresolved_gap_count": sum(not gap.resolved for gap in self.gaps),
-            "oldest_book_received_at": (
-                min(book.received_at for book in self.books.values()).isoformat()
-                if self.books else ""
-            ),
+            **health,
         })
         return record
 
@@ -5436,7 +5455,7 @@ class LiveStateStore:
                 self._index_queue.put_nowait(records)
             except queue.Full:
                 self._isolate_derived_index(RuntimeError(
-                    "derived index backlog exceeded 4 durable batches"
+                    "derived index backlog exceeded 256 durable batches"
                 ))
         elapsed = time.monotonic() - started
         if elapsed >= 0.25:
