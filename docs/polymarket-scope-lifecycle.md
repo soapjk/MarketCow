@@ -1,6 +1,6 @@
 # Polymarket exact scope 生命周期与滚动切换
 
-本设计面向使用 `:8790` / `:8791` 的模拟交易消费者。固定 scope 是内容寻址、不可变的
+本设计面向使用统一 API `:8790` 的模拟交易消费者。固定 scope 是内容寻址、不可变的
 100 个 `market_id` 集合；市场生命周期变化只改变该成员的运行状态，不修改原 manifest，
 也不以替补市场覆盖旧 scope。
 
@@ -34,7 +34,7 @@
 ## Candidate、验收与切换
 
 每个 candidate 使用独立 root、collector、live stream 和 API 进程边界预热。启动器在
-candidate root 写入不可变 `scope-runtime.json`，使 8790/8791 的 bootstrap、snapshot、
+candidate root 写入不可变 `scope-runtime.json`，使 8790 的 bootstrap、snapshot、
 health 和 full-sync 都能返回 manifest 的内容寻址 `scope_id`。
 
 ```bash
@@ -49,7 +49,7 @@ PYTHONPATH=src python scripts/manage_polymarket_scopes.py \
 
 PYTHONPATH=src python scripts/verify_polymarket_exact_scope.py \
   --scope-manifest /absolute/candidate-manifest.json \
-  --expected-scope-id '<sha256>' --port 8790 --port 8791 \
+  --expected-scope-id '<sha256>' --port 8790 \
   --rounds 2 --round-interval-seconds 5 \
   --output /absolute/candidate-acceptance.json
 
@@ -65,7 +65,7 @@ PYTHONPATH=src python scripts/manage_polymarket_scopes.py \
 生成器只验证 Tradude 显式给出的 1–100 个市场和完整关系成员，并原样保留市场顺序。
 MarketCow 不保留旧成员、不按流动性或结束时间排序，也不自动补足 Top 100。
 
-验收器要求两端均为 HTTP 200 / `index_ready`，100 markets、200 books、100 complete、
+验收器要求统一 API 为 HTTP 200 / `index_ready`，100 markets、200 books、100 complete、
 tick 200/200、gap 0、disconnect 0，并至少两轮 cursor 推进。任何一项不满足都不会生成
 可激活 acceptance。active pointer 通过临时文件、fsync 和 `os.replace` 原子切换；旧 scope
 在宽限期内按其 `scope_id` 明确返回 `grace`，宽限后返回稳定

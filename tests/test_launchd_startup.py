@@ -143,7 +143,9 @@ class LaunchdStartupTest(unittest.TestCase):
         self.assertIn('cp "$script_dir/ensure-production-storage.sh"', installer)
         self.assertIn('cp "$script_dir/clickhouse-production.xml"', installer)
         self.assertIn('cp "$project_dir/.env.production" "$target_env"', installer)
-        self.assertIn('cp "$script_dir/run-production.py" "$target_runner"', installer)
+        self.assertNotIn('cp "$script_dir/run-production.py"', installer)
+        self.assertIn('com.marketcow.*.plist', installer)
+        self.assertIn('retired-launch-agents', installer)
         self.assertIn('until launchctl bootstrap "$domain" "$target_plist"', installer)
 
     def test_production_runner_builds_complete_polymarket_stack(self) -> None:
@@ -178,8 +180,7 @@ class LaunchdStartupTest(unittest.TestCase):
                 [
                     "polymarket-discovery-collector",
                     "polymarket-collector",
-                    "shared-api",
-                    "polymarket-read-api",
+                    "unified-api",
                 ],
             )
             commands = {service.name: service.command for service in services}
@@ -187,15 +188,12 @@ class LaunchdStartupTest(unittest.TestCase):
                 str(project.resolve() / "scripts" / "run_polymarket_live_paper_scope.py"),
                 commands["polymarket-collector"],
             )
-            self.assertIn("8794", commands["polymarket-read-api"][-1])
             self.assertIn(
                 "8795", commands["polymarket-discovery-collector"]
             )
-            self.assertIn(
-                "--discovery-root", commands["polymarket-read-api"]
-            )
-            self.assertIn("8790", commands["shared-api"])
-            self.assertIn("8791", commands["polymarket-read-api"])
+            self.assertIn("8790", commands["unified-api"])
+            self.assertNotIn("8791", " ".join(sum(commands.values(), ())))
+            self.assertNotIn("run_polymarket_live_read_api.py", " ".join(sum(commands.values(), ())))
             self.assertNotIn("0.0.0.0", " ".join(sum(commands.values(), ())))
 
     def test_production_runner_fails_closed_without_polymarket_scope(self) -> None:
@@ -246,6 +244,7 @@ class LaunchdStartupTest(unittest.TestCase):
         self.assertIn("<string>C</string>", plist)
         self.assertIn("<key>PYTHONPATH</key>", plist)
         self.assertIn("/Volumes/T9/projects/marketcow/src", plist)
+        self.assertIn("MARKETCOW_PROJECT_DIR", plist)
 
     @staticmethod
     def _write_executable(path: Path, content: str) -> None:

@@ -43,11 +43,17 @@ uv run marketcow --profile development doctor
 uv run marketcow --profile development start --host 127.0.0.1 --port 8792
 ```
 
-正式服务默认监听 `127.0.0.1:8790`：
+开发模式可以直接启动单个 API 进程。正式环境只有一个受支持的启动入口：
 
 ```bash
-uv run marketcow --profile production start --host 127.0.0.1 --port 8790
+ops/launchd/install.sh
 ```
+
+该入口一次性启动 PostgreSQL、ClickHouse、股票/加密资产实时能力、Polymarket 热
+scope、Polymarket 全市场 discovery 和统一 API。所有业务 HTTP、WebSocket 与 MCP
+接口都收口到 `127.0.0.1:8790`；`8794`、`8795` 仅供受管进程在 loopback 上内部通信，
+不属于调用方接口。不要在生产环境单独运行 `marketcow start` 或任何 Polymarket 脚本。
+详细边界见 [统一生产启动](docs/production-startup.md)。
 
 ## Provider
 

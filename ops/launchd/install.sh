@@ -12,7 +12,6 @@ target_launcher="$support_dir/start-production.sh"
 target_storage_launcher="$support_dir/ensure-production-storage.sh"
 target_clickhouse_config="$support_dir/clickhouse-production.xml"
 target_env="$support_dir/production.env"
-target_runner="$support_dir/run-production.py"
 domain="gui/$(id -u)"
 
 production_python="${MARKETCOW_PYTHON:-$project_dir/.venv/bin/python}"
@@ -31,14 +30,27 @@ if [ ! -f "$project_dir/.env.production" ]; then
 fi
 
 mkdir -p "$HOME/Library/LaunchAgents" "$support_dir" "$log_dir"
+retired_launch_agents="$support_dir/retired-launch-agents"
+mkdir -p "$retired_launch_agents"
+
+# Production has exactly one launchd owner. Retire historical MarketCow jobs
+# so a login or reboot cannot start a partial Polymarket-only stack beside it.
+for legacy_plist in "$HOME/Library/LaunchAgents"/com.marketcow.*.plist; do
+    [ -e "$legacy_plist" ] || continue
+    [ "$legacy_plist" != "$target_plist" ] || continue
+    legacy_label=$(basename "$legacy_plist" .plist)
+    launchctl bootout "$domain/$legacy_label" 2>/dev/null || true
+    launchctl disable "$domain/$legacy_label" 2>/dev/null || true
+    mv "$legacy_plist" "$retired_launch_agents/$legacy_label.plist"
+done
+
 plutil -lint "$source_plist"
 cp "$source_plist" "$target_plist"
 cp "$script_dir/start-production.sh" "$target_launcher"
 cp "$script_dir/ensure-production-storage.sh" "$target_storage_launcher"
 cp "$script_dir/clickhouse-production.xml" "$target_clickhouse_config"
 cp "$project_dir/.env.production" "$target_env"
-cp "$script_dir/run-production.py" "$target_runner"
-chmod 700 "$target_launcher" "$target_storage_launcher" "$target_runner"
+chmod 700 "$target_launcher" "$target_storage_launcher"
 chmod 600 "$target_clickhouse_config" "$target_env"
 
 launchctl bootout "$domain/$label" 2>/dev/null || true

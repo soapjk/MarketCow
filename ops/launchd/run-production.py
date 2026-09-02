@@ -52,30 +52,24 @@ def build_services(
     if host not in LOOPBACK_HOSTS:
         raise ValueError("production MarketCow APIs must bind to loopback")
     api_port = int(environment.get("MARKETCOW_PORT", "8790"))
-    read_api_port = int(environment.get("MARKETCOW_POLYMARKET_READ_API_PORT", "8791"))
-    stream_host = "127.0.0.1"
     stream_port = 8794
     discovery_stream_port = int(environment.get(
         "MARKETCOW_POLYMARKET_DISCOVERY_STREAM_PORT", "8795"
     ))
     for name, port in (
         ("MARKETCOW_PORT", api_port),
-        ("MARKETCOW_POLYMARKET_READ_API_PORT", read_api_port),
-        ("Polymarket live stream port", stream_port),
-        ("Polymarket discovery stream port", discovery_stream_port),
+        ("Polymarket internal live stream port", stream_port),
+        ("Polymarket internal discovery stream port", discovery_stream_port),
     ):
         if not 1 <= port <= 65535:
             raise ValueError(f"{name} must be in [1, 65535]")
-    if len({api_port, read_api_port, stream_port, discovery_stream_port}) != 4:
-        raise ValueError("MarketCow API, read API and live stream ports must differ")
+    if len({api_port, stream_port, discovery_stream_port}) != 3:
+        raise ValueError("MarketCow API and internal stream ports must differ")
 
     manifest = _required_path(environment, "MARKETCOW_POLYMARKET_SCOPE_MANIFEST")
     report = _required_path(environment, "MARKETCOW_POLYMARKET_SELECTION_REPORT")
     candidates = _required_path(environment, "MARKETCOW_POLYMARKET_CANDIDATE_SNAPSHOT")
     tradude_worktree = _required_path(environment, "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE")
-    consumer_age = environment.get("MARKETCOW_POLYMARKET_CONSUMER_MAXIMUM_BOOK_AGE_SECONDS", "5.0")
-    delivery_headroom = environment.get("MARKETCOW_POLYMARKET_MINIMUM_DELIVERY_HEADROOM_SECONDS", "1.0")
-    stream_uri = f"ws://{stream_host}:{stream_port}"
     depth_notionals = [
         value.strip() for value in environment.get(
             "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS", ""
@@ -85,12 +79,6 @@ def build_services(
         raise ValueError(
             "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS is required"
         )
-    depth_arguments = tuple(
-        argument
-        for value in depth_notionals
-        for argument in ("--discovery-depth-notional", value)
-    )
-
     discovery_collector = Service(
         "polymarket-discovery-collector",
         (
@@ -128,8 +116,8 @@ def build_services(
             environment.get("MARKETCOW_POLYMARKET_SNAPSHOT_REFRESH_SECONDS", "2.0"),
         ),
     )
-    shared_api = Service(
-        "shared-api",
+    unified_api = Service(
+        "unified-api",
         (
             python,
             "-m",
@@ -143,39 +131,7 @@ def build_services(
             str(api_port),
         ),
     )
-    read_api = Service(
-        "polymarket-read-api",
-        (
-            python,
-            str(project_dir / "scripts" / "run_polymarket_live_read_api.py"),
-            "--root",
-            str(live_root),
-            "--discovery-root",
-            str(discovery_root),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(read_api_port),
-            "--stable-snapshot-max-book-age-seconds",
-            environment.get("MARKETCOW_POLYMARKET_STABLE_SNAPSHOT_MAX_BOOK_AGE_SECONDS", "3.5"),
-            "--consumer-maximum-book-age-seconds",
-            consumer_age,
-            "--minimum-delivery-headroom-seconds",
-            delivery_headroom,
-            "--stable-read-wait-seconds",
-            environment.get("MARKETCOW_POLYMARKET_STABLE_READ_WAIT_SECONDS", "6.0"),
-            "--stable-read-poll-seconds",
-            environment.get("MARKETCOW_POLYMARKET_STABLE_READ_POLL_SECONDS", "0.025"),
-            "--executor-workers",
-            environment.get("MARKETCOW_POLYMARKET_READ_EXECUTOR_WORKERS", "4"),
-            *depth_arguments,
-            "--discovery-maximum-book-age-ms",
-            str(int(float(consumer_age) * 1000)),
-            "--live-stream-uri",
-            stream_uri,
-        ),
-    )
-    return discovery_collector, collector, shared_api, read_api
+    return discovery_collector, collector, unified_api
 
 
 def supervise(
@@ -246,6 +202,10 @@ def main() -> None:
     # worktree. Production children must always import the selected main
     # checkout, independent of site-packages state.
     environment["PYTHONPATH"] = str(project_dir.resolve(strict=True) / "src")
+    # The collectors' loopback WebSockets are implementation details. Every
+    # stock, crypto and prediction-market API remains on the single public
+    # MarketCow listener.
+    environment["MARKETCOW_POLYMARKET_LIVE_STREAM_URI"] = "ws://127.0.0.1:8794"
     services = build_services(project_dir, environment)
     raise SystemExit(supervise(services, project_dir=project_dir, environment=environment))
 

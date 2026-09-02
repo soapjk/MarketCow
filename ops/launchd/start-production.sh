@@ -18,4 +18,4 @@ if [ ! -x "$python" ]; then
     python="$managed_python"
 fi
 
-exec "$python" "$script_dir/run-production.py"
+exec "$python" "$project_dir/ops/launchd/run-production.py"

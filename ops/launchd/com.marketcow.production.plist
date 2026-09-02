@@ -17,6 +17,8 @@
         <string>production</string>
         <key>MARKETCOW_ENV_FILE</key>
         <string>/Users/androidjk/Library/Application Support/MarketCow/production.env</string>
+        <key>MARKETCOW_PROJECT_DIR</key>
+        <string>/Volumes/T9/projects/marketcow</string>
         <key>MARKETCOW_LONGPORT_ENABLE_OVERNIGHT</key>
         <string>true</string>
         <key>LC_ALL</key>
