@@ -2169,7 +2169,12 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         offset = self._page_offset(boundary.snapshot_id, page_cursor)
         with self._database(boundary.database_path, readonly=True) as connection:
             rows = list(connection.execute(self._quote_query(), (boundary.boundary_cursor, page_size, offset)))
-        items = [DiscoveryMarketQuote.model_validate_json(bytes(row[0])) for row in rows]
+        items = [
+            DiscoveryMarketQuote.model_validate_json(bytes(row[0])).model_copy(
+                update={"cursor": boundary.boundary_cursor}
+            )
+            for row in rows
+        ]
         next_offset = offset + len(items)
         return DiscoverySnapshotPage(
             snapshot_id=boundary.snapshot_id,
@@ -2219,7 +2224,11 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                     (market_id, boundary.boundary_cursor),
                 ).fetchone()
                 if quote_row is not None:
-                    quotes.append(DiscoveryMarketQuote.model_validate_json(bytes(quote_row[0])))
+                    quotes.append(
+                        DiscoveryMarketQuote.model_validate_json(
+                            bytes(quote_row[0])
+                        ).model_copy(update={"cursor": boundary.boundary_cursor})
+                    )
         return relation.model_copy(update={"quotes": quotes})
 
     def _outcomes_for_tokens(self, catalog_revision: str, token_ids: set[str]) -> dict[str, str]:

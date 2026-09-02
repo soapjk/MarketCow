@@ -77,9 +77,16 @@ def refresh_catalog_or_reuse_published(
             "fee_semantics_policy",
             None,
         )
+        policy_fillable_fields = {
+            "currency", "maker_rate", "formula", "quantum", "effective_from",
+        }
         incomplete_count = (
             sum(
-                not market.rules.fee_schedule.complete
+                bool(
+                    policy_fillable_fields.intersection(
+                        market.rules.fee_schedule.missing_fields
+                    )
+                )
                 for market in catalog.values()
             )
             if policy is not None else 0

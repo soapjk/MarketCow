@@ -218,6 +218,42 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(reader.cursor, expected_cursor)
         self.assertTrue(reader._recovered)
 
+    def test_startup_does_not_rebuild_provider_incomplete_fee_facts(self):
+        store = LiveStateStore(self.root / "provider-incomplete-fee")
+        row = gamma_row()
+        row["fee_schedule"].pop("taker_rate")
+        row["fee_schedule"].pop("exponent")
+        store.replace_catalog(
+            GammaLiveNormalizer.normalize([row], NOW),
+            [row],
+        )
+        policy = GammaFeeSemanticsPolicy.model_validate({
+            "schema_version": "marketcow.polymarket.gamma-fee-semantics.v1",
+            "currency": "pUSD",
+            "maker_rate": "0",
+            "formula": "fee = C * feeRate * (p * (1 - p)) ^ exponent",
+            "quantum": "0.00001",
+            "rounding_mode": "UNSPECIFIED",
+            "tie_semantics": "unspecified",
+            "calculation_status": "informational_only",
+            "effective_from": "2026-04-17T00:00:00Z",
+            "revision": "test-fee-semantics-v1",
+            "source": "polymarket_docs",
+            "source_url": "https://docs.polymarket.com/trading/fees",
+            "field_paths": ["fee formula"],
+        })
+        collector = type("Collector", (), {
+            "store": store,
+            "catalog_client": type("Catalog", (), {
+                "fee_semantics_policy": policy,
+            })(),
+        })()
+
+        result = refresh_catalog_or_reuse_published(collector)
+
+        self.assertEqual(result["status"], "published_catalog_reused")
+        self.assertFalse(next(iter(store.catalog.values())).rules.fee_schedule.complete)
+
     def setUp(self):
         self.folder = TemporaryDirectory()
         self.root = Path(self.folder.name)

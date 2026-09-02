@@ -234,6 +234,10 @@ class PolymarketDiscoveryTest(unittest.TestCase):
             )
             snapshot_id = first_body["snapshot_id"]
             boundary_cursor = first_body["boundary_cursor"]
+            self.assertTrue(all(
+                item["cursor"] == boundary_cursor
+                for item in first_body["items"]
+            ))
             old_revision = next(
                 item["book_revision"] for item in first_body["items"]
                 if item["market_id"] == "m000"
@@ -255,6 +259,10 @@ class PolymarketDiscoveryTest(unittest.TestCase):
             self.assertEqual(second.json()["snapshot_id"], snapshot_id)
             self.assertEqual(second.json()["boundary_cursor"], boundary_cursor)
             self.assertEqual(second.json()["page_count"], 41)
+            self.assertTrue(all(
+                item["cursor"] == boundary_cursor
+                for item in second.json()["items"]
+            ))
 
             immutable_first = client.get(
                 "/v1/prediction-markets/polymarket/live/discovery/snapshot",
