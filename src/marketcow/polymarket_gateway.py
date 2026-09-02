@@ -24,6 +24,9 @@ _MARKET_SNAPSHOT_PREFIX = (
     "/v1/prediction-markets/polymarket/live/markets/"
 )
 _POLYMARKET_LIVE_PREFIX = "/v1/prediction-markets/polymarket/live/"
+_POLYMARKET_DISCOVERY_PREFIX = (
+    "/v1/prediction-markets/polymarket/live/discovery/"
+)
 _HOP_HEADERS = frozenset({
     b"connection", b"keep-alive", b"proxy-authenticate",
     b"proxy-authorization", b"te", b"trailers", b"transfer-encoding",
@@ -72,7 +75,10 @@ class RustPolymarketGatewayMiddleware:
         if scope["type"] == "http" and (
             path in _HTTP_PATHS
             or path.startswith(_MARKET_SNAPSHOT_PREFIX)
-            or path.startswith(_POLYMARKET_LIVE_PREFIX)
+            or (
+                path.startswith(_POLYMARKET_LIVE_PREFIX)
+                and not path.startswith(_POLYMARKET_DISCOVERY_PREFIX)
+            )
         ):
             await self._http(scope, receive, send)
             return

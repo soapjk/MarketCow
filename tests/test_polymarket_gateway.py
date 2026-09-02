@@ -40,12 +40,19 @@ class RustPolymarketGatewayTest(unittest.TestCase):
         def legacy_gaps() -> dict[str, str]:
             return {"owner": "python"}
 
+        @app.get("/v1/prediction-markets/polymarket/live/discovery/snapshot")
+        def discovery_snapshot() -> dict[str, str]:
+            return {"owner": "python-discovery"}
+
         with TestClient(app) as client:
             response = client.get(
                 "/v1/prediction-markets/polymarket/live/scope?generation=7"
             )
             retired_route_response = client.get(
                 "/v1/prediction-markets/polymarket/live/gaps"
+            )
+            discovery_response = client.get(
+                "/v1/prediction-markets/polymarket/live/discovery/snapshot"
             )
             health_response = client.get("/v1/health")
 
@@ -59,6 +66,7 @@ class RustPolymarketGatewayTest(unittest.TestCase):
         )
         self.assertEqual(health_response.json(), {"owner": "gateway"})
         self.assertEqual(retired_route_response.json()["owner"], "rust")
+        self.assertEqual(discovery_response.json()["owner"], "python-discovery")
         self.assertEqual(
             str(observed[1].url),
             "http://127.0.0.1:8796/v1/prediction-markets/polymarket/live/gaps",
