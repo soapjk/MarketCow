@@ -15,7 +15,6 @@ from marketcow.polymarket_live import (
     GammaLiveNormalizer,
     LiveStateStore,
     PolymarketLiveCollector,
-    _durable_event_log_tail,
     live_collector_lease,
     load_scoped_live_store,
 )
@@ -45,19 +44,6 @@ def refresh_catalog_or_reuse_published(
     that first publication cannot be completed.
     """
     store = collector.store
-    if isinstance(store, LiveStateStore) and not store._recovered:
-        tail, event_log_size = _durable_event_log_tail(store.event_path)
-        store.cursor = tail.cursor if tail is not None else 0
-        store.persisted_cursor = store.cursor
-        store._last_log_cursor = store.cursor
-        store._event_offset = event_log_size
-        store._recovered = True
-        LOGGER.info(
-            "polymarket_discovery_event_replay_bypassed durable_cursor=%d "
-            "durable_event_log_size=%d",
-            store.cursor,
-            event_log_size,
-        )
     catalog = getattr(store, "catalog", None)
     catalog_path = getattr(store, "catalog_path", None)
     load_catalog = getattr(store, "_load_catalog", None)
