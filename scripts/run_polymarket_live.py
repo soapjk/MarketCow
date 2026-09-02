@@ -43,7 +43,20 @@ def refresh_catalog_or_reuse_published(
     collector must fetch the authoritative catalog and still fails closed if
     that first publication cannot be completed.
     """
-    catalog = getattr(collector.store, "catalog", None)
+    store = collector.store
+    catalog = getattr(store, "catalog", None)
+    catalog_path = getattr(store, "catalog_path", None)
+    load_catalog = getattr(store, "_load_catalog", None)
+    if (
+        not catalog
+        and isinstance(catalog_path, Path)
+        and catalog_path.is_file()
+        and callable(load_catalog)
+    ):
+        # Loading the immutable catalog boundary is independent of the legacy
+        # event-derived SQLite projection and must never trigger its replay.
+        load_catalog(catalog_path)
+        catalog = getattr(store, "catalog", None)
     if catalog:
         policy = getattr(
             getattr(collector, "catalog_client", None),

@@ -191,6 +191,29 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertTrue(next(iter(store.catalog.values())).rules.fee_schedule.complete)
         self.assertTrue(store.raw_catalog_path.is_file())
 
+    def test_startup_loads_published_catalog_without_event_recovery(self):
+        root = self.root / "catalog-only-load"
+        writer = LiveStateStore(root)
+        row = gamma_row()
+        writer.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+        reader = LiveStateStore(root)
+        reader._recovered = False
+        reader.catalog = {}
+        reader._recover_unlocked = lambda: self.fail(
+            "published catalog reuse must not replay the event log"
+        )
+        collector = type("Collector", (), {
+            "store": reader,
+            "catalog_client": type("Catalog", (), {
+                "fee_semantics_policy": None,
+            })(),
+        })()
+
+        result = refresh_catalog_or_reuse_published(collector)
+
+        self.assertEqual(result["status"], "published_catalog_reused")
+        self.assertEqual(result["market_count"], 1)
+
     def setUp(self):
         self.folder = TemporaryDirectory()
         self.root = Path(self.folder.name)
