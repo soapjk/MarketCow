@@ -151,6 +151,7 @@ class LaunchdStartupTest(unittest.TestCase):
         self.assertIn('retired-launch-agents', installer)
         self.assertIn('until launchctl bootstrap "$domain" "$target_plist"', installer)
         self.assertIn('cargo_bin=', installer)
+        self.assertIn('rust_build_root/release/marketcow"', installer)
         self.assertIn('configure_polymarket_final_architecture.py', installer)
 
     def test_production_runner_builds_complete_polymarket_stack(self) -> None:

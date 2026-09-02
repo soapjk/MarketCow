@@ -14,7 +14,7 @@ target_clickhouse_config="$support_dir/clickhouse-production.xml"
 target_env="$support_dir/production.env"
 domain="gui/$(id -u)"
 rust_build_root="$support_dir/rust-build"
-rust_binary="$support_dir/bin/marketcowd"
+rust_binary="$support_dir/bin/marketcow"
 
 production_python="${MARKETCOW_PYTHON:-$project_dir/.venv/bin/python}"
 if [ ! -x "$production_python" ]; then
@@ -66,7 +66,7 @@ mkdir -p "$rust_build_root" "$support_dir/bin"
 CARGO_TARGET_DIR="$rust_build_root" "$cargo_bin" build \
     --locked --release -p marketcowd --manifest-path "$project_dir/Cargo.toml"
 rust_temporary="$rust_binary.tmp.$$"
-cp "$rust_build_root/release/marketcowd" "$rust_temporary"
+cp "$rust_build_root/release/marketcow" "$rust_temporary"
 chmod 700 "$rust_temporary"
 mv "$rust_temporary" "$rust_binary"
 
