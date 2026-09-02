@@ -4760,6 +4760,10 @@ class ClobBooksClient:
         session = getattr(self._thread_sessions, "session", None)
         if session is None:
             session = requests.Session()
+            # This is an explicitly configured public data source. Ambient
+            # proxy variables can otherwise reroute loopback deployments and
+            # make the strict periodic freshness deadline fail in TLS setup.
+            session.trust_env = False
             self._thread_sessions.session = session
         return session.post(*args, **kwargs)
 

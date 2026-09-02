@@ -1178,6 +1178,23 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual([len(batch) for batch in batches], [2, 1])
 
+    def test_clob_books_ignores_ambient_proxy_configuration(self):
+        class Session:
+            trust_env = True
+
+            def post(self, _url, **kwargs):
+                return Response([
+                    snapshot(item["token_id"], "0.40", "0.42")
+                    for item in kwargs["json"]
+                ])
+
+        session = Session()
+        with patch.object(requests, "Session", return_value=session):
+            rows = ClobBooksClient().fetch(["a"])
+
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(session.trust_env)
+
     def test_clob_books_retries_and_reports_complete_coverage(self):
         responses = [
             Response({}, 429, {"Retry-After": "0"}),
