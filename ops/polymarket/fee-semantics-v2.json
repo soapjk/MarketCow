@@ -1,0 +1,20 @@
+{
+  "schema_version": "marketcow.polymarket.gamma-fee-semantics.v1",
+  "currency": "pUSD",
+  "maker_rate": "0",
+  "formula": "fee = C * feeRate * (p * (1 - p)) ^ exponent",
+  "quantum": "0.00001",
+  "rounding_mode": "UNSPECIFIED",
+  "tie_semantics": "unspecified",
+  "calculation_status": "informational_only",
+  "effective_from": "2026-04-17T00:00:00Z",
+  "revision": "polymarket-clob-v2-fee-semantics-2026-04-17",
+  "source": "polymarket_docs",
+  "source_url": "https://docs.polymarket.com/trading/fees",
+  "field_paths": [
+    "fee_formula",
+    "maker_fee_policy",
+    "settlement_currency",
+    "fee_precision"
+  ]
+}

@@ -150,25 +150,41 @@ class LaunchdStartupTest(unittest.TestCase):
         self.assertIn('com.marketcow.*.plist', installer)
         self.assertIn('retired-launch-agents', installer)
         self.assertIn('until launchctl bootstrap "$domain" "$target_plist"', installer)
+        self.assertIn('cargo_bin=', installer)
+        self.assertIn('configure_polymarket_final_architecture.py', installer)
 
     def test_production_runner_builds_complete_polymarket_stack(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             project = root / "project"
             project.mkdir()
-            manifest = root / "manifest.json"
-            report = root / "selection-report.json"
-            candidates = root / "candidates.json"
+            rust_binary = root / "marketcow"
+            rust_scope = root / "scope.json"
+            fee_semantics = root / "fee-semantics.json"
+            opportunity_config = root / "opportunity.yaml"
+            refresh_config = root / "refresh.json"
+            tradude_python = root / "python"
+            registry = root / "registry"
+            registry.mkdir()
             tradude = root / "tradude"
             tradude.mkdir()
-            for path in (manifest, report, candidates):
+            for path in (
+                rust_binary, rust_scope, fee_semantics, opportunity_config,
+                refresh_config, tradude_python,
+            ):
                 path.write_text("{}")
             environment = {
                 "MARKETCOW_HOME": str(root / "data"),
-                "MARKETCOW_POLYMARKET_SCOPE_MANIFEST": str(manifest),
-                "MARKETCOW_POLYMARKET_SELECTION_REPORT": str(report),
-                "MARKETCOW_POLYMARKET_CANDIDATE_SNAPSHOT": str(candidates),
+                "MARKETCOW_RUST_BINARY": str(rust_binary),
+                "MARKETCOW_RUST_SCOPE_ID": "a" * 64,
+                "MARKETCOW_RUST_ADMIN_TOKEN": "test-admin-token",
+                "MARKETCOW_POLYMARKET_RUST_SCOPE_FILE": str(rust_scope),
+                "MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT": str(registry),
+                "MARKETCOW_POLYMARKET_FEE_SEMANTICS_POLICY": str(fee_semantics),
                 "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE": str(tradude),
+                "MARKETCOW_TRADUDE_PYTHON": str(tradude_python),
+                "MARKETCOW_POLYMARKET_OPPORTUNITY_CONTROLLER_CONFIG": str(opportunity_config),
+                "MARKETCOW_POLYMARKET_UNIVERSE_REFRESH_CONFIG": str(refresh_config),
                 "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS": "10,50,100,500",
             }
 
@@ -182,27 +198,46 @@ class LaunchdStartupTest(unittest.TestCase):
                 [service.name for service in services],
                 [
                     "polymarket-discovery-collector",
-                    "polymarket-collector",
+                    "polymarket-rust-data-plane",
                     "unified-api",
+                    "polymarket-opportunity-controller",
+                    "polymarket-universe-activator",
                 ],
             )
             commands = {service.name: service.command for service in services}
-            self.assertIn(
-                str(project.resolve() / "scripts" / "run_polymarket_live_paper_scope.py"),
-                commands["polymarket-collector"],
+            self.assertEqual(
+                commands["polymarket-rust-data-plane"],
+                (str(rust_binary.resolve()), "serve"),
             )
             self.assertIn(
                 "8795", commands["polymarket-discovery-collector"]
             )
+            self.assertIn(
+                str(fee_semantics.resolve()),
+                commands["polymarket-discovery-collector"],
+            )
             self.assertIn("8790", commands["unified-api"])
             self.assertNotIn("8791", " ".join(sum(commands.values(), ())))
+            self.assertNotIn("18872", " ".join(sum(commands.values(), ())))
             self.assertNotIn("run_polymarket_live_read_api.py", " ".join(sum(commands.values(), ())))
+            self.assertNotIn("run_polymarket_live_paper_scope.py", " ".join(sum(commands.values(), ())))
             self.assertNotIn("0.0.0.0", " ".join(sum(commands.values(), ())))
+            rust_service = next(
+                service for service in services
+                if service.name == "polymarket-rust-data-plane"
+            )
+            self.assertEqual(
+                rust_service.environment["MARKETCOW_RUST_BIND"],
+                "127.0.0.1:8796",
+            )
+            self.assertEqual(
+                rust_service.environment["MARKETCOW_RUST_SHADOW"], "false",
+            )
 
     def test_production_runner_fails_closed_without_polymarket_scope(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             project = Path(folder)
-            with self.assertRaisesRegex(ValueError, "MARKETCOW_POLYMARKET_SCOPE_MANIFEST is required"):
+            with self.assertRaisesRegex(ValueError, "MARKETCOW_RUST_BINARY is required"):
                 RUNNER.build_services(project, {}, python="/production/python")
 
     def test_required_child_exit_stops_production_stack(self) -> None:

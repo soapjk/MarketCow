@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -106,17 +108,61 @@ class Session:
 
 
 def _config(tmp_path: Path) -> RefreshConfig:
-    for name in ("candidates.json", "catalog.sqlite3", "catalog.jsonl", "fees.json"):
-        (tmp_path / name).write_text("{}")
+    revision = "c" * 64
+    candidates = tmp_path / "candidates.json"
+    candidates.write_text(json.dumps({
+        "schema": "tradude.prediction_market.scope_selection.v2",
+        "catalog_revision": revision,
+        "market_ids": ["1", "2", "3", "retired-bad-market"],
+        "relations": [],
+    }))
+    catalog = tmp_path / "catalog.jsonl"
+    offsets = []
+    with catalog.open("wb") as stream:
+        for market_id in ("1", "2", "3", "retired-bad-market"):
+            row = json.dumps({
+                "identity": {
+                    "market_id": market_id,
+                    "outcomes": [
+                        {"outcome": "Yes", "instrument_id": f"POLY:c:{market_id}1"},
+                        {"outcome": "No", "instrument_id": f"POLY:c:{market_id}2"},
+                    ],
+                },
+            }, separators=(",", ":")).encode() + b"\n"
+            offset = stream.tell()
+            stream.write(row)
+            offsets.append((market_id, offset, len(row)))
+    catalog_index = tmp_path / "catalog.sqlite3"
+    with sqlite3.connect(catalog_index) as connection:
+        connection.execute(
+            "CREATE TABLE markets (market_id TEXT PRIMARY KEY, byte_offset INTEGER, byte_length INTEGER)"
+        )
+        connection.executemany("INSERT INTO markets VALUES (?, ?, ?)", offsets)
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    catalog_manifest = tmp_path / "catalog-manifest.json"
+    catalog_manifest.write_text(json.dumps({
+        "schema_version": "marketcow.polymarket.live.v2",
+        "catalog_revision": revision,
+        "normalized_catalog": {
+            "format": "canonical_jsonl",
+            "path": str(catalog),
+            "sha256": digest(catalog),
+        },
+        "catalog_index": {
+            "format": "sqlite-offset-v1",
+            "catalog_revision": revision,
+            "path": str(catalog_index),
+            "sha256": digest(catalog_index),
+        },
+    }))
     registry = tmp_path / "registry"
     registry.mkdir()
     (registry / f"{'a' * 64}.json").write_text("{\"old\":true}")
     return RefreshConfig(
         service_url="http://127.0.0.1:18872",
-        candidate_manifest=tmp_path / "candidates.json",
-        catalog_index=tmp_path / "catalog.sqlite3",
-        catalog=tmp_path / "catalog.jsonl",
-        fee_registry=tmp_path / "fees.json",
+        candidate_manifest=candidates,
+        catalog_manifest=catalog_manifest,
+        startup_scope=tmp_path / "active-scope.json",
         scope_registry_root=registry,
         work_root=tmp_path / "work",
         audit_result=tmp_path / "audit.json",
@@ -217,6 +263,7 @@ def test_changed_membership_registers_and_atomically_activates(tmp_path, monkeyp
     assert request["json"]["scope_file_sha256"] == result["candidate_sha256"]
     registered = json.loads((config.scope_registry_root / f"{'a' * 64}.json").read_text())
     assert registered["universe"]["generation"] == 2
+    assert json.loads(config.startup_scope.read_text())["universe"]["generation"] == 2
 
 
 def test_below_target_quarantine_view_is_automatically_replenished(tmp_path, monkeypatch):
@@ -449,9 +496,8 @@ def test_config_rejects_non_loopback_activation(tmp_path):
         "schema_version": CONFIG_SCHEMA_VERSION,
         "service_url": "https://example.com",
         "candidate_manifest": "a",
-        "catalog_index": "b",
-        "catalog": "c",
-        "fee_registry": "d",
+        "catalog_manifest": "b",
+        "startup_scope": "c",
         "scope_registry_root": "e",
         "work_root": "f",
         "audit_result": "g",

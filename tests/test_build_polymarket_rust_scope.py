@@ -398,7 +398,7 @@ def test_dynamic_universe_fails_closed_below_minimum(tmp_path: Path) -> None:
         )
 
 
-def test_dynamic_universe_requires_exact_tradude_selection_count(tmp_path: Path) -> None:
+def test_dynamic_universe_rejects_selection_above_target_count(tmp_path: Path) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
     with pytest.raises(ValueError, match="explicit selection count"):
         build_dynamic_universe(
@@ -409,6 +409,28 @@ def test_dynamic_universe_requires_exact_tradude_selection_count(tmp_path: Path)
             minimum_market_count=1,
             validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
         )
+
+
+def test_dynamic_universe_accepts_selection_between_minimum_and_target(
+    tmp_path: Path,
+) -> None:
+    manifest, index, catalog, registry = _fixture(tmp_path)
+    payload = json.loads(manifest.read_text())
+    payload["market_ids"] = ["2"]
+    manifest.write_text(json.dumps(payload, separators=(",", ":")))
+
+    result = build_dynamic_universe(
+        manifest, index, catalog, registry, _books(tmp_path),
+        universe_id="f" * 64,
+        generation=1,
+        target_market_count=100,
+        minimum_market_count=1,
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+
+    assert result["market_ids"] == ["2"]
+    assert result["universe"]["target_market_count"] == 100
+    assert result["universe"]["minimum_market_count"] == 1
 
 
 def _clob_books() -> dict[str, dict[str, object]]:

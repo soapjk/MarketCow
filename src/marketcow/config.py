@@ -75,6 +75,7 @@ class Settings:
     realtime_replay_capacity: int = 4096
     realtime_heartbeat_seconds: float = 15.0
     polymarket_live_stream_uri: str = ""
+    polymarket_rust_data_plane_url: str = ""
     polymarket_live_stream_replay_capacity: int = 10_000
     polymarket_consumer_maximum_book_age_seconds: float = 5.0
     polymarket_minimum_delivery_headroom_seconds: float = 1.0
@@ -232,8 +233,11 @@ class Settings:
             )),
             polymarket_live_stream_uri=os.getenv(
                 "MARKETCOW_POLYMARKET_LIVE_STREAM_URI",
-                "ws://127.0.0.1:8794" if profile == "production" else "",
+                "",
             ).strip(),
+            polymarket_rust_data_plane_url=os.getenv(
+                "MARKETCOW_POLYMARKET_RUST_DATA_PLANE_URL", ""
+            ).strip().rstrip("/"),
             polymarket_live_stream_replay_capacity=int(os.getenv(
                 "MARKETCOW_POLYMARKET_LIVE_STREAM_REPLAY_CAPACITY", "10000"
             )),
@@ -473,6 +477,25 @@ class Settings:
                 or not self._loopback(parsed_stream.hostname)
             ):
                 raise ValueError("Polymarket live stream must use a loopback WebSocket URI")
+        if self.polymarket_rust_data_plane_url:
+            parsed_data_plane = urlsplit(self.polymarket_rust_data_plane_url)
+            if (
+                parsed_data_plane.scheme != "http"
+                or not parsed_data_plane.hostname
+                or not self._loopback(parsed_data_plane.hostname)
+                or parsed_data_plane.port is None
+                or parsed_data_plane.port == self.port
+                or parsed_data_plane.path not in {"", "/"}
+                or parsed_data_plane.query
+                or parsed_data_plane.fragment
+            ):
+                raise ValueError(
+                    "Polymarket Rust data plane must be a distinct loopback HTTP origin"
+                )
+        if self.polymarket_rust_data_plane_url and self.polymarket_live_stream_uri:
+            raise ValueError(
+                "Rust Polymarket data plane and legacy Python live stream are mutually exclusive"
+            )
         if self.public_read_enabled:
             from .public_access import JwtPolicy, PublicAccessConfig, parse_key_set
 

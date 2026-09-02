@@ -22,6 +22,7 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 class Service:
     name: str
     command: tuple[str, ...]
+    environment: Mapping[str, str] | None = None
 
 
 def _required_path(environment: Mapping[str, str], name: str) -> Path:
@@ -45,31 +46,51 @@ def build_services(
     data_root = Path(environment.get("MARKETCOW_HOME", str(DEFAULT_DATA_ROOT)))
     if not data_root.is_absolute():
         raise ValueError("MARKETCOW_HOME must be an absolute path")
-    live_root = data_root / "prediction-markets" / "polymarket-live"
     discovery_root = data_root / "prediction-markets" / "polymarket-discovery"
+    rust_root = data_root / "prediction-markets" / "polymarket-rust"
 
     host = environment.get("MARKETCOW_HOST", "127.0.0.1")
     if host not in LOOPBACK_HOSTS:
         raise ValueError("production MarketCow APIs must bind to loopback")
     api_port = int(environment.get("MARKETCOW_PORT", "8790"))
-    stream_port = 8794
+    rust_port = int(environment.get("MARKETCOW_POLYMARKET_RUST_PORT", "8796"))
     discovery_stream_port = int(environment.get(
         "MARKETCOW_POLYMARKET_DISCOVERY_STREAM_PORT", "8795"
     ))
     for name, port in (
         ("MARKETCOW_PORT", api_port),
-        ("Polymarket internal live stream port", stream_port),
+        ("Polymarket internal Rust data-plane port", rust_port),
         ("Polymarket internal discovery stream port", discovery_stream_port),
     ):
         if not 1 <= port <= 65535:
             raise ValueError(f"{name} must be in [1, 65535]")
-    if len({api_port, stream_port, discovery_stream_port}) != 3:
+    if len({api_port, rust_port, discovery_stream_port}) != 3:
         raise ValueError("MarketCow API and internal stream ports must differ")
 
-    manifest = _required_path(environment, "MARKETCOW_POLYMARKET_SCOPE_MANIFEST")
-    report = _required_path(environment, "MARKETCOW_POLYMARKET_SELECTION_REPORT")
-    candidates = _required_path(environment, "MARKETCOW_POLYMARKET_CANDIDATE_SNAPSHOT")
+    rust_binary = _required_path(environment, "MARKETCOW_RUST_BINARY")
+    rust_scope = _required_path(environment, "MARKETCOW_POLYMARKET_RUST_SCOPE_FILE")
+    rust_scope_registry = _required_path(
+        environment, "MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT"
+    )
+    fee_semantics = _required_path(
+        environment, "MARKETCOW_POLYMARKET_FEE_SEMANTICS_POLICY"
+    )
     tradude_worktree = _required_path(environment, "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE")
+    tradude_python = _required_path(environment, "MARKETCOW_TRADUDE_PYTHON")
+    opportunity_config = _required_path(
+        environment, "MARKETCOW_POLYMARKET_OPPORTUNITY_CONTROLLER_CONFIG"
+    )
+    refresh_config = _required_path(
+        environment, "MARKETCOW_POLYMARKET_UNIVERSE_REFRESH_CONFIG"
+    )
+    rust_scope_id = environment.get("MARKETCOW_RUST_SCOPE_ID", "").strip()
+    rust_admin_token = environment.get("MARKETCOW_RUST_ADMIN_TOKEN", "").strip()
+    if len(rust_scope_id) != 64 or any(
+        value not in "0123456789abcdef" for value in rust_scope_id
+    ):
+        raise ValueError("MARKETCOW_RUST_SCOPE_ID must be a lowercase SHA-256")
+    if not rust_admin_token:
+        raise ValueError("MARKETCOW_RUST_ADMIN_TOKEN is required")
     depth_notionals = [
         value.strip() for value in environment.get(
             "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS", ""
@@ -94,28 +115,62 @@ def build_services(
             ),
             "--live-stream-port",
             str(discovery_stream_port),
+            "--fee-semantics-policy",
+            str(fee_semantics),
         ),
     )
 
-    collector = Service(
-        "polymarket-collector",
+    rust_environment = dict(environment)
+    rust_environment.update({
+        "MARKETCOW_RUST_PROFILE": "production",
+        "MARKETCOW_RUST_ROLE": "polymarket_data_plane",
+        "MARKETCOW_RUST_BIND": f"127.0.0.1:{rust_port}",
+        "MARKETCOW_RUST_STORAGE_ROOT": str(rust_root),
+        "MARKETCOW_RUST_SCOPE_ID": rust_scope_id,
+        "MARKETCOW_RUST_SHADOW": "false",
+        "MARKETCOW_POLYMARKET_LIVE_ENABLED": "true",
+        "MARKETCOW_POLYMARKET_SCOPE_FILE": str(rust_scope),
+        "MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT": str(rust_scope_registry),
+        "MARKETCOW_REAL_ORDER_SUBMISSION_ENABLED": "false",
+    })
+    rust_data_plane = Service(
+        "polymarket-rust-data-plane",
+        (str(rust_binary), "serve"),
+        rust_environment,
+    )
+    opportunity_controller = Service(
+        "polymarket-opportunity-controller",
+        (
+            str(tradude_python),
+            str(tradude_worktree / "examples/polymarket/run_opportunity_scope_controller.py"),
+            "--config", str(opportunity_config),
+            "--follow", "--retry-seconds",
+            environment.get("MARKETCOW_POLYMARKET_CONTROLLER_RETRY_SECONDS", "5"),
+        ),
+        {
+            **environment,
+            "PYTHONPATH": str(tradude_worktree),
+        },
+    )
+    universe_activator = Service(
+        "polymarket-universe-activator",
         (
             python,
-            str(project_dir / "scripts" / "run_polymarket_live_paper_scope.py"),
-            "--root",
-            str(live_root),
-            "--scope-manifest",
-            str(manifest),
-            "--selection-report",
-            str(report),
-            "--candidate-snapshot",
-            str(candidates),
-            "--tradude-worktree",
-            str(tradude_worktree),
-            "--snapshot-refresh-seconds",
-            environment.get("MARKETCOW_POLYMARKET_SNAPSHOT_REFRESH_SECONDS", "2.0"),
+            str(project_dir / "scripts/migration/auto_refresh_polymarket_dynamic_universe.py"),
+            "--config", str(refresh_config),
+            "--follow", "--poll-seconds",
+            environment.get("MARKETCOW_POLYMARKET_ACTIVATOR_POLL_SECONDS", "2"),
         ),
+        {
+            **environment,
+            "PYTHONPATH": os.pathsep.join((str(project_dir), str(project_dir / "src"))),
+        },
     )
+    gateway_environment = dict(environment)
+    gateway_environment.update({
+        "MARKETCOW_POLYMARKET_RUST_DATA_PLANE_URL": f"http://127.0.0.1:{rust_port}",
+        "MARKETCOW_POLYMARKET_LIVE_STREAM_URI": "",
+    })
     unified_api = Service(
         "unified-api",
         (
@@ -130,8 +185,15 @@ def build_services(
             "--port",
             str(api_port),
         ),
+        gateway_environment,
     )
-    return discovery_collector, collector, unified_api
+    return (
+        discovery_collector,
+        rust_data_plane,
+        unified_api,
+        opportunity_controller,
+        universe_activator,
+    )
 
 
 def supervise(
@@ -156,7 +218,7 @@ def supervise(
             process = subprocess.Popen(
                 service.command,
                 cwd=project_dir,
-                env=dict(environment),
+                env=dict(service.environment or environment),
             )
             processes.append((service, process))
             print(
@@ -202,10 +264,6 @@ def main() -> None:
     # worktree. Production children must always import the selected main
     # checkout, independent of site-packages state.
     environment["PYTHONPATH"] = str(project_dir.resolve(strict=True) / "src")
-    # The collectors' loopback WebSockets are implementation details. Every
-    # stock, crypto and prediction-market API remains on the single public
-    # MarketCow listener.
-    environment["MARKETCOW_POLYMARKET_LIVE_STREAM_URI"] = "ws://127.0.0.1:8794"
     services = build_services(project_dir, environment)
     raise SystemExit(supervise(services, project_dir=project_dir, environment=environment))
 

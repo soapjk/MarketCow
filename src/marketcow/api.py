@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Literal, Optional
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from fastapi import (
     FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect,
 )
@@ -107,6 +109,7 @@ from .polymarket_live_stream import (
     PolymarketLiveProjection,
     PolymarketLiveStreamClient,
 )
+from .polymarket_gateway import RustPolymarketGatewayMiddleware
 from .polymarket_discovery import (
     DiscoveryEventPage,
     DiscoveryMetadataPage,
@@ -539,6 +542,11 @@ def create_app(
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
     app = FastAPI(title="MarketCow", version=__version__)
+    if settings.polymarket_rust_data_plane_url:
+        app.add_middleware(
+            RustPolymarketGatewayMiddleware,
+            base_url=settings.polymarket_rust_data_plane_url,
+        )
     admin_auth = AdminAuth(
         settings.admin_auth_required,
         settings.admin_tokens_json,
@@ -689,6 +697,17 @@ def create_app(
     app.state.polymarket_event_metrics = polymarket_event_metrics
 
     async def read_polymarket_live_health():
+        if settings.polymarket_rust_data_plane_url:
+            async with httpx.AsyncClient(
+                trust_env=False,
+                timeout=httpx.Timeout(10, connect=3),
+            ) as client:
+                response = await client.get(
+                    settings.polymarket_rust_data_plane_url.rstrip("/")
+                    + "/v1/prediction-markets/polymarket/live/health"
+                )
+                response.raise_for_status()
+                return LiveReadHealth.model_validate(response.json())
         if polymarket_live_stream_client is not None:
             return await asyncio.get_running_loop().run_in_executor(
                 polymarket_frame_executor,

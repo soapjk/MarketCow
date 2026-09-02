@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 from pathlib import Path
 
 from marketcow.polymarket_live import (
     ClobBooksClient,
+    GammaCatalogRows,
+    GammaFeeSemanticsPolicy,
     GammaKeysetCatalog,
+    GammaLiveNormalizer,
     LiveStateStore,
     PolymarketLiveCollector,
     live_collector_lease,
@@ -41,6 +45,59 @@ def refresh_catalog_or_reuse_published(
     """
     catalog = getattr(collector.store, "catalog", None)
     if catalog:
+        policy = getattr(
+            getattr(collector, "catalog_client", None),
+            "fee_semantics_policy",
+            None,
+        )
+        incomplete = (
+            [
+                market.identity.market_id
+                for market in catalog.values()
+                if not market.rules.fee_schedule.complete
+            ]
+            if policy is not None else []
+        )
+        if policy is not None and incomplete:
+            raw_path = getattr(collector.store, "raw_catalog_path", None)
+            source = getattr(collector.store, "catalog_source", None) or {}
+            raw_format = source.get("raw_format")
+            if raw_path is None or raw_format not in {
+                "canonical_jsonl", "canonical_json_array",
+            }:
+                raise RuntimeError(
+                    "published catalog cannot be rebuilt from verified Gamma evidence"
+                )
+            rows = (
+                GammaCatalogRows(
+                    raw_path,
+                    row_count=int(source.get("market_count") or 0),
+                    sha256=str(source.get("raw_payload_sha256") or ""),
+                )
+                if raw_format == "canonical_jsonl"
+                else json.loads(raw_path.read_text(encoding="utf-8"))
+            )
+            markets = GammaLiveNormalizer.normalize(
+                rows,
+                collector.store.now_provider(),
+                fee_semantics_policy=policy,
+            )
+            update = collector.store.replace_catalog(markets, rows)
+            remaining = sum(
+                not market.rules.fee_schedule.complete for market in markets
+            )
+            LOGGER.info(
+                "polymarket_catalog_fee_policy_rebuilt market_count=%d "
+                "previous_incomplete_count=%d remaining_incomplete_count=%d",
+                len(markets), len(incomplete), remaining,
+            )
+            return {
+                "status": "published_catalog_fee_policy_rebuilt",
+                "market_count": len(markets),
+                "previous_incomplete_count": len(incomplete),
+                "remaining_incomplete_count": remaining,
+                **update,
+            }
         LOGGER.info(
             "polymarket_catalog_startup_reusing_published market_count=%d",
             len(catalog),
@@ -96,6 +153,14 @@ def main() -> None:
     parser.add_argument("--max-websocket-connections", type=int, default=32)
     parser.add_argument("--catalog-progress-pages", type=int, default=25)
     parser.add_argument(
+        "--fee-semantics-policy",
+        type=Path,
+        help=(
+            "Absolute, versioned protocol policy used to complete Gamma fee facts; "
+            "without it missing provider fields remain fail-closed"
+        ),
+    )
+    parser.add_argument(
         "--market-id", action="append", default=[],
         help=(
             "Hydrate only this indexed market (repeatable, at most 100) and "
@@ -121,6 +186,14 @@ def main() -> None:
 
     if arguments.market_id and arguments.catalog_only:
         parser.error("--catalog-only cannot be combined with --market-id")
+    if arguments.fee_semantics_policy is not None and not (
+        arguments.fee_semantics_policy.is_absolute()
+    ):
+        parser.error("--fee-semantics-policy must be absolute")
+    fee_semantics_policy = (
+        GammaFeeSemanticsPolicy.from_path(arguments.fee_semantics_policy)
+        if arguments.fee_semantics_policy is not None else None
+    )
     with live_collector_lease(arguments.root):
         store = (
             load_scoped_live_store(arguments.root, arguments.market_id)
@@ -131,6 +204,7 @@ def main() -> None:
             GammaKeysetCatalog(
                 spool_root=arguments.root / "spool",
                 progress_every_pages=arguments.catalog_progress_pages,
+                fee_semantics_policy=fee_semantics_policy,
             ),
             ClobBooksClient(
                 timeout=(1.75 if arguments.market_id else 20),

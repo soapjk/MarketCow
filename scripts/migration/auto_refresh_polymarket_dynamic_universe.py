@@ -31,7 +31,7 @@ from scripts.migration.fetch_polymarket_dynamic_candidate_books import (
 
 
 SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh.v2"
-CONFIG_SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh-config.v2"
+CONFIG_SCHEMA_VERSION = "marketcow.polymarket.universe-auto-refresh-config.v3"
 ACTIVATION_SCHEMA_VERSION = "marketcow.polymarket.scope-activation.v1"
 SCOPE_SCHEMA_VERSION = "marketcow.polymarket.scope-discovery.v5"
 
@@ -40,9 +40,8 @@ SCOPE_SCHEMA_VERSION = "marketcow.polymarket.scope-discovery.v5"
 class RefreshConfig:
     service_url: str
     candidate_manifest: Path
-    catalog_index: Path
-    catalog: Path
-    fee_registry: Path
+    catalog_manifest: Path
+    startup_scope: Path
     scope_registry_root: Path
     work_root: Path
     audit_result: Path
@@ -56,8 +55,8 @@ class RefreshConfig:
 def _load_config(path: Path) -> RefreshConfig:
     payload = json.loads(path.resolve(strict=True).read_bytes())
     expected = {
-        "schema_version", "service_url", "candidate_manifest", "catalog_index", "catalog",
-        "fee_registry", "scope_registry_root", "work_root", "audit_result",
+        "schema_version", "service_url", "candidate_manifest", "catalog_manifest",
+        "startup_scope", "scope_registry_root", "work_root", "audit_result",
         "target_market_count", "minimum_market_count",
         "clob_books_endpoint", "request_timeout_seconds", "retry_seconds",
     }
@@ -71,9 +70,8 @@ def _load_config(path: Path) -> RefreshConfig:
     return RefreshConfig(
         service_url=payload["service_url"].rstrip("/"),
         candidate_manifest=Path(payload["candidate_manifest"]),
-        catalog_index=Path(payload["catalog_index"]),
-        catalog=Path(payload["catalog"]),
-        fee_registry=Path(payload["fee_registry"]),
+        catalog_manifest=Path(payload["catalog_manifest"]),
+        startup_scope=Path(payload["startup_scope"]),
         scope_registry_root=Path(payload["scope_registry_root"]),
         work_root=Path(payload["work_root"]),
         audit_result=Path(payload["audit_result"]),
@@ -87,6 +85,125 @@ def _load_config(path: Path) -> RefreshConfig:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@dataclass(frozen=True)
+class CatalogBoundary:
+    revision: str
+    catalog_index: Path
+    catalog: Path
+
+
+def _catalog_boundary(config: RefreshConfig) -> CatalogBoundary:
+    manifest_path = config.catalog_manifest.resolve(strict=True)
+    payload = json.loads(manifest_path.read_bytes())
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != "marketcow.polymarket.live.v2"
+    ):
+        raise ValueError("current catalog manifest is unsupported")
+    revision = payload.get("catalog_revision")
+    normalized = payload.get("normalized_catalog")
+    index = payload.get("catalog_index")
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 64
+        or any(value not in "0123456789abcdef" for value in revision)
+        or not isinstance(normalized, dict)
+        or not isinstance(index, dict)
+        or normalized.get("format") != "canonical_jsonl"
+        or index.get("format") != "sqlite-offset-v1"
+        or normalized.get("catalog_revision", revision) != revision
+        or index.get("catalog_revision") != revision
+    ):
+        raise ValueError("current catalog manifest boundary is incoherent")
+    catalog = Path(str(normalized.get("path") or "")).resolve(strict=True)
+    catalog_index = Path(str(index.get("path") or "")).resolve(strict=True)
+    if _sha256(catalog) != normalized.get("sha256"):
+        raise ValueError("current normalized catalog hash mismatch")
+    if _sha256(catalog_index) != index.get("sha256"):
+        raise ValueError("current catalog index hash mismatch")
+    return CatalogBoundary(revision, catalog_index, catalog)
+
+
+def _selection_relation_registry(
+    selection_path: Path,
+    boundary: CatalogBoundary,
+    output_path: Path,
+) -> Path:
+    """Build the exact relation registry from one immutable selection boundary."""
+    selection = json.loads(selection_path.read_bytes())
+    if selection.get("schema") != "tradude.prediction_market.scope_selection.v2":
+        raise ValueError("candidate manifest must be a Tradude scope selection v2")
+    if selection.get("catalog_revision") != boundary.revision:
+        raise ValueError("selection and current catalog revisions differ")
+    market_ids = selection.get("market_ids")
+    relations = selection.get("relations")
+    if not isinstance(market_ids, list) or not isinstance(relations, list):
+        raise ValueError("selection markets/relations are invalid")
+    import sqlite3
+
+    placeholders = ",".join("?" for _ in market_ids)
+    uri = f"{boundary.catalog_index.as_uri()}?mode=ro&immutable=1"
+    with sqlite3.connect(uri, uri=True) as connection:
+        rows = connection.execute(
+            f"SELECT market_id, byte_offset, byte_length FROM markets "
+            f"WHERE market_id IN ({placeholders}) ORDER BY market_id",
+            market_ids,
+        ).fetchall()
+    market_outcomes: dict[str, dict[str, dict[str, Any]]] = {}
+    with boundary.catalog.open("rb") as catalog:
+        for market_id, offset, length in rows:
+            catalog.seek(offset)
+            row = json.loads(catalog.read(length))
+            outcomes = (row.get("identity") or {}).get("outcomes") or []
+            market_outcomes[str(market_id)] = {
+                str(item.get("outcome", "")).casefold(): item for item in outcomes
+            }
+    if set(market_outcomes) != set(map(str, market_ids)):
+        raise ValueError("selection relation registry cannot resolve every market")
+    groups = []
+    for relation in relations:
+        if not isinstance(relation, dict) or relation.get("complete") is not True:
+            raise ValueError("selection contains an incomplete relation")
+        member_ids = list(map(str, relation.get("member_market_ids") or []))
+        if (
+            not member_ids
+            or int(relation.get("expected_member_count", -1)) != len(member_ids)
+            or int(relation.get("actual_member_count", -1)) != len(member_ids)
+            or set(member_ids) - set(market_outcomes)
+        ):
+            raise ValueError("selection relation membership is invalid")
+        members = []
+        for market_id in member_ids:
+            outcomes = market_outcomes[market_id]
+            yes = outcomes.get("yes")
+            no = outcomes.get("no")
+            if yes is None or no is None:
+                raise ValueError("selection relation member is not binary Yes/No")
+            members.append({
+                "market_id": market_id,
+                "yes_outcome_id": yes["instrument_id"],
+                "no_outcome_id": no["instrument_id"],
+            })
+        material = {
+            "relation_id": relation.get("relation_id"),
+            "members": members,
+        }
+        groups.append({
+            **material,
+            "relation_revision": hashlib.sha256(
+                json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "complete": True,
+        })
+    registry = {
+        "schema_version": "marketcow.polymarket.selection-relation-registry.v1",
+        "catalog_revision": boundary.revision,
+        "negative_risk_groups": groups,
+    }
+    write_atomic_json(output_path, registry)
+    return output_path
 
 
 def _canonical_timestamp(value: str) -> datetime:
@@ -311,6 +428,18 @@ def _activate(
         payload = response.json(parse_float=str, parse_int=str)
         if response.status_code != 200 or payload.get("status") != "activated_ready":
             raise RuntimeError(f"activation failed closed: HTTP {response.status_code} {payload}")
+        startup_temporary = config.startup_scope.with_name(
+            f".{config.startup_scope.name}.{os.getpid()}.tmp"
+        )
+        config.startup_scope.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with startup_temporary.open("xb") as stream:
+                stream.write(candidate_path.read_bytes())
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(startup_temporary, config.startup_scope)
+        finally:
+            startup_temporary.unlink(missing_ok=True)
         return payload
     except Exception:
         # A timeout is ambiguous. Only restore the registered artifact if the service demonstrably
@@ -350,20 +479,26 @@ def refresh_once(
     current_identities = _configured_market_identities(config, session, scope)
     next_generation = current_generation + 1
     config.work_root.mkdir(parents=True, exist_ok=True)
+    boundary = _catalog_boundary(config)
+    relation_registry = _selection_relation_registry(
+        config.candidate_manifest,
+        boundary,
+        config.work_root / f"generation-{next_generation:020d}-relations.json",
+    )
     books_path = config.work_root / f"generation-{next_generation:020d}-candidate-books.json"
     candidate_path = config.work_root / f"generation-{next_generation:020d}-candidate.json"
     books = book_snapshot_builder(
         config.candidate_manifest,
-        config.catalog_index,
+        boundary.catalog_index,
         endpoint=config.clob_books_endpoint,
         timeout_seconds=config.request_timeout_seconds,
     )
     write_atomic_json(books_path, books)
     candidate = universe_builder(
         config.candidate_manifest,
-        config.catalog_index,
-        config.catalog,
-        config.fee_registry,
+        boundary.catalog_index,
+        boundary.catalog,
+        relation_registry,
         books_path,
         universe_id=universe_id,
         generation=next_generation,
@@ -422,7 +557,13 @@ def refresh_once(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--follow", action="store_true")
+    parser.add_argument("--poll-seconds", type=float)
     arguments = parser.parse_args()
+    if arguments.follow != (arguments.poll_seconds is not None):
+        parser.error("--follow and --poll-seconds must be supplied together")
+    if arguments.poll_seconds is not None and arguments.poll_seconds <= 0:
+        parser.error("--poll-seconds must be positive")
     config = _load_config(arguments.config)
     config.work_root.mkdir(parents=True, exist_ok=True)
     lock_path = config.work_root / "auto-refresh.lock"
@@ -436,21 +577,29 @@ def main() -> int:
                 "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             })
             return 0
-        try:
-            result = refresh_once(config)
-        except Exception as error:
-            write_atomic_json(config.audit_result, {
-                "schema_version": SCHEMA_VERSION,
-                "status": "failed_closed",
-                "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "error_type": type(error).__name__,
-                "error": str(error),
-                "real_order_submission_enabled": False,
-            })
-            raise
-        write_atomic_json(config.audit_result, result)
-        print(json.dumps(result, sort_keys=True))
-        return 0
+        last_completed_digest: str | None = None
+        while True:
+            try:
+                digest = _sha256(config.candidate_manifest)
+                if digest != last_completed_digest:
+                    result = refresh_once(config)
+                    write_atomic_json(config.audit_result, result)
+                    print(json.dumps(result, sort_keys=True), flush=True)
+                    last_completed_digest = digest
+            except Exception as error:
+                write_atomic_json(config.audit_result, {
+                    "schema_version": SCHEMA_VERSION,
+                    "status": "failed_closed",
+                    "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "real_order_submission_enabled": False,
+                })
+                if not arguments.follow:
+                    raise
+            if not arguments.follow:
+                return 0
+            time.sleep(arguments.poll_seconds)
 
 
 if __name__ == "__main__":

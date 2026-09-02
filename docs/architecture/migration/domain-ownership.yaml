@@ -1,5 +1,5 @@
-schema_version: marketcow.domain-ownership.v1
-revision: phase0-shadow
+schema_version: marketcow.domain-ownership.v2
+revision: polymarket-final-architecture
 service_boundary:
   kind: market_data_read_service
   trading_interfaces_allowed: false
@@ -7,17 +7,22 @@ service_boundary:
 domains:
   public_gateway:
     current_owner: python
-    shadow_owner: rust
+    polymarket_live_upstream: rust
     writer: none
-  polymarket_realtime:
+  polymarket_discovery:
     current_owner: python
-    shadow_owner: rust
+    public_access: via_unified_gateway
+  polymarket_scope_selection:
+    current_owner: tradude
+    marketcow_ranking_allowed: false
+  polymarket_realtime:
+    current_owner: rust
+    python_fallback_allowed: false
     writer_gate: single_writer_required
-    rust_write_enabled: false
+    rust_write_enabled: true
     real_order_submission_enabled: false
   authoritative_wal:
-    current_owner: python
-    shadow_owner: rust
+    current_owner: rust
     append_only: true
   postgresql:
     current_owner: python
@@ -34,4 +39,5 @@ domains:
     database_credentials_allowed: false
 lifecycle:
   marketcow_owner: marketcow
-  tradude_may_manage_marketcow: false
+  tradude_may_select_scope: true
+  tradude_may_start_or_stop_marketcow: false

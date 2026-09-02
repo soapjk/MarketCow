@@ -1,14 +1,14 @@
 # ADR: Polymarket live scope is dynamically activated inside MarketCow
 
-- Status: accepted
+- Status: implemented
 - Date: 2026-08-28
 - Safety boundary: market-data reads only; real order submission remains outside MarketCow
 
 ## Decision
 
 Polymarket strategies may change their monitored market universe without restarting `marketcowd`.
-Every distinct universe is an immutable, hash-pinned scope artifact and receives a distinct stable
-`scope_id`. The active list is never edited in place.
+One stable `universe_id` identifies the logical universe; each immutable, hash-pinned artifact is a
+monotonically increasing generation. The active list is never edited in place.
 
 An authenticated admin request activates a registered scope by `scope_id` and exact artifact
 SHA-256. MarketCow resolves only `<registry-root>/<scope_id>.json`, rejects symlinks and path
@@ -32,10 +32,12 @@ scope discovery and full-sync again; cursors are never compared across scopes.
 - Registry root: `MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT`
 - Required fields: `scope_id`, `scope_file_sha256`
 - Receipt schema: `marketcow.polymarket.scope-activation-receipt.v1`
-- Successful activation status is initially `activated_unready`; it is not a readiness claim.
+- Successful activation status is `activated_ready`; publication occurs only after the candidate
+  passes the complete warmup/readiness boundary.
 - The endpoint is protected by the existing admin Bearer authentication and append-only audit.
 - The bounded switch queue fails closed when saturated.
-- Tradude may request a data-scope activation but never starts, stops, or restarts MarketCow.
+- Tradude publishes the exact ranked selection. MarketCow alone validates, registers, warms, and
+  activates it; Tradude never starts, stops, or restarts MarketCow.
 - No order, cancel, signing, wallet, or trading-control API is introduced.
 
 ## Consequences

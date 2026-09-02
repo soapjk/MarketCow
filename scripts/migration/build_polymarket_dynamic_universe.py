@@ -130,7 +130,7 @@ def build_dynamic_universe(
         or any(value not in "0123456789abcdefABCDEF" for value in universe_id)
         or generation <= 0
         or minimum_market_count <= 0
-        or minimum_market_count != target_market_count
+        or minimum_market_count > target_market_count
         or target_market_count > 250
         or retry_seconds <= 0
     ):
@@ -152,8 +152,10 @@ def build_dynamic_universe(
         raise ValueError("candidate market identifiers must be decimal strings")
     if len(set(candidates)) != len(candidates):
         raise ValueError("candidate market identifiers must be unique")
-    if len(candidates) != target_market_count:
-        raise ValueError("explicit selection count must equal target market count")
+    if not minimum_market_count <= len(candidates) <= target_market_count:
+        raise ValueError(
+            "explicit selection count must be between minimum and target market count"
+        )
     previous_identity_by_id = _previous_identity_map(previous_market_identities)
     previous_order = list(previous_market_ids or previous_identity_by_id)
     if (
@@ -217,13 +219,13 @@ def build_dynamic_universe(
                 "observed_at": now.isoformat().replace("+00:00", "Z"),
             })
 
-    if len(active) != target_market_count:
+    if len(active) != len(candidates):
         counts: dict[str, int] = {}
         for item in excluded:
             counts[item["reason_code"]] = counts.get(item["reason_code"], 0) + 1
         raise ValueError(
             "Tradude selection is not atomically ready: "
-            f"{len(active)} != {target_market_count}; exclusions={counts}"
+            f"{len(active)} != {len(candidates)} selected; exclusions={counts}"
         )
     active_ids = [market["market_id"] for market in active]
     previous = set(previous_order)

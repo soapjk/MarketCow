@@ -13,6 +13,8 @@ target_storage_launcher="$support_dir/ensure-production-storage.sh"
 target_clickhouse_config="$support_dir/clickhouse-production.xml"
 target_env="$support_dir/production.env"
 domain="gui/$(id -u)"
+rust_build_root="$support_dir/rust-build"
+rust_binary="$support_dir/bin/marketcowd"
 
 production_python="${MARKETCOW_PYTHON:-$project_dir/.venv/bin/python}"
 if [ ! -x "$production_python" ]; then
@@ -52,6 +54,29 @@ cp "$script_dir/clickhouse-production.xml" "$target_clickhouse_config"
 [ -f "$target_env" ] || cp "$project_dir/.env.production" "$target_env"
 chmod 700 "$target_launcher" "$target_storage_launcher"
 chmod 600 "$target_clickhouse_config" "$target_env"
+
+# Build and pin the authoritative Rust data plane locally. The launch job never
+# compiles code and always executes this stable binary path.
+cargo_bin="${CARGO:-$(command -v cargo || true)}"
+[ -x "$cargo_bin" ] || {
+    echo "Missing cargo executable required to build marketcowd" >&2
+    exit 1
+}
+mkdir -p "$rust_build_root" "$support_dir/bin"
+CARGO_TARGET_DIR="$rust_build_root" "$cargo_bin" build \
+    --locked --release -p marketcowd --manifest-path "$project_dir/Cargo.toml"
+rust_temporary="$rust_binary.tmp.$$"
+cp "$rust_build_root/release/marketcowd" "$rust_temporary"
+chmod 700 "$rust_temporary"
+mv "$rust_temporary" "$rust_binary"
+
+PYTHONPATH="$project_dir/src" "$production_python" \
+    "$project_dir/scripts/configure_polymarket_final_architecture.py" \
+    --project-dir "$project_dir" \
+    --support-dir "$support_dir" \
+    --data-root "/Volumes/T9/data/marketcow/production" \
+    --env-file "$target_env" \
+    --rust-binary "$rust_binary"
 
 launchctl bootout "$domain/$label" 2>/dev/null || true
 launchctl enable "$domain/$label"

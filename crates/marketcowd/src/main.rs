@@ -146,6 +146,7 @@ enum WalCommand {
 #[derive(Clone, Serialize)]
 struct Config {
     profile: String,
+    role: String,
     bind: SocketAddr,
     storage_root: PathBuf,
     wal_root: PathBuf,
@@ -453,6 +454,7 @@ fn validate_secret_reference_config(
 impl Config {
     fn load() -> Result<Self> {
         let profile = env::var("MARKETCOW_RUST_PROFILE").unwrap_or_else(|_| "development".into());
+        let role = env::var("MARKETCOW_RUST_ROLE").unwrap_or_else(|_| "public_gateway".into());
         let bind: SocketAddr = env::var("MARKETCOW_RUST_BIND")
             .unwrap_or_else(|_| "127.0.0.1:8870".into())
             .parse()?;
@@ -480,8 +482,14 @@ impl Config {
         if orders {
             bail!("real order submission is prohibited by the migration safety gate");
         }
-        if profile == "production" && bind.port() != 8790 {
-            bail!("production must bind port 8790");
+        if !matches!(role.as_str(), "public_gateway" | "polymarket_data_plane") {
+            bail!("MARKETCOW_RUST_ROLE must be public_gateway or polymarket_data_plane");
+        }
+        if profile == "production" && role == "public_gateway" && bind.port() != 8790 {
+            bail!("production public gateway must bind port 8790");
+        }
+        if profile == "production" && role == "polymarket_data_plane" && bind.port() == 8790 {
+            bail!("production Polymarket data plane must use an internal non-public port");
         }
         if profile != "production" && bind.port() == 8790 {
             bail!("non-production may not bind production port 8790");
@@ -491,14 +499,23 @@ impl Config {
         {
             bail!("non-loopback bind requires explicit MARKETCOW_ALLOW_PUBLIC_BIND=confirmed");
         }
-        if !shadow_mode {
-            bail!("writer/cutover mode is not enabled in this work item");
+        if !shadow_mode && role != "polymarket_data_plane" {
+            bail!("authoritative mode is restricted to the Polymarket data-plane role");
+        }
+        if role == "polymarket_data_plane" && polymarket_live.is_none() {
+            bail!("Polymarket data-plane role requires live configuration");
+        }
+        if role == "polymarket_data_plane"
+            && (legacy_mcp_url.is_some() || hyperliquid_shadow.is_some())
+        {
+            bail!("Polymarket data plane cannot own legacy MCP or Hyperliquid transports");
         }
         if maximum_book_age_ms == 0 {
             bail!("MARKETCOW_RUST_MAX_BOOK_AGE_MS must be positive");
         }
         Ok(Self {
             profile,
+            role,
             bind,
             storage_root,
             wal_root,
@@ -4363,7 +4380,7 @@ async fn serve() -> Result<()> {
     });
     let app = app(state);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    info!(bind=%config.bind, shadow=true, "marketcowd_ready");
+    info!(bind=%config.bind, role=%config.role, shadow=config.shadow_mode, "marketcowd_ready");
     let shutdown_sender = service_shutdown_tx.clone();
     let server_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -4717,6 +4734,10 @@ fn app(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/readiness", get(readiness))
+        .route(
+            "/v1/prediction-markets/polymarket/live/health",
+            get(polymarket_live_health),
+        )
         .route("/v1/prediction-markets/polymarket/live/scope", get(scope))
         .route(
             "/v1/prediction-markets/polymarket/live/snapshot",
@@ -4816,9 +4837,12 @@ fn health_payload(state: &AppState) -> serde_json::Value {
             marketcow_realtime::RealtimeHubHealth::Ready { .. }
         )
     });
+    let projection = state.projection.load_full();
+    let polymarket_ready = polymarket_projection_ready(state, &projection);
     json!({
-        "status":if hyperliquid_ready { "healthy" } else { "degraded" }, "service":"marketcowd", "profile":state.config.profile,
-        "shadow_mode":true, "real_order_submission_enabled":false,
+        "status":if hyperliquid_ready && polymarket_ready { "healthy" } else { "degraded" }, "service":"marketcowd", "profile":state.config.profile,
+        "role":state.config.role,
+        "shadow_mode":state.config.shadow_mode, "real_order_submission_enabled":false,
         "mcp":{
             "enabled":true,
             "endpoint":"/mcp",
@@ -4863,6 +4887,75 @@ fn health_payload(state: &AppState) -> serde_json::Value {
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(health_payload(&state))
+}
+
+async fn polymarket_live_health(State(state): State<AppState>) -> Response {
+    let projection = state.projection.load_full();
+    let ready = polymarket_projection_ready(&state, &projection);
+    let active_market_ids = projection.active_market_ids();
+    let active_token_ids = projection.active_token_ids();
+    let book_token_count = active_token_ids
+        .iter()
+        .filter(|token_id| projection.books.contains_key(*token_id))
+        .count();
+    let maximum_book_age_ms = projection_maximum_effective_book_age_ms(&state, &projection);
+    let reasons = if ready {
+        Vec::<String>::new()
+    } else {
+        vec![
+            projection
+                .fail_closed_reason
+                .clone()
+                .unwrap_or_else(|| "polymarket_projection_unready_or_stale".into()),
+        ]
+    };
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "schema_version":"marketcow.polymarket.live-read-health.v1",
+            "status":if ready { "index_ready" } else { "degraded" },
+            "catalog_revision":state.active_polymarket_scope.load().as_ref()
+                .and_then(|value| value.catalog_revision.clone()),
+            "catalog_index_ready":true,
+            "latest_state_ready":ready,
+            "market_count":active_market_ids.len(),
+            "token_count":active_token_ids.len(),
+            "book_token_count":book_token_count,
+            "book_complete_market_count":active_market_ids.len()
+                .saturating_sub(projection.quarantined_market_ids().len()),
+            "active_market_count":active_market_ids.len(),
+            "terminal_market_count":0,
+            "complete_market_count":if ready { active_market_ids.len() } else { 0 },
+            "missing_market_count":if ready { 0 } else { active_market_ids.len() },
+            "scope_status":if ready { "exact_ready" } else { "data_degraded" },
+            "scope_id":projection.scope_id,
+            "unresolved_gap_count":projection.unresolved_gaps.len(),
+            "latest_cursor":projection.cursor,
+            "persisted_cursor":projection.persisted_cursor,
+            "persistence_lag_events":projection.cursor.saturating_sub(projection.persisted_cursor),
+            "persistence_queue_depth":0,
+            "derived_index_error":null,
+            "live_stream_connected":true,
+            "live_stream_disconnect_count":state.metrics.disconnects.load(Ordering::Relaxed),
+            "event_loop_stall_max_ms":0,
+            "events_read_source":"memory_projection",
+            "realtime_sqlite_query_ms":0,
+            "reason_codes":reasons,
+            "source_policy":"official_free_only",
+            "projection_generation":projection.generation,
+            "scope_market_ids":active_market_ids,
+            "freshness_checked_at":Utc::now(),
+            "oldest_book_received_at":null,
+            "maximum_book_age_ms":maximum_book_age_ms,
+            "authoritative_owner":"marketcowd",
+        })),
+    )
+        .into_response()
 }
 
 async fn hyperliquid_shadow_snapshot(
@@ -6806,8 +6899,10 @@ async fn readiness(State(state): State<AppState>) -> Response {
     (
         status,
         Json(json!({
-            "ready":ready, "mode":"shadow", "scope_id":projection.scope_id,
-            "writer_enabled":false, "real_order_submission_enabled":false,
+            "ready":ready,
+            "mode":if state.config.shadow_mode { "shadow" } else { "authoritative" },
+            "scope_id":projection.scope_id,
+            "writer_enabled":!state.config.shadow_mode, "real_order_submission_enabled":false,
             "fail_closed_reason":if !fresh {
                 Some("book_stale".to_string())
             } else if !polymarket_ready {
@@ -6875,7 +6970,7 @@ async fn scope(
         "universe_id":universe.as_ref().map(|value| value.universe_id.clone()),
         "generation":universe.as_ref().map(|value| value.generation),
         "scope_status":if ready { "ready" } else { "unready" },
-        "mode":"shadow",
+        "mode":if state.config.shadow_mode { "shadow" } else { "authoritative" },
         "ready":ready,
         "market_count":active_market_count,
         "token_count":active_token_count,
@@ -8018,20 +8113,21 @@ fn bootstrap_projection(scope_id: String) -> marketcow_core::Projection {
 async fn admin_migration(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "schema":"marketcow.migration-control.v1",
-        "phase":"shadow",
-        "cutover_allowed":false,
+        "phase":"polymarket_final_architecture",
+        "cutover_allowed":true,
         "checkpoint_persistence":if state.control_plane.persistence_enabled() {
             "healthy"
         } else {
             "degraded_development_only"
         },
         "ownership_registry":{
-            "schema":"marketcow.domain-ownership.v1",
-            "revision":"phase0-shadow",
+            "schema":"marketcow.domain-ownership.v2",
+            "revision":"polymarket-final-architecture",
             "sha256":hex::encode(Sha256::digest(DOMAIN_OWNERSHIP_REGISTRY))
         },
         "real_order_submission_enabled":false,
-        "tradude_may_manage_marketcow":false
+        "tradude_may_manage_marketcow":false,
+        "tradude_may_select_scope":true
     }))
 }
 
@@ -8551,7 +8647,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         format!(
             "# TYPE marketcow_http_requests_total counter\nmarketcow_http_requests_total {}\n\
              # TYPE marketcow_http_errors_total counter\nmarketcow_http_errors_total {}\n\
-             marketcow_real_order_submission_enabled 0\nmarketcow_shadow_mode 1\n\
+             marketcow_real_order_submission_enabled 0\nmarketcow_shadow_mode {}\n\
              marketcow_projection_published_cursor {}\nmarketcow_projection_persisted_cursor {}\n\
              marketcow_unresolved_gaps {}\nmarketcow_book_count {}\nmarketcow_maximum_book_age_ms {}\n\
              marketcow_disconnects_total {}\nmarketcow_ingress_queue_depth 0\n\
@@ -8574,6 +8670,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
              marketcow_hyperliquid_public_channel_depth {}\n",
             state.metrics.requests.load(Ordering::Relaxed),
             state.metrics.errors.load(Ordering::Relaxed),
+            u8::from(state.config.shadow_mode),
             projection.cursor,
             projection.persisted_cursor,
             projection.unresolved_gaps.len(),
@@ -9384,6 +9481,7 @@ mod tests {
         let audit = Arc::new(AuditCoordinator::memory(&dir.path().join("audit.jsonl")));
         let config = Config {
             profile: "test".into(),
+            role: "public_gateway".into(),
             bind: "127.0.0.1:8870".parse().unwrap(),
             storage_root: dir.path().into(),
             wal_root: dir.path().join("wal"),
@@ -12606,16 +12704,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_migration_checkpoint_is_cas_fenced_and_never_enables_cutover() {
+    async fn migration_checkpoint_is_cas_fenced_after_final_cutover() {
         let (_dir, state) = test_state();
         let migration = admin_migration(State(state.clone())).await.0;
         assert_eq!(migration["schema"], "marketcow.migration-control.v1");
-        assert_eq!(migration["cutover_allowed"], false);
+        assert_eq!(migration["cutover_allowed"], true);
         assert_eq!(migration["real_order_submission_enabled"], false);
         assert_eq!(migration["tradude_may_manage_marketcow"], false);
         assert_eq!(
             migration["ownership_registry"]["sha256"],
-            "9c2345373563e1dae75543b6953695af85734678e16f0e4e610e7b983fc648e1"
+            "7a7553c26b6d47a5f57a2f84dd5b0cdf96f872ed05ff44b0192df48c115a7250"
         );
 
         let path = AxumPath((
@@ -13249,6 +13347,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = Config {
             profile: "test".into(),
+            role: "public_gateway".into(),
             bind: "127.0.0.1:8870".parse().unwrap(),
             storage_root: dir.path().into(),
             wal_root: dir.path().join("wal"),

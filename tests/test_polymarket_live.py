@@ -33,6 +33,7 @@ from marketcow.polymarket_live import (
     DataApiPublicClient,
     DataApiPublicNormalizer,
     GammaKeysetCatalog,
+    GammaFeeSemanticsPolicy,
     GammaLiveNormalizer,
     LiveStateStore,
     PolymarketLiveReadError,
@@ -151,6 +152,44 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(published.refresh_calls, 0)
         with self.assertRaises(ConnectionError):
             refresh_catalog_or_reuse_published(Collector({}))
+
+    def test_startup_rebuilds_incomplete_catalog_from_verified_raw_policy(self):
+        store = LiveStateStore(self.root / "policy-rebuild")
+        row = gamma_row()
+        row.pop("fee_schedule")
+        row["feeSchedule"] = {
+            "rate": "0.07", "exponent": "1", "takerOnly": True,
+        }
+        store.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+        self.assertFalse(next(iter(store.catalog.values())).rules.fee_schedule.complete)
+        policy = GammaFeeSemanticsPolicy.model_validate({
+            "schema_version": "marketcow.polymarket.gamma-fee-semantics.v1",
+            "currency": "pUSD",
+            "maker_rate": "0",
+            "formula": "fee = C * feeRate * (p * (1 - p)) ^ exponent",
+            "quantum": "0.00001",
+            "rounding_mode": "UNSPECIFIED",
+            "tie_semantics": "unspecified",
+            "calculation_status": "informational_only",
+            "effective_from": "2026-04-17T00:00:00Z",
+            "revision": "test-fee-semantics-v1",
+            "source": "polymarket_docs",
+            "source_url": "https://docs.polymarket.com/trading/fees",
+            "field_paths": ["fee formula"],
+        })
+        collector = type("Collector", (), {
+            "store": store,
+            "catalog_client": type("Catalog", (), {
+                "fee_semantics_policy": policy,
+            })(),
+        })()
+
+        result = refresh_catalog_or_reuse_published(collector)
+
+        self.assertEqual(result["status"], "published_catalog_fee_policy_rebuilt")
+        self.assertEqual(result["remaining_incomplete_count"], 0)
+        self.assertTrue(next(iter(store.catalog.values())).rules.fee_schedule.complete)
+        self.assertTrue(store.raw_catalog_path.is_file())
 
     def setUp(self):
         self.folder = TemporaryDirectory()
@@ -594,6 +633,48 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(
             {item.source for item in fee.provenance},
             {"polymarket_gamma", "polymarket_docs"},
+        )
+
+    def test_explicit_fee_semantics_complete_current_gamma_v2_schedule(self):
+        row = gamma_row()
+        row.pop("fee_schedule")
+        row["feeSchedule"] = {
+            "rate": "0.07", "exponent": "2", "takerOnly": True,
+        }
+        policy = GammaFeeSemanticsPolicy.model_validate({
+            "schema_version": "marketcow.polymarket.gamma-fee-semantics.v1",
+            "currency": "pUSD",
+            "maker_rate": "0",
+            "formula": "fee = C * feeRate * (p * (1 - p)) ^ exponent",
+            "quantum": "0.00001",
+            "rounding_mode": "UNSPECIFIED",
+            "tie_semantics": "unspecified",
+            "calculation_status": "informational_only",
+            "effective_from": "2026-04-17T00:00:00Z",
+            "revision": "clob-v2-fees-v1",
+            "source": "polymarket_docs",
+            "source_url": "https://docs.polymarket.com/trading/fees",
+            "field_paths": ["fee_formula", "maker_fee_policy"],
+        })
+
+        without_policy = GammaLiveNormalizer.normalize([row], NOW)[0]
+        with_policy = GammaLiveNormalizer.normalize(
+            [row], NOW, fee_semantics_policy=policy,
+        )[0]
+
+        self.assertFalse(without_policy.rules.fee_schedule.complete)
+        fee = with_policy.rules.fee_schedule
+        self.assertTrue(fee.complete)
+        self.assertEqual(fee.currency, "pUSD")
+        self.assertEqual(fee.maker_rate, "0")
+        self.assertEqual(fee.taker_rate, "0.07")
+        self.assertEqual(fee.exponent, "2")
+        self.assertEqual(fee.effective_from, datetime(
+            2026, 4, 17, tzinfo=timezone.utc,
+        ))
+        self.assertEqual(
+            [item.revision for item in fee.provenance][-1],
+            "clob-v2-fees-v1",
         )
 
     def test_catalog_raw_revisions_are_immutable_and_verified_on_restart(self):

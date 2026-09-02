@@ -23,7 +23,7 @@ from urllib.parse import quote
 
 import requests
 import websockets
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .polymarket_contracts import (
     CONTRACT_VERSION,
@@ -1235,6 +1235,64 @@ class LiveFeeSchedule(BaseModel):
         if self.complete != (not missing):
             raise ValueError("fee completeness disagrees with typed schedule")
         return self
+
+
+class GammaFeeSemanticsPolicy(BaseModel):
+    """Explicit protocol facts that Gamma does not repeat on every market.
+
+    Per-market fee rates and exponents still come from the provider payload. This
+    policy supplies only pinned settlement and calculation semantics. Production
+    must opt in with a file; without one the schedule remains fail-closed.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["marketcow.polymarket.gamma-fee-semantics.v1"]
+    currency: str = Field(min_length=1)
+    maker_rate: str
+    formula: str = Field(min_length=1)
+    quantum: str
+    rounding_mode: Literal[
+        "ROUND_DOWN", "ROUND_HALF_EVEN", "ROUND_HALF_UP", "UNSPECIFIED"
+    ]
+    tie_semantics: Literal[
+        "toward_zero", "ties_to_even", "ties_away_from_zero", "unspecified"
+    ]
+    calculation_status: Literal["executable_pnl", "informational_only"]
+    effective_from: datetime
+    revision: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    source_url: str = Field(min_length=1)
+    field_paths: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def typed_policy(self):
+        decimal_text(self.maker_rate, "maker_rate")
+        decimal_text(self.quantum, "quantum", allow_zero=False)
+        expected_ties = {
+            "ROUND_DOWN": "toward_zero",
+            "ROUND_HALF_EVEN": "ties_to_even",
+            "ROUND_HALF_UP": "ties_away_from_zero",
+            "UNSPECIFIED": "unspecified",
+        }
+        if self.tie_semantics != expected_ties[self.rounding_mode]:
+            raise ValueError("fee policy rounding mode and tie semantics disagree")
+        if (
+            self.calculation_status == "executable_pnl"
+            and self.rounding_mode == "UNSPECIFIED"
+        ):
+            raise ValueError("executable fee policy requires deterministic rounding")
+        if self.effective_from.tzinfo is None:
+            raise ValueError("fee policy effective_from must include a timezone")
+        if any(not value.strip() for value in self.field_paths):
+            raise ValueError("fee policy field_paths must be non-empty strings")
+        return self
+
+    @classmethod
+    def from_path(cls, path: Path) -> "GammaFeeSemanticsPolicy":
+        if not path.is_absolute():
+            raise ValueError("Gamma fee semantics policy path must be absolute")
+        return cls.model_validate_json(path.resolve(strict=True).read_bytes())
 
 
 class LiveRuleSet(BaseModel):
@@ -4060,6 +4118,7 @@ class GammaKeysetCatalog:
         progress_every_pages: int = 25,
         progress: Callable[[dict[str, Any]], None] | None = None,
         spool_root: Path | None = None,
+        fee_semantics_policy: GammaFeeSemanticsPolicy | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -4071,6 +4130,7 @@ class GammaKeysetCatalog:
         self.progress_every_pages = max(1, progress_every_pages)
         self.progress = progress or self._log_progress
         self.spool_root = spool_root.resolve() if spool_root else None
+        self.fee_semantics_policy = fee_semantics_policy
         self.sleeper = sleeper
         self.clock = clock
 
@@ -4378,7 +4438,12 @@ class GammaLiveNormalizer:
         )
 
     @staticmethod
-    def normalize(rows: Iterable[dict[str, Any]], observed_at: datetime) -> list[LiveMarket]:
+    def normalize(
+        rows: Iterable[dict[str, Any]],
+        observed_at: datetime,
+        *,
+        fee_semantics_policy: GammaFeeSemanticsPolicy | None = None,
+    ) -> list[LiveMarket]:
         result = []
         pair_labels: dict[str, str] = {}
         for row in rows:
@@ -4497,6 +4562,12 @@ class GammaLiveNormalizer:
                 _instant(fee_schedule["effectiveTo"])
                 if fee_schedule.get("effectiveTo") else None
             )
+            if fee_semantics_policy is not None:
+                fee_currency = fee_currency or fee_semantics_policy.currency
+                maker_rate = maker_rate or fee_semantics_policy.maker_rate
+                fee_formula = fee_formula or fee_semantics_policy.formula
+                fee_quantum = fee_quantum or fee_semantics_policy.quantum
+                effective_from = effective_from or fee_semantics_policy.effective_from
             tick = row.get("orderPriceMinTickSize") or row.get("minimumTickSize") or row.get("tickSize")
             minimum = row.get("orderMinSize") or row.get("minimumOrderSize")
             docs_provenance = GammaLiveNormalizer._provenance(
@@ -4555,6 +4626,17 @@ class GammaLiveNormalizer:
                     "rounding_mode": "UNSPECIFIED",
                 },
                 field_paths=["fee_structure", "fee_precision"],
+            )
+            fee_policy_provenance = (
+                GammaLiveNormalizer._provenance(
+                    source=fee_semantics_policy.source,
+                    revision=fee_semantics_policy.revision,
+                    source_url=fee_semantics_policy.source_url,
+                    observed_at=observed_at,
+                    payload=fee_semantics_policy.model_dump(mode="json"),
+                    field_paths=list(fee_semantics_policy.field_paths),
+                )
+                if fee_semantics_policy is not None else None
             )
             closed = bool(row.get("closed"))
             resolution = row.get("resolution")
@@ -4619,9 +4701,24 @@ class GammaLiveNormalizer:
                         schedule_version=fee_version,
                         **fee_values,
                         effective_to=effective_to,
-                        rounding_mode="UNSPECIFIED", tie_semantics="unspecified",
-                        calculation_status="informational_only",
-                        provenance=[fee_provenance, fee_docs_provenance],
+                        rounding_mode=(
+                            fee_semantics_policy.rounding_mode
+                            if fee_semantics_policy is not None else "UNSPECIFIED"
+                        ),
+                        tie_semantics=(
+                            fee_semantics_policy.tie_semantics
+                            if fee_semantics_policy is not None else "unspecified"
+                        ),
+                        calculation_status=(
+                            fee_semantics_policy.calculation_status
+                            if fee_semantics_policy is not None
+                            else "informational_only"
+                        ),
+                        provenance=[
+                            fee_provenance,
+                            fee_docs_provenance,
+                            *([fee_policy_provenance] if fee_policy_provenance else []),
+                        ],
                         missing_fields=fee_missing,
                         complete=not fee_missing,
                     ),
@@ -7378,7 +7475,11 @@ class PolymarketLiveCollector:
         )
         try:
             observed_markets = GammaLiveNormalizer.normalize(
-                rows, self.store.now_provider(),
+                rows,
+                self.store.now_provider(),
+                fee_semantics_policy=getattr(
+                    self.catalog_client, "fee_semantics_policy", None,
+                ),
             )
         finally:
             cleanup = getattr(rows, "cleanup", None)
@@ -7430,7 +7531,13 @@ class PolymarketLiveCollector:
         if not callable(exact_fetch):
             return set()
         rows, _ = exact_fetch(affected_market_ids)
-        observed_markets = GammaLiveNormalizer.normalize(rows, observed_at)
+        observed_markets = GammaLiveNormalizer.normalize(
+            rows,
+            observed_at,
+            fee_semantics_policy=getattr(
+                self.catalog_client, "fee_semantics_policy", None,
+            ),
+        )
         by_id = {
             market.identity.market_id: market for market in observed_markets
         }
@@ -7537,7 +7644,13 @@ class PolymarketLiveCollector:
         rows, evidence = self.catalog_client.fetch_all()
         publish_started = time.monotonic()
         try:
-            markets = GammaLiveNormalizer.normalize(rows, self.store.now_provider())
+            markets = GammaLiveNormalizer.normalize(
+                rows,
+                self.store.now_provider(),
+                fee_semantics_policy=getattr(
+                    self.catalog_client, "fee_semantics_policy", None,
+                ),
+            )
             update = self.store.replace_catalog(markets, rows)
             rows.mark_published()
         finally:
