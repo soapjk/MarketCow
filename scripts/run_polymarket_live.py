@@ -77,15 +77,14 @@ def refresh_catalog_or_reuse_published(
             "fee_semantics_policy",
             None,
         )
-        incomplete = (
-            [
-                market.identity.market_id
+        incomplete_count = (
+            sum(
+                not market.rules.fee_schedule.complete
                 for market in catalog.values()
-                if not market.rules.fee_schedule.complete
-            ]
-            if policy is not None else []
+            )
+            if policy is not None else 0
         )
-        if policy is not None and incomplete:
+        if policy is not None and incomplete_count:
             raw_path = getattr(collector.store, "raw_catalog_path", None)
             source = getattr(collector.store, "catalog_source", None) or {}
             raw_format = source.get("raw_format")
@@ -95,6 +94,12 @@ def refresh_catalog_or_reuse_published(
                 raise RuntimeError(
                     "published catalog cannot be rebuilt from verified Gamma evidence"
                 )
+            # The verified on-disk catalog remains the rollback boundary. Do not
+            # retain its full Pydantic object graph while constructing another
+            # full-market generation from immutable raw evidence: that doubles
+            # the working set and can force the host into swap.
+            catalog.clear()
+            store.token_to_market.clear()
             rows = (
                 GammaCatalogRows(
                     raw_path,
@@ -116,12 +121,12 @@ def refresh_catalog_or_reuse_published(
             LOGGER.info(
                 "polymarket_catalog_fee_policy_rebuilt market_count=%d "
                 "previous_incomplete_count=%d remaining_incomplete_count=%d",
-                len(markets), len(incomplete), remaining,
+                len(markets), incomplete_count, remaining,
             )
             return {
                 "status": "published_catalog_fee_policy_rebuilt",
                 "market_count": len(markets),
-                "previous_incomplete_count": len(incomplete),
+                "previous_incomplete_count": incomplete_count,
                 "remaining_incomplete_count": remaining,
                 **update,
             }

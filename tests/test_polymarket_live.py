@@ -187,6 +187,7 @@ class PolymarketLiveTest(unittest.TestCase):
         result = refresh_catalog_or_reuse_published(collector)
 
         self.assertEqual(result["status"], "published_catalog_fee_policy_rebuilt")
+        self.assertEqual(result["previous_incomplete_count"], 1)
         self.assertEqual(result["remaining_incomplete_count"], 0)
         self.assertTrue(next(iter(store.catalog.values())).rules.fee_schedule.complete)
         self.assertTrue(store.raw_catalog_path.is_file())
