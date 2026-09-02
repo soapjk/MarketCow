@@ -151,7 +151,7 @@ def main() -> None:
             # startup/reconnect recovery retains the stronger retry policy.
             max_concurrent_snapshot_refreshes=(4 if arguments.market_id else 1),
             periodic_snapshot_request_timeout=(
-                (0.75, 0.75) if arguments.market_id else None
+                (1.75, 1.75) if arguments.market_id else None
             ),
             periodic_snapshot_max_retries=(0 if arguments.market_id else None),
         )
