@@ -6991,51 +6991,73 @@ def catch_up_live_state_index(
         with event_path.open("rb") as stream:
             stream.seek(offset)
             while offset < actual_size:
-                line = stream.readline()
-                if not line.endswith(b"\n"):
-                    raise RuntimeError("durable live event tail is incomplete")
-                event = LiveEventEnvelope.model_validate_json(line)
-                LiveStateStore._validate_event(event, expected_cursor)
-                if event.event_type == "catalog_revision" and event.applied:
-                    catalog_revision = str(
-                        event.canonical_payload.get("catalog_revision") or ""
-                    ) or catalog_revision
-                if event.event_type == "recovery_started" and event.applied:
-                    active_recovery_id = str(
-                        event.canonical_payload.get("recovery_id") or ""
-                    ) or None
-                elif event.event_type == "recovery_completed" and event.applied:
-                    active_recovery_id = None
-                book = None
-                if (
-                    event.applied and event.token_id
-                    and event.event_type in {
-                        "book", "price_change", "best_bid_ask",
-                        "last_trade_price", "tick_size_change",
-                    }
-                ):
-                    book = LiveBook.model_validate(event.canonical_payload)
-                next_offset = offset + len(line)
-                token_to_market = {
-                    gap.token_id: event.market_id
-                    for gap in event.gaps
-                    if gap.token_id and event.market_id
-                }
-                state_index.append(
-                    event,
-                    byte_offset=offset,
-                    byte_length=len(line),
-                    line_sha256=hashlib.sha256(line).hexdigest(),
-                    book=book,
-                    gaps=event.gaps,
-                    catalog_revision=catalog_revision,
-                    event_log_size=next_offset,
-                    token_to_market=token_to_market,
-                    active_recovery_id=active_recovery_id,
-                )
-                offset = next_offset
-                expected_cursor += 1
-                replayed += 1
+                # A stale-but-valid derived index may have millions of durable
+                # events to replay. Commit bounded groups so offline recovery is
+                # fast without creating an unbounded SQLite transaction.
+                with state_index.batch():
+                    for _ in range(state_index.rebuild_batch_size):
+                        if offset >= actual_size:
+                            break
+                        line = stream.readline()
+                        if not line.endswith(b"\n"):
+                            raise RuntimeError(
+                                "durable live event tail is incomplete"
+                            )
+                        event = LiveEventEnvelope.model_validate_json(line)
+                        LiveStateStore._validate_event(event, expected_cursor)
+                        if (
+                            event.event_type == "catalog_revision"
+                            and event.applied
+                        ):
+                            catalog_revision = str(
+                                event.canonical_payload.get(
+                                    "catalog_revision"
+                                ) or ""
+                            ) or catalog_revision
+                        if (
+                            event.event_type == "recovery_started"
+                            and event.applied
+                        ):
+                            active_recovery_id = str(
+                                event.canonical_payload.get("recovery_id") or ""
+                            ) or None
+                        elif (
+                            event.event_type == "recovery_completed"
+                            and event.applied
+                        ):
+                            active_recovery_id = None
+                        book = None
+                        if (
+                            event.applied and event.token_id
+                            and event.event_type in {
+                                "book", "price_change", "best_bid_ask",
+                                "last_trade_price", "tick_size_change",
+                            }
+                        ):
+                            book = LiveBook.model_validate(
+                                event.canonical_payload
+                            )
+                        next_offset = offset + len(line)
+                        token_to_market = {
+                            gap.token_id: event.market_id
+                            for gap in event.gaps
+                            if gap.token_id and event.market_id
+                        }
+                        state_index.append(
+                            event,
+                            byte_offset=offset,
+                            byte_length=len(line),
+                            line_sha256=hashlib.sha256(line).hexdigest(),
+                            book=book,
+                            gaps=event.gaps,
+                            catalog_revision=catalog_revision,
+                            event_log_size=next_offset,
+                            token_to_market=token_to_market,
+                            active_recovery_id=active_recovery_id,
+                        )
+                        offset = next_offset
+                        expected_cursor += 1
+                        replayed += 1
         if offset != actual_size:
             raise RuntimeError("durable live event size changed during tail recovery")
         if replayed:

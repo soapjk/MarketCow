@@ -622,22 +622,21 @@ def create_app(
         ),
     )
     app.state.polymarket_live_read = polymarket_live_read
+    polymarket_discovery_read = PolymarketLiveReadStore(
+        settings.storage_root / "prediction-markets" / "polymarket-discovery",
+        stable_snapshot_max_book_age_seconds=(
+            settings.polymarket_consumer_maximum_book_age_seconds
+        ),
+        consumer_maximum_book_age_seconds=(
+            settings.polymarket_consumer_maximum_book_age_seconds
+        ),
+        minimum_delivery_headroom_seconds=(
+            settings.polymarket_minimum_delivery_headroom_seconds
+        ),
+    )
     polymarket_discovery = (
         PolymarketDiscoveryStore(
-            PolymarketLiveReadStore(
-                settings.storage_root
-                / "prediction-markets"
-                / "polymarket-discovery",
-                stable_snapshot_max_book_age_seconds=(
-                    settings.polymarket_consumer_maximum_book_age_seconds
-                ),
-                consumer_maximum_book_age_seconds=(
-                    settings.polymarket_consumer_maximum_book_age_seconds
-                ),
-                minimum_delivery_headroom_seconds=(
-                    settings.polymarket_minimum_delivery_headroom_seconds
-                ),
-            ),
+            polymarket_discovery_read,
             depth_notionals=settings.polymarket_discovery_depth_notionals,
             maximum_book_age_ms=int(
                 settings.polymarket_consumer_maximum_book_age_seconds * 1000
@@ -1702,7 +1701,17 @@ def create_app(
     )
     def polymarket_live_candidates():
         try:
-            path, metadata = polymarket_live_read.candidate_snapshot_path()
+            try:
+                path, metadata = (
+                    polymarket_discovery_read.candidate_snapshot_path()
+                )
+            except PolymarketLiveReadError as exc:
+                if exc.code not in {
+                    "polymarket_catalog_index_unavailable",
+                    "polymarket_candidate_snapshot_unavailable",
+                }:
+                    raise
+                path, metadata = polymarket_live_read.candidate_snapshot_path()
             return FileResponse(
                 path,
                 media_type="application/json",
