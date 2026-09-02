@@ -37,7 +37,10 @@ class ConfigurePolymarketFinalArchitectureTest(unittest.TestCase):
                 path.mkdir(parents=True)
             (project / "ops/polymarket/fee-semantics-v2.json").write_text("{}")
             (tradude / "examples/polymarket/run_opportunity_scope_controller.py").write_text("")
-            python.write_text("#!/bin/sh\n")
+            python.write_text(
+                "#!/bin/sh\n"
+                "exit 0\n"
+            )
             rust.write_text("binary")
             os.chmod(python, 0o700)
             os.chmod(rust, 0o700)
@@ -48,7 +51,12 @@ class ConfigurePolymarketFinalArchitectureTest(unittest.TestCase):
                 "scope_id": scope_id,
                 "market_count": 1,
                 "token_count": 2,
-                "universe": {"universe_id": scope_id, "generation": 9},
+                "universe": {
+                    "schema_version": "marketcow.polymarket.universe.v1",
+                    "universe_id": scope_id,
+                    "generation": 9,
+                    "excluded_markets": [{"reason_code": "target_capacity"}],
+                },
             }))
             env_file = support / "production.env"
             env_file.write_text(
@@ -85,6 +93,12 @@ class ConfigurePolymarketFinalArchitectureTest(unittest.TestCase):
             self.assertEqual(refresh["startup_scope"], result["scope_file"])
             self.assertEqual(refresh["target_market_count"], 100)
             self.assertEqual(refresh["minimum_market_count"], 1)
+            active = json.loads(Path(result["scope_file"]).read_text())
+            self.assertEqual(
+                active["universe"]["schema_version"],
+                "marketcow.polymarket.universe.v2",
+            )
+            self.assertEqual(active["universe"]["excluded_markets"], [])
 
 
 if __name__ == "__main__":

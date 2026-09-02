@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import secrets
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,14 @@ def _scope_payload(path: Path) -> dict[str, Any]:
         or int(payload.get("token_count", 0)) != 2 * int(payload["market_count"])
     ):
         raise ValueError(f"invalid Rust v4 Polymarket seed scope: {path}")
+    universe_schema = universe.get("schema_version")
+    if universe_schema == "marketcow.polymarket.universe.v1":
+        universe["schema_version"] = "marketcow.polymarket.universe.v2"
+        # V1 carried ranking exclusions that are not part of the active scope.
+        # V2 exclusions are reserved for MarketCow validation failures.
+        universe["excluded_markets"] = []
+    elif universe_schema != "marketcow.polymarket.universe.v2":
+        raise ValueError(f"unsupported dynamic universe seed schema: {path}")
     return payload
 
 
@@ -129,9 +138,11 @@ def configure(
         payload = _scope_payload(active_scope)
     else:
         seed = _choose_seed(support_dir, explicit_seed)
-        body = seed.read_bytes()
-        _atomic_write(active_scope, body)
-        payload = _scope_payload(active_scope)
+        payload = _scope_payload(seed)
+    _atomic_write(
+        active_scope,
+        json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n",
+    )
     scope_id = payload["scope_id"]
     registry_scope = registry_root / f"{scope_id}.json"
     _atomic_write(registry_scope, active_scope.read_bytes())
@@ -153,16 +164,36 @@ def configure(
     configured_tradude_python = Path(current.get(
         "MARKETCOW_TRADUDE_PYTHON", str(canonical_tradude_python),
     ))
+    def usable_tradude_python(candidate: Path) -> bool:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return False
+        try:
+            result = subprocess.run(
+                [
+                    str(candidate),
+                    "-c",
+                    "import pyarrow; import domains.prediction_markets.discovery.opportunity_controller",
+                ],
+                env={**os.environ, "PYTHONPATH": str(tradude_root)},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+
     tradude_python = (
         configured_tradude_python
-        if configured_tradude_python.is_file()
-        and os.access(configured_tradude_python, os.X_OK)
+        if usable_tradude_python(configured_tradude_python)
         else canonical_tradude_python
-    ).resolve(strict=True)
+    ).absolute()
     controller_entrypoint = (
         tradude_root / "examples/polymarket/run_opportunity_scope_controller.py"
     )
-    if not controller_entrypoint.is_file() or not os.access(tradude_python, os.X_OK):
+    if not controller_entrypoint.is_file() or not usable_tradude_python(tradude_python):
         raise RuntimeError("Tradude opportunity controller is not executable")
 
     api_port = int(current.get("MARKETCOW_PORT", "8790"))
