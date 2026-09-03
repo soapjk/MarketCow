@@ -430,6 +430,39 @@ class PolymarketLiveTest(unittest.TestCase):
         reader.recover_with_loaded_catalog()
         self.assertTrue(reader._recovered)
 
+    def test_fresh_start_anchors_tail_without_replaying_broken_index(self):
+        root = self.root / "fresh-tail-start"
+        writer = LiveStateStore(root)
+        row = gamma_row()
+        writer.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        expected_cursor = writer.cursor
+        expected_size = writer.event_path.stat().st_size
+        writer.state_index.close()
+        writer.state_index.path.write_bytes(b"broken derived index")
+        for suffix in ("-wal", "-shm"):
+            writer.state_index.path.with_name(
+                f"{writer.state_index.path.name}{suffix}"
+            ).unlink(missing_ok=True)
+
+        reader = LiveStateStore(root)
+        reader._load_catalog(reader.catalog_path)
+        reader.start_from_durable_tail()
+
+        self.assertTrue(reader._recovered)
+        self.assertEqual(reader.cursor, expected_cursor)
+        self.assertEqual(reader._event_offset, expected_size)
+        self.assertEqual(reader.books, {})
+        with sqlite3.connect(reader.state_index.path) as connection:
+            self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            event_offset_count = connection.execute(
+                "SELECT COUNT(*) FROM event_offsets"
+            ).fetchone()[0]
+        self.assertEqual(int(metadata["latest_cursor"]), expected_cursor)
+        self.assertEqual(int(metadata["event_log_size"]), expected_size)
+        self.assertEqual(event_offset_count, 1)
+
     def test_startup_does_not_rebuild_provider_incomplete_fee_facts(self):
         store = LiveStateStore(self.root / "provider-incomplete-fee")
         row = gamma_row()

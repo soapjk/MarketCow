@@ -3745,6 +3745,59 @@ class LiveStateIndex:
             temporary.unlink(missing_ok=True)
         self._publish_manifest()
 
+    def reset_to_durable_tail(
+        self,
+        *,
+        event: LiveEventEnvelope | None,
+        event_log_size: int,
+        byte_offset: int,
+        byte_length: int,
+        line_sha256: str,
+        catalog_revision: str | None,
+    ) -> None:
+        """Publish an empty live projection anchored at the durable tail."""
+        self.close()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.fresh")
+        temporary.unlink(missing_ok=True)
+        try:
+            with sqlite3.connect(temporary) as connection:
+                self._schema(connection, wal=False)
+                latest_cursor = event.cursor if event is not None else 0
+                if event is not None:
+                    connection.execute(
+                        """INSERT INTO event_offsets(
+                            cursor, byte_offset, byte_length, event_id,
+                            market_id, token_id, line_sha256
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            event.cursor, byte_offset, byte_length,
+                            event.event_id, event.market_id, event.token_id,
+                            line_sha256,
+                        ),
+                    )
+                self._set_metadata(connection, {
+                    "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                    "catalog_revision": catalog_revision or "",
+                    "latest_cursor": latest_cursor,
+                    "event_log_size": event_log_size,
+                    "active_recovery_id": "",
+                    "book_token_count": 0,
+                    "book_complete_market_count": 0,
+                    "unresolved_gap_count": 0,
+                    "oldest_book_received_at": "",
+                })
+                connection.commit()
+            with _publication_lock(self.root, exclusive=True):
+                for suffix in ("-wal", "-shm"):
+                    self.path.with_name(
+                        f"{self.path.name}{suffix}"
+                    ).unlink(missing_ok=True)
+                os.replace(temporary, self.path)
+                self._publish_manifest()
+        finally:
+            temporary.unlink(missing_ok=True)
+
     @staticmethod
     def _commit_rebuild_batch(
         connection: sqlite3.Connection, values: dict[str, Any],
@@ -7350,6 +7403,37 @@ class LiveStateStore:
             self._recover_unlocked(load_catalog=False)
             self._recovered = True
 
+    def start_from_durable_tail(self) -> None:
+        """Start a fresh live projection without replaying historical state."""
+        with self._sync_lock:
+            if not self.catalog or self.catalog_revision is None:
+                raise RuntimeError("live catalog must be loaded before startup")
+            (
+                tail, event_log_size, byte_offset, byte_length, line_sha256,
+            ) = _durable_event_log_tail_record(self.event_path)
+            self.books = {}
+            self.gaps = []
+            self.events.clear()
+            self.seen_raw_hashes.clear()
+            self._seen_raw_hash_order.clear()
+            self.active_recovery_id = None
+            self.cursor = tail.cursor if tail is not None else 0
+            self._event_offset = event_log_size
+            self._last_log_cursor = self.cursor
+            self.persisted_cursor = self.cursor
+            self.indexed_cursor = self.cursor
+            self.state_index.reset_to_durable_tail(
+                event=tail,
+                event_log_size=event_log_size,
+                byte_offset=byte_offset,
+                byte_length=byte_length,
+                line_sha256=line_sha256,
+                catalog_revision=self.catalog_revision,
+            )
+            self._state_index_available = True
+            self.derived_index_error = None
+            self._recovered = True
+
     def _ensure_loaded(self) -> None:
         """Preserve legacy stateful behavior without blocking app construction."""
         with self._sync_lock:
@@ -7652,17 +7736,17 @@ def catch_up_live_state_index(
         }
 
 
-def _durable_event_log_tail(
+def _durable_event_log_tail_record(
     event_path: Path,
-) -> tuple[LiveEventEnvelope | None, int]:
+) -> tuple[LiveEventEnvelope | None, int, int, int, str]:
     """Read and authenticate only the final append-only event-log record."""
     if not event_path.is_file():
-        return None, 0
+        return None, 0, 0, 0, ""
     with event_path.open("rb") as stream:
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
         if size == 0:
-            return None, 0
+            return None, 0, 0, 0, ""
         stream.seek(size - 1)
         if stream.read(1) != b"\n":
             raise RuntimeError("durable live event log ends with a partial row")
@@ -7680,12 +7764,19 @@ def _durable_event_log_tail(
                 start = position + newline + 1
                 break
         stream.seek(start)
-        line = stream.read(end - start)
+        line = stream.read(size - start)
     try:
         event = LiveEventEnvelope.model_validate_json(line)
         LiveStateStore._validate_event(event, event.cursor)
     except ValueError as exc:
         raise RuntimeError("durable live event log tail is invalid") from exc
+    return event, size, start, len(line), hashlib.sha256(line).hexdigest()
+
+
+def _durable_event_log_tail(
+    event_path: Path,
+) -> tuple[LiveEventEnvelope | None, int]:
+    event, size, _, _, _ = _durable_event_log_tail_record(event_path)
     return event, size
 
 

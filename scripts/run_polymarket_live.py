@@ -328,7 +328,7 @@ def main() -> None:
             if realtime_evidence is not None:
                 evidence = {**evidence, **realtime_evidence}
             if isinstance(store, LiveStateStore) and not store._recovered:
-                store.recover_with_loaded_catalog()
+                store.start_from_durable_tail()
             print(evidence)
         if arguments.catalog_only:
             return
