@@ -3447,7 +3447,6 @@ async fn commit_polymarket_scope_switch(
     if let Some(universe) = activated.universe.as_ref() {
         let candidate = candidate_runtime.projection();
         if candidate.cursor <= previous_cursor
-            || !candidate.ready
             || !candidate.instrument_ticks_consistent()
             || !projection_matches_polymarket_scope(&activated, &candidate, true)
         {
@@ -7978,8 +7977,7 @@ async fn prepare_polymarket_scope_candidate(
             .map_err(|error| format!("scope_catalog_seed_failed:{error}"))?;
         let projection = runtime.projection();
         if activated.universe.is_some()
-            && (!projection.ready
-                || !projection.instrument_ticks_consistent()
+            && (!projection.instrument_ticks_consistent()
                 || !projection_matches_polymarket_scope(&activated, &projection, true))
         {
             return Err("universe_candidate_not_ready".into());
