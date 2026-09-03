@@ -1680,7 +1680,7 @@ class PolymarketLiveTest(unittest.TestCase):
         ):
             client.fetch_stream(["a"], require_complete_batches=True)
 
-    def test_partial_books_bootstrap_does_not_publish_incomplete_batch(self):
+    def test_partial_books_bootstrap_starts_with_available_books(self):
         rows = [
             gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1")),
             gamma_row("m2", "0x" + "2" * 64, ("yes-2", "no-2")),
@@ -1702,16 +1702,15 @@ class PolymarketLiveTest(unittest.TestCase):
             books,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
-            asyncio.run(collector.bootstrap_books())
+        asyncio.run(collector.bootstrap_books())
 
         health = store.health()
         self.assertEqual(health.status, "degraded")
-        self.assertEqual(health.book_token_count, 0)
-        self.assertEqual(health.missing_book_token_count, 4)
-        self.assertEqual(health.ready_market_count, 0)
+        self.assertEqual(health.book_token_count, 2)
+        self.assertEqual(health.missing_book_token_count, 2)
+        self.assertEqual(health.ready_market_count, 1)
         self.assertIsNone(store.active_recovery_id)
-        self.assertEqual(store.frame("m1", now=NOW).status, "fail_closed")
+        self.assertEqual(store.frame("m1", now=NOW).status, "ready")
         self.assertEqual(store.frame("m2", now=NOW).status, "fail_closed")
 
     def test_bootstrap_retry_after_incomplete_batch_converges_recovery(self):
@@ -1736,9 +1735,8 @@ class PolymarketLiveTest(unittest.TestCase):
             partial,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
-            asyncio.run(collector.bootstrap_books())
-        self.assertEqual(store.books, {})
+        asyncio.run(collector.bootstrap_books())
+        self.assertEqual(set(store.books), {"yes-1", "no-1"})
         self.assertIsNone(store.active_recovery_id)
 
         collector.books_client = ClobBooksClient(
