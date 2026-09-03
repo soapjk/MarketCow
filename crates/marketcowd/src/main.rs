@@ -4183,7 +4183,6 @@ fn polymarket_projection_ready(state: &AppState, projection: &marketcow_core::Pr
     projection.ready
         && projection.instrument_ticks_consistent()
         && projection.active_market_books_two_sided()
-        && projection_fresh(state, projection)
         && state
             .active_polymarket_scope
             .load()
@@ -6891,7 +6890,6 @@ fn mcp_error(request_id: serde_json::Value, code: i64, message: &str) -> serde_j
 
 async fn readiness(State(state): State<AppState>) -> Response {
     let projection = state.projection.load_full();
-    let fresh = projection_fresh(&state, &projection);
     let hyperliquid_ready = state.hyperliquid_shadow.as_ref().is_none_or(|reader| {
         matches!(
             reader.snapshot().health,
@@ -6912,9 +6910,7 @@ async fn readiness(State(state): State<AppState>) -> Response {
             "mode":if state.config.shadow_mode { "shadow" } else { "authoritative" },
             "scope_id":projection.scope_id,
             "writer_enabled":!state.config.shadow_mode,
-            "fail_closed_reason":if !fresh {
-                Some("book_stale".to_string())
-            } else if !polymarket_ready {
+            "fail_closed_reason":if !polymarket_ready {
                 projection.fail_closed_reason.clone().or_else(|| Some("polymarket_projection_unready".into()))
             } else if !hyperliquid_ready {
                 Some("hyperliquid_shadow_unready".into())
@@ -13162,7 +13158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_projection_is_not_ready_even_when_book_state_is_valid() {
+    async fn stale_book_does_not_disable_an_otherwise_valid_shadow_projection() {
         let (_dir, state) = test_state();
         let mut projection = bootstrap_projection("s".into());
         projection.ready = true;
@@ -13198,7 +13194,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
