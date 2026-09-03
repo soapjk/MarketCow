@@ -3109,6 +3109,7 @@ fn start_polymarket_live(
                                 continue 'service;
                             }
                             Err(error) => {
+                                warn!(error=%error, "polymarket_scope_activation_failed");
                                 let _ = response.send(Err(error));
                                 match wait_for_polymarket_retry_or_scope_recovery(
                                     &state,
@@ -7960,6 +7961,10 @@ async fn prepare_polymarket_scope_candidate(
                 wal_segment_bytes: 256 * 1024 * 1024,
                 recent_event_capacity: POLYMARKET_RECENT_EVENT_CAPACITY,
             };
+            if candidate_config.root.exists() {
+                fs::remove_dir_all(&candidate_config.root)
+                    .map_err(|error| format!("universe_candidate_cleanup_failed:{error}"))?;
+            }
             active_runtime
                 .blocking_lock()
                 .fork_candidate(candidate_config)
@@ -10622,6 +10627,13 @@ mod tests {
             .store(Some(Arc::new(current.clone())));
 
         let next = dynamic_universe_live(&universe_id, 2, "2", "30", "40", Some("1"));
+        let stale_candidate = dir
+            .path()
+            .join("polymarket-universes")
+            .join(&universe_id)
+            .join("generation-00000000000000000002");
+        fs::create_dir_all(&stale_candidate).unwrap();
+        fs::write(stale_candidate.join("failed-attempt"), b"stale").unwrap();
         let candidate = prepare_polymarket_scope_candidate(&state, &current, &next)
             .await
             .unwrap();
