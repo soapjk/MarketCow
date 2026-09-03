@@ -3618,6 +3618,9 @@ class LiveStateIndex:
         catalog_revision: str | None,
         token_to_market: dict[str, str],
         active_recovery_id: str | None = None,
+        verified_event_offsets: list[
+            tuple[LiveEventEnvelope, int, int, str]
+        ] | None = None,
     ) -> None:
         self.close()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -3628,7 +3631,33 @@ class LiveStateIndex:
         try:
             with sqlite3.connect(temporary) as connection:
                 self._schema(connection, wal=False)
-                if event_path.exists():
+                if verified_event_offsets is not None:
+                    for event, byte_offset, byte_length, line_sha256 in (
+                        verified_event_offsets
+                    ):
+                        if event.cursor != latest_cursor + 1:
+                            raise RuntimeError(
+                                "verified live event cursor is not contiguous"
+                            )
+                        connection.execute(
+                            """INSERT INTO event_offsets(
+                                cursor, byte_offset, byte_length, event_id,
+                                market_id, token_id, line_sha256
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                event.cursor, byte_offset, byte_length,
+                                event.event_id, event.market_id, event.token_id,
+                                line_sha256,
+                            ),
+                        )
+                        latest_cursor = event.cursor
+                        event_log_size = byte_offset + byte_length
+                    actual_size = event_path.stat().st_size if event_path.exists() else 0
+                    if actual_size != event_log_size:
+                        raise RuntimeError(
+                            "verified live event log changed during recovery"
+                        )
+                elif event_path.exists():
                     with event_path.open("rb") as stream:
                         while True:
                             byte_offset = stream.tell()
@@ -7196,10 +7225,15 @@ class LiveStateStore:
             ) or None
         self.cursor = max(self.cursor, event.cursor)
 
-    def _read_all_events(self) -> tuple[list[LiveEventEnvelope], int]:
+    def _read_verified_events(self) -> tuple[
+        list[LiveEventEnvelope],
+        list[tuple[LiveEventEnvelope, int, int, str]],
+        int,
+    ]:
         if not self.event_path.exists():
-            return [], 0
+            return [], [], 0
         events = []
+        verified_offsets = []
         offset = 0
         expected = 1
         with self.event_path.open("rb") as stream:
@@ -7218,8 +7252,15 @@ class LiveStateStore:
                     raise RuntimeError("live event log contains invalid JSON") from exc
                 self._validate_event(event, expected)
                 events.append(event)
+                verified_offsets.append(
+                    (event, start, len(line), hashlib.sha256(line).hexdigest())
+                )
                 expected += 1
                 offset = stream.tell()
+        return events, verified_offsets, offset
+
+    def _read_all_events(self) -> tuple[list[LiveEventEnvelope], int]:
+        events, _, offset = self._read_verified_events()
         return events, offset
 
     def _rebuild_from_checkpoint(
@@ -7281,7 +7322,7 @@ class LiveStateStore:
             body = self.checkpoint_path.read_bytes()
             checkpoint = self._validate_checkpoint(body)
             self._checkpoint_file_sha256 = hashlib.sha256(body).hexdigest()
-        events, offset = self._read_all_events()
+        events, verified_offsets, offset = self._read_verified_events()
         self._rebuild_from_checkpoint(checkpoint, events)
         self._event_offset = offset
         self.persisted_cursor = self.cursor
@@ -7292,6 +7333,7 @@ class LiveStateStore:
             catalog_revision=self.catalog_revision,
             token_to_market=self.token_to_market,
             active_recovery_id=self.active_recovery_id,
+            verified_event_offsets=verified_offsets,
         )
 
     def recover(self) -> None:
