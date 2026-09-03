@@ -287,18 +287,21 @@ def _books(tmp_path: Path, *, one_sided: set[str] | None = None) -> Path:
     return path
 
 
-def test_dynamic_universe_does_not_replace_failed_tradude_member(tmp_path: Path) -> None:
+def test_dynamic_universe_uses_available_subset_of_tradude_selection(tmp_path: Path) -> None:
     manifest, index, catalog, registry = _fixture(tmp_path)
-    with pytest.raises(ValueError, match="Tradude selection is not atomically ready"):
-        build_dynamic_universe(
-            manifest, index, catalog, registry, _books(tmp_path, one_sided={"10"}),
-            universe_id="a" * 64,
-            generation=7,
-            target_market_count=2,
-            minimum_market_count=2,
-            previous_market_ids=["1"],
-            validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
-        )
+    result = build_dynamic_universe(
+        manifest, index, catalog, registry, _books(tmp_path, one_sided={"10"}),
+        universe_id="a" * 64,
+        generation=7,
+        target_market_count=2,
+        minimum_market_count=1,
+        previous_market_ids=["1"],
+        validated_at=datetime(2026, 8, 29, tzinfo=timezone.utc),
+    )
+
+    assert result["market_ids"] == ["2"]
+    assert result["universe"]["removed_markets"] == ["1"]
+    assert result["universe"]["excluded_markets"][0]["reason_code"] == "one_sided_book"
 
 
 def test_dynamic_universe_preserves_explicit_selection_order(tmp_path: Path) -> None:

@@ -219,13 +219,13 @@ def build_dynamic_universe(
                 "observed_at": now.isoformat().replace("+00:00", "Z"),
             })
 
-    if len(active) != len(candidates):
+    if len(active) < minimum_market_count:
         counts: dict[str, int] = {}
         for item in excluded:
             counts[item["reason_code"]] = counts.get(item["reason_code"], 0) + 1
         raise ValueError(
             "Tradude selection is not atomically ready: "
-            f"{len(active)} != {len(candidates)} selected; exclusions={counts}"
+            f"{len(active)} < {minimum_market_count} minimum; exclusions={counts}"
         )
     active_ids = [market["market_id"] for market in active]
     previous = set(previous_order)
