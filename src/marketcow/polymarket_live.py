@@ -6999,17 +6999,88 @@ class LiveStateStore:
             or _file_sha256(normalized_path) != normalized.get("sha256")
         ):
             raise RuntimeError("normalized live catalog integrity failed")
+        revision = str(payload.get("catalog_revision") or "")
+        realtime_universe = payload.get("realtime_universe")
+        realtime_market_ids = None
+        if isinstance(realtime_universe, dict):
+            declared_market_ids = {
+                str(value) for value in realtime_universe.get("market_ids") or []
+            }
+            realtime_market_ids = self._validate_realtime_universe(
+                realtime_universe,
+                catalog_revision=revision,
+                available_market_ids=declared_market_ids,
+            )
+
         markets = []
-        with normalized_path.open("r", encoding="utf-8") as stream:
-            for line in stream:
-                if line.strip():
-                    markets.append(LiveMarket.model_validate_json(line))
-        if len(markets) != int(normalized.get("market_count") or -1):
-            raise RuntimeError("normalized live catalog row count mismatch")
-        markets.sort(key=lambda item: item.identity.market_id)
-        observed_revision = _market_sequence_sha256(markets)
-        if observed_revision != payload.get("catalog_revision"):
-            raise RuntimeError("live catalog integrity failed")
+        if realtime_market_ids is None:
+            with normalized_path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        markets.append(LiveMarket.model_validate_json(line))
+            if len(markets) != int(normalized.get("market_count") or -1):
+                raise RuntimeError("normalized live catalog row count mismatch")
+            markets.sort(key=lambda item: item.identity.market_id)
+            if _market_sequence_sha256(markets) != revision:
+                raise RuntimeError("live catalog integrity failed")
+        else:
+            # The immutable JSONL and its offset index are checksum-bound to the
+            # complete catalog revision. Once a bounded realtime generation
+            # exists, hydrate only its rows instead of retaining the full Gamma
+            # directory as hundreds of thousands of Python object graphs.
+            catalog_index = payload.get("catalog_index")
+            if not isinstance(catalog_index, dict):
+                raise RuntimeError("bounded live catalog lacks its offset index")
+            index_path = Path(str(catalog_index.get("path") or "")).resolve()
+            if (
+                not index_path.is_relative_to(self.root / "catalog-indexes")
+                or not index_path.is_file()
+                or _file_sha256(index_path) != catalog_index.get("sha256")
+            ):
+                raise RuntimeError("bounded live catalog index integrity failed")
+            with _readonly_sqlite(index_path) as connection:
+                metadata = _catalog_index_metadata(connection)
+                if any(
+                    metadata.get(key) != value
+                    for key, value in {
+                        "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+                        "catalog_revision": revision,
+                        "catalog_sha256": str(normalized.get("sha256") or ""),
+                        "market_count": str(normalized.get("market_count") or ""),
+                    }.items()
+                ):
+                    raise RuntimeError("bounded live catalog index binding failed")
+                indexed_rows: dict[str, sqlite3.Row] = {}
+                selected_ids = sorted(realtime_market_ids)
+                for offset in range(0, len(selected_ids), 500):
+                    batch = selected_ids[offset:offset + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    indexed_rows.update({
+                        str(row["market_id"]): row
+                        for row in connection.execute(
+                            f"""SELECT market_id, byte_offset, byte_length,
+                                row_sha256 FROM markets
+                                WHERE market_id IN ({placeholders})""",
+                            batch,
+                        )
+                    })
+            if set(indexed_rows) != set(realtime_market_ids):
+                raise RuntimeError("bounded live catalog index coverage failed")
+            with normalized_path.open("rb") as stream:
+                for market_id in sorted(realtime_market_ids):
+                    indexed = indexed_rows[market_id]
+                    stream.seek(int(indexed["byte_offset"]))
+                    body = stream.read(int(indexed["byte_length"]))
+                    if (
+                        stream.read(1) != b"\n"
+                        or hashlib.sha256(body).hexdigest()
+                        != indexed["row_sha256"]
+                    ):
+                        raise RuntimeError("bounded live catalog row integrity failed")
+                    market = LiveMarket.model_validate_json(body)
+                    if market.identity.market_id != market_id:
+                        raise RuntimeError("bounded live catalog row identity failed")
+                    markets.append(market)
         catalog_source = payload.get("catalog_source")
         raw_path = None
         if catalog_source:
@@ -7022,15 +7093,10 @@ class LiveStateStore:
             ):
                 raise RuntimeError("live raw catalog integrity failed")
         self.catalog = {item.identity.market_id: item for item in markets}
-        realtime_universe = payload.get("realtime_universe")
-        realtime_market_ids = (
-            self._validate_realtime_universe(
-                realtime_universe,
-                catalog_revision=str(payload.get("catalog_revision") or ""),
-                available_market_ids=set(self.catalog),
-            )
-            if isinstance(realtime_universe, dict) else None
-        )
+        if realtime_market_ids is not None and set(self.catalog) != set(
+            realtime_market_ids
+        ):
+            raise RuntimeError("bounded live catalog hydration is incomplete")
         self.token_to_market = {
             outcome.token_id: market.identity.market_id
             for market in markets
@@ -7041,7 +7107,7 @@ class LiveStateStore:
             )
             for outcome in market.identity.outcomes
         }
-        self.catalog_revision = payload.get("catalog_revision")
+        self.catalog_revision = revision
         self.catalog_source = catalog_source
         self.raw_catalog_path = raw_path
         self._catalog_file_sha256 = _file_sha256(path)
@@ -8021,6 +8087,31 @@ class PolymarketLiveCollector:
         policy = self.realtime_universe_policy
         if policy is None:
             return None
+        try:
+            published = json.loads(self.store.catalog_path.read_bytes()).get(
+                "realtime_universe"
+            )
+        except (OSError, ValueError):
+            published = None
+        if isinstance(published, dict):
+            selected = self.store._validate_realtime_universe(
+                published,
+                catalog_revision=str(self.store.catalog_revision or ""),
+                available_market_ids=set(self.store.catalog),
+            )
+            if (
+                selected == set(self.store.catalog)
+                and len(selected) <= policy.maximum_market_count
+                and int(published.get("book_backed_market_count") or 0)
+                >= len(selected)
+            ):
+                return {
+                    "catalog_revision": self.store.catalog_revision,
+                    "realtime_universe_id": published["universe_id"],
+                    "realtime_market_count": len(selected),
+                    "realtime_token_count": len(self.store.token_to_market),
+                    "status": "published_realtime_universe_reused",
+                }
         source = self.store.catalog_source or {}
         raw_path = self.store.raw_catalog_path
         raw_format = str(source.get("raw_format") or "")
@@ -8040,12 +8131,6 @@ class PolymarketLiveCollector:
             rows,
             catalog_revision=str(self.store.catalog_revision or ""),
         )
-        try:
-            published = json.loads(self.store.catalog_path.read_bytes()).get(
-                "realtime_universe"
-            )
-        except (OSError, ValueError):
-            published = None
         if (
             isinstance(published, dict)
             and published.get("universe_id") == universe["universe_id"]

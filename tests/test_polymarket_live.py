@@ -147,7 +147,16 @@ class PolymarketLiveTest(unittest.TestCase):
             2, required_market_ids=("m1", "missing")
         )
         universe = policy.select(
-            markets, rows, catalog_revision=revision
+            markets,
+            rows,
+            catalog_revision=revision,
+            available_token_ids={
+                token_id
+                for market in markets
+                for token_id in (
+                    outcome.token_id for outcome in market.identity.outcomes
+                )
+            },
         )
 
         self.assertEqual(universe["market_ids"], ["m1", "m3"])
@@ -187,7 +196,25 @@ class PolymarketLiveTest(unittest.TestCase):
 
         restored = LiveStateStore(store.root, now_provider=lambda: NOW)
         restored.recover()
-        self.assertEqual(len(restored.catalog), 4)
+        self.assertEqual(len(restored.catalog), 2)
+        self.assertEqual(
+            set(restored.catalog), set(universe["market_ids"]),
+        )
+        persisted = json.loads(restored.catalog_path.read_text())
+        self.assertEqual(persisted["normalized_catalog"]["market_count"], 4)
+
+        collector = PolymarketLiveCollector(
+            restored,
+            GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+            ClobBooksClient(
+                requester=lambda *_args, **_kwargs: self.fail(
+                    "published realtime universe should be reused"
+                )
+            ),
+            realtime_universe_policy=GammaRealtimeUniversePolicy(2),
+        )
+        reused = collector.configure_published_realtime_universe()
+        self.assertEqual(reused["status"], "published_realtime_universe_reused")
         self.assertEqual(
             set(restored.token_to_market.values()), {"m1", "m3"}
         )
