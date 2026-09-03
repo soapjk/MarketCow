@@ -837,6 +837,47 @@ impl Projection {
     pub fn token_has_recovery_gap(&self, token_id: &str) -> bool {
         self.unresolved_gaps.contains(token_id) || self.quarantined_token_ids.contains(token_id)
     }
+
+    /// Removes token-local gaps that belong only to markets retained for settlement monitoring.
+    /// Unknown gaps remain global, and gaps for the current configured scope remain fail-closed.
+    pub fn prune_stale_scope_gaps(&mut self) -> usize {
+        let configured_tokens = self.configured_token_ids();
+        let mut known_tokens = configured_tokens.clone();
+        known_tokens.extend(self.monitoring_markets.values().flat_map(|market| {
+            market
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.token_id.clone())
+        }));
+        let previous_count = self.unresolved_gaps.len();
+        self.unresolved_gaps
+            .retain(|gap| !known_tokens.contains(gap) || configured_tokens.contains(gap));
+        let removed = previous_count.saturating_sub(self.unresolved_gaps.len());
+        if removed > 0 {
+            let catalog_books_complete = self.catalog_revision.is_none()
+                || self
+                    .markets
+                    .values()
+                    .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                    .filter(|market| self.market_is_public(&market.market_id))
+                    .flat_map(|market| market.outcomes.iter())
+                    .all(|outcome| self.books.contains_key(&outcome.token_id));
+            let usable_projection = if self.catalog_revision.is_none() {
+                !self.books.is_empty()
+            } else {
+                !self.active_market_ids().is_empty()
+            };
+            self.ready = self.unresolved_gaps.is_empty()
+                && usable_projection
+                && catalog_books_complete
+                && self.instrument_ticks_consistent()
+                && self.active_market_books_two_sided();
+            if self.ready {
+                self.fail_closed_reason = None;
+            }
+        }
+        removed
+    }
 }
 
 fn event_market_id(projection: &Projection, kind: &EventKind) -> Option<String> {
@@ -1268,10 +1309,11 @@ impl<L: DurableLog> SingleWriter<L> {
         &mut self.log
     }
 
-    pub fn resume(projection: Projection, log: L) -> Result<Self, CoreError> {
+    pub fn resume(mut projection: Projection, log: L) -> Result<Self, CoreError> {
         if projection.cursor != projection.persisted_cursor {
             return Err(CoreError::PersistedWatermarkMismatch);
         }
+        projection.prune_stale_scope_gaps();
         Ok(Self {
             current: ArcSwap::from_pointee(projection),
             log,
@@ -1486,24 +1528,6 @@ impl<L: DurableLog> SingleWriter<L> {
                     } else if let Some((catalog, conditions, relations, active_tokens)) =
                         validated_catalog(&combined, negative_risk_relations)
                     {
-                        let mut known_scope_tokens = next
-                            .markets
-                            .values()
-                            .flat_map(|market| {
-                                market
-                                    .outcomes
-                                    .iter()
-                                    .map(|outcome| outcome.token_id.clone())
-                            })
-                            .collect::<BTreeSet<_>>();
-                        known_scope_tokens.extend(next.monitoring_markets.values().flat_map(
-                            |market| {
-                                market
-                                    .outcomes
-                                    .iter()
-                                    .map(|outcome| outcome.token_id.clone())
-                            },
-                        ));
                         // A dynamic-universe replacement removes a market from opportunity
                         // scanning, but that must not erase the stable identities and last
                         // authoritative books a position owner needs for settlement monitoring.
@@ -1590,11 +1614,9 @@ impl<L: DurableLog> SingleWriter<L> {
                                 });
                         }
                         next.unresolved_gaps.retain(|gap| {
-                            !gap.starts_with("catalog:")
-                                && !gap.starts_with("negative_risk:")
-                                && (!known_scope_tokens.contains(gap)
-                                    || active_tokens.contains(gap))
+                            !gap.starts_with("catalog:") && !gap.starts_with("negative_risk:")
                         });
+                        next.prune_stale_scope_gaps();
                     } else {
                         next.unresolved_gaps.insert("catalog:invalid".into());
                         applied = false;
@@ -4079,6 +4101,9 @@ mod tests {
             ))
             .unwrap();
         assert!(writer.projection().unresolved_gaps.contains("m1-yes"));
+        let resumed = SingleWriter::resume((*writer.projection()).clone(), MemoryLog).unwrap();
+        assert!(resumed.projection().unresolved_gaps.is_empty());
+        assert!(resumed.projection().ready);
 
         let replaced = writer
             .apply(event(
