@@ -259,7 +259,7 @@ class LaunchdStartupTest(unittest.TestCase):
                 "127.0.0.1:8796",
             )
             self.assertEqual(
-                rust_service.environment["MARKETCOW_RUST_SHADOW"], "false",
+                rust_service.environment["MARKETCOW_RUST_SHADOW"], "true",
             )
             by_name = {service.name: service for service in services}
             self.assertEqual(

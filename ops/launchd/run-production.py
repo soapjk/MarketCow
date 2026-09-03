@@ -147,7 +147,7 @@ def build_services(
         "MARKETCOW_RUST_BIND": f"127.0.0.1:{rust_port}",
         "MARKETCOW_RUST_STORAGE_ROOT": str(rust_root),
         "MARKETCOW_RUST_SCOPE_ID": rust_scope_id,
-        "MARKETCOW_RUST_SHADOW": "false",
+        "MARKETCOW_RUST_SHADOW": "true",
         "MARKETCOW_POLYMARKET_LIVE_ENABLED": "true",
         "MARKETCOW_POLYMARKET_SCOPE_FILE": str(rust_scope),
         "MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT": str(rust_scope_registry),
