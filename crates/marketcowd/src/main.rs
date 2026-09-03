@@ -3446,8 +3446,7 @@ async fn commit_polymarket_scope_switch(
     let same_scope = current.scope_id == activated.scope_id;
     if let Some(universe) = activated.universe.as_ref() {
         let candidate = candidate_runtime.projection();
-        if candidate.cursor <= previous_cursor
-            || !candidate.instrument_ticks_consistent()
+        if !candidate.instrument_ticks_consistent()
             || !projection_matches_polymarket_scope(&activated, &candidate, true)
         {
             return Err("universe_candidate_not_atomic_ready".into());
