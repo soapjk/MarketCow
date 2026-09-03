@@ -57,6 +57,6 @@ jq -n \
       assertions:["safe_forward_migration_idempotent","exact_decimal_round_trip",
         "provider_mapping_resolves","stale_mapping_removed",
         "cross_instrument_mapping_conflict_rejected"]},
-    real_order_submission_enabled:false,tradude_manages_marketcow:false}' >"$temporary"
+    tradude_manages_marketcow:false}' >"$temporary"
 mv "$temporary" "$output"
 cat "$output"

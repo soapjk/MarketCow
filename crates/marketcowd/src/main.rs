@@ -152,7 +152,6 @@ struct Config {
     wal_root: PathBuf,
     worker_socket: PathBuf,
     scope_id: String,
-    real_order_submission_enabled: bool,
     shadow_mode: bool,
     maximum_book_age_ms: u64,
     legacy_mcp_url: Option<String>,
@@ -521,7 +520,6 @@ impl Config {
             wal_root,
             worker_socket,
             scope_id,
-            real_order_submission_enabled: false,
             shadow_mode,
             maximum_book_age_ms,
             legacy_mcp_url,
@@ -2279,7 +2277,6 @@ impl AuditCoordinator {
                 "domain":domain,
                 "transition":transition,
                 "details":details,
-                "real_order_submission_enabled":false
             }),
             true,
         )
@@ -3481,7 +3478,6 @@ async fn commit_polymarket_scope_switch(
                     "added_markets":universe.added_markets,
                     "removed_markets":universe.removed_markets,
                     "scope_file_sha256":activated.scope_file_sha256,
-                    "real_order_submission_enabled":false
                 }),
             )
             .map_err(|error| format!("universe_activation_audit_failed:{error}"))?;
@@ -3518,7 +3514,6 @@ async fn commit_polymarket_scope_switch(
                 "universe_id":universe.universe_id,
                 "generation":universe.generation,
                 "boundary_cursor":state.projection.load().cursor,
-                "real_order_submission_enabled":false
             }),
         )
     {
@@ -3769,7 +3764,6 @@ async fn apply_polymarket_transport_frames(
             "last_cursor":last_cursor,
             "action":"same_scope_authoritative_websocket_reconnect",
             "periodic_http_snapshot_used_for_repair":false,
-            "real_order_submission_enabled":false
         });
         if let Err(error) = state.audit.record_lifecycle(
             "polymarket_transport",
@@ -3844,7 +3838,6 @@ fn publish_polymarket_outcomes(state: &AppState, published: &[marketcow_core::Ap
                 "reason_code":market.reason_code,
                 "retryable":true,
                 "full_sync_required":false,
-                "real_order_submission_enabled":false
             }),
         ) {
             warn!(error=%error, "polymarket_market_transition_audit_failed");
@@ -3987,7 +3980,6 @@ async fn validate_polymarket_book_refreshes(
             "evidence_sha256":evidence_sha256,
             "projection_mutated":false,
             "public_cursor_advanced":false,
-            "real_order_submission_enabled":false
         }),
     )?;
     state
@@ -4138,7 +4130,6 @@ async fn recover_quarantined_polymarket_markets(
                 "source":"polymarket_clob_http",
                 "atomic_two_token_boundary":true,
                 "healthy_markets_unchanged":true,
-                "real_order_submission_enabled":false
             }),
         )?;
     }
@@ -4514,7 +4505,6 @@ fn replay_file(config: &Config, input: &Path, checkpoint: bool) -> Result<serde_
         "projection_sha256":projection.hash(),
         "ready":projection.ready,
         "checkpoint_cursor":manifest.map(|value|value.current.cursor),
-        "real_order_submission_enabled":false
     }))
 }
 
@@ -4682,7 +4672,6 @@ fn run_headless_shadow_soak(
             percentile(&persistence_latency_us, 0.99) <= 20_000,
         "projection_publication_latency_p99_us_lte_5000":
             percentile(&publication_latency_us, 0.99) <= 5_000,
-        "real_orders_disabled":!config.real_order_submission_enabled,
         "tradude_does_not_manage_marketcow":true
     });
     let passed = gate_verdicts
@@ -4726,7 +4715,6 @@ fn run_headless_shadow_soak(
         "maximum_publication_latency_us":maximum_publication_latency_us,
         "max_rss_kb":max_rss_kb,
         "gate_verdicts":gate_verdicts,
-        "real_order_submission_enabled":false,
         "tradude_manages_marketcow":false,
         "passed":passed
     });
@@ -4865,7 +4853,7 @@ fn health_payload(state: &AppState) -> serde_json::Value {
     json!({
         "status":if hyperliquid_ready && polymarket_ready { "healthy" } else { "degraded" }, "service":"marketcowd", "profile":state.config.profile,
         "role":state.config.role,
-        "shadow_mode":state.config.shadow_mode, "real_order_submission_enabled":false,
+        "shadow_mode":state.config.shadow_mode,
         "mcp":{
             "enabled":true,
             "endpoint":"/mcp",
@@ -5129,7 +5117,6 @@ async fn hyperliquid_shadow_events(
                 "current_sequence":snapshot.public_sequence,
                 "next_sequence":next_sequence,
                 "frames":frames,
-                "real_order_submission_enabled":false
             }))
             .into_response()
         }
@@ -5250,7 +5237,6 @@ async fn serve_hyperliquid_shadow_stream(
             "stream_id":snapshot.stream_id,
             "current_sequence":snapshot.public_sequence,
             "resumed":after < snapshot.public_sequence,
-            "real_order_submission_enabled":false
         }),
     )
     .await
@@ -6925,7 +6911,7 @@ async fn readiness(State(state): State<AppState>) -> Response {
             "ready":ready,
             "mode":if state.config.shadow_mode { "shadow" } else { "authoritative" },
             "scope_id":projection.scope_id,
-            "writer_enabled":!state.config.shadow_mode, "real_order_submission_enabled":false,
+            "writer_enabled":!state.config.shadow_mode,
             "fail_closed_reason":if !fresh {
                 Some("book_stale".to_string())
             } else if !polymarket_ready {
@@ -7024,7 +7010,6 @@ async fn scope(
         "removed_markets":universe.as_ref().map(|value| value.removed_markets.clone()),
         "excluded_markets":effective_exclusions,
         "filters":universe.as_ref().map(|value| value.filters.clone()),
-        "real_order_submission_enabled":false,
     }))
     .into_response()
 }
@@ -8065,7 +8050,6 @@ async fn admin_activate_polymarket_scope(
             "active_scope_id":active.scope_id,
             "boundary_cursor":state.projection.load().cursor,
             "scope_file_sha256":active.scope_file_sha256,
-            "real_order_submission_enabled":false,
         }))
         .into_response();
     }
@@ -8105,7 +8089,6 @@ async fn admin_activate_polymarket_scope(
             "previous_generation":receipt.previous_generation,
             "active_generation":receipt.active_generation,
             "full_sync_required":true,
-            "real_order_submission_enabled":false,
         }))
         .into_response(),
         Ok(Ok(Err(_))) => error(
@@ -8151,7 +8134,6 @@ async fn admin_migration(State(state): State<AppState>) -> Json<serde_json::Valu
             "revision":"polymarket-final-architecture",
             "sha256":hex::encode(Sha256::digest(DOMAIN_OWNERSHIP_REGISTRY))
         },
-        "real_order_submission_enabled":false,
         "tradude_may_manage_marketcow":false,
         "tradude_may_select_scope":true
     }))
@@ -8204,7 +8186,6 @@ async fn admin_get_migration_checkpoint(
             "schema":"marketcow.migration-checkpoint.v1",
             "checkpoint":record,
             "cutover_allowed":false,
-            "real_order_submission_enabled":false
         }))
         .into_response(),
         Ok(None) => error(
@@ -8269,7 +8250,6 @@ async fn admin_put_migration_checkpoint(
             "schema":"marketcow.migration-checkpoint.v1",
             "checkpoint":stored,
             "cutover_allowed":false,
-            "real_order_submission_enabled":false
         }))
         .into_response(),
         Err(marketcow_storage::RepositoryError::RevisionConflict) => error(
@@ -8491,7 +8471,6 @@ fn admin_job_view(job: &marketcow_jobs::ProviderJob) -> serde_json::Value {
         "error":job.error,
         "result":job.result,
         "audit_actor":job.audit_actor,
-        "real_order_submission_enabled":false
     })
 }
 
@@ -8507,7 +8486,6 @@ async fn admin_checkpoint(
                 "status":"checkpoint_written",
                 "cursor":manifest.current.cursor,
                 "projection_sha256":manifest.current.projection_sha256,
-                "real_order_submission_enabled":false
             }))
             .into_response()
         }
@@ -8534,10 +8512,7 @@ async fn admin_shadow_ingest(
     Extension(request_id): Extension<String>,
     Json(request): Json<ShadowIngestRequest>,
 ) -> Response {
-    if !state.config.shadow_mode
-        || state.config.real_order_submission_enabled
-        || state.config.polymarket_live.is_some()
-    {
+    if !state.config.shadow_mode || state.config.polymarket_live.is_some() {
         return error(
             StatusCode::FORBIDDEN,
             "shadow_ingest_disabled",
@@ -8594,7 +8569,6 @@ async fn admin_shadow_ingest(
                 "apply_latency_us":apply_latency_us,
                 "persistence_latency_us":persistence_latency_us,
                 "publication_latency_us":publication_latency_us,
-                "real_order_submission_enabled":false
             }))
             .into_response()
         }
@@ -8673,7 +8647,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         format!(
             "# TYPE marketcow_http_requests_total counter\nmarketcow_http_requests_total {}\n\
              # TYPE marketcow_http_errors_total counter\nmarketcow_http_errors_total {}\n\
-             marketcow_real_order_submission_enabled 0\nmarketcow_shadow_mode {}\n\
+             marketcow_shadow_mode {}\n\
              marketcow_projection_published_cursor {}\nmarketcow_projection_persisted_cursor {}\n\
              marketcow_unresolved_gaps {}\nmarketcow_book_count {}\nmarketcow_maximum_book_age_ms {}\n\
              marketcow_disconnects_total {}\nmarketcow_ingress_queue_depth 0\n\
@@ -9513,7 +9487,6 @@ mod tests {
             wal_root: dir.path().join("wal"),
             worker_socket: dir.path().join("worker.sock"),
             scope_id: "s".into(),
-            real_order_submission_enabled: false,
             shadow_mode: true,
             maximum_book_age_ms: 30_000,
             legacy_mcp_url: None,
@@ -9633,7 +9606,6 @@ mod tests {
             recovery["details"]["action"],
             "same_scope_authoritative_websocket_reconnect"
         );
-        assert_eq!(recovery["real_order_submission_enabled"], false);
     }
 
     #[test]
@@ -11651,8 +11623,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["real_order_submission_enabled"],
-            false
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["shadow_mode"],
+            true
         );
     }
 
@@ -11690,7 +11662,6 @@ mod tests {
 
         let health = health_payload(&state);
         assert_eq!(health["status"], "degraded");
-        assert_eq!(health["real_order_submission_enabled"], false);
         assert_eq!(health["components"]["hyperliquid_shadow"]["enabled"], true);
         let readiness = readiness(State(state.clone())).await;
         assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -11732,7 +11703,6 @@ mod tests {
         assert_eq!(records[1]["transition"], "ready");
         assert!(records.iter().all(|record| {
             record["domain"] == "hyperliquid"
-                && record["real_order_submission_enabled"] == false
                 && record["audit_id"]
                     .as_str()
                     .is_some_and(|value| value.starts_with("audit-"))
@@ -11809,7 +11779,6 @@ mod tests {
         assert_eq!(page["current_sequence"], 1);
         assert_eq!(page["next_sequence"], 1);
         assert_eq!(page["frames"][0]["type"], "sequence_watermark");
-        assert_eq!(page["real_order_submission_enabled"], false);
     }
 
     #[tokio::test]
@@ -11878,7 +11847,6 @@ mod tests {
         assert_eq!(subscription["type"], "subscription");
         assert_eq!(subscription["provider"], "hyperliquid");
         assert_eq!(subscription["stream_id"], "hyperliquid-main");
-        assert_eq!(subscription["real_order_submission_enabled"], false);
         let replay = client.next().await.unwrap().unwrap().into_text().unwrap();
         let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
         assert_eq!(replay["type"], "event");
@@ -11974,10 +11942,6 @@ mod tests {
         let called: serde_json::Value =
             serde_json::from_slice(&to_bytes(call.into_body(), 65_536).await.unwrap()).unwrap();
         assert_eq!(called["result"]["isError"], false);
-        assert_eq!(
-            called["result"]["structuredContent"]["real_order_submission_enabled"],
-            false
-        );
         assert_eq!(
             called["result"]["structuredContent"]["mcp"]["endpoint"],
             "/mcp"
@@ -12656,7 +12620,6 @@ mod tests {
         let first_value: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
         assert!(first_value.get("lease_token").is_none());
         assert_eq!(first_value["lease_active"], false);
-        assert_eq!(first_value["real_order_submission_enabled"], false);
 
         let second = admin_submit_job(
             State(state.clone()),
@@ -12759,11 +12722,10 @@ mod tests {
         let migration = admin_migration(State(state.clone())).await.0;
         assert_eq!(migration["schema"], "marketcow.migration-control.v1");
         assert_eq!(migration["cutover_allowed"], true);
-        assert_eq!(migration["real_order_submission_enabled"], false);
         assert_eq!(migration["tradude_may_manage_marketcow"], false);
         assert_eq!(
             migration["ownership_registry"]["sha256"],
-            "7a7553c26b6d47a5f57a2f84dd5b0cdf96f872ed05ff44b0192df48c115a7250"
+            "e2eab2ce96145f102d06b216b990434ccefb06cc639c23ea64eca238c641c5a6"
         );
 
         let path = AxumPath((
@@ -13403,7 +13365,6 @@ mod tests {
             wal_root: dir.path().join("wal"),
             worker_socket: dir.path().join("worker.sock"),
             scope_id: "shadow-seed".into(),
-            real_order_submission_enabled: false,
             shadow_mode: true,
             maximum_book_age_ms: 30_000,
             legacy_mcp_url: None,
@@ -13419,7 +13380,6 @@ mod tests {
         assert_eq!(result["canonical_events"], 4);
         assert_eq!(result["rejected_events"], 0);
         assert_eq!(result["ready"], true);
-        assert_eq!(result["real_order_submission_enabled"], false);
         let revision = calculated_config_revision(&config).unwrap();
         let recovered =
             marketcow_runtime::PolymarketRuntime::open(runtime_config(&config, &revision)).unwrap();

@@ -175,9 +175,6 @@ def main() -> int:
                     pass
                 time.sleep(0.05)
             checks["rust_health_available"] = health is not None and status == 200
-            checks["real_orders_disabled"] = bool(
-                health and health.get("real_order_submission_enabled") is False
-            )
             checks["legacy_proxy_reported_without_url"] = bool(
                 health
                 and health.get("mcp", {}).get("legacy_proxy_configured") is True
@@ -237,7 +234,6 @@ def main() -> int:
         "failure": failure or None,
         "process_exit_code": process.returncode if process else None,
         "process_stderr_tail": stderr_tail,
-        "real_order_submission_enabled": False,
         "tradude_manages_marketcow": False,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

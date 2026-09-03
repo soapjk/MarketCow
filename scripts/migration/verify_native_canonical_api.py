@@ -240,9 +240,6 @@ def main() -> int:
             checks["four_native_tools_reported"] = (
                 health.get("mcp", {}).get("native_tools") == 4
             )
-            checks["real_orders_disabled"] = (
-                health.get("real_order_submission_enabled") is False
-            )
             migration_status, migration = json_request(
                 f"{base_url}/v1/admin/migration",
                 bearer="local-integration-admin-token",
@@ -251,7 +248,6 @@ def main() -> int:
                 migration_status == 200
                 and migration.get("tradude_may_manage_marketcow") is False
                 and migration.get("cutover_allowed") is False
-                and migration.get("real_order_submission_enabled") is False
             )
 
             instrument = {
@@ -461,7 +457,6 @@ def main() -> int:
         "failure": failure or None,
         "process_log_tail": log_tail,
         "safety": {
-            "real_order_submission_enabled": False,
             "tradude_manages_marketcow": False,
             "headless_substitutes_http_network_soak": False,
         },

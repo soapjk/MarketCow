@@ -1775,7 +1775,6 @@ class PolymarketOpenPositionGuard:
             "frame_status": frame.status,
             "frame_reason_codes": frame.reason_codes,
             "decision_code": code,
-            "real_order_submission_enabled": False,
             "decided_at": self.now_provider().isoformat(),
         }
         audit_id = content_sha256(evidence)

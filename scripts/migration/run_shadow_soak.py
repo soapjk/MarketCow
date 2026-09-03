@@ -75,7 +75,7 @@ def ingest(base: str, raw_payload: dict, now: datetime) -> dict:
         payload={"received_at": now.isoformat(), "raw_payload": raw_payload},
         admin=True,
     )
-    if status != 200 or body.get("rejected") != 0 or body.get("real_order_submission_enabled") is not False:
+    if status != 200 or body.get("rejected") != 0:
         raise RuntimeError(f"invalid shadow ingest response: {status} {body}")
     return body
 
@@ -159,7 +159,7 @@ def main() -> None:
                         raise RuntimeError("shadow process exited during startup")
                     try:
                         status, body = request_json(f"{base}/v1/health")
-                        if status == 200 and body.get("real_order_submission_enabled") is False:
+                        if status == 200:
                             break
                     except Exception:  # noqa: BLE001 - expected until socket bind completes
                         pass
@@ -227,7 +227,7 @@ def main() -> None:
                             status, body = request_json(
                                 f"{base}/v1/admin/polymarket/checkpoint", payload={}, admin=True,
                             )
-                            if status != 200 or body.get("real_order_submission_enabled") is not False:
+                            if status != 200:
                                 raise RuntimeError(f"checkpoint contract failed: {status} {body}")
                             checkpoint_count += 1
                             next_checkpoint = loop_now + 60
@@ -308,10 +308,7 @@ def main() -> None:
                 status, final_checkpoint = request_json(
                     f"{base}/v1/admin/polymarket/checkpoint", payload={}, admin=True,
                 )
-                if (
-                    status != 200
-                    or final_checkpoint.get("real_order_submission_enabled") is not False
-                ):
+                if status != 200:
                     failures.append({
                         "kind": "final_checkpoint", "status": status, "body": final_checkpoint,
                     })
@@ -361,7 +358,6 @@ def main() -> None:
         "projection_publication_latency_p99_us_lte_5000": (
             percentile(publication_latencies_us, .99) <= 5_000
         ),
-        "real_orders_disabled": True,
         "tradude_does_not_manage_marketcow": True,
     }
     passed = all(gate_verdicts.values())
@@ -434,7 +430,6 @@ def main() -> None:
         "failures": failures[:100],
         "gate_verdicts": gate_verdicts,
         "process_log_tail": process_log_tail,
-        "real_order_submission_enabled": False,
         "tradude_manages_marketcow": False,
         "headless_substitutes_http_network_soak": False,
         "passed": passed,

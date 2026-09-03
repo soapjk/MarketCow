@@ -36,7 +36,6 @@ def test_domain_ownership_keeps_orders_and_tradude_disabled() -> None:
     assert "kind: market_data_read_service" in registry
     assert "trading_interfaces_allowed: false" in registry
     assert "order_signing_credentials_allowed: false" in registry
-    assert "real_order_submission_enabled: false" in registry
     assert "tradude_may_manage_marketcow: false" in registry
     assert "rust_write_enabled: false" in registry
 

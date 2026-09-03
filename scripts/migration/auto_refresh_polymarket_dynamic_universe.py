@@ -301,7 +301,6 @@ def _validate_scope_identity(scope: dict[str, Any]) -> None:
     ready = scope.get("ready") is True
     checks = {
         "schema": scope.get("schema_version") == SCOPE_SCHEMA_VERSION,
-        "read_only": scope.get("real_order_submission_enabled") is False,
         "scope_identity": scope.get("active_scope_id") == scope.get("universe_id"),
         "universe_id": isinstance(scope.get("universe_id"), str)
         and len(scope["universe_id"]) == 64
@@ -540,7 +539,6 @@ def refresh_once(
         "candidate_sha256": _sha256(candidate_path),
         "book_snapshot_path": str(books_path.resolve()),
         "book_snapshot_sha256": _sha256(books_path),
-        "real_order_submission_enabled": False,
         "scope_selection_owner": "tradude",
         "marketcow_computes_market_ranking": False,
     }
@@ -593,7 +591,6 @@ def main() -> int:
                     "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "error_type": type(error).__name__,
                     "error": str(error),
-                    "real_order_submission_enabled": False,
                 })
                 if not arguments.follow:
                     raise

@@ -158,7 +158,6 @@ pub struct ScopeDiscovery {
     pub schema_version: String,
     pub active_scope_id: String,
     pub scope_status: String,
-    pub real_order_submission_enabled: bool,
 }
 
 impl ScopeDiscovery {
@@ -167,7 +166,6 @@ impl ScopeDiscovery {
             schema_version: "marketcow.polymarket.scope-discovery.v1".into(),
             active_scope_id: scope_id,
             scope_status: "shadow".into(),
-            real_order_submission_enabled: false,
         }
     }
 }
@@ -323,13 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn scope_and_error_shapes_are_stable_and_orders_are_disabled() {
+    fn scope_and_error_shapes_are_stable() {
         let scope = serde_json::to_value(ScopeDiscovery::shadow("scope".into())).unwrap();
         assert_eq!(
             scope["schema_version"],
             "marketcow.polymarket.scope-discovery.v1"
         );
-        assert_eq!(scope["real_order_submission_enabled"], false);
         let error = MachineErrorEnvelope {
             detail: MachineErrorDetail {
                 code: "cursor_gap".into(),

@@ -8,7 +8,7 @@ MarketCow owns read-only market discovery, source-fact validation, Scope preheat
 market-data publication. Tradude owns candidate selection, opportunity ranking, projected capital
 release, positions, accounts, risk and orders. MarketCow exposes no
 order, cancellation, signing, wallet or execution operation, and
-`real_order_submission_enabled` remains `false`.
+MarketCow remains a market-data service and has no order-submission interface.
 
 The stable identity is a 64-hex `universe_id`. Membership changes do not change this identity.
 Every accepted refresh increments a durable `generation` by exactly one. A generation is built in

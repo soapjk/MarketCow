@@ -58,6 +58,6 @@ jq -n \
         "runtime_config_hash_verified","runtime_config_append_only_idempotent",
         "runtime_config_point_in_time","checkpoint_create_and_cas",
         "checkpoint_stale_revision_rejected","checkpoint_concurrent_single_winner"]},
-    real_order_submission_enabled:false,tradude_manages_marketcow:false}' >"$temporary"
+    tradude_manages_marketcow:false}' >"$temporary"
 mv "$temporary" "$output"
 cat "$output"

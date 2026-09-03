@@ -144,7 +144,6 @@ def validate_boundary(scope: dict[str, Any], full: dict[str, Any]) -> dict[str, 
         and scope.get("scope_status") == "ready"
         and 0 < minimum_market_count <= market_count <= target_market_count <= 250
         and token_count == 2 * market_count
-        and scope.get("real_order_submission_enabled") is False
         and full.get("schema_version") == "marketcow.polymarket.live.v4"
         and full.get("scope_id") == scope.get("active_scope_id")
         and full.get("universe_id") == scope.get("universe_id")

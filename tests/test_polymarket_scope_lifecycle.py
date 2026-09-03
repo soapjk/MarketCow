@@ -268,7 +268,6 @@ def test_pretrade_guard_rejects_terminal_and_stale_books_with_audit() -> None:
         assert raised.value.code == "polymarket_open_position_market_resolved"
         audit = json.loads((root / "pretrade-audit.jsonl").read_text())
         assert audit["decision_code"] == raised.value.code
-        assert audit["real_order_submission_enabled"] is False
         assert audit["audit_id"] == raised.value.audit_id
 
         active_row = gamma_row("m2", "0x" + "2" * 64, ("yes-2", "no-2"))
@@ -345,7 +344,6 @@ def test_candidate_requires_both_exact_advancing_endpoints_before_atomic_switch(
         registry.prepare(first)
         registry.prepare(second)
         failed = {
-            "real_order_submission_enabled": False,
             "endpoints": {
                 "8790": acceptance_observation(),
                 "8791": acceptance_observation(cursor_start=10, cursor_end=10),
@@ -359,7 +357,6 @@ def test_candidate_requires_both_exact_advancing_endpoints_before_atomic_switch(
         assert unaccepted.value.code == "polymarket_candidate_not_accepted"
 
         evidence = {
-            "real_order_submission_enabled": False,
             "endpoints": {
                 "8790": acceptance_observation(),
                 "8791": acceptance_observation(
@@ -373,7 +370,6 @@ def test_candidate_requires_both_exact_advancing_endpoints_before_atomic_switch(
         pointer = registry.activate(second["scope_id"], grace_seconds=60)
         assert pointer["active_scope_id"] == second["scope_id"]
         assert pointer["previous_scope_id"] == first["scope_id"]
-        assert pointer["real_order_submission_enabled"] is False
         assert registry.resolve(first["scope_id"], "a-000")["scope_status"] == "grace"
 
         rolled_back = registry.rollback(grace_seconds=60)
@@ -463,6 +459,5 @@ def test_scope_discovery_and_stale_scope_id_return_stable_410() -> None:
             )
         assert discovery.status_code == 200
         assert discovery.json()["active_scope_id"] == "a" * 64
-        assert discovery.json()["real_order_submission_enabled"] is False
         assert retired.status_code == 410
         assert retired.json()["detail"]["code"] == "polymarket_scope_retired"

@@ -59,7 +59,6 @@ class Session:
             "scope_file_sha256": "b" * 64,
             "target_market_count": 1,
             "minimum_market_count": 1,
-            "real_order_submission_enabled": False,
         }
 
     def _full(self) -> dict:
@@ -103,7 +102,6 @@ class Session:
         return Response(200, {
             "status": "activated_ready",
             "active_generation": 2,
-            "real_order_submission_enabled": False,
         })
 
 

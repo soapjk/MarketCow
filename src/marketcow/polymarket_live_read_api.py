@@ -183,7 +183,6 @@ def create_polymarket_live_read_app(
             "schema_version": "marketcow.polymarket.scope-discovery.v1",
             "active_scope_id": projection.scope_id or reader.scope_id,
             "scope_status": "active" if (projection.scope_id or reader.scope_id) else "unscoped",
-            "real_order_submission_enabled": False,
         }
 
     async def run_read(

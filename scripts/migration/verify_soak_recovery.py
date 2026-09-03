@@ -57,7 +57,6 @@ def main() -> int:
         "full_sync_cursor_matches_manifest": False,
         "published_cursor_equals_persisted_cursor": False,
         "unresolved_gap_count_zero": False,
-        "real_orders_disabled": False,
         "tradude_does_not_manage_marketcow": True,
     }
     manifest: dict = {}
@@ -135,9 +134,6 @@ def main() -> int:
                 checks["recovered_daemon_ready"] = (
                     status == 200 and response.get("ready") is True
                 )
-                checks["real_orders_disabled"] = (
-                    response.get("real_order_submission_enabled") is False
-                )
                 if not checks["recovered_daemon_ready"]:
                     raise RuntimeError(
                         f"recovered daemon did not become ready: status={status}"
@@ -198,7 +194,6 @@ def main() -> int:
         },
         "process_exit_code": process_exit_code,
         "process_stderr_tail": stderr_tail,
-        "real_order_submission_enabled": False,
         "tradude_manages_marketcow": False,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -74,7 +74,6 @@ def write_scope_runtime(
         "schema_version": "marketcow.polymarket.scope-runtime.v1",
         "scope_id": scope_id,
         "manifest_sha256": manifest_sha256,
-        "real_order_submission_enabled": False,
     }
     _atomic_create(root.resolve() / "scope-runtime.json", canonical_json(descriptor))
     return descriptor
@@ -198,7 +197,6 @@ class PolymarketScopeRegistry:
             "scope_id": scope_id,
             "manifest_sha256": hashlib.sha256(body).hexdigest(),
             "market_count": 100,
-            "real_order_submission_enabled": False,
         }
         _atomic_create(
             self.scopes_root / scope_id / "candidate.json",
@@ -250,11 +248,6 @@ class PolymarketScopeRegistry:
             )
         for observation in endpoints.values():
             self._validate_endpoint_observation(observation)
-        if evidence.get("real_order_submission_enabled") is not False:
-            raise ScopeTransitionError(
-                "polymarket_real_orders_not_disabled",
-                "candidate acceptance requires real order submission disabled",
-            )
         accepted = {
             "schema_version": "marketcow.polymarket.scope-acceptance.v1",
             "scope_id": scope_id,
@@ -296,7 +289,6 @@ class PolymarketScopeRegistry:
                 (now + timedelta(seconds=grace_seconds)).isoformat()
                 if previous else None
             ),
-            "real_order_submission_enabled": False,
         }
         _atomic_replace(self.active_path, pointer)
         self._audit("activate", pointer)

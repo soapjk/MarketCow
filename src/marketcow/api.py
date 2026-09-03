@@ -1617,7 +1617,6 @@ def create_app(
             "schema_version": "marketcow.polymarket.scope-discovery.v1",
             "active_scope_id": scope_id,
             "scope_status": "active" if scope_id else "unscoped",
-            "real_order_submission_enabled": False,
         }
 
     @app.get(

@@ -104,7 +104,7 @@ jq -n \
         canonical_page_order_and_ohlcv_validation:true,
         adjustment_factor_decimal128_scale_18:true,
         factor_provenance_round_trip:true},passed:true},
-    real_order_submission_enabled:false,tradude_manages_marketcow:false,
+    tradude_manages_marketcow:false,
     headless_substitutes_http_network_soak:false}' >"$temporary"
 mv "$temporary" "$output"
 cat "$output"

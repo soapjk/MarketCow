@@ -113,10 +113,7 @@ def main() -> None:
             report["environment"]["api_alive_at_finish"] is True
             and report["environment"]["collector_alive_at_finish"] is True
         ),
-        "shadow_and_orders_disabled": (
-            config["mode"] == "shadow"
-            and config["real_order_submission_enabled"] is False
-        ),
+        "shadow_mode": config["mode"] == "shadow",
         "structured_phase_traces_complete": (
             len(successful) > 0
             and all(required_trace_fields <= set(trace) for trace in traces)

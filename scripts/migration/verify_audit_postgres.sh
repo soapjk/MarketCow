@@ -60,6 +60,6 @@ jq -n \
         "bounded_pagination","update_rejected_by_trigger",
         "delete_rejected_by_trigger","original_event_retained"]},
     local_authoritative_audit_copy_retained:true,
-    real_order_submission_enabled:false,tradude_manages_marketcow:false}' >"$temporary"
+    tradude_manages_marketcow:false}' >"$temporary"
 mv "$temporary" "$output"
 cat "$output"

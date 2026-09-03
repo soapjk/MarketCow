@@ -209,9 +209,6 @@ def main() -> int:
                     and health["config_revision"].startswith("sha256:")
                     and len(health["config_revision"]) == 71
                 )
-                checks["real_orders_disabled"] = (
-                    health.get("real_order_submission_enabled") is False
-                )
                 checks["two_native_tools_reported"] = (
                     health.get("mcp", {}).get("native_tools") == 2
                 )
@@ -285,11 +282,10 @@ def main() -> int:
                     and migration.get("schema") == "marketcow.migration-control.v1"
                     and migration.get("phase") == "shadow"
                     and migration.get("cutover_allowed") is False
-                    and migration.get("real_order_submission_enabled") is False
                     and migration.get("tradude_may_manage_marketcow") is False
                     and migration.get("checkpoint_persistence") == "healthy"
                     and migration.get("ownership_registry", {}).get("sha256")
-                    == "c71864af6bc9227cf166d42dc3963da12261b8fe80cb1c1ce581f2695714bf5e"
+                    == "e2eab2ce96145f102d06b216b990434ccefb06cc639c23ea64eca238c641c5a6"
                 )
                 checkpoint_url = (
                     f"{base_url}/v1/admin/migration/checkpoints/"
@@ -313,7 +309,6 @@ def main() -> int:
                     and checkpoint_created.get("checkpoint", {}).get("revision") == 1
                     and checkpoint_created.get("checkpoint", {}).get("status") == "running"
                     and checkpoint_created.get("cutover_allowed") is False
-                    and checkpoint_created.get("real_order_submission_enabled") is False
                 )
                 checkpoint_completed = dict(checkpoint_running)
                 checkpoint_completed.update({
@@ -538,7 +533,6 @@ def main() -> int:
         "mcp_actual_on_failure": (
             actual_mcp_call if checks.get("mcp_result_matches_python") is False else None
         ),
-        "real_order_submission_enabled": False,
         "tradude_manages_marketcow": False,
         "headless_substitutes_http_network_soak": False,
     }

@@ -359,7 +359,6 @@ def main() -> None:
         ),
         "integrity_failures_zero": integrity_failure_count == 0,
         "processes_survived": all(value is not False for value in process_alive.values()),
-        "real_orders_disabled": config["real_order_submission_enabled"] is False,
     }
     report = {
         "schema_version": "marketcow.polymarket.snapshot-smoke.v1",

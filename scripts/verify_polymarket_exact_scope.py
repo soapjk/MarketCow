@@ -234,7 +234,6 @@ def main() -> None:
         "failures": failures,
         "observations": observations,
         "activation_evidence": {
-            "real_order_submission_enabled": False,
             "endpoints": {
                 str(port): {
                     "http_status": samples[-1]["http_status"],

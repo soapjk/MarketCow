@@ -29,7 +29,7 @@
 - `polymarket_open_position_fresh_book_required`
 
 每次判断写入本地 append-only 审计 JSONL，包含 request、市场 revision、frame cursor、
-原因及 `real_order_submission_enabled=false`。该 guard 只做判断，绝不提交订单。
+原因。MarketCow 只提供市场数据，不实现订单提交。
 
 ## Candidate、验收与切换
 
@@ -84,5 +84,5 @@ candidate manifest、candidate descriptor 和 acceptance 都是 create-once 文�
 
 这些工具只读官方公开市场数据并修改本地运行状态，不调用真实订单、转账、支付或账户
 变更 API。prepare、accept、activate 和 rollback 证据均强制记录
-`real_order_submission_enabled=false`。生产进程编排、监管适用性及跨系统交易权限仍需由
+MarketCow 不实现订单提交。生产进程编排、监管适用性及跨系统交易权限仍需由
 部署方按所在地和机构规则复核。

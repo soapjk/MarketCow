@@ -87,7 +87,6 @@ def load_v48_config(path: Path) -> dict[str, Any]:
             yaml_scalar(unified, "maximum_book_age_ns", 2)
         ) / 1_000_000_000,
         "mode": "shadow",
-        "real_order_submission_enabled": False,
         "config_path": str(path.resolve()),
         "config_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
@@ -500,10 +499,7 @@ def main() -> None:
                 process_alive(args.api_pid), process_alive(args.collector_pid),
             )
         ),
-        "shadow_and_orders_disabled": (
-            config["mode"] == "shadow"
-            and config["real_order_submission_enabled"] is False
-        ),
+        "shadow_mode": config["mode"] == "shadow",
     }
     report = {
         "schema_version": "marketcow.polymarket.shared-events-soak.v1",

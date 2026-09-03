@@ -174,7 +174,6 @@ def build_refreshed_manifest(
         "replacement_market_ids": selected[len(retained) :],
         "surviving_negative_risk_relation_ids": surviving_relation_ids,
         "dropped_negative_risk_relation_ids": dropped_relation_ids,
-        "real_order_submission_enabled": False,
     }
     return manifest, evidence
 

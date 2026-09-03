@@ -255,7 +255,6 @@ def main() -> None:
                         arguments.expected_universe_generation is None
                         or scope.get("generation") == arguments.expected_universe_generation
                     )
-                    and scope.get("real_order_submission_enabled") is False
                     and full_response.status_code == 200
                     and boundary is not None
                     and boundary["passed"]
@@ -307,7 +306,6 @@ def main() -> None:
                         arguments.expected_universe_generation is None
                         or scope.get("generation") == arguments.expected_universe_generation
                     )
-                    and scope.get("real_order_submission_enabled") is False
                     and full_response.status_code == 200
                     and boundary is not None
                     and boundary["passed"]

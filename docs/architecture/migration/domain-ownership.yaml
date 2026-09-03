@@ -20,7 +20,6 @@ domains:
     python_fallback_allowed: false
     writer_gate: single_writer_required
     rust_write_enabled: true
-    real_order_submission_enabled: false
   authoritative_wal:
     current_owner: rust
     append_only: true
