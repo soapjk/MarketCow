@@ -8631,6 +8631,7 @@ class PolymarketLiveCollector:
             else websockets.connect(
                 self.endpoint,
                 ping_interval=20,
+                max_size=16 * 1024 * 1024,
                 # Durable publication can briefly saturate an older multi-GB
                 # index.  Keep protocol liveness detection, but do not turn a
                 # transient local scheduling delay into a recovery feedback loop.

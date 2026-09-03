@@ -4543,6 +4543,7 @@ class PolymarketLiveCollectorTest(unittest.TestCase):
 
             self.assertEqual(connect.call_args.kwargs["ping_interval"], 20)
             self.assertEqual(connect.call_args.kwargs["ping_timeout"], 60)
+            self.assertEqual(connect.call_args.kwargs["max_size"], 16 * 1024 * 1024)
 
 
 if __name__ == "__main__":
