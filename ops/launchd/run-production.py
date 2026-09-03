@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -23,6 +24,8 @@ class Service:
     name: str
     command: tuple[str, ...]
     environment: Mapping[str, str] | None = None
+    ready_port: int | None = None
+    start_after: tuple[str, ...] = ()
 
 
 def _required_path(
@@ -134,6 +137,7 @@ def build_services(
             "--fee-semantics-policy",
             str(fee_semantics),
         ),
+        ready_port=discovery_stream_port,
     )
 
     rust_environment = dict(environment)
@@ -153,6 +157,7 @@ def build_services(
         "polymarket-rust-data-plane",
         (str(rust_binary), "serve"),
         rust_environment,
+        ready_port=rust_port,
     )
     opportunity_controller = Service(
         "polymarket-opportunity-controller",
@@ -167,6 +172,7 @@ def build_services(
             **environment,
             "PYTHONPATH": str(tradude_worktree),
         },
+        start_after=("unified-api",),
     )
     universe_activator = Service(
         "polymarket-universe-activator",
@@ -181,6 +187,7 @@ def build_services(
             **environment,
             "PYTHONPATH": os.pathsep.join((str(project_dir), str(project_dir / "src"))),
         },
+        start_after=("unified-api",),
     )
     gateway_environment = dict(environment)
     gateway_environment.update({
@@ -202,6 +209,11 @@ def build_services(
             str(api_port),
         ),
         gateway_environment,
+        ready_port=api_port,
+        start_after=(
+            "polymarket-discovery-collector",
+            "polymarket-rust-data-plane",
+        ),
     )
     return (
         discovery_collector,
@@ -219,8 +231,12 @@ def supervise(
     environment: Mapping[str, str],
     poll_seconds: float = 0.25,
     shutdown_seconds: float = 10.0,
+    startup_timeout_seconds: float = 1_800.0,
 ) -> int:
     processes: list[tuple[Service, subprocess.Popen[bytes]]] = []
+    pending = list(services)
+    ready: set[str] = set()
+    started_at: dict[str, float] = {}
     stopping = False
 
     def request_stop(signum: int, _frame: object) -> None:
@@ -230,18 +246,25 @@ def supervise(
 
     previous_handlers = {signum: signal.signal(signum, request_stop) for signum in (signal.SIGTERM, signal.SIGINT)}
     try:
-        for service in services:
-            process = subprocess.Popen(
-                service.command,
-                cwd=project_dir,
-                env=dict(service.environment or environment),
-            )
-            processes.append((service, process))
-            print(
-                f"marketcow_production_service_started name={service.name} pid={process.pid}",
-                flush=True,
-            )
         while not stopping:
+            for service in list(pending):
+                if not set(service.start_after).issubset(ready):
+                    continue
+                process = subprocess.Popen(
+                    service.command,
+                    cwd=project_dir,
+                    env=dict(service.environment or environment),
+                )
+                processes.append((service, process))
+                pending.remove(service)
+                started_at[service.name] = time.monotonic()
+                print(
+                    "marketcow_production_service_started "
+                    f"name={service.name} pid={process.pid}",
+                    flush=True,
+                )
+                if service.ready_port is None:
+                    ready.add(service.name)
             for service, process in processes:
                 returncode = process.poll()
                 if returncode is not None:
@@ -252,6 +275,30 @@ def supervise(
                         flush=True,
                     )
                     return returncode if returncode != 0 else 1
+                if service.name in ready or service.ready_port is None:
+                    continue
+                try:
+                    with socket.create_connection(
+                        ("127.0.0.1", service.ready_port), timeout=0.1,
+                    ):
+                        ready.add(service.name)
+                        print(
+                            "marketcow_production_service_ready "
+                            f"name={service.name} port={service.ready_port}",
+                            flush=True,
+                        )
+                except OSError:
+                    if (
+                        time.monotonic() - started_at[service.name]
+                        >= startup_timeout_seconds
+                    ):
+                        print(
+                            "marketcow_production_service_startup_timeout "
+                            f"name={service.name} port={service.ready_port}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        return 1
             time.sleep(poll_seconds)
         return 0
     finally:

@@ -48,6 +48,8 @@ def required_market_ids_from_scope(path: Path | None) -> tuple[str, ...]:
 
 def refresh_catalog_or_reuse_published(
     collector: PolymarketLiveCollector,
+    *,
+    recover_state: bool = True,
 ) -> dict:
     """Start from verified local state without blocking on a remote refresh.
 
@@ -70,7 +72,11 @@ def refresh_catalog_or_reuse_published(
         # event-derived SQLite projection and must never trigger its replay.
         load_catalog(catalog_path)
         catalog = getattr(store, "catalog", None)
-        if isinstance(store, LiveStateStore) and not store._recovered:
+        if (
+            recover_state
+            and isinstance(store, LiveStateStore)
+            and not store._recovered
+        ):
             # The immutable catalog has already passed its complete integrity
             # checks. Replay every durable event and rebuild its derived index,
             # but do not parse the multi-gigabyte catalog a second time.
@@ -310,10 +316,20 @@ def main() -> None:
                 "starting_cursor": store.cursor,
             })
         else:
-            evidence = refresh_catalog_or_reuse_published(collector)
+            # Establish the bounded, book-backed generation before replaying
+            # mutable state.  A legacy manifest may map hundreds of thousands
+            # of Gamma directory entries; recovering that generation first is
+            # both wasteful and exposes stale state to concurrently-started
+            # readers.
+            evidence = refresh_catalog_or_reuse_published(
+                collector, recover_state=False,
+            )
             realtime_evidence = collector.configure_published_realtime_universe()
             if realtime_evidence is not None:
                 evidence = {**evidence, **realtime_evidence}
+            if isinstance(store, LiveStateStore) and not store._recovered:
+                store.recover_with_loaded_catalog()
+                store.checkpoint()
             print(evidence)
         if arguments.catalog_only:
             return

@@ -6,6 +6,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -260,6 +261,78 @@ class LaunchdStartupTest(unittest.TestCase):
             self.assertEqual(
                 rust_service.environment["MARKETCOW_RUST_SHADOW"], "false",
             )
+            by_name = {service.name: service for service in services}
+            self.assertEqual(
+                by_name["unified-api"].start_after,
+                (
+                    "polymarket-discovery-collector",
+                    "polymarket-rust-data-plane",
+                ),
+            )
+            self.assertEqual(
+                by_name["polymarket-opportunity-controller"].start_after,
+                ("unified-api",),
+            )
+            self.assertEqual(by_name["unified-api"].ready_port, 8790)
+            self.assertEqual(
+                by_name["polymarket-discovery-collector"].ready_port, 8795,
+            )
+            self.assertEqual(
+                by_name["polymarket-rust-data-plane"].ready_port, 8796,
+            )
+
+    def test_production_runner_gates_dependents_on_ready_port(self) -> None:
+        class Process:
+            def __init__(self, returncode=None):
+                self.pid = 100 if returncode is None else 101
+                self.returncode = returncode
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        services = (
+            RUNNER.Service("data", ("data",), ready_port=8795),
+            RUNNER.Service("consumer", ("consumer",), start_after=("data",)),
+        )
+        started = []
+
+        def popen(command, **_kwargs):
+            started.append(command[0])
+            return Process(None if command[0] == "data" else 7)
+
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            mock.patch.object(RUNNER.subprocess, "Popen", side_effect=popen),
+            mock.patch.object(
+                RUNNER.socket, "create_connection", return_value=Connection(),
+            ),
+        ):
+            result = RUNNER.supervise(
+                services,
+                project_dir=Path(folder),
+                environment=os.environ,
+                poll_seconds=0.001,
+                shutdown_seconds=1,
+            )
+
+        self.assertEqual(result, 7)
+        self.assertEqual(started, ["data", "consumer"])
 
     def test_production_runner_fails_closed_without_polymarket_scope(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

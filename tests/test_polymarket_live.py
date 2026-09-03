@@ -372,6 +372,37 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertTrue(reader._recovered)
         self.assertEqual(reader.cursor, 0)
 
+    def test_startup_can_publish_bounded_universe_before_state_recovery(self):
+        root = self.root / "bounded-before-recovery"
+        rows = [
+            gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1")),
+            gamma_row("m2", "0x" + "2" * 64, ("yes-2", "no-2")),
+        ]
+        for index, row in enumerate(rows, 1):
+            row.update({
+                "enableOrderBook": True,
+                "volume24hrClob": str(index),
+                "liquidityClob": str(index),
+            })
+        writer = LiveStateStore(root)
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        writer.replace_catalog(markets, rows)
+
+        reader = LiveStateStore(root)
+        reader._load_catalog(reader.catalog_path)
+        universe = GammaRealtimeUniversePolicy(1).select(
+            markets, rows, catalog_revision=str(reader.catalog_revision),
+        )
+        reader.replace_realtime_universe(universe)
+
+        self.assertFalse(reader._recovered)
+        self.assertEqual(len(reader.token_to_market), 2)
+        self.assertEqual(
+            set(reader.token_to_market.values()), set(universe["market_ids"]),
+        )
+        reader.recover_with_loaded_catalog()
+        self.assertTrue(reader._recovered)
+
     def test_startup_does_not_rebuild_provider_incomplete_fee_facts(self):
         store = LiveStateStore(self.root / "provider-incomplete-fee")
         row = gamma_row()

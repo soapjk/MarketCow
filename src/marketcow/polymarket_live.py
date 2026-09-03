@@ -5955,7 +5955,15 @@ class LiveStateStore:
 
     def replace_realtime_universe(self, universe: dict[str, Any]) -> dict[str, Any]:
         """Attach a bounded realtime generation to an existing catalog."""
-        self._ensure_loaded()
+        # Startup may already have integrity-checked the immutable catalog but
+        # intentionally deferred mutable-state recovery.  Publishing the
+        # bounded token map first lets replay and index rebuild ignore the
+        # broad legacy Gamma directory instead of rebuilding it and pruning it
+        # immediately afterwards.
+        recovered = self._recovered
+        if not self.catalog or self.catalog_revision is None:
+            self._ensure_loaded()
+            recovered = self._recovered
         selected = self._validate_realtime_universe(
             universe,
             catalog_revision=str(self.catalog_revision or ""),
@@ -6004,15 +6012,16 @@ class LiveStateStore:
             ]
             self._index_health_cache = None
             self._catalog_file_sha256 = _file_sha256(self.catalog_path)
-            self.checkpoint()
-            self.state_index.rebuild(
-                event_path=self.event_path,
-                books=self.books,
-                gaps=self.gaps,
-                catalog_revision=self.catalog_revision,
-                token_to_market=self.token_to_market,
-                active_recovery_id=self.active_recovery_id,
-            )
+            if recovered:
+                self.checkpoint()
+                self.state_index.rebuild(
+                    event_path=self.event_path,
+                    books=self.books,
+                    gaps=self.gaps,
+                    catalog_revision=self.catalog_revision,
+                    token_to_market=self.token_to_market,
+                    active_recovery_id=self.active_recovery_id,
+                )
         return {
             "catalog_revision": self.catalog_revision,
             "realtime_universe_id": universe["universe_id"],
