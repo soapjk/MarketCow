@@ -1486,10 +1486,9 @@ impl<L: DurableLog> SingleWriter<L> {
                     } else if let Some((catalog, conditions, relations, active_tokens)) =
                         validated_catalog(&combined, negative_risk_relations)
                     {
-                        let previous_active_tokens = next
+                        let mut known_scope_tokens = next
                             .markets
                             .values()
-                            .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
                             .flat_map(|market| {
                                 market
                                     .outcomes
@@ -1497,6 +1496,14 @@ impl<L: DurableLog> SingleWriter<L> {
                                     .map(|outcome| outcome.token_id.clone())
                             })
                             .collect::<BTreeSet<_>>();
+                        known_scope_tokens.extend(next.monitoring_markets.values().flat_map(
+                            |market| {
+                                market
+                                    .outcomes
+                                    .iter()
+                                    .map(|outcome| outcome.token_id.clone())
+                            },
+                        ));
                         // A dynamic-universe replacement removes a market from opportunity
                         // scanning, but that must not erase the stable identities and last
                         // authoritative books a position owner needs for settlement monitoring.
@@ -1585,7 +1592,7 @@ impl<L: DurableLog> SingleWriter<L> {
                         next.unresolved_gaps.retain(|gap| {
                             !gap.starts_with("catalog:")
                                 && !gap.starts_with("negative_risk:")
-                                && (!previous_active_tokens.contains(gap)
+                                && (!known_scope_tokens.contains(gap)
                                     || active_tokens.contains(gap))
                         });
                     } else {
@@ -4050,9 +4057,21 @@ mod tests {
                 ))
                 .unwrap();
         }
-        writer
+        let first_replacement = writer
             .apply(event(
                 6,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-2".into(),
+                    markets: vec![market("m2", "condition-2", None)],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+        assert!(first_replacement.projection.ready);
+
+        writer
+            .apply(event(
+                7,
                 EventKind::SourceGap {
                     token_id: "m1-yes".into(),
                     reason: "upstream_connection_boundary".into(),
@@ -4063,9 +4082,9 @@ mod tests {
 
         let replaced = writer
             .apply(event(
-                7,
+                8,
                 EventKind::CatalogSnapshot {
-                    catalog_revision: "catalog-2".into(),
+                    catalog_revision: "catalog-3".into(),
                     markets: vec![market("m2", "condition-2", None)],
                     negative_risk_relations: Vec::new(),
                 },
