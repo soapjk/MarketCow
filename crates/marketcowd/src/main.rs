@@ -4174,6 +4174,7 @@ fn projection_maximum_effective_book_age_ms(
         .unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 fn projection_fresh(state: &AppState, projection: &marketcow_core::Projection) -> bool {
     projection_maximum_effective_book_age_ms(state, projection) <= state.config.maximum_book_age_ms
 }
