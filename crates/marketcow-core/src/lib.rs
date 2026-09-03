@@ -1486,6 +1486,17 @@ impl<L: DurableLog> SingleWriter<L> {
                     } else if let Some((catalog, conditions, relations, active_tokens)) =
                         validated_catalog(&combined, negative_risk_relations)
                     {
+                        let previous_active_tokens = next
+                            .markets
+                            .values()
+                            .filter(|market| market.lifecycle_state == MarketLifecycleState::Active)
+                            .flat_map(|market| {
+                                market
+                                    .outcomes
+                                    .iter()
+                                    .map(|outcome| outcome.token_id.clone())
+                            })
+                            .collect::<BTreeSet<_>>();
                         // A dynamic-universe replacement removes a market from opportunity
                         // scanning, but that must not erase the stable identities and last
                         // authoritative books a position owner needs for settlement monitoring.
@@ -1572,7 +1583,10 @@ impl<L: DurableLog> SingleWriter<L> {
                                 });
                         }
                         next.unresolved_gaps.retain(|gap| {
-                            !gap.starts_with("catalog:") && !gap.starts_with("negative_risk:")
+                            !gap.starts_with("catalog:")
+                                && !gap.starts_with("negative_risk:")
+                                && (!previous_active_tokens.contains(gap)
+                                    || active_tokens.contains(gap))
                         });
                     } else {
                         next.unresolved_gaps.insert("catalog:invalid".into());
@@ -3994,6 +4008,76 @@ mod tests {
             Some("source_gap:upstream_connection_boundary")
         );
         assert!(failed.projection.quarantined_market_ids().is_empty());
+    }
+
+    #[test]
+    fn catalog_replacement_prunes_gaps_for_removed_tokens() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                unreachable!()
+            }
+            fn append_outcome(&mut self, _: &PersistedEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog);
+        writer
+            .apply(event(
+                1,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-1".into(),
+                    markets: vec![
+                        market("m1", "condition-1", None),
+                        market("m2", "condition-2", None),
+                    ],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+        for (cursor, token_id) in [(2, "m1-yes"), (3, "m1-no"), (4, "m2-yes"), (5, "m2-no")] {
+            writer
+                .apply(event(
+                    cursor,
+                    EventKind::FullBook {
+                        token_id: token_id.into(),
+                        bids: levels("0.4", "10"),
+                        asks: levels("0.6", "10"),
+                        tick_size: Price::parse_tick("0.01").unwrap(),
+                        tick_version: "tick-v1".into(),
+                    },
+                ))
+                .unwrap();
+        }
+        writer
+            .apply(event(
+                6,
+                EventKind::SourceGap {
+                    token_id: "m1-yes".into(),
+                    reason: "upstream_connection_boundary".into(),
+                },
+            ))
+            .unwrap();
+        assert!(writer.projection().unresolved_gaps.contains("m1-yes"));
+
+        let replaced = writer
+            .apply(event(
+                7,
+                EventKind::CatalogSnapshot {
+                    catalog_revision: "catalog-2".into(),
+                    markets: vec![market("m2", "condition-2", None)],
+                    negative_risk_relations: Vec::new(),
+                },
+            ))
+            .unwrap();
+
+        assert!(replaced.projection.unresolved_gaps.is_empty());
+        assert_eq!(
+            replaced.projection.active_market_ids(),
+            BTreeSet::from(["m2".to_owned()])
+        );
+        assert!(replaced.projection.ready);
     }
 
     #[test]
