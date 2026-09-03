@@ -309,6 +309,7 @@ class _DiscoveryBoundary:
         database_path: Path,
         active_market_count: int,
         relation_count: int,
+        realtime_universe_id: str | None = None,
     ) -> None:
         self.snapshot_id = snapshot_id
         self.catalog_revision = catalog_revision
@@ -317,6 +318,7 @@ class _DiscoveryBoundary:
         self.database_path = database_path
         self.active_market_count = active_market_count
         self.relation_count = relation_count
+        self.realtime_universe_id = realtime_universe_id
 
 
 def _decimal_config(values: Iterable[str]) -> tuple[str, ...]:
@@ -1262,7 +1264,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             with self._database(database_path, readonly=True) as connection:
                 rows = list(connection.execute(
                     "SELECT snapshot_id, catalog_revision, boundary_cursor, "
-                    "observed_at, active_market_count, relation_count "
+                    "observed_at, active_market_count, relation_count, "
+                    "realtime_universe_id "
                     "FROM snapshots WHERE boundary_cursor<=? "
                     "ORDER BY boundary_cursor DESC LIMIT ?",
                     (
@@ -1281,6 +1284,10 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                     database_path=database_path,
                     active_market_count=int(row["active_market_count"]),
                     relation_count=int(row["relation_count"]),
+                    realtime_universe_id=(
+                        str(row["realtime_universe_id"])
+                        if row["realtime_universe_id"] is not None else None
+                    ),
                 )
                 self._snapshots[boundary.snapshot_id] = boundary
             if rows:
@@ -1332,7 +1339,9 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
 
     def _catalog_paths(
         self,
-    ) -> tuple[str, Path, Path, str, str, datetime]:
+    ) -> tuple[
+        str, Path, Path, str, str, datetime, frozenset[str] | None, str | None
+    ]:
         payload, normalized_path, _, _ = self.reader._manifest_binding()
         source = payload.get("catalog_source")
         if not isinstance(source, dict):
@@ -1350,6 +1359,40 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 "Discovery catalog source identity is incomplete",
                 503,
             )
+        realtime_universe = payload.get("realtime_universe")
+        realtime_market_ids = None
+        realtime_universe_id = None
+        if isinstance(realtime_universe, dict):
+            universe_payload = dict(realtime_universe)
+            realtime_universe_id = str(
+                universe_payload.pop("universe_id", "")
+            )
+            for field in (
+                "maximum_market_count", "source_market_count",
+                "eligible_market_count", "market_count", "token_count",
+            ):
+                universe_payload[field] = int(universe_payload[field])
+            if universe_payload.get("book_backed_market_count") is not None:
+                universe_payload["book_backed_market_count"] = int(
+                    universe_payload["book_backed_market_count"]
+                )
+            market_ids = [
+                str(value) for value in universe_payload.get("market_ids") or []
+            ]
+            realtime_market_ids = frozenset(market_ids)
+            if (
+                universe_payload.get("catalog_revision")
+                != payload.get("catalog_revision")
+                or len(realtime_market_ids) != len(market_ids)
+                or int(universe_payload.get("market_count") or -1)
+                != len(realtime_market_ids)
+                or content_sha256(universe_payload) != realtime_universe_id
+            ):
+                raise PolymarketLiveReadError(
+                    "discovery_realtime_universe_invalid",
+                    "Discovery realtime universe is not bound to its catalog",
+                    409,
+                )
         return (
             str(payload["catalog_revision"]),
             normalized_path,
@@ -1357,6 +1400,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             str(source.get("raw_format") or ""),
             source_url,
             observed_at,
+            realtime_market_ids,
+            realtime_universe_id,
         )
 
     @staticmethod
@@ -1407,7 +1452,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             CREATE TABLE snapshots (
                 snapshot_id TEXT PRIMARY KEY, catalog_revision TEXT NOT NULL,
                 boundary_cursor INTEGER NOT NULL, observed_at TEXT NOT NULL,
-                active_market_count INTEGER NOT NULL, relation_count INTEGER NOT NULL
+                active_market_count INTEGER NOT NULL, relation_count INTEGER NOT NULL,
+                realtime_universe_id TEXT
             );
             CREATE INDEX snapshots_cursor ON snapshots(boundary_cursor);
             """
@@ -1699,7 +1745,11 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         return count
 
     def _full_materialize(self) -> _DiscoveryBoundary:
-        catalog_revision, normalized_path, raw_path, raw_format, source_url, catalog_observed_at = self._catalog_paths()
+        (
+            catalog_revision, normalized_path, raw_path, raw_format,
+            source_url, catalog_observed_at, realtime_market_ids,
+            realtime_universe_id,
+        ) = self._catalog_paths()
         for stale in self.materialization_root.glob(".building-*.sqlite3*"):
             stale.unlink(missing_ok=True)
         staging = self.materialization_root / f".building-{uuid.uuid4().hex}.sqlite3"
@@ -1711,13 +1761,23 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 market_id = str(raw.get("id") or "")
                 if not market_id:
                     continue
-                raw_body = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
-                connection.execute("INSERT OR REPLACE INTO raw_catalog VALUES (?,?)", (market_id, raw_body))
                 if relation_id := self._relation_id_from_raw(raw):
                     connection.execute(
                         "INSERT INTO relation_sources VALUES (?,?)",
                         (relation_id, content_sha256(raw)),
                     )
+                if (
+                    realtime_market_ids is not None
+                    and market_id not in realtime_market_ids
+                ):
+                    continue
+                raw_body = json.dumps(
+                    raw, sort_keys=True, separators=(",", ":")
+                ).encode()
+                connection.execute(
+                    "INSERT OR REPLACE INTO raw_catalog VALUES (?,?)",
+                    (market_id, raw_body),
+                )
             connection.commit()
             observed_at = self.reader.now_provider()
             active_count = 0
@@ -1727,6 +1787,11 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                     if not body:
                         continue
                     market = LiveMarket.model_validate_json(body)
+                    if (
+                        realtime_market_ids is not None
+                        and market.identity.market_id not in realtime_market_ids
+                    ):
+                        continue
                     if not market.active or market.closed:
                         continue
                     raw_row = connection.execute(
@@ -1852,6 +1917,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             digest = hashlib.sha256()
             digest.update(DISCOVERY_SCHEMA_VERSION.encode())
             digest.update(catalog_revision.encode())
+            digest.update((realtime_universe_id or "").encode())
             digest.update(str(boundary_cursor).encode())
             digest.update(json.dumps(self.depth_notionals).encode())
             for row in connection.execute(
@@ -1860,8 +1926,12 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 digest.update(json.dumps(tuple(row), separators=(",", ":")).encode())
             snapshot_id = digest.hexdigest()
             connection.execute(
-                "INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
-                (snapshot_id, catalog_revision, boundary_cursor, observed_at.isoformat(), active_count, relation_count),
+                "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?)",
+                (
+                    snapshot_id, catalog_revision, boundary_cursor,
+                    observed_at.isoformat(), active_count, relation_count,
+                    realtime_universe_id,
+                ),
             )
             connection.executescript(
                 "DROP TABLE raw_catalog; DROP TABLE relation_sources; "
@@ -1885,10 +1955,14 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             boundary_cursor=boundary_cursor, observed_at=observed_at,
             database_path=database_path, active_market_count=active_count,
             relation_count=relation_count,
+            realtime_universe_id=realtime_universe_id,
         )
 
     def _incremental_materialize(self, current: _DiscoveryBoundary) -> _DiscoveryBoundary | None:
         observed_at = self.reader.now_provider()
+        current_realtime_universe_id = self._catalog_paths()[-1]
+        if current_realtime_universe_id != current.realtime_universe_id:
+            return self._full_materialize()
         connection = self._open_database(current.database_path)
         requires_full_materialization = False
         changed_market_ids: set[str] = set()
@@ -2011,13 +2085,18 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             snapshot_id = content_sha256({
                 "schema_version": DISCOVERY_SCHEMA_VERSION,
                 "catalog_revision": catalog_revision,
+                "realtime_universe_id": current.realtime_universe_id,
                 "boundary_cursor": boundary_cursor,
                 "previous_snapshot_id": current.snapshot_id,
                 "changed_market_ids": sorted(changed_market_ids),
             })
             connection.execute(
-                "INSERT INTO snapshots VALUES (?,?,?,?,?,?)",
-                (snapshot_id, catalog_revision, boundary_cursor, observed_at.isoformat(), current.active_market_count, current.relation_count),
+                "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?)",
+                (
+                    snapshot_id, catalog_revision, boundary_cursor,
+                    observed_at.isoformat(), current.active_market_count,
+                    current.relation_count, current.realtime_universe_id,
+                ),
             )
             connection.commit()
         finally:
@@ -2028,6 +2107,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             database_path=current.database_path,
             active_market_count=current.active_market_count,
             relation_count=current.relation_count,
+            realtime_universe_id=current.realtime_universe_id,
         )
 
     def _publish(self, boundary: _DiscoveryBoundary) -> None:
@@ -2035,6 +2115,13 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             previous_database_paths = {
                 item.database_path for item in self._snapshots.values()
             }
+            previous = next(reversed(self._snapshots.values()), None)
+            if (
+                previous is not None
+                and previous.realtime_universe_id
+                != boundary.realtime_universe_id
+            ):
+                self._snapshots.clear()
             self._snapshots[boundary.snapshot_id] = boundary
             self._snapshots.move_to_end(boundary.snapshot_id)
             while len(self._snapshots) > self.retained_snapshots:
@@ -2080,6 +2167,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             "snapshot_id": boundary.snapshot_id,
             "catalog_revision": boundary.catalog_revision,
             "boundary_cursor": boundary.boundary_cursor,
+            "realtime_universe_id": boundary.realtime_universe_id,
         }
         temporary = self.current_manifest_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(manifest, sort_keys=True))
@@ -2142,6 +2230,13 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 if snapshot_id is not None
                 else next(reversed(self._snapshots.values()), None)
             )
+        current_realtime_universe_id = self._catalog_paths()[-1]
+        if (
+            boundary is not None
+            and boundary.realtime_universe_id != current_realtime_universe_id
+        ):
+            self.start_background_materialization()
+            boundary = None
         if boundary is None:
             self.start_background_materialization()
             code = "discovery_snapshot_expired" if snapshot_id else "discovery_snapshot_materializing"

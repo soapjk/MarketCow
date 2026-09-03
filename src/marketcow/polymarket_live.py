@@ -504,6 +504,7 @@ def _write_candidate_snapshot(
     revision: str,
     normalized: dict[str, Any],
     source: dict[str, Any],
+    realtime_market_ids: frozenset[str] | None = None,
 ) -> dict[str, Any]:
     """Materialize one immutable, metadata-only candidate catalog boundary."""
     root = root.resolve()
@@ -530,7 +531,12 @@ def _write_candidate_snapshot(
 
     candidate_root = root / "candidate-snapshots"
     candidate_root.mkdir(parents=True, exist_ok=True)
-    destination = candidate_root / f"{revision}.json"
+    selection_suffix = (
+        ""
+        if realtime_market_ids is None
+        else "-" + content_sha256(sorted(realtime_market_ids))
+    )
+    destination = candidate_root / f"{revision}{selection_suffix}.json"
     with tempfile.TemporaryDirectory(
         dir=root, prefix=".candidate-snapshot-",
     ) as temporary_name:
@@ -612,6 +618,11 @@ def _write_candidate_snapshot(
                             continue
                         market = LiveMarket.model_validate_json(body)
                         market_id = market.identity.market_id
+                        if (
+                            realtime_market_ids is not None
+                            and market_id not in realtime_market_ids
+                        ):
+                            continue
                         raw = raw_index.execute(
                             "SELECT * FROM raw_markets WHERE market_id=?",
                             (market_id,),
@@ -729,7 +740,11 @@ def _write_candidate_snapshot(
             if (
                 normalized_hasher.hexdigest() != normalized.get("sha256")
                 or normalized.get("market_count") is None
-                or candidate_count != int(normalized["market_count"])
+                or candidate_count != (
+                    int(normalized["market_count"])
+                    if realtime_market_ids is None
+                    else len(realtime_market_ids)
+                )
             ):
                 raise RuntimeError("candidate normalized catalog stream mismatch")
 
@@ -745,6 +760,8 @@ def _write_candidate_snapshot(
                 for group_id, expected_count, raw_binary_count in raw_groups:
                     relation_id = f"neg-risk:{group_id}"
                     actual = actual_relations.pop(relation_id, None)
+                    if realtime_market_ids is not None and actual is None:
+                        continue
                     pairs = list((actual or {}).get("outcome_pairs") or [])
                     members = [CandidateRelationMember(
                         market_id=str(pair["market_id"]),
@@ -966,6 +983,7 @@ def _atomic_write_catalog(
     revision: str,
     markets: list[LiveMarket],
     source: dict[str, Any],
+    realtime_universe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_root = path.parent / "catalogs"
     normalized_root.mkdir(parents=True, exist_ok=True)
@@ -1022,15 +1040,22 @@ def _atomic_write_catalog(
         revision=revision,
         normalized=normalized,
         source=source,
+        realtime_market_ids=(
+            frozenset(realtime_universe["market_ids"])
+            if realtime_universe is not None else None
+        ),
     )
-    _atomic_write(path, canonical_json({
+    manifest = {
         "catalog_revision": revision,
         "catalog_source": source,
         "catalog_index": catalog_index,
         "candidate_snapshot": candidate_snapshot,
         "normalized_catalog": normalized,
         "schema_version": LIVE_SCHEMA_VERSION,
-    }))
+    }
+    if realtime_universe is not None:
+        manifest["realtime_universe"] = realtime_universe
+    _atomic_write(path, canonical_json(manifest))
     return normalized
 
 
@@ -1116,6 +1141,11 @@ def build_live_candidate_snapshot(root: Path) -> dict[str, Any]:
             revision=revision,
             normalized=normalized,
             source=source,
+            realtime_market_ids=(
+                frozenset(payload["realtime_universe"]["market_ids"])
+                if isinstance(payload.get("realtime_universe"), dict)
+                else None
+            ),
         )
         if manifest_path.read_bytes() != manifest_body:
             raise RuntimeError("live catalog changed during candidate publication")
@@ -4101,6 +4131,137 @@ class GammaCatalogRows:
             self.retry_manifest_path.unlink(missing_ok=True)
 
 
+class GammaRealtimeUniversePolicy:
+    """Select a bounded book universe without redefining the Gamma catalog.
+
+    Gamma ``closed=false`` is a broad discovery directory.  It is not a
+    promise that every listed token has a CLOB book.  Rank only explicitly
+    order-book-enabled rows for the discovery collector while retaining the
+    complete normalized catalog as immutable metadata evidence.
+    """
+
+    schema_version = "marketcow.polymarket.realtime-universe.v1"
+    policy_version = "gamma-clob-liquidity-volume-v1"
+
+    def __init__(
+        self,
+        maximum_market_count: int,
+        *,
+        required_market_ids: Iterable[str] = (),
+    ) -> None:
+        if not 1 <= maximum_market_count <= 10_000:
+            raise ValueError("realtime market limit must be in [1, 10000]")
+        self.maximum_market_count = maximum_market_count
+        self.required_market_ids = frozenset(
+            str(value).strip() for value in required_market_ids
+            if str(value).strip()
+        )
+
+    @staticmethod
+    def _decimal(row: dict[str, Any], *names: str) -> Decimal:
+        for name in names:
+            value = row.get(name)
+            if value is None:
+                continue
+            try:
+                parsed = Decimal(str(value))
+            except Exception:
+                return Decimal("-1")
+            return parsed if parsed.is_finite() else Decimal("-1")
+        return Decimal("0")
+
+    @staticmethod
+    def _source_eligible(row: dict[str, Any]) -> bool:
+        events = row.get("events")
+        event = events[0] if isinstance(events, list) and events else {}
+        return all((
+            row.get("enableOrderBook") is True,
+            row.get("archived") is not True,
+            row.get("pendingDeployment") is not True,
+            row.get("deploying") is not True,
+            event.get("active") is not False,
+            event.get("closed") is not True,
+            event.get("archived") is not True,
+        ))
+
+    def select(
+        self,
+        markets: Iterable[LiveMarket],
+        raw_rows: Iterable[dict[str, Any]],
+        *,
+        catalog_revision: str,
+        available_token_ids: frozenset[str] | None = None,
+    ) -> dict[str, Any]:
+        by_id = {
+            market.identity.market_id: market
+            for market in markets
+            if market.active and not market.closed and market.accepting_orders
+        }
+        ranked: list[tuple[tuple[Decimal, Decimal, Decimal, str], str]] = []
+        source_row_count = 0
+        source_eligible_count = 0
+        for row in raw_rows:
+            source_row_count += 1
+            market_id = str(row.get("id") or "")
+            if market_id not in by_id or not self._source_eligible(row):
+                continue
+            source_eligible_count += 1
+            if (
+                available_token_ids is not None
+                and any(
+                    outcome.token_id not in available_token_ids
+                    for outcome in by_id[market_id].identity.outcomes
+                )
+            ):
+                continue
+            ranked.append((
+                (
+                    self._decimal(row, "volume24hrClob", "volume24hr"),
+                    self._decimal(row, "liquidityClob", "liquidityNum"),
+                    self._decimal(row, "volumeClob", "volumeNum"),
+                    market_id,
+                ),
+                market_id,
+            ))
+        eligible_ids = {market_id for _, market_id in ranked}
+        required = sorted(self.required_market_ids & eligible_ids)
+        if len(required) > self.maximum_market_count:
+            raise RuntimeError(
+                "eligible required realtime markets exceed the configured limit"
+            )
+        selected = list(required)
+        selected_set = set(required)
+        for _, market_id in sorted(ranked, reverse=True):
+            if market_id in selected_set:
+                continue
+            selected.append(market_id)
+            selected_set.add(market_id)
+            if len(selected) == self.maximum_market_count:
+                break
+        selected.sort()
+        payload = {
+            "schema_version": self.schema_version,
+            "policy_version": self.policy_version,
+            "catalog_revision": catalog_revision,
+            "maximum_market_count": self.maximum_market_count,
+            "source_market_count": source_row_count,
+            "eligible_market_count": source_eligible_count,
+            "book_backed_market_count": (
+                len(eligible_ids)
+                if available_token_ids is not None else None
+            ),
+            "market_count": len(selected),
+            "token_count": len(selected) * 2,
+            "market_ids": selected,
+            "required_market_ids": sorted(self.required_market_ids),
+            "ineligible_required_market_ids": sorted(
+                self.required_market_ids - eligible_ids
+            ),
+        }
+        payload["universe_id"] = content_sha256(payload)
+        return payload
+
+
 class GammaKeysetCatalog:
     """Complete active-market discovery using Gamma's keyset endpoint."""
 
@@ -5266,6 +5427,7 @@ class LiveStateStore:
             self._index_health_cache is None
             or now - self._index_health_cache_at >= 0.25
         ):
+            realtime_market_ids = set(self.token_to_market.values())
             self._index_health_cache = {
                 "book_token_count": len(self.books),
                 "book_complete_market_count": sum(
@@ -5275,8 +5437,8 @@ class LiveStateStore:
                         and self.books[outcome.token_id].asks
                         for outcome in market.identity.outcomes
                     )
-                    for market in self.catalog.values()
-                    if market.active and not market.closed
+                    for market_id in realtime_market_ids
+                    for market in (self.catalog[market_id],)
                 ),
                 "unresolved_gap_count": sum(
                     not gap.resolved for gap in self.gaps
@@ -5552,6 +5714,8 @@ class LiveStateStore:
         self,
         markets: list[LiveMarket],
         raw_rows: Iterable[dict[str, Any]] | GammaCatalogRows,
+        *,
+        realtime_universe: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._ensure_loaded()
         def relation_revisions(values: Iterable[LiveMarket]) -> dict[str, str]:
@@ -5574,10 +5738,23 @@ class LiveStateStore:
         markets.sort(key=lambda item: item.identity.market_id)
         next_relation_revisions = relation_revisions(markets)
         revision = _market_sequence_sha256(markets)
+        realtime_market_ids = (
+            self._validate_realtime_universe(
+                realtime_universe,
+                catalog_revision=revision,
+                available_market_ids=set(by_id),
+            )
+            if realtime_universe is not None else None
+        )
         previous_tokens = set(self.token_to_market)
         next_token_to_market = {
             outcome.token_id: market.identity.market_id
-            for market in markets if market.active and not market.closed
+            for market in markets
+            if market.active and not market.closed
+            and (
+                realtime_market_ids is None
+                or market.identity.market_id in realtime_market_ids
+            )
             for outcome in market.identity.outcomes
         }
         if isinstance(raw_rows, GammaCatalogRows):
@@ -5613,9 +5790,27 @@ class LiveStateStore:
             _atomic_write_catalog(
                 self.catalog_path, revision=revision, markets=markets,
                 source=next_catalog_source,
+                realtime_universe=realtime_universe,
             )
             self.catalog = by_id
             self.token_to_market = next_token_to_market
+            if realtime_market_ids is not None:
+                selected_tokens = set(next_token_to_market)
+                self.books = {
+                    token_id: book for token_id, book in self.books.items()
+                    if token_id in selected_tokens
+                }
+                self._rest_refresh_generation = {
+                    token_id: generation
+                    for token_id, generation
+                    in self._rest_refresh_generation.items()
+                    if token_id in selected_tokens
+                }
+                self.gaps = [
+                    gap for gap in self.gaps
+                    if gap.token_id is None or gap.token_id in selected_tokens
+                ]
+                self._index_health_cache = None
             self.catalog_revision = revision
             self.raw_catalog_path = next_raw_catalog_path
             self.catalog_source = next_catalog_source
@@ -5707,7 +5902,123 @@ class LiveStateStore:
                         received_at=self.now_provider(),
                         _publication_locked=True,
                     )
-        return {"catalog_revision": revision, "token_changes": token_changes}
+        if realtime_market_ids is not None:
+            # Bind restart recovery to the same bounded generation.  This is
+            # outside the publication lock because async durability must take
+            # that lock before checkpointing can wait for its cursor.
+            self.checkpoint()
+        return {
+            "catalog_revision": revision,
+            "realtime_market_count": (
+                len(realtime_market_ids)
+                if realtime_market_ids is not None else len(markets)
+            ),
+            "token_changes": token_changes,
+        }
+
+    @staticmethod
+    def _validate_realtime_universe(
+        universe: dict[str, Any],
+        *,
+        catalog_revision: str,
+        available_market_ids: set[str],
+    ) -> frozenset[str]:
+        if (
+            universe.get("schema_version")
+            != GammaRealtimeUniversePolicy.schema_version
+            or universe.get("catalog_revision") != catalog_revision
+        ):
+            raise RuntimeError("realtime universe catalog binding is invalid")
+        market_ids = [str(value) for value in universe.get("market_ids") or []]
+        selected = frozenset(market_ids)
+        if (
+            len(selected) != len(market_ids)
+            or int(universe.get("market_count") or -1) != len(selected)
+            or int(universe.get("token_count") or -1) != len(selected) * 2
+            or selected - available_market_ids
+        ):
+            raise RuntimeError("realtime universe market coverage is invalid")
+        payload = dict(universe)
+        universe_id = str(payload.pop("universe_id", ""))
+        for field in (
+            "maximum_market_count", "source_market_count",
+            "eligible_market_count", "market_count", "token_count",
+        ):
+            payload[field] = int(payload[field])
+        if payload.get("book_backed_market_count") is not None:
+            payload["book_backed_market_count"] = int(
+                payload["book_backed_market_count"]
+            )
+        if content_sha256(payload) != universe_id:
+            raise RuntimeError("realtime universe checksum is invalid")
+        return selected
+
+    def replace_realtime_universe(self, universe: dict[str, Any]) -> dict[str, Any]:
+        """Attach a bounded realtime generation to an existing catalog."""
+        self._ensure_loaded()
+        selected = self._validate_realtime_universe(
+            universe,
+            catalog_revision=str(self.catalog_revision or ""),
+            available_market_ids=set(self.catalog),
+        )
+        with _publication_lock(self.root, exclusive=True):
+            payload = json.loads(self.catalog_path.read_bytes())
+            if payload.get("catalog_revision") != self.catalog_revision:
+                raise RuntimeError(
+                    "catalog changed during realtime universe publication"
+                )
+            normalized = payload.get("normalized_catalog")
+            source = payload.get("catalog_source")
+            if not isinstance(normalized, dict) or not isinstance(source, dict):
+                raise RuntimeError("catalog cannot publish a realtime universe")
+            candidate_snapshot = _write_candidate_snapshot(
+                self.root,
+                revision=str(self.catalog_revision),
+                normalized=normalized,
+                source=source,
+                realtime_market_ids=selected,
+            )
+            payload["candidate_snapshot"] = candidate_snapshot
+            payload["realtime_universe"] = universe
+            _atomic_write(self.catalog_path, canonical_json(payload))
+            self.token_to_market = {
+                outcome.token_id: market.identity.market_id
+                for market in self.catalog.values()
+                if market.active and not market.closed
+                and market.identity.market_id in selected
+                for outcome in market.identity.outcomes
+            }
+            selected_tokens = set(self.token_to_market)
+            self.books = {
+                token_id: book for token_id, book in self.books.items()
+                if token_id in selected_tokens
+            }
+            self._rest_refresh_generation = {
+                token_id: generation
+                for token_id, generation in self._rest_refresh_generation.items()
+                if token_id in selected_tokens
+            }
+            self.gaps = [
+                gap for gap in self.gaps
+                if gap.token_id is None or gap.token_id in selected_tokens
+            ]
+            self._index_health_cache = None
+            self._catalog_file_sha256 = _file_sha256(self.catalog_path)
+            self.checkpoint()
+            self.state_index.rebuild(
+                event_path=self.event_path,
+                books=self.books,
+                gaps=self.gaps,
+                catalog_revision=self.catalog_revision,
+                token_to_market=self.token_to_market,
+                active_recovery_id=self.active_recovery_id,
+            )
+        return {
+            "catalog_revision": self.catalog_revision,
+            "realtime_universe_id": universe["universe_id"],
+            "realtime_market_count": len(selected),
+            "realtime_token_count": len(self.token_to_market),
+        }
 
     def _emit(
         self,
@@ -5798,6 +6109,7 @@ class LiveStateStore:
         )
         self._event_offset = byte_offset + byte_length
         self._last_log_cursor = envelope.cursor
+        realtime_market_ids = set(self.token_to_market.values())
         self.state_index.append(
             envelope,
             byte_offset=byte_offset,
@@ -5817,8 +6129,8 @@ class LiveStateStore:
                     and self.books[outcome.token_id].asks
                     for outcome in market.identity.outcomes
                 )
-                for market in self.catalog.values()
-                if market.active and not market.closed
+                for market_id in realtime_market_ids
+                for market in (self.catalog[market_id],)
             ),
             unresolved_gap_count=sum(not gap.resolved for gap in self.gaps),
             oldest_book_received_at=(
@@ -6701,9 +7013,23 @@ class LiveStateStore:
             ):
                 raise RuntimeError("live raw catalog integrity failed")
         self.catalog = {item.identity.market_id: item for item in markets}
+        realtime_universe = payload.get("realtime_universe")
+        realtime_market_ids = (
+            self._validate_realtime_universe(
+                realtime_universe,
+                catalog_revision=str(payload.get("catalog_revision") or ""),
+                available_market_ids=set(self.catalog),
+            )
+            if isinstance(realtime_universe, dict) else None
+        )
         self.token_to_market = {
             outcome.token_id: market.identity.market_id
-            for market in markets if market.active and not market.closed
+            for market in markets
+            if market.active and not market.closed
+            and (
+                realtime_market_ids is None
+                or market.identity.market_id in realtime_market_ids
+            )
             for outcome in market.identity.outcomes
         }
         self.catalog_revision = payload.get("catalog_revision")
@@ -6753,7 +7079,7 @@ class LiveStateStore:
                 self.gaps.append(gap.model_copy(deep=True))
                 existing_gaps.add(identity)
         if (
-            event.applied and event.token_id
+            event.applied and event.token_id in self.token_to_market
             and event.event_type in {
                 "book", "price_change", "best_bid_ask",
                 "last_trade_price", "tick_size_change",
@@ -7029,12 +7355,24 @@ def build_live_state_index(root: Path) -> dict[str, Any]:
 
     try:
         with _readonly_sqlite(catalog_index_path) as connection:
+            realtime_universe = payload.get("realtime_universe")
+            selected_market_ids = (
+                frozenset(
+                    str(value)
+                    for value in realtime_universe.get("market_ids") or []
+                )
+                if isinstance(realtime_universe, dict) else None
+            )
             token_to_market = {
                 str(row[0]): str(row[1])
                 for row in connection.execute(
                     """SELECT tokens.token_id, tokens.market_id
                        FROM tokens JOIN markets USING(market_id)
                        WHERE markets.active=1 AND markets.closed=0"""
+                )
+                if (
+                    selected_market_ids is None
+                    or str(row[1]) in selected_market_ids
                 )
             }
     except sqlite3.DatabaseError as exc:
@@ -7445,6 +7783,7 @@ class PolymarketLiveCollector:
         websocket_flush_seconds: float = 0.1,
         max_websocket_batch_messages: int = 256,
         max_websocket_batch_items: int = 32,
+        realtime_universe_policy: GammaRealtimeUniversePolicy | None = None,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -7473,6 +7812,7 @@ class PolymarketLiveCollector:
         self.websocket_flush_seconds = max(0, websocket_flush_seconds)
         self.max_websocket_batch_messages = max(1, max_websocket_batch_messages)
         self.max_websocket_batch_items = max(1, max_websocket_batch_items)
+        self.realtime_universe_policy = realtime_universe_policy
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
         # Independent periodic partitions may fetch concurrently, but a full
@@ -7667,6 +8007,102 @@ class PolymarketLiveCollector:
             grouped[find(market_id)].append(market_id)
         return sorted(tuple(members) for members in grouped.values())
 
+    def configure_published_realtime_universe(self) -> dict[str, Any] | None:
+        """Apply the bounded policy to an integrity-checked local catalog."""
+        policy = self.realtime_universe_policy
+        if policy is None:
+            return None
+        source = self.store.catalog_source or {}
+        raw_path = self.store.raw_catalog_path
+        raw_format = str(source.get("raw_format") or "")
+        if raw_path is None:
+            raise RuntimeError("published catalog has no verified raw evidence")
+        if raw_format != "canonical_jsonl":
+            raise RuntimeError(
+                "bounded realtime discovery requires canonical Gamma JSONL"
+            )
+        rows = GammaCatalogRows(
+            raw_path,
+            row_count=int(source.get("market_count") or 0),
+            sha256=str(source.get("raw_payload_sha256") or ""),
+        )
+        universe = self._select_realtime_universe(
+            self.store.catalog.values(),
+            rows,
+            catalog_revision=str(self.store.catalog_revision or ""),
+        )
+        try:
+            published = json.loads(self.store.catalog_path.read_bytes()).get(
+                "realtime_universe"
+            )
+        except (OSError, ValueError):
+            published = None
+        if (
+            isinstance(published, dict)
+            and published.get("universe_id") == universe["universe_id"]
+        ):
+            return {
+                "catalog_revision": self.store.catalog_revision,
+                "realtime_universe_id": universe["universe_id"],
+                "realtime_market_count": universe["market_count"],
+                "realtime_token_count": len(self.store.token_to_market),
+                "status": "published_realtime_universe_reused",
+            }
+        return self.store.replace_realtime_universe(universe)
+
+    def _select_realtime_universe(
+        self,
+        markets: Iterable[LiveMarket],
+        raw_rows: Iterable[dict[str, Any]],
+        *,
+        catalog_revision: str,
+    ) -> dict[str, Any]:
+        policy = self.realtime_universe_policy
+        if policy is None:
+            raise RuntimeError("realtime universe policy is not configured")
+        markets = list(markets)
+        raw_rows = list(raw_rows) if not isinstance(
+            raw_rows, GammaCatalogRows
+        ) else raw_rows
+        probe_limit = min(10_000, policy.maximum_market_count * 3)
+        probe_policy = GammaRealtimeUniversePolicy(
+            probe_limit,
+            required_market_ids=policy.required_market_ids,
+        )
+        probe = probe_policy.select(
+            markets,
+            raw_rows,
+            catalog_revision=catalog_revision,
+        )
+        by_id = {market.identity.market_id: market for market in markets}
+        probe_tokens = [
+            outcome.token_id
+            for market_id in probe["market_ids"]
+            for outcome in by_id[market_id].identity.outcomes
+        ]
+        book_rows = self.books_client.fetch_stream(
+            probe_tokens,
+            require_complete_batches=False,
+        )
+        available_token_ids = frozenset(
+            str(row.get("asset_id") or row.get("token_id") or "")
+            for row in book_rows
+            if row.get("bids") and row.get("asks")
+        )
+        universe = policy.select(
+            markets,
+            raw_rows,
+            catalog_revision=catalog_revision,
+            available_token_ids=available_token_ids,
+        )
+        LOGGER.info(
+            "polymarket_realtime_universe_selected catalog_markets=%d "
+            "probe_markets=%d book_backed_markets=%d selected_markets=%d",
+            len(markets), probe["market_count"],
+            universe["book_backed_market_count"], universe["market_count"],
+        )
+        return universe
+
     def refresh_catalog(self) -> dict[str, Any]:
         rows, evidence = self.catalog_client.fetch_all()
         publish_started = time.monotonic()
@@ -7678,7 +8114,22 @@ class PolymarketLiveCollector:
                     self.catalog_client, "fee_semantics_policy", None,
                 ),
             )
-            update = self.store.replace_catalog(markets, rows)
+            revision = _market_sequence_sha256(
+                sorted(markets, key=lambda item: item.identity.market_id)
+            )
+            realtime_universe = (
+                self._select_realtime_universe(
+                    markets,
+                    rows,
+                    catalog_revision=revision,
+                )
+                if self.realtime_universe_policy is not None else None
+            )
+            update = self.store.replace_catalog(
+                markets,
+                rows,
+                realtime_universe=realtime_universe,
+            )
             rows.mark_published()
         finally:
             rows.cleanup()

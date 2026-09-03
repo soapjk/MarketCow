@@ -19,8 +19,9 @@ all other existing APIs. Polymarket live HTTP and WebSocket requests under
 `/v1/prediction-markets/polymarket/live/*` are forwarded without fallback to
 the internal Rust data plane.
 
-- Python full-market discovery is internal and publishes the fee-complete,
-  indexed candidate boundary.
+- Python retains the complete Gamma metadata catalog, but its internal
+  discovery collector bootstraps and publishes only a checksum-bound, ranked
+  realtime universe (1000 markets by default).
 - Tradude alone ranks opportunities and publishes an exact selection.
 - MarketCow validates books and facts, warms a new generation, and atomically
   activates it.
@@ -33,5 +34,5 @@ Ports `8795` (discovery stream) and `8796` (Rust data plane/control plane) are
 loopback implementation details. Consumers use `8790` only.
 
 The discovery API retains 4096 immutable snapshot generations by default. At
-the 0.5-second materialization cadence this gives a full-market consumer about
-34 minutes to finish pagination without crossing or expiring its boundary.
+the 0.5-second materialization cadence this gives a consumer about 34 minutes
+to finish pagination without crossing or expiring its bounded boundary.

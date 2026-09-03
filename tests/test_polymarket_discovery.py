@@ -11,7 +11,11 @@ from tempfile import TemporaryDirectory
 from fastapi.testclient import TestClient
 
 from marketcow.polymarket_discovery import PolymarketDiscoveryStore
-from marketcow.polymarket_live import GammaLiveNormalizer, LiveStateStore
+from marketcow.polymarket_live import (
+    GammaLiveNormalizer,
+    GammaRealtimeUniversePolicy,
+    LiveStateStore,
+)
 from marketcow.polymarket_live_read_api import create_polymarket_live_read_app
 from tests.test_polymarket_live import gamma_row, snapshot
 
@@ -65,6 +69,66 @@ class PolymarketDiscoveryTest(unittest.TestCase):
             self.assertEqual(response.status_code, 503, response.text)
             time.sleep(0.01)
         self.fail("discovery snapshot did not finish materializing")
+
+    def test_materialization_exposes_only_bounded_realtime_universe(self):
+        rows = [
+            gamma_row(
+                f"m{index}", f"0x{index:064x}",
+                (f"yes-{index}", f"no-{index}"),
+            )
+            for index in range(1, 4)
+        ]
+        for index, row in enumerate(rows, start=1):
+            row.update({
+                "enableOrderBook": True,
+                "volume24hrClob": str(index),
+                "liquidityClob": str(index * 10),
+            })
+        writer = LiveStateStore(self.root, now_provider=lambda: NOW)
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        writer.replace_catalog(markets, rows)
+        universe = GammaRealtimeUniversePolicy(2).select(
+            markets,
+            rows,
+            catalog_revision=str(writer.catalog_revision),
+        )
+        writer.replace_realtime_universe(universe)
+        for index in (2, 3):
+            writer.apply_snapshot(
+                snapshot(f"yes-{index}", "0.40", "0.42"),
+                received_at=NOW,
+            )
+            writer.apply_snapshot(
+                snapshot(f"no-{index}", "0.58", "0.60"),
+                received_at=NOW,
+            )
+
+        with TestClient(self.app()) as client:
+            body = self.ready_snapshot(client, limit=100).json()
+            replacement = GammaRealtimeUniversePolicy(1).select(
+                markets,
+                rows,
+                catalog_revision=str(writer.catalog_revision),
+            )
+            writer.replace_realtime_universe(replacement)
+            expired = client.get(
+                "/v1/prediction-markets/polymarket/live/discovery/snapshot",
+                params={
+                    "snapshot_id": body["snapshot_id"],
+                    "page_size": 100,
+                },
+            )
+            replacement_body = self.ready_snapshot(client, limit=100).json()
+
+        self.assertEqual(len(writer.catalog), 3)
+        self.assertEqual(body["active_market_count"], 2)
+        self.assertEqual(
+            {item["market_id"] for item in body["items"]},
+            {"m2", "m3"},
+        )
+        self.assertEqual(expired.status_code, 410)
+        self.assertEqual(replacement_body["active_market_count"], 1)
+        self.assertEqual(replacement_body["items"][0]["market_id"], "m3")
 
     def test_explicit_depth_configuration_is_mandatory_and_ordered(self):
         rows = [gamma_row()]

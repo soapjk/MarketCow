@@ -9,14 +9,14 @@ MarketCow 正式环境只有一个受支持的服务所有者和一个调用方�
 安装命令会编译并固定本地 Rust 二进制、生成最终架构配置、准备 PostgreSQL 与
 ClickHouse，并由同一个 supervisor 同时管理：
 
-1. Polymarket 全市场 discovery collector；
+1. Polymarket 完整目录与有界实时 discovery collector；
 2. 权威 Polymarket Rust 数据面；
 3. MarketCow 统一 API 网关；
 4. Tradude 机会范围控制器；
 5. MarketCow 动态 universe 校验与原子激活器。
 
 股票与 Hyperliquid 实时订阅由统一 API 进程内的 realtime hub 管理，不是独立服务。
-全市场 discovery 使用内部端口 `8795`，Rust 数据面使用内部端口 `8796`；这些端口
+Discovery 使用内部端口 `8795`，Rust 数据面使用内部端口 `8796`；这些端口
 不是调用方接口。旧端口 `8794`、`8791`、`18872` 不属于正式架构。HTTP、WebSocket、
 管理后台 API 和 MCP 的调用方入口均为 `8790`。
 
@@ -24,6 +24,11 @@ Polymarket live 的 scope、快照、事件、checkpoint、full-sync、健康状
 都由 8790 网关转发给 Rust。网关在 Rust 不可用时返回 503，绝不回落到旧 Python
 scope/index。范围不是固定 100 个市场：Tradude 按机会选择最多 100 个市场，至少一个
 完整且可交易的候选才允许 MarketCow 构建并激活新一代。
+
+Gamma 的完整 `closed=false` 目录只作为元数据保存。生产配置默认从中选择最多 1000
+个明确启用 CLOB、已部署并按近期 CLOB 成交量和流动性排序的市场进行盘口 bootstrap
+与订阅；当前 Rust Scope 中仍合格的市场优先保留。该边界由
+`MARKETCOW_POLYMARKET_DISCOVERY_REALTIME_MARKET_LIMIT` 控制，不能设置为全目录规模。
 
 `ops/launchd/install.sh` 会停用并把旧的 `com.marketcow.*` 独立 LaunchAgent 移至
 `~/Library/Application Support/MarketCow/retired-launch-agents/`。这样旧的 scoped、

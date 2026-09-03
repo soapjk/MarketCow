@@ -79,6 +79,10 @@ class ConfigurePolymarketFinalArchitectureTest(unittest.TestCase):
             self.assertEqual(result["rust_internal_port"], "8796")
             env = env_file.read_text()
             self.assertIn("MARKETCOW_RUST_ADMIN_TOKEN=preserved-secret", env)
+            self.assertIn(
+                "MARKETCOW_POLYMARKET_DISCOVERY_REALTIME_MARKET_LIMIT=1000",
+                env,
+            )
             self.assertNotIn("18872", env)
             controller = json.loads(Path(result["controller_config"]).read_text())
             self.assertEqual(

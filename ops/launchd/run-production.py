@@ -123,6 +123,12 @@ def build_services(
             environment.get(
                 "MARKETCOW_POLYMARKET_DISCOVERY_MAX_WEBSOCKET_CONNECTIONS", "32"
             ),
+            "--realtime-market-limit",
+            environment.get(
+                "MARKETCOW_POLYMARKET_DISCOVERY_REALTIME_MARKET_LIMIT", "1000"
+            ),
+            "--required-realtime-scope",
+            str(rust_scope),
             "--live-stream-port",
             str(discovery_stream_port),
             "--fee-semantics-policy",

@@ -13,6 +13,7 @@ from marketcow.polymarket_live import (
     GammaFeeSemanticsPolicy,
     GammaKeysetCatalog,
     GammaLiveNormalizer,
+    GammaRealtimeUniversePolicy,
     LiveStateStore,
     PolymarketLiveCollector,
     live_collector_lease,
@@ -31,6 +32,18 @@ def effective_snapshot_refresh_seconds(
     if requested is None or not bounded_scope:
         return requested
     return min(requested, 1.0)
+
+
+def required_market_ids_from_scope(path: Path | None) -> tuple[str, ...]:
+    if path is None:
+        return ()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    market_ids = payload.get("market_ids")
+    if not isinstance(market_ids, list) or any(
+        not isinstance(value, str) or not value for value in market_ids
+    ):
+        raise ValueError("required realtime scope has invalid market_ids")
+    return tuple(dict.fromkeys(market_ids))
 
 
 def refresh_catalog_or_reuse_published(
@@ -183,6 +196,17 @@ def main() -> None:
     parser.add_argument("--max-websocket-connections", type=int, default=32)
     parser.add_argument("--catalog-progress-pages", type=int, default=25)
     parser.add_argument(
+        "--realtime-market-limit", type=int,
+        help=(
+            "Keep the complete Gamma catalog, but bootstrap and subscribe only "
+            "this many ranked discovery markets"
+        ),
+    )
+    parser.add_argument(
+        "--required-realtime-scope", type=Path,
+        help="Prefer eligible incumbent market_ids from this Rust scope manifest",
+    )
+    parser.add_argument(
         "--fee-semantics-policy",
         type=Path,
         help=(
@@ -216,6 +240,15 @@ def main() -> None:
 
     if arguments.market_id and arguments.catalog_only:
         parser.error("--catalog-only cannot be combined with --market-id")
+    if arguments.market_id and arguments.realtime_market_limit is not None:
+        parser.error("--realtime-market-limit cannot be combined with --market-id")
+    if (
+        arguments.required_realtime_scope is not None
+        and arguments.realtime_market_limit is None
+    ):
+        parser.error(
+            "--required-realtime-scope requires --realtime-market-limit"
+        )
     if arguments.fee_semantics_policy is not None and not (
         arguments.fee_semantics_policy.is_absolute()
     ):
@@ -223,6 +256,15 @@ def main() -> None:
     fee_semantics_policy = (
         GammaFeeSemanticsPolicy.from_path(arguments.fee_semantics_policy)
         if arguments.fee_semantics_policy is not None else None
+    )
+    realtime_universe_policy = (
+        GammaRealtimeUniversePolicy(
+            arguments.realtime_market_limit,
+            required_market_ids=required_market_ids_from_scope(
+                arguments.required_realtime_scope
+            ),
+        )
+        if arguments.realtime_market_limit is not None else None
     )
     with live_collector_lease(arguments.root):
         store = (
@@ -258,6 +300,7 @@ def main() -> None:
                 (1.75, 1.75) if arguments.market_id else None
             ),
             periodic_snapshot_max_retries=(0 if arguments.market_id else None),
+            realtime_universe_policy=realtime_universe_policy,
         )
         if arguments.market_id:
             print({
@@ -268,6 +311,9 @@ def main() -> None:
             })
         else:
             evidence = refresh_catalog_or_reuse_published(collector)
+            realtime_evidence = collector.configure_published_realtime_universe()
+            if realtime_evidence is not None:
+                evidence = {**evidence, **realtime_evidence}
             print(evidence)
         if arguments.catalog_only:
             return

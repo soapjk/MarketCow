@@ -23,6 +23,7 @@ from scripts.run_polymarket_scoped_manifest import (
 from scripts.run_polymarket_live import (
     effective_snapshot_refresh_seconds,
     refresh_catalog_or_reuse_published,
+    required_market_ids_from_scope,
 )
 from marketcow.api import create_app
 from marketcow.config import Settings
@@ -35,6 +36,7 @@ from marketcow.polymarket_live import (
     GammaKeysetCatalog,
     GammaFeeSemanticsPolicy,
     GammaLiveNormalizer,
+    GammaRealtimeUniversePolicy,
     LiveStateStore,
     PolymarketLiveReadError,
     PolymarketLiveReadStore,
@@ -121,6 +123,128 @@ class Response:
 
 
 class PolymarketLiveTest(unittest.TestCase):
+    def test_realtime_universe_is_bounded_without_truncating_catalog(self):
+        rows = [
+            gamma_row(
+                f"m{index}", f"0x{index:064x}",
+                (f"yes-{index}", f"no-{index}"),
+            )
+            for index in range(1, 5)
+        ]
+        for index, row in enumerate(rows, start=1):
+            row.update({
+                "enableOrderBook": True,
+                "volume24hrClob": str(index * 10),
+                "liquidityClob": str(index * 100),
+                "volumeClob": str(index * 1000),
+            })
+        rows[3]["pendingDeployment"] = True
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        revision = polymarket_live_module._market_sequence_sha256(
+            sorted(markets, key=lambda item: item.identity.market_id)
+        )
+        policy = GammaRealtimeUniversePolicy(
+            2, required_market_ids=("m1", "missing")
+        )
+        universe = policy.select(
+            markets, rows, catalog_revision=revision
+        )
+
+        self.assertEqual(universe["market_ids"], ["m1", "m3"])
+        self.assertEqual(universe["eligible_market_count"], 3)
+        self.assertEqual(
+            universe["ineligible_required_market_ids"], ["missing"]
+        )
+
+        store = self.store()
+        store.replace_catalog(markets, rows)
+        for index in range(1, 5):
+            store.apply_snapshot(
+                snapshot(f"yes-{index}", "0.40", "0.42"), received_at=NOW
+            )
+            store.apply_snapshot(
+                snapshot(f"no-{index}", "0.58", "0.60"), received_at=NOW
+            )
+        store.replace_realtime_universe(universe)
+        self.assertEqual(len(store.catalog), 4)
+        self.assertEqual(
+            set(store.token_to_market.values()), {"m1", "m3"}
+        )
+        self.assertEqual(set(store.books), {"yes-1", "no-1", "yes-3", "no-3"})
+        manifest = json.loads(store.catalog_path.read_text())
+        self.assertEqual(manifest["normalized_catalog"]["market_count"], 4)
+        self.assertEqual(manifest["candidate_snapshot"]["candidate_count"], 2)
+        self.assertEqual(
+            manifest["realtime_universe"]["universe_id"],
+            universe["universe_id"],
+        )
+        store.replace_catalog(
+            markets, rows, realtime_universe=universe
+        )
+        self.assertEqual(
+            set(store.token_to_market.values()), {"m1", "m3"}
+        )
+
+        restored = LiveStateStore(store.root, now_provider=lambda: NOW)
+        restored.recover()
+        self.assertEqual(len(restored.catalog), 4)
+        self.assertEqual(
+            set(restored.token_to_market.values()), {"m1", "m3"}
+        )
+        self.assertEqual(
+            set(restored.books), {"yes-1", "no-1", "yes-3", "no-3"}
+        )
+
+    def test_required_realtime_scope_reads_only_explicit_market_ids(self):
+        scope = self.root / "scope.json"
+        scope.write_text(json.dumps({"market_ids": ["m2", "m1", "m2"]}))
+        self.assertEqual(
+            required_market_ids_from_scope(scope), ("m2", "m1")
+        )
+
+    def test_realtime_universe_probe_requires_two_sided_books_for_both_tokens(self):
+        rows = [
+            gamma_row(
+                f"m{index}", f"0x{index:064x}",
+                (f"yes-{index}", f"no-{index}"),
+            )
+            for index in range(1, 4)
+        ]
+        for index, row in enumerate(rows, start=1):
+            row.update({
+                "enableOrderBook": True,
+                "volume24hrClob": str(index),
+                "liquidityClob": str(index * 10),
+            })
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        revision = polymarket_live_module._market_sequence_sha256(
+            sorted(markets, key=lambda item: item.identity.market_id)
+        )
+
+        def requester(_url, **kwargs):
+            return Response([
+                {
+                    "asset_id": item["token_id"],
+                    "bids": ([{"price": "0.4", "size": "10"}]
+                             if item["token_id"] != "yes-3" else []),
+                    "asks": [{"price": "0.6", "size": "10"}],
+                }
+                for item in kwargs["json"]
+            ])
+
+        collector = PolymarketLiveCollector(
+            self.store(rows),
+            GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+            ClobBooksClient(requester=requester),
+            realtime_universe_policy=GammaRealtimeUniversePolicy(1),
+        )
+        universe = collector._select_realtime_universe(
+            markets, rows, catalog_revision=revision
+        )
+
+        self.assertEqual(universe["market_ids"], ["m2"])
+        self.assertEqual(universe["book_backed_market_count"], 2)
+
     def test_bounded_scope_refresh_cadence_preserves_strict_headroom(self):
         self.assertEqual(
             effective_snapshot_refresh_seconds(2, bounded_scope=True), 1,

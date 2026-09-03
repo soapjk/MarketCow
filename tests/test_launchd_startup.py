@@ -232,6 +232,17 @@ class LaunchdStartupTest(unittest.TestCase):
                 str(fee_semantics.resolve()),
                 commands["polymarket-discovery-collector"],
             )
+            self.assertIn(
+                "--realtime-market-limit",
+                commands["polymarket-discovery-collector"],
+            )
+            self.assertIn(
+                "1000", commands["polymarket-discovery-collector"]
+            )
+            self.assertIn(
+                str(rust_scope.resolve()),
+                commands["polymarket-discovery-collector"],
+            )
             self.assertIn("8790", commands["unified-api"])
             self.assertNotIn("8791", " ".join(sum(commands.values(), ())))
             self.assertNotIn("18872", " ".join(sum(commands.values(), ())))

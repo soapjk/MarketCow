@@ -1,30 +1,35 @@
-# Polymarket full-market discovery v2
+# Polymarket catalog and bounded discovery v2
 
-This private breaking protocol separates full-market opportunity discovery from the
-bounded hot Scope. MarketCow publishes only source-bound market, book, fee, lifecycle,
-and relation facts. It does not publish edge, expected profit, APY, projected capital
-release, strategy scores, or market rankings.
+This private protocol separates the complete Gamma metadata catalog, a bounded
+realtime discovery universe, and the bounded Rust hot Scope. MarketCow publishes only
+source-bound market, book, fee, lifecycle, and relation facts. It does not publish
+edge, expected profit, APY, projected capital release, strategy scores, or final Scope
+rankings.
 
 ## Runtime topology
 
-Two collectors have separate storage and publication boundaries:
+The catalog and two realtime boundaries have distinct responsibilities:
 
 - `polymarket-discovery-collector` runs `run_polymarket_live.py` without any
-  `--market-id`. It follows the complete active Gamma catalog, shards all outcome
-  tokens across CLOB WebSocket connections, and writes
-  `prediction-markets/polymarket-discovery`.
-- the existing hot-Scope collector continues to write
-  `prediction-markets/polymarket-live`. Complete L2 reads remain bounded to at most
-  100 explicitly selected markets.
+  `--market-id`. It retains the complete `closed=false` Gamma catalog as metadata,
+  then applies `MARKETCOW_POLYMARKET_DISCOVERY_REALTIME_MARKET_LIMIT` (1000 in
+  production) to explicitly order-book-enabled markets ranked by recent CLOB volume
+  and liquidity. Only that checksum-bound universe is REST-bootstrapped, subscribed,
+  and exposed through discovery pagination. Eligible markets from the incumbent Rust
+  Scope are retained before filling the remaining capacity.
+- the authoritative Rust data plane owns the final Tradude-selected Scope of at most
+  100 markets and writes `prediction-markets/polymarket-rust`.
 
-The read API does not join the two boundaries. Hot-Scope routes read the hot root;
-discovery routes read the full-market root. A failed discovery refresh cannot partially
-replace the active hot Scope.
+The unified API does not redefine either boundary. A failed discovery refresh cannot
+partially replace the active Rust Scope. Gamma `active=true`/`closed=false` is treated
+as directory lifecycle metadata, not as proof that every outcome token has a current
+CLOB book.
 
 Depth tiers must be explicit decimal base-outcome sizes:
 
 ```dotenv
 MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS=10,50,100,500
+MARKETCOW_POLYMARKET_DISCOVERY_REALTIME_MARKET_LIMIT=1000
 ```
 
 They are never supplied by a code default. The standalone read API refuses to start
@@ -51,11 +56,13 @@ parameter, resync frame, and close code.
 ## Atomic materialization and pagination
 
 A dedicated single-flight background worker materializes discovery independently of
-HTTP request workers. The initial catalog is parsed one market at a time into a local
-SQLite boundary; it is never retained as one list of Pydantic market objects. Later
-book events append quote versions only for affected markets. Catalog or relation
-membership changes build a replacement database and publish it atomically while the
-preceding boundary remains readable.
+HTTP request workers. The complete catalog remains the source-bound metadata record,
+but only the checksum-bound realtime universe is copied into the serving SQLite
+boundary. Raw hashes from the complete catalog still determine expected relation
+membership, so excluding a relation member makes that relation incomplete rather than
+silently redefining it. Later book events append quote versions only for affected
+markets. Catalog, realtime-universe, or relation membership changes build a replacement
+database and publish it atomically while the preceding boundary remains readable.
 
 The first snapshot request omits `snapshot_id` and reads the latest published boundary.
 It never calls the materializer. Before the first boundary is ready it returns promptly
