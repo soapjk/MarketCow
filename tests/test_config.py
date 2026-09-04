@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from marketcow.config import Settings
+from marketcow.polymarket_discovery import DEFAULT_MAXIMUM_FULL_SYNC_BYTES
 
 
 class SettingsTest(unittest.TestCase):
@@ -38,7 +39,34 @@ class SettingsTest(unittest.TestCase):
             self.assertEqual(settings.profile, "test")
             self.assertEqual(settings.postgres_schema, "marketcow_test")
             self.assertEqual(settings.clickhouse_database, "marketcow_test")
+            self.assertEqual(
+                settings.polymarket_discovery_maximum_full_sync_bytes,
+                DEFAULT_MAXIMUM_FULL_SYNC_BYTES,
+            )
             self.assertTrue(settings.mcp_enabled)
+
+    def test_discovery_full_sync_byte_limit_env_binding(self):
+        with tempfile.TemporaryDirectory(suffix="-test") as folder:
+            root = Path(folder)
+            env = {
+                "MARKETCOW_PROFILE": "test",
+                "MARKETCOW_HOME": str(root),
+                "MARKETCOW_ALLOWED_ROOT": str(root.parent),
+                "MARKETCOW_POSTGRES_DSN":
+                    "postgresql://user:password@127.0.0.1/marketcow_test",
+                "MARKETCOW_CLICKHOUSE_PASSWORD": "secret",
+                "MARKETCOW_POLYMARKET_DISCOVERY_MAXIMUM_FULL_SYNC_BYTES": "123456",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                settings = Settings.from_env()
+        self.assertEqual(
+            settings.polymarket_discovery_maximum_full_sync_bytes, 123456
+        )
+        with self.assertRaisesRegex(ValueError, "full-sync bytes must be positive"):
+            replace(
+                settings,
+                polymarket_discovery_maximum_full_sync_bytes=0,
+            ).validate_preflight()
 
     def test_mcp_is_enabled_by_default_and_can_be_disabled(self):
         with tempfile.TemporaryDirectory(suffix="-test") as folder:
