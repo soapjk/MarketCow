@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
+from .polymarket_discovery import DEFAULT_MAXIMUM_FULL_SYNC_BYTES
+
 PROFILES = frozenset({"production", "development", "test"})
 
 
@@ -81,6 +83,9 @@ class Settings:
     polymarket_minimum_delivery_headroom_seconds: float = 1.0
     polymarket_discovery_depth_notionals: tuple[str, ...] = ()
     polymarket_discovery_retained_snapshots: int = 4096
+    polymarket_discovery_maximum_full_sync_bytes: int = (
+        DEFAULT_MAXIMUM_FULL_SYNC_BYTES
+    )
     sec_user_agent: str = "MarketCow toczx@outlook.com"
     dividend_cache_ttl_seconds: int = 21600
     dividend_empty_cache_ttl_seconds: int = 900
@@ -257,6 +262,10 @@ class Settings:
             ),
             polymarket_discovery_retained_snapshots=int(os.getenv(
                 "MARKETCOW_POLYMARKET_DISCOVERY_RETAINED_SNAPSHOTS", "4096"
+            )),
+            polymarket_discovery_maximum_full_sync_bytes=int(os.getenv(
+                "MARKETCOW_POLYMARKET_DISCOVERY_MAXIMUM_FULL_SYNC_BYTES",
+                str(DEFAULT_MAXIMUM_FULL_SYNC_BYTES),
             )),
             sec_user_agent=os.getenv(
                 "MARKETCOW_SEC_USER_AGENT", "MarketCow toczx@outlook.com"
@@ -472,6 +481,10 @@ class Settings:
         ):
             raise ValueError(
                 "Polymarket delivery headroom must be non-negative and smaller than maximum book age"
+            )
+        if self.polymarket_discovery_maximum_full_sync_bytes <= 0:
+            raise ValueError(
+                "Polymarket discovery maximum full-sync bytes must be positive"
             )
         if self.polymarket_live_stream_uri:
             parsed_stream = urlsplit(self.polymarket_live_stream_uri)

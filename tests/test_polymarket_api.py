@@ -45,6 +45,29 @@ class PolymarketApiTest(unittest.TestCase):
     def tearDown(self):
         self.folder.cleanup()
 
+    def test_unified_gateway_exposes_only_discovery_v3_routes(self):
+        openapi = self.client.get("/openapi.json").json()
+        paths = openapi["paths"]
+        self.assertIn(
+            "/v1/prediction-markets/polymarket/live/discovery/full-sync",
+            paths,
+        )
+        for removed in (
+            "/v1/prediction-markets/polymarket/live/discovery/snapshot",
+            "/v1/prediction-markets/polymarket/live/discovery/events",
+            "/v1/prediction-markets/polymarket/live/discovery/metadata",
+            "/v1/prediction-markets/polymarket/live/discovery/relations/{relation_id}",
+        ):
+            self.assertNotIn(removed, paths)
+        websocket = openapi["x-websocket-paths"][
+            "/v1/prediction-markets/polymarket/live/discovery/stream"
+        ]
+        self.assertEqual(
+            websocket["schema_version"],
+            "marketcow.polymarket.discovery-events.v3",
+        )
+        self.assertIn("projection_id", websocket["query_parameters"])
+
     def test_only_certified_manifest_and_immutable_parquet_are_public(self):
         identity = PredictionMarketIdentity(
             event_id="e", market_id="m", condition_id="c", slug="will-x",
