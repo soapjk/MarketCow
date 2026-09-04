@@ -72,6 +72,15 @@ class DiscoveryDepthLevel(BaseModel):
     buy_status: Literal["complete", "insufficient_depth", "book_unavailable"]
     sell_status: Literal["complete", "insufficient_depth", "book_unavailable"]
 
+    @model_validator(mode="after")
+    def decimal_contract(self):
+        decimal_text(self.notional, "notional", allow_zero=False)
+        for name in ("buy_cost_at_notional", "sell_proceeds_at_notional"):
+            value = getattr(self, name)
+            if value is not None:
+                decimal_text(value, name)
+        return self
+
 
 class DiscoveryOutcomeQuote(BaseModel):
     outcome: str
@@ -85,6 +94,17 @@ class DiscoveryOutcomeQuote(BaseModel):
     book_observed_at: datetime | None
     book_age_ms: int | None = Field(default=None, ge=0)
     book_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def decimal_contract(self):
+        for name in (
+            "best_bid", "best_bid_size", "best_ask", "best_ask_size",
+            "last_trade_price",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                decimal_text(value, name)
+        return self
 
 
 class DiscoveryMarketQuote(BaseModel):
@@ -114,7 +134,7 @@ class DiscoveryMarketQuote(BaseModel):
     minimum_order_size: str | None
     fee_schedule_id: str | None
     missing_fields: list[str]
-    metadata_revision: str
+    metadata_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     book_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     cursor: int = Field(ge=0)
@@ -137,6 +157,12 @@ class DiscoveryMarketQuote(BaseModel):
             raise ValueError("ready discovery quote cannot have missing fields")
         if self.book_status != "ready" and not self.missing_fields:
             raise ValueError("fail-closed discovery quote requires missing_fields")
+        if self.tick_size is not None:
+            decimal_text(self.tick_size, "tick_size", allow_zero=False)
+        if self.minimum_order_size is not None:
+            decimal_text(
+                self.minimum_order_size, "minimum_order_size", allow_zero=False
+            )
         return self
 
 
@@ -146,13 +172,13 @@ class DiscoveryFullSync(BaseModel):
     )
     projection_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
-    universe_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    universe_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     boundary_cursor: int = Field(ge=0)
     observed_at: datetime
     ready: bool
     fail_closed_reason: str | None
     unresolved_gap_count: int = Field(ge=0)
-    depth_notionals: list[str] = Field(min_length=1)
+    depth_notionals: list[str]
     markets: list[DiscoveryMarketQuote]
     relations: list[DiscoveryRelation]
 
@@ -164,6 +190,12 @@ class DiscoveryFullSync(BaseModel):
             raise ValueError("fail-closed full-sync requires a fail_closed_reason")
         if self.unresolved_gap_count > 0 and self.ready:
             raise ValueError("unresolved gaps force the full-sync to fail closed")
+        if len(set(self.depth_notionals)) != len(self.depth_notionals):
+            raise ValueError("depth notionals must be unique")
+        if self.depth_notionals != sorted(self.depth_notionals, key=Decimal):
+            raise ValueError("depth notionals must be strictly increasing")
+        for value in self.depth_notionals:
+            decimal_text(value, "depth_notional", allow_zero=False)
         return self
 
 
@@ -175,10 +207,16 @@ class DiscoveryDeltaItem(BaseModel):
 
     @model_validator(mode="after")
     def payload_contract(self):
-        if self.type == "market_update" and self.market is None:
-            raise ValueError("market_update delta requires a market payload")
-        if self.type == "relation_update" and self.relation is None:
-            raise ValueError("relation_update delta requires a relation payload")
+        if self.type == "market_update":
+            if self.market is None:
+                raise ValueError("market_update delta requires a market payload")
+            if self.relation is not None or self.universe_revision is not None:
+                raise ValueError("market_update delta must carry only a market payload")
+        if self.type == "relation_update":
+            if self.relation is None:
+                raise ValueError("relation_update delta requires a relation payload")
+            if self.market is not None or self.universe_revision is not None:
+                raise ValueError("relation_update delta must carry only a relation payload")
         if self.type == "universe_changed":
             if self.universe_revision is None:
                 raise ValueError("universe_changed delta requires universe_revision")
@@ -193,13 +231,21 @@ class DiscoveryDeltaFrame(BaseModel):
     )
     projection_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
-    universe_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    universe_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     after_cursor: int = Field(ge=0)
     next_cursor: int = Field(ge=0)
     boundary_cursor: int = Field(ge=0)
     has_more: bool
     resync_required: bool
     items: list[DiscoveryDeltaItem]
+
+    @model_validator(mode="after")
+    def cursor_contract(self):
+        if not self.resync_required and self.next_cursor not in {
+            self.after_cursor, self.after_cursor + 1
+        }:
+            raise ValueError("ordinary delta cursor must stay put or advance exactly once")
+        return self
 
 
 class DiscoveryMetadataFact(BaseModel):
@@ -233,17 +279,6 @@ class DiscoveryMetadataFact(BaseModel):
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-class DiscoveryMetadataPage(BaseModel):
-    schema_version: Literal["marketcow.polymarket.discovery.v3"] = (
-        DISCOVERY_SCHEMA_VERSION
-    )
-    snapshot_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
-    page_size: int = Field(ge=1)
-    next_page_cursor: str | None
-    items: list[DiscoveryMetadataFact]
-
-
 class DiscoveryRelationMember(BaseModel):
     market_id: str
     condition_id: str
@@ -266,13 +301,11 @@ class DiscoveryRelation(BaseModel):
     complete: bool
     valid_from: datetime
     valid_to: datetime | None
-    relation_revision: str
+    relation_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     provenance: dict[str, Any]
     evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     reason_codes: list[str]
-    quotes: list[DiscoveryMarketQuote] = Field(default_factory=list)
-
     @model_validator(mode="after")
     def complete_members_are_atomic(self):
         if self.actual_member_count != len(self.members):
@@ -287,6 +320,11 @@ class DiscoveryRelation(BaseModel):
         ):
             raise ValueError("relation completeness disagrees")
         return self
+
+
+DiscoveryFullSync.model_rebuild()
+DiscoveryDeltaItem.model_rebuild()
+DiscoveryDeltaFrame.model_rebuild()
 
 
 class LifecycleHistoryEvent(BaseModel):
@@ -318,6 +356,8 @@ class _DiscoveryBoundary:
         self,
         *,
         snapshot_id: str,
+        projection_id: str,
+        universe_revision: str,
         catalog_revision: str,
         boundary_cursor: int,
         observed_at: datetime,
@@ -328,6 +368,8 @@ class _DiscoveryBoundary:
         unresolved_gap_count: int = 0,
     ) -> None:
         self.snapshot_id = snapshot_id
+        self.projection_id = projection_id
+        self.universe_revision = universe_revision
         self.catalog_revision = catalog_revision
         self.boundary_cursor = boundary_cursor
         self.observed_at = observed_at
@@ -458,7 +500,6 @@ class PolymarketDiscoveryStore:
         self._token_outcomes_revision: str | None = None
         self._token_outcomes: dict[str, str] = {}
 
-    @staticmethod
     def _read_events(
         self, after_cursor: int, limit: int,
     ) -> tuple[list[LiveEventEnvelope], int, bool, str]:
@@ -652,7 +693,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 raise ValueError("materialized database escapes its root")
             with self._database(database_path, readonly=True) as connection:
                 rows = list(connection.execute(
-                    "SELECT snapshot_id, catalog_revision, boundary_cursor, "
+                    "SELECT snapshot_id, projection_id, catalog_revision, "
+                    "universe_revision, boundary_cursor, "
                     "observed_at, active_market_count, relation_count, "
                     "realtime_universe_id, unresolved_gap_count "
                     "FROM snapshots WHERE boundary_cursor<=? "
@@ -667,6 +709,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             for row in reversed(rows):
                 boundary = _DiscoveryBoundary(
                     snapshot_id=str(row["snapshot_id"]),
+                    projection_id=str(row["projection_id"]),
+                    universe_revision=str(row["universe_revision"]),
                     catalog_revision=str(row["catalog_revision"]),
                     boundary_cursor=int(row["boundary_cursor"]),
                     observed_at=_raw_instant(row["observed_at"]),
@@ -720,10 +764,35 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
     def materialization_status(self) -> dict[str, Any]:
         with self._lock:
             latest = next(reversed(self._snapshots.values()), None)
+            ready = (
+                self._materialization_state == "ready"
+                and latest is not None
+                and latest.unresolved_gap_count == 0
+                and latest.active_market_count > 0
+            )
+            fail_closed_reason = None
+            if not ready:
+                if latest is not None and latest.unresolved_gap_count > 0:
+                    fail_closed_reason = "discovery_unresolved_gaps"
+                elif latest is not None and latest.active_market_count == 0:
+                    fail_closed_reason = "discovery_empty_universe"
+                elif self._materialization_state == "building":
+                    fail_closed_reason = "discovery_projection_building"
+                elif self._materialization_state == "failed":
+                    fail_closed_reason = "discovery_materialization_failed"
+                else:
+                    fail_closed_reason = "discovery_projection_unavailable"
             return {
-                "state": self._materialization_state,
+                "state": "ready" if ready else self._materialization_state,
+                "ready": ready,
+                "fail_closed_reason": fail_closed_reason,
+                "unresolved_gap_count": (
+                    latest.unresolved_gap_count if latest is not None else None
+                ),
                 "error": self._materialization_error,
                 "snapshot_id": latest.snapshot_id if latest else None,
+                "projection_id": latest.projection_id if latest else None,
+                "universe_revision": latest.universe_revision if latest else None,
                 "boundary_cursor": latest.boundary_cursor if latest else None,
             }
 
@@ -840,7 +909,8 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             );
             CREATE INDEX quote_versions_cursor ON quote_versions(cursor);
             CREATE TABLE snapshots (
-                snapshot_id TEXT PRIMARY KEY, catalog_revision TEXT NOT NULL,
+                snapshot_id TEXT PRIMARY KEY, projection_id TEXT NOT NULL,
+                catalog_revision TEXT NOT NULL, universe_revision TEXT NOT NULL,
                 boundary_cursor INTEGER NOT NULL, observed_at TEXT NOT NULL,
                 active_market_count INTEGER NOT NULL, relation_count INTEGER NOT NULL,
                 realtime_universe_id TEXT, unresolved_gap_count INTEGER NOT NULL DEFAULT 0
@@ -1134,7 +1204,9 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             count += 1
         return count
 
-    def _full_materialize(self) -> _DiscoveryBoundary:
+    def _full_materialize(
+        self, previous: _DiscoveryBoundary | None = None
+    ) -> _DiscoveryBoundary:
         (
             catalog_revision, normalized_path, raw_path, raw_format,
             source_url, catalog_observed_at, realtime_market_ids,
@@ -1318,10 +1390,22 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             ):
                 digest.update(json.dumps(tuple(row), separators=(",", ":")).encode())
             snapshot_id = digest.hexdigest()
+            universe_revision = realtime_universe_id or content_sha256([
+                str(row[0]) for row in connection.execute(
+                    "SELECT market_id FROM markets ORDER BY market_id"
+                )
+            ])
+            projection_id = (
+                previous.projection_id
+                if previous is not None
+                and previous.universe_revision == universe_revision
+                else snapshot_id
+            )
             connection.execute(
-                "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
-                    snapshot_id, catalog_revision, boundary_cursor,
+                    snapshot_id, projection_id, catalog_revision,
+                    universe_revision, boundary_cursor,
                     observed_at.isoformat(), active_count, relation_count,
                     realtime_universe_id, unresolved_gap_count,
                 ),
@@ -1344,7 +1428,9 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             published.execute("PRAGMA journal_mode=WAL")
             published.execute("PRAGMA synchronous=NORMAL")
         return _DiscoveryBoundary(
-            snapshot_id=snapshot_id, catalog_revision=catalog_revision,
+            snapshot_id=snapshot_id, projection_id=projection_id,
+            universe_revision=universe_revision,
+            catalog_revision=catalog_revision,
             boundary_cursor=boundary_cursor, observed_at=observed_at,
             database_path=database_path, active_market_count=active_count,
             relation_count=relation_count,
@@ -1356,10 +1442,11 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         observed_at = self.reader.now_provider()
         current_realtime_universe_id = self._catalog_paths()[-1]
         if current_realtime_universe_id != current.realtime_universe_id:
-            return self._full_materialize()
+            return self._full_materialize(previous=current)
         connection = self._open_database(current.database_path)
         requires_full_materialization = False
         changed_market_ids: set[str] = set()
+        unresolved_gap_count = current.unresolved_gap_count
         try:
             connection.execute("BEGIN IMMEDIATE")
             with self.reader._state_snapshot() as (_, source, state):
@@ -1371,6 +1458,10 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                     connection.rollback()
                     return None
                 else:
+                    unresolved_gap_count = int(source.execute(
+                        "SELECT COUNT(DISTINCT market_id) FROM gaps "
+                        "WHERE resolved=0 AND market_id IS NOT NULL"
+                    ).fetchone()[0])
                     earliest = source.execute(
                         "SELECT MIN(cursor) FROM event_offsets"
                     ).fetchone()[0]
@@ -1475,7 +1566,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                             )
             if requires_full_materialization:
                 connection.rollback()
-                return self._full_materialize()
+                return self._full_materialize(previous=current)
             snapshot_id = content_sha256({
                 "schema_version": DISCOVERY_SCHEMA_VERSION,
                 "catalog_revision": catalog_revision,
@@ -1485,25 +1576,28 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 "changed_market_ids": sorted(changed_market_ids),
             })
             connection.execute(
-                "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO snapshots VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
-                    snapshot_id, catalog_revision, boundary_cursor,
+                    snapshot_id, current.projection_id, catalog_revision,
+                    current.universe_revision, boundary_cursor,
                     observed_at.isoformat(), current.active_market_count,
                     current.relation_count, current.realtime_universe_id,
-                    current.unresolved_gap_count,
+                    unresolved_gap_count,
                 ),
             )
             connection.commit()
         finally:
             connection.close()
         return _DiscoveryBoundary(
-            snapshot_id=snapshot_id, catalog_revision=catalog_revision,
+            snapshot_id=snapshot_id, projection_id=current.projection_id,
+            universe_revision=current.universe_revision,
+            catalog_revision=catalog_revision,
             boundary_cursor=boundary_cursor, observed_at=observed_at,
             database_path=current.database_path,
             active_market_count=current.active_market_count,
             relation_count=current.relation_count,
             realtime_universe_id=current.realtime_universe_id,
-            unresolved_gap_count=current.unresolved_gap_count,
+            unresolved_gap_count=unresolved_gap_count,
         )
 
     def _publish(self, boundary: _DiscoveryBoundary) -> None:
@@ -1511,13 +1605,6 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             previous_database_paths = {
                 item.database_path for item in self._snapshots.values()
             }
-            previous = next(reversed(self._snapshots.values()), None)
-            if (
-                previous is not None
-                and previous.realtime_universe_id
-                != boundary.realtime_universe_id
-            ):
-                self._snapshots.clear()
             self._snapshots[boundary.snapshot_id] = boundary
             self._snapshots.move_to_end(boundary.snapshot_id)
             while len(self._snapshots) > self.retained_snapshots:
@@ -1558,9 +1645,10 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                     )
             connection.commit()
         manifest = {
-            "schema_version": "marketcow.polymarket.discovery-materialization.v2",
+            "schema_version": "marketcow.polymarket.discovery-materialization.v3",
             "database_path": str(boundary.database_path.resolve()),
             "snapshot_id": boundary.snapshot_id,
+            "projection_id": boundary.projection_id,
             "catalog_revision": boundary.catalog_revision,
             "boundary_cursor": boundary.boundary_cursor,
             "realtime_universe_id": boundary.realtime_universe_id,
@@ -1673,9 +1761,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 "SELECT payload_json FROM relations ORDER BY relation_id"
             ))
             relations = [
-                DiscoveryRelation.model_validate_json(bytes(row[0])).model_copy(
-                    update={"quotes": []}
-                )
+                DiscoveryRelation.model_validate_json(bytes(row[0]))
                 for row in relation_rows
             ]
         ready = (
@@ -1692,9 +1778,9 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             )
         )
         full_sync = DiscoveryFullSync(
-            projection_id=boundary.snapshot_id,
+            projection_id=boundary.projection_id,
             catalog_revision=boundary.catalog_revision,
-            universe_revision=boundary.realtime_universe_id,
+            universe_revision=boundary.universe_revision,
             boundary_cursor=boundary.boundary_cursor,
             observed_at=boundary.observed_at,
             ready=ready,
@@ -1730,64 +1816,164 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 sorted(token_ids),
             )}
 
-    def events_page(self, after_cursor: int, limit: int) -> DiscoveryEventPage:
-        events, boundary_cursor, has_more, catalog_revision = self._read_events(after_cursor, limit)
-        resync_required = any(event.event_type in {"catalog_revision", "market_terminal", "market_resolved"} for event in events)
-        token_outcomes = {} if resync_required else self._outcomes_for_tokens(
-            catalog_revision, {event.token_id for event in events if event.token_id}
+    def _projection_boundary(self, projection_id: str) -> _DiscoveryBoundary | None:
+        with self._lock:
+            return next((
+                boundary for boundary in reversed(self._snapshots.values())
+                if boundary.projection_id == projection_id
+            ), None)
+
+    def _market_delta_payload(
+        self, boundary: _DiscoveryBoundary, market_id: str
+    ) -> DiscoveryMarketQuote | None:
+        with self._database(boundary.database_path, readonly=True) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM quote_versions WHERE market_id=? "
+                "AND cursor<=? ORDER BY cursor DESC LIMIT 1",
+                (market_id, boundary.boundary_cursor),
+            ).fetchone()
+        if row is None:
+            return None
+        return DiscoveryMarketQuote.model_validate_json(bytes(row[0])).model_copy(
+            update={"cursor": boundary.boundary_cursor}
         )
-        items: list[DiscoveryEvent] = []
-        for event in events:
-            if event.event_type == "catalog_revision":
-                changes = event.canonical_payload.get("relation_changes") or {}
-                relation_ids = sorted(set((changes.get("added_relation_ids") or []) + (changes.get("removed_relation_ids") or []) + (changes.get("changed_relation_ids") or []))) or [None]
-                for relation_id in relation_ids:
-                    items.append(DiscoveryEvent(
-                        cursor=event.cursor,
-                        event_id=content_sha256({"source_event_id": event.event_id, "relation_id": relation_id}) if relation_id else event.event_id,
-                        event_type="relation_changed", market_id=None, token_id=None,
-                        relation_id=relation_id, catalog_revision=catalog_revision,
-                        observed_at=event.received_at, quote=None,
-                        book_status="resync_required", missing_fields=["atomic_catalog_resync"],
-                        raw_payload_sha256=event.raw_payload_sha256,
-                    ))
-                continue
-            if event.event_type in {"market_terminal", "market_resolved"}:
-                items.append(DiscoveryEvent(
-                    cursor=event.cursor, event_id=event.event_id,
-                    event_type="market_lifecycle_changed", market_id=event.market_id,
-                    token_id=event.token_id, relation_id=None,
-                    catalog_revision=catalog_revision, observed_at=event.received_at,
-                    quote=None, book_status="resync_required",
-                    missing_fields=["atomic_catalog_resync"],
-                    raw_payload_sha256=event.raw_payload_sha256,
-                ))
-                continue
-            if resync_required or event.event_type not in {"book", "price_change", "best_bid_ask", "last_trade_price", "tick_size_change"}:
-                continue
-            quote = None
-            if event.applied and event.token_id and event.token_id in token_outcomes:
-                try:
-                    quote = _outcome_quote(
-                        token_outcomes[event.token_id], event.token_id,
-                        LiveBook.model_validate(event.canonical_payload),
-                        observed_at=event.received_at, notionals=self.depth_notionals,
-                    )
-                except Exception:
-                    quote = None
-            fail_closed = not event.applied or quote is None
-            items.append(DiscoveryEvent(
-                cursor=event.cursor, event_id=event.event_id,
-                event_type="book_fail_closed" if fail_closed else "quote_changed",
-                market_id=event.market_id, token_id=event.token_id, relation_id=None,
-                catalog_revision=catalog_revision, observed_at=event.received_at,
-                quote=quote, book_status="source_gap" if fail_closed else "ready",
-                missing_fields=[event.fail_closed_reason or "authoritative_book_unavailable"] if fail_closed else [],
-                raw_payload_sha256=event.raw_payload_sha256,
+
+    def _relation_delta_payload(
+        self, boundary: _DiscoveryBoundary, relation_id: str
+    ) -> DiscoveryRelation | None:
+        with self._database(boundary.database_path, readonly=True) as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM relations WHERE relation_id=?",
+                (relation_id,),
+            ).fetchone()
+        return (
+            DiscoveryRelation.model_validate_json(bytes(row[0]))
+            if row is not None else None
+        )
+
+    def events_page(
+        self, projection_id: str, after_cursor: int, limit: int
+    ) -> DiscoveryDeltaFrame:
+        if not 1 <= limit <= 10_000:
+            raise PolymarketLiveReadError(
+                "discovery_event_limit_invalid", "limit must be in [1, 10000]", 422
+            )
+        current = self.boundary(None)
+        requested = self._projection_boundary(projection_id)
+        if projection_id != current.projection_id:
+            universe_changed = (
+                requested is not None
+                and requested.universe_revision != current.universe_revision
+            )
+            return DiscoveryDeltaFrame(
+                projection_id=projection_id,
+                catalog_revision=current.catalog_revision,
+                universe_revision=current.universe_revision,
+                after_cursor=after_cursor,
+                next_cursor=after_cursor,
+                boundary_cursor=current.boundary_cursor,
+                has_more=False,
+                resync_required=True,
+                items=(
+                    [DiscoveryDeltaItem(
+                        type="universe_changed",
+                        universe_revision=current.universe_revision,
+                    )]
+                    if universe_changed else []
+                ),
+            )
+
+        events, source_boundary_cursor, has_more, catalog_revision = (
+            self._read_events(after_cursor, 1)
+        )
+        if not events:
+            return DiscoveryDeltaFrame(
+                projection_id=projection_id,
+                catalog_revision=current.catalog_revision,
+                universe_revision=current.universe_revision,
+                after_cursor=after_cursor,
+                next_cursor=after_cursor,
+                boundary_cursor=source_boundary_cursor,
+                has_more=False,
+                resync_required=False,
+                items=[],
+            )
+        event = events[0]
+        if event.cursor != after_cursor + 1:
+            return DiscoveryDeltaFrame(
+                projection_id=projection_id,
+                catalog_revision=current.catalog_revision,
+                universe_revision=current.universe_revision,
+                after_cursor=after_cursor,
+                next_cursor=after_cursor,
+                boundary_cursor=source_boundary_cursor,
+                has_more=False,
+                resync_required=True,
+                items=[],
+            )
+        if (
+            catalog_revision != current.catalog_revision
+            or event.cursor > current.boundary_cursor
+        ):
+            return DiscoveryDeltaFrame(
+                projection_id=projection_id,
+                catalog_revision=current.catalog_revision,
+                universe_revision=current.universe_revision,
+                after_cursor=after_cursor,
+                next_cursor=after_cursor,
+                boundary_cursor=current.boundary_cursor,
+                has_more=False,
+                resync_required=False,
+                items=[],
+            )
+
+        items: list[DiscoveryDeltaItem] = []
+        resync_required = False
+        if event.event_type == "catalog_revision":
+            changes = event.canonical_payload["relation_changes"]
+            relation_ids = sorted(set(
+                list(changes["added_relation_ids"])
+                + list(changes["removed_relation_ids"])
+                + list(changes["changed_relation_ids"])
             ))
-        next_cursor = events[-1].cursor if events else after_cursor
-        return DiscoveryEventPage(
-            catalog_revision=catalog_revision, after_cursor=after_cursor,
-            next_cursor=next_cursor, boundary_cursor=boundary_cursor,
-            has_more=has_more, resync_required=resync_required, items=items,
+            for relation_id in relation_ids:
+                relation = self._relation_delta_payload(current, str(relation_id))
+                if relation is None:
+                    resync_required = True
+                    continue
+                items.append(DiscoveryDeltaItem(
+                    type="relation_update", relation=relation
+                ))
+        elif event.event_type in {
+            "book", "price_change", "best_bid_ask", "last_trade_price",
+            "tick_size_change",
+        }:
+            market = (
+                self._market_delta_payload(current, event.market_id)
+                if event.market_id is not None else None
+            )
+            if market is None:
+                resync_required = True
+            else:
+                items.append(DiscoveryDeltaItem(type="market_update", market=market))
+        elif event.event_type in {"market_terminal", "market_resolved"}:
+            market = (
+                self._market_delta_payload(current, event.market_id)
+                if event.market_id is not None else None
+            )
+            if market is None:
+                resync_required = True
+            else:
+                items.append(DiscoveryDeltaItem(type="market_update", market=market))
+
+        return DiscoveryDeltaFrame(
+            projection_id=projection_id,
+            catalog_revision=catalog_revision,
+            universe_revision=current.universe_revision,
+            after_cursor=after_cursor,
+            next_cursor=event.cursor,
+            boundary_cursor=source_boundary_cursor,
+            has_more=has_more,
+            resync_required=resync_required,
+            items=items,
         )

@@ -34,10 +34,9 @@ from .polymarket_live_stream import (
 )
 from .polymarket_events_observability import PolymarketReadTraceMiddleware
 from .polymarket_discovery import (
-    DiscoveryEventPage,
-    DiscoveryMetadataPage,
-    DiscoveryRelation,
-    DiscoverySnapshotPage,
+    DEFAULT_MAXIMUM_FULL_SYNC_BYTES,
+    DISCOVERY_EVENT_SCHEMA_VERSION,
+    DiscoveryFullSync,
     LifecycleHistoryPage,
     PolymarketDiscoveryStore,
     install_discovery_openapi_extension,
@@ -56,6 +55,7 @@ def create_polymarket_live_read_app(
     executor_workers: int,
     discovery_depth_notionals: tuple[str, ...],
     discovery_maximum_book_age_ms: int,
+    discovery_maximum_full_sync_bytes: int = DEFAULT_MAXIMUM_FULL_SYNC_BYTES,
     live_stream_uri: str = "",
     live_stream_replay_capacity: int = 10_000,
     consumer_maximum_book_age_seconds: float | None = None,
@@ -106,6 +106,7 @@ def create_polymarket_live_read_app(
         discovery_reader,
         depth_notionals=discovery_depth_notionals,
         maximum_book_age_ms=discovery_maximum_book_age_ms,
+        maximum_full_sync_bytes=discovery_maximum_full_sync_bytes,
     )
     executor = ThreadPoolExecutor(
         max_workers=executor_workers,
@@ -320,21 +321,12 @@ def create_polymarket_live_read_app(
             _raise_read_error(exc)
 
     @app.get(
-        "/v1/prediction-markets/polymarket/live/discovery/snapshot",
-        response_model=DiscoverySnapshotPage,
+        "/v1/prediction-markets/polymarket/live/discovery/full-sync",
+        response_model=DiscoveryFullSync,
     )
-    async def discovery_snapshot(
-        snapshot_id: str | None = Query(default=None),
-        page_cursor: str | None = Query(default=None),
-        page_size: int = Query(default=250, ge=1, le=1000),
-    ):
+    async def discovery_full_sync():
         try:
-            return await run_read(
-                discovery.snapshot_page,
-                snapshot_id=snapshot_id,
-                page_cursor=page_cursor,
-                page_size=page_size,
-            )
+            return await run_read(discovery.full_sync)
         except PolymarketLiveReadError as exc:
             _raise_read_error(exc)
 
@@ -342,42 +334,32 @@ def create_polymarket_live_read_app(
     async def discovery_status():
         return discovery.materialization_status()
 
-    @app.get(
-        "/v1/prediction-markets/polymarket/live/discovery/events",
-        response_model=DiscoveryEventPage,
-    )
-    async def discovery_events(
-        after_cursor: int = Query(default=0, ge=0),
-        limit: int = Query(default=1000, ge=1, le=10000),
-    ):
-        try:
-            return await run_read(discovery.events_page, after_cursor, limit)
-        except PolymarketLiveReadError as exc:
-            _raise_read_error(exc)
-
     @app.websocket(
         "/v1/prediction-markets/polymarket/live/discovery/stream"
     )
     async def discovery_stream(
         socket: WebSocket,
         after_cursor: int = Query(default=0, ge=0),
+        projection_id: str = Query(..., pattern=r"^[0-9a-f]{64}$"),
     ):
         await socket.accept()
         cursor = after_cursor
         try:
             while True:
                 try:
-                    page = await run_read(discovery.events_page, cursor, 1000)
+                    page = await run_read(
+                        discovery.events_page, projection_id, cursor, 1000
+                    )
                 except PolymarketLiveReadError as exc:
                     await socket.send_json({
-                        "schema_version": "marketcow.polymarket.discovery-events.v2",
+                        "schema_version": DISCOVERY_EVENT_SCHEMA_VERSION,
                         "type": "resync_required",
                         "cursor": cursor,
                         "reason": exc.code,
                     })
                     await socket.close(code=1012, reason="resync_required")
                     return
-                if page.items or page.resync_required:
+                if page.next_cursor != cursor or page.resync_required:
                     await socket.send_text(page.model_dump_json())
                     cursor = page.next_cursor
                 if page.resync_required:
@@ -387,38 +369,6 @@ def create_polymarket_live_read_app(
                     await asyncio.sleep(0.25)
         except WebSocketDisconnect:
             return
-
-    @app.get(
-        "/v1/prediction-markets/polymarket/live/discovery/metadata",
-        response_model=DiscoveryMetadataPage,
-    )
-    async def discovery_metadata(
-        snapshot_id: str = Query(...),
-        page_cursor: str | None = Query(default=None),
-        page_size: int = Query(default=250, ge=1, le=1000),
-    ):
-        try:
-            return await run_read(
-                discovery.metadata_page,
-                snapshot_id=snapshot_id,
-                page_cursor=page_cursor,
-                page_size=page_size,
-            )
-        except PolymarketLiveReadError as exc:
-            _raise_read_error(exc)
-
-    @app.get(
-        "/v1/prediction-markets/polymarket/live/discovery/relations/{relation_id:path}",
-        response_model=DiscoveryRelation,
-    )
-    async def discovery_relation(
-        relation_id: str,
-        snapshot_id: str = Query(...),
-    ):
-        try:
-            return await run_read(discovery.relation, relation_id, snapshot_id)
-        except PolymarketLiveReadError as exc:
-            _raise_read_error(exc)
 
     @app.get(
         "/v1/prediction-markets/polymarket/history/lifecycle-events",

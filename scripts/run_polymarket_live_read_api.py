@@ -46,6 +46,11 @@ def main() -> None:
         "--discovery-maximum-book-age-ms", required=True, type=int,
     )
     parser.add_argument(
+        "--discovery-maximum-full-sync-bytes",
+        type=int,
+        default=256 * 1024 * 1024,
+    )
+    parser.add_argument(
         "--live-stream-uri", default="ws://127.0.0.1:8794"
     )
     parser.add_argument("--live-stream-replay-capacity", type=int, default=10_000)
@@ -71,6 +76,9 @@ def main() -> None:
         discovery_depth_notionals=tuple(arguments.discovery_depth_notional),
         discovery_maximum_book_age_ms=(
             arguments.discovery_maximum_book_age_ms
+        ),
+        discovery_maximum_full_sync_bytes=(
+            arguments.discovery_maximum_full_sync_bytes
         ),
         live_stream_uri=arguments.live_stream_uri,
         live_stream_replay_capacity=arguments.live_stream_replay_capacity,
