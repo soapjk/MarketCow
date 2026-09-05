@@ -22,18 +22,21 @@ from scripts.run_polymarket_scoped_manifest import (
 )
 from scripts.run_polymarket_live import (
     effective_snapshot_refresh_seconds,
-    refresh_catalog_or_reuse_published,
-    required_market_ids_from_scope,
+    load_published_startup_data,
+    validate_rest_poll_startup_state,
 )
+from scripts.prepare_polymarket_discovery import required_market_ids_from_scope
 from marketcow.api import create_app
 from marketcow.config import Settings
 from marketcow.polymarket_contracts import content_sha256
 from marketcow.polymarket_live import (
     CandidateSnapshot,
     ClobBooksClient,
+    ClobBooksCoverageError,
     DataApiPublicClient,
     DataApiPublicNormalizer,
     GammaKeysetCatalog,
+    GammaCatalogRows,
     GammaFeeSemanticsPolicy,
     GammaLiveNormalizer,
     GammaRealtimeUniversePolicy,
@@ -123,6 +126,76 @@ class Response:
 
 
 class PolymarketLiveTest(unittest.TestCase):
+    def test_disk_normalization_preserves_relations_and_bounded_selection(self):
+        rows = [
+            gamma_row(
+                f"m{index:04d}", f"0x{index:064x}",
+                (f"yes-{index}", f"no-{index}"),
+                neg_risk=index in {7, 8},
+            )
+            for index in range(1, 201)
+        ]
+        for index, row in enumerate(rows, start=1):
+            row.update({
+                "enableOrderBook": True,
+                "volume24hrClob": str(index),
+                "liquidityClob": str(index * 2),
+                "volumeClob": str(index * 3),
+            })
+        raw_path = self.root / "gamma.jsonl"
+        bodies = [polymarket_live_module.canonical_json(row) for row in rows]
+        raw_path.write_bytes(b"\n".join(bodies) + b"\n")
+        raw = GammaCatalogRows(
+            raw_path,
+            row_count=len(rows),
+            sha256=polymarket_live_module._file_sha256(raw_path),
+        )
+        progress = []
+
+        normalized = GammaLiveNormalizer.normalize_to_disk(
+            raw,
+            NOW,
+            output_root=self.root / "normalized",
+            progress=progress.append,
+            progress_every_rows=25,
+        )
+
+        self.assertEqual(len(normalized), 200)
+        self.assertTrue(progress[-1]["complete"])
+        self.assertEqual(progress[-1]["normalized_market_count"], 200)
+        negative = normalized.load_market_ids(["m0007", "m0008"])
+        relations = [
+            next(
+                relation for relation in negative[market_id].relations
+                if relation.relation_type == "standard_negative_risk"
+            )
+            for market_id in sorted(negative)
+        ]
+        self.assertEqual(len({relation.revision for relation in relations}), 1)
+        self.assertTrue(all(relation.complete for relation in relations))
+        self.assertTrue(all(len(relation.outcome_pairs) == 2 for relation in relations))
+        universe = GammaRealtimeUniversePolicy(3).select(
+            normalized,
+            raw,
+            catalog_revision=normalized.revision,
+        )
+        self.assertEqual(universe["market_ids"], ["m0198", "m0199", "m0200"])
+        self.assertEqual(universe["source_market_count"], 200)
+        self.assertEqual(universe["eligible_market_count"], 200)
+        store = LiveStateStore(
+            self.root / "disk-published", now_provider=lambda: NOW,
+        )
+        published = store.replace_catalog(
+            normalized, raw, realtime_universe=universe,
+        )
+        self.assertEqual(published["catalog_revision"], normalized.revision)
+        self.assertEqual(set(store.catalog), set(universe["market_ids"]))
+        manifest = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["normalized_catalog"]["market_count"], 200)
+        restored = LiveStateStore(store.root, now_provider=lambda: NOW)
+        restored.recover()
+        self.assertEqual(set(restored.catalog), set(universe["market_ids"]))
+
     def test_realtime_universe_is_bounded_without_truncating_catalog(self):
         rows = [
             gamma_row(
@@ -222,6 +295,60 @@ class PolymarketLiveTest(unittest.TestCase):
             set(restored.books), {"yes-1", "no-1", "yes-3", "no-3"}
         )
 
+    def test_offline_refresh_publishes_disk_catalog_and_same_selection_books(self):
+        rows = [
+            gamma_row(
+                f"m{index}", f"0x{index:064x}",
+                (f"yes-{index}", f"no-{index}"),
+            )
+            for index in range(1, 5)
+        ]
+        for index, row in enumerate(rows, start=1):
+            row.update({
+                "enableOrderBook": True,
+                "volume24hrClob": str(index),
+                "liquidityClob": str(index * 10),
+                "volumeClob": str(index * 100),
+            })
+
+        def books_requester(_url, **kwargs):
+            return Response([
+                snapshot(item["token_id"], "0.40", "0.60")
+                for item in kwargs["json"]
+            ])
+
+        root = self.root / "offline-refresh"
+        store = LiveStateStore(root, now_provider=lambda: NOW)
+        collector = PolymarketLiveCollector(
+            store,
+            GammaKeysetCatalog(
+                requester=lambda *_args, **_kwargs: Response({"markets": rows}),
+                spool_root=root / "spool",
+            ),
+            ClobBooksClient(requester=books_requester),
+            realtime_universe_policy=GammaRealtimeUniversePolicy(2),
+        )
+
+        result = collector.refresh_catalog()
+        recovery = collector.publish_catalog_selection_books()
+
+        self.assertEqual(result["normalized_market_count"], 4)
+        self.assertEqual(set(store.catalog), {"m3", "m4"})
+        manifest = json.loads(store.catalog_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["normalized_catalog"]["market_count"], 4)
+        self.assertEqual(
+            manifest["realtime_universe"]["selection_report"][
+                "included_market_count"
+            ],
+            2,
+        )
+        self.assertEqual(recovery["health"]["unresolved_gap_count"], 0)
+        self.assertEqual(recovery["health"]["book_token_count"], 4)
+        restored = LiveStateStore(root, now_provider=lambda: NOW)
+        restored.recover()
+        self.assertEqual(set(restored.catalog), {"m3", "m4"})
+        self.assertEqual(restored.health().unresolved_gap_count, 0)
+
     def test_required_realtime_scope_reads_only_explicit_market_ids(self):
         scope = self.root / "scope.json"
         scope.write_text(json.dumps({"market_ids": ["m2", "m1", "m2"]}))
@@ -252,6 +379,7 @@ class PolymarketLiveTest(unittest.TestCase):
             return Response([
                 {
                     "asset_id": item["token_id"],
+                    "tick_size": "0.01",
                     "bids": ([{"price": "0.4", "size": "10"}]
                              if item["token_id"] != "yes-3" else []),
                     "asks": [{"price": "0.6", "size": "10"}],
@@ -271,6 +399,76 @@ class PolymarketLiveTest(unittest.TestCase):
 
         self.assertEqual(universe["market_ids"], ["m2"])
         self.assertEqual(universe["book_backed_market_count"], 2)
+        report = universe["selection_report"]
+        self.assertEqual(report["requested_market_count"], 3)
+        self.assertEqual(report["requested_token_count"], 6)
+        self.assertEqual(report["returned_book_token_count"], 6)
+        self.assertEqual(report["complete_book_token_count"], 5)
+        self.assertEqual(report["included_market_count"], 1)
+        self.assertEqual(report["included_token_count"], 2)
+        reasons = {item["reason"]: item for item in report["exclusions"]}
+        self.assertEqual(
+            reasons["incomplete_required_token_book"]["market_count"], 1
+        )
+        self.assertEqual(
+            reasons["incomplete_required_token_book"]["token_count"], 1
+        )
+        self.assertEqual(
+            reasons["ranked_below_market_limit"]["market_count"], 1
+        )
+        self.assertRegex(report["recovery_boundary_id"], r"^[0-9a-f]{64}$")
+        report_sha256 = report.pop("report_sha256")
+        self.assertEqual(report_sha256, content_sha256(report))
+
+    def test_realtime_universe_excludes_incomplete_catalog_and_book_ticks(self):
+        rows = [
+            gamma_row(
+                f"m{index}", f"0x{index:064x}",
+                (f"yes-{index}", f"no-{index}"),
+            )
+            for index in range(1, 4)
+        ]
+        for index, row in enumerate(rows, start=1):
+            row.update({
+                "enableOrderBook": True,
+                "volume24hrClob": str(index),
+                "liquidityClob": str(index),
+            })
+        rows[2]["outcomes"] = '["Up","Down"]'
+        markets = GammaLiveNormalizer.normalize(rows, NOW)
+        revision = polymarket_live_module._market_sequence_sha256(
+            sorted(markets, key=lambda item: item.identity.market_id)
+        )
+
+        def requester(_url, **kwargs):
+            return Response([{
+                "asset_id": item["token_id"],
+                "tick_size": (
+                    "0.001" if item["token_id"].endswith("2") else "0.01"
+                ),
+                "bids": [{"price": "0.4", "size": "10"}],
+                "asks": [{"price": "0.6", "size": "10"}],
+            } for item in kwargs["json"]])
+
+        collector = PolymarketLiveCollector(
+            self.store(rows),
+            GammaKeysetCatalog(requester=lambda *_args, **_kwargs: None),
+            ClobBooksClient(requester=requester),
+            realtime_universe_policy=GammaRealtimeUniversePolicy(1),
+        )
+        universe = collector._select_realtime_universe(
+            markets, rows, catalog_revision=revision,
+        )
+
+        self.assertEqual(universe["market_ids"], ["m1"])
+        reasons = {
+            item["reason"]: item
+            for item in universe["selection_report"]["exclusions"]
+        }
+        self.assertEqual(reasons["catalog_integrity_incomplete"]["market_count"], 1)
+        self.assertEqual(
+            reasons["inconsistent_required_token_book"]["market_count"], 1
+        )
 
     def test_bounded_scope_refresh_cadence_preserves_strict_headroom(self):
         self.assertEqual(
@@ -286,118 +484,86 @@ class PolymarketLiveTest(unittest.TestCase):
             effective_snapshot_refresh_seconds(None, bounded_scope=True)
         )
 
-    def test_startup_catalog_refresh_reuses_only_a_published_catalog(self):
-        class Collector:
-            def __init__(self, catalog):
-                self.store = type("Store", (), {"catalog": catalog})()
-                self.refresh_calls = 0
-
-            def refresh_catalog(self):
-                self.refresh_calls += 1
-                raise ConnectionError("transient Gamma TLS failure")
-
-        published = Collector({"market-1": object()})
-        result = refresh_catalog_or_reuse_published(published)
-        self.assertEqual(result["status"], "published_catalog_reused")
-        self.assertEqual(result["market_count"], 1)
-        self.assertEqual(published.refresh_calls, 0)
-        with self.assertRaises(ConnectionError):
-            refresh_catalog_or_reuse_published(Collector({}))
-
-    def test_startup_rebuilds_incomplete_catalog_from_verified_raw_policy(self):
-        store = LiveStateStore(self.root / "policy-rebuild")
+    def test_startup_requires_offline_prepared_bounded_data(self):
+        root = self.root / "prepared-startup"
         row = gamma_row()
-        row.pop("fee_schedule")
-        row["feeSchedule"] = {
-            "rate": "0.07", "exponent": "1", "takerOnly": True,
-        }
-        store.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
-        self.assertFalse(next(iter(store.catalog.values())).rules.fee_schedule.complete)
-        policy = GammaFeeSemanticsPolicy.model_validate({
-            "schema_version": "marketcow.polymarket.gamma-fee-semantics.v1",
-            "currency": "pUSD",
-            "maker_rate": "0",
-            "formula": "fee = C * feeRate * (p * (1 - p)) ^ exponent",
-            "quantum": "0.00001",
-            "rounding_mode": "UNSPECIFIED",
-            "tie_semantics": "unspecified",
-            "calculation_status": "informational_only",
-            "effective_from": "2026-04-17T00:00:00Z",
-            "revision": "test-fee-semantics-v1",
-            "source": "polymarket_docs",
-            "source_url": "https://docs.polymarket.com/trading/fees",
-            "field_paths": ["fee formula"],
+        row.update({
+            "enableOrderBook": True,
+            "volume24hrClob": "1",
+            "liquidityClob": "1",
         })
-        collector = type("Collector", (), {
-            "store": store,
-            "catalog_client": type("Catalog", (), {
-                "fee_semantics_policy": policy,
-            })(),
-        })()
-
-        result = refresh_catalog_or_reuse_published(collector)
-
-        self.assertEqual(result["status"], "published_catalog_fee_policy_rebuilt")
-        self.assertEqual(result["previous_incomplete_count"], 1)
-        self.assertEqual(result["remaining_incomplete_count"], 0)
-        self.assertTrue(next(iter(store.catalog.values())).rules.fee_schedule.complete)
-        self.assertTrue(store.raw_catalog_path.is_file())
-
-    def test_startup_replays_events_without_loading_catalog_twice(self):
-        root = self.root / "catalog-only-load"
+        markets = GammaLiveNormalizer.normalize([row], NOW)
+        universe = GammaRealtimeUniversePolicy(1).select(
+            markets,
+            [row],
+            catalog_revision=polymarket_live_module._market_sequence_sha256(markets),
+            available_token_ids={"yes-1", "no-1"},
+        )
         writer = LiveStateStore(root)
-        row = gamma_row()
-        writer.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
-        expected_cursor = writer.cursor
+        writer.replace_catalog(
+            markets,
+            [row],
+            realtime_universe=universe,
+        )
+
         reader = LiveStateStore(root)
-        reader._recovered = False
-        reader.catalog = {}
-        original_load_catalog = reader._load_catalog
-        load_calls = 0
+        result = load_published_startup_data(reader)
 
-        def counted_load_catalog(path):
-            nonlocal load_calls
-            load_calls += 1
-            original_load_catalog(path)
-
-        reader._load_catalog = counted_load_catalog
-        collector = type("Collector", (), {
-            "store": reader,
-            "catalog_client": type("Catalog", (), {
-                "fee_semantics_policy": None,
-            })(),
-        })()
-
-        result = refresh_catalog_or_reuse_published(collector)
-
-        self.assertEqual(result["status"], "published_catalog_reused")
+        self.assertEqual(result["status"], "published_startup_data_loaded")
         self.assertEqual(result["market_count"], 1)
-        self.assertTrue(reader._recovered)
-        self.assertEqual(reader.cursor, expected_cursor)
-        self.assertEqual(load_calls, 1)
+        self.assertEqual(result["token_count"], 2)
+        self.assertEqual(set(reader.catalog), {"m1"})
+        self.assertFalse(reader._recovered)
 
-    def test_catalog_only_bootstrap_marks_empty_event_log_recovered(self):
-        root = self.root / "empty-event-bootstrap"
-        writer = LiveStateStore(root)
+    def test_startup_missing_data_fails_without_remote_fallback(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "prepare_polymarket_discovery.py",
+        ):
+            load_published_startup_data(LiveStateStore(self.root / "missing"))
+
+    def test_rest_poll_startup_reuses_only_complete_local_boundary(self):
+        root = self.root / "rest-poll-startup"
         row = gamma_row()
+        row.update({
+            "enableOrderBook": True,
+            "volume24hrClob": "1",
+            "liquidityClob": "1",
+        })
+        markets = GammaLiveNormalizer.normalize([row], NOW)
+        universe = GammaRealtimeUniversePolicy(1).select(
+            markets,
+            [row],
+            catalog_revision=polymarket_live_module._market_sequence_sha256(markets),
+            available_token_ids={"yes-1", "no-1"},
+        )
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        writer.replace_catalog(markets, [row], realtime_universe=universe)
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+
+        result = validate_rest_poll_startup_state(writer)
+
+        self.assertEqual(
+            result["status"], "complete_local_rest_poll_boundary_reused"
+        )
+        self.assertEqual(result["token_count"], 2)
+
+    def test_rest_poll_startup_rejects_missing_local_books(self):
+        store = LiveStateStore(self.root / "incomplete-rest-poll")
+        row = gamma_row()
+        store.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+
+        with self.assertRaisesRegex(RuntimeError, "startup state is incomplete"):
+            validate_rest_poll_startup_state(store)
+
+    def test_startup_rejects_catalog_without_published_universe(self):
+        root = self.root / "catalog-without-universe"
+        row = gamma_row()
+        writer = LiveStateStore(root)
         writer.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
-        writer.event_path.unlink()
-        reader = LiveStateStore(root)
-        reader._recovered = False
-        reader.catalog = {}
-        reader.token_to_market = {}
-        collector = type("Collector", (), {
-            "store": reader,
-            "catalog_client": type("Catalog", (), {
-                "fee_semantics_policy": None,
-            })(),
-        })()
 
-        result = refresh_catalog_or_reuse_published(collector)
-
-        self.assertEqual(result["status"], "published_catalog_reused")
-        self.assertTrue(reader._recovered)
-        self.assertEqual(reader.cursor, 0)
+        with self.assertRaisesRegex(RuntimeError, "realtime universe is missing"):
+            load_published_startup_data(LiveStateStore(root))
 
     def test_startup_can_publish_bounded_universe_before_state_recovery(self):
         root = self.root / "bounded-before-recovery"
@@ -463,41 +629,24 @@ class PolymarketLiveTest(unittest.TestCase):
         self.assertEqual(int(metadata["event_log_size"]), expected_size)
         self.assertEqual(event_offset_count, 1)
 
-    def test_startup_does_not_rebuild_provider_incomplete_fee_facts(self):
-        store = LiveStateStore(self.root / "provider-incomplete-fee")
+    def test_checkpoint_tail_start_restores_complete_boundary(self):
+        root = self.root / "checkpoint-tail-start"
+        writer = LiveStateStore(root)
         row = gamma_row()
-        row["fee_schedule"].pop("taker_rate")
-        row["fee_schedule"].pop("exponent")
-        store.replace_catalog(
-            GammaLiveNormalizer.normalize([row], NOW),
-            [row],
-        )
-        policy = GammaFeeSemanticsPolicy.model_validate({
-            "schema_version": "marketcow.polymarket.gamma-fee-semantics.v1",
-            "currency": "pUSD",
-            "maker_rate": "0",
-            "formula": "fee = C * feeRate * (p * (1 - p)) ^ exponent",
-            "quantum": "0.00001",
-            "rounding_mode": "UNSPECIFIED",
-            "tie_semantics": "unspecified",
-            "calculation_status": "informational_only",
-            "effective_from": "2026-04-17T00:00:00Z",
-            "revision": "test-fee-semantics-v1",
-            "source": "polymarket_docs",
-            "source_url": "https://docs.polymarket.com/trading/fees",
-            "field_paths": ["fee formula"],
-        })
-        collector = type("Collector", (), {
-            "store": store,
-            "catalog_client": type("Catalog", (), {
-                "fee_semantics_policy": policy,
-            })(),
-        })()
+        writer.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+        writer.apply_snapshot(snapshot("yes-1", "0.40", "0.42"), received_at=NOW)
+        writer.apply_snapshot(snapshot("no-1", "0.58", "0.60"), received_at=NOW)
+        writer.checkpoint()
 
-        result = refresh_catalog_or_reuse_published(collector)
+        reader = LiveStateStore(root)
+        reader._load_catalog(reader.catalog_path)
+        reader.start_from_checkpoint_tail()
 
-        self.assertEqual(result["status"], "published_catalog_reused")
-        self.assertFalse(next(iter(store.catalog.values())).rules.fee_schedule.complete)
+        self.assertTrue(reader._recovered)
+        self.assertEqual(reader.cursor, writer.cursor)
+        self.assertEqual(set(reader.books), {"yes-1", "no-1"})
+        self.assertEqual(reader.health().book_token_count, 2)
+        self.assertEqual(reader.health().unresolved_gap_count, 0)
 
     def setUp(self):
         self.folder = TemporaryDirectory()
@@ -1680,7 +1829,7 @@ class PolymarketLiveTest(unittest.TestCase):
         ):
             client.fetch_stream(["a"], require_complete_batches=True)
 
-    def test_partial_books_bootstrap_starts_with_available_books(self):
+    def test_partial_books_bootstrap_fails_closed(self):
         rows = [
             gamma_row("m1", "0x" + "1" * 64, ("yes-1", "no-1")),
             gamma_row("m2", "0x" + "2" * 64, ("yes-2", "no-2")),
@@ -1702,15 +1851,16 @@ class PolymarketLiveTest(unittest.TestCase):
             books,
         )
 
-        asyncio.run(collector.bootstrap_books())
+        with self.assertRaises(ClobBooksCoverageError):
+            asyncio.run(collector.bootstrap_books())
 
         health = store.health()
         self.assertEqual(health.status, "degraded")
-        self.assertEqual(health.book_token_count, 2)
-        self.assertEqual(health.missing_book_token_count, 2)
-        self.assertEqual(health.ready_market_count, 1)
+        self.assertEqual(health.book_token_count, 0)
+        self.assertEqual(health.missing_book_token_count, 4)
+        self.assertEqual(health.ready_market_count, 0)
         self.assertIsNone(store.active_recovery_id)
-        self.assertEqual(store.frame("m1", now=NOW).status, "ready")
+        self.assertEqual(store.frame("m1", now=NOW).status, "fail_closed")
         self.assertEqual(store.frame("m2", now=NOW).status, "fail_closed")
 
     def test_bootstrap_retry_after_incomplete_batch_converges_recovery(self):
@@ -1735,8 +1885,9 @@ class PolymarketLiveTest(unittest.TestCase):
             partial,
         )
 
-        asyncio.run(collector.bootstrap_books())
-        self.assertEqual(set(store.books), {"yes-1", "no-1"})
+        with self.assertRaises(ClobBooksCoverageError):
+            asyncio.run(collector.bootstrap_books())
+        self.assertEqual(set(store.books), set())
         self.assertIsNone(store.active_recovery_id)
 
         collector.books_client = ClobBooksClient(
@@ -2632,6 +2783,32 @@ class PolymarketLiveTest(unittest.TestCase):
             .snapshot(["m1"]).items[0].cursor,
             4,
         )
+
+    def test_scoped_writer_hydrates_large_negative_risk_relation_closure(self):
+        root = self.root / "large-relation-live"
+        rows = [
+            gamma_row(
+                f"m{index}", f"0x{index + 1:064x}",
+                (f"yes-{index}", f"no-{index}"), neg_risk=True,
+            )
+            for index in range(101)
+        ]
+        writer = LiveStateStore(root, now_provider=lambda: NOW)
+        writer.replace_catalog(GammaLiveNormalizer.normalize(rows, NOW), rows)
+        reader = PolymarketLiveReadStore(root, now_provider=lambda: NOW)
+
+        with self.assertRaises(PolymarketLiveReadError) as oversized_public_scope:
+            reader.bootstrap([f"m{index}" for index in range(101)])
+        self.assertEqual(
+            oversized_public_scope.exception.code,
+            "polymarket_scope_too_large",
+        )
+
+        scoped = load_scoped_live_store(root, ["m0"], now_provider=lambda: NOW)
+
+        self.assertEqual(len(scoped.catalog), 101)
+        self.assertEqual(len(scoped.token_to_market), 202)
+        self.assertEqual(set(scoped.catalog), {f"m{index}" for index in range(101)})
 
     def test_scoped_writer_starts_from_log_tail_when_derived_index_is_malformed(self):
         root = self.root / "live"

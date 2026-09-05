@@ -30,6 +30,22 @@ Gamma 的完整 `closed=false` 目录只作为元数据保存。生产配置默�
 与订阅；当前 Rust Scope 中仍合格的市场优先保留。该边界由
 `MARKETCOW_POLYMARKET_DISCOVERY_REALTIME_MARKET_LIMIT` 控制，不能设置为全目录规模。
 
+完整 Gamma 目录刷新不属于服务启动。首次准备或人工刷新必须单独运行：
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/prepare_polymarket_discovery.py \
+  --root "$MARKETCOW_HOME/prediction-markets/polymarket-discovery" \
+  --realtime-market-limit "$MARKETCOW_POLYMARKET_DISCOVERY_REALTIME_MARKET_LIMIT" \
+  --required-realtime-scope "$MARKETCOW_POLYMARKET_RUST_SCOPE_FILE" \
+  --fee-semantics-policy "$MARKETCOW_POLYMARKET_FEE_SEMANTICS_POLICY"
+```
+
+该工具负责遍历 Gamma、验证候选市场的全部 CLOB token books，并原子发布 catalog、
+catalog index 与有界 realtime universe。常驻 collector 启动时只读取并校验这套已发布
+边界；边界缺失或损坏时 discovery collector 明确退出，不会联网补建。supervisor 将
+其记录为独立模块失败，同时继续启动 Rust 数据面和统一 API；Discovery 状态接口保持
+可访问并返回 fail-closed 状态。
+
 `ops/launchd/install.sh` 会停用并把旧的 `com.marketcow.*` 独立 LaunchAgent 移至
 `~/Library/Application Support/MarketCow/retired-launch-agents/`。这样旧的 scoped、
 read-api、soak 或 refresh job 不会在登录或重启后与正式服务并行启动。

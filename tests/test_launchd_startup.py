@@ -229,18 +229,15 @@ class LaunchdStartupTest(unittest.TestCase):
             self.assertIn(
                 "8795", commands["polymarket-discovery-collector"]
             )
-            self.assertIn(
+            self.assertNotIn(
                 str(fee_semantics.resolve()),
                 commands["polymarket-discovery-collector"],
             )
-            self.assertIn(
+            self.assertNotIn(
                 "--realtime-market-limit",
                 commands["polymarket-discovery-collector"],
             )
-            self.assertIn(
-                "1000", commands["polymarket-discovery-collector"]
-            )
-            self.assertIn(
+            self.assertNotIn(
                 str(rust_scope.resolve()),
                 commands["polymarket-discovery-collector"],
             )
@@ -264,10 +261,10 @@ class LaunchdStartupTest(unittest.TestCase):
             by_name = {service.name: service for service in services}
             self.assertEqual(
                 by_name["unified-api"].start_after,
-                (
-                    "polymarket-discovery-collector",
-                    "polymarket-rust-data-plane",
-                ),
+                ("polymarket-rust-data-plane",),
+            )
+            self.assertFalse(
+                by_name["polymarket-discovery-collector"].required
             )
             self.assertEqual(
                 by_name["polymarket-opportunity-controller"].start_after,
@@ -357,6 +354,26 @@ class LaunchdStartupTest(unittest.TestCase):
             )
 
             self.assertEqual(result, 7)
+
+    def test_optional_module_failure_does_not_block_other_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            project = Path(folder)
+            services = (
+                RUNNER.Service(
+                    "discovery", ("/bin/sh", "-c", "exit 7"), required=False,
+                ),
+                RUNNER.Service("api", ("/bin/sh", "-c", "exit 9")),
+            )
+
+            result = RUNNER.supervise(
+                services,
+                project_dir=project,
+                environment=os.environ,
+                poll_seconds=0.01,
+                shutdown_seconds=1,
+            )
+
+            self.assertEqual(result, 9)
 
     def test_production_storage_defaults_live_outside_source_checkout(self) -> None:
         storage_script = (LAUNCHD / "ensure-production-storage.sh").read_text()

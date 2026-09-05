@@ -73,6 +73,38 @@ class PolymarketDiscoveryTest(unittest.TestCase):
             time.sleep(0.01)
         self.fail("discovery full-sync did not finish materializing")
 
+    def test_missing_discovery_startup_data_is_isolated_from_live_api(self):
+        self.writer([gamma_row()])
+        app = create_polymarket_live_read_app(
+            root=self.root,
+            discovery_root=self.root / "missing-discovery",
+            stable_snapshot_max_book_age_seconds=5,
+            stable_read_wait_seconds=1,
+            stable_read_poll_seconds=0.01,
+            executor_workers=4,
+            discovery_depth_notionals=("1", "10"),
+            discovery_maximum_book_age_ms=5000,
+        )
+        app.state.polymarket_live_read.now_provider = lambda: NOW
+
+        with TestClient(app) as client:
+            live = client.get(
+                "/v1/prediction-markets/polymarket/live/health"
+            )
+            discovery = client.get(
+                "/v1/prediction-markets/polymarket/live/discovery/status"
+            )
+            full_sync = client.get(
+                "/v1/prediction-markets/polymarket/live/discovery/full-sync"
+            )
+
+        self.assertEqual(live.status_code, 200, live.text)
+        self.assertEqual(discovery.status_code, 200, discovery.text)
+        self.assertEqual(discovery.json()["state"], "failed")
+        self.assertFalse(discovery.json()["ready"])
+        self.assertIn("catalog is not configured", discovery.json()["error"])
+        self.assertEqual(full_sync.status_code, 503)
+
     def test_materialization_exposes_only_bounded_realtime_universe(self):
         rows = [
             gamma_row(
@@ -134,11 +166,13 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(len(frame.items), 1)
         self.assertEqual(frame.items[0].type, "universe_changed")
         self.assertEqual(
-            frame.items[0].universe_revision,
+            frame.items[0].payload.universe_revision,
             replacement_body["universe_revision"],
         )
-        self.assertIsNone(frame.items[0].market)
-        self.assertIsNone(frame.items[0].relation)
+        self.assertEqual(
+            set(frame.items[0].model_dump(mode="json")),
+            {"type", "payload"},
+        )
 
     def test_explicit_depth_configuration_is_mandatory_and_ordered(self):
         rows = [gamma_row()]
@@ -429,22 +463,68 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         writer = self.writer([gamma_row()])
         with TestClient(self.app()) as client:
             baseline = self.ready_full_sync(client).json()
+            discovery = client.app.state.polymarket_discovery
+            # The assertion below deliberately drives one synchronous
+            # materialization. Stop the normal background owner first so it
+            # cannot consume the two events between the write and that call.
+            discovery.stop_background_materialization()
 
             writer.apply_snapshot(
                 snapshot("yes-1", "0.41", "0.43", "1785739201000"),
                 received_at=NOW + timedelta(milliseconds=1),
             )
-            discovery = client.app.state.polymarket_discovery
+            writer.apply_snapshot(
+                snapshot("no-1", "0.57", "0.59", "1785739202000"),
+                received_at=NOW + timedelta(milliseconds=2),
+            )
             discovery.materialize_once()
             frame = discovery.events_page(
                 baseline["projection_id"], baseline["boundary_cursor"], 1000
             )
         self.assertFalse(frame.resync_required)
         self.assertEqual(frame.next_cursor, frame.after_cursor + 1)
+        self.assertGreater(frame.boundary_cursor, frame.next_cursor)
         self.assertEqual(len(frame.items), 1)
         self.assertEqual(frame.items[0].type, "market_update")
-        self.assertEqual(frame.items[0].market.market_id, "m1")
-        self.assertEqual(len(frame.items[0].market.outcomes), 2)
+        self.assertEqual(frame.items[0].payload.market_id, "m1")
+        self.assertEqual(frame.items[0].payload.cursor, frame.next_cursor)
+        self.assertEqual(len(frame.items[0].payload.outcomes), 2)
+        self.assertEqual(
+            set(frame.items[0].model_dump(mode="json")),
+            {"type", "payload"},
+        )
+        second = discovery.events_page(
+            baseline["projection_id"], frame.next_cursor, 1000
+        )
+        self.assertEqual(second.next_cursor, second.after_cursor + 1)
+        self.assertEqual(second.items[0].payload.cursor, second.next_cursor)
+
+    def test_market_settlement_is_optional_and_never_inferred(self):
+        without_settlement = gamma_row()
+        with_settlement = gamma_row(
+            "m2", "0x" + "2" * 64, ("yes-2", "no-2")
+        )
+        with_settlement.update({
+            "rules": "Resolves YES if the event occurs.",
+            "resolutionSource": "official-results",
+            "redeemable": True,
+            "redeemableAt": "2026-08-04T12:34:56.123456Z",
+        })
+        self.writer([without_settlement, with_settlement])
+
+        with TestClient(self.app()) as client:
+            markets = {
+                market["market_id"]: market
+                for market in self.ready_full_sync(client).json()["markets"]
+            }
+
+        self.assertIsNone(markets["m1"]["settlement"])
+        settlement = markets["m2"]["settlement"]
+        self.assertEqual(settlement["resolution_source"], "official-results")
+        self.assertRegex(settlement["rules_revision"], r"^[0-9a-f]{64}$")
+        self.assertTrue(settlement["redeemable"])
+        self.assertEqual(settlement["redeemable_at_ns"], 1785846896123456000)
+        self.assertRegex(settlement["evidence_sha256"], r"^[0-9a-f]{64}$")
 
     def test_negative_risk_relation_is_complete_and_quoted_atomically(self):
         rows = [
@@ -492,7 +572,11 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(len(frame.items), 1)
         self.assertEqual(frame.items[0].type, "relation_update")
         self.assertEqual(
-            frame.items[0].relation.relation_id, "neg-risk:neg-group"
+            frame.items[0].payload.relation_id, "neg-risk:neg-group"
+        )
+        self.assertEqual(
+            set(frame.items[0].model_dump(mode="json")),
+            {"type", "payload"},
         )
 
     def test_cursor_expiry_and_websocket_resync_are_explicit(self):
@@ -590,8 +674,31 @@ class PolymarketDiscoveryTest(unittest.TestCase):
             self.assertNotIn(removed, openapi["paths"])
         schemas = openapi["components"]["schemas"]
         self.assertIn("DiscoveryFullSync", schemas)
+        self.assertIn("DiscoveryDeltaFrame", schemas)
+        self.assertIn("DiscoverySettlement", schemas)
         self.assertNotIn("DiscoveryMetadataPage", schemas)
         self.assertIn("LifecycleHistoryPage", schemas)
+        delta_items = schemas["DiscoveryDeltaFrame"]["properties"]["items"][
+            "items"
+        ]
+        self.assertEqual(delta_items["discriminator"]["propertyName"], "type")
+        self.assertEqual(
+            set(delta_items["discriminator"]["mapping"]),
+            {"market_update", "relation_update", "universe_changed"},
+        )
+        for schema_name in (
+            "DiscoveryMarketUpdateItem",
+            "DiscoveryRelationUpdateItem",
+            "DiscoveryUniverseChangedItem",
+        ):
+            self.assertEqual(
+                set(schemas[schema_name]["required"]),
+                {"payload"},
+            )
+            self.assertEqual(
+                set(schemas[schema_name]["properties"]),
+                {"type", "payload"},
+            )
         self.assertIn(
             "/v1/prediction-markets/polymarket/live/discovery/stream",
             openapi["x-websocket-paths"],

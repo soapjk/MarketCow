@@ -8,12 +8,13 @@ from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
-from marketcow.api import create_app
+from marketcow.api import PolymarketConfiguredScope, create_app
 from marketcow.config import Settings
 from marketcow.polymarket_contracts import (
     OutcomeToken,
     PredictionMarketIdentity,
     SourceRevision,
+    content_sha256,
 )
 from marketcow.polymarket_history import (
     PolymarketWebSocketRecorder,
@@ -67,6 +68,43 @@ class PolymarketApiTest(unittest.TestCase):
             "marketcow.polymarket.discovery-events.v3",
         )
         self.assertIn("projection_id", websocket["query_parameters"])
+
+    def test_explicit_empty_shadow_incumbent_is_content_addressed(self):
+        catalog_revision = "7" * 64
+        scope_id = content_sha256({
+            "catalog_revision": catalog_revision,
+            "configured_markets": [],
+            "mode": "shadow",
+        })
+        contract = {
+            "schema_version": "marketcow.polymarket.scope-discovery.v1",
+            "mode": "shadow",
+            "active_scope_id": scope_id,
+            "catalog_revision": catalog_revision,
+            "configured_market_count": 0,
+            "configured_markets": [],
+        }
+        client = TestClient(create_app(
+            self.settings,
+            Service(),
+            polymarket_configured_scope=contract,
+        ))
+
+        response = client.get("/v1/prediction-markets/polymarket/live/scope")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), contract)
+
+    def test_shadow_incumbent_rejects_non_content_addressed_scope_id(self):
+        with self.assertRaisesRegex(ValueError, "not content-addressed"):
+            PolymarketConfiguredScope.model_validate({
+                "schema_version": "marketcow.polymarket.scope-discovery.v1",
+                "mode": "shadow",
+                "active_scope_id": "a" * 64,
+                "catalog_revision": "7" * 64,
+                "configured_market_count": 0,
+                "configured_markets": [],
+            })
 
     def test_only_certified_manifest_and_immutable_parquet_are_public(self):
         identity = PredictionMarketIdentity(

@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Literal, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -80,6 +80,7 @@ from .polymarket_history import PublishedPredictionMarketStore
 from .polymarket_contracts import (
     PredictionMarketBootstrap,
     PredictionMarketManifest,
+    content_sha256,
 )
 from .polymarket_live import (
     CandidateSnapshot,
@@ -530,15 +531,67 @@ class CsvImportRetryInput(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=200)
 
 
+class PolymarketConfiguredMarket(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market_id: str = Field(min_length=1)
+    condition_id: str = Field(min_length=1)
+    token_ids: tuple[str, ...] = Field(min_length=2, max_length=2)
+    end_at: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "PolymarketConfiguredMarket":
+        if len(set(self.token_ids)) != 2 or any(not token for token in self.token_ids):
+            raise ValueError("configured market token IDs must be distinct")
+        datetime.fromisoformat(self.end_at.replace("Z", "+00:00"))
+        return self
+
+
+class PolymarketConfiguredScope(BaseModel):
+    """Explicit read-only incumbent supplied to an isolated Shadow API."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["marketcow.polymarket.scope-discovery.v1"]
+    mode: Literal["shadow"]
+    active_scope_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    configured_market_count: int = Field(ge=0)
+    configured_markets: tuple[PolymarketConfiguredMarket, ...]
+
+    @model_validator(mode="after")
+    def validate_content_identity(self) -> "PolymarketConfiguredScope":
+        if self.configured_market_count != len(self.configured_markets):
+            raise ValueError("configured market count is inconsistent")
+        market_ids = [market.market_id for market in self.configured_markets]
+        if len(set(market_ids)) != len(market_ids):
+            raise ValueError("configured market IDs must be unique")
+        expected_scope_id = content_sha256({
+            "catalog_revision": self.catalog_revision,
+            "configured_markets": [
+                market.model_dump(mode="json") for market in self.configured_markets
+            ],
+            "mode": self.mode,
+        })
+        if self.active_scope_id != expected_scope_id:
+            raise ValueError("configured scope ID is not content-addressed")
+        return self
+
+
 def create_app(
     settings: Optional[Settings] = None,
     service: Optional[FundamentalService] = None,
     now_provider: Optional[Callable[[], datetime]] = None,
     realtime_hub: Optional[RealtimeHub] = None,
     mcp_server: Optional[McpServer] = None,
+    polymarket_configured_scope: Mapping[str, Any] | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     service = service or FundamentalService(settings)
+    configured_scope = (
+        PolymarketConfiguredScope.model_validate(polymarket_configured_scope)
+        if polymarket_configured_scope is not None else None
+    )
     app = FastAPI(title="MarketCow", version=__version__)
     if settings.polymarket_rust_data_plane_url:
         app.add_middleware(
@@ -1613,6 +1666,8 @@ def create_app(
         summary="Discover the active immutable Polymarket scope",
     )
     def polymarket_live_scope():
+        if configured_scope is not None:
+            return configured_scope.model_dump(mode="json")
         scope_id = polymarket_live_projection.scope_id or polymarket_live_read.scope_id
         return {
             "schema_version": "marketcow.polymarket.scope-discovery.v1",
@@ -2450,23 +2505,35 @@ def create_app(
                 requested.append((symbol, None, str(exc)))
 
         workers = max(1, min(settings.dividend_batch_workers, len(unique_symbols)))
+        batch_deadline = time.monotonic() + settings.dividend_batch_timeout_seconds
+
+        def load_dividends(symbol: str) -> tuple[float, Any, Exception | None]:
+            try:
+                data = service.get_dividends(symbol, request.fiscal_year)
+                return time.monotonic(), data, None
+            except Exception as exc:
+                return time.monotonic(), None, exc
+
         executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="dividend-query"
         )
         futures = {
-            executor.submit(service.get_dividends, symbol, request.fiscal_year): symbol
+            executor.submit(load_dividends, symbol): symbol
             for symbol in unique_symbols
         }
         done, unfinished = wait(
-            futures, timeout=settings.dividend_batch_timeout_seconds
+            futures, timeout=max(0.0, batch_deadline - time.monotonic())
         )
         results: Dict[str, Dict[str, Any]] = {}
         for future in done:
             symbol = futures[future]
-            try:
-                results[symbol] = {"data": future.result(), "error": None}
-            except Exception as exc:
-                results[symbol] = {"data": None, "error": str(exc)}
+            completed_at, data, error = future.result()
+            if completed_at > batch_deadline:
+                unfinished.add(future)
+            elif error is None:
+                results[symbol] = {"data": data, "error": None}
+            else:
+                results[symbol] = {"data": None, "error": str(error)}
         for future in unfinished:
             symbol = futures[future]
             future.cancel()

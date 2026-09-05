@@ -282,17 +282,28 @@ fields are rejected. Each fact is an envelope with separately hashed
 
 ## Running locally
 
-The command below is intentionally separate from the MarketCow web process. It changes
-only the supplied local storage directory.
+Prepare the complete Gamma catalog and bounded runtime universe explicitly. This is the
+only command that performs the long full-directory traversal:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/prepare_polymarket_discovery.py \
+  --root '<MarketCow storage_root>/prediction-markets/polymarket-live' \
+  --realtime-market-limit 1000 \
+  --fee-semantics-policy "$(pwd)/ops/polymarket/fee-semantics-v2.json"
+```
+
+After that boundary exists, start the collector. Startup is local-only: it validates
+the published catalog/index/universe and exits with an actionable error if any required
+input is absent or invalid. It never falls back to a Gamma traversal or rebuilds the
+full catalog in process.
 
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/run_polymarket_live.py \
-  --root '<MarketCow storage_root>/prediction-markets/polymarket-live' \
-  --catalog-progress-pages 25
+  --root '<MarketCow storage_root>/prediction-markets/polymarket-live'
 ```
 
-Use `--catalog-only` to validate discovery or `--bootstrap-only` to stop after REST
-recovery (which may honestly report partial coverage). Every REST `/books` request and
+Use `--bootstrap-only` to stop after REST recovery. A failed initial recovery exits once
+instead of retrying forever inside startup. Every REST `/books` request and
 WebSocket subscription message is
 bounded to 500 tokens. Up to 32 WebSocket connections are used by default; all shards
 are distributed evenly across those connections and additional shards use the official
