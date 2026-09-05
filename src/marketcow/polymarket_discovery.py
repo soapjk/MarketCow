@@ -13,12 +13,12 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal
+from typing import Annotated, Any, Iterable, Iterator, Literal
 
 from pydantic import BaseModel, Field, model_validator
 from fastapi import FastAPI
 
-from .polymarket_contracts import content_sha256, decimal_text
+from .polymarket_contracts import canonical_json, content_sha256, decimal_text
 from .polymarket_live import (
     LiveBook,
     LiveEventEnvelope,
@@ -44,6 +44,15 @@ def install_discovery_openapi_extension(app: FastAPI) -> None:
     def openapi() -> dict[str, Any]:
         if app.openapi_schema is None:
             schema = original()
+            frame_schema = DiscoveryDeltaFrame.model_json_schema(
+                ref_template="#/components/schemas/{model}",
+            )
+            definitions = frame_schema.pop("$defs", {})
+            component_schemas = schema.setdefault("components", {}).setdefault(
+                "schemas", {}
+            )
+            component_schemas.update(definitions)
+            component_schemas["DiscoveryDeltaFrame"] = frame_schema
             schema["x-websocket-paths"] = {
                 "/v1/prediction-markets/polymarket/live/discovery/stream": {
                     "schema_version": DISCOVERY_EVENT_SCHEMA_VERSION,
@@ -107,6 +116,21 @@ class DiscoveryOutcomeQuote(BaseModel):
         return self
 
 
+class DiscoverySettlement(BaseModel):
+    resolution_source: str
+    rules_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    redeemable: bool
+    redeemable_at_ns: int | None = Field(default=None, ge=0)
+    observed_at: datetime
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def redemption_state_is_consistent(self):
+        if self.redeemable != (self.redeemable_at_ns is not None):
+            raise ValueError("redeemable and redeemable_at_ns must agree")
+        return self
+
+
 class DiscoveryMarketQuote(BaseModel):
     market_id: str
     condition_id: str
@@ -138,6 +162,7 @@ class DiscoveryMarketQuote(BaseModel):
     book_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
     cursor: int = Field(ge=0)
+    settlement: DiscoverySettlement | None = None
 
     @model_validator(mode="after")
     def fail_closed_contract(self):
@@ -196,55 +221,6 @@ class DiscoveryFullSync(BaseModel):
             raise ValueError("depth notionals must be strictly increasing")
         for value in self.depth_notionals:
             decimal_text(value, "depth_notional", allow_zero=False)
-        return self
-
-
-class DiscoveryDeltaItem(BaseModel):
-    type: Literal["market_update", "relation_update", "universe_changed"]
-    market: DiscoveryMarketQuote | None = None
-    relation: DiscoveryRelation | None = None
-    universe_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-
-    @model_validator(mode="after")
-    def payload_contract(self):
-        if self.type == "market_update":
-            if self.market is None:
-                raise ValueError("market_update delta requires a market payload")
-            if self.relation is not None or self.universe_revision is not None:
-                raise ValueError("market_update delta must carry only a market payload")
-        if self.type == "relation_update":
-            if self.relation is None:
-                raise ValueError("relation_update delta requires a relation payload")
-            if self.market is not None or self.universe_revision is not None:
-                raise ValueError("relation_update delta must carry only a relation payload")
-        if self.type == "universe_changed":
-            if self.universe_revision is None:
-                raise ValueError("universe_changed delta requires universe_revision")
-            if self.market is not None or self.relation is not None:
-                raise ValueError("universe_changed delta must not carry market/relation payloads")
-        return self
-
-
-class DiscoveryDeltaFrame(BaseModel):
-    schema_version: Literal["marketcow.polymarket.discovery-events.v3"] = (
-        DISCOVERY_EVENT_SCHEMA_VERSION
-    )
-    projection_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
-    universe_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
-    after_cursor: int = Field(ge=0)
-    next_cursor: int = Field(ge=0)
-    boundary_cursor: int = Field(ge=0)
-    has_more: bool
-    resync_required: bool
-    items: list[DiscoveryDeltaItem]
-
-    @model_validator(mode="after")
-    def cursor_contract(self):
-        if not self.resync_required and self.next_cursor not in {
-            self.after_cursor, self.after_cursor + 1
-        }:
-            raise ValueError("ordinary delta cursor must stay put or advance exactly once")
         return self
 
 
@@ -322,8 +298,57 @@ class DiscoveryRelation(BaseModel):
         return self
 
 
+class DiscoveryUniverseChangedPayload(BaseModel):
+    universe_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DiscoveryMarketUpdateItem(BaseModel):
+    type: Literal["market_update"] = "market_update"
+    payload: DiscoveryMarketQuote
+
+
+class DiscoveryRelationUpdateItem(BaseModel):
+    type: Literal["relation_update"] = "relation_update"
+    payload: DiscoveryRelation
+
+
+class DiscoveryUniverseChangedItem(BaseModel):
+    type: Literal["universe_changed"] = "universe_changed"
+    payload: DiscoveryUniverseChangedPayload
+
+
+DiscoveryDeltaItem = Annotated[
+    DiscoveryMarketUpdateItem
+    | DiscoveryRelationUpdateItem
+    | DiscoveryUniverseChangedItem,
+    Field(discriminator="type"),
+]
+
+
+class DiscoveryDeltaFrame(BaseModel):
+    schema_version: Literal["marketcow.polymarket.discovery-events.v3"] = (
+        DISCOVERY_EVENT_SCHEMA_VERSION
+    )
+    projection_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    universe_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    after_cursor: int = Field(ge=0)
+    next_cursor: int = Field(ge=0)
+    boundary_cursor: int = Field(ge=0)
+    has_more: bool
+    resync_required: bool
+    items: list[DiscoveryDeltaItem]
+
+    @model_validator(mode="after")
+    def cursor_contract(self):
+        if not self.resync_required and self.next_cursor not in {
+            self.after_cursor, self.after_cursor + 1
+        }:
+            raise ValueError("ordinary delta cursor must stay put or advance exactly once")
+        return self
+
+
 DiscoveryFullSync.model_rebuild()
-DiscoveryDeltaItem.model_rebuild()
 DiscoveryDeltaFrame.model_rebuild()
 
 
@@ -729,11 +754,27 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         except (OSError, ValueError, KeyError, sqlite3.Error):
             self._snapshots.clear()
 
-    def start_background_materialization(self) -> None:
+    def _validate_startup_data(self) -> None:
+        """Require an offline-prepared catalog and mutable-state boundary."""
+        self.reader._manifest_binding()
+        self.reader._state_manifest()
+
+    def start_background_materialization(self) -> bool:
+        try:
+            self._validate_startup_data()
+        except Exception as exc:
+            with self._lock:
+                self._materialization_state = "failed"
+                self._materialization_error = f"{type(exc).__name__}: {exc}"
+            LOGGER.error(
+                "polymarket_discovery_startup_data_unavailable error=%s",
+                self._materialization_error,
+            )
+            return False
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 self._wake.set()
-                return
+                return True
             self._stop.clear()
             self._thread = threading.Thread(
                 target=self._materialization_loop,
@@ -741,6 +782,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 daemon=True,
             )
             self._thread.start()
+            return True
 
     def stop_background_materialization(self) -> None:
         self._stop.set()
@@ -1015,6 +1057,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         market: LiveMarket,
         books: dict[str, LiveBook | None],
         *,
+        metadata: DiscoveryMetadataFact,
         relation_complete: bool,
         has_gap: bool,
         catalog_revision: str,
@@ -1082,6 +1125,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         book_observed_at = min((book.received_at for book in present), default=None)
         book_age_ms = max(0, int((observed_at - book_observed_at).total_seconds() * 1000)) if book_observed_at else None
         book_revision = content_sha256({book.token_id: book.state_checksum for book in sorted(present, key=lambda value: value.token_id)}) if len(present) == 2 else None
+        settlement = self._settlement_from_metadata(metadata)
         return DiscoveryMarketQuote(
             market_id=market.identity.market_id,
             condition_id=market.identity.condition_id,
@@ -1108,6 +1152,34 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             book_revision=book_revision,
             catalog_revision=catalog_revision,
             cursor=boundary_cursor,
+            settlement=settlement,
+        )
+
+    @staticmethod
+    def _settlement_from_metadata(
+        metadata: DiscoveryMetadataFact,
+    ) -> DiscoverySettlement | None:
+        if (
+            metadata.resolution_source is None
+            or metadata.rules_revision is None
+            or metadata.redeemable is None
+            or metadata.redeemable
+            != (metadata.redeemable_at is not None)
+        ):
+            return None
+        redeemable_at_ns = None
+        if metadata.redeemable_at is not None:
+            redeemable_at_ns = (
+                int(metadata.redeemable_at.timestamp()) * 1_000_000_000
+                + metadata.redeemable_at.microsecond * 1_000
+            )
+        return DiscoverySettlement(
+            resolution_source=metadata.resolution_source,
+            rules_revision=metadata.rules_revision,
+            redeemable=metadata.redeemable,
+            redeemable_at_ns=redeemable_at_ns,
+            observed_at=metadata.observed_at,
+            evidence_sha256=metadata.evidence_sha256,
         )
 
     def _copy_state_boundary(
@@ -1323,6 +1395,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                     quote = self._market_quote(
                         market,
                         books,
+                        metadata=metadata,
                         relation_complete=(
                             not market.identity.neg_risk or relation_id is not None
                         ),
@@ -1395,10 +1468,22 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                     "SELECT market_id FROM markets ORDER BY market_id"
                 )
             ])
+            previous_supports_point_in_time_deltas = False
+            if previous is not None:
+                with self._database(
+                    previous.database_path, readonly=True,
+                ) as previous_connection:
+                    previous_supports_point_in_time_deltas = (
+                        previous_connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='source_books'"
+                        ).fetchone() is not None
+                    )
             projection_id = (
                 previous.projection_id
                 if previous is not None
                 and previous.universe_revision == universe_revision
+                and previous_supports_point_in_time_deltas
                 else snapshot_id
             )
             connection.execute(
@@ -1412,7 +1497,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             )
             connection.executescript(
                 "DROP TABLE raw_catalog; DROP TABLE relation_sources; "
-                "DROP TABLE source_books; DROP TABLE gap_markets; DROP TABLE relation_copies;"
+                "DROP TABLE relation_copies;"
             )
             connection.commit()
         except BaseException:
@@ -1444,6 +1529,11 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
         if current_realtime_universe_id != current.realtime_universe_id:
             return self._full_materialize(previous=current)
         connection = self._open_database(current.database_path)
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_books'"
+        ).fetchone() is None:
+            connection.close()
+            return self._full_materialize(previous=current)
         requires_full_materialization = False
         changed_market_ids: set[str] = set()
         unresolved_gap_count = current.unresolved_gap_count
@@ -1492,6 +1582,7 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                                     "catalog_revision", "market_terminal", "market_resolved"
                                 }:
                                     requires_full_materialization = True
+                                    break
                                 elif (
                                     event.market_id is not None
                                     and event.event_type in {
@@ -1499,71 +1590,139 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                                         "last_trade_price", "tick_size_change",
                                     }
                                 ):
+                                    if (
+                                        not event.applied
+                                        or event.token_id is None
+                                        or event.gaps
+                                    ):
+                                        requires_full_materialization = True
+                                        break
                                     changed_market_ids.add(event.market_id)
-                    if not requires_full_materialization:
-                        for market_id in sorted(changed_market_ids):
-                            market_row = connection.execute(
-                                "SELECT static_payload FROM markets WHERE market_id=?",
-                                (market_id,),
-                            ).fetchone()
-                            if market_row is None:
-                                continue
-                            market = LiveMarket.model_validate_json(
-                                bytes(market_row[0])
-                            )
-                            books = {}
-                            for outcome in market.identity.outcomes:
-                                row = source.execute(
-                                    """SELECT b.token_id, b.market_id,
-                                    b.payload_json, b.payload_sha256,
-                                    c.exchange_at AS confirmed_exchange_at,
-                                    c.received_at AS confirmed_received_at,
-                                    c.state_checksum AS confirmed_state_checksum,
-                                    c.source_hash AS confirmed_source_hash,
-                                    c.confirmation_sha256 FROM books b
-                                    LEFT JOIN book_confirmations c
-                                    ON c.token_id=b.token_id WHERE b.token_id=?""",
-                                    (outcome.token_id,),
-                                ).fetchone()
-                                books[outcome.token_id] = (
-                                    self.reader._indexed_book(row) if row else None
-                                )
-                            relation_id = next((
-                                item.relation_id for item in market.relations
-                                if item.relation_type == "standard_negative_risk"
-                            ), None)
-                            relation_row = (
-                                connection.execute(
-                                    "SELECT complete FROM relations WHERE relation_id=?",
-                                    (relation_id,),
-                                ).fetchone()
-                                if relation_id else None
-                            )
-                            relation_complete = (
-                                not market.identity.neg_risk
-                                or bool(relation_row and relation_row[0])
-                            )
-                            has_gap = source.execute(
-                                "SELECT 1 FROM gaps WHERE resolved=0 AND market_id=? LIMIT 1",
-                                (market_id,),
-                            ).fetchone() is not None
-                            quote = self._market_quote(
-                                market, books,
-                                relation_complete=relation_complete,
-                                has_gap=has_gap,
-                                catalog_revision=catalog_revision,
-                                boundary_cursor=boundary_cursor,
-                                observed_at=observed_at,
-                            )
-                            connection.execute(
-                                "INSERT INTO quote_versions VALUES (?,?,?,?,?,?)",
-                                (
-                                    market_id, boundary_cursor,
-                                    quote.model_dump_json().encode(),
-                                    quote.metadata_revision, quote.book_revision,
-                                    quote.book_status,
-                                ),
-                            )
+                                    book = LiveBook.model_validate(
+                                        event.canonical_payload
+                                    )
+                                    if book.token_id != event.token_id:
+                                        raise PolymarketLiveReadError(
+                                            "polymarket_state_integrity_failed",
+                                            "Event token differs from its canonical book",
+                                            409,
+                                        )
+                                    book_body = canonical_json(
+                                        book.model_dump(mode="json")
+                                    )
+                                    connection.execute(
+                                        """INSERT INTO source_books(
+                                            token_id, market_id, payload_json,
+                                            payload_sha256, confirmed_exchange_at,
+                                            confirmed_received_at,
+                                            confirmed_state_checksum,
+                                            confirmed_source_hash,
+                                            confirmation_sha256
+                                        ) VALUES (?,?,?,?,NULL,NULL,NULL,NULL,NULL)
+                                        ON CONFLICT(token_id) DO UPDATE SET
+                                            market_id=excluded.market_id,
+                                            payload_json=excluded.payload_json,
+                                            payload_sha256=excluded.payload_sha256,
+                                            confirmed_exchange_at=NULL,
+                                            confirmed_received_at=NULL,
+                                            confirmed_state_checksum=NULL,
+                                            confirmed_source_hash=NULL,
+                                            confirmation_sha256=NULL""",
+                                        (
+                                            event.token_id, event.market_id,
+                                            book_body,
+                                            hashlib.sha256(book_body).hexdigest(),
+                                        ),
+                                    )
+                                    market_id = event.market_id
+                                    market_row = connection.execute(
+                                        "SELECT static_payload, metadata_payload "
+                                        "FROM markets WHERE market_id=?",
+                                        (market_id,),
+                                    ).fetchone()
+                                    if market_row is None:
+                                        requires_full_materialization = True
+                                        break
+                                    market = LiveMarket.model_validate_json(
+                                        bytes(market_row[0])
+                                    )
+                                    metadata = DiscoveryMetadataFact.model_validate_json(
+                                        bytes(market_row[1])
+                                    )
+                                    books = {}
+                                    for outcome in market.identity.outcomes:
+                                        row = connection.execute(
+                                            """SELECT token_id, market_id,
+                                            payload_json, payload_sha256,
+                                            confirmed_exchange_at,
+                                            confirmed_received_at,
+                                            confirmed_state_checksum,
+                                            confirmed_source_hash,
+                                            confirmation_sha256
+                                            FROM source_books WHERE token_id=?""",
+                                            (outcome.token_id,),
+                                        ).fetchone()
+                                        books[outcome.token_id] = (
+                                            self.reader._indexed_book(row)
+                                            if row else None
+                                        )
+                                    relation_id = next((
+                                        item.relation_id for item in market.relations
+                                        if item.relation_type == "standard_negative_risk"
+                                    ), None)
+                                    relation_row = (
+                                        connection.execute(
+                                            "SELECT complete FROM relations "
+                                            "WHERE relation_id=?",
+                                            (relation_id,),
+                                        ).fetchone()
+                                        if relation_id else None
+                                    )
+                                    relation_complete = (
+                                        not market.identity.neg_risk
+                                        or bool(relation_row and relation_row[0])
+                                    )
+                                    has_gap = connection.execute(
+                                        "SELECT 1 FROM gap_markets "
+                                        "WHERE market_id=? LIMIT 1",
+                                        (market_id,),
+                                    ).fetchone() is not None
+                                    quote = self._market_quote(
+                                        market, books,
+                                        metadata=metadata,
+                                        relation_complete=relation_complete,
+                                        has_gap=has_gap,
+                                        catalog_revision=catalog_revision,
+                                        boundary_cursor=event.cursor,
+                                        observed_at=event.received_at,
+                                    )
+                                    quote_values = (
+                                        market_id, event.cursor,
+                                        quote.model_dump_json().encode(),
+                                        quote.metadata_revision,
+                                        quote.book_revision,
+                                        quote.book_status,
+                                    )
+                                    inserted = connection.execute(
+                                        "INSERT OR IGNORE INTO quote_versions "
+                                        "VALUES (?,?,?,?,?,?)",
+                                        quote_values,
+                                    )
+                                    if inserted.rowcount == 0:
+                                        existing = connection.execute(
+                                            "SELECT market_id, cursor, payload_json, "
+                                            "metadata_revision, book_revision, "
+                                            "book_status FROM quote_versions "
+                                            "WHERE market_id=? AND cursor=?",
+                                            (market_id, event.cursor),
+                                        ).fetchone()
+                                        if existing is None or tuple(existing) != quote_values:
+                                            raise PolymarketLiveReadError(
+                                                "polymarket_state_integrity_failed",
+                                                "Discovery quote replay differs at an "
+                                                "existing market cursor",
+                                                409,
+                                            )
             if requires_full_materialization:
                 connection.rollback()
                 return self._full_materialize(previous=current)
@@ -1824,18 +1983,18 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
             ), None)
 
     def _market_delta_payload(
-        self, boundary: _DiscoveryBoundary, market_id: str
+        self, boundary: _DiscoveryBoundary, market_id: str, cursor: int
     ) -> DiscoveryMarketQuote | None:
         with self._database(boundary.database_path, readonly=True) as connection:
             row = connection.execute(
-                "SELECT payload_json FROM quote_versions WHERE market_id=? "
-                "AND cursor<=? ORDER BY cursor DESC LIMIT 1",
-                (market_id, boundary.boundary_cursor),
+                "SELECT payload_json FROM quote_versions "
+                "WHERE market_id=? AND cursor=?",
+                (market_id, cursor),
             ).fetchone()
         if row is None:
             return None
         return DiscoveryMarketQuote.model_validate_json(bytes(row[0])).model_copy(
-            update={"cursor": boundary.boundary_cursor}
+            update={"cursor": cursor}
         )
 
     def _relation_delta_payload(
@@ -1875,9 +2034,10 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 has_more=False,
                 resync_required=True,
                 items=(
-                    [DiscoveryDeltaItem(
-                        type="universe_changed",
-                        universe_revision=current.universe_revision,
+                    [DiscoveryUniverseChangedItem(
+                        payload=DiscoveryUniverseChangedPayload(
+                            universe_revision=current.universe_revision,
+                        ),
                     )]
                     if universe_changed else []
                 ),
@@ -1941,30 +2101,30 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 if relation is None:
                     resync_required = True
                     continue
-                items.append(DiscoveryDeltaItem(
-                    type="relation_update", relation=relation
+                items.append(DiscoveryRelationUpdateItem(
+                    payload=relation,
                 ))
         elif event.event_type in {
             "book", "price_change", "best_bid_ask", "last_trade_price",
             "tick_size_change",
         }:
             market = (
-                self._market_delta_payload(current, event.market_id)
+                self._market_delta_payload(current, event.market_id, event.cursor)
                 if event.market_id is not None else None
             )
             if market is None:
                 resync_required = True
             else:
-                items.append(DiscoveryDeltaItem(type="market_update", market=market))
+                items.append(DiscoveryMarketUpdateItem(payload=market))
         elif event.event_type in {"market_terminal", "market_resolved"}:
             market = (
-                self._market_delta_payload(current, event.market_id)
+                self._market_delta_payload(current, event.market_id, event.cursor)
                 if event.market_id is not None else None
             )
             if market is None:
                 resync_required = True
             else:
-                items.append(DiscoveryDeltaItem(type="market_update", market=market))
+                items.append(DiscoveryMarketUpdateItem(payload=market))
 
         return DiscoveryDeltaFrame(
             projection_id=projection_id,

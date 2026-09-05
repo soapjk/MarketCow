@@ -208,6 +208,32 @@ def test_active_clob_omission_remains_a_real_data_failure() -> None:
         assert not any(event.event_type == "market_terminal" for event in store.events)
 
 
+def test_periodic_omission_does_not_start_unbounded_gamma_reconciliation() -> None:
+    with TemporaryDirectory() as folder:
+        row = gamma_row()
+        catalog = CatalogClient([row])
+        store = LiveStateStore(Path(folder), now_provider=lambda: NOW)
+        store.replace_catalog(GammaLiveNormalizer.normalize([row], NOW), [row])
+        collector = PolymarketLiveCollector(
+            store,
+            catalog,
+            ClobBooksClient(
+                requester=lambda *_args, **_kwargs: Response([]),
+                max_retries_per_batch=0,
+            ),
+            publish_checkpoints=False,
+        )
+
+        cursor = store.cursor
+        asyncio.run(collector.refresh_books(
+            reconcile_terminal_omissions=False,
+        ))
+
+        assert catalog.exact_requests == []
+        assert store.cursor == cursor
+        assert not [gap for gap in store.gaps if not gap.resolved]
+
+
 def test_hot_health_reports_terminal_without_exact_ready_or_global_failure() -> None:
     with TemporaryDirectory() as folder:
         root = Path(folder)

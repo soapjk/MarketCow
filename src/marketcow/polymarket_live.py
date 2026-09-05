@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import heapq
 import hashlib
 import json
 import logging
@@ -981,46 +982,57 @@ def _atomic_write_catalog(
     path: Path,
     *,
     revision: str,
-    markets: list[LiveMarket],
+    markets: list[LiveMarket] | "GammaNormalizedCatalog",
     source: dict[str, Any],
     realtime_universe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_root = path.parent / "catalogs"
     normalized_root.mkdir(parents=True, exist_ok=True)
     normalized_path = normalized_root / f"{revision}.jsonl"
-    normalized_rows = [
-        (market, canonical_json(market.model_dump(mode="json")))
-        for market in markets
-    ]
-    normalized_hasher = hashlib.sha256()
-    for _, body in normalized_rows:
-        normalized_hasher.update(body + b"\n")
-    expected_normalized_sha256 = normalized_hasher.hexdigest()
-    temporary = None
-    if not normalized_path.exists():
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=normalized_root, delete=False,
-            ) as stream:
-                temporary = Path(stream.name)
-                for _, body in normalized_rows:
-                    stream.write(body + b"\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, normalized_path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+    if isinstance(markets, GammaNormalizedCatalog):
+        if markets.revision != revision:
+            raise RuntimeError("prepared live catalog revision mismatch")
+        expected_normalized_sha256 = markets.sha256
+        market_count = len(markets)
+        if not normalized_path.exists():
+            _atomic_copy(markets.path, normalized_path)
+        normalized_rows: Iterable[tuple[LiveMarket, bytes]] = markets.iter_rows()
+    else:
+        buffered_rows = [
+            (market, canonical_json(market.model_dump(mode="json")))
+            for market in markets
+        ]
+        normalized_hasher = hashlib.sha256()
+        for _, body in buffered_rows:
+            normalized_hasher.update(body + b"\n")
+        expected_normalized_sha256 = normalized_hasher.hexdigest()
+        market_count = len(markets)
+        temporary = None
+        if not normalized_path.exists():
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=normalized_root, delete=False,
+                ) as stream:
+                    temporary = Path(stream.name)
+                    for _, body in buffered_rows:
+                        stream.write(body + b"\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, normalized_path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        normalized_rows = buffered_rows
     if _file_sha256(normalized_path) != expected_normalized_sha256:
         raise RuntimeError("normalized live catalog integrity failed before publication")
     normalized = {
         "format": "canonical_jsonl",
-        "market_count": len(markets),
+        "market_count": market_count,
         "path": str(normalized_path),
         "sha256": expected_normalized_sha256,
     }
     index_path = path.parent / "catalog-indexes" / f"{revision}.sqlite3"
-    if index_path.exists():
+    if index_path.exists() and not isinstance(markets, GammaNormalizedCatalog):
         catalog_index = _reuse_catalog_index(
             index_path,
             revision=revision,
@@ -1033,7 +1045,7 @@ def _atomic_write_catalog(
             revision=revision,
             catalog_sha256=expected_normalized_sha256,
             rows=normalized_rows,
-            expected_market_count=len(normalized_rows),
+            expected_market_count=market_count,
         )
     candidate_snapshot = _write_candidate_snapshot(
         path.parent,
@@ -2238,9 +2250,22 @@ class PolymarketLiveReadStore:
         return path, metadata
 
     def bootstrap(
-        self, market_ids: Iterable[str], *, _bind_live_books: bool = True,
+        self,
+        market_ids: Iterable[str],
+        *,
+        _bind_live_books: bool = True,
+        _relation_closure: bool = False,
     ) -> LiveBootstrapResponse:
-        selected_ids = self._scope(market_ids)
+        selected_ids = (
+            list(dict.fromkeys(str(item).strip() for item in market_ids))
+            if _relation_closure else self._scope(market_ids)
+        )
+        if not selected_ids or any(not item for item in selected_ids):
+            raise PolymarketLiveReadError(
+                "polymarket_market_scope_required",
+                "At least one non-empty market_id is required",
+                400,
+            )
         payload, normalized_path, index_path, _ = self._manifest_binding()
         normalized_stat = normalized_path.stat()
         cache_key = (
@@ -2704,7 +2729,11 @@ class PolymarketLiveReadStore:
             if pair.market_id not in selected_ids
         })
         related_bootstrap = (
-            self.bootstrap(relation_ids, _bind_live_books=False)
+            self.bootstrap(
+                relation_ids,
+                _bind_live_books=False,
+                _relation_closure=True,
+            )
             if relation_ids else None
         )
         related = related_bootstrap.markets if related_bootstrap else []
@@ -3797,6 +3826,101 @@ class LiveStateIndex:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def restore_checkpoint_boundary(
+        self,
+        *,
+        checkpoint: LiveCheckpoint,
+        tail_event: LiveEventEnvelope,
+        event_log_size: int,
+        tail_byte_offset: int,
+        tail_byte_length: int,
+        tail_line_sha256: str,
+        catalog_revision: str,
+        token_to_market: dict[str, str],
+    ) -> None:
+        """Publish an authenticated checkpoint without replaying the event log."""
+        self.close()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.checkpoint")
+        temporary.unlink(missing_ok=True)
+        try:
+            with sqlite3.connect(temporary) as connection:
+                self._schema(connection, wal=False)
+                connection.execute(
+                    """INSERT INTO event_offsets(
+                        cursor, byte_offset, byte_length, event_id,
+                        market_id, token_id, line_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        tail_event.cursor, tail_byte_offset, tail_byte_length,
+                        tail_event.event_id, tail_event.market_id,
+                        tail_event.token_id, tail_line_sha256,
+                    ),
+                )
+                for token_id, book in sorted(checkpoint.books.items()):
+                    market_id = token_to_market.get(token_id)
+                    if market_id is None:
+                        raise RuntimeError(
+                            "live checkpoint contains a token outside the published universe"
+                        )
+                    body = canonical_json(book.model_dump(mode="json"))
+                    connection.execute(
+                        """INSERT INTO books(
+                            token_id, market_id, cursor, payload_json, payload_sha256
+                        ) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            token_id, market_id, checkpoint.cursor, body,
+                            hashlib.sha256(body).hexdigest(),
+                        ),
+                    )
+                for gap in checkpoint.unresolved_gaps:
+                    body = canonical_json(gap.model_dump(mode="json"))
+                    connection.execute(
+                        """INSERT INTO gaps(
+                            gap_id, market_id, token_id, cursor, payload_json,
+                            payload_sha256, resolved
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                        (
+                            _gap_identity(gap),
+                            token_to_market.get(gap.token_id or ""), gap.token_id,
+                            checkpoint.cursor, body,
+                            hashlib.sha256(body).hexdigest(),
+                        ),
+                    )
+                complete_markets = {
+                    market_id for market_id in token_to_market.values()
+                    if sum(
+                        token_to_market.get(token_id) == market_id
+                        for token_id in checkpoint.books
+                    ) == 2
+                }
+                self._set_metadata(connection, {
+                    "schema_version": STATE_INDEX_SCHEMA_VERSION,
+                    "catalog_revision": catalog_revision,
+                    "latest_cursor": checkpoint.cursor,
+                    "event_log_size": event_log_size,
+                    "active_recovery_id": "",
+                    "book_token_count": len(checkpoint.books),
+                    "book_complete_market_count": len(complete_markets),
+                    "unresolved_gap_count": len(checkpoint.unresolved_gaps),
+                    "oldest_book_received_at": (
+                        min(
+                            book.received_at for book in checkpoint.books.values()
+                        ).isoformat()
+                        if checkpoint.books else ""
+                    ),
+                })
+                connection.commit()
+            with _publication_lock(self.root, exclusive=True):
+                for suffix in ("-wal", "-shm"):
+                    self.path.with_name(f"{self.path.name}{suffix}").unlink(
+                        missing_ok=True,
+                    )
+                os.replace(temporary, self.path)
+                self._publish_manifest()
+        finally:
+            temporary.unlink(missing_ok=True)
+
     @staticmethod
     def _commit_rebuild_batch(
         connection: sqlite3.Connection, values: dict[str, Any],
@@ -4188,11 +4312,13 @@ class GammaCatalogRows:
         row_count: int,
         sha256: str,
         retry_manifest_path: Path | None = None,
+        delete_retry_manifest_on_publish: bool = True,
     ):
         self.path = path.resolve()
         self.row_count = row_count
         self.sha256 = sha256
         self.retry_manifest_path = retry_manifest_path
+        self.delete_retry_manifest_on_publish = delete_retry_manifest_on_publish
 
     def __len__(self) -> int:
         return self.row_count
@@ -4208,8 +4334,84 @@ class GammaCatalogRows:
             self.path.unlink(missing_ok=True)
 
     def mark_published(self) -> None:
-        if self.retry_manifest_path is not None:
+        if (
+            self.retry_manifest_path is not None
+            and self.delete_retry_manifest_on_publish
+        ):
             self.retry_manifest_path.unlink(missing_ok=True)
+
+
+class GammaNormalizedCatalog:
+    """Immutable normalized JSONL whose object graph is never retained in RAM."""
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        market_count: int,
+        revision: str,
+        sha256: str,
+    ) -> None:
+        self.path = path.resolve()
+        self.market_count = market_count
+        self.revision = revision
+        self.sha256 = sha256
+
+    def __len__(self) -> int:
+        return self.market_count
+
+    def __iter__(self) -> Iterable[LiveMarket]:
+        for market, _body in self.iter_rows():
+            yield market
+
+    def iter_rows(self) -> Iterable[tuple[LiveMarket, bytes]]:
+        with self.path.open("rb") as stream:
+            for line in stream:
+                body = line.removesuffix(b"\n")
+                if body:
+                    yield LiveMarket.model_validate_json(body), body
+
+    def validate(self) -> None:
+        normalized_hasher = hashlib.sha256()
+        revision_hasher = hashlib.sha256()
+        revision_hasher.update(b"[")
+        count = 0
+        with self.path.open("rb") as stream:
+            for line in stream:
+                if not line.endswith(b"\n"):
+                    raise RuntimeError("prepared normalized catalog has a partial row")
+                body = line[:-1]
+                if not body:
+                    raise RuntimeError("prepared normalized catalog has an empty row")
+                normalized_hasher.update(line)
+                if count:
+                    revision_hasher.update(b",")
+                revision_hasher.update(body)
+                count += 1
+        revision_hasher.update(b"]")
+        if (
+            count != self.market_count
+            or normalized_hasher.hexdigest() != self.sha256
+            or revision_hasher.hexdigest() != self.revision
+        ):
+            raise RuntimeError("prepared normalized catalog integrity failed")
+
+    def load_market_ids(
+        self, market_ids: Iterable[str],
+    ) -> dict[str, LiveMarket]:
+        requested = frozenset(str(value) for value in market_ids)
+        found: dict[str, LiveMarket] = {}
+        if not requested:
+            return found
+        for market in self:
+            market_id = market.identity.market_id
+            if market_id in requested:
+                found[market_id] = market
+                if len(found) == len(requested):
+                    break
+        if set(found) != set(requested):
+            raise RuntimeError("prepared catalog market lookup is incomplete")
+        return found
 
 
 class GammaRealtimeUniversePolicy:
@@ -4265,6 +4467,20 @@ class GammaRealtimeUniversePolicy:
             event.get("archived") is not True,
         ))
 
+    @staticmethod
+    def _catalog_complete(market: LiveMarket) -> bool:
+        """Require every static fact needed for a fail-open discovery quote."""
+        outcome_labels = {
+            outcome.outcome.strip().casefold()
+            for outcome in market.identity.outcomes
+        }
+        return all((
+            outcome_labels == {"yes", "no"},
+            market.rules.rules_complete,
+            market.rules.fee_schedule.complete,
+            all(relation.complete for relation in market.relations),
+        ))
+
     def select(
         self,
         markets: Iterable[LiveMarket],
@@ -4273,10 +4489,18 @@ class GammaRealtimeUniversePolicy:
         catalog_revision: str,
         available_token_ids: frozenset[str] | None = None,
     ) -> dict[str, Any]:
+        if isinstance(markets, GammaNormalizedCatalog):
+            return self._select_disk_backed(
+                markets,
+                raw_rows,
+                catalog_revision=catalog_revision,
+                available_token_ids=available_token_ids,
+            )
         by_id = {
             market.identity.market_id: market
             for market in markets
             if market.active and not market.closed and market.accepting_orders
+            and self._catalog_complete(market)
         }
         ranked: list[tuple[tuple[Decimal, Decimal, Decimal, str], str]] = []
         source_row_count = 0
@@ -4342,6 +4566,101 @@ class GammaRealtimeUniversePolicy:
         payload["universe_id"] = content_sha256(payload)
         return payload
 
+    def _select_disk_backed(
+        self,
+        markets: GammaNormalizedCatalog,
+        raw_rows: Iterable[dict[str, Any]],
+        *,
+        catalog_revision: str,
+        available_token_ids: frozenset[str] | None,
+    ) -> dict[str, Any]:
+        """Select Top-K directly from Gamma rows with bounded resident state."""
+        if markets.revision != catalog_revision:
+            raise RuntimeError("prepared catalog selection revision mismatch")
+        ranked: list[tuple[tuple[Decimal, Decimal, Decimal, str], str]] = []
+        required: dict[str, tuple[tuple[Decimal, Decimal, Decimal, str], str]] = {}
+        eligible_count = 0
+        eligible_required_ids: set[str] = set()
+        source_row_count = 0
+        source_eligible_count = 0
+        for row in raw_rows:
+            source_row_count += 1
+            market_id = str(row.get("id") or "")
+            tokens = _list(row.get("clobTokenIds") or row.get("clob_token_ids"))
+            outcomes = _list(row.get("outcomes"))
+            condition_id = str(
+                row.get("conditionId") or row.get("condition_id") or ""
+            )
+            if not (
+                market_id
+                and condition_id
+                and len(tokens) == 2
+                and len(outcomes) == 2
+                and row.get("active", not bool(row.get("closed"))) is not False
+                and row.get("closed") is not True
+                and row.get("acceptingOrders", row.get("accepting_orders", False))
+                is True
+                and self._source_eligible(row)
+            ):
+                continue
+            source_eligible_count += 1
+            if (
+                available_token_ids is not None
+                and any(token not in available_token_ids for token in tokens)
+            ):
+                continue
+            rank = (
+                self._decimal(row, "volume24hrClob", "volume24hr"),
+                self._decimal(row, "liquidityClob", "liquidityNum"),
+                self._decimal(row, "volumeClob", "volumeNum"),
+                market_id,
+            )
+            candidate = (rank, market_id)
+            eligible_count += 1
+            if market_id in self.required_market_ids:
+                eligible_required_ids.add(market_id)
+                required[market_id] = candidate
+                continue
+            if len(ranked) < self.maximum_market_count:
+                heapq.heappush(ranked, candidate)
+            elif candidate > ranked[0]:
+                heapq.heapreplace(ranked, candidate)
+        required_ids = sorted(required)
+        if len(required_ids) > self.maximum_market_count:
+            raise RuntimeError(
+                "eligible required realtime markets exceed the configured limit"
+            )
+        selected = list(required_ids)
+        selected_set = set(selected)
+        for _rank, market_id in sorted(ranked, reverse=True):
+            if len(selected) == self.maximum_market_count:
+                break
+            if market_id in selected_set:
+                continue
+            selected.append(market_id)
+            selected_set.add(market_id)
+        selected.sort()
+        payload = {
+            "schema_version": self.schema_version,
+            "policy_version": self.policy_version,
+            "catalog_revision": catalog_revision,
+            "maximum_market_count": self.maximum_market_count,
+            "source_market_count": source_row_count,
+            "eligible_market_count": source_eligible_count,
+            "book_backed_market_count": (
+                eligible_count if available_token_ids is not None else None
+            ),
+            "market_count": len(selected),
+            "token_count": len(selected) * 2,
+            "market_ids": selected,
+            "required_market_ids": sorted(self.required_market_ids),
+            "ineligible_required_market_ids": sorted(
+                self.required_market_ids - eligible_required_ids
+            ),
+        }
+        payload["universe_id"] = content_sha256(payload)
+        return payload
+
 
 class GammaKeysetCatalog:
     """Complete active-market discovery using Gamma's keyset endpoint."""
@@ -4361,6 +4680,7 @@ class GammaKeysetCatalog:
         progress: Callable[[dict[str, Any]], None] | None = None,
         spool_root: Path | None = None,
         fee_semantics_policy: GammaFeeSemanticsPolicy | None = None,
+        retain_verified_spool: bool = False,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -4373,6 +4693,7 @@ class GammaKeysetCatalog:
         self.progress = progress or self._log_progress
         self.spool_root = spool_root.resolve() if spool_root else None
         self.fee_semantics_policy = fee_semantics_policy
+        self.retain_verified_spool = retain_verified_spool
         self.sleeper = sleeper
         self.clock = clock
 
@@ -4448,6 +4769,7 @@ class GammaKeysetCatalog:
             row_count=market_count,
             sha256=expected_sha256,
             retry_manifest_path=manifest_path,
+            delete_retry_manifest_on_publish=not self.retain_verified_spool,
         ), evidence
 
     @staticmethod
@@ -4645,6 +4967,9 @@ class GammaKeysetCatalog:
                                 row_count=market_count,
                                 sha256=raw_hasher.hexdigest(),
                                 retry_manifest_path=manifest_path,
+                                delete_retry_manifest_on_publish=(
+                                    not self.retain_verified_spool
+                                ),
                             ), evidence
                         self.progress(evidence)
                         return GammaCatalogRows(
@@ -4678,6 +5003,159 @@ class GammaLiveNormalizer:
             observed_at=observed_at, payload_sha256=content_sha256(payload),
             field_paths=field_paths,
         )
+
+    @staticmethod
+    def normalize_to_disk(
+        rows: GammaCatalogRows,
+        observed_at: datetime,
+        *,
+        output_root: Path,
+        fee_semantics_policy: GammaFeeSemanticsPolicy | None = None,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        progress_every_rows: int = 5_000,
+    ) -> GammaNormalizedCatalog:
+        """Normalize a complete Gamma spool without retaining the catalog graph.
+
+        Non-negative-risk markets are normalized one row at a time. Negative-risk
+        rows are grouped on disk and normalized one relation group at a time so
+        cross-market relation completeness remains identical to ``normalize``.
+        """
+        output_root = output_root.resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+        progress_every_rows = max(1, progress_every_rows)
+        callback = progress or (lambda _evidence: None)
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(
+            dir=output_root, prefix=".gamma-normalize-",
+        ) as temporary_name:
+            temporary_root = Path(temporary_name)
+            database_path = temporary_root / "normalized.sqlite3"
+            output_path = temporary_root / "catalog.jsonl"
+            with sqlite3.connect(database_path) as connection:
+                connection.executescript("""
+                    PRAGMA journal_mode=DELETE;
+                    PRAGMA synchronous=FULL;
+                    CREATE TABLE normalized (
+                        market_id TEXT PRIMARY KEY,
+                        body BLOB NOT NULL
+                    ) WITHOUT ROWID;
+                    CREATE TABLE negative_risk_rows (
+                        group_id TEXT NOT NULL,
+                        market_id TEXT NOT NULL,
+                        body BLOB NOT NULL,
+                        PRIMARY KEY(group_id, market_id)
+                    ) WITHOUT ROWID;
+                """)
+                scanned = 0
+                for row in rows:
+                    scanned += 1
+                    market_id = str(row.get("id") or "")
+                    event = (row.get("events") or [{}])[0]
+                    group_id = str(
+                        row.get("negRiskMarketID")
+                        or row.get("neg_risk_market_id")
+                        or event.get("negRiskMarketID")
+                        or ""
+                    )
+                    if bool(row.get("negRisk") or row.get("neg_risk")) and group_id:
+                        connection.execute(
+                            "INSERT INTO negative_risk_rows VALUES (?, ?, ?)",
+                            (group_id, market_id, canonical_json(row)),
+                        )
+                    else:
+                        normalized = GammaLiveNormalizer.normalize(
+                            [row], observed_at,
+                            fee_semantics_policy=fee_semantics_policy,
+                        )
+                        if normalized:
+                            market = normalized[0]
+                            connection.execute(
+                                "INSERT INTO normalized VALUES (?, ?)",
+                                (
+                                    market.identity.market_id,
+                                    canonical_json(market.model_dump(mode="json")),
+                                ),
+                            )
+                    if scanned % progress_every_rows == 0:
+                        connection.commit()
+                        callback({
+                            "phase": "normalize",
+                            "scanned_market_count": scanned,
+                            "source_market_count": len(rows),
+                            "elapsed_seconds": time.monotonic() - started,
+                            "complete": False,
+                        })
+                connection.commit()
+                groups = connection.execute(
+                    "SELECT DISTINCT group_id FROM negative_risk_rows ORDER BY group_id"
+                )
+                for group_index, (group_id,) in enumerate(groups, start=1):
+                    group_rows = [
+                        json.loads(body, parse_float=str, parse_int=str)
+                        for (body,) in connection.execute(
+                            "SELECT body FROM negative_risk_rows "
+                            "WHERE group_id=? ORDER BY market_id",
+                            (group_id,),
+                        )
+                    ]
+                    for market in GammaLiveNormalizer.normalize(
+                        group_rows, observed_at,
+                        fee_semantics_policy=fee_semantics_policy,
+                    ):
+                        connection.execute(
+                            "INSERT INTO normalized VALUES (?, ?)",
+                            (
+                                market.identity.market_id,
+                                canonical_json(market.model_dump(mode="json")),
+                            ),
+                        )
+                    if group_index % 100 == 0:
+                        connection.commit()
+                connection.commit()
+
+                revision_hasher = hashlib.sha256()
+                revision_hasher.update(b"[")
+                normalized_hasher = hashlib.sha256()
+                market_count = 0
+                with output_path.open("wb") as output:
+                    for (body,) in connection.execute(
+                        "SELECT body FROM normalized ORDER BY market_id"
+                    ):
+                        body = bytes(body)
+                        if market_count:
+                            revision_hasher.update(b",")
+                        revision_hasher.update(body)
+                        line = body + b"\n"
+                        output.write(line)
+                        normalized_hasher.update(line)
+                        market_count += 1
+                    output.flush()
+                    os.fsync(output.fileno())
+                revision_hasher.update(b"]")
+            revision = revision_hasher.hexdigest()
+            sha256 = normalized_hasher.hexdigest()
+            destination = output_root / f"{revision}.jsonl"
+            if destination.exists():
+                if _file_sha256(destination) != sha256:
+                    raise RuntimeError("existing normalized catalog is not deterministic")
+            else:
+                os.replace(output_path, destination)
+            callback({
+                "phase": "normalize",
+                "scanned_market_count": len(rows),
+                "normalized_market_count": market_count,
+                "source_market_count": len(rows),
+                "catalog_revision": revision,
+                "normalized_sha256": sha256,
+                "elapsed_seconds": time.monotonic() - started,
+                "complete": True,
+            })
+            return GammaNormalizedCatalog(
+                destination,
+                market_count=market_count,
+                revision=revision,
+                sha256=sha256,
+            )
 
     @staticmethod
     def normalize(
@@ -5793,7 +6271,7 @@ class LiveStateStore:
 
     def replace_catalog(
         self,
-        markets: list[LiveMarket],
+        markets: list[LiveMarket] | GammaNormalizedCatalog,
         raw_rows: Iterable[dict[str, Any]] | GammaCatalogRows,
         *,
         realtime_universe: dict[str, Any] | None = None,
@@ -5811,14 +6289,28 @@ class LiveStateStore:
             }
 
         previous_relation_revisions = relation_revisions(self.catalog.values())
-        by_id = {market.identity.market_id: market for market in markets}
-        for market_id, previous in self.catalog.items():
-            if market_id not in by_id and previous.lifecycle_state == "resolved":
-                by_id[market_id] = previous
-        markets = list(by_id.values())
-        markets.sort(key=lambda item: item.identity.market_id)
-        next_relation_revisions = relation_revisions(markets)
-        revision = _market_sequence_sha256(markets)
+        prepared_catalog = isinstance(markets, GammaNormalizedCatalog)
+        if prepared_catalog:
+            if realtime_universe is None:
+                raise RuntimeError(
+                    "disk-backed catalog publication requires a bounded universe"
+                )
+            by_id = markets.load_market_ids(realtime_universe["market_ids"])
+            runtime_markets = sorted(
+                by_id.values(), key=lambda item: item.identity.market_id,
+            )
+            revision = markets.revision
+            publish_markets = markets
+        else:
+            by_id = {market.identity.market_id: market for market in markets}
+            for market_id, previous in self.catalog.items():
+                if market_id not in by_id and previous.lifecycle_state == "resolved":
+                    by_id[market_id] = previous
+            runtime_markets = list(by_id.values())
+            runtime_markets.sort(key=lambda item: item.identity.market_id)
+            revision = _market_sequence_sha256(runtime_markets)
+            publish_markets = runtime_markets
+        next_relation_revisions = relation_revisions(runtime_markets)
         realtime_market_ids = (
             self._validate_realtime_universe(
                 realtime_universe,
@@ -5830,7 +6322,7 @@ class LiveStateStore:
         previous_tokens = set(self.token_to_market)
         next_token_to_market = {
             outcome.token_id: market.identity.market_id
-            for market in markets
+            for market in runtime_markets
             if market.active and not market.closed
             and (
                 realtime_market_ids is None
@@ -5869,7 +6361,7 @@ class LiveStateStore:
             raise RuntimeError("live raw catalog integrity failed before publication")
         with _publication_lock(self.root, exclusive=True):
             _atomic_write_catalog(
-                self.catalog_path, revision=revision, markets=markets,
+                self.catalog_path, revision=revision, markets=publish_markets,
                 source=next_catalog_source,
                 realtime_universe=realtime_universe,
             )
@@ -6030,6 +6522,31 @@ class LiveStateStore:
             payload["book_backed_market_count"] = int(
                 payload["book_backed_market_count"]
             )
+        selection_report = payload.get("selection_report")
+        if isinstance(selection_report, dict):
+            selection_report = dict(selection_report)
+            for field in (
+                "requested_market_count", "requested_token_count",
+                "returned_book_token_count", "complete_book_token_count",
+                "included_market_count", "included_token_count",
+            ):
+                selection_report[field] = int(selection_report[field])
+            exclusions = []
+            for exclusion in selection_report["exclusions"]:
+                normalized_exclusion = dict(exclusion)
+                normalized_exclusion["market_count"] = int(
+                    normalized_exclusion["market_count"]
+                )
+                normalized_exclusion["token_count"] = int(
+                    normalized_exclusion["token_count"]
+                )
+                exclusions.append(normalized_exclusion)
+            selection_report["exclusions"] = exclusions
+            report_sha256 = str(selection_report.pop("report_sha256"))
+            if content_sha256(selection_report) != report_sha256:
+                raise RuntimeError("realtime universe selection report is invalid")
+            selection_report["report_sha256"] = report_sha256
+            payload["selection_report"] = selection_report
         if content_sha256(payload) != universe_id:
             raise RuntimeError("realtime universe checksum is invalid")
         return selected
@@ -7433,6 +7950,62 @@ class LiveStateStore:
             self.derived_index_error = None
             self._recovered = True
 
+    def start_from_checkpoint_tail(self) -> None:
+        """Restore a complete local boundary without historical event replay."""
+        with self._sync_lock:
+            if not self.catalog or self.catalog_revision is None:
+                raise RuntimeError("live catalog must be loaded before startup")
+            if not self.checkpoint_path.is_file():
+                raise RuntimeError("published live checkpoint is missing")
+            body = self.checkpoint_path.read_bytes()
+            checkpoint = self._validate_checkpoint(body)
+            if checkpoint.catalog_revision != self.catalog_revision:
+                raise RuntimeError("live checkpoint catalog revision mismatch")
+            (
+                tail, event_log_size, tail_byte_offset, tail_byte_length,
+                tail_line_sha256,
+            ) = _durable_event_log_tail_record(self.event_path)
+            if tail is None or tail.cursor != checkpoint.cursor:
+                raise RuntimeError(
+                    "live checkpoint does not match the durable event-log tail"
+                )
+            if set(checkpoint.books) != set(self.token_to_market):
+                raise RuntimeError(
+                    "live checkpoint does not cover the published universe"
+                )
+            if checkpoint.unresolved_gaps:
+                raise RuntimeError("live checkpoint contains unresolved gaps")
+            self.books = {
+                token_id: book.model_copy(deep=True)
+                for token_id, book in checkpoint.books.items()
+            }
+            self.gaps = []
+            self.events.clear()
+            self.seen_raw_hashes.clear()
+            self._seen_raw_hash_order.clear()
+            self._remember_raw_hash(tail.raw_payload_sha256)
+            self.active_recovery_id = None
+            self.cursor = checkpoint.cursor
+            self._checkpoint_cursor = checkpoint.cursor
+            self._event_offset = event_log_size
+            self._last_log_cursor = checkpoint.cursor
+            self.persisted_cursor = checkpoint.cursor
+            self.indexed_cursor = checkpoint.cursor
+            self._checkpoint_file_sha256 = hashlib.sha256(body).hexdigest()
+            self.state_index.restore_checkpoint_boundary(
+                checkpoint=checkpoint,
+                tail_event=tail,
+                event_log_size=event_log_size,
+                tail_byte_offset=tail_byte_offset,
+                tail_byte_length=tail_byte_length,
+                tail_line_sha256=tail_line_sha256,
+                catalog_revision=self.catalog_revision,
+                token_to_market=self.token_to_market,
+            )
+            self._state_index_available = True
+            self.derived_index_error = None
+            self._recovered = True
+
     def _ensure_loaded(self) -> None:
         """Preserve legacy stateful behavior without blocking app construction."""
         with self._sync_lock:
@@ -7793,6 +8366,25 @@ def load_scoped_live_store(
     # to subscribe and REST-bootstrap the scoped in-memory projection even when
     # the mutable latest-state index is unavailable.
     bootstrap = reader.bootstrap(selected_ids, _bind_live_books=False)
+    relation_market_ids = sorted({
+        pair.market_id
+        for market in bootstrap.markets
+        for relation in market.relations
+        if relation.relation_type == "standard_negative_risk"
+        for pair in relation.outcome_pairs
+        if pair.market_id not in selected_ids
+    })
+    related_bootstrap = (
+        reader.bootstrap(
+            relation_market_ids,
+            _bind_live_books=False,
+            _relation_closure=True,
+        )
+        if relation_market_ids else None
+    )
+    hydrated_markets = bootstrap.markets + (
+        related_bootstrap.markets if related_bootstrap is not None else []
+    )
     derived_index_error: str | None = None
     state_index_available = True
     # Writer hydration must preserve an interrupted recovery marker so the
@@ -7847,11 +8439,11 @@ def load_scoped_live_store(
     # horizon instead of retaining up to 100k full-depth book events.
     store = LiveStateStore(root, replay_capacity=2_000, now_provider=now_provider)
     store.catalog = {
-        market.identity.market_id: market for market in bootstrap.markets
+        market.identity.market_id: market for market in hydrated_markets
     }
     store.token_to_market = {
         outcome.token_id: market.identity.market_id
-        for market in bootstrap.markets if market.active and not market.closed
+        for market in hydrated_markets if market.active and not market.closed
         for outcome in market.identity.outcomes
     }
     store.books = books
@@ -7991,6 +8583,7 @@ class PolymarketLiveCollector:
         max_websocket_batch_messages: int = 256,
         max_websocket_batch_items: int = 32,
         realtime_universe_policy: GammaRealtimeUniversePolicy | None = None,
+        preparation_progress: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.store = store
         self.catalog_client = catalog
@@ -8020,6 +8613,8 @@ class PolymarketLiveCollector:
         self.max_websocket_batch_messages = max(1, max_websocket_batch_messages)
         self.max_websocket_batch_items = max(1, max_websocket_batch_items)
         self.realtime_universe_policy = realtime_universe_policy
+        self.preparation_progress = preparation_progress or (lambda _item: None)
+        self._catalog_selection_book_rows: list[dict[str, Any]] | None = None
         self.sockets: list[Any] = []
         self.socket_tokens: dict[Any, set[str]] = {}
         # Independent periodic partitions may fetch concurrently, but a full
@@ -8138,8 +8733,43 @@ class PolymarketLiveCollector:
         reason: str,
         request_timeout: float | tuple[float, float] | None = None,
         max_retries_per_batch: int | None = None,
+        reconcile_terminal_omissions: bool = True,
     ) -> tuple[list[dict[str, Any]], set[str]]:
         requested = sorted(set(token_ids))
+        if not reconcile_terminal_omissions:
+            rows = await asyncio.to_thread(
+                self.books_client.fetch_stream,
+                requested,
+                require_complete_batches=False,
+                request_timeout=request_timeout,
+                max_retries_per_batch=max_retries_per_batch,
+            )
+            requested_set = set(requested)
+            returned_by_token = {
+                str(row.get("asset_id") or row.get("token_id") or ""): row
+                for row in rows
+                if str(row.get("asset_id") or row.get("token_id") or "")
+                in requested_set
+            }
+            accepted_tokens: set[str] = set()
+            requested_markets = {
+                self.store.token_to_market[token_id]
+                for token_id in requested
+                if token_id in self.store.token_to_market
+            }
+            for market_id in requested_markets:
+                market_tokens = {
+                    token_id
+                    for token_id, indexed_market_id
+                    in self.store.token_to_market.items()
+                    if indexed_market_id == market_id
+                }
+                if market_tokens and market_tokens.issubset(returned_by_token):
+                    accepted_tokens.update(market_tokens)
+            return (
+                [returned_by_token[token_id] for token_id in sorted(accepted_tokens)],
+                requested_set - accepted_tokens,
+            )
         try:
             rows = await asyncio.to_thread(
                 self.books_client.fetch_stream,
@@ -8150,6 +8780,8 @@ class PolymarketLiveCollector:
             )
             return rows, set()
         except ClobBooksCoverageError as exc:
+            if not reconcile_terminal_omissions:
+                raise
             retired = await asyncio.to_thread(
                 self.reconcile_terminal_tokens,
                 exc.missing_token_ids,
@@ -8278,7 +8910,7 @@ class PolymarketLiveCollector:
 
     def _select_realtime_universe(
         self,
-        markets: Iterable[LiveMarket],
+        markets: Iterable[LiveMarket] | GammaNormalizedCatalog,
         raw_rows: Iterable[dict[str, Any]],
         *,
         catalog_revision: str,
@@ -8286,7 +8918,9 @@ class PolymarketLiveCollector:
         policy = self.realtime_universe_policy
         if policy is None:
             raise RuntimeError("realtime universe policy is not configured")
-        markets = list(markets)
+        disk_backed = isinstance(markets, GammaNormalizedCatalog)
+        if not disk_backed:
+            markets = list(markets)
         raw_rows = list(raw_rows) if not isinstance(
             raw_rows, GammaCatalogRows
         ) else raw_rows
@@ -8300,7 +8934,12 @@ class PolymarketLiveCollector:
             raw_rows,
             catalog_revision=catalog_revision,
         )
-        by_id = {market.identity.market_id: market for market in markets}
+        by_id = (
+            markets.load_market_ids(probe["market_ids"])
+            if disk_backed else {
+                market.identity.market_id: market for market in markets
+            }
+        )
         probe_tokens = [
             outcome.token_id
             for market_id in probe["market_ids"]
@@ -8310,10 +8949,55 @@ class PolymarketLiveCollector:
             probe_tokens,
             require_complete_batches=False,
         )
-        available_token_ids = frozenset(
+        self._catalog_selection_book_rows = book_rows
+        returned_token_ids = frozenset(
+            str(row.get("asset_id") or row.get("token_id") or "")
+            for row in book_rows
+        )
+        two_sided_token_ids = frozenset(
             str(row.get("asset_id") or row.get("token_id") or "")
             for row in book_rows
             if row.get("bids") and row.get("asks")
+        )
+        catalog_incomplete_market_ids = frozenset(
+            market_id for market_id, market in by_id.items()
+            if not policy._catalog_complete(market)
+        )
+        rows_by_token = {
+            str(row.get("asset_id") or row.get("token_id") or ""): row
+            for row in book_rows
+        }
+        inconsistent_book_market_ids = frozenset(
+            market_id for market_id, market in by_id.items()
+            if market_id not in catalog_incomplete_market_ids
+            and all(
+                outcome.token_id in two_sided_token_ids
+                for outcome in market.identity.outcomes
+            )
+            and (
+                len({
+                    str(rows_by_token[outcome.token_id].get("tick_size") or "")
+                    for outcome in market.identity.outcomes
+                }) != 1
+                or market.rules.instrument.price_increment not in {
+                    str(rows_by_token[outcome.token_id].get("tick_size") or "")
+                    for outcome in market.identity.outcomes
+                }
+            )
+        )
+        complete_market_ids = frozenset(
+            market_id for market_id, market in by_id.items()
+            if market_id not in catalog_incomplete_market_ids
+            and market_id not in inconsistent_book_market_ids
+            and all(
+                outcome.token_id in two_sided_token_ids
+                for outcome in market.identity.outcomes
+            )
+        )
+        available_token_ids = frozenset(
+            outcome.token_id
+            for market_id in complete_market_ids
+            for outcome in by_id[market_id].identity.outcomes
         )
         universe = policy.select(
             markets,
@@ -8321,28 +9005,172 @@ class PolymarketLiveCollector:
             catalog_revision=catalog_revision,
             available_token_ids=available_token_ids,
         )
+        selected_market_ids = frozenset(universe["market_ids"])
+        probe_market_ids = frozenset(probe["market_ids"])
+        missing_token_ids = frozenset(probe_tokens) - returned_token_ids
+        incomplete_token_ids = returned_token_ids - two_sided_token_ids
+        incomplete_market_ids = frozenset(
+            market_id for market_id in probe_market_ids
+            if market_id not in catalog_incomplete_market_ids
+            and any(
+                outcome.token_id not in two_sided_token_ids
+                for outcome in by_id[market_id].identity.outcomes
+            )
+        )
+        capacity_excluded_market_ids = complete_market_ids - selected_market_ids
+
+        def exclusion_reason(
+            reason: str,
+            market_ids: Iterable[str],
+            token_ids: Iterable[str],
+        ) -> dict[str, Any]:
+            sorted_markets = sorted(set(market_ids))
+            sorted_tokens = sorted(set(token_ids))
+            return {
+                "reason": reason,
+                "market_count": len(sorted_markets),
+                "token_count": len(sorted_tokens),
+                "market_ids_sha256": content_sha256(sorted_markets),
+                "token_ids_sha256": content_sha256(sorted_tokens),
+            }
+
+        report = {
+            "schema_version": "marketcow.polymarket.realtime-universe-selection.v1",
+            "catalog_revision": catalog_revision,
+            "requested_market_count": len(probe_market_ids),
+            "requested_token_count": len(set(probe_tokens)),
+            "returned_book_token_count": len(returned_token_ids),
+            "complete_book_token_count": len(two_sided_token_ids),
+            "included_market_count": len(selected_market_ids),
+            "included_token_count": len(selected_market_ids) * 2,
+            "included_market_ids_sha256": content_sha256(
+                sorted(selected_market_ids)
+            ),
+            "included_token_ids_sha256": content_sha256(sorted(
+                outcome.token_id
+                for market_id in selected_market_ids
+                for outcome in by_id[market_id].identity.outcomes
+            )),
+            "exclusions": [
+                exclusion_reason(
+                    "missing_required_token_book",
+                    (
+                        market_id for market_id in incomplete_market_ids
+                        if any(
+                            outcome.token_id in missing_token_ids
+                            for outcome in by_id[market_id].identity.outcomes
+                        )
+                    ),
+                    missing_token_ids,
+                ),
+                exclusion_reason(
+                    "incomplete_required_token_book",
+                    (
+                        market_id for market_id in incomplete_market_ids
+                        if any(
+                            outcome.token_id in incomplete_token_ids
+                            for outcome in by_id[market_id].identity.outcomes
+                        )
+                    ),
+                    incomplete_token_ids,
+                ),
+                exclusion_reason(
+                    "catalog_integrity_incomplete",
+                    catalog_incomplete_market_ids,
+                    (
+                        outcome.token_id
+                        for market_id in catalog_incomplete_market_ids
+                        for outcome in by_id[market_id].identity.outcomes
+                    ),
+                ),
+                exclusion_reason(
+                    "inconsistent_required_token_book",
+                    inconsistent_book_market_ids,
+                    (
+                        outcome.token_id
+                        for market_id in inconsistent_book_market_ids
+                        for outcome in by_id[market_id].identity.outcomes
+                    ),
+                ),
+                exclusion_reason(
+                    "ranked_below_market_limit",
+                    capacity_excluded_market_ids,
+                    (
+                        outcome.token_id
+                        for market_id in capacity_excluded_market_ids
+                        for outcome in by_id[market_id].identity.outcomes
+                    ),
+                ),
+            ],
+        }
+        report["recovery_boundary_id"] = content_sha256({
+            "catalog_revision": catalog_revision,
+            "requested_token_ids": sorted(set(probe_tokens)),
+            "returned_books": sorted(
+                (
+                    str(row.get("asset_id") or row.get("token_id") or ""),
+                    content_sha256(row),
+                )
+                for row in book_rows
+            ),
+        })
+        report["report_sha256"] = content_sha256(report)
+        universe.pop("universe_id")
+        universe["selection_report"] = report
+        universe["universe_id"] = content_sha256(universe)
         LOGGER.info(
             "polymarket_realtime_universe_selected catalog_markets=%d "
-            "probe_markets=%d book_backed_markets=%d selected_markets=%d",
+            "probe_markets=%d book_backed_markets=%d selected_markets=%d "
+            "recovery_boundary_id=%s selection_report_sha256=%s",
             len(markets), probe["market_count"],
             universe["book_backed_market_count"], universe["market_count"],
+            report["recovery_boundary_id"], report["report_sha256"],
         )
         return universe
 
-    def refresh_catalog(self) -> dict[str, Any]:
+    def refresh_catalog(
+        self,
+        *,
+        normalized_catalog: GammaNormalizedCatalog | None = None,
+    ) -> dict[str, Any]:
         rows, evidence = self.catalog_client.fetch_all()
         publish_started = time.monotonic()
         try:
-            markets = GammaLiveNormalizer.normalize(
-                rows,
-                self.store.now_provider(),
-                fee_semantics_policy=getattr(
-                    self.catalog_client, "fee_semantics_policy", None,
-                ),
+            fee_policy = getattr(
+                self.catalog_client, "fee_semantics_policy", None,
             )
-            revision = _market_sequence_sha256(
-                sorted(markets, key=lambda item: item.identity.market_id)
-            )
+            if normalized_catalog is not None:
+                normalized_catalog.validate()
+                markets: list[LiveMarket] | GammaNormalizedCatalog = (
+                    normalized_catalog
+                )
+                revision = markets.revision
+            elif (
+                isinstance(rows, GammaCatalogRows)
+                and self.realtime_universe_policy is not None
+            ):
+                markets = (
+                    GammaLiveNormalizer.normalize_to_disk(
+                        rows,
+                        self.store.now_provider(),
+                        output_root=self.store.normalized_catalog_root,
+                        fee_semantics_policy=fee_policy,
+                        progress=lambda item: (
+                            LOGGER.info("gamma_normalization_progress %s", item),
+                            self.preparation_progress(item),
+                        ),
+                    )
+                )
+                revision = markets.revision
+            else:
+                markets = GammaLiveNormalizer.normalize(
+                    rows,
+                    self.store.now_provider(),
+                    fee_semantics_policy=fee_policy,
+                )
+                revision = _market_sequence_sha256(
+                    sorted(markets, key=lambda item: item.identity.market_id)
+                )
             realtime_universe = (
                 self._select_realtime_universe(
                     markets,
@@ -8377,6 +9205,42 @@ class PolymarketLiveCollector:
         }
         LOGGER.info("gamma_catalog_published %s", result)
         return result
+
+    def publish_catalog_selection_books(
+        self, *, reason: str = "catalog_selection_boundary",
+    ) -> dict[str, Any]:
+        """Publish the exact CLOB rows used to admit the bounded universe."""
+        rows = self._catalog_selection_book_rows
+        if rows is None:
+            raise RuntimeError("catalog selection recovery rows are unavailable")
+        selected_tokens = set(self.store.token_to_market)
+        selected_rows = [
+            row for row in rows
+            if str(row.get("asset_id") or row.get("token_id") or "")
+            in selected_tokens
+        ]
+        with self.store._sync_lock:
+            recovery_started_at = self.store.now_provider()
+            recovery_id = self.store.mark_recovery_started(reason)
+            tracker = self.store.new_book_recovery_tracker()
+        coverage = self._commit_recovery_rows(
+            selected_rows,
+            recovery_id,
+            tracker,
+            complete=True,
+            refresh_started_at=recovery_started_at,
+            received_at=self.store.now_provider(),
+            write_checkpoint=self.publish_checkpoints,
+            publish_completion_event=True,
+        )
+        self._catalog_selection_book_rows = None
+        if coverage is None:  # pragma: no cover - complete=True above
+            raise RuntimeError("catalog selection recovery did not complete")
+        return {
+            "recovery_id": recovery_id,
+            **coverage,
+            "health": self.store.health().model_dump(mode="json"),
+        }
 
     def _commit_recovery_rows(
         self,
@@ -8426,59 +9290,24 @@ class PolymarketLiveCollector:
 
     async def bootstrap_books(self, reason: str = "startup") -> str:
         token_ids = sorted(self.store.token_to_market)
-        if len(token_ids) <= self.books_client.batch_size:
-            rows = await asyncio.to_thread(
-                self.books_client.fetch_stream,
-                token_ids,
-                require_complete_batches=False,
-            )
-            with self.store._sync_lock:
-                recovery_started_at = self.store.now_provider()
-                recovery_id = self.store.mark_recovery_started(reason)
-                tracker = self.store.new_book_recovery_tracker()
-            coverage = self._commit_recovery_rows(
-                rows,
-                recovery_id,
-                tracker,
-                complete=True,
-                refresh_started_at=recovery_started_at,
-                received_at=self.store.now_provider(),
-                write_checkpoint=self.publish_checkpoints,
-                publish_completion_event=True,
-            )
-        else:
-            with self.store._sync_lock:
-                recovery_started_at = self.store.now_provider()
-                recovery_id = self.store.mark_recovery_started(reason)
-                tracker = self.store.new_book_recovery_tracker()
-
-            def consume(rows: list[dict[str, Any]]) -> None:
-                self._commit_recovery_rows(
-                    rows,
-                    recovery_id,
-                    tracker,
-                    complete=False,
-                    refresh_started_at=recovery_started_at,
-                    received_at=self.store.now_provider(),
-                    write_checkpoint=False,
-                    publish_completion_event=False,
-                )
-
-            await asyncio.to_thread(
-                self.books_client.fetch_stream,
-                token_ids,
-                batch_consumer=consume,
-                require_complete_batches=False,
-            )
-            coverage = self._commit_recovery_rows(
-                [],
-                recovery_id,
-                tracker,
-                complete=True,
-                refresh_started_at=recovery_started_at,
-                write_checkpoint=self.publish_checkpoints,
-                publish_completion_event=True,
-            )
+        rows, _retired = await self._fetch_complete_books(
+            token_ids,
+            reason=f"{reason}_missing_clob_books",
+        )
+        with self.store._sync_lock:
+            recovery_started_at = self.store.now_provider()
+            recovery_id = self.store.mark_recovery_started(reason)
+            tracker = self.store.new_book_recovery_tracker()
+        coverage = self._commit_recovery_rows(
+            rows,
+            recovery_id,
+            tracker,
+            complete=True,
+            refresh_started_at=recovery_started_at,
+            received_at=self.store.now_provider(),
+            write_checkpoint=self.publish_checkpoints,
+            publish_completion_event=True,
+        )
         if coverage is None:  # pragma: no cover - complete=True above
             raise RuntimeError("book recovery did not publish completion")
         if self.books_client.last_evidence is not None:
@@ -8496,6 +9325,7 @@ class PolymarketLiveCollector:
         *,
         partition_index: int = 0,
         partition_count: int = 1,
+        reconcile_terminal_omissions: bool = True,
     ) -> str:
         """Refresh a healthy scope without exposing recovery-in-progress state."""
         if not 0 <= partition_index < partition_count:
@@ -8555,6 +9385,7 @@ class PolymarketLiveCollector:
                     refresh_token_ids, reason=f"{reason}:clob_omission",
                     request_timeout=self.periodic_snapshot_request_timeout,
                     max_retries_per_batch=self.periodic_snapshot_max_retries,
+                    reconcile_terminal_omissions=reconcile_terminal_omissions,
                 )
                 tracker["expected"].difference_update(retired)
                 self._commit_recovery_rows(
@@ -8785,6 +9616,7 @@ class PolymarketLiveCollector:
                             "periodic_snapshot_refresh",
                             partition_index=partition_index,
                             partition_count=self.max_concurrent_snapshot_refreshes,
+                            reconcile_terminal_omissions=False,
                         )
                     finally:
                         self._active_periodic_snapshot_operations -= 1

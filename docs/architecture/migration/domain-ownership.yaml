@@ -39,4 +39,5 @@ domains:
 lifecycle:
   marketcow_owner: marketcow
   tradude_may_select_scope: true
+  tradude_may_manage_marketcow: false
   tradude_may_start_or_stop_marketcow: false

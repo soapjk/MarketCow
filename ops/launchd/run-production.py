@@ -26,6 +26,7 @@ class Service:
     environment: Mapping[str, str] | None = None
     ready_port: int | None = None
     start_after: tuple[str, ...] = ()
+    required: bool = True
 
 
 def _required_path(
@@ -79,9 +80,6 @@ def build_services(
     rust_scope_registry = _required_path(
         environment, "MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT"
     )
-    fee_semantics = _required_path(
-        environment, "MARKETCOW_POLYMARKET_FEE_SEMANTICS_POLICY"
-    )
     tradude_worktree = _required_path(environment, "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE")
     tradude_python = _required_path(
         environment,
@@ -126,18 +124,11 @@ def build_services(
             environment.get(
                 "MARKETCOW_POLYMARKET_DISCOVERY_MAX_WEBSOCKET_CONNECTIONS", "32"
             ),
-            "--realtime-market-limit",
-            environment.get(
-                "MARKETCOW_POLYMARKET_DISCOVERY_REALTIME_MARKET_LIMIT", "1000"
-            ),
-            "--required-realtime-scope",
-            str(rust_scope),
             "--live-stream-port",
             str(discovery_stream_port),
-            "--fee-semantics-policy",
-            str(fee_semantics),
         ),
         ready_port=discovery_stream_port,
+        required=False,
     )
 
     rust_environment = dict(environment)
@@ -210,10 +201,7 @@ def build_services(
         ),
         gateway_environment,
         ready_port=api_port,
-        start_after=(
-            "polymarket-discovery-collector",
-            "polymarket-rust-data-plane",
-        ),
+        start_after=("polymarket-rust-data-plane",),
     )
     return (
         discovery_collector,
@@ -236,6 +224,7 @@ def supervise(
     processes: list[tuple[Service, subprocess.Popen[bytes]]] = []
     pending = list(services)
     ready: set[str] = set()
+    failed: set[str] = set()
     started_at: dict[str, float] = {}
     stopping = False
 
@@ -266,15 +255,25 @@ def supervise(
                 if service.ready_port is None:
                     ready.add(service.name)
             for service, process in processes:
+                if service.name in failed:
+                    continue
                 returncode = process.poll()
                 if returncode is not None:
+                    event = (
+                        "marketcow_production_required_service_exited"
+                        if service.required
+                        else "marketcow_production_module_failed"
+                    )
                     print(
-                        "marketcow_production_required_service_exited "
-                        f"name={service.name} pid={process.pid} returncode={returncode}",
+                        f"{event} name={service.name} pid={process.pid} "
+                        f"returncode={returncode}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    return returncode if returncode != 0 else 1
+                    if service.required:
+                        return returncode if returncode != 0 else 1
+                    failed.add(service.name)
+                    continue
                 if service.name in ready or service.ready_port is None:
                     continue
                 try:
@@ -292,13 +291,21 @@ def supervise(
                         time.monotonic() - started_at[service.name]
                         >= startup_timeout_seconds
                     ):
+                        event = (
+                            "marketcow_production_service_startup_timeout"
+                            if service.required
+                            else "marketcow_production_module_startup_timeout"
+                        )
                         print(
-                            "marketcow_production_service_startup_timeout "
-                            f"name={service.name} port={service.ready_port}",
+                            f"{event} name={service.name} "
+                            f"port={service.ready_port}",
                             file=sys.stderr,
                             flush=True,
                         )
-                        return 1
+                        if service.required:
+                            return 1
+                        process.terminate()
+                        failed.add(service.name)
             time.sleep(poll_seconds)
         return 0
     finally:

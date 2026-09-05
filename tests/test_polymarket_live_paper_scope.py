@@ -216,29 +216,21 @@ class PolymarketLivePaperScopeTest(unittest.TestCase):
                 )
 
 
-class PolymarketLiveBootstrapRetryTest(unittest.IsolatedAsyncioTestCase):
-    async def test_incomplete_provider_snapshot_retries_in_process(self) -> None:
+class PolymarketLiveBootstrapStartupTest(unittest.IsolatedAsyncioTestCase):
+    async def test_incomplete_provider_snapshot_fails_without_in_process_retry(self) -> None:
         class Collector:
             def __init__(self) -> None:
                 self.reasons = []
 
             async def bootstrap_books(self, reason: str) -> str:
                 self.reasons.append(reason)
-                if len(self.reasons) < 3:
-                    raise RuntimeError("provider omitted requested tokens")
-                return "recovery-ready"
+                raise RuntimeError("provider omitted requested tokens")
 
         collector = Collector()
-        result = await LIVE_MODULE.bootstrap_books_until_ready(
-            collector,
-            retry_seconds=0,
-        )
+        with self.assertRaisesRegex(RuntimeError, "omitted requested tokens"):
+            await LIVE_MODULE.bootstrap_books_once(collector)
 
-        self.assertEqual(result, "recovery-ready")
-        self.assertEqual(
-            collector.reasons,
-            ["startup", "startup_retry:1", "startup_retry:2"],
-        )
+        self.assertEqual(collector.reasons, ["startup"])
 
 
 if __name__ == "__main__":
