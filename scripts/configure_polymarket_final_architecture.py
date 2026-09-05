@@ -206,11 +206,9 @@ def configure(
             "discovery_base_url": f"http://127.0.0.1:{api_port}",
             "live_base_url": f"http://127.0.0.1:{api_port}",
             "timeout_seconds": 120,
-            "maximum_page_bytes": 16_777_216,
             "maximum_scope_bytes": 8_388_608,
             "maximum_full_sync_bytes": 104_857_600,
             "maximum_stream_frame_bytes": 16_777_216,
-            "page_size": 1_000,
         },
         "prefilter": {
             "target_quantity": "5",
