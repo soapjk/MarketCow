@@ -31,7 +31,6 @@ from .polymarket_live import (
 
 DISCOVERY_SCHEMA_VERSION = "marketcow.polymarket.discovery.v3"
 DISCOVERY_EVENT_SCHEMA_VERSION = "marketcow.polymarket.discovery-events.v3"
-DISCOVERY_RELATION_SCHEMA_VERSION = "marketcow.polymarket.discovery-relation.v3"
 LIFECYCLE_HISTORY_SCHEMA_VERSION = "marketcow.polymarket.lifecycle-history.v3"
 DEFAULT_MAXIMUM_FULL_SYNC_BYTES = 256 * 1024 * 1024
 LOGGER = logging.getLogger(__name__)
@@ -265,9 +264,6 @@ class DiscoveryRelationMember(BaseModel):
 
 
 class DiscoveryRelation(BaseModel):
-    schema_version: Literal["marketcow.polymarket.discovery-relation.v3"] = (
-        DISCOVERY_RELATION_SCHEMA_VERSION
-    )
     relation_id: str
     relation_type: Literal["standard_negative_risk"] = "standard_negative_risk"
     member_market_ids: list[str]

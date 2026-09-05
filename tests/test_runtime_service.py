@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -111,7 +112,11 @@ class ServiceRoutingTest(unittest.TestCase):
             pg.query_fundamentals.return_value = [{"symbol": "000001"}]
             pg.list_artifacts.return_value = [{"artifact_id": "artifact-1"}]
             direct = MagicMock()
-            direct.get_latest_quotes.return_value = [{"symbol": "AAPL.XNAS", "close": 1.0}]
+            direct.get_latest_quotes.return_value = [{
+                "symbol": "AAPL.XNAS",
+                "close": 1.0,
+                "ingested_at": datetime.now(timezone.utc).isoformat(),
+            }]
             direct.get_price_bars.return_value = []
             writer = MagicMock()
             resources = SimpleNamespace(

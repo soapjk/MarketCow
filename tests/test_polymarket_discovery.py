@@ -539,6 +539,7 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(body["expected_member_count"], 2)
         self.assertEqual(body["actual_member_count"], 2)
         self.assertNotIn("quotes", body)
+        self.assertNotIn("schema_version", body)
 
     def test_catalog_relation_change_emits_relation_update_payload(self):
         rows = [
