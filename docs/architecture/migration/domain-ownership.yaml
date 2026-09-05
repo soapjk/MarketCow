@@ -4,6 +4,13 @@ service_boundary:
   kind: market_data_read_service
   trading_interfaces_allowed: false
   order_signing_credentials_allowed: false
+migration_policy:
+  rust_required_for: realtime_hot_path
+  python_allowed_for:
+    - historical_data
+    - mcp
+    - low_frequency_discovery
+    - administrative_workflows
 domains:
   public_gateway:
     current_owner: python
@@ -20,6 +27,15 @@ domains:
     python_fallback_allowed: false
     writer_gate: single_writer_required
     rust_write_enabled: true
+  hyperliquid_realtime:
+    current_owner: rust_shadow
+    target_owner: rust
+    python_fallback_allowed: false
+  longport_realtime:
+    current_owner: python
+    target_data_plane_owner: rust
+    python_typed_raw_bridge_allowed: true
+    public_python_listener_allowed: false
   authoritative_wal:
     current_owner: rust
     append_only: true

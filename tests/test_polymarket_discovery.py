@@ -134,11 +134,13 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(len(frame.items), 1)
         self.assertEqual(frame.items[0].type, "universe_changed")
         self.assertEqual(
-            frame.items[0].universe_revision,
+            frame.items[0].payload.universe_revision,
             replacement_body["universe_revision"],
         )
-        self.assertIsNone(frame.items[0].market)
-        self.assertIsNone(frame.items[0].relation)
+        self.assertEqual(
+            set(frame.items[0].model_dump(mode="json")),
+            {"type", "payload"},
+        )
 
     def test_explicit_depth_configuration_is_mandatory_and_ordered(self):
         rows = [gamma_row()]
@@ -443,8 +445,39 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(frame.next_cursor, frame.after_cursor + 1)
         self.assertEqual(len(frame.items), 1)
         self.assertEqual(frame.items[0].type, "market_update")
-        self.assertEqual(frame.items[0].market.market_id, "m1")
-        self.assertEqual(len(frame.items[0].market.outcomes), 2)
+        self.assertEqual(frame.items[0].payload.market_id, "m1")
+        self.assertEqual(len(frame.items[0].payload.outcomes), 2)
+        self.assertEqual(
+            set(frame.items[0].model_dump(mode="json")),
+            {"type", "payload"},
+        )
+
+    def test_market_settlement_is_optional_and_never_inferred(self):
+        without_settlement = gamma_row()
+        with_settlement = gamma_row(
+            "m2", "0x" + "2" * 64, ("yes-2", "no-2")
+        )
+        with_settlement.update({
+            "rules": "Resolves YES if the event occurs.",
+            "resolutionSource": "official-results",
+            "redeemable": True,
+            "redeemableAt": "2026-08-04T12:34:56.123456Z",
+        })
+        self.writer([without_settlement, with_settlement])
+
+        with TestClient(self.app()) as client:
+            markets = {
+                market["market_id"]: market
+                for market in self.ready_full_sync(client).json()["markets"]
+            }
+
+        self.assertIsNone(markets["m1"]["settlement"])
+        settlement = markets["m2"]["settlement"]
+        self.assertEqual(settlement["resolution_source"], "official-results")
+        self.assertRegex(settlement["rules_revision"], r"^[0-9a-f]{64}$")
+        self.assertTrue(settlement["redeemable"])
+        self.assertEqual(settlement["redeemable_at_ns"], 1785846896123456000)
+        self.assertRegex(settlement["evidence_sha256"], r"^[0-9a-f]{64}$")
 
     def test_negative_risk_relation_is_complete_and_quoted_atomically(self):
         rows = [
@@ -459,6 +492,7 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(body["expected_member_count"], 2)
         self.assertEqual(body["actual_member_count"], 2)
         self.assertNotIn("quotes", body)
+        self.assertNotIn("schema_version", body)
 
     def test_catalog_relation_change_emits_relation_update_payload(self):
         rows = [
@@ -492,7 +526,11 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(len(frame.items), 1)
         self.assertEqual(frame.items[0].type, "relation_update")
         self.assertEqual(
-            frame.items[0].relation.relation_id, "neg-risk:neg-group"
+            frame.items[0].payload.relation_id, "neg-risk:neg-group"
+        )
+        self.assertEqual(
+            set(frame.items[0].model_dump(mode="json")),
+            {"type", "payload"},
         )
 
     def test_cursor_expiry_and_websocket_resync_are_explicit(self):
@@ -590,8 +628,31 @@ class PolymarketDiscoveryTest(unittest.TestCase):
             self.assertNotIn(removed, openapi["paths"])
         schemas = openapi["components"]["schemas"]
         self.assertIn("DiscoveryFullSync", schemas)
+        self.assertIn("DiscoveryDeltaFrame", schemas)
+        self.assertIn("DiscoverySettlement", schemas)
         self.assertNotIn("DiscoveryMetadataPage", schemas)
         self.assertIn("LifecycleHistoryPage", schemas)
+        delta_items = schemas["DiscoveryDeltaFrame"]["properties"]["items"][
+            "items"
+        ]
+        self.assertEqual(delta_items["discriminator"]["propertyName"], "type")
+        self.assertEqual(
+            set(delta_items["discriminator"]["mapping"]),
+            {"market_update", "relation_update", "universe_changed"},
+        )
+        for schema_name in (
+            "DiscoveryMarketUpdateItem",
+            "DiscoveryRelationUpdateItem",
+            "DiscoveryUniverseChangedItem",
+        ):
+            self.assertEqual(
+                set(schemas[schema_name]["required"]),
+                {"payload"},
+            )
+            self.assertEqual(
+                set(schemas[schema_name]["properties"]),
+                {"type", "payload"},
+            )
         self.assertIn(
             "/v1/prediction-markets/polymarket/live/discovery/stream",
             openapi["x-websocket-paths"],
