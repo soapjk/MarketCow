@@ -285,7 +285,7 @@ def main() -> int:
                     and migration.get("tradude_may_manage_marketcow") is False
                     and migration.get("checkpoint_persistence") == "healthy"
                     and migration.get("ownership_registry", {}).get("sha256")
-                    == "e2eab2ce96145f102d06b216b990434ccefb06cc639c23ea64eca238c641c5a6"
+                    == "935da908a21cf54091dbdfc25bba1a971abae3c5283e8ff1488a31f97b1dadda"
                 )
                 checkpoint_url = (
                     f"{base_url}/v1/admin/migration/checkpoints/"

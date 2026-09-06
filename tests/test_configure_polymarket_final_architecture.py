@@ -93,6 +93,17 @@ class ConfigurePolymarketFinalArchitectureTest(unittest.TestCase):
                 controller["marketcow"]["live_base_url"],
                 "http://127.0.0.1:8790",
             )
+            self.assertEqual(
+                set(controller["marketcow"]),
+                {
+                    "discovery_base_url",
+                    "live_base_url",
+                    "timeout_seconds",
+                    "maximum_scope_bytes",
+                    "maximum_full_sync_bytes",
+                    "maximum_stream_frame_bytes",
+                },
+            )
             refresh = json.loads(Path(result["refresh_config"]).read_text())
             self.assertEqual(refresh["service_url"], "http://127.0.0.1:8796")
             self.assertEqual(refresh["startup_scope"], result["scope_file"])
