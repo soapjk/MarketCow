@@ -118,6 +118,11 @@ without restarting the service.
 
 ## Local object-assembly comparison (not deployed)
 
+At source22816d1, `cargo test --locked --workspace -q` exited0 locally:
+285 passed across test binaries, 9 ignored, no failures. Ignored tests are not
+counted as passing; the explicit real assembly benchmark above was run separately.
+This local debug regression does not replace U1 release/load verification.
+
 Candidate 3a5dd6f removes four deep clones of completed JSON object fields.
 Ignored test `real_fixture_object_assembly_benchmark` explicitly requires the
 same captured 40270232-byte Live full-sync and its SHA; it asserts exactly250
