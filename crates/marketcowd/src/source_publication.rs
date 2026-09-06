@@ -1124,6 +1124,30 @@ mod tests {
         json!({"latest_cursor":0,"books":[],"markets":[],"gaps":[],"schema_version":"marketcow.polymarket.live-stream.v1","type":"state"})
     }
     #[tokio::test]
+    async fn expired_public_reader_does_not_poison_current_reader_or_publication() {
+        // Exercises the exact MemoryReader used by both public Rust APIs, not
+        // a synthetic socket queue. A separate HTTP/WS test is still required.
+        let mut p=Publication::start(0,Some(seed()),tokens(),2,65536,16384, |_|Ok(())).unwrap();
+        let fast=p.reader();
+        let slow=p.reader();
+        let mut fast_cursor=0;
+        let mut changed=fast.subscribe();
+        for at in (0..20).step_by(2) {
+            p.publish_with_capacity(events(at)).await.unwrap();
+            let page=fast.replay(fast_cursor,0,64,65536).unwrap();
+            assert_eq!(page.next,at+2);
+            fast_cursor=page.next;
+            while p.persisted_cursor()<at+2 {changed.changed().await.unwrap();}
+        }
+        assert!(slow.replay(0,0,64,65536).err().unwrap().to_string().contains("expired"));
+        assert_eq!(fast.capture().unwrap().cursor,20);
+        assert_eq!(slow.capture().unwrap().cursor,20);
+        p.publish_with_capacity(events(20)).await.unwrap();
+        assert_eq!(fast.replay(20,0,64,65536).unwrap().next,22);
+        assert_eq!(slow.replay(20,0,64,65536).unwrap().next,22);
+        p.finish().await.unwrap();
+    }
+    #[tokio::test]
     async fn blocked_disk_does_not_block_publication_or_memory_stream() {
         let (started, wait) = mpsc::channel();
         let (release, gate) = mpsc::channel();
