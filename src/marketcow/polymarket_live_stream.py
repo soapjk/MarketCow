@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import threading
+import contextvars
 import time
 from uuid import uuid4
 from collections import deque
@@ -127,6 +128,8 @@ def _decode_stream_message_timed(raw, submitted):
     timings['worker_entry_wait'] = entered - submitted
     timings['worker_other'] = max(0.0, finished - entered - sum(timings[k] for k in
         ('json_parse', 'model_validation', 'semantic_validation', 'hash_identity')))
+    timings['_trace'] = {'submit': submitted, 'entry': entered, 'finish': finished,
+                         'worker_thread_id': threading.get_native_id(), 'wire_length': len(raw)}
     return message, validated, timings, finished
 
 
@@ -1791,10 +1794,18 @@ class PolymarketLiveStreamClient:
                         # event loop prevents broad frame serialization or a
                         # slow HTTP writer from starving WebSocket receive.
                         decode_started = time.perf_counter()
-                        message, validated, detail, worker_finished = await asyncio.to_thread(
-                            _decode_stream_message_timed, raw, decode_started
-                        )
-                        detail['await_resume'] = time.perf_counter() - worker_finished
+                        # Same default executor and copied context as to_thread;
+                        # expose completion callback without an extra Task hop.
+                        callback = {}
+                        future = asyncio.get_running_loop().run_in_executor(
+                            None, contextvars.copy_context().run,
+                            _decode_stream_message_timed, raw, decode_started)
+                        future.add_done_callback(lambda _, stamp=callback: stamp.update(at=time.perf_counter()))
+                        message, validated, detail, worker_finished = await future
+                        resumed = time.perf_counter()
+                        detail['await_resume'] = resumed - worker_finished
+                        detail['_trace'].update(resume=resumed, callback=callback.get('at'),
+                            executor_scope='one sequential source decode; not whole executor')
                         metrics.record_decode(detail, message)
                         metrics.record('decode',time.perf_counter()-decode_started)
                         apply_started = time.perf_counter()

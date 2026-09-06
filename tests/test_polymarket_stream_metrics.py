@@ -50,7 +50,7 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(len(metrics.decode_totals), len(DECODE_STAGES))
         self.assertEqual(metrics.last_frame['ordinal'], 10000)
         self.assertEqual(metrics.last_frame['cursor'], 123)
-        self.assertTrue(all(value >= 0 for value in detail.values()))
+        self.assertTrue(all(detail[key] >= 0 for key in DECODE_STAGES))
         with self.assertRaises(json.JSONDecodeError):
             _decode_stream_message_timed('{', time.perf_counter())
         with self.assertRaises(ValueError):
