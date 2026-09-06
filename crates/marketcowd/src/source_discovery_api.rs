@@ -48,7 +48,7 @@ fn error(status:StatusCode,code:&str,retry:bool)->Response {
 async fn full_sync(State(api):State<Arc<Api>>)->Response {
     let Ok(permit)=api.snapshots.clone().try_acquire_owned() else {return error(StatusCode::SERVICE_UNAVAILABLE,"discovery_full_sync_capacity",true)};
     let result=tokio::task::spawn_blocking(move ||->Result<OwnedBytes>{
-        let view=Arc::new(api.reader.capture()?);
+        let view=Arc::new(api.reader.capture_for_resume(api.limits.send_timeout,api.limits.cached_baselines)?);
         // Bound retained state, not just outgoing quote JSON. Each baseline
         // and each client may keep one immutable book/metadata version set.
         let size=view.books.values().map(|v|serde_json::to_vec(v).map(|v|v.len())).collect::<std::result::Result<Vec<_>,_>>()?.into_iter().sum::<usize>()

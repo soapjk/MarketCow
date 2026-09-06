@@ -216,7 +216,9 @@ async fn scoped_response(api: Arc<PublicApi>, query: ScopeQuery, component: Opti
     // Bound CPU tasks before submission; permit lives until construction and
     // encoding finish even if the requesting connection is cancelled.
     let result = tokio::task::spawn_blocking(move || -> Result<SnapshotBytes> {
-        let view = api.reader.capture()?;
+        let view = if component.is_none() {
+            api.reader.capture_for_resume(api.limits.send_timeout,api.limits.clients.min(4))?
+        } else {api.reader.capture()?};
         let mut model = full_sync(&view,&api.scope,api.generation,&api.instance,Utc::now())?;
         let model = match component {Some(key)=>model[key].take(),None=>model};
         Ok(SnapshotBytes{bytes:encode_bounded(&model,api.full_sync_bytes)?,_permit:permit})

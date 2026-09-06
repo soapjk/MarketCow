@@ -83,6 +83,7 @@ struct Memory {
     markets: BTreeMap<String, Arc<Value>>,
     replay: VecDeque<Arc<Batch>>,
     replay_bytes: usize,
+    snapshot_leases: BTreeMap<u64, std::time::Instant>,
     state_bytes: usize,
     state_sizes: BTreeMap<(bool, String), usize>,
     confirmation_cursor: u64,
@@ -133,6 +134,20 @@ pub struct PublicReplay {
 impl MemoryReader {
     pub fn capture(&self) -> Result<MemoryView> {
         MemoryView::capture(&self.memory.lock().unwrap())
+    }
+    /// Pin a full-sync boundary against count-based eviction until the
+    /// existing response timeout. The global byte cap still wins: overflow
+    /// expires the affected resume rather than blocking publication.
+    pub fn capture_for_resume(&self, ttl:std::time::Duration, capacity:usize)->Result<MemoryView> {
+        ensure!(!ttl.is_zero() && (1..=4).contains(&capacity),"snapshot lease budget");
+        let mut m=self.memory.lock().unwrap();
+        let now=std::time::Instant::now();
+        m.snapshot_leases.retain(|_,until|*until>now);
+        let view=MemoryView::capture(&m)?;
+        ensure!(m.snapshot_leases.contains_key(&view.cursor)||m.snapshot_leases.len()<capacity,"snapshot resume capacity");
+        // Re-reading the same boundary cannot extend a lease indefinitely.
+        m.snapshot_leases.entry(view.cursor).or_insert(now+ttl);
+        Ok(view)
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> { self.changed.subscribe() }
 
@@ -323,6 +338,7 @@ impl Publication {
             markets,
             replay: VecDeque::new(),
             replay_bytes: 0,
+            snapshot_leases: BTreeMap::new(),
             state_bytes,
             state_sizes,
             confirmation_cursor: 0,
@@ -841,7 +857,13 @@ impl Publication {
         m.queued_bytes += bytes;
         m.replay.push_back(batch);
         m.replay_bytes += bytes;
+        m.snapshot_leases.retain(|_,until|*until>std::time::Instant::now());
         while m.replay.len() > self.max_batches || m.replay_bytes > self.max_bytes {
+            let pinned=m.snapshot_leases.keys().next().is_some_and(|after| {
+                m.replay.front().and_then(|b|b.validated.events().last())
+                    .and_then(|e|e["cursor"].as_u64()).is_some_and(|end|end>*after)
+            });
+            if pinned && m.replay_bytes<=self.max_bytes {break;}
             let old = m.replay.pop_front().unwrap();
             m.replay_bytes -= old.bytes;
         }
@@ -1692,6 +1714,41 @@ mod tests {
                 .contains("resync")
         );
         assert_eq!(stream.page(2, 0).unwrap().1, 4);
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_survives_count_eviction_then_expires_without_blocking_source() {
+        let mut p=Publication::start(0,Some(seed()),tokens(),1,65536,16384, |_|Ok(())).unwrap();
+        let reader=p.reader();
+        assert_eq!(reader.capture_for_resume(std::time::Duration::from_secs(5),1).unwrap().cursor,0);
+        let mut changed=p.changed.subscribe();
+        for at in [0,2] {
+            p.publish(events(at),None).unwrap();
+            while p.persisted_cursor()<at+2 {changed.changed().await.unwrap();}
+        }
+        assert_eq!(reader.replay(0,0,64,65536).unwrap().next,4);
+        assert!(reader.capture_for_resume(std::time::Duration::from_secs(5),1).is_err());
+        p.memory.lock().unwrap().snapshot_leases.insert(0,std::time::Instant::now());
+        p.publish(events(4),None).unwrap();
+        assert!(reader.replay(0,0,64,65536).is_err());
+        assert_eq!(reader.replay(4,0,64,65536).unwrap().next,6);
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_never_exceeds_existing_byte_cap() {
+        let mut p=Publication::start(0,Some(seed()),tokens(),1,16384,16384, |_|Ok(())).unwrap();
+        let reader=p.reader();
+        reader.capture_for_resume(std::time::Duration::from_secs(60),1).unwrap();
+        let mut changed=p.changed.subscribe();
+        for at in (0..24).step_by(2) {
+            p.publish(events(at),None).unwrap();
+            while p.persisted_cursor()<at+2 {changed.changed().await.unwrap();}
+            assert!(p.memory.lock().unwrap().replay_bytes<=16384);
+        }
+        assert!(reader.replay(0,0,64,16384).is_err());
+        assert_eq!(reader.capture().unwrap().cursor,24);
         p.finish().await.unwrap();
     }
 
