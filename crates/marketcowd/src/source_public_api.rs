@@ -323,7 +323,7 @@ pub fn full_sync(view: &MemoryView, scope: &ConfiguredScope, generation: u64,
         "projection_generation":generation,"scope_id":scope.active_scope_id,
         "markets":dependency_markets,"missing_market_ids":missing_dependencies});
     let mut bootstrap = common.clone();
-    bootstrap.as_object_mut().unwrap().extend(json!({
+    extend_object(&mut bootstrap,json!({
         "contract_version":"marketcow.prediction_market.v1","schema_version":"marketcow.polymarket.live-bootstrap.v2",
         "catalog_source":view.base.get("catalog_source").context("catalog source missing")?,
         "cursor":view.cursor,"markets":markets,"dependency_markets":dependency_markets,
@@ -331,12 +331,12 @@ pub fn full_sync(view: &MemoryView, scope: &ConfiguredScope, generation: u64,
         "active_token_ids":active_tokens,"sequence_semantics":"deterministic_normalized","source_policy":"official_free_only",
         "recovery":{"bootstrap":"CLOB POST /books full snapshots","disconnect":"new book_epoch followed by full /books recovery",
             "resume":"in-memory live stream replay required before event resume"}
-    }).as_object().unwrap().clone());
+    }));
     let mut snapshot = common.clone();
-    snapshot.as_object_mut().unwrap().extend(json!({"schema_version":"marketcow.polymarket.live-snapshot.v2",
-        "cursor":view.cursor,"count":selected.len(),"books":books,"items":frames}).as_object().unwrap().clone());
+    extend_object(&mut snapshot,json!({"schema_version":"marketcow.polymarket.live-snapshot.v2",
+        "cursor":view.cursor,"count":selected.len(),"books":books,"items":frames}));
     let mut health = common.clone();
-    health.as_object_mut().unwrap().extend(json!({"schema_version":"marketcow.polymarket.live-read-health.v1",
+    extend_object(&mut health,json!({"schema_version":"marketcow.polymarket.live-read-health.v1",
         "status":if latest_ready {"index_ready"}else{"degraded"},"catalog_index_ready":true,"latest_state_ready":latest_ready,
         "market_count":selected.len(),"token_count":books.len(),"book_token_count":books.len(),
         "book_complete_market_count":complete,"active_market_count":active,"terminal_market_count":terminal,
@@ -347,14 +347,21 @@ pub fn full_sync(view: &MemoryView, scope: &ConfiguredScope, generation: u64,
         "derived_index_error":null,"live_stream_connected":true,"live_stream_disconnect_count":0,
         "event_loop_stall_max_ms":0,"events_read_source":"memory_projection","realtime_sqlite_query_ms":0,
         "reason_codes":reasons,"oldest_book_received_at":oldest.to_rfc3339(),"maximum_book_age_ms":age,"source_policy":"official_free_only"
-    }).as_object().unwrap().clone());
+    }));
     let mut response = common;
-    response.as_object_mut().unwrap().extend(json!({"schema_version":"marketcow.polymarket.live-full-sync.v1",
+    extend_object(&mut response,json!({"schema_version":"marketcow.polymarket.live-full-sync.v1",
         "cursor":view.cursor,"oldest_book_received_at":oldest.to_rfc3339(),"maximum_book_age_ms":age,
         "consumer_maximum_book_age_ms":null,"minimum_delivery_headroom_ms":null,"freshness_budget_remaining_ms":null,
         "freshness_policy":"consumer_decides","stream_instance_id":instance,"confirmation_sequence":view.confirmation_sequence,
-        "health":health,"bootstrap":bootstrap,"snapshot":snapshot}).as_object().unwrap().clone());
+        "health":health,"bootstrap":bootstrap,"snapshot":snapshot}));
     Ok(response)
+}
+
+// Move the already constructed fields. Cloning this object would recursively
+// duplicate every book/market immediately before dropping the original.
+fn extend_object(target:&mut Value, fields:Value) {
+    let Value::Object(fields)=fields else {unreachable!("internal object construction")};
+    target.as_object_mut().expect("internal target object").extend(fields);
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -456,6 +463,18 @@ pub fn encode_bounded(value: &impl serde::Serialize, limit: usize) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn object_assembly_moves_payload_without_changing_fields() {
+        let payload="large synthetic nested payload".repeat(1024);
+        let original=payload.as_ptr();
+        let mut target=json!({"keep":1,"replace":"old"});
+        let mut fields=serde_json::Map::new();
+        fields.insert("replace".into(),Value::String(payload));
+        extend_object(&mut target,Value::Object(fields));
+        assert_eq!(target["keep"],1);
+        assert_eq!(target["replace"].as_str().unwrap().as_ptr(),original);
+        assert_eq!(target.as_object().unwrap().len(),2);
+    }
     #[tokio::test]
     async fn send_diagnostics_distinguish_deadline_transport_and_success() {
         let error=timed_send(Duration::from_millis(1),
