@@ -33,7 +33,13 @@ async def probe(base, scope, output, live):
         async with websockets.connect(base.replace('http:', 'ws:')+path+'stream?'+query,
                 max_size=67108864, max_queue=1, close_timeout=5) as ws:
             while time.monotonic()-started < 45:
-                raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                # Discovery is explicitly REST-polled every 30s. A quiet 15s
+                # interval is not a failed connection. Keep the overall 45s
+                # audit deadline; this changes no source or strategy freshness.
+                remaining = 45 - (time.monotonic()-started)
+                if remaining <= 0:
+                    break
+                raw = await asyncio.wait_for(ws.recv(), timeout=min(15 if live else 45, remaining))
                 encoded = raw.encode() if isinstance(raw, str) else raw
                 assert size+len(encoded)+1 <= 67108864, 'wire byte cap before required sample'
                 wire.write(encoded+b'\n')
