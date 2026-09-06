@@ -7,7 +7,10 @@ from uuid import uuid4
 
 LOGGER = logging.getLogger(__name__)
 STAGES = ('receive_wait', 'decode', 'apply', 'encode_send',
-          'replay_page', 'filter_convert', 'json_encode', 'socket_send', 'send_yield')
+          'replay_page', 'filter_convert', 'json_encode', 'socket_send', 'send_yield',
+          'projection_lock_wait', 'recovery_validation', 'gap_maintenance',
+          'book_validation', 'instrument_binding', 'subscriber_notify',
+          'confirmation_apply')
 DECODE_STAGES = ('worker_entry_wait', 'json_parse', 'model_validation',
                  'semantic_validation', 'hash_identity', 'worker_other', 'await_resume')
 
@@ -40,7 +43,7 @@ class StreamMetrics:
         values[1] += seconds
         values[2] = max(values[2], seconds)
 
-    def emit(self, cursor, *, force=False, error=None):
+    def emit(self, cursor, *, force=False, error=None, scale=None):
         now = time.monotonic()
         if not force and now - self.started < 5:
             return
@@ -50,6 +53,8 @@ class StreamMetrics:
             'interval_seconds': now-self.started, 'stages_count_sum_max_seconds': self.totals,
             'receive_wait_is_network_rtt': False, 'queue_occupancy': 'not_measured',
             'error': error,
+            'projection_scale': scale,
+            'stage_measurement_boundary': 'wall time including scheduling and lock waits; not pure CPU; stages are not necessarily additive',
             'decode_detail_count_sum_max_seconds': self.decode_totals,
             'last_frame': self.last_frame,
             'decode_measurement_boundary': 'successful frames only; wall time including scheduling/GIL; entry wait and await resume are not pure queue or GIL measurements; model validators may include conversion',

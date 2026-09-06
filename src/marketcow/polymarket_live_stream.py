@@ -35,6 +35,31 @@ LOGGER = logging.getLogger(__name__)
 STREAM_SCHEMA = "marketcow.polymarket.live-stream.v1"
 
 
+class _GapIndex:
+    """Insertion-ordered gap facts; mutated only under the projection lock.
+
+    Hash each incoming fact once, never hash retained facts during lookup or
+    token retirement. Values are owned copies so identity cannot drift.
+    """
+    def __init__(self, gaps=()):
+        self.by_id: dict[str, GapEntry] = {}
+        self.by_token: dict[str | None, set[str]] = {}
+        for gap in gaps:
+            self.add(gap)
+
+    def add(self, gap: GapEntry) -> None:
+        identity = content_sha256(gap.model_dump(mode="json"))
+        if identity not in self.by_id:
+            owned = gap.model_copy(deep=True)
+            self.by_id[identity] = owned
+            self.by_token.setdefault(owned.token_id, set()).add(identity)
+
+    def remove_tokens(self, tokens) -> None:
+        for token in tokens:
+            for identity in self.by_token.pop(token, ()):
+                del self.by_id[identity]
+
+
 def _validate_event(event: LiveEventEnvelope, timings=None) -> None:
     from .polymarket_token_recovery import validate_token_recovery
     started = time.perf_counter()
@@ -115,7 +140,8 @@ class PolymarketLiveProjection:
         self._lock = threading.RLock()
         self._events: deque[LiveEventEnvelope] = deque(maxlen=replay_capacity)
         self._books: dict[str, LiveBook] = {}
-        self._gaps: list[GapEntry] = []
+        self._gap_index = _GapIndex()
+        self._apply_metrics = StreamMetrics('projection_apply')
         self._token_recoveries: dict[str, tuple[str, int | None]] = {}
         self._markets: dict[str, Any] = {}
         self._membership_revision = 0
@@ -144,6 +170,39 @@ class PolymarketLiveProjection:
         self._generation = 0
         self._confirmation_sequence = 0
         self._stream_instance_id = uuid4().hex
+
+    @property
+    def _gaps(self) -> list[GapEntry]:
+        # Snapshot/read boundary only; hot mutation uses the indexes directly.
+        return list(self._gap_index.by_id.values())
+
+    @_gaps.setter
+    def _gaps(self, gaps) -> None:
+        self._gap_index = _GapIndex(gaps)
+
+    def emit_apply_metrics(self) -> None:
+        if time.monotonic() - self._apply_metrics.started < 5:
+            return
+        with self._lock:
+            cursor = self._latest_cursor
+            scale = {
+                'stream_instance_id': self._stream_instance_id,
+                'gap_count': len(self._gap_index.by_id),
+                'gap_token_count': len(self._gap_index.by_token),
+                'book_count': len(self._books),
+                'recovery_count': len(self._token_recoveries),
+                'retained_events': len(self._events),
+                'subscriber_count': len(self._subscribers),
+                'persisted_cursor': self._persisted_cursor,
+            }
+        # The source client records/emits on its single ingestion loop. Never
+        # hold the projection lock while writing the bounded diagnostic log.
+        self._apply_metrics.emit(cursor, scale=scale)
+
+    def _retire_gap_tokens(self, tokens) -> None:
+        started = time.perf_counter()
+        self._gap_index.remove_tokens(tokens)
+        self._apply_metrics.record('gap_maintenance', time.perf_counter() - started)
 
     @property
     def ready(self) -> bool:
@@ -231,6 +290,7 @@ class PolymarketLiveProjection:
             gap for item in gaps
             if not (gap := GapEntry.model_validate(item)).resolved
         ]
+        validated_gap_index = _GapIndex(validated_gaps)
         latest_cursor = int(payload.get("latest_cursor", -1))
         persisted_cursor = int(payload.get("persisted_cursor", -1))
         if latest_cursor < 0 or persisted_cursor < 0 or persisted_cursor > latest_cursor:
@@ -248,7 +308,7 @@ class PolymarketLiveProjection:
             }
             self._membership_revision += 1
             self._books = {item.token_id: item for item in validated_books}
-            self._gaps = validated_gaps
+            self._gap_index = validated_gap_index
             self._token_recoveries.clear()
             if 'token_recoveries' in payload:
                 recoveries = payload['token_recoveries']
@@ -364,13 +424,17 @@ class PolymarketLiveProjection:
         """Atomically expose one ordered collector publication batch."""
         if not events:
             raise ValueError("Polymarket live event batch is empty")
+        lock_started = time.perf_counter()
         with self._lock:
+            self._apply_metrics.record('projection_lock_wait', time.perf_counter() - lock_started)
             for event in events:
                 if not self._ready:
                     raise ValueError(
                         "Polymarket live event arrived before replay was ready"
                     )
+                validation_started = time.perf_counter()
                 self._validate_token_recovery_transition(event)
+                self._apply_metrics.record('recovery_validation', time.perf_counter() - validation_started)
                 if event.cursor != self._latest_cursor + 1:
                     self._ready = False
                     self._error_code = "polymarket_live_stream_cursor_gap"
@@ -385,6 +449,7 @@ class PolymarketLiveProjection:
                 self._apply_event_state(event)
                 self._last_message_at = datetime.now(timezone.utc)
                 self._generation += 1
+                notify_started = time.perf_counter()
                 for queue in tuple(self._subscribers):
                     if queue.full():
                         self._subscribers.discard(queue)
@@ -397,6 +462,7 @@ class PolymarketLiveProjection:
                         ))
                         continue
                     queue.put_nowait(event)
+                self._apply_metrics.record('subscriber_notify', time.perf_counter() - notify_started)
 
     def update_persistence(
         self, cursor: int, *, queue_depth: int = 0, error: str | None = None,
@@ -462,7 +528,10 @@ class PolymarketLiveProjection:
         """Atomically apply a validated immutable confirmation batch."""
         if not books:
             raise ValueError("Polymarket live book confirmation batch is empty")
+        lock_started = time.perf_counter()
         with self._lock:
+            self._apply_metrics.record('projection_lock_wait', time.perf_counter() - lock_started)
+            confirmation_started = time.perf_counter()
             applicable = []
             for book in books:
                 previous = self._books.get(book.token_id)
@@ -489,11 +558,13 @@ class PolymarketLiveProjection:
                 applicable.append(book.model_copy(update={
                     "book_received_at": previous.book_received_at or previous.received_at,
                 }))
+            self._apply_metrics.record('confirmation_apply', time.perf_counter() - confirmation_started)
             if applicable:
                 self._books.update({book.token_id: book for book in applicable})
                 self._last_message_at = datetime.now(timezone.utc)
                 self._generation += 1
                 self._confirmation_sequence += 1
+                notify_started = time.perf_counter()
                 self._notify_subscribers({
                     "type": "book_confirmations",
                     "cursor": self._latest_cursor,
@@ -501,6 +572,7 @@ class PolymarketLiveProjection:
                     "stream_instance_id": self._stream_instance_id,
                     "books": tuple(applicable),
                 })
+                self._apply_metrics.record('subscriber_notify', time.perf_counter() - notify_started)
 
     def _validate_token_recovery_transition(self, event: LiveEventEnvelope) -> None:
         from .polymarket_token_recovery import validate_token_recovery
@@ -518,20 +590,17 @@ class PolymarketLiveProjection:
                 raise ValueError('token recovery completion without matching fresh snapshot')
 
     def _apply_event_state(self, event: LiveEventEnvelope) -> None:
+        gap_started = time.perf_counter()
         if (
             event.applied and event.event_type == 'recovery_started'
             and event.canonical_payload.get('recovery_scope') == 'token'
         ):
             # A replacement attempt supersedes this token's previous gap, not
             # another token's availability. Keep replay and snapshots aligned.
-            self._gaps = [gap for gap in self._gaps if gap.token_id != event.token_id]
+            self._gap_index.remove_tokens((event.token_id,))
         for gap in event.gaps:
-            identity = content_sha256(gap.model_dump(mode="json"))
-            if all(
-                content_sha256(item.model_dump(mode="json")) != identity
-                for item in self._gaps
-            ):
-                self._gaps.append(gap.model_copy(deep=True))
+            self._gap_index.add(gap)
+        self._apply_metrics.record('gap_maintenance', time.perf_counter() - gap_started)
         if (
             event.applied
             and event.token_id
@@ -540,9 +609,11 @@ class PolymarketLiveProjection:
                 "tick_size_change",
             }
         ):
+            book_started = time.perf_counter()
             book = LiveBook.model_validate(
                 event.canonical_payload
             )
+            self._apply_metrics.record('book_validation', time.perf_counter() - book_started)
             previous = self._books.get(event.token_id)
             if (
                 event.event_type in {"best_bid_ask", "last_trade_price"}
@@ -566,6 +637,7 @@ class PolymarketLiveProjection:
                 self._token_recoveries[event.token_id] = (recovery_id, event.cursor)
             market_id = event.market_id
             if market_id and market_id in self._markets:
+                binding_started = time.perf_counter()
                 self._markets[market_id] = bind_market_instrument_to_books(
                     self._markets[market_id],
                     self._books,
@@ -573,6 +645,7 @@ class PolymarketLiveProjection:
                     projection_generation=self._generation + 1,
                     observed_at=event.received_at,
                 )
+                self._apply_metrics.record('instrument_binding', time.perf_counter() - binding_started)
         if event.event_type == "market_terminal" and event.applied:
             from .polymarket_live import LiveMarket
 
@@ -589,7 +662,7 @@ class PolymarketLiveProjection:
                 raise ValueError("terminal retirement binding differs")
             for token_id in retired:
                 self._token_recoveries.pop(token_id, None)
-            self._gaps = [gap for gap in self._gaps if gap.token_id not in retired]
+            self._retire_gap_tokens(retired)
         if event.event_type == "recovery_started" and event.applied:
             if event.canonical_payload.get('recovery_scope') == 'token':
                 self._token_recoveries[event.token_id] = (event.canonical_payload['recovery_id'], None)
@@ -599,16 +672,14 @@ class PolymarketLiveProjection:
             ) or None
         if event.event_type == "recovery_completed" and event.applied:
             if event.canonical_payload.get('recovery_scope') == 'token':
-                self._gaps = [gap for gap in self._gaps if gap.token_id != event.token_id]
+                self._retire_gap_tokens((event.token_id,))
                 del self._token_recoveries[event.token_id]
                 return
             recovered = set(
                 event.canonical_payload.get("resolved_gap_token_ids")
                 or event.canonical_payload.get("recovered_token_ids") or []
             )
-            self._gaps = [
-                gap for gap in self._gaps if gap.token_id not in recovered
-            ]
+            self._retire_gap_tokens(recovered)
             self._active_recovery_id = None
 
     def _require_ready(self) -> None:
@@ -1833,6 +1904,7 @@ class PolymarketLiveStreamClient:
                         else:
                             raise ValueError("unsupported Polymarket stream frame")
                         metrics.record('apply',time.perf_counter()-apply_started)
+                        self.projection.emit_apply_metrics()
                         metrics.emit(self.projection.latest_cursor)
                         receive_started = time.perf_counter()
             except asyncio.CancelledError:
