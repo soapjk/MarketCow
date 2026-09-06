@@ -52,6 +52,21 @@ same directory have SHA256 `981ea5ec9c465e26275423ce16fa542905dc9e6d0761ca73373e
 and `fa14c8d3b17bdb7c42dfa554893315e7b9f35f0b4d5fa2b95c0ce8a8d9b7f90c`.
 This is a separate successful sample, not a retroactive pass for the first run.
 
+Both captured fixtures were subsequently replayed through the unchanged Tradude
+consumer using `scripts/replay_public_rust_fixture.py` and
+`scripts/replay_rust_discovery_fixture.py`, with the SHA arguments above and
+Tradude's interpreter/PYTHONPATH. Live: 250 identities, 1559 events, one ready,
+one confirmation, zero global protocol errors or local confirmation rejects;
+Discovery: 1000 markets, 241 relations, ready true/gaps zero and all 100 strict
+deltas accepted. This replay performs no Paper execution or account mutation.
+
+Resource sample at Live elapsed 7m43s: Rust PID265320 RSS3108920KiB, unit
+MemoryCurrent3197571072 bytes/MemoryPeak3738206208 bytes. Discovery PID264123
+elapsed20m57s RSS950984KiB, MemoryCurrent981798912/MemoryPeak982749184 bytes.
+Both NRestarts zero. Cgroup memory includes more than RSS; this is neither a
+steady-state proof nor a long-term memory bound measurement. Repeated Paper
+full-sync/reconnect remains part of this actual load and must not be hidden.
+
 ## Remaining actual failure
 
 Prior direct-Rust release logged five `deadline has elapsed` stream terminations.
