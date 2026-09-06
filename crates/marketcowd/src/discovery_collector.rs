@@ -19,6 +19,7 @@ mod source_lifecycle;
 mod source_public_api;
 mod source_public_frame;
 mod source_public_binding;
+mod source_discovery_quote;
 mod source_publication;
 mod source_websocket;
 

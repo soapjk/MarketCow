@@ -1,10 +1,11 @@
 """Finite direct-Rust smoke test; never starts Python API or changes formal units."""
 import asyncio
+import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
-import signal
+import re
 import socket
 import sqlite3
 import subprocess
@@ -19,6 +20,8 @@ PREFIX = BASE / 'logs/public-rust-smoke-r1'
 UNIT = 'marketcow-public-rust-smoke-collector-r1'
 SCOPE = '54b2ad555edfd47bd1863fc71c7bb6443ca57a50c7433644b78ef3a78a4e4a12'
 BINARY_SHA = '8ad46042cd084263357925342f046eae89f4166387711b976ee9ea7c72b3196b'
+SECONDS = 20
+WIRE_BYTES = 16777216
 
 
 def sha(path):
@@ -61,13 +64,24 @@ async def audit(report):
     report['counts'] = {}
     uri = f'ws://127.0.0.1:8794/v1/prediction-markets/polymarket/live/stream?scope_id={SCOPE}&after_cursor={cursor}'
     start = time.monotonic()
+    pid = int(props()['MainPID'])
+    next_sample = start
+    report['resources'] = []
     async with websockets.connect(uri, max_size=67108864, max_queue=1, close_timeout=5) as ws:
         with PREFIX.with_suffix('.ws.jsonl').open('xb') as wire:
             total = 0
-            while time.monotonic() - start < 20 and total < 16777216:
+            while time.monotonic() - start < SECONDS and total < WIRE_BYTES:
+                if time.monotonic() >= next_sample:
+                    fields = {}
+                    for line in Path(f'/proc/{pid}/status').read_text().splitlines():
+                        if line.startswith(('VmRSS:', 'VmHWM:', 'Threads:')):
+                            key, value = line.split(':', 1)
+                            fields[key] = value.strip()
+                    report['resources'].append({'elapsed': time.monotonic()-start, **fields})
+                    next_sample = time.monotonic() + 1
                 raw = await asyncio.wait_for(ws.recv(), timeout=10)
                 encoded = raw.encode() if isinstance(raw, str) else raw
-                if total + len(encoded) + 1 > 16777216:
+                if total + len(encoded) + 1 > WIRE_BYTES:
                     break
                 wire.write(encoded + b'\n')
                 total += len(encoded) + 1
@@ -87,6 +101,19 @@ async def audit(report):
 
 
 def main():
+    global PREFIX, UNIT, BINARY_SHA, SECONDS, WIRE_BYTES
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--run', required=True)
+    parser.add_argument('--binary-sha256', required=True)
+    parser.add_argument('--seconds', required=True, type=int)
+    parser.add_argument('--wire-bytes', required=True, type=int)
+    args = parser.parse_args()
+    assert re.fullmatch(r'r[1-9][0-9]*', args.run)
+    assert re.fullmatch(r'[0-9a-f]{64}', args.binary_sha256)
+    assert 1 <= args.seconds <= 60 and 1 <= args.wire_bytes <= 67108864
+    PREFIX = BASE / f'logs/public-rust-smoke-{args.run}'
+    UNIT = f'marketcow-public-rust-smoke-collector-{args.run}'
+    BINARY_SHA, SECONDS, WIRE_BYTES = args.binary_sha256, args.seconds, args.wire_bytes
     assert not PREFIX.with_suffix('.report.json').exists()
     preparation = json.loads((ROOT / 'public-candidate-report.json').read_text())
     assert preparation['complete'] and preparation['no_jsonl']
@@ -95,7 +122,8 @@ def main():
     with socket.socket() as check:
         check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         check.bind(('127.0.0.1', 8794))
-    report = {'passed': False, 'binary_sha256': BINARY_SHA, 'root': str(ROOT)}
+    report = {'passed': False, 'binary_sha256': BINARY_SHA, 'root': str(ROOT),
+        'requested_seconds': SECONDS, 'maximum_wire_bytes': WIRE_BYTES}
     cmd = [str(binary), '--input-mode', 'websocket', '--market-workers', '6',
         '--root', str(ROOT), '--plan', str(ROOT/'rust-scoped-plan-r1.json'),
         '--plan-sha256', sha(ROOT/'rust-scoped-plan-r1.json'),
