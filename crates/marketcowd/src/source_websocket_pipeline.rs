@@ -9,23 +9,23 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 const INPUT_BYTES: usize = 64 * 1024 * 1024;
 const FRAME_BYTES: usize = 8 * 1024 * 1024;
 const OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-const MARKET_QUEUE_CAPACITY: usize = 6;
+const MARKET_QUEUE_CAPACITY: usize = 32;
 
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn six_waiting_inputs_fit_seventh_rejected_and_fifo_preserved() {
+    async fn thirty_two_waiting_inputs_fit_next_rejected_and_fifo_preserved() {
         let (mut dispatch, mut output) = Dispatcher::start(
             [("market".into(), ())].into(),
             MARKET_QUEUE_CAPACITY, 6, 12, |_, item: usize| Ok(item),
         ).unwrap();
-        for item in 0..6 { dispatch.try_submit("market", item).unwrap(); }
-        assert_eq!(dispatch.occupancy(), (6, 6, 6));
-        assert_eq!(dispatch.try_submit("market", 6), Err(6));
+        for item in 0..32 { dispatch.try_submit("market", item).unwrap(); }
+        assert_eq!(dispatch.occupancy(), (32, 32, 6));
+        assert_eq!(dispatch.try_submit("market", 32), Err(32));
         dispatch.close();
-        for expected in 0..6 {
+        for expected in 0..32 {
             assert_eq!(output.recv().await.unwrap().result.unwrap(), expected);
         }
         dispatch.join().await;
@@ -115,7 +115,7 @@ impl Pipeline {
                 )
             })
             .collect();
-        // At most workers CPU jobs, six queued inputs/market, and twice workers
+        // At most workers CPU jobs, 32 queued inputs/market, and twice workers
         // output reservations (including in-flight results), each <=16 MiB.
         let (dispatch, output) = Dispatcher::start_filtered(
             states,
