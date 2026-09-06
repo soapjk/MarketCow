@@ -20,6 +20,7 @@ mod source_public_api;
 mod source_public_frame;
 mod source_public_binding;
 mod source_discovery_quote;
+mod source_discovery_history;
 mod source_publication;
 mod source_websocket;
 

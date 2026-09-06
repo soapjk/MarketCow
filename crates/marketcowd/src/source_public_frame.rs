@@ -41,14 +41,15 @@ pub fn frame(view: &MemoryView, market_id: &str, now: DateTime<Utc>, generation:
             if view.books.contains_key(&token) { own_tokens.push(token); }
         }
         if own_tokens.len() != 2 { reasons.insert("missing_outcome_book".into()); }
-        let expected_tick = Decimal::from_str(text(instrument,"price_increment")?)?;
+        let expected_tick = instrument.get("price_increment").context("price increment field absent")?
+            .as_str().map(Decimal::from_str).transpose()?;
         let mut tick_versions = BTreeSet::new();
-        let mut binding_invalid = own_tokens.len() != 2;
+        let mut binding_invalid = own_tokens.len() != 2 || expected_tick.is_none();
         for token in &own_tokens {
             let book = &view.books[token];
             binding_invalid |= text(book,"token_id")? != token
                 || text(book,"condition_id")? != text(identity,"condition_id")?
-                || Decimal::from_str(text(book,"tick_size")?)? != expected_tick;
+                || Some(Decimal::from_str(text(book,"tick_size")?)?) != expected_tick;
             tick_versions.insert(text(book,"tick_version")?);
         }
         if binding_invalid || tick_versions.len() != 1 {
@@ -199,8 +200,12 @@ mod tests {
 
     #[tokio::test]
     async fn missing_market_does_not_block_other_market_or_hide_old_age() {
+        let mut incomplete = market("2",["c","d"]);
+        incomplete["rules"]["instrument"]["price_increment"] = Value::Null;
+        incomplete["rules"]["instrument"]["complete"] = json!(false);
+        incomplete["rules"]["rules_complete"] = json!(false);
         let seed = json!({"latest_cursor":0,"catalog_revision":"a".repeat(64),"catalog_source":{},"gaps":[],"books":[book("a","1"),book("b","1")],
-            "markets":[market("1",["a","b"]),market("2",["c","d"])]});
+            "markets":[market("1",["a","b"]),incomplete]});
         let p = Publication::start(0,Some(seed),[("a".into(),"1".into()),("b".into(),"1".into()),
             ("c".into(),"2".into()),("d".into(),"2".into())].into(),8,131072,65536, |_|Ok(())).unwrap();
         let view = p.capture_view().unwrap();

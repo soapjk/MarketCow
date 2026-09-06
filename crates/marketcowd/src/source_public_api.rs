@@ -17,6 +17,17 @@ use tokio::sync::Semaphore;
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
 use std::time::Duration;
 
+// Keep admission charged until the last response-byte owner is dropped, not
+// merely until JSON encoding completes. A slow HTTP reader cannot accumulate
+// arbitrarily many completed full-sync buffers behind the semaphore.
+struct SnapshotBytes {
+    bytes: Vec<u8>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl AsRef<[u8]> for SnapshotBytes {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
+}
+
 #[derive(Clone)]
 pub struct StreamLimits {
     pub frame_bytes: usize,
@@ -183,15 +194,14 @@ async fn scoped_response(api: Arc<PublicApi>, query: ScopeQuery, component: Opti
     };
     // Bound CPU tasks before submission; permit lives until construction and
     // encoding finish even if the requesting connection is cancelled.
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let _permit = permit;
+    let result = tokio::task::spawn_blocking(move || -> Result<SnapshotBytes> {
         let view = api.reader.capture()?;
         let mut model = full_sync(&view,&api.scope,api.generation,&api.instance,Utc::now())?;
         let model = match component {Some(key)=>model[key].take(),None=>model};
-        Ok(encode_bounded(&model,api.full_sync_bytes)?)
+        Ok(SnapshotBytes{bytes:encode_bounded(&model,api.full_sync_bytes)?,_permit:permit})
     }).await;
     match result {
-        Ok(Ok(bytes)) => ([(header::CONTENT_TYPE,"application/json")],bytes).into_response(),
+        Ok(Ok(bytes)) => ([(header::CONTENT_TYPE,"application/json")],axum::body::Bytes::from_owner(bytes)).into_response(),
         Ok(Err(error)) if error.downcast_ref::<EncodeError>().is_some_and(|e| matches!(e,EncodeError::TooLarge)) =>
             failure(StatusCode::PAYLOAD_TOO_LARGE,"polymarket_full_sync_too_large",false),
         _ => failure(StatusCode::SERVICE_UNAVAILABLE,"polymarket_live_snapshot_unavailable",true),
@@ -401,6 +411,18 @@ pub fn encode_bounded(value: &impl serde::Serialize, limit: usize) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn snapshot_admission_lives_until_last_wire_buffer_reference() {
+        let capacity=Arc::new(Semaphore::new(1));
+        let permit=capacity.clone().try_acquire_owned().unwrap();
+        let bytes=axum::body::Bytes::from_owner(SnapshotBytes{bytes:vec![1,2,3],_permit:permit});
+        let network_reference=bytes.clone();
+        drop(bytes);
+        assert!(capacity.clone().try_acquire_owned().is_err());
+        assert_eq!(&network_reference[..],&[1,2,3]);
+        drop(network_reference);
+        assert!(capacity.try_acquire_owned().is_ok());
+    }
 
     #[test]
     fn scope_binds_exact_content_and_rejects_unknown_fields() {
