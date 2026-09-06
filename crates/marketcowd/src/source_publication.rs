@@ -125,6 +125,7 @@ pub struct MemoryReader {
 pub struct PublicReplay {
     pub batches: Vec<Arc<Batch>>,
     pub next: u64,
+    pub boundary_cursor: u64,
     pub caught_up: bool,
     pub confirmation_sequence: u64,
     pub confirmation_books: Vec<Arc<Value>>,
@@ -166,7 +167,7 @@ impl MemoryReader {
             m.confirmations.iter().filter(|(_,seq)| **seq > confirmation_after)
                 .filter_map(|(token,_)| m.books.get(token).cloned()).collect()
         } else { Vec::new() };
-        Ok(PublicReplay {batches,next,caught_up,confirmation_books,
+        Ok(PublicReplay {batches,next,boundary_cursor:m.cursor,caught_up,confirmation_books,
             confirmation_sequence:if caught_up {m.confirmation_cursor}else{confirmation_after}})
     }
 }
