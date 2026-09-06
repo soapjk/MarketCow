@@ -90,8 +90,12 @@ async fn ws_upgrade(State(api): State<Arc<PublicApi>>, Query(query): Query<Strea
     };
     ws.max_message_size(4096).max_frame_size(4096).on_upgrade(move |mut socket|async move {
         let _permit = permit;
+        let connection=uuid::Uuid::new_v4().simple().to_string();
+        let opened=Utc::now();
         if let Err(error) = public_stream(&mut socket,&api,query.after_cursor).await {
-            eprintln!("public live stream closed: {error:#}");
+            eprintln!("{}",json!({"stage":"public_live_stream_closed","at":Utc::now(),
+                "connection":connection,"opened_at":opened,
+                "instance":api.instance,"initial_cursor":query.after_cursor,"error":format!("{error:#}")}));
             let _ = send_public(&mut socket,&api,json!({"type":"error","code":"polymarket_live_stream_disconnected",
                 "message":"Source disconnected; re-establish snapshot and stream","retryable":true})).await;
         }
@@ -101,9 +105,24 @@ async fn ws_upgrade(State(api): State<Arc<PublicApi>>, Query(query): Query<Strea
 
 async fn send_public(socket: &mut WebSocket, api: &PublicApi, frame: Value) -> Result<()> {
     let bytes = encode_bounded(&frame,api.limits.frame_bytes)?;
+    let size = bytes.len();
     let body = String::from_utf8(bytes)?;
-    tokio::time::timeout(api.limits.send_timeout,socket.send(Message::Text(body.into()))).await??;
+    // Error-only metadata: never log the book payload or allocate a per-frame
+    // diagnostic history. This interval is socket-await wall time, not CPU/RTT.
+    timed_send(api.limits.send_timeout,socket.send(Message::Text(body.into())),
+        "data",size).await.with_context(|| format!("frame_type={} cursor={} instance={}",
+            frame["type"],frame["cursor"],api.instance))?;
     Ok(())
+}
+
+async fn timed_send<F,E>(budget:Duration, send:F, kind:&str, bytes:usize)->Result<()>
+where F:std::future::Future<Output=std::result::Result<(),E>>,
+      E:std::error::Error+Send+Sync+'static {
+    let started=std::time::Instant::now();
+    match tokio::time::timeout(budget,send).await {
+        Ok(result)=>result.with_context(||format!("socket_send_failed kind={kind} bytes={bytes} elapsed_us={}",started.elapsed().as_micros())),
+        Err(_)=>anyhow::bail!("socket_send_timeout kind={kind} bytes={bytes} budget_ms={} elapsed_us={}",budget.as_millis(),started.elapsed().as_micros()),
+    }
 }
 
 /// Poll at most one control message per replay batch, without waiting for a
@@ -114,7 +133,8 @@ pub(crate) async fn poll_replay_control(socket:&mut WebSocket,timeout:Duration)-
         incoming=socket.recv()=>match incoming {
             None|Some(Ok(Message::Close(_)))=>Ok(false),
             Some(Ok(Message::Ping(bytes)))=>{
-                tokio::time::timeout(timeout,socket.send(Message::Pong(bytes))).await??;
+                let size=bytes.len();
+                timed_send(timeout,socket.send(Message::Pong(bytes)),"pong",size).await?;
                 Ok(true)
             },
             Some(Ok(Message::Pong(_)))=>Ok(true),
@@ -146,7 +166,8 @@ async fn public_stream(socket: &mut WebSocket, api: &PublicApi, mut cursor: u64)
     let mut confirmation = 0;
     loop {
         changed.borrow_and_update();
-        let page = api.reader.replay(cursor,confirmation,64,api.limits.replay_bytes)?;
+        let page = api.reader.replay(cursor,confirmation,64,api.limits.replay_bytes)
+            .with_context(||format!("public_replay after={cursor} confirmation_sequence={confirmation}"))?;
         for batch in &page.batches {
             if !poll_replay_control(socket,api.limits.send_timeout).await? {return Ok(());}
             for event in batch.validated.events() {
@@ -178,7 +199,8 @@ async fn public_stream(socket: &mut WebSocket, api: &PublicApi, mut cursor: u64)
                 match message {
                     None | Some(Ok(Message::Close(_))) => return Ok(()),
                     Some(Ok(Message::Ping(bytes))) => {
-                        tokio::time::timeout(api.limits.send_timeout,socket.send(Message::Pong(bytes))).await??;
+                        let size=bytes.len();
+                        timed_send(api.limits.send_timeout,socket.send(Message::Pong(bytes)),"pong",size).await?;
                     },
                     Some(Ok(Message::Pong(_))) => {},
                     _ => anyhow::bail!("unexpected public client message"),
@@ -434,6 +456,20 @@ pub fn encode_bounded(value: &impl serde::Serialize, limit: usize) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn send_diagnostics_distinguish_deadline_transport_and_success() {
+        let error=timed_send(Duration::from_millis(1),
+            std::future::pending::<std::io::Result<()>>(),"data",123).await.unwrap_err();
+        let message=format!("{error:#}");
+        assert!(message.contains("socket_send_timeout kind=data bytes=123 budget_ms=1"));
+        let error=timed_send(Duration::from_secs(1),async {
+            Err::<(),_>(io::Error::other("synthetic transport failure"))
+        },"pong",2).await.unwrap_err();
+        let message=format!("{error:#}");
+        assert!(message.contains("socket_send_failed kind=pong bytes=2"));
+        assert!(message.contains("synthetic transport failure"));
+        timed_send(Duration::from_secs(1),async {Ok::<(),io::Error>(())},"data",3).await.unwrap();
+    }
     #[tokio::test]
     async fn replay_control_handles_ping_and_close_during_continuous_output() {
         use futures_util::{SinkExt,StreamExt};
