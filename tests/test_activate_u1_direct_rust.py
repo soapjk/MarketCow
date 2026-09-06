@@ -63,13 +63,7 @@ class ActivationTests(unittest.TestCase):
                     for name in cmd[3:]:
                         states[name] = cmd[2] == 'start'
             def baseline(*args):
-                if tamper:
-                    with self.assertRaises(AssertionError):
-                        activation.main()
-                    self.assertEqual(calls, [])
-                    self.assertFalse((root/'logs/direct-rust-0424396-activation.json').exists())
-                    return
-                elif fail:
+                if fail:
                     raise RuntimeError('injected startup failure')
                 return {'cursor': 11}
             with patch.multiple(activation, R=root, RELEASE=release, CONFIG=config), \
@@ -78,7 +72,13 @@ class ActivationTests(unittest.TestCase):
                  patch.object(activation, 'baseline', side_effect=baseline), \
                  patch.object(sys, 'argv', ['activate', '--manifest-sha256', activation.sha(manifest_path),
                     '--paper-pause-receipt', 'channel_message:synthetic-test']):
-                if fail:
+                if tamper:
+                    with self.assertRaises(AssertionError):
+                        activation.main()
+                    self.assertEqual(calls, [])
+                    self.assertFalse((root/'logs/direct-rust-0424396-activation.json').exists())
+                    return
+                elif fail:
                     with self.assertRaisesRegex(RuntimeError, 'injected'):
                         activation.main()
                 else:
