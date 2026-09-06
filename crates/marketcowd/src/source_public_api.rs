@@ -464,6 +464,34 @@ pub fn encode_bounded(value: &impl serde::Serialize, limit: usize) -> Result<Vec
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "explicit bounded real fixture component benchmark"]
+    fn real_fixture_object_assembly_benchmark() {
+        use sha2::{Digest,Sha256};
+        let path=std::env::var("MARKETCOW_ASSEMBLY_FIXTURE").unwrap();
+        let expected=std::env::var("MARKETCOW_ASSEMBLY_SHA256").unwrap();
+        let mode=std::env::var("MARKETCOW_ASSEMBLY_MODE").unwrap();
+        assert!(mode=="clone"||mode=="move");
+        let file=std::fs::File::open(path).unwrap();
+        assert!(file.metadata().unwrap().len()<=64*1024*1024);
+        let mut raw=Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(file,64*1024*1024+1),&mut raw).unwrap();
+        assert!(raw.len()<=64*1024*1024);
+        assert_eq!(format!("{:x}",Sha256::digest(&raw)),expected);
+        let fields:Value=serde_json::from_slice(&raw).unwrap();
+        assert_eq!(fields["scope_market_ids"].as_array().unwrap().len(),250);
+        let expected_output=canonical_hash(&fields);
+        let mut target=json!({});
+        let started=std::time::Instant::now();
+        if mode=="clone" {
+            target.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            drop(fields);
+        } else {extend_object(&mut target,fields);}
+        let elapsed=started.elapsed().as_micros();
+        assert_eq!(canonical_hash(&target),expected_output);
+        println!("{}",json!({"mode":mode,"input_sha256":expected,"output_sha256":expected_output,
+            "input_bytes":raw.len(),"assembly_elapsed_us":elapsed,"scope":"object merge only, not full service"}));
+    }
+    #[test]
     fn object_assembly_moves_payload_without_changing_fields() {
         let payload="large synthetic nested payload".repeat(1024);
         let original=payload.as_ptr();

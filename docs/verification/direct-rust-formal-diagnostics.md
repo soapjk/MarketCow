@@ -115,3 +115,32 @@ Do not enlarge source buffers/timeout to mask the serial checkpoint path. Peer
 must preserve durable account ordering while removing full historical-state
 serialization from normal receive progress; source diagnostics remain available
 without restarting the service.
+
+## Local object-assembly comparison (not deployed)
+
+Candidate 3a5dd6f removes four deep clones of completed JSON object fields.
+Ignored test `real_fixture_object_assembly_benchmark` explicitly requires the
+same captured 40270232-byte Live full-sync and its SHA; it asserts exactly250
+scope identities and equal canonical output SHA. Two separate local debug
+processes (old clone first, then move), one sample each:
+
+| Mode | Object merge including old-field disposal | `/usr/bin/time -l` maximum RSS bytes |
+|---|---:|---:|
+| clone | 194316 us | 660652032 |
+| move | 136 us | 582844416 |
+
+Both output hashes equal input `061f68691086a9925508951c6aa736fad093843e04fa479c00500b3e89516434`.
+Parsing and two full canonical hash passes are outside the merge timer but
+inside process-memory measurement. Cargo/test overhead is included in the
+external command measurement. This is not repeated randomized release A/B,
+full-sync construction as a whole, or U1 live RSS evidence. No formal restart.
+
+Reproduce from this worktree for each mode `clone` and `move`:
+
+```sh
+MARKETCOW_ASSEMBLY_FIXTURE=/private/tmp/marketcow-send-diag-lan-r1/live.full-sync.json \
+MARKETCOW_ASSEMBLY_SHA256=061f68691086a9925508951c6aa736fad093843e04fa479c00500b3e89516434 \
+MARKETCOW_ASSEMBLY_MODE=clone /usr/bin/time -l cargo test -q -p marketcowd \
+  --bin marketcow-discovery-collector real_fixture_object_assembly_benchmark \
+  --locked -- --ignored --nocapture
+```
