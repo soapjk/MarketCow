@@ -16,6 +16,9 @@ use tokio::task::JoinSet;
 mod durable_bootstrap;
 mod source_dispatch;
 mod source_lifecycle;
+mod source_public_api;
+mod source_public_frame;
+mod source_public_binding;
 mod source_publication;
 mod source_websocket;
 
@@ -89,6 +92,21 @@ struct Args {
     live_frame_bytes: Option<usize>,
     #[arg(long, requires = "live_listen")]
     live_maximum_clients: Option<usize>,
+    /// Direct Rust public read API; does not require the internal WS listener.
+    #[arg(long, requires_all = ["configured_scope", "dependency_plan", "public_full_sync_bytes", "public_snapshot_concurrency", "public_frame_bytes", "public_replay_bytes", "public_maximum_clients", "public_send_timeout_seconds"])]
+    public_listen: Option<std::net::SocketAddr>,
+    #[arg(long, requires = "public_listen")]
+    public_full_sync_bytes: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_snapshot_concurrency: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_frame_bytes: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_replay_bytes: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_maximum_clients: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_send_timeout_seconds: Option<u64>,
     #[arg(long)]
     poll_seconds: u64,
     #[arg(long)]
@@ -456,6 +474,7 @@ async fn main() -> Result<()> {
         manifest["catalog_revision"] == plan.catalog_revision,
         "source catalog revision differs"
     );
+    let mut public_scope = None;
     if let Some(path) = &args.configured_scope {
         ensure!(
             fs::canonicalize(path)?.starts_with(fs::canonicalize(&args.root)?),
@@ -479,6 +498,11 @@ async fn main() -> Result<()> {
             "scope runtime binding differs"
         );
         validate_scope_binding(&scope, &plan)?;
+        if args.public_listen.is_some() {
+            let typed: source_public_api::ConfiguredScope = serde_json::from_slice(&bytes)?;
+            typed.validate()?;
+            public_scope = Some(typed);
+        }
     } else {
         let declared: BTreeSet<_> = manifest["realtime_universe"]["market_ids"]
             .as_array()
@@ -540,7 +564,7 @@ async fn main() -> Result<()> {
         writer.enable_bounded_history(limit)?;
     }
     let cursor = writer.cursor()?;
-    let base = if args.live_listen.is_some() {
+    let base = if args.live_listen.is_some() || args.public_listen.is_some() {
         Some(durable_bootstrap::bootstrap(
             args.root.clone(),
             args.dependency_plan
@@ -549,7 +573,8 @@ async fn main() -> Result<()> {
             args.dependency_plan_sha256
                 .as_deref()
                 .context("missing stream plan hash")?,
-            args.live_frame_bytes.context("missing frame cap")?,
+            if args.public_listen.is_some() { args.public_full_sync_bytes.context("public seed cap")? }
+                else { args.live_frame_bytes.context("missing frame cap")? },
         )?)
     } else {
         None
@@ -597,6 +622,20 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let public_task = if let Some(listen) = args.public_listen {
+        ensure!(listen.ip().is_loopback() || matches!(listen.ip(), std::net::IpAddr::V4(ip) if ip.is_private()),
+            "public read API must bind explicit loopback or private LAN address");
+        let router = source_public_api::PublicApi::router(publication.reader(),public_scope.context("public scope")?,
+            1,uuid::Uuid::new_v4().simple().to_string(),args.public_full_sync_bytes.context("public bytes")?,
+            args.public_snapshot_concurrency.context("snapshot concurrency")?,source_public_api::StreamLimits {
+                frame_bytes:args.public_frame_bytes.context("public frame bytes")?,
+                replay_bytes:args.public_replay_bytes.context("public replay bytes")?,
+                clients:args.public_maximum_clients.context("public clients")?,
+                send_timeout:Duration::from_secs(args.public_send_timeout_seconds.context("send timeout")?),
+            })?;
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        Some(tokio::spawn(async move {axum::serve(listener,router).await}))
+    } else {None};
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.request_timeout_seconds))
         .build()?;
@@ -613,6 +652,7 @@ async fn main() -> Result<()> {
         if let Some(task) = stream_task {
             task.abort();
         }
+        if let Some(task) = public_task { task.abort(); }
         let drain = publication.finish().await;
         result?;
         drain?;
@@ -722,6 +762,7 @@ async fn main() -> Result<()> {
         Ok(())
     }.await;
     workers.abort_all();
+    if let Some(task) = public_task { task.abort(); }
     if let Some(task) = stream_task {
         task.abort();
     }
