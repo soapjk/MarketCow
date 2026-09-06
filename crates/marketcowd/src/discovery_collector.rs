@@ -23,6 +23,7 @@ mod source_discovery_quote;
 mod source_discovery_history;
 mod source_discovery_projection;
 mod source_discovery_api;
+mod source_discovery_startup;
 mod source_publication;
 mod source_websocket;
 
@@ -111,6 +112,27 @@ struct Args {
     public_maximum_clients: Option<usize>,
     #[arg(long, requires = "public_listen")]
     public_send_timeout_seconds: Option<u64>,
+    /// Independent direct Rust Discovery surface over this frozen universe.
+    #[arg(long, conflicts_with_all=["configured_scope", "public_listen", "live_listen"], requires_all=["discovery_seed", "discovery_seed_sha256", "discovery_state_bytes", "discovery_full_sync_bytes", "discovery_frame_bytes", "discovery_replay_bytes", "discovery_clients", "discovery_baselines", "discovery_send_timeout_seconds"])]
+    discovery_listen:Option<std::net::SocketAddr>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_seed:Option<PathBuf>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_seed_sha256:Option<String>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_state_bytes:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_full_sync_bytes:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_frame_bytes:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_replay_bytes:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_clients:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_baselines:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_send_timeout_seconds:Option<u64>,
     #[arg(long)]
     poll_seconds: u64,
     #[arg(long)]
@@ -568,7 +590,12 @@ async fn main() -> Result<()> {
         writer.enable_bounded_history(limit)?;
     }
     let cursor = writer.cursor()?;
-    let base = if args.live_listen.is_some() || args.public_listen.is_some() {
+    let mut discovery_config=None;
+    let base = if args.discovery_listen.is_some() {
+        let (config,base)=source_discovery_startup::load(&args.root,args.discovery_seed.as_deref().context("Discovery seed")?,
+            args.discovery_seed_sha256.as_deref().context("Discovery seed hash")?,args.discovery_state_bytes.context("Discovery state cap")?,&plan.markets)?;
+        discovery_config=Some(config);Some(base)
+    } else if args.live_listen.is_some() || args.public_listen.is_some() {
         Some(durable_bootstrap::bootstrap(
             args.root.clone(),
             args.dependency_plan
@@ -640,6 +667,16 @@ async fn main() -> Result<()> {
         let listener = tokio::net::TcpListener::bind(listen).await?;
         Some(tokio::spawn(async move {axum::serve(listener,router).await}))
     } else {None};
+    let discovery_task=if let Some(listen)=args.discovery_listen {
+        ensure!(listen.ip().is_loopback() || matches!(listen.ip(),std::net::IpAddr::V4(ip) if ip.is_private()),"Discovery requires explicit loopback/private address");
+        let router=source_discovery_api::router(publication.reader(),std::sync::Arc::new(discovery_config.context("Discovery config")?),
+            source_discovery_api::DiscoveryLimits{full_sync_bytes:args.discovery_full_sync_bytes.context("Discovery response cap")?,
+                frame_bytes:args.discovery_frame_bytes.context("Discovery frame cap")?,state_bytes:args.discovery_state_bytes.context("Discovery state cap")?,
+                replay_bytes:args.discovery_replay_bytes.context("Discovery replay cap")?,clients:args.discovery_clients.context("Discovery clients")?,
+                cached_baselines:args.discovery_baselines.context("Discovery baselines")?,send_timeout:Duration::from_secs(args.discovery_send_timeout_seconds.context("Discovery send timeout")?)})?;
+        let listener=tokio::net::TcpListener::bind(listen).await?;
+        Some(tokio::spawn(async move{axum::serve(listener,router).await}))
+    }else{None};
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.request_timeout_seconds))
         .build()?;
@@ -657,6 +694,7 @@ async fn main() -> Result<()> {
             task.abort();
         }
         if let Some(task) = public_task { task.abort(); }
+        if let Some(task) = discovery_task { task.abort(); }
         let drain = publication.finish().await;
         result?;
         drain?;
@@ -767,6 +805,7 @@ async fn main() -> Result<()> {
     }.await;
     workers.abort_all();
     if let Some(task) = public_task { task.abort(); }
+    if let Some(task) = discovery_task { task.abort(); }
     if let Some(task) = stream_task {
         task.abort();
     }

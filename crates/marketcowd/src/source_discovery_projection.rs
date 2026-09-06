@@ -7,6 +7,12 @@ use serde_json::{Value,json};
 use std::{collections::{BTreeMap,BTreeSet},sync::Arc};
 use crate::{source_discovery_quote::{market_quote,QuotePolicy},source_discovery_history::DiscoveryHistory,source_publication::MemoryView};
 
+fn relation_wire(relation:&Value)->Value {
+    let mut wire=relation.clone();
+    wire["schema_version"]=json!("marketcow.polymarket.discovery-relation.v3");
+    wire
+}
+
 pub struct DiscoveryConfig {
     pub projection_id:String,
     pub catalog_revision:String,
@@ -56,10 +62,24 @@ impl DiscoveryConfig {
         let markets=self.market_ids.iter().map(|id|self.quote(view,id,observed)).collect::<Result<Vec<_>>>()?;
         let unresolved=view.recoveries.len()+view.base["gaps"].as_array().context("source gaps")?.iter().filter(|g|g["resolved"]==false).count();
         let ready=unresolved==0;
+        let relations=self.relations.iter().map(relation_wire).collect::<Vec<_>>();
         Ok(json!({"schema_version":"marketcow.polymarket.discovery.v3","projection_id":self.projection_id,
             "catalog_revision":self.catalog_revision,"universe_revision":self.universe_revision,"boundary_cursor":view.cursor,
             "observed_at":observed,"ready":ready,"fail_closed_reason":if ready{None}else{Some("discovery_unresolved_gaps")},
-            "unresolved_gap_count":unresolved,"depth_notionals":self.policy.quantities,"markets":markets,"relations":self.relations}))
+            "unresolved_gap_count":unresolved,"depth_notionals":self.policy.quantities,"markets":markets,"relations":relations}))
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    #[test]
+    fn relation_wire_adds_required_schema_without_rewriting_evidence() {
+        let fact=json!({"relation_id":"r","evidence_sha256":"a".repeat(64),"members":[]});
+        let mut wire=relation_wire(&fact);
+        assert_eq!(wire.as_object_mut().unwrap().remove("schema_version"),Some(json!("marketcow.polymarket.discovery-relation.v3")));
+        assert_eq!(wire,fact);
+        assert!(fact.get("schema_version").is_none());
     }
 }
 

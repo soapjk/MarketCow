@@ -35,14 +35,14 @@ class CloneTests(unittest.TestCase):
             target = Path(directory) / 'candidate'
             self.seed(source)
             before = (source / 'catalog.json').read_bytes()
-            clone(source,target)
+            clone(source,target,kind='scoped')
             self.assertEqual(before,(source / 'catalog.json').read_bytes())
             self.assertNotEqual((source / 'catalog.json').stat().st_ino,(target / 'catalog.json').stat().st_ino)
             self.assertEqual((source / 'catalogs/data').stat().st_ino,(target / 'catalogs/data').stat().st_ino)
             self.assertFalse((target / 'events.jsonl').exists())
             self.assertTrue(json.loads((target / 'public-candidate-report.json').read_text())['complete'])
             with self.assertRaises(ValueError):
-                clone(source,target)
+                clone(source,target,kind='scoped')
 
     def test_corruption_never_publishes_candidate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -54,8 +54,21 @@ class CloneTests(unittest.TestCase):
             db.commit()
             db.close()
             with self.assertRaisesRegex(ValueError,'hash'):
-                clone(source,target)
+                clone(source,target,kind='scoped')
             self.assertFalse(target.exists())
+
+    def test_discovery_clone_keeps_plan_without_scoped_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'
+            target = Path(directory) / 'candidate'
+            self.seed(source)
+            plan = b'{"schema_version":"explicit-discovery-plan"}'
+            (source / 'rust-source-plan.json').write_bytes(plan)
+            clone(source, target, kind='discovery')
+            self.assertEqual((target / 'rust-source-plan.json').read_bytes(), plan)
+            self.assertFalse((target / 'configured-scope.json').exists())
+            self.assertFalse((target / 'events.jsonl').exists())
+            self.assertEqual(json.loads((target / 'public-candidate-report.json').read_text())['kind'], 'discovery')
 
 
 if __name__ == '__main__':

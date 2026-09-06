@@ -9,15 +9,18 @@ import sqlite3
 import time
 
 
-def clone(source: Path, target: Path):
+def clone(source: Path, target: Path, *, kind: str):
+    if kind not in ('scoped', 'discovery'):
+        raise ValueError('explicit scoped/discovery kind required')
     source = source.resolve(strict=True)
     target = target.resolve()
     stage = target.with_name(target.name + '.preparing')
     if target.exists() or stage.exists() or target.is_relative_to(source):
         raise ValueError('new isolated target required')
     os.umask(0o077)
-    names = ['catalog.json', 'configured-scope.json', 'scope-runtime.json',
-             'rust-scoped-plan-r1.json', 'live-bridge-plan-r1.json']
+    names = (['catalog.json', 'configured-scope.json', 'scope-runtime.json',
+              'rust-scoped-plan-r1.json', 'live-bridge-plan-r1.json'] if kind == 'scoped'
+             else ['catalog.json', 'rust-source-plan.json'])
     files = [source / name for name in names]
     for name in ['catalogs', 'catalog-indexes', 'candidate-snapshots', 'raw']:
         files.extend(p for p in (source / name).rglob('*') if not p.is_dir())
@@ -77,14 +80,15 @@ def clone(source: Path, target: Path):
         return value
     catalog = stage / 'catalog.json'
     catalog.write_text(json.dumps(rebase(json.loads(catalog.read_text())), separators=(',', ':')))
-    plan_path = stage / 'live-bridge-plan-r1.json'
-    plan = rebase(json.loads(plan_path.read_text()))
-    plan['catalog_manifest_sha256'] = hashlib.sha256(catalog.read_bytes()).hexdigest()
-    plan_path.write_text(json.dumps(plan, separators=(',', ':')))
+    plan_path = stage / ('live-bridge-plan-r1.json' if kind == 'scoped' else 'rust-source-plan.json')
+    if kind == 'scoped':
+        plan = rebase(json.loads(plan_path.read_text()))
+        plan['catalog_manifest_sha256'] = hashlib.sha256(catalog.read_bytes()).hexdigest()
+        plan_path.write_text(json.dumps(plan, separators=(',', ':')))
     state = dict(metadata)
     state['path'] = str(target / 'indexes/latest-state.sqlite3')
     (stage / 'state-index.json').write_text(json.dumps(state, separators=(',', ':')))
-    report = {'complete': True, 'source': str(source), 'target': str(target),
+    report = {'complete': True, 'kind': kind, 'source': str(source), 'target': str(target),
               'cursor': metadata['latest_cursor'], 'floor': metadata['history_floor_cursor'],
               'gaps': metadata['unresolved_gap_count'], 'recent_events': count,
               'recent_event_bytes': used, 'no_jsonl': True, 'files': copied,
@@ -109,5 +113,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', required=True, type=Path)
     parser.add_argument('--target', required=True, type=Path)
+    parser.add_argument('--kind', required=True, choices=['scoped', 'discovery'])
     args = parser.parse_args()
-    clone(args.source, args.target)
+    clone(args.source, args.target, kind=args.kind)
