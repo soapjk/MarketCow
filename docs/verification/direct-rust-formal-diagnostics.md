@@ -66,3 +66,37 @@ Paper's actual resumed account retained cash and six positions, but its run had
 proof of stable Paper operation. Next evidence must correlate these new Rust
 send errors with the peer's bounded processor/checkpoint timing. Do not restart
 Paper automatically or claim stability based on active units.
+
+## Actual send diagnostics, 16:23–16:25 UTC
+
+All three following failures are `socket_send_timeout kind=data`, not Pong or
+replay expiry. They share instance `04144f457d6840f89ec965477c10093c`.
+
+| Rust connection | Open UTC | Failed frame/cursor | Bytes | Timeout UTC / elapsed |
+|---|---|---|---:|---|
+| 436c060fa2dc4200b54fb3df25415061 | 16:23:44.525249637 | event / 10190800 | 3117 | 16:23:51.756761369 / 5.000811s |
+| 31705d8646b6453386e28410164e6958 | 16:24:23.852692966 | book_confirmations / 10210577 | 6903 | 16:24:30.873866953 / 5.001774s |
+| 519fa3f0fda94a79af44b58767a8740d | 16:25:05.442145665 | book_confirmations / 10225960 | 7975 | 16:25:12.961127103 / 5.000688s |
+
+Source: U1 `linux/logs/direct-rust-send-diag-6b23ab9-marketcow-polymarket-collector.log`,
+filter `public_live_stream_closed`. First connection initial cursor 10188874
+matches the peer's actual full-sync, unlike coincidental adjacent connections.
+
+Peer's rotating `paper-runtime.log` independently records checkpoint intervals:
+
+- cursor10190114: 16:23:44.992596–16:23:54.947031, monotonic elapsed9.938551625s;
+- cursor10209699: 16:24:24.274180–16:24:35.267414, monotonic10.991881333s;
+- cursor10225378: 16:25:05.890431–16:25:18.073395, monotonic12.182869041s.
+
+Each Rust timeout is inside the corresponding reported checkpoint wall-time
+interval. Approximate send-start UTC obtained by subtracting elapsed is not an
+independently recorded timestamp. Cross-host clock offsets and wall/monotonic
+differences remain uncorrected. This is strong aligned evidence of serial
+checkpoint-induced application receive stalls alongside data-send backpressure;
+it is not a TCP receive-window trace or proof that every historical error shares
+this cause. A controlled consumer-side fix/comparison remains necessary.
+
+Do not enlarge source buffers/timeout to mask the serial checkpoint path. Peer
+must preserve durable account ordering while removing full historical-state
+serialization from normal receive progress; source diagnostics remain available
+without restarting the service.
