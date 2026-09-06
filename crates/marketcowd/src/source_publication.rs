@@ -513,6 +513,22 @@ impl Publication {
                     .context("book received_at")?,
             )?
             .with_timezone(&chrono::Utc);
+            // An identical REST/targeted-WS response may finish decoding after
+            // a newer WS book or confirmation was already installed. Matching
+            // price/size alone does not make its older receipt a fresh proof.
+            // Never move either the original-book or confirmation time back.
+            let mut freshness_fence = current_received;
+            for field in ["book_received_at", "confirmed_at"] {
+                if let Some(value) = current[field].as_str() {
+                    freshness_fence = freshness_fence.max(
+                        chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc)
+                    );
+                }
+            }
+            if received_at <= freshness_fence {
+                superseded += 1;
+                continue;
+            }
             let candidate = &candidates[token];
             let current_book_exchange = memory
                 .book_exchanges
@@ -1441,6 +1457,16 @@ mod tests {
         assert!(!Arc::ptr_eq(&old_book, &after_confirmation.books["11"]));
         assert!(old_book["confirmed_at"].is_null());
         assert!(!after_confirmation.books["11"]["confirmed_at"].is_null());
+        // Same-content responses that arrive at this stage late cannot roll
+        // back timestamps or allocate a new confirmation sequence/cursor.
+        for stale in [requested, received] {
+            assert_eq!(p.confirm_market("1", "condition", &tokens, &raw, requested, stale).unwrap(),
+                ConfirmationOutcome::Superseded);
+            let unchanged = p.capture_view().unwrap();
+            assert_eq!(unchanged.confirmation_sequence, after_confirmation.confirmation_sequence);
+            assert_eq!(unchanged.cursor, after_confirmation.cursor);
+            assert_eq!(unchanged.books, after_confirmation.books);
+        }
         let page = p.reader().replay(0,0,1,131072).unwrap();
         assert_eq!(page.next,2);
         assert!(page.caught_up);
@@ -1537,7 +1563,7 @@ mod tests {
                 &tokens,
                 &partly_superseded,
                 chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
-                chrono::DateTime::from_timestamp(1_700_000_006, 0).unwrap()
+                chrono::DateTime::from_timestamp(1_700_000_007, 0).unwrap()
             )
             .unwrap(),
             ConfirmationOutcome::Confirmed
