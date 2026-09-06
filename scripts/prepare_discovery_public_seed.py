@@ -15,9 +15,9 @@ from marketcow.polymarket_discovery import DiscoveryMetadataFact, DiscoveryRelat
 from marketcow.polymarket_live import LiveMarket
 
 
-def prepare(source: Path, target: Path, quantities: list[str], age_ms: int):
+def prepare(source: Path, target: Path, quantities: list[str], age_ms: int, *, allow_same_root=False):
     source, target = source.resolve(strict=True), target.resolve(strict=True)
-    assert source != target
+    assert source != target or allow_same_root, 'same-root preparation requires explicit opt-in'
     output = target / 'discovery-public-seed.json'
     stage = output.with_suffix('.preparing')
     assert not output.exists() and not stage.exists()
@@ -76,5 +76,6 @@ if __name__ == '__main__':
     parser.add_argument('--target-root', required=True, type=Path)
     parser.add_argument('--depth-quantities', required=True, nargs='+')
     parser.add_argument('--maximum-book-age-ms', required=True, type=int)
+    parser.add_argument('--allow-same-root', action='store_true', help='Only create a new seed; never overwrite catalog/state')
     args = parser.parse_args()
-    prepare(args.source_root, args.target_root, args.depth_quantities, args.maximum_book_age_ms)
+    prepare(args.source_root, args.target_root, args.depth_quantities, args.maximum_book_age_ms, allow_same_root=args.allow_same_root)
