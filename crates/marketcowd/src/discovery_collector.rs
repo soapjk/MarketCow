@@ -45,6 +45,9 @@ struct Args {
     /// Upstream transport. Switching requires a controlled collector restart.
     #[arg(long, value_enum, default_value = "websocket")]
     input_mode: InputMode,
+    /// CPU market actors; output reservations are bounded to twice this count.
+    #[arg(long, default_value_t = 6)]
+    market_workers: usize,
     #[arg(long)]
     root: PathBuf,
     #[arg(long)]
@@ -389,6 +392,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(
         (1..=32).contains(&args.concurrency)
+            && (1..=8).contains(&args.market_workers)
             && (1..=20).contains(&args.request_market_batch_size)
             && (2..=500).contains(&args.websocket_shard_tokens)
             && (1..=32).contains(&args.websocket_recovery_concurrency)
