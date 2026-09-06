@@ -1,0 +1,7 @@
+[Unit]
+Description=MarketCow isolated Polymarket Paper data plane
+Wants=marketcow-polymarket-proxy.service marketcow-polymarket-discovery.service marketcow-polymarket-collector.service marketcow-paper-read-api.service
+After=network-online.target
+
+[Install]
+WantedBy=default.target

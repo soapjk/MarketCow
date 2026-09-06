@@ -1238,6 +1238,7 @@ dependencies = [
  "futures-util",
  "hex",
  "marketcow-core",
+ "rust_decimal",
  "rustls",
  "serde",
  "serde_json",
@@ -1275,11 +1276,13 @@ dependencies = [
 name = "marketcow-runtime"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "hex",
  "libc",
  "marketcow-core",
  "marketcow-polymarket",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1332,6 +1335,7 @@ dependencies = [
  "marketcow-runtime",
  "marketcow-storage",
  "reqwest",
+ "rusqlite",
  "rust_decimal",
  "serde",
  "serde_json",

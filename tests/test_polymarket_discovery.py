@@ -499,6 +499,52 @@ class PolymarketDiscoveryTest(unittest.TestCase):
         self.assertEqual(second.next_cursor, second.after_cursor + 1)
         self.assertEqual(second.items[0].payload.cursor, second.next_cursor)
 
+    def bounded_source(self, floor):
+        """Synthetic migration fixture; never used for authoritative data."""
+        with sqlite3.connect(self.root / "indexes/latest-state.sqlite3") as db:
+            db.execute("CREATE TABLE recent_events(cursor INTEGER PRIMARY KEY,payload BLOB,sha256 TEXT)")
+            with (self.root / "events.jsonl").open("rb") as stream:
+                for cursor, offset, size, sha in db.execute(
+                    "SELECT cursor,byte_offset,byte_length,line_sha256 FROM event_offsets WHERE cursor>?", (floor,)
+                ).fetchall():
+                    stream.seek(offset)
+                    db.execute("INSERT INTO recent_events VALUES(?,?,?)", (cursor, stream.read(size), sha))
+            size = db.execute("SELECT SUM(length(payload)) FROM recent_events").fetchone()[0]
+            db.executemany("INSERT OR REPLACE INTO metadata VALUES(?,?)", [
+                ("bounded_history_bytes", str(64 * 1024 * 1024)),
+                ("history_floor_cursor", str(floor)), ("recent_event_bytes", str(size)),
+            ])
+            db.execute("DELETE FROM event_offsets")
+        (self.root / "events.jsonl").unlink()
+
+    def test_bounded_source_incremental_without_jsonl(self):
+        writer = self.writer([gamma_row()])
+        with TestClient(self.app()) as client:
+            baseline = self.ready_full_sync(client).json()
+            discovery = client.app.state.polymarket_discovery
+            discovery.stop_background_materialization()
+            writer.apply_snapshot(snapshot("yes-1", "0.41", "0.43", "1785739201000"), received_at=NOW)
+            self.bounded_source(baseline["boundary_cursor"])
+            discovery.materialize_once()
+            frame = discovery.events_page(baseline["projection_id"], baseline["boundary_cursor"], 100)
+            self.assertFalse(frame.resync_required)
+            self.assertEqual(frame.next_cursor, baseline["boundary_cursor"] + 1)
+            self.assertEqual(frame.items[0].payload.cursor, frame.next_cursor)
+
+    def test_bounded_source_expired_materializer_rebuilds_current_state(self):
+        writer = self.writer([gamma_row()])
+        with TestClient(self.app()) as client:
+            baseline = self.ready_full_sync(client).json()
+            discovery = client.app.state.polymarket_discovery
+            discovery.stop_background_materialization()
+            writer.apply_snapshot(snapshot("yes-1", "0.41", "0.43", "1785739201000"), received_at=NOW)
+            writer.apply_snapshot(snapshot("no-1", "0.57", "0.59", "1785739202000"), received_at=NOW)
+            self.bounded_source(baseline["boundary_cursor"] + 1)
+            discovery.materialize_once()
+            current = self.ready_full_sync(client).json()
+            self.assertEqual(current["boundary_cursor"], baseline["boundary_cursor"] + 2)
+            self.assertTrue(discovery.events_page(baseline["projection_id"], baseline["boundary_cursor"], 100).resync_required)
+
     def test_market_settlement_is_optional_and_never_inferred(self):
         without_settlement = gamma_row()
         with_settlement = gamma_row(

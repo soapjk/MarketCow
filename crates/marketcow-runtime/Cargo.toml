@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+rusqlite.workspace = true
 chrono.workspace = true
 hex.workspace = true
 libc.workspace = true

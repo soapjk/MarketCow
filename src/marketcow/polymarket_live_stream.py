@@ -5,11 +5,13 @@ import json
 import logging
 import threading
 import time
+from uuid import uuid4
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import websockets
+from .polymarket_stream_metrics import StreamMetrics
 
 from .polymarket_live import (
     GapEntry,
@@ -33,45 +35,74 @@ LOGGER = logging.getLogger(__name__)
 STREAM_SCHEMA = "marketcow.polymarket.live-stream.v1"
 
 
-def _validate_event(event: LiveEventEnvelope) -> None:
+def _validate_event(event: LiveEventEnvelope, timings=None) -> None:
+    from .polymarket_token_recovery import validate_token_recovery
+    started = time.perf_counter()
+    validate_token_recovery(event)
+    if timings is not None:
+        timings['semantic_validation'] += time.perf_counter() - started
+    started = time.perf_counter()
     if content_sha256(event.canonical_payload) != event.canonical_payload_sha256:
         raise ValueError("live stream canonical payload hash mismatch")
     if content_sha256(event.raw_payload) != event.raw_payload_sha256:
         raise ValueError("live stream raw payload hash mismatch")
     if live_event_identity(event) != event.event_id:
         raise ValueError("live stream event identity mismatch")
+    if timings is not None:
+        timings['hash_identity'] += time.perf_counter() - started
 
 
 def _decode_stream_message(
     raw: str | bytes,
+    timings=None,
 ) -> tuple[
     dict[str, Any], LiveEventEnvelope | LiveBook | list[LiveBook] | None,
 ]:
     """Decode and authenticate one frame in one worker scheduling hop."""
+    started = time.perf_counter()
     message = json.loads(raw)
+    if timings is not None:
+        timings['json_parse'] += time.perf_counter() - started
+    def validate(model, value):
+        started = time.perf_counter()
+        result = model.model_validate(value)
+        if timings is not None:
+            timings['model_validation'] += time.perf_counter() - started
+        return result
     kind = message.get("type")
     if kind == "event":
-        event = LiveEventEnvelope.model_validate(message["event"])
-        _validate_event(event)
+        event = validate(LiveEventEnvelope, message["event"])
+        _validate_event(event, timings)
         return message, event
     if kind == "events":
         events = [
-            LiveEventEnvelope.model_validate(item)
+            validate(LiveEventEnvelope, item)
             for item in message.get("events") or []
         ]
         if not events:
             raise ValueError("live stream event batch is empty")
         for event in events:
-            _validate_event(event)
+            _validate_event(event, timings)
         return message, events
     if kind == "book_confirmation":
-        return message, LiveBook.model_validate(message["book"])
+        return message, validate(LiveBook, message["book"])
     if kind == "book_confirmations":
         books = message.get("books")
         if not isinstance(books, list) or not books:
             raise ValueError("live stream book confirmation batch is empty")
-        return message, [LiveBook.model_validate(book) for book in books]
+        return message, [validate(LiveBook, book) for book in books]
     return message, None
+
+
+def _decode_stream_message_timed(raw, submitted):
+    entered = time.perf_counter()
+    timings = dict.fromkeys(('json_parse', 'model_validation', 'semantic_validation', 'hash_identity'), 0.0)
+    message, validated = _decode_stream_message(raw, timings)
+    finished = time.perf_counter()
+    timings['worker_entry_wait'] = entered - submitted
+    timings['worker_other'] = max(0.0, finished - entered - sum(timings[k] for k in
+        ('json_parse', 'model_validation', 'semantic_validation', 'hash_identity')))
+    return message, validated, timings, finished
 
 
 class PolymarketLiveProjection:
@@ -85,7 +116,9 @@ class PolymarketLiveProjection:
         self._events: deque[LiveEventEnvelope] = deque(maxlen=replay_capacity)
         self._books: dict[str, LiveBook] = {}
         self._gaps: list[GapEntry] = []
+        self._token_recoveries: dict[str, tuple[str, int | None]] = {}
         self._markets: dict[str, Any] = {}
+        self._membership_revision = 0
         self._catalog_source: dict[str, Any] | None = None
         self._catalog_revision: str | None = None
         self._scope_id: str | None = None
@@ -107,8 +140,10 @@ class PolymarketLiveProjection:
         self._ready = False
         self._error_code: str | None = "polymarket_live_stream_disconnected"
         self._last_message_at: datetime | None = None
-        self._subscribers: set[asyncio.Queue[LiveEventEnvelope]] = set()
+        self._subscribers: set[asyncio.Queue[LiveEventEnvelope | PolymarketLiveReadError]] = set()
         self._generation = 0
+        self._confirmation_sequence = 0
+        self._stream_instance_id = uuid4().hex
 
     @property
     def ready(self) -> bool:
@@ -144,6 +179,23 @@ class PolymarketLiveProjection:
             self._ready = False
             self._error_code = code
             self._generation += 1
+            self._notify_subscribers(PolymarketLiveReadError(
+                code, "Source disconnected; re-establish snapshot and stream", 503,
+            ))
+
+    def _notify_subscribers(self, message) -> None:
+        # Called on the ingestion event loop, under the projection lock.
+        for queue in tuple(self._subscribers):
+            if queue.full():
+                self._subscribers.discard(queue)
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait(PolymarketLiveReadError(
+                    "polymarket_live_subscriber_resync_required",
+                    "Subscriber queue exhausted; full-sync required", 503,
+                ))
+            else:
+                queue.put_nowait(message)
 
     def install_state(self, payload: dict[str, Any]) -> None:
         if payload.get("schema_version") != STREAM_SCHEMA:
@@ -159,6 +211,17 @@ class PolymarketLiveProjection:
 
         validated_markets = [LiveMarket.model_validate(item) for item in markets]
         validated_books = [LiveBook.model_validate(item) for item in books]
+        # Older prepared sources mislabeled the opaque exchange hash as SHA256.
+        # Keep book data, but never advertise those fields as trusted confirmation.
+        validated_books = [book if book.confirmed_at is None or (
+            book.confirmation_source is not None
+            and book.confirmation_evidence_sha256 is not None
+            and len(book.confirmation_evidence_sha256) == 64
+            and all(c in "0123456789abcdef" for c in book.confirmation_evidence_sha256)
+            and book.confirmed_at == book.received_at
+        ) else book.model_copy(update={"confirmed_at": None,
+            "confirmation_source": None, "confirmation_evidence_sha256": None})
+            for book in validated_books]
         # Resolved gaps belong to the durable audit/history path.  Keeping the
         # complete ledger in the hot projection made every broad snapshot copy
         # and rescan tens of thousands of irrelevant entries.  The live read
@@ -173,12 +236,43 @@ class PolymarketLiveProjection:
         if latest_cursor < 0 or persisted_cursor < 0 or persisted_cursor > latest_cursor:
             raise ValueError("Polymarket live stream cursor watermarks are invalid")
         with self._lock:
+            self._notify_subscribers(PolymarketLiveReadError(
+                "polymarket_live_stream_resync_required",
+                "Source baseline replaced; obtain a new full-sync", 503,
+            ))
+            self._stream_instance_id = uuid4().hex
+            self._confirmation_sequence = 0
             self._events.clear()
             self._markets = {
                 item.identity.market_id: item for item in validated_markets
             }
+            self._membership_revision += 1
             self._books = {item.token_id: item for item in validated_books}
             self._gaps = validated_gaps
+            self._token_recoveries.clear()
+            if 'token_recoveries' in payload:
+                recoveries = payload['token_recoveries']
+                if not isinstance(recoveries, list) or len(recoveries) > 2048:
+                    raise ValueError('token recovery state capacity/type')
+                for item in recoveries:
+                    if not isinstance(item, dict):
+                        raise ValueError('token recovery state item type')
+                    token = item['token_id']
+                    market = self._markets.get(item['market_id'])
+                    if market is None or market.identity.condition_id != item['condition_id'] or token not in {
+                        outcome.token_id for outcome in market.identity.outcomes
+                    } or token in self._token_recoveries:
+                        raise ValueError('token recovery state identity')
+                    gap = GapEntry.model_validate(item['gap'])
+                    if gap.token_id != token or gap.resolved or gap not in validated_gaps:
+                        raise ValueError('token recovery state gap differs')
+                    snapshot = item['snapshot_cursor']
+                    if snapshot is not None and (not isinstance(snapshot, int) or isinstance(snapshot, bool)
+                            or not 0 < snapshot <= latest_cursor):
+                        raise ValueError('token recovery state boundary')
+                    if not isinstance(item['recovery_id'], str) or not item['recovery_id']:
+                        raise ValueError('token recovery state attempt')
+                    self._token_recoveries[token] = (item['recovery_id'], snapshot)
             self._catalog_source = payload.get("catalog_source")
             self._catalog_revision = payload.get("catalog_revision")
             self._scope_id = payload.get("scope_id") or None
@@ -276,6 +370,7 @@ class PolymarketLiveProjection:
                     raise ValueError(
                         "Polymarket live event arrived before replay was ready"
                     )
+                self._validate_token_recovery_transition(event)
                 if event.cursor != self._latest_cursor + 1:
                     self._ready = False
                     self._error_code = "polymarket_live_stream_cursor_gap"
@@ -293,6 +388,13 @@ class PolymarketLiveProjection:
                 for queue in tuple(self._subscribers):
                     if queue.full():
                         self._subscribers.discard(queue)
+                        while not queue.empty():
+                            queue.get_nowait()
+                        queue.put_nowait(PolymarketLiveReadError(
+                            'polymarket_live_subscriber_resync_required',
+                            'Subscriber queue exhausted; full-sync required',
+                            status_code=503,
+                        ))
                         continue
                     queue.put_nowait(event)
 
@@ -364,36 +466,65 @@ class PolymarketLiveProjection:
             applicable = []
             for book in books:
                 previous = self._books.get(book.token_id)
-                if previous is None:
-                    self._ready = False
-                    self._error_code = (
-                        "polymarket_live_stream_confirmation_mismatch"
-                    )
-                    raise ValueError(
-                        "Polymarket live book confirmation mismatches state"
-                    )
-                if previous.state_checksum != book.state_checksum:
-                    if book.received_at < previous.received_at:
-                        # A WebSocket delta published after this REST
-                        # confirmation can cross it between collector worker
-                        # threads and the loopback event loop. Its later
-                        # received_at proves the confirmation is superseded;
-                        # an equal/newer mismatch remains a hard divergence.
-                        continue
-                    self._ready = False
-                    self._error_code = (
-                        "polymarket_live_stream_confirmation_mismatch"
-                    )
-                    raise ValueError(
-                        "Polymarket live book confirmation mismatches state"
-                    )
-                applicable.append(book)
+                # Confirmations never install a version or recover a missing
+                # book. Reject only this confirmation, preserving other tokens.
+                version_fields = ("condition_id", "book_epoch", "sequence",
+                                  "tick_version", "tick_size", "state_checksum",
+                                  "bids", "asks", "last_trade_price")
+                if previous is None or any(
+                    getattr(previous, field) != getattr(book, field)
+                    for field in version_fields
+                ):
+                    continue
+                if book.confirmed_at is not None and (
+                    book.confirmation_source is None
+                    or book.confirmation_evidence_sha256 is None
+                    or len(book.confirmation_evidence_sha256) != 64
+                    or any(c not in "0123456789abcdef" for c in book.confirmation_evidence_sha256)
+                    or book.confirmed_at != book.received_at
+                ):
+                    continue
+                if book.received_at < previous.received_at:
+                    continue
+                applicable.append(book.model_copy(update={
+                    "book_received_at": previous.book_received_at or previous.received_at,
+                }))
             if applicable:
                 self._books.update({book.token_id: book for book in applicable})
                 self._last_message_at = datetime.now(timezone.utc)
                 self._generation += 1
+                self._confirmation_sequence += 1
+                self._notify_subscribers({
+                    "type": "book_confirmations",
+                    "cursor": self._latest_cursor,
+                    "confirmation_sequence": self._confirmation_sequence,
+                    "stream_instance_id": self._stream_instance_id,
+                    "books": tuple(applicable),
+                })
+
+    def _validate_token_recovery_transition(self, event: LiveEventEnvelope) -> None:
+        from .polymarket_token_recovery import validate_token_recovery
+        token = validate_token_recovery(event)
+        if token is None:
+            return
+        market = self._markets.get(event.market_id)
+        if market is None or market.identity.condition_id != event.condition_id or token not in {
+            outcome.token_id for outcome in market.identity.outcomes
+        }:
+            raise ValueError('token recovery outside catalog identity')
+        if event.event_type == 'recovery_completed':
+            expected = (event.canonical_payload['recovery_id'], event.canonical_payload['snapshot_cursor'])
+            if self._token_recoveries.get(token) != expected:
+                raise ValueError('token recovery completion without matching fresh snapshot')
 
     def _apply_event_state(self, event: LiveEventEnvelope) -> None:
+        if (
+            event.applied and event.event_type == 'recovery_started'
+            and event.canonical_payload.get('recovery_scope') == 'token'
+        ):
+            # A replacement attempt supersedes this token's previous gap, not
+            # another token's availability. Keep replay and snapshots aligned.
+            self._gaps = [gap for gap in self._gaps if gap.token_id != event.token_id]
         for gap in event.gaps:
             identity = content_sha256(gap.model_dump(mode="json"))
             if all(
@@ -409,9 +540,30 @@ class PolymarketLiveProjection:
                 "tick_size_change",
             }
         ):
-            self._books[event.token_id] = LiveBook.model_validate(
+            book = LiveBook.model_validate(
                 event.canonical_payload
             )
+            previous = self._books.get(event.token_id)
+            if (
+                event.event_type in {"best_bid_ask", "last_trade_price"}
+                and previous is not None
+                and previous.received_at > book.received_at
+            ):
+                # These events update an independent top-quote/trade fact, not
+                # the complete order book. They must not roll back a newer
+                # REST/targeted-WS full-book confirmation already delivered to
+                # the consumer projection.
+                book = book.model_copy(update={
+                    "received_at": previous.received_at,
+                })
+            self._books[event.token_id] = book
+            from .polymarket_token_recovery import is_authoritative_book_snapshot
+            if (
+                is_authoritative_book_snapshot(event)
+                and event.token_id in self._token_recoveries
+            ):
+                recovery_id, _ = self._token_recoveries[event.token_id]
+                self._token_recoveries[event.token_id] = (recovery_id, event.cursor)
             market_id = event.market_id
             if market_id and market_id in self._markets:
                 self._markets[market_id] = bind_market_instrument_to_books(
@@ -428,11 +580,28 @@ class PolymarketLiveProjection:
                 event.canonical_payload.get("market")
             )
             self._markets[terminal.identity.market_id] = terminal
+            self._membership_revision += 1
+            retired = set(event.canonical_payload.get("retired_token_ids") or [])
+            expected = {
+                outcome.token_id for outcome in terminal.identity.outcomes
+            }
+            if retired != expected:
+                raise ValueError("terminal retirement binding differs")
+            for token_id in retired:
+                self._token_recoveries.pop(token_id, None)
+            self._gaps = [gap for gap in self._gaps if gap.token_id not in retired]
         if event.event_type == "recovery_started" and event.applied:
+            if event.canonical_payload.get('recovery_scope') == 'token':
+                self._token_recoveries[event.token_id] = (event.canonical_payload['recovery_id'], None)
+                return
             self._active_recovery_id = str(
                 event.canonical_payload.get("recovery_id") or ""
             ) or None
         if event.event_type == "recovery_completed" and event.applied:
+            if event.canonical_payload.get('recovery_scope') == 'token':
+                self._gaps = [gap for gap in self._gaps if gap.token_id != event.token_id]
+                del self._token_recoveries[event.token_id]
+                return
             recovered = set(
                 event.canonical_payload.get("resolved_gap_token_ids")
                 or event.canonical_payload.get("recovered_token_ids") or []
@@ -459,7 +628,9 @@ class PolymarketLiveProjection:
         limit: int,
     ) -> LiveEventPage:
         self._require_ready()
-        selected = set(PolymarketLiveReadStore._scope(market_ids))
+        selected = set(PolymarketLiveReadStore._scope(
+            market_ids, maximum_markets=250,
+        ))
         page_limit = min(limit, PolymarketLiveReadStore.max_event_page_items)
         # Hold the ingestion lock only long enough to capture an immutable
         # watermark and event-reference snapshot.  Pydantic JSON sizing below
@@ -494,7 +665,7 @@ class PolymarketLiveProjection:
         candidates = [
             event for event in events
             if event.cursor > after_cursor
-            and (event.market_id is None or event.market_id in selected)
+            and self.event_affects_scope(event, selected)
         ]
         bounded: list[LiveEventEnvelope] = []
         size = 0
@@ -509,7 +680,7 @@ class PolymarketLiveProjection:
                 break
             bounded.append(event)
             size += event_size
-        next_cursor = bounded[-1].cursor if bounded else after_cursor
+        next_cursor = bounded[-1].cursor if has_more else latest_cursor
         return LiveEventPage(
             after_cursor=after_cursor,
             next_cursor=next_cursor,
@@ -637,6 +808,19 @@ class PolymarketLiveProjection:
             503,
         )
 
+    def event_affects_scope(self, event: LiveEventEnvelope, selected: Iterable[str]) -> bool:
+        selected = set(selected)
+        if event.market_id is None or event.market_id in selected:
+            return True
+        with self._lock:
+            # A configured market consumes the full relation closure. Book and
+            # token-availability changes of a dependency are just as relevant
+            # as its terminal transition and must be pushed without polling.
+            return any(pair.market_id == event.market_id
+                       for mid in selected if mid in self._markets
+                       for relation in self._markets[mid].relations
+                       for pair in relation.outcome_pairs)
+
     def _capture_scope(
         self,
         reader: PolymarketLiveReadStore,
@@ -644,7 +828,9 @@ class PolymarketLiveProjection:
         phases: dict[str, float],
     ) -> dict[str, Any]:
         """Capture one complete scoped projection generation under one lock."""
-        selected = PolymarketLiveReadStore._scope(market_ids)
+        selected = PolymarketLiveReadStore._scope(
+            market_ids, maximum_markets=250,
+        )
         lock_started = time.perf_counter()
         with self._lock:
             phases["lock_wait_ms"] = (time.perf_counter() - lock_started) * 1000
@@ -654,7 +840,7 @@ class PolymarketLiveProjection:
                     "Polymarket real-time in-memory projection is not ready",
                     503,
                 )
-            if self._active_recovery_id or self._persistence_error:
+            if self._persistence_error:
                 raise PolymarketLiveReadStore._stable_boundary_unavailable("full-sync")
             selected_markets = [self._markets.get(market_id) for market_id in selected]
             if any(market is None for market in selected_markets):
@@ -671,8 +857,6 @@ class PolymarketLiveProjection:
                 if pair.market_id not in selected
             })
             relation_markets = [self._markets.get(item) for item in relation_market_ids]
-            if any(market is None for market in relation_markets):
-                raise PolymarketLiveReadStore._stable_boundary_unavailable("full-sync")
             all_markets = [
                 market for market in (*selected_markets, *relation_markets)
                 if market is not None
@@ -681,16 +865,14 @@ class PolymarketLiveProjection:
                 outcome.token_id
                 for market in selected_markets
                 if market is not None
-                and market.lifecycle_state == "active"
-                and market.accepting_orders
                 for outcome in market.identity.outcomes
             }
             relation_token_ids = {
-                pair.yes_token_id
+                token
                 for market in selected_markets if market is not None
-                and market.lifecycle_state == "active"
                 for relation in market.relations
                 for pair in relation.outcome_pairs
+                for token in (pair.yes_token_id, pair.no_token_id)
             }
             required_token_ids = own_token_ids | relation_token_ids
             source_books = {
@@ -701,6 +883,9 @@ class PolymarketLiveProjection:
                 gap for gap in self._gaps
                 if not gap.resolved and gap.token_id in required_token_ids
             ]
+            recovering = set(self._token_recoveries) & required_token_ids
+            active_recovery_id = self._active_recovery_id
+            binding_errors = set()
             checked_at = reader.now_provider()
             generation = self._generation
             revision = self._catalog_revision
@@ -720,15 +905,6 @@ class PolymarketLiveProjection:
             if (
                 not revision
                 or generation < 1
-                or (
-                    not required_token_ids
-                    and any(
-                        market is not None and market.lifecycle_state == "active"
-                        for market in selected_markets
-                    )
-                )
-                or unresolved
-                or any(book is None for book in source_books.values())
             ):
                 raise PolymarketLiveReadStore._stable_boundary_unavailable("full-sync")
             for market in selected_markets:
@@ -740,6 +916,8 @@ class PolymarketLiveProjection:
                     outcome.token_id for outcome in market.identity.outcomes
                 )
                 market_books = [source_books.get(token_id) for token_id in expected]
+                if any(book is None for book in market_books):
+                    continue
                 observed_ticks = {
                     book.tick_size for book in market_books if book is not None
                 }
@@ -767,11 +945,7 @@ class PolymarketLiveProjection:
                     or market.rules.instrument.price_increment
                     != market_books[0].tick_size
                 ):
-                    raise PolymarketLiveReadError(
-                        "polymarket_instrument_book_binding_incomplete",
-                        "Live book tick differs from atomic instrument facts",
-                        503,
-                    )
+                    binding_errors.add(market.identity.market_id)
             # Projection models are publication snapshots: ingestion replaces
             # market/book/gap instances and never mutates an instance after it
             # becomes visible.  Capture their references while holding the
@@ -789,6 +963,8 @@ class PolymarketLiveProjection:
                 if book is not None
             }
             gaps = tuple(unresolved)
+            stream_instance_id = self._stream_instance_id
+            confirmation_sequence = self._confirmation_sequence
             phases["projection_copy_ms"] = (
                 time.perf_counter() - copy_started
             ) * 1000
@@ -797,8 +973,7 @@ class PolymarketLiveProjection:
             default=checked_at,
         )
         maximum_age_ms = (checked_at - oldest).total_seconds() * 1000
-        if maximum_age_ms < 0:
-            raise self._freshness_budget_exhausted()
+        maximum_age_ms = max(0.0, maximum_age_ms)
         phases.update({
             "scope_count": float(len(selected)),
             "maximum_book_age_ms": maximum_age_ms,
@@ -807,10 +982,15 @@ class PolymarketLiveProjection:
         })
         return {
             "selected": selected,
+            "stream_instance_id": stream_instance_id,
+            "confirmation_sequence": confirmation_sequence,
             "selected_count": len(selected),
             "markets": markets,
             "books": books,
             "gaps": gaps,
+            "recovering": recovering,
+            "active_recovery_id": active_recovery_id,
+            "binding_errors": binding_errors,
             "checked_at": checked_at,
             "oldest": oldest,
             "maximum_age_ms": maximum_age_ms,
@@ -853,32 +1033,65 @@ class PolymarketLiveProjection:
         transient.cursor = capture["cursor"]
         transient.books = capture["books"]
         transient.gaps = capture["gaps"]
+        transient.active_recovery_id = capture["active_recovery_id"]
         frames = [
-            transient.frame(market_id, now=capture["checked_at"])
+            transient.frame(market_id, now=capture["checked_at"], evaluate_freshness=False)
             for market_id in selected
         ]
-        referenced_token_ids = {
-            token_id for frame in frames
-            for token_id in (*frame.token_ids, *frame.relation_token_ids)
-        }
+        for index, frame in enumerate(frames):
+            market = transient.catalog[frame.market_id]
+            required = {outcome.token_id for outcome in market.identity.outcomes}
+            required.update(pair.yes_token_id for pair in frame.relation_pairs
+                            if pair.market_id not in transient.catalog
+                            or transient.catalog[pair.market_id].lifecycle_state == "active")
+            if market.lifecycle_state in {"closed", "resolved", "invalid"}:
+                required = set()
+            missing = sorted(required - capture["books"].keys())
+            recovering = sorted(required & capture["recovering"])
+            reasons = set(frame.reason_codes)
+            if recovering:
+                reasons.add("recovery_in_progress")
+            if frame.market_id in capture["binding_errors"]:
+                reasons.add("polymarket_instrument_book_binding_incomplete")
+            observed = [capture["books"][token].received_at for token in required
+                        if token in capture["books"]]
+            frames[index] = frame.model_copy(update={
+                "status": "terminal" if frame.status == "terminal" else (
+                    "fail_closed" if reasons or missing else "ready"),
+                "reason_codes": sorted(reasons),
+                "decision_owner": "consumer", "open_position_allowed": None,
+                "open_position_error_code": None,
+                "required_token_ids": sorted(required), "missing_token_ids": missing,
+                "recovering_token_ids": recovering,
+                "dependency_market_ids": sorted({pair.market_id for pair in frame.relation_pairs
+                                                  if pair.market_id != frame.market_id}),
+                "maximum_book_age_ms": max(0.0, (capture["checked_at"] - min(observed)).total_seconds() * 1000)
+                if observed else None,
+            })
+        # Snapshot and stream have the identical identity closure, including
+        # both dependency outcomes and last-known terminal books. Strategy
+        # eligibility is represented by frames, never by silently hiding books.
         page_books = {
             token_id: capture["books"][token_id]
-            for token_id in sorted(referenced_token_ids)
-            if token_id in capture["books"]
+            for token_id in sorted(capture["books"])
         }
         active_count = sum(
             market.lifecycle_state == "active" for market in selected_markets
         )
         terminal_count = len(selected_markets) - active_count
+        terminal_state_complete = all(
+            market.lifecycle_state == "resolved" and bool(market.resolution)
+            for market in selected_markets
+            if market.lifecycle_state != "active"
+        )
         complete_count = sum(frame.status == "ready" for frame in frames)
         missing_count = sum(frame.status == "fail_closed" for frame in frames)
+        latest_state_ready = missing_count == 0 and terminal_state_complete
         exact_ready = (
-            len(selected) == 100
-            and active_count == 100
-            and complete_count == 100
+            active_count == len(selected)
+            and complete_count == len(selected)
             and missing_count == 0
         )
-        ready = missing_count == 0
         reason_codes = sorted({
             reason for frame in frames for reason in frame.reason_codes
         })
@@ -889,12 +1102,16 @@ class PolymarketLiveProjection:
             "scope_id": capture["scope_id"],
         }
         health = LiveReadHealth(
-            status="index_ready" if ready and not terminal_count else "degraded",
+            status="index_ready" if latest_state_ready else "degraded",
             catalog_revision=capture["revision"],
             catalog_index_ready=True,
-            latest_state_ready=ready and not terminal_count,
+            # A content-addressed resolved lifecycle with a typed payout is the
+            # complete latest state for a retired market.  It intentionally has
+            # no fresh L2 dependency, but must remain distinguishable from a
+            # merely closed/invalid market whose settlement is incomplete.
+            latest_state_ready=latest_state_ready,
             market_count=len(selected),
-            token_count=len(referenced_token_ids),
+            token_count=len(page_books),
             book_token_count=len(page_books),
             book_complete_market_count=sum(frame.status == "ready" for frame in frames),
             active_market_count=active_count,
@@ -906,7 +1123,7 @@ class PolymarketLiveProjection:
                 else "terminal_degraded" if terminal_count and not missing_count
                 else "data_degraded"
             ),
-            unresolved_gap_count=0,
+            unresolved_gap_count=len(capture["gaps"]),
             latest_cursor=capture["cursor"],
             persisted_cursor=capture["persisted_cursor"],
             persistence_lag_events=(
@@ -924,11 +1141,26 @@ class PolymarketLiveProjection:
             maximum_book_age_ms=capture["maximum_age_ms"],
             **common,
         )
+        dependency_ids = sorted({pair.market_id for market in selected_markets
+                                 for relation in market.relations for pair in relation.outcome_pairs
+                                 if pair.market_id not in selected})
+        by_id = {market.identity.market_id: market for market in markets}
+        dependency_markets = [by_id[mid] for mid in dependency_ids if mid in by_id]
+        missing_dependency_ids = [mid for mid in dependency_ids if mid not in by_id]
+        dependency_binding = {
+            "catalog_revision": capture["revision"], "cursor": capture["cursor"],
+            "projection_generation": capture["generation"], "scope_id": capture["scope_id"],
+            "markets": [market.model_dump(mode="json") for market in dependency_markets],
+            "missing_market_ids": missing_dependency_ids,
+        }
         bootstrap = LiveBootstrapResponse(
             catalog_revision=capture["revision"],
             catalog_source=capture["catalog_source"],
             cursor=capture["cursor"],
             markets=selected_markets,
+            dependency_markets=dependency_markets,
+            missing_dependency_market_ids=missing_dependency_ids,
+            dependency_metadata_sha256=content_sha256(dependency_binding),
             active_token_ids=sorted({
                 outcome.token_id
                 for market in selected_markets if market.active and not market.closed
@@ -955,15 +1187,18 @@ class PolymarketLiveProjection:
         *, _phase_ms: dict[str, float] | None = None,
     ) -> tuple[bytes, dict[str, float], Any]:
         phases = _phase_ms if _phase_ms is not None else {}
-        operation_started = time.perf_counter()
-        capture = self._capture_scope(reader, market_ids, phases)
+        selected = tuple(market_ids)
+        stable_wait_started = time.perf_counter()
+        capture = self._capture_scope(reader, selected, phases)
+        phases.update({
+            "stable_wait_ms": (
+                time.perf_counter() - stable_wait_started
+            ) * 1000,
+            "stable_wait_attempts": 0.0,
+        })
         health, bootstrap, snapshot = self._build_atomic_components(
             reader, capture, phases,
         )
-        maximum_seconds = reader.consumer_maximum_book_age_seconds
-        if maximum_seconds is None:
-            raise ValueError("consumer maximum book age must be configured")
-        delivery_ms = reader.minimum_delivery_headroom_seconds * 1000
         if kind == "health":
             model: Any = health
         elif kind == "bootstrap":
@@ -979,9 +1214,8 @@ class PolymarketLiveProjection:
                 scope_id=capture["scope_id"],
                 oldest_book_received_at=capture["oldest"],
                 maximum_book_age_ms=capture["maximum_age_ms"],
-                consumer_maximum_book_age_ms=maximum_seconds * 1000,
-                minimum_delivery_headroom_ms=delivery_ms,
-                freshness_budget_remaining_ms=0,
+                stream_instance_id=capture["stream_instance_id"],
+                confirmation_sequence=capture["confirmation_sequence"],
                 health=health, bootstrap=bootstrap, snapshot=snapshot,
             )
         else:
@@ -989,43 +1223,10 @@ class PolymarketLiveProjection:
         serialization_started = time.perf_counter()
         payload = model.model_dump_json().encode("utf-8")
         serialization_ms = (time.perf_counter() - serialization_started) * 1000
-        known_cost_ms = (time.perf_counter() - operation_started) * 1000
-        remaining_ms = (
-            maximum_seconds * 1000
-            - capture["maximum_age_ms"]
-            - known_cost_ms
-        )
-        if kind == "full-sync":
-            # Reserve two measured serialization passes beyond the already
-            # observed first pass.  The payload therefore reports a
-            # conservative, directly verifiable delivery budget without a
-            # self-referential serialization loop.
-            remaining_ms -= 2 * serialization_ms
-            model = model.model_copy(update={
-                "freshness_budget_remaining_ms": remaining_ms,
-            })
-            serialization_started = time.perf_counter()
-            payload = model.model_dump_json().encode("utf-8")
-            serialization_ms += (
-                time.perf_counter() - serialization_started
-            ) * 1000
-            known_cost_ms = (time.perf_counter() - operation_started) * 1000
-            actual_remaining_ms = (
-                maximum_seconds * 1000
-                - capture["maximum_age_ms"]
-                - known_cost_ms
-            )
-            if actual_remaining_ms < remaining_ms:
-                raise self._freshness_budget_exhausted()
-        check_started = time.perf_counter()
         phases.update({
             "json_serialize_ms": serialization_ms,
             "response_body_bytes": float(len(payload)),
-            "freshness_headroom_ms": remaining_ms,
-            "freshness_check_ms": (time.perf_counter() - check_started) * 1000,
         })
-        if remaining_ms <= delivery_ms:
-            raise self._freshness_budget_exhausted()
         return payload, phases, model
 
     def bootstrap(
@@ -1083,13 +1284,140 @@ class PolymarketLiveProjection:
             reader, market_ids, "health", _phase_ms=_phase_ms,
         )[0]
 
-    def subscribe(self, *, capacity: int = 1024) -> asyncio.Queue[LiveEventEnvelope]:
-        queue: asyncio.Queue[LiveEventEnvelope] = asyncio.Queue(maxsize=capacity)
+    def subscribe(self, *, capacity: int = 1024) -> asyncio.Queue[LiveEventEnvelope | PolymarketLiveReadError]:
+        if not 1 <= capacity <= 4096:
+            raise ValueError('subscriber capacity must be in 1..4096')
+        queue: asyncio.Queue[LiveEventEnvelope | PolymarketLiveReadError] = asyncio.Queue(maxsize=capacity)
         with self._lock:
             self._subscribers.add(queue)
         return queue
 
-    def unsubscribe(self, queue: asyncio.Queue[LiveEventEnvelope]) -> None:
+    async def stream_messages(self, market_ids: Iterable[str], after_cursor: int, *, metrics=None):
+        """One replay/live path, including dependency and confirmation facts.
+
+        Cursor denotes a scanned source boundary; filtered events can skip
+        numbers. Confirmation sequences belong to this projection instance
+        and reconnect obtains current confirmation facts in a new baseline.
+        """
+        scope = tuple(market_ids)
+        queue = self.subscribe(capacity=2048)
+        cursor = after_cursor
+        membership = None
+        def current_membership():
+            nonlocal membership
+            membership = self.scope_membership(scope, membership)
+            return membership
+        try:
+            while True:
+                stage_started = time.perf_counter()
+                with self._lock:
+                    page = self.events_after(scope, cursor, 1000)
+                    if not page.has_more:
+                        # Same source boundary as this replay page. Subscribe
+                        # first so confirmations after capture remain queued.
+                        confirmation_sequence = self._confirmation_sequence
+                        instance = self._stream_instance_id
+                        _, _, scope_tokens = current_membership()
+                        baseline = tuple(book for book in self._books.values()
+                                         if book.confirmed_at is not None
+                                         and book.token_id in scope_tokens)
+                if metrics is not None:
+                    metrics.record('replay_page', time.perf_counter() - stage_started)
+                for event in page.items:
+                    stage_started = time.perf_counter()
+                    frame = {"type": "event", "cursor": event.cursor,
+                             "event": event.model_dump(mode="json")}
+                    if metrics is not None:
+                        metrics.record('filter_convert', time.perf_counter() - stage_started)
+                    yield frame
+                cursor = page.next_cursor
+                if not page.has_more:
+                    break
+            # Never advertise a watermark newer than the replay just scanned.
+            stage_started = time.perf_counter()
+            frame = {"type": "ready", "cursor": cursor,
+                   "stream_instance_id": instance,
+                   "confirmation_sequence": confirmation_sequence,
+                   "confirmation_books": [book.model_dump(mode="json") for book in baseline]}
+            if metrics is not None:
+                metrics.record('filter_convert', time.perf_counter() - stage_started)
+            yield frame
+            while True:
+                message = await queue.get()
+                if isinstance(message, PolymarketLiveReadError):
+                    raise message
+                if isinstance(message, dict):
+                    if message["confirmation_sequence"] <= confirmation_sequence:
+                        continue
+                    if message["cursor"] < cursor:
+                        continue
+                    # One current closure per frame, not a full market/relation
+                    # scan for every token. No cross-generation cache.
+                    stage_started = time.perf_counter()
+                    _, _, scope_tokens = current_membership()
+                    books = [book.model_dump(mode="json") for book in message["books"]
+                             if book.token_id in scope_tokens]
+                    if metrics is not None:
+                        metrics.record('filter_convert', time.perf_counter() - stage_started)
+                    if books:
+                        yield {**message, "books": books}
+                    confirmation_sequence = message["confirmation_sequence"]
+                    continue
+                if message.cursor <= cursor:
+                    continue
+                stage_started = time.perf_counter()
+                _, scope_markets, _ = current_membership()
+                frame = ({"type": "event", "cursor": message.cursor,
+                          "event": message.model_dump(mode="json")}
+                         if message.market_id is None or message.market_id in scope_markets else None)
+                if metrics is not None:
+                    metrics.record('filter_convert', time.perf_counter() - stage_started)
+                if frame is not None:
+                    yield frame
+                cursor = message.cursor
+        finally:
+            self.unsubscribe(queue)
+
+    def token_affects_scope(self, token_id: str, selected: Iterable[str]) -> bool:
+        return token_id in self.scope_token_ids(selected)
+
+    def scope_membership(self, selected, cached=None):
+        """One bounded connection-local cache of metadata membership only.
+
+        Full state replacement and typed terminal metadata replacement invalidate
+        it. Tick binding only changes instrument facts, never identity/relations.
+        Books, confirmations, gaps and readiness are deliberately not cached.
+        """
+        with self._lock:
+            if cached is not None and cached[0] == self._membership_revision:
+                return cached
+            markets = set(selected)
+            tokens = set()
+            for mid in selected:
+                if mid not in self._markets:
+                    continue
+                market = self._markets[mid]
+                tokens.update(outcome.token_id for outcome in market.identity.outcomes)
+                for relation in market.relations:
+                    for pair in relation.outcome_pairs:
+                        markets.add(pair.market_id)
+                        tokens.update((pair.yes_token_id, pair.no_token_id))
+            return self._membership_revision, frozenset(markets), frozenset(tokens)
+
+    def scope_token_ids(self, selected: Iterable[str]) -> set[str]:
+        with self._lock:
+            tokens = set()
+            for mid in selected:
+                if mid not in self._markets:
+                    continue
+                market = self._markets[mid]
+                tokens.update(outcome.token_id for outcome in market.identity.outcomes)
+                for relation in market.relations:
+                    for pair in relation.outcome_pairs:
+                        tokens.update((pair.yes_token_id, pair.no_token_id))
+            return tokens
+
+    def unsubscribe(self, queue: asyncio.Queue[LiveEventEnvelope | PolymarketLiveReadError]) -> None:
         with self._lock:
             self._subscribers.discard(queue)
 
@@ -1375,6 +1703,7 @@ class PolymarketLiveStreamClient:
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             self.projection.mark_connecting()
+            metrics = StreamMetrics('rust_source_to_api')
             try:
                 async with websockets.connect(
                     self.uri,
@@ -1383,14 +1712,21 @@ class PolymarketLiveStreamClient:
                     ping_timeout=60,
                 ) as websocket:
                     await websocket.send(json.dumps({"type": "subscribe"}))
+                    receive_started = time.perf_counter()
                     async for raw in websocket:
+                        metrics.record('receive_wait', time.perf_counter()-receive_started)
                         # JSON decoding, Pydantic validation, and integrity hash
                         # verification are CPU-bound.  Keeping them off the API
                         # event loop prevents broad frame serialization or a
                         # slow HTTP writer from starving WebSocket receive.
-                        message, validated = await asyncio.to_thread(
-                            _decode_stream_message, raw
+                        decode_started = time.perf_counter()
+                        message, validated, detail, worker_finished = await asyncio.to_thread(
+                            _decode_stream_message_timed, raw, decode_started
                         )
+                        detail['await_resume'] = time.perf_counter() - worker_finished
+                        metrics.record_decode(detail, message)
+                        metrics.record('decode',time.perf_counter()-decode_started)
+                        apply_started = time.perf_counter()
                         kind = message.get("type")
                         if kind == "state":
                             await asyncio.to_thread(
@@ -1496,9 +1832,13 @@ class PolymarketLiveStreamClient:
                             )
                         else:
                             raise ValueError("unsupported Polymarket stream frame")
+                        metrics.record('apply',time.perf_counter()-apply_started)
+                        metrics.emit(self.projection.latest_cursor)
+                        receive_started = time.perf_counter()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                metrics.emit(self.projection.latest_cursor, force=True, error=f'{type(exc).__name__}: {str(exc)[:300]}')
                 self.projection.mark_disconnected(
                     "polymarket_live_stream_cursor_gap"
                     if "cursor" in str(exc).lower()

@@ -22,6 +22,7 @@ def main() -> None:
     )
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--discovery-root", required=True, type=Path)
+    parser.add_argument("--configured-scope", type=Path)
     parser.add_argument("--host", required=True)
     parser.add_argument("--port", required=True, type=int)
     parser.add_argument(
@@ -65,6 +66,7 @@ def main() -> None:
         parser.error("--port must be in [1, 65535]")
 
     app = create_polymarket_live_read_app(
+        configured_scope_path=arguments.configured_scope,
         root=arguments.root,
         discovery_root=arguments.discovery_root,
         stable_snapshot_max_book_age_seconds=(

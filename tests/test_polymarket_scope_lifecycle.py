@@ -266,14 +266,14 @@ def test_hot_health_reports_terminal_without_exact_ready_or_global_failure() -> 
             consumer_maximum_book_age_seconds=5,
         )
         health = projection.health(reader, ["m1", "m2"])
-        assert health.status == "degraded"
+        assert health.status == "index_ready"
         assert health.scope_status == "terminal_degraded"
         assert health.scope_id == "a" * 64
         assert health.active_market_count == 1
         assert health.terminal_market_count == 1
         assert health.complete_market_count == 1
         assert health.missing_market_count == 0
-        assert health.status != "index_ready"
+        assert health.latest_state_ready
 
 
 def test_pretrade_guard_rejects_terminal_and_stale_books_with_audit() -> None:

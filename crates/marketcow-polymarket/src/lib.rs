@@ -1,6 +1,8 @@
 //! Strict Polymarket CLOB raw-frame normalizer. Transport and cursor ownership stay outside this
 //! crate; a frame is normalized without network, storage, or async-runtime dependencies.
 
+pub mod discovery_source;
+
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use marketcow_core::{
@@ -184,12 +186,12 @@ pub async fn run_polymarket_transport(
         if *shutdown.borrow() {
             return Ok(());
         }
-        if !publish_connection_gaps(&tokens, attempt, &output, &mut shutdown).await? {
-            return Ok(());
-        }
         match run_polymarket_connection(&config, &tokens, &output, &mut shutdown).await {
             Ok(ConnectionEnd::Shutdown) => return Ok(()),
             Ok(ConnectionEnd::Disconnected) => {
+                if !publish_connection_gaps(&tokens, attempt, &output, &mut shutdown).await? {
+                    return Ok(());
+                }
                 tracing::warn!(
                     attempt,
                     reason = "upstream_disconnected",
@@ -198,6 +200,9 @@ pub async fn run_polymarket_transport(
             }
             Err(TransportError::Backpressure) => return Err(TransportError::Backpressure),
             Err(error) if attempt == config.maximum_reconnect_attempts => {
+                if !publish_connection_gaps(&tokens, attempt, &output, &mut shutdown).await? {
+                    return Ok(());
+                }
                 tracing::warn!(
                     attempt,
                     reason = error.reason_code(),
@@ -206,6 +211,9 @@ pub async fn run_polymarket_transport(
                 return Err(error);
             }
             Err(error) => {
+                if !publish_connection_gaps(&tokens, attempt, &output, &mut shutdown).await? {
+                    return Ok(());
+                }
                 tracing::warn!(
                     attempt,
                     reason = error.reason_code(),
@@ -1366,9 +1374,6 @@ mod tests {
             sender,
             shutdown_rx,
         ));
-        let boundary = receiver.recv().await.unwrap();
-        assert_eq!(boundary.len(), 1);
-        assert_eq!(boundary[0].raw_payload["event_type"], "source_gap");
         let books = receiver.recv().await.unwrap();
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].raw_payload["event_type"], "book");

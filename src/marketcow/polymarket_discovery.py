@@ -9,7 +9,7 @@ import threading
 import uuid
 import fcntl
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -35,6 +35,59 @@ DISCOVERY_RELATION_SCHEMA_VERSION = "marketcow.polymarket.discovery-relation.v3"
 LIFECYCLE_HISTORY_SCHEMA_VERSION = "marketcow.polymarket.lifecycle-history.v3"
 DEFAULT_MAXIMUM_FULL_SYNC_BYTES = 256 * 1024 * 1024
 LOGGER = logging.getLogger(__name__)
+
+
+def _source_history_floor(connection, metadata) -> int:
+    if "bounded_history_bytes" in metadata:
+        return int(metadata["history_floor_cursor"])
+    earliest = connection.execute("SELECT MIN(cursor) FROM event_offsets").fetchone()[0]
+    return max(0, int(earliest) - 1) if earliest is not None else 0
+
+
+@contextmanager
+def _source_event_lines(connection, metadata, event_path, after, boundary, limit):
+    """Read and verify one pinned source transaction, including bounded eviction."""
+    bounded = "bounded_history_bytes" in metadata
+    if after < _source_history_floor(connection, metadata):
+        raise PolymarketLiveReadError(
+            "discovery_cursor_expired", "Discovery cursor expired; resync from a snapshot", 410
+        )
+    rows = connection.execute(
+        ("SELECT cursor,payload,sha256 AS line_sha256 FROM recent_events "
+         "WHERE cursor>? AND cursor<=? ORDER BY cursor LIMIT ?") if bounded else
+        ("SELECT cursor,byte_offset,byte_length,line_sha256 FROM event_offsets "
+         "WHERE cursor>? AND cursor<=? ORDER BY cursor LIMIT ?"),
+        (after, boundary, limit),
+    )
+    with (nullcontext(None) if bounded else event_path.open("rb")) as stream:
+        def verified():
+            expected = after + 1
+            for row in rows:
+                if bounded:
+                    line = bytes(row["payload"])
+                else:
+                    stream.seek(int(row["byte_offset"]))
+                    line = stream.read(int(row["byte_length"]))
+                if int(row["cursor"]) != expected:
+                    raise PolymarketLiveReadError(
+                        "discovery_source_discontinuity", "Missing source event; resync required", 409
+                    )
+                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
+                    raise PolymarketLiveReadError(
+                        "polymarket_state_integrity_failed", "Event continuity/hash mismatch", 409
+                    )
+                event = LiveEventEnvelope.model_validate_json(line)
+                if event.cursor != expected:
+                    raise PolymarketLiveReadError(
+                        "polymarket_state_integrity_failed", "Event cursor mismatch", 409
+                    )
+                expected += 1
+                yield event
+            if expected <= boundary and expected - after - 1 < limit:
+                raise PolymarketLiveReadError(
+                    "discovery_source_discontinuity", "Missing source events", 409
+                )
+        yield verified()
 
 
 def install_discovery_openapi_extension(app: FastAPI) -> None:
@@ -533,39 +586,16 @@ class PolymarketDiscoveryStore:
                 "discovery_event_limit_invalid", "limit must be in [1, 10000]", 422
             )
         with self.reader._state_snapshot() as (_, connection, metadata):
-            earliest = connection.execute(
-                "SELECT MIN(cursor) FROM event_offsets"
-            ).fetchone()[0]
             boundary_cursor = int(metadata["latest_cursor"])
             if after_cursor > boundary_cursor:
                 raise PolymarketLiveReadError(
                     "discovery_cursor_ahead", "Cursor is ahead of the live boundary", 422
                 )
-            if after_cursor and earliest is not None and after_cursor < int(earliest) - 1:
-                raise PolymarketLiveReadError(
-                    "discovery_cursor_expired",
-                    "Discovery cursor expired; resync from a snapshot",
-                    410,
-                )
-            rows = list(connection.execute(
-                """SELECT cursor, byte_offset, byte_length, line_sha256
-                    FROM event_offsets WHERE cursor > ? ORDER BY cursor LIMIT ?""",
-                (after_cursor, limit + 1),
-            ))
+            with _source_event_lines(connection, metadata, self.reader.event_path,
+                                     after_cursor, boundary_cursor, limit + 1) as source_events:
+                events = list(source_events)
             catalog_revision = str(metadata["catalog_revision"])
-        has_more = len(rows) > limit
-        rows = rows[:limit]
-        events: list[LiveEventEnvelope] = []
-        with self.reader.event_path.open("rb") as stream:
-            for row in rows:
-                stream.seek(int(row["byte_offset"]))
-                line = stream.read(int(row["byte_length"]))
-                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
-                    raise PolymarketLiveReadError(
-                        "polymarket_state_integrity_failed", "Event hash mismatch", 409
-                    )
-                events.append(LiveEventEnvelope.model_validate_json(line))
-        return events, boundary_cursor, has_more, catalog_revision
+        return events[:limit], boundary_cursor, len(events) > limit, catalog_revision
 
     def lifecycle_history(
         self,
@@ -1552,32 +1582,13 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                         "SELECT COUNT(DISTINCT market_id) FROM gaps "
                         "WHERE resolved=0 AND market_id IS NOT NULL"
                     ).fetchone()[0])
-                    earliest = source.execute(
-                        "SELECT MIN(cursor) FROM event_offsets"
-                    ).fetchone()[0]
-                    if (
-                        earliest is not None
-                        and current.boundary_cursor < int(earliest) - 1
-                    ):
+                    if current.boundary_cursor < _source_history_floor(source, state):
                         requires_full_materialization = True
                     else:
-                        event_rows = source.execute(
-                            """SELECT cursor, byte_offset, byte_length, line_sha256
-                            FROM event_offsets WHERE cursor>? AND cursor<=?
-                            ORDER BY cursor""",
-                            (current.boundary_cursor, boundary_cursor),
-                        )
-                        with self.reader.event_path.open("rb") as stream:
-                            for event_row in event_rows:
-                                stream.seek(int(event_row["byte_offset"]))
-                                line = stream.read(int(event_row["byte_length"]))
-                                if hashlib.sha256(line).hexdigest() != event_row["line_sha256"]:
-                                    raise PolymarketLiveReadError(
-                                        "polymarket_state_integrity_failed",
-                                        "Event hash mismatch",
-                                        409,
-                                    )
-                                event = LiveEventEnvelope.model_validate_json(line)
+                        with _source_event_lines(source, state, self.reader.event_path,
+                                                 current.boundary_cursor, boundary_cursor,
+                                                 boundary_cursor - current.boundary_cursor) as event_rows:
+                            for event in event_rows:
                                 if event.event_type in {
                                     "catalog_revision", "market_terminal", "market_resolved"
                                 }:
@@ -2043,9 +2054,17 @@ class PolymarketDiscoveryStore(_InMemoryPolymarketDiscoveryStore):
                 ),
             )
 
-        events, source_boundary_cursor, has_more, catalog_revision = (
-            self._read_events(after_cursor, 1)
-        )
+        try:
+            events, source_boundary_cursor, has_more, catalog_revision = self._read_events(after_cursor, 1)
+        except PolymarketLiveReadError as exc:
+            if exc.code not in {"discovery_cursor_expired", "discovery_source_discontinuity"}:
+                raise
+            return DiscoveryDeltaFrame(
+                projection_id=projection_id, catalog_revision=current.catalog_revision,
+                universe_revision=current.universe_revision, after_cursor=after_cursor,
+                next_cursor=after_cursor, boundary_cursor=current.boundary_cursor,
+                has_more=False, resync_required=True, items=[],
+            )
         if not events:
             return DiscoveryDeltaFrame(
                 projection_id=projection_id,

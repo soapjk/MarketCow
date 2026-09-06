@@ -1,0 +1,23 @@
+[Unit]
+Description=MarketCow read-only Paper API (U1 LAN)
+Requires=marketcow-polymarket-collector.service
+After=marketcow-polymarket-collector.service marketcow-polymarket-discovery.service
+ConditionPathIsMountPoint=/mnt/p44pro/marketcow-shadow-v3-runtime/linux
+
+[Service]
+Type=simple
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/mnt/p44pro/marketcow-shadow-v3-runtime/linux/read-api-packages:/mnt/p44pro/projects/marketcow-shadow-v3/src
+ExecStart=/usr/bin/python3 /mnt/p44pro/projects/marketcow-shadow-v3/scripts/run_polymarket_live_read_api.py --root /mnt/p44pro/marketcow-shadow-v3-runtime/linux/dynamic-live-candidate-r1 --discovery-root /mnt/p44pro/marketcow-shadow-v3-runtime/linux/discovery-source-r1 --configured-scope /mnt/p44pro/marketcow-shadow-v3-runtime/linux/dynamic-live-candidate-r1/configured-scope.json --host 192.168.124.3 --port 8793 --live-stream-uri ws://127.0.0.1:18896 --stable-snapshot-max-book-age-seconds 5 --consumer-maximum-book-age-seconds 5 --minimum-delivery-headroom-seconds 0 --stable-read-wait-seconds 6 --stable-read-poll-seconds .025 --executor-workers 2 --discovery-maximum-book-age-ms 5000 --discovery-maximum-full-sync-bytes 268435456 --live-stream-replay-capacity 2048 --discovery-depth-notional 10 --discovery-depth-notional 50 --discovery-depth-notional 100 --discovery-depth-notional 500 --no-access-log
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=40
+MemoryMax=384M
+NoNewPrivileges=true
+StandardOutput=append:/mnt/p44pro/marketcow-shadow-v3-runtime/linux/logs/paper-read-api.log
+StandardError=append:/mnt/p44pro/marketcow-shadow-v3-runtime/linux/logs/paper-read-api.log
+
+[Install]
+WantedBy=marketcow-paper-data.target

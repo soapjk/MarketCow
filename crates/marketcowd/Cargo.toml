@@ -8,8 +8,21 @@ license.workspace = true
 name = "marketcow"
 path = "src/main.rs"
 
+[[bin]]
+name = "marketcow-source-maintenance"
+path = "src/source_maintenance.rs"
+
+[[bin]]
+name = "marketcow-discovery-collector"
+path = "src/discovery_collector.rs"
+
+[[bin]]
+name = "marketcow-live-source-bridge"
+path = "src/live_source_bridge.rs"
+
 [dependencies]
 anyhow.workspace = true
+rusqlite.workspace = true
 arc-swap.workspace = true
 axum.workspace = true
 base64.workspace = true

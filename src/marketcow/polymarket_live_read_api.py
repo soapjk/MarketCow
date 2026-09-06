@@ -13,6 +13,7 @@ from typing import Callable, NoReturn, TypeVar
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from starlette.responses import FileResponse, Response
+from .polymarket_stream_metrics import StreamMetrics
 
 from .polymarket_live import (
     PUBLIC_DATA_KINDS,
@@ -33,6 +34,7 @@ from .polymarket_live_stream import (
     PolymarketLiveStreamClient,
 )
 from .polymarket_events_observability import PolymarketReadTraceMiddleware
+from .polymarket_configured_scope import PolymarketConfiguredScope
 from .polymarket_discovery import (
     DEFAULT_MAXIMUM_FULL_SYNC_BYTES,
     DISCOVERY_EVENT_SCHEMA_VERSION,
@@ -43,6 +45,35 @@ from .polymarket_discovery import (
 )
 
 T = TypeVar("T")
+
+
+async def _send_live_message(websocket, message, metrics=None):
+    try:
+        if metrics is None:
+            await websocket.send_json(message)
+        else:
+            started = time.perf_counter()
+            # Match Starlette send_json text encoding exactly.
+            encoded = json.dumps(message, separators=(',', ':'), ensure_ascii=False)
+            metrics.record('json_encode', time.perf_counter() - started)
+            started = time.perf_counter()
+            await websocket.send_text(encoded)
+            metrics.record('socket_send', time.perf_counter() - started)
+        # ASGI sends may complete synchronously while the socket is writable.
+        # Give source ingestion a turn even during an uninterrupted replay.
+        started = time.perf_counter()
+        await asyncio.sleep(0)
+        if metrics is not None:
+            metrics.record('send_yield', time.perf_counter() - started)
+        return True
+    except WebSocketDisconnect:
+        return False
+    except RuntimeError as exc:
+        # Uvicorn can have already closed on a keepalive failure. Do not mask
+        # unrelated application/runtime exceptions or send a second error.
+        if "Unexpected ASGI message 'websocket.send', after sending 'websocket.close'" in str(exc):
+            return False
+        raise
 
 
 def create_polymarket_live_read_app(
@@ -60,6 +91,7 @@ def create_polymarket_live_read_app(
     live_stream_replay_capacity: int = 10_000,
     consumer_maximum_book_age_seconds: float | None = None,
     minimum_delivery_headroom_seconds: float = 0.0,
+    configured_scope_path: Path | None = None,
 ) -> FastAPI:
     if not root.is_absolute():
         raise ValueError("Polymarket live read root must be absolute")
@@ -178,8 +210,57 @@ def create_polymarket_live_read_app(
                 410,
             )
 
+    def load_configured_scope() -> PolymarketConfiguredScope:
+        if configured_scope_path is None:
+            raise ValueError("configured scope is unavailable")
+        path = configured_scope_path.resolve(strict=True)
+        if not path.is_relative_to(root.resolve()):
+            raise ValueError("configured scope escapes live root")
+        raw = path.read_bytes()
+        scope = PolymarketConfiguredScope.model_validate_json(raw)
+        runtime = json.loads((root / "scope-runtime.json").read_bytes())
+        catalog = json.loads((root / "catalog.json").read_bytes())
+        if (runtime["manifest_sha256"] != hashlib.sha256(raw).hexdigest()
+                or runtime["scope_id"] != scope.active_scope_id
+                or catalog["catalog_revision"] != scope.catalog_revision):
+            raise ValueError("configured scope binding differs")
+        return scope
+
+    def resolve_market_scope(
+        market_id: list[str] | None,
+        scope_id: str | None,
+    ) -> list[str]:
+        require_scope_identity(scope_id)
+        if market_id:
+            # Caller-selected reads retain the public 100-market request cap.
+            return PolymarketLiveReadStore._scope(market_id)
+        if scope_id is None or configured_scope_path is None:
+            return _require_scope(market_id)
+        configured = load_configured_scope()
+        if scope_id != configured.active_scope_id:
+            raise PolymarketLiveReadError(
+                "polymarket_scope_retired",
+                "Requested scope is no longer active; discover scope_id and re-bootstrap",
+                410,
+            )
+        # The configured scope is already content-addressed and bounded to 250.
+        return PolymarketLiveReadStore._scope(
+            (item.market_id for item in configured.configured_markets),
+            maximum_markets=250,
+        )
+
     @app.get("/v1/prediction-markets/polymarket/live/scope")
     async def scope_discovery():
+        if configured_scope_path is not None:
+            try:
+                scope = load_configured_scope()
+                return scope.model_dump(mode="json")
+            except (OSError, ValueError, KeyError) as error:
+                # Scope failure does not prevent Discovery and other modules serving.
+                raise HTTPException(status_code=409, detail={
+                    "code": "polymarket_configured_scope_invalid",
+                    "message": str(error), "retryable": False,
+                }) from error
         return {
             "schema_version": "marketcow.polymarket.scope-discovery.v1",
             "active_scope_id": projection.scope_id or reader.scope_id,
@@ -224,8 +305,7 @@ def create_polymarket_live_read_app(
         scope_id: str | None = Query(default=None),
     ):
         try:
-            require_scope_identity(scope_id)
-            scope = _require_scope(market_id)
+            scope = resolve_market_scope(market_id, scope_id)
             if stream_client is not None:
                 body, phases = await run_hot_json(
                     projection.bootstrap_json, scope,
@@ -251,8 +331,7 @@ def create_polymarket_live_read_app(
         scope_id: str | None = Query(default=None),
     ):
         try:
-            require_scope_identity(scope_id)
-            scope = _require_scope(market_id)
+            scope = resolve_market_scope(market_id, scope_id)
             if stream_client is not None:
                 body, phases = await run_hot_json(
                     projection.snapshot_json, scope,
@@ -278,7 +357,7 @@ def create_polymarket_live_read_app(
         scope_id: str | None = Query(default=None),
     ):
         try:
-            require_scope_identity(scope_id)
+            scope = resolve_market_scope(market_id, scope_id)
             if stream_client is None:
                 raise PolymarketLiveReadError(
                     "polymarket_live_stream_not_configured",
@@ -286,7 +365,7 @@ def create_polymarket_live_read_app(
                     503,
                 )
             result, phases = await run_hot_json(
-                projection.full_sync_json, _require_scope(market_id),
+                projection.full_sync_json, scope,
                 request.scope["polymarket_read_trace"],
             )
             body = result[0] if isinstance(result, tuple) else result
@@ -401,11 +480,12 @@ def create_polymarket_live_read_app(
         after_cursor: int = Query(0, ge=0),
         limit: int = Query(1000, ge=1, le=10000),
         market_id: list[str] | None = Query(default=None),
+        scope_id: str | None = Query(default=None),
     ):
         try:
             payload, _, _ = await run_read(
                 projection.events_json if stream_client is not None else reader.events_json,
-                _require_scope(market_id),
+                resolve_market_scope(market_id, scope_id),
                 after_cursor,
                 limit,
             )
@@ -435,9 +515,16 @@ def create_polymarket_live_read_app(
         try:
             require_scope_identity(scope_id)
             if stream_client is not None:
+                if market_id is not None:
+                    health_scope = market_id
+                elif configured_scope_path is not None:
+                    configured = await scope_discovery()
+                    health_scope = [item["market_id"] for item in configured["configured_markets"]]
+                else:
+                    health_scope = projection.market_ids()
                 body, phases = await run_hot_json(
                     projection.health_json,
-                    market_id or projection.market_ids(),
+                    health_scope,
                     request.scope["polymarket_read_trace"],
                 )
                 return Response(
@@ -472,6 +559,7 @@ def create_polymarket_live_read_app(
         websocket: WebSocket,
         after_cursor: int = Query(0, ge=0),
         market_id: list[str] | None = Query(default=None),
+        scope_id: str | None = Query(default=None),
     ):
         await websocket.accept()
         if stream_client is None:
@@ -482,44 +570,25 @@ def create_polymarket_live_read_app(
             })
             await websocket.close(code=1013)
             return
-        queue = projection.subscribe(capacity=2048)
-        cursor = after_cursor
         try:
-            scope = _require_scope(market_id)
-            while True:
-                page = projection.events_after(scope, cursor, 1000)
-                for event in page.items:
-                    await websocket.send_json({
-                        "type": "event", "cursor": event.cursor,
-                        "event": event.model_dump(mode="json"),
-                    })
-                    cursor = event.cursor
-                if not page.has_more:
-                    break
-            await websocket.send_json({
-                "type": "ready", "cursor": projection.latest_cursor,
-            })
-            while True:
-                event = await queue.get()
-                if event.cursor <= cursor:
-                    continue
-                if event.market_id is not None and event.market_id not in scope:
-                    continue
-                await websocket.send_json({
-                    "type": "event", "cursor": event.cursor,
-                    "event": event.model_dump(mode="json"),
-                })
-                cursor = event.cursor
+            scope = resolve_market_scope(market_id, scope_id)
+            metrics = StreamMetrics('api_to_consumer')
+            async for message in projection.stream_messages(scope, after_cursor, metrics=metrics):
+                sending = time.perf_counter()
+                if not await _send_live_message(websocket,message,metrics):
+                    metrics.emit(message.get('cursor',after_cursor),force=True,error='downstream_closed')
+                    return
+                metrics.record('encode_send',time.perf_counter()-sending)
+                metrics.emit(message.get('cursor',after_cursor))
         except PolymarketLiveReadError as exc:
-            await websocket.send_json({
+            sent = await _send_live_message(websocket,{
                 "type": "error", "code": exc.code, "message": str(exc),
                 "retryable": exc.status_code == 503,
             })
-            await websocket.close(code=1013)
+            if sent:
+                await websocket.close(code=1013)
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass
-        finally:
-            projection.unsubscribe(queue)
 
     @app.get(
         "/v1/prediction-markets/polymarket/live/public-data/{kind}",

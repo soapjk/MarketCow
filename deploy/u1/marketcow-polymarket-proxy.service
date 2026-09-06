@@ -1,0 +1,17 @@
+[Unit]
+Description=MarketCow Polymarket-only proxy (U1 isolated Paper data)
+ConditionPathIsMountPoint=/mnt/p44pro/marketcow-shadow-v3-runtime/linux
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart=/mnt/p44pro/marketcow-shadow-v3-runtime/linux/polymarket-proxy/mihomo -d /mnt/p44pro/marketcow-shadow-v3-runtime/linux/polymarket-proxy -f /mnt/p44pro/marketcow-shadow-v3-runtime/linux/polymarket-proxy/config.yaml
+Restart=on-failure
+RestartSec=2
+MemoryMax=256M
+NoNewPrivileges=true
+StandardOutput=append:/mnt/p44pro/marketcow-shadow-v3-runtime/linux/logs/paper-proxy.log
+StandardError=append:/mnt/p44pro/marketcow-shadow-v3-runtime/linux/logs/paper-proxy.log
+
+[Install]
+WantedBy=marketcow-paper-data.target

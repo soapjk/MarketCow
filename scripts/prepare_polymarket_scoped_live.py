@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from marketcow.api import PolymarketConfiguredScope
+from marketcow.polymarket_configured_scope import PolymarketConfiguredScope
 from marketcow.polymarket_contracts import canonical_json, content_sha256
 from marketcow.polymarket_live import PolymarketLiveReadStore
 from marketcow.polymarket_scopes import write_scope_runtime
@@ -27,6 +27,21 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validated_selection_market_ids(selection: object) -> list[str]:
+    if not isinstance(selection, dict):
+        raise ValueError("frozen selection must be an object")
+    market_ids = selection.get("market_ids")
+    if (
+        selection.get("schema") != SELECTION_SCHEMA
+        or not isinstance(market_ids, list)
+        or not 1 <= len(market_ids) <= 250
+        or len(set(market_ids)) != len(market_ids)
+        or any(not isinstance(value, str) or not value for value in market_ids)
+    ):
+        raise ValueError("frozen selection must contain 1..250 unique markets")
+    return market_ids
 
 
 def _verified_local_path(root: Path, raw: object, directory: str) -> Path:
@@ -80,15 +95,7 @@ def prepare_scoped_live(
     if file_sha256(selection_path) != selection_sha256:
         raise ValueError("frozen selection SHA-256 mismatch")
     selection = json.loads(selection_path.read_bytes())
-    market_ids = selection.get("market_ids")
-    if (
-        selection.get("schema") != SELECTION_SCHEMA
-        or not isinstance(market_ids, list)
-        or len(market_ids) != 100
-        or len(set(market_ids)) != 100
-        or any(not isinstance(value, str) or not value for value in market_ids)
-    ):
-        raise ValueError("frozen selection must contain exactly 100 unique markets")
+    market_ids = _validated_selection_market_ids(selection)
 
     source_manifest_path = source_root / "catalog.json"
     source_manifest = json.loads(source_manifest_path.read_bytes())
@@ -106,8 +113,11 @@ def prepare_scoped_live(
         raise ValueError("source catalog publication is incomplete")
 
     reader = PolymarketLiveReadStore(source_root)
-    bootstrap = reader.bootstrap(market_ids, _bind_live_books=False)
-    if bootstrap.catalog_revision != catalog_revision:
+    bootstraps = [
+        reader.bootstrap(market_ids[offset:offset + 100], _bind_live_books=False)
+        for offset in range(0, len(market_ids), 100)
+    ]
+    if any(item.catalog_revision != catalog_revision for item in bootstraps):
         raise ValueError("verified bootstrap catalog revision mismatch")
 
     bindings = (
@@ -144,13 +154,21 @@ def prepare_scoped_live(
     target_manifest.pop("realtime_universe", None)
     _atomic_write(target_root / "catalog.json", canonical_json(target_manifest))
 
-    target_bootstrap = PolymarketLiveReadStore(target_root).bootstrap(
-        market_ids, _bind_live_books=False,
-    )
+    target_reader = PolymarketLiveReadStore(target_root)
+    target_bootstraps = [
+        target_reader.bootstrap(
+            market_ids[offset:offset + 100], _bind_live_books=False,
+        )
+        for offset in range(0, len(market_ids), 100)
+    ]
     configured_markets = []
     missing_relation_market_ids: set[str] = set()
     selected = set(market_ids)
-    for market in target_bootstrap.markets:
+    for market in (
+        market
+        for bootstrap in target_bootstraps
+        for market in bootstrap.markets
+    ):
         if market.end_at is None:
             raise ValueError(f"configured market end_at is missing: {market.identity.market_id}")
         configured_markets.append({
@@ -195,7 +213,11 @@ def prepare_scoped_live(
         "selection_evidence_sha256": selection.get("selection_evidence_sha256"),
         "catalog_revision": catalog_revision,
         "market_count": len(configured_markets),
-        "token_count": len(target_bootstrap.active_token_ids),
+        "token_count": len({
+            token_id
+            for bootstrap in target_bootstraps
+            for token_id in bootstrap.active_token_ids
+        }),
         "active_scope_id": scope["active_scope_id"],
         "missing_relation_market_count": len(missing_relation_market_ids),
         "missing_relation_market_ids_sha256": content_sha256(
@@ -210,7 +232,7 @@ def prepare_scoped_live(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Promote a verified catalog and frozen 100-market selection into scoped live.v2",
+        description="Promote a verified catalog and frozen bounded selection into scoped live.v2",
     )
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--target-root", required=True, type=Path)

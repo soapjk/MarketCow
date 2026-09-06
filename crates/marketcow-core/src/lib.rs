@@ -1288,6 +1288,7 @@ impl<T> BoundedClientQueue<T> {
 pub struct SingleWriter<L> {
     current: ArcSwap<Projection>,
     log: L,
+    enforce_source_freshness: bool,
 }
 
 impl<L: DurableLog> SingleWriter<L> {
@@ -1295,6 +1296,18 @@ impl<L: DurableLog> SingleWriter<L> {
         Self {
             current: ArcSwap::from_pointee(Projection::bootstrap(scope_id)),
             log,
+            enforce_source_freshness: true,
+        }
+    }
+
+    /// Data delivery retains delay evidence but leaves its trading significance
+    /// to the consumer. Identity, sequence, checksums and missing data remain
+    /// enforced. Use only for read-only feed reducers, never an order gate.
+    pub fn new_data_delivery(scope_id: String, log: L) -> Self {
+        Self {
+            current: ArcSwap::from_pointee(Projection::bootstrap(scope_id)),
+            log,
+            enforce_source_freshness: false,
         }
     }
 
@@ -1317,6 +1330,7 @@ impl<L: DurableLog> SingleWriter<L> {
         Ok(Self {
             current: ArcSwap::from_pointee(projection),
             log,
+            enforce_source_freshness: true,
         })
     }
 
@@ -1357,7 +1371,8 @@ impl<L: DurableLog> SingleWriter<L> {
         }
         let mut persisted = Vec::with_capacity(events.len());
         for event in events {
-            let (updated, outcome) = Self::evaluate_event(next, event, false, false)?;
+            let (updated, outcome) =
+                Self::evaluate_event(next, event, false, false, self.enforce_source_freshness)?;
             next = updated;
             persisted.push(outcome);
         }
@@ -1389,6 +1404,7 @@ impl<L: DurableLog> SingleWriter<L> {
         mut event: CanonicalEvent,
         validate_raw_payload: bool,
         validate_duplicate: bool,
+        enforce_source_freshness: bool,
     ) -> Result<(Projection, PersistedEvent), CoreError> {
         if event.schema_version != CONTRACT_VERSION {
             return Err(CoreError::SchemaMismatch);
@@ -1472,7 +1488,7 @@ impl<L: DurableLog> SingleWriter<L> {
         let atomic_delta_superseded_by_book =
             delayed_atomic_delta_superseded_by_book || queued_atomic_delta_superseded_by_refresh;
         if !event.source.missing
-            && !event.source.delayed
+            && (!event.source.delayed || !enforce_source_freshness)
             && !atomic_delta_superseded_by_book
             && event.normalizer_version == "marketcow.polymarket.normalizer.v2"
             && let EventKind::AtomicDelta {
@@ -1486,7 +1502,9 @@ impl<L: DurableLog> SingleWriter<L> {
             *changes =
                 book.replay_complete_atomic_changes(changes, best_bid.as_ref(), best_ask.as_ref());
         }
-        if event.source.missing || event.source.delayed && !atomic_delta_superseded_by_book {
+        if event.source.missing
+            || enforce_source_freshness && event.source.delayed && !atomic_delta_superseded_by_book
+        {
             next.unresolved_gaps.insert(event.kind.token_id().into());
             applied = false;
             rejected = Some(if event.source.missing {
@@ -2158,7 +2176,13 @@ impl<L: DurableLog> SingleWriter<L> {
         validate_raw_payload: bool,
     ) -> Result<ApplyOutcome, CoreError> {
         let previous = (*self.current.load_full()).clone();
-        let (next, persisted) = Self::evaluate_event(previous, event, validate_raw_payload, true)?;
+        let (next, persisted) = Self::evaluate_event(
+            previous,
+            event,
+            validate_raw_payload,
+            true,
+            self.enforce_source_freshness,
+        )?;
         let persistence_started = std::time::Instant::now();
         self.log.append_outcome(&persisted)?;
         let persistence_latency_us = persistence_started.elapsed().as_micros() as u64;

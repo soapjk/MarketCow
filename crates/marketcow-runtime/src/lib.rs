@@ -1,6 +1,8 @@
 //! Polymarket runtime composition: normalization, the authoritative single writer, WAL recovery,
 //! bounded replay exposure, and atomic checkpoint manifests.
 
+pub mod discovery_source;
+
 use chrono::{DateTime, Utc};
 use marketcow_core::{
     ApplyOutcome, EventKind, PersistedEvent, Projection, SegmentedWal, SingleWriter,

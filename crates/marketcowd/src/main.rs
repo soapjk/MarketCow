@@ -12722,7 +12722,7 @@ mod tests {
         assert_eq!(migration["tradude_may_manage_marketcow"], false);
         assert_eq!(
             migration["ownership_registry"]["sha256"],
-            "e2eab2ce96145f102d06b216b990434ccefb06cc639c23ea64eca238c641c5a6"
+            "5a190d05b47d608dfa2ddabd8f5eaa6de9991d196a7ecaab7301a517d3bfa280"
         );
 
         let path = AxumPath((

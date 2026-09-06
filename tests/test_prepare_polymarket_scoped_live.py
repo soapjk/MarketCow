@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 from scripts.prepare_polymarket_scoped_live import (
     _clone_verified,
+    _validated_selection_market_ids,
     _verified_local_path,
 )
 
@@ -51,3 +52,23 @@ class PreparePolymarketScopedLiveTest(unittest.TestCase):
             _clone_verified(source, destination, expected)
 
         self.assertEqual(destination.read_bytes(), b"previous-generation\n")
+
+    def test_frozen_selection_accepts_exact_250_but_not_251(self):
+        selection = {
+            "schema": "tradude.prediction_market.scope_selection.v2",
+            "market_ids": [str(index) for index in range(250)],
+        }
+        self.assertEqual(
+            _validated_selection_market_ids(selection),
+            selection["market_ids"],
+        )
+        selection["market_ids"].append("250")
+        with self.assertRaisesRegex(ValueError, "1..250"):
+            _validated_selection_market_ids(selection)
+
+    def test_frozen_selection_rejects_duplicate_market(self):
+        with self.assertRaisesRegex(ValueError, "unique markets"):
+            _validated_selection_market_ids({
+                "schema": "tradude.prediction_market.scope_selection.v2",
+                "market_ids": ["1", "1"],
+            })

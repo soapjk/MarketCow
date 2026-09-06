@@ -41,7 +41,7 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def app(self):
+    def app(self, **kwargs):
         app = create_polymarket_live_read_app(
             root=self.root,
             discovery_root=self.root,
@@ -51,9 +51,33 @@ class PolymarketLiveReadApiTest(unittest.TestCase):
             executor_workers=4,
             discovery_depth_notionals=("10", "50", "100", "500"),
             discovery_maximum_book_age_ms=5000,
+            **kwargs,
         )
         app.state.polymarket_live_read.now_provider = lambda: NOW
         return app
+
+    def test_configured_scope_binding_and_failure_isolation(self):
+        import hashlib
+        from marketcow.polymarket_contracts import content_sha256
+        catalog = json.loads((self.root / "catalog.json").read_bytes())
+        body = {"catalog_revision": catalog["catalog_revision"],
+                "configured_markets": [], "mode": "shadow"}
+        scope = {**body, "schema_version": "marketcow.polymarket.scope-discovery.v1",
+                 "configured_market_count": 0, "active_scope_id": content_sha256(body)}
+        path = self.root / "configured-scope.json"
+        path.write_text(json.dumps(scope))
+        (self.root / "scope-runtime.json").write_text(json.dumps({
+            "scope_id": scope["active_scope_id"],
+            "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }))
+        with TestClient(self.app(configured_scope_path=path)) as client:
+            response = client.get("/v1/prediction-markets/polymarket/live/scope")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), scope)
+            scope["configured_market_count"] = 1
+            path.write_text(json.dumps(scope))
+            self.assertEqual(client.get("/v1/prediction-markets/polymarket/live/scope").status_code, 409)
+            self.assertEqual(client.get("/v1/prediction-markets/polymarket/live/discovery/status").status_code, 200)
 
     def test_contract_matches_bounded_live_read_routes(self):
         with TestClient(self.app()) as client:

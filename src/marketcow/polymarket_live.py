@@ -35,7 +35,7 @@ from .polymarket_contracts import (
     content_sha256,
     decimal_text,
 )
-from .polymarket_history import _validate_book
+from .polymarket_book_validation import _validate_book
 from .polymarket_sources import _atomic_write, utc_now
 
 
@@ -1583,6 +1583,10 @@ class LiveBook(BaseModel):
     last_trade_price: str | None = None
     state_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
     source_hash: str | None = None
+    confirmed_at: datetime | None = None
+    book_received_at: datetime | None = None
+    confirmation_source: Literal["polymarket_rest", "polymarket_websocket"] | None = None
+    confirmation_evidence_sha256: str | None = None
 
 
 def bind_market_instrument_to_books(
@@ -1738,8 +1742,14 @@ class MarketFrame(BaseModel):
     relation_pairs: list[LiveOutcomePair]
     instrument_revision: str
     fee_schedule_id: str
-    open_position_allowed: bool = False
+    open_position_allowed: bool | None = False
     open_position_error_code: str | None = None
+    decision_owner: Literal["producer", "consumer"] = "producer"
+    required_token_ids: list[str] = Field(default_factory=list)
+    missing_token_ids: list[str] = Field(default_factory=list)
+    recovering_token_ids: list[str] = Field(default_factory=list)
+    dependency_market_ids: list[str] = Field(default_factory=list)
+    maximum_book_age_ms: float | None = None
 
 
 class PolymarketOpenPositionError(RuntimeError):
@@ -1825,6 +1835,9 @@ class LiveBootstrapResponse(BaseModel):
     catalog_source: dict[str, Any] | None
     cursor: int = Field(ge=0)
     markets: list[LiveMarket]
+    dependency_markets: list[LiveMarket] = Field(default_factory=list)
+    missing_dependency_market_ids: list[str] = Field(default_factory=list)
+    dependency_metadata_sha256: str | None = None
     active_token_ids: list[str]
     sequence_semantics: Literal["deterministic_normalized"]
     recovery: dict[str, str]
@@ -1862,9 +1875,12 @@ class LiveFullSyncResponse(BaseModel):
     scope_id: str | None = None
     oldest_book_received_at: datetime
     maximum_book_age_ms: float = Field(ge=0)
-    consumer_maximum_book_age_ms: float = Field(gt=0)
-    minimum_delivery_headroom_ms: float = Field(ge=0)
-    freshness_budget_remaining_ms: float
+    consumer_maximum_book_age_ms: float | None = Field(default=None, gt=0)
+    minimum_delivery_headroom_ms: float | None = Field(default=None, ge=0)
+    freshness_budget_remaining_ms: float | None = None
+    freshness_policy: Literal["consumer_decides"] = "consumer_decides"
+    stream_instance_id: str | None = None
+    confirmation_sequence: int = Field(default=0, ge=0)
     health: "LiveReadHealth"
     bootstrap: LiveBootstrapResponse
     snapshot: LiveSnapshotPage
@@ -2194,7 +2210,11 @@ class PolymarketLiveReadStore:
         return payload, normalized_path, index_path, metadata
 
     @staticmethod
-    def _scope(market_ids: Iterable[str]) -> list[str]:
+    def _scope(
+        market_ids: Iterable[str],
+        *,
+        maximum_markets: int | None = None,
+    ) -> list[str]:
         selected = list(dict.fromkeys(str(item).strip() for item in market_ids))
         if not selected or any(not item for item in selected):
             raise PolymarketLiveReadError(
@@ -2202,10 +2222,16 @@ class PolymarketLiveReadStore:
                 "At least one non-empty market_id is required",
                 400,
             )
-        if len(selected) > PolymarketLiveReadStore.max_scope_markets:
+        limit = (
+            PolymarketLiveReadStore.max_scope_markets
+            if maximum_markets is None else maximum_markets
+        )
+        if limit < 1:
+            raise ValueError("maximum market scope must be positive")
+        if len(selected) > limit:
             raise PolymarketLiveReadError(
                 "polymarket_scope_too_large",
-                "At most 100 distinct market_id values may be requested",
+                f"At most {limit} distinct market_id values may be requested",
                 400,
             )
         return selected
@@ -2445,6 +2471,16 @@ class PolymarketLiveReadStore:
                 409,
             )
         event_log_size = int(metadata.get("event_log_size", "-1"))
+        if "bounded_history_bytes" in metadata:
+            latest = connection.execute(
+                "SELECT cursor,payload,sha256 FROM recent_events ORDER BY cursor DESC LIMIT 1"
+            ).fetchone()
+            if latest is None or int(latest["cursor"]) != int(metadata["latest_cursor"]) or (
+                hashlib.sha256(latest["payload"]).hexdigest() != latest["sha256"]
+            ):
+                raise PolymarketLiveReadError("polymarket_state_integrity_failed",
+                    "Bounded history and current state disagree", 409)
+            return metadata
         actual_size = self.event_path.stat().st_size if self.event_path.exists() else 0
         if event_log_size > actual_size:
             raise PolymarketLiveReadError(
@@ -2574,6 +2610,50 @@ class PolymarketLiveReadStore:
             "source_hash": confirmation["source_hash"],
         })
 
+    @staticmethod
+    def _overlay_indexed_lifecycle(
+        response: LiveBootstrapResponse,
+        rows: Iterable[sqlite3.Row],
+        latest_cursor: int,
+    ) -> LiveBootstrapResponse:
+        """Overlay content-addressed terminal facts from the same state boundary."""
+        terminal_by_id: dict[str, LiveMarket] = {}
+        for row in rows:
+            body = bytes(row["payload_json"])
+            if (
+                int(row["cursor"]) > latest_cursor
+                or hashlib.sha256(body).hexdigest() != row["payload_sha256"]
+            ):
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed",
+                    "Market lifecycle payload is outside its indexed boundary",
+                    409,
+                )
+            terminal = LiveMarket.model_validate_json(body)
+            market_id = str(row["market_id"])
+            if (
+                terminal.identity.market_id != market_id
+                or terminal.lifecycle_state not in {"closed", "resolved", "invalid"}
+            ):
+                raise PolymarketLiveReadError(
+                    "polymarket_state_integrity_failed",
+                    "Market lifecycle payload identity is invalid",
+                    409,
+                )
+            terminal_by_id[market_id] = terminal
+        result = response.model_copy(deep=True)
+        result.markets = [
+            terminal_by_id.get(market.identity.market_id, market)
+            for market in result.markets
+        ]
+        result.active_token_ids = sorted(
+            outcome.token_id
+            for market in result.markets
+            if market.active and not market.closed
+            for outcome in market.identity.outcomes
+        )
+        return result
+
     def _bind_bootstrap_to_live_books(
         self,
         response: LiveBootstrapResponse,
@@ -2591,11 +2671,7 @@ class PolymarketLiveReadStore:
         market_ids = [market.identity.market_id for market in response.markets]
         if not market_ids:
             return response
-        expected_token_ids = {
-            outcome.token_id
-            for market in response.markets
-            for outcome in market.identity.outcomes
-        }
+        result = response
         if indexed_books is None:
             placeholders = ",".join("?" for _ in market_ids)
             deadline = time.monotonic() + self._stable_read_wait_seconds
@@ -2622,12 +2698,29 @@ class PolymarketLiveReadStore:
                                 WHERE market_id IN ({placeholders}) AND resolved=0""",
                             market_ids,
                         ).fetchone()[0])
+                        lifecycle_rows = list(connection.execute(
+                            f"""SELECT market_id, cursor, payload_json, payload_sha256
+                                FROM market_lifecycle
+                                WHERE market_id IN ({placeholders})""",
+                            market_ids,
+                        ))
                 except PolymarketLiveReadError as exc:
                     if exc.status_code != 503:
                         raise
                     rows = []
                     metadata = None
                     gap_count = 1
+                    lifecycle_rows = []
+                if metadata is not None:
+                    result = self._overlay_indexed_lifecycle(
+                        response, lifecycle_rows, int(metadata["latest_cursor"]),
+                    )
+                expected_token_ids = {
+                    outcome.token_id
+                    for market in result.markets
+                    if market.lifecycle_state == "active"
+                    for outcome in market.identity.outcomes
+                }
                 stable = (
                     metadata is not None
                     and not metadata.get("active_recovery_id")
@@ -2635,7 +2728,11 @@ class PolymarketLiveReadStore:
                 )
                 if stable and self._stable_snapshot_max_book_age_seconds is not None:
                     stable = self._book_rows_form_fresh_boundary(
-                        rows, expected_token_ids,
+                        (
+                            row for row in rows
+                            if str(row["token_id"]) in expected_token_ids
+                        ),
+                        expected_token_ids,
                     )
                 if stable:
                     break
@@ -2653,9 +2750,11 @@ class PolymarketLiveReadStore:
             metadata = state_metadata
         if metadata is None:
             raise RuntimeError("live book binding requires state metadata")
-        result = response.model_copy(deep=True)
+        result = result.model_copy(deep=True)
         result.cursor = int(metadata["latest_cursor"])
         for market_index, market in enumerate(result.markets):
+            if market.lifecycle_state != "active":
+                continue
             books = books_by_market.get(market.identity.market_id, [])
             expected_tokens = {outcome.token_id for outcome in market.identity.outcomes}
             if {book.token_id for book in books} != expected_tokens:
@@ -2739,15 +2838,15 @@ class PolymarketLiveReadStore:
         related = related_bootstrap.markets if related_bootstrap else []
         markets = bootstrap.markets + related
         all_market_ids = [market.identity.market_id for market in markets]
-        expected_token_ids = {
-            outcome.token_id
-            for market in markets
-            for outcome in market.identity.outcomes
-        }
         placeholders = ",".join("?" for _ in all_market_ids)
         deadline = time.monotonic() + self._stable_read_wait_seconds
         while True:
             with self._state_snapshot() as (_, connection, metadata):
+                if "bounded_history_bytes" in metadata:
+                    raise PolymarketLiveReadError(
+                        "polymarket_bounded_history_requires_live_stream",
+                        "Bounded source events require the configured live stream", 409,
+                    )
                 if metadata["catalog_revision"] != bootstrap.catalog_revision:
                     raise PolymarketLiveReadError(
                         "polymarket_state_integrity_failed",
@@ -2774,6 +2873,32 @@ class PolymarketLiveReadStore:
                         WHERE market_id IN ({placeholders}) AND resolved=0""",
                     all_market_ids,
                 ))
+                lifecycle_rows = list(connection.execute(
+                    f"""SELECT market_id, cursor, payload_json, payload_sha256
+                        FROM market_lifecycle
+                        WHERE market_id IN ({placeholders})""",
+                    all_market_ids,
+                ))
+            current_bootstrap = self._overlay_indexed_lifecycle(
+                bootstrap, lifecycle_rows, int(metadata["latest_cursor"]),
+            )
+            current_related_bootstrap = (
+                self._overlay_indexed_lifecycle(
+                    related_bootstrap, lifecycle_rows, int(metadata["latest_cursor"]),
+                )
+                if related_bootstrap else None
+            )
+            current_related = (
+                current_related_bootstrap.markets
+                if current_related_bootstrap else []
+            )
+            current_markets = current_bootstrap.markets + current_related
+            expected_token_ids = {
+                outcome.token_id
+                for market in current_markets
+                if market.lifecycle_state == "active"
+                for outcome in market.identity.outcomes
+            }
             stable = (
                 not _wait_for_stable_boundary
                 or (not metadata.get("active_recovery_id") and not gap_rows)
@@ -2784,7 +2909,11 @@ class PolymarketLiveReadStore:
                 and self._stable_snapshot_max_book_age_seconds is not None
             ):
                 stable = self._book_rows_form_fresh_boundary(
-                    book_rows, expected_token_ids,
+                    (
+                        row for row in book_rows
+                        if str(row["token_id"]) in expected_token_ids
+                    ),
+                    expected_token_ids,
                 )
             if stable:
                 break
@@ -2800,6 +2929,8 @@ class PolymarketLiveReadStore:
             if remaining <= 0:
                 raise self._stable_boundary_unavailable("snapshot")
             time.sleep(min(self._stable_read_poll_seconds, remaining))
+        bootstrap = current_bootstrap
+        related_bootstrap = current_related_bootstrap
         books = {}
         books_by_market: dict[str, list[LiveBook]] = defaultdict(list)
         for row in book_rows:
@@ -3282,6 +3413,23 @@ def _gap_identity(gap: GapEntry) -> str:
 
 
 class LiveStateIndex:
+    @staticmethod
+    def _index_terminal_event(connection: sqlite3.Connection, event: LiveEventEnvelope) -> None:
+        if event.event_type != "market_terminal" or not event.applied:
+            return
+        # Catalog ingestion also emits source-timestamped ``market_terminal``
+        # lifecycle facts.  Those facts intentionally carry only their
+        # authoritative source fields; only reconciliation events contain the
+        # complete Market snapshot required by this latest-state overlay.
+        if "market" not in event.canonical_payload:
+            return
+        terminal = LiveMarket.model_validate(event.canonical_payload["market"])
+        if terminal.identity.market_id != event.market_id or terminal.identity.condition_id != event.condition_id:
+            raise ValueError("terminal event identity differs")
+        body = canonical_json(terminal.model_dump(mode="json"))
+        connection.execute("INSERT OR REPLACE INTO market_lifecycle VALUES (?,?,?,?)",
+                           (event.market_id, event.cursor, body, hashlib.sha256(body).hexdigest()))
+
     """Mutable derived state; the append-only event log remains authoritative."""
 
     rebuild_batch_size = 1_000
@@ -3359,6 +3507,10 @@ class LiveStateIndex:
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS market_lifecycle (
+                market_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL,
+                payload_json BLOB NOT NULL, payload_sha256 TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS books (
                 token_id TEXT PRIMARY KEY, market_id TEXT NOT NULL,
                 cursor INTEGER NOT NULL, payload_json BLOB NOT NULL,
@@ -3560,6 +3712,7 @@ class LiveStateIndex:
                     event.market_id, event.token_id, line_sha256,
                 ),
             )
+            self._index_terminal_event(connection, event)
             if book is not None and event.market_id is not None:
                 body = canonical_json(book.model_dump(mode="json"))
                 connection.execute(
@@ -3667,6 +3820,7 @@ class LiveStateIndex:
                             raise RuntimeError(
                                 "verified live event cursor is not contiguous"
                             )
+                        self._index_terminal_event(connection, event)
                         connection.execute(
                             """INSERT INTO event_offsets(
                                 cursor, byte_offset, byte_length, event_id,
@@ -4138,6 +4292,7 @@ class LiveStateIndex:
                                 "live event log contains invalid JSON"
                             ) from exc
                         LiveStateStore._validate_event(event, latest_cursor + 1)
+                        self._index_terminal_event(connection, event)
                         connection.execute(
                             """INSERT INTO event_offsets(
                                 cursor, byte_offset, byte_length, event_id,
@@ -7447,7 +7602,10 @@ class LiveStateStore:
         self.recover_book_batch(rows, recovery_id, tracker)
         return self.complete_book_recovery(recovery_id, tracker)
 
-    def frame(self, market_id: str, *, now: datetime | None = None) -> MarketFrame:
+    def frame(
+        self, market_id: str, *, now: datetime | None = None,
+        evaluate_freshness: bool = True,
+    ) -> MarketFrame:
         self._ensure_loaded()
         market = self.catalog.get(market_id)
         if market is None:
@@ -7491,9 +7649,9 @@ class LiveStateStore:
                 max(item.received_at for item in books)
                 - min(item.received_at for item in books)
             ).total_seconds() * 1000
-            if skew > self.max_frame_skew_ms:
+            if evaluate_freshness and skew > self.max_frame_skew_ms:
                 reasons.append("token_frame_skew")
-            if any((current - item.received_at).total_seconds() * 1000 > self.stale_after_ms for item in books):
+            if evaluate_freshness and any((current - item.received_at).total_seconds() * 1000 > self.stale_after_ms for item in books):
                 reasons.append("stale_book")
         relation_ids = [item.relation_id for item in market.relations]
         negative_relations = [
@@ -7503,7 +7661,20 @@ class LiveStateStore:
         relation_pairs = [
             pair for relation in negative_relations for pair in relation.outcome_pairs
         ]
-        relation_token_ids = {pair.yes_token_id for pair in relation_pairs}
+        terminal_pairs = [pair for pair in relation_pairs
+                          if pair.market_id in self.catalog
+                          and self.catalog[pair.market_id].lifecycle_state in {"closed", "resolved", "invalid"}]
+        terminal_ids = {pair.market_id for pair in terminal_pairs}
+        relation_token_ids = {pair.yes_token_id for pair in relation_pairs if pair.market_id not in terminal_ids}
+        unresolved_terminal_pairs = [
+            pair for pair in terminal_pairs
+            if self.catalog[pair.market_id].lifecycle_state != "resolved"
+            or not self.catalog[pair.market_id].resolution
+        ]
+        if unresolved_terminal_pairs:
+            # Lifecycle-only evidence retires L2 requirements, but the economic
+            # dependency stays fail-closed until a typed resolved outcome exists.
+            reasons.append("negative_risk_terminal_dependency_requires_resolution")
         if any(not relation.complete for relation in negative_relations):
             reasons.append("negative_risk_relation_incomplete")
         pair_markets = [self.catalog.get(pair.market_id) for pair in relation_pairs]
@@ -7531,9 +7702,9 @@ class LiveStateStore:
                     max(item.received_at for item in relation_books)
                     - min(item.received_at for item in relation_books)
                 ).total_seconds() * 1000
-                if relation_skew > self.max_frame_skew_ms:
+                if evaluate_freshness and relation_skew > self.max_frame_skew_ms:
                     reasons.append("negative_risk_frame_skew")
-                if any(
+                if evaluate_freshness and any(
                     (current - item.received_at).total_seconds() * 1000 > self.stale_after_ms
                     for item in relation_books
                 ):

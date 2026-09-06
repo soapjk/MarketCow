@@ -1,0 +1,21 @@
+[Unit]
+Description=MarketCow Rust Polymarket collector (U1 isolated Paper data)
+Requires=marketcow-polymarket-proxy.service
+After=marketcow-polymarket-proxy.service
+ConditionPathIsMountPoint=/mnt/p44pro/marketcow-shadow-v3-runtime/linux
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart=/usr/bin/env -u ALL_PROXY -u all_proxy -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy HTTPS_PROXY=http://127.0.0.1:17890 HTTP_PROXY=http://127.0.0.1:17890 NO_PROXY=127.0.0.1,localhost,::1 /mnt/p44pro/marketcow-shadow-v3-runtime/linux/target/release/marketcow-discovery-collector --input-mode websocket --root /mnt/p44pro/marketcow-shadow-v3-runtime/linux/dynamic-live-candidate-r1 --plan /mnt/p44pro/marketcow-shadow-v3-runtime/linux/dynamic-live-candidate-r1/rust-scoped-plan-r1.json --plan-sha256 603396c05129df8c598ee941fccd9b6894081719af67057c762f8cade1035389 --configured-scope /mnt/p44pro/marketcow-shadow-v3-runtime/linux/dynamic-live-candidate-r1/configured-scope.json --configured-scope-sha256 1f95a4d8cbe99b40a1a24571f47994ce020640a9e12c03f13ff13f796eb1e7f6 --dependency-plan /mnt/p44pro/marketcow-shadow-v3-runtime/linux/dynamic-live-candidate-r1/live-bridge-plan-r1.json --dependency-plan-sha256 a6802894c3d12c4d42e881e0af1d7442d7af4df59c7219e348429422b6169dfd --expected-market-count 100 --concurrency 16 --request-market-batch-size 20 --response-byte-limit 2097152 --batch-byte-limit 16777216 --persistence-queue-batches 256 --persistence-queue-bytes 67108864 --websocket-shard-tokens 50 --websocket-recovery-concurrency 16 --websocket-confirmation-seconds 1 --poll-seconds 1 --request-timeout-seconds 10 --lifecycle-refresh-seconds 300 --live-listen 127.0.0.1:18896 --live-frame-bytes 33554432 --live-maximum-clients 2
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=40
+MemoryMax=512M
+NoNewPrivileges=true
+StandardOutput=append:/mnt/p44pro/marketcow-shadow-v3-runtime/linux/logs/paper-collector.log
+StandardError=append:/mnt/p44pro/marketcow-shadow-v3-runtime/linux/logs/paper-collector.log
+
+[Install]
+WantedBy=marketcow-paper-data.target
