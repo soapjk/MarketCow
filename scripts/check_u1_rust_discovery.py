@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import socket
 import sqlite3
 import subprocess
@@ -93,9 +94,14 @@ async def audit(report):
 
 
 def main():
+    global PREFIX, UNIT
     parser = argparse.ArgumentParser()
+    parser.add_argument('--run', required=True)
     parser.add_argument('--binary-sha256', required=True)
     args = parser.parse_args()
+    assert re.fullmatch(r'r[1-9][0-9]*', args.run)
+    PREFIX = BASE / f'logs/public-discovery-smoke-{args.run}'
+    UNIT = f'marketcow-public-discovery-smoke-collector-{args.run}'
     binary = BASE / 'target/release/marketcow-discovery-collector'
     assert sha(binary) == args.binary_sha256
     assert not PREFIX.with_suffix('.report.json').exists()
