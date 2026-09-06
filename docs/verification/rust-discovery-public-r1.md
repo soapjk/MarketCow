@@ -39,3 +39,18 @@ repeat real HTTP/WS + unchanged consumer replay before declaring compatibility.
 Source preparation seed: 1000 markets, 241 relations, settlement present=0;
 SHA256 `ea7d9423c9f506c5bbb981dfd913ba568f9c05991bb7a8716c0c92c2feeed930`.
 Existing metadata only; absent settlement remains null.
+
+## r2 real corrected wire — native consumer decoding passed
+
+Release `131aba7106b2df80fdf180b250166c2c2bba49cb4408158fe585ee584ec0c64a`,
+build-r4 exit0, 59 daemon tests passed (2 ignored).
+`check_u1_rust_discovery.py --run r2 --binary-sha256 <above>`:
+1000 markets/241 relations, cursor2645411→2646411 over1000 real delta frames.
+Reached frame budget in2.663s including close, not long-running verification.
+Raw full-sync SHA `de7884c3107f7f71a0fe16dc617e8693d481cd98e3c70c6fb680ca1492923473`;
+raw WS application-message JSONL SHA `73f37528f65968b8d7cf821c25692a84f997951298f9d13a96b63d627e12c601`.
+Artifacts use prefix `linux/logs/public-discovery-smoke-r2`.
+Unmodified Tradude decoder via `scripts/replay_rust_discovery_fixture.py` accepted
+the unchanged raw baseline and all1000frames, ready=true/gaps0.
+Collector MainPID0/Resultsuccess/exit0; durable2646957/floor2636078,
+history67100904bytes/noJSONL/integrityok. Formal/Paper untouched.

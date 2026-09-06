@@ -118,6 +118,7 @@ async fn stream(api:&Api,socket:&mut WebSocket,query:&mut Resume)->Result<()> {
         changed.borrow_and_update();
         let page=api.reader.replay(consumer.cursor(),u64::MAX,64,api.limits.replay_bytes)?;
         for batch in &page.batches {
+            if !crate::source_public_api::poll_replay_control(socket,api.limits.send_timeout).await? {return Ok(());}
             for index in 0..batch.validated.events().len() {
                 if let Some(mut frame)=consumer.apply_event(&batch.validated,index)? {
                     frame["boundary_cursor"]=json!(page.boundary_cursor);

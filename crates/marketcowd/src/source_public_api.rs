@@ -106,6 +106,25 @@ async fn send_public(socket: &mut WebSocket, api: &PublicApi, frame: Value) -> R
     Ok(())
 }
 
+/// Poll at most one control message per replay batch, without waiting for a
+/// quiet market. No receive task, additional queue, or unbounded drain.
+pub(crate) async fn poll_replay_control(socket:&mut WebSocket,timeout:Duration)->Result<bool> {
+    tokio::select! {
+        biased;
+        incoming=socket.recv()=>match incoming {
+            None|Some(Ok(Message::Close(_)))=>Ok(false),
+            Some(Ok(Message::Ping(bytes)))=>{
+                tokio::time::timeout(timeout,socket.send(Message::Pong(bytes))).await??;
+                Ok(true)
+            },
+            Some(Ok(Message::Pong(_)))=>Ok(true),
+            Some(Err(error))=>Err(error.into()),
+            _=>anyhow::bail!("unexpected public client input"),
+        },
+        _=std::future::ready(())=>Ok(true),
+    }
+}
+
 async fn public_stream(socket: &mut WebSocket, api: &PublicApi, mut cursor: u64) -> Result<()> {
     let mut changed = api.reader.subscribe();
     let view = api.reader.capture()?;
@@ -129,6 +148,7 @@ async fn public_stream(socket: &mut WebSocket, api: &PublicApi, mut cursor: u64)
         changed.borrow_and_update();
         let page = api.reader.replay(cursor,confirmation,64,api.limits.replay_bytes)?;
         for batch in &page.batches {
+            if !poll_replay_control(socket,api.limits.send_timeout).await? {return Ok(());}
             for event in batch.validated.events() {
                 let at = event["cursor"].as_u64().context("event cursor")?;
                 if at <= cursor { continue; }
@@ -137,6 +157,7 @@ async fn public_stream(socket: &mut WebSocket, api: &PublicApi, mut cursor: u64)
                 }
                 cursor = at;
             }
+            tokio::task::yield_now().await;
         }
         ensure!(cursor == page.next,"public replay boundary");
         if page.caught_up {
@@ -411,6 +432,41 @@ pub fn encode_bounded(value: &impl serde::Serialize, limit: usize) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn replay_control_handles_ping_and_close_during_continuous_output() {
+        use futures_util::{SinkExt,StreamExt};
+        let stopped=Arc::new(tokio::sync::Notify::new());
+        let signal=stopped.clone();
+        let app=Router::new().route("/",get(move |upgrade:WebSocketUpgrade| {
+            let signal=signal.clone();
+            async move {upgrade.on_upgrade(move |mut socket|async move {
+                for _ in 0..10000 {
+                    if !poll_replay_control(&mut socket,Duration::from_secs(1)).await.unwrap() {
+                        signal.notify_one();
+                        return;
+                    }
+                    socket.send(Message::Text("bounded-test-frame".into())).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+                panic!("control message starved behind output");
+            })}
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+        let (mut client,_)=tokio_tungstenite::connect_async(format!("ws://{address}/")).await.unwrap();
+        client.send(tokio_tungstenite::tungstenite::Message::Ping(vec![1,2].into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2),async {
+            loop {
+                if let tokio_tungstenite::tungstenite::Message::Pong(bytes)=client.next().await.unwrap().unwrap() {
+                    assert_eq!(&bytes[..],&[1,2]);break;
+                }
+            }
+        }).await.unwrap();
+        client.send(tokio_tungstenite::tungstenite::Message::Close(None)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2),stopped.notified()).await.unwrap();
+        server.abort();
+    }
     #[tokio::test]
     async fn snapshot_admission_lives_until_last_wire_buffer_reference() {
         let capacity=Arc::new(Semaphore::new(1));
