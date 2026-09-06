@@ -160,6 +160,32 @@ mod tests {
     use super::*;
     use std::sync::mpsc as sync;
 
+    // Diagnostic reproduction: input slots can reject a burst before any CPU
+    // work starts. More CPU permits do not add same-entity admission capacity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn burst_rejects_with_all_eight_cpu_permits_idle() {
+        let (mut dispatch, mut output) = Dispatcher::start(
+            [("a".into(), ()), ("b".into(), ())].into(),
+            2, 8, 16, |_, item: usize| Ok(item),
+        ).unwrap();
+        dispatch.try_submit("a", 1).unwrap();
+        dispatch.try_submit("a", 2).unwrap();
+        assert_eq!(dispatch.occupancy(), (2, 2, 8));
+        assert_eq!(dispatch.try_submit("a", 3), Err(3));
+        dispatch.try_submit("b", 4).unwrap();
+        dispatch.close();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for _ in 0..3 {
+            let item = output.recv().await.unwrap();
+            if item.entity == "a" { a.push(item.result.unwrap()); }
+            else { b.push(item.result.unwrap()); }
+        }
+        assert_eq!(a, [1, 2]);
+        assert_eq!(b, [4]);
+        dispatch.join().await;
+    }
+
     #[tokio::test]
     async fn fenced_queued_work_is_discarded_before_cpu_and_fresh_work_survives() {
         use std::sync::atomic::{AtomicUsize, Ordering};
