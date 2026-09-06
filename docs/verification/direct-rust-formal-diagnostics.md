@@ -140,6 +140,15 @@ inside process-memory measurement. Cargo/test overhead is included in the
 external command measurement. This is not repeated randomized release A/B,
 full-sync construction as a whole, or U1 live RSS evidence. No formal restart.
 
+Additional source inspection: `http_health` invokes `scoped_response` with
+`Some("health")`, but that function currently constructs the entire `full_sync`
+before taking the selected component. Thus health/bootstrap/snapshot requests
+can allocate unrelated response components. Snapshot admission remains bounded
+by the existing semaphore (formal concurrency1); this is avoidable allocation,
+not evidence of unlimited queued requests or the sole cause of RSS growth.
+No code or runtime change was made for this separate optimization, and it is
+not a new precondition for Paper resumption.
+
 Reproduce from this worktree for each mode `clone` and `move`:
 
 ```sh
