@@ -959,6 +959,7 @@ pub async fn run(
         publication,
         args.websocket_shard_tokens,
         args.websocket_recovery_concurrency,
+        args.market_workers,
         args.websocket_confirmation_seconds,
         args.request_market_batch_size,
         args.concurrency,
@@ -1190,6 +1191,7 @@ async fn run_connection(
     publication: &mut Publication,
     websocket_shard_tokens: usize,
     websocket_recovery_concurrency: usize,
+    market_workers: usize,
     websocket_confirmation_seconds: u64,
     request_market_batch_size: usize,
     network_concurrency: usize,
@@ -1199,7 +1201,7 @@ async fn run_connection(
     lifecycle_candidates: Vec<super::Market>,
     lifecycle_markets: BTreeMap<String, Value>,
 ) -> Result<()> {
-    let (pipeline, mut completed_markets) = pipeline::Pipeline::start(adapter)?;
+    let (pipeline, mut completed_markets) = pipeline::Pipeline::start_with_workers(adapter, market_workers)?;
     let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let mut jobs = tokio::task::JoinSet::new();
@@ -1300,6 +1302,14 @@ async fn run_connection(
                         Err(error) => eprintln!("{}", json!({"stage":"rest_confirmation_request_failed","detail":error.to_string()})),
                         Ok((books, received_at)) => {
                             for market in confirmation.markets {
+                                for _ in 0..market_workers * 2 {
+                                    match completed_markets.try_recv() {
+                                        Ok(done) => pipeline.publish(adapter, publication, done).await?,
+                                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => anyhow::bail!("market workers stopped"),
+                                    }
+                                }
+                                tokio::task::yield_now().await;
                                 let selected:Vec<_> = books.iter().filter(|book| market.token_ids.iter()
                                     .any(|token| book["asset_id"] == *token)).cloned().collect();
                                 if selected.len() != 2 {
@@ -1327,9 +1337,10 @@ async fn run_connection(
                                     .map(|attempt|(token.clone(),attempt.clone()))).collect();
                                 if !pending.is_empty() {
                                     if pending.iter().any(|(token,attempt)| rest_submitted.get(token) != Some(attempt)) {
-                                        pipeline.submit_rest_recovery(adapter, publication, selected, received_at,
-                                            pending.clone()).await?;
-                                        for (token,attempt) in pending { rest_submitted.insert(token, attempt); }
+                                        if pipeline.submit_rest_recovery(adapter, publication, selected, received_at,
+                                            pending.clone()).await? {
+                                            for (token,attempt) in pending { rest_submitted.insert(token, attempt); }
+                                        }
                                     }
                                     continue;
                                 }
@@ -1531,7 +1542,18 @@ async fn run_connection(
                 _=&mut shutdown_requested=>break,
             };
             for frame in frames {
+                // Consume completed work between admissions, not only after
+                // the whole upstream batch. A bounded drain prevents either
+                // continuously ready branch from starving the other.
+                for _ in 0..market_workers * 2 {
+                    match completed_markets.try_recv() {
+                        Ok(done) => pipeline.publish(adapter, publication, done).await?,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => anyhow::bail!("market workers stopped"),
+                    }
+                }
                 pipeline.submit(adapter, publication, frame, None).await?;
+                tokio::task::yield_now().await;
             }
         }
         Ok(())
@@ -1606,7 +1628,7 @@ async fn run_connection(
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(request_timeout_seconds))
             .build()?;
-        let (cleanup, mut cleanup_output) = pipeline::Pipeline::start(adapter)?;
+        let (cleanup, mut cleanup_output) = pipeline::Pipeline::start_with_workers(adapter, market_workers)?;
         for batch in recovery_markets.chunks(request_market_batch_size) {
             let (books, received_at) = super::fetch(client.clone(), batch, response_byte_limit)
                 .await

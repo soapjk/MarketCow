@@ -16,6 +16,14 @@ use tokio::task::JoinSet;
 mod durable_bootstrap;
 mod source_dispatch;
 mod source_lifecycle;
+mod source_public_api;
+mod source_public_frame;
+mod source_public_binding;
+mod source_discovery_quote;
+mod source_discovery_history;
+mod source_discovery_projection;
+mod source_discovery_api;
+mod source_discovery_startup;
 mod source_publication;
 mod source_websocket;
 
@@ -45,6 +53,9 @@ struct Args {
     /// Upstream transport. Switching requires a controlled collector restart.
     #[arg(long, value_enum, default_value = "websocket")]
     input_mode: InputMode,
+    /// CPU market actors; output reservations are bounded to twice this count.
+    #[arg(long, default_value_t = 6)]
+    market_workers: usize,
     #[arg(long)]
     root: PathBuf,
     #[arg(long)]
@@ -86,6 +97,42 @@ struct Args {
     live_frame_bytes: Option<usize>,
     #[arg(long, requires = "live_listen")]
     live_maximum_clients: Option<usize>,
+    /// Direct Rust public read API; does not require the internal WS listener.
+    #[arg(long, requires_all = ["configured_scope", "dependency_plan", "public_full_sync_bytes", "public_snapshot_concurrency", "public_frame_bytes", "public_replay_bytes", "public_maximum_clients", "public_send_timeout_seconds"])]
+    public_listen: Option<std::net::SocketAddr>,
+    #[arg(long, requires = "public_listen")]
+    public_full_sync_bytes: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_snapshot_concurrency: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_frame_bytes: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_replay_bytes: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_maximum_clients: Option<usize>,
+    #[arg(long, requires = "public_listen")]
+    public_send_timeout_seconds: Option<u64>,
+    /// Independent direct Rust Discovery surface over this frozen universe.
+    #[arg(long, conflicts_with_all=["configured_scope", "public_listen", "live_listen"], requires_all=["discovery_seed", "discovery_seed_sha256", "discovery_state_bytes", "discovery_full_sync_bytes", "discovery_frame_bytes", "discovery_replay_bytes", "discovery_clients", "discovery_baselines", "discovery_send_timeout_seconds"])]
+    discovery_listen:Option<std::net::SocketAddr>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_seed:Option<PathBuf>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_seed_sha256:Option<String>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_state_bytes:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_full_sync_bytes:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_frame_bytes:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_replay_bytes:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_clients:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_baselines:Option<usize>,
+    #[arg(long,requires="discovery_listen")]
+    discovery_send_timeout_seconds:Option<u64>,
     #[arg(long)]
     poll_seconds: u64,
     #[arg(long)]
@@ -389,6 +436,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(
         (1..=32).contains(&args.concurrency)
+            && (1..=8).contains(&args.market_workers)
             && (1..=20).contains(&args.request_market_batch_size)
             && (2..=500).contains(&args.websocket_shard_tokens)
             && (1..=32).contains(&args.websocket_recovery_concurrency)
@@ -452,6 +500,7 @@ async fn main() -> Result<()> {
         manifest["catalog_revision"] == plan.catalog_revision,
         "source catalog revision differs"
     );
+    let mut public_scope = None;
     if let Some(path) = &args.configured_scope {
         ensure!(
             fs::canonicalize(path)?.starts_with(fs::canonicalize(&args.root)?),
@@ -475,6 +524,11 @@ async fn main() -> Result<()> {
             "scope runtime binding differs"
         );
         validate_scope_binding(&scope, &plan)?;
+        if args.public_listen.is_some() {
+            let typed: source_public_api::ConfiguredScope = serde_json::from_slice(&bytes)?;
+            typed.validate()?;
+            public_scope = Some(typed);
+        }
     } else {
         let declared: BTreeSet<_> = manifest["realtime_universe"]["market_ids"]
             .as_array()
@@ -536,7 +590,12 @@ async fn main() -> Result<()> {
         writer.enable_bounded_history(limit)?;
     }
     let cursor = writer.cursor()?;
-    let base = if args.live_listen.is_some() {
+    let mut discovery_config=None;
+    let base = if args.discovery_listen.is_some() {
+        let (config,base)=source_discovery_startup::load(&args.root,args.discovery_seed.as_deref().context("Discovery seed")?,
+            args.discovery_seed_sha256.as_deref().context("Discovery seed hash")?,args.discovery_state_bytes.context("Discovery state cap")?,&plan.markets)?;
+        discovery_config=Some(config);Some(base)
+    } else if args.live_listen.is_some() || args.public_listen.is_some() {
         Some(durable_bootstrap::bootstrap(
             args.root.clone(),
             args.dependency_plan
@@ -545,7 +604,8 @@ async fn main() -> Result<()> {
             args.dependency_plan_sha256
                 .as_deref()
                 .context("missing stream plan hash")?,
-            args.live_frame_bytes.context("missing frame cap")?,
+            if args.public_listen.is_some() { args.public_full_sync_bytes.context("public seed cap")? }
+                else { args.live_frame_bytes.context("missing frame cap")? },
         )?)
     } else {
         None
@@ -593,6 +653,30 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let public_task = if let Some(listen) = args.public_listen {
+        ensure!(listen.ip().is_loopback() || matches!(listen.ip(), std::net::IpAddr::V4(ip) if ip.is_private()),
+            "public read API must bind explicit loopback or private LAN address");
+        let router = source_public_api::PublicApi::router(publication.reader(),public_scope.context("public scope")?,
+            1,uuid::Uuid::new_v4().simple().to_string(),args.public_full_sync_bytes.context("public bytes")?,
+            args.public_snapshot_concurrency.context("snapshot concurrency")?,source_public_api::StreamLimits {
+                frame_bytes:args.public_frame_bytes.context("public frame bytes")?,
+                replay_bytes:args.public_replay_bytes.context("public replay bytes")?,
+                clients:args.public_maximum_clients.context("public clients")?,
+                send_timeout:Duration::from_secs(args.public_send_timeout_seconds.context("send timeout")?),
+            })?;
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        Some(tokio::spawn(async move {axum::serve(listener,router).await}))
+    } else {None};
+    let discovery_task=if let Some(listen)=args.discovery_listen {
+        ensure!(listen.ip().is_loopback() || matches!(listen.ip(),std::net::IpAddr::V4(ip) if ip.is_private()),"Discovery requires explicit loopback/private address");
+        let router=source_discovery_api::router(publication.reader(),std::sync::Arc::new(discovery_config.context("Discovery config")?),
+            source_discovery_api::DiscoveryLimits{full_sync_bytes:args.discovery_full_sync_bytes.context("Discovery response cap")?,
+                frame_bytes:args.discovery_frame_bytes.context("Discovery frame cap")?,state_bytes:args.discovery_state_bytes.context("Discovery state cap")?,
+                replay_bytes:args.discovery_replay_bytes.context("Discovery replay cap")?,clients:args.discovery_clients.context("Discovery clients")?,
+                cached_baselines:args.discovery_baselines.context("Discovery baselines")?,send_timeout:Duration::from_secs(args.discovery_send_timeout_seconds.context("Discovery send timeout")?)})?;
+        let listener=tokio::net::TcpListener::bind(listen).await?;
+        Some(tokio::spawn(async move{axum::serve(listener,router).await}))
+    }else{None};
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.request_timeout_seconds))
         .build()?;
@@ -609,6 +693,8 @@ async fn main() -> Result<()> {
         if let Some(task) = stream_task {
             task.abort();
         }
+        if let Some(task) = public_task { task.abort(); }
+        if let Some(task) = discovery_task { task.abort(); }
         let drain = publication.finish().await;
         result?;
         drain?;
@@ -718,6 +804,8 @@ async fn main() -> Result<()> {
         Ok(())
     }.await;
     workers.abort_all();
+    if let Some(task) = public_task { task.abort(); }
+    if let Some(task) = discovery_task { task.abort(); }
     if let Some(task) = stream_task {
         task.abort();
     }

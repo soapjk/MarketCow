@@ -53,7 +53,7 @@ pub(crate) fn bootstrap(root: PathBuf, plan_path: PathBuf, sha: &str, cap: usize
         "catalog manifest changed"
     );
     let scope: Value = serde_json::from_slice(&fs::read(root.join("scope-runtime.json"))?)?;
-    ensure!(scope["scope_id"] == plan.scope_id, "scope changed");
+    ensure!(plan.scope_id.is_some() && scope["scope_id"] == json!(plan.scope_id), "scope changed");
     let bridge = Bridge {
         args: Args {
             root: fs::canonicalize(root)?,
@@ -67,6 +67,19 @@ pub(crate) fn bootstrap(root: PathBuf, plan_path: PathBuf, sha: &str, cap: usize
         plan,
         permits: Arc::new(Semaphore::new(1)),
     };
+    Ok(serde_json::from_str(&bridge.snapshot()?.0)?)
+}
+
+/// Explicit unscoped Discovery startup. Reuses bounded SQLite recovery, not a
+/// scoped runtime or an online disk bridge. No scope-runtime file is invented.
+pub(crate) fn bootstrap_discovery(root:PathBuf,catalog_revision:String,catalog_manifest_sha256:String,
+    markets:Vec<Value>,catalog_source:Value,cap:usize)->Result<Value> {
+    ensure!(!markets.is_empty()&&markets.len()<=MAX_DEPENDENCY_MARKETS,"Discovery seed market bounds");
+    ensure!(hex::encode(Sha256::digest(fs::read(root.join("catalog.json"))?))==catalog_manifest_sha256,"Discovery catalog manifest changed");
+    let bridge=Bridge{args:Args{root:fs::canonicalize(root)?,plan:PathBuf::new(),plan_sha256:String::new(),
+        listen:"127.0.0.1:1".parse()?,maximum_frame_bytes:cap,maximum_clients:1,poll_ms:1},
+        plan:Plan{schema_version:"marketcow.polymarket.discovery-public-seed.v1".into(),catalog_revision,
+            scope_id:None,catalog_manifest_sha256,markets,catalog_source},permits:Arc::new(Semaphore::new(1))};
     Ok(serde_json::from_str(&bridge.snapshot()?.0)?)
 }
 
@@ -93,7 +106,7 @@ struct Args {
 struct Plan {
     schema_version: String,
     catalog_revision: String,
-    scope_id: String,
+    scope_id: Option<String>,
     catalog_manifest_sha256: String,
     markets: Vec<Value>,
     catalog_source: Value,
@@ -411,7 +424,7 @@ async fn main() -> Result<()> {
         "catalog manifest changed"
     );
     let scope: Value = serde_json::from_slice(&fs::read(args.root.join("scope-runtime.json"))?)?;
-    ensure!(scope["scope_id"] == plan.scope_id, "scope changed");
+    ensure!(plan.scope_id.is_some() && scope["scope_id"] == json!(plan.scope_id), "scope changed");
     let listen = args.listen;
     let permits = Arc::new(Semaphore::new(args.maximum_clients));
     let bridge = Arc::new(Bridge {
@@ -457,7 +470,7 @@ mod tests {
             plan: Plan {
                 schema_version: "marketcow.polymarket.live-bridge-plan.v1".into(),
                 catalog_revision: "catalog".into(),
-                scope_id: "scope".into(),
+                scope_id: Some("scope".into()),
                 catalog_manifest_sha256: String::new(),
                 markets: vec![],
                 catalog_source: json!({}),

@@ -73,16 +73,17 @@ struct Memory {
     queued_bytes: usize,
     error: Option<String>,
     base: Option<Value>,
-    books: BTreeMap<String, Value>,
+    books: BTreeMap<String, Arc<Value>>,
     book_cursors: BTreeMap<String, u64>,
     // Venue time of the latest order-book mutation. `LiveBook.exchange_at`
     // also advances on last_trade_price, so it cannot fence REST book
     // confirmations without falsely treating an independent trade as a newer
     // book.
     book_exchanges: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
-    markets: BTreeMap<String, Value>,
+    markets: BTreeMap<String, Arc<Value>>,
     replay: VecDeque<Arc<Batch>>,
     replay_bytes: usize,
+    snapshot_leases: BTreeMap<u64, std::time::Instant>,
     state_bytes: usize,
     state_sizes: BTreeMap<(bool, String), usize>,
     confirmation_cursor: u64,
@@ -98,7 +99,134 @@ pub struct Publication {
     max_bytes: usize,
     batch_cap: usize,
 }
+
+/// One atomic memory boundary. Books/markets are immutable versions: holding a
+/// view cannot block ingestion and later confirmations cannot mutate this view.
+/// Callers must bound concurrent views and their lifetime independently.
+#[derive(Clone)]
+pub struct MemoryView {
+    pub cursor: u64,
+    pub persisted_cursor: u64,
+    pub confirmation_sequence: u64,
+    pub books: BTreeMap<String, Arc<Value>>,
+    pub markets: BTreeMap<String, Arc<Value>>,
+    pub recoveries: BTreeMap<String, Value>,
+    pub book_cursors: BTreeMap<String, u64>,
+    pub confirmation_versions: BTreeMap<String, u64>,
+    pub base: Value,
+    pub queued: usize,
+}
+
+/// Read-only shared handle. It cannot publish events or perform persistence.
+#[derive(Clone)]
+pub struct MemoryReader {
+    memory: Arc<Mutex<Memory>>,
+    changed: watch::Sender<u64>,
+}
+pub struct PublicReplay {
+    pub batches: Vec<Arc<Batch>>,
+    pub next: u64,
+    pub boundary_cursor: u64,
+    pub caught_up: bool,
+    pub confirmation_sequence: u64,
+    pub confirmation_books: Vec<Arc<Value>>,
+}
+impl MemoryReader {
+    pub fn capture(&self) -> Result<MemoryView> {
+        MemoryView::capture(&self.memory.lock().unwrap())
+    }
+    /// Pin a full-sync boundary against count-based eviction until the
+    /// existing response timeout. The global byte cap still wins: overflow
+    /// expires the affected resume rather than blocking publication.
+    pub fn capture_for_resume(&self, ttl:std::time::Duration, capacity:usize)->Result<MemoryView> {
+        ensure!(!ttl.is_zero() && (1..=4).contains(&capacity),"snapshot lease budget");
+        let mut m=self.memory.lock().unwrap();
+        let now=std::time::Instant::now();
+        m.snapshot_leases.retain(|_,until|*until>now);
+        let view=MemoryView::capture(&m)?;
+        ensure!(m.snapshot_leases.contains_key(&view.cursor)||m.snapshot_leases.len()<capacity,"snapshot resume capacity");
+        // Re-reading the same boundary cannot extend a lease indefinitely.
+        m.snapshot_leases.entry(view.cursor).or_insert(now+ttl);
+        Ok(view)
+    }
+    pub fn subscribe(&self) -> watch::Receiver<u64> { self.changed.subscribe() }
+
+    /// Shared immutable batches, not per-client copies. Confirmation baseline
+    /// is captured under the same lock only if this page reaches its boundary.
+    pub fn replay(&self, after: u64, confirmation_after: u64, max_batches: usize, max_bytes: usize) -> Result<PublicReplay> {
+        ensure!((1..=64).contains(&max_batches), "replay batch budget");
+        ensure!(max_bytes > 0, "replay byte budget");
+        let m = self.memory.lock().unwrap();
+        ensure!(m.source_ready && m.error.is_none(), "source unavailable");
+        ensure!(after <= m.cursor, "future cursor");
+        let mut batches = Vec::new();
+        let mut next = after;
+        let mut bytes = 0usize;
+        for batch in &m.replay {
+            let end = batch.validated.events().last().context("empty batch")?["cursor"].as_u64().context("cursor")?;
+            if end <= after { continue; }
+            if batch.bytes > max_bytes.saturating_sub(bytes) {
+                ensure!(!batches.is_empty(), "single batch exceeds public replay budget");
+                break;
+            }
+            let first = batch.validated.events().first().context("empty batch")?["cursor"].as_u64().context("cursor")?;
+            ensure!(first <= next.checked_add(1).context("cursor overflow")?, "memory replay expired");
+            batches.push(batch.clone());
+            bytes += batch.bytes;
+            next = end;
+            if batches.len() == max_batches { break; }
+        }
+        ensure!(after == m.cursor || next > after, "memory replay expired");
+        let caught_up = next == m.cursor;
+        let confirmation_books = if caught_up {
+            m.confirmations.iter().filter(|(_,seq)| **seq > confirmation_after)
+                .filter_map(|(token,_)| m.books.get(token).cloned()).collect()
+        } else { Vec::new() };
+        Ok(PublicReplay {batches,next,boundary_cursor:m.cursor,caught_up,confirmation_books,
+            confirmation_sequence:if caught_up {m.confirmation_cursor}else{confirmation_after}})
+    }
+}
+
+impl MemoryView {
+    fn capture(m: &Memory) -> Result<Self> {
+        ensure!(m.source_ready, "upstream WebSocket recovery pending");
+        ensure!(m.error.is_none(), "persistence failed");
+        Ok(Self {
+            cursor: m.cursor,
+            persisted_cursor: m.persisted,
+            confirmation_sequence: m.confirmation_cursor,
+            books: m.books.clone(),
+            markets: m.markets.clone(),
+            recoveries: m.recoveries.clone(),
+            book_cursors: m.book_cursors.clone(),
+            confirmation_versions: m.confirmations.clone(),
+            base: m.base.clone().context("missing stream seed")?,
+            queued: m.queued,
+        })
+    }
+
+    /// Legacy internal shape, built outside the ingestion lock. The public
+    /// adapter consumes this same boundary without a network/SQLite bridge.
+    fn into_source_state(self) -> Result<Value> {
+        let mut state = self.base;
+        state["latest_cursor"] = json!(self.cursor);
+        state["persisted_cursor"] = json!(self.persisted_cursor);
+        state["persistence_queue_depth"] = json!(self.queued);
+        state["history_oldest_cursor"] = json!(self.cursor.checked_add(1).context("cursor overflow")?);
+        state["books"] = json!(self.books.values().collect::<Vec<_>>());
+        state["token_recoveries"] = json!(self.recoveries.values().collect::<Vec<_>>());
+        let mut gaps = state["gaps"].as_array().context("base gaps")?.clone();
+        gaps.extend(self.recoveries.values().map(|r| r["gap"].clone()));
+        state["gaps"] = json!(gaps);
+        state["markets"] = json!(self.markets.values().collect::<Vec<_>>());
+        Ok(state)
+    }
+}
 impl Publication {
+    pub fn reader(&self) -> MemoryReader { MemoryReader { memory: self.memory.clone(), changed:self.changed.clone() } }
+    pub fn capture_view(&self) -> Result<MemoryView> {
+        MemoryView::capture(&self.memory.lock().unwrap())
+    }
     pub fn start(
         cursor: u64,
         mut base: Option<Value>,
@@ -139,7 +267,7 @@ impl Publication {
                 // The initial state is one atomic snapshot. Every included
                 // book is causally safe at the snapshot's cursor.
                 book_cursors.insert(token.clone(), cursor);
-                books.insert(token, book.clone());
+                books.insert(token, Arc::new(book.clone()));
             }
             for market in state["markets"].as_array().context("missing markets")? {
                 state_sizes.insert(
@@ -157,7 +285,7 @@ impl Publication {
                         .as_str()
                         .context("market id")?
                         .into(),
-                    market.clone(),
+                    Arc::new(market.clone()),
                 );
             }
         }
@@ -210,6 +338,7 @@ impl Publication {
             markets,
             replay: VecDeque::new(),
             replay_bytes: 0,
+            snapshot_leases: BTreeMap::new(),
             state_bytes,
             state_sizes,
             confirmation_cursor: 0,
@@ -401,6 +530,22 @@ impl Publication {
                     .context("book received_at")?,
             )?
             .with_timezone(&chrono::Utc);
+            // An identical REST/targeted-WS response may finish decoding after
+            // a newer WS book or confirmation was already installed. Matching
+            // price/size alone does not make its older receipt a fresh proof.
+            // Never move either the original-book or confirmation time back.
+            let mut freshness_fence = current_received;
+            for field in ["book_received_at", "confirmed_at"] {
+                if let Some(value) = current[field].as_str() {
+                    freshness_fence = freshness_fence.max(
+                        chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc)
+                    );
+                }
+            }
+            if received_at <= freshness_fence {
+                superseded += 1;
+                continue;
+            }
             let candidate = &candidates[token];
             let current_book_exchange = memory
                 .book_exchanges
@@ -436,7 +581,7 @@ impl Publication {
                 // earlier in this loop.
                 return Ok(ConfirmationOutcome::Mismatch);
             }
-            let mut next = current.clone();
+            let mut next = current.as_ref().clone();
             if next["book_received_at"].is_null() {
                 next["book_received_at"] = current["received_at"].clone();
             }
@@ -492,7 +637,7 @@ impl Publication {
                 "memory state byte budget exhausted"
             );
             memory.state_sizes.insert((false, token.clone()), new_size);
-            memory.books.insert(token.clone(), book.clone());
+            memory.books.insert(token.clone(), Arc::new(book));
             memory.book_exchanges.insert(token.clone(), book_exchange);
             memory.confirmation_cursor = memory
                 .confirmation_cursor
@@ -669,7 +814,7 @@ impl Publication {
                 if terminal {
                     m.markets.insert(
                         event["market_id"].as_str().unwrap().into(),
-                        event["canonical_payload"]["market"].clone(),
+                        Arc::new(event["canonical_payload"]["market"].clone()),
                     );
                 } else {
                     let token = event["token_id"].as_str().unwrap().to_owned();
@@ -695,10 +840,10 @@ impl Publication {
                     let mut next = event["canonical_payload"].clone();
                     preserve_confirmed_book_freshness(
                         event["event_type"].as_str(),
-                        m.books.get(&token),
+                        m.books.get(&token).map(Arc::as_ref),
                         &mut next,
                     )?;
-                    m.books.insert(token, next);
+                    m.books.insert(token, Arc::new(next));
                 }
             }
         }
@@ -712,7 +857,13 @@ impl Publication {
         m.queued_bytes += bytes;
         m.replay.push_back(batch);
         m.replay_bytes += bytes;
+        m.snapshot_leases.retain(|_,until|*until>std::time::Instant::now());
         while m.replay.len() > self.max_batches || m.replay_bytes > self.max_bytes {
+            let pinned=m.snapshot_leases.keys().next().is_some_and(|after| {
+                m.replay.front().and_then(|b|b.validated.events().last())
+                    .and_then(|e|e["cursor"].as_u64()).is_some_and(|end|end>*after)
+            });
+            if pinned && m.replay_bytes<=self.max_bytes {break;}
             let old = m.replay.pop_front().unwrap();
             m.replay_bytes -= old.bytes;
         }
@@ -774,21 +925,10 @@ impl Stream {
             "persistence_queue_batches":m.queued,"persistence_queue_bytes":m.queued_bytes})
     }
     fn snapshot(&self) -> Result<(Value, u64, u64)> {
-        let m = self.memory.lock().unwrap();
-        ensure!(m.source_ready, "upstream WebSocket recovery pending");
-        ensure!(m.error.is_none(), "persistence failed");
-        let mut state = m.base.clone().context("missing stream seed")?;
-        state["latest_cursor"] = json!(m.cursor);
-        state["persisted_cursor"] = json!(m.persisted);
-        state["persistence_queue_depth"] = json!(m.queued);
-        state["history_oldest_cursor"] = json!(m.cursor.checked_add(1).context("cursor overflow")?);
-        state["books"] = json!(m.books.values().collect::<Vec<_>>());
-        state["token_recoveries"] = json!(m.recoveries.values().collect::<Vec<_>>());
-        let mut gaps = state["gaps"].as_array().context("base gaps")?.clone();
-        gaps.extend(m.recoveries.values().map(|r| r["gap"].clone()));
-        state["gaps"] = json!(gaps);
-        state["markets"] = json!(m.markets.values().collect::<Vec<_>>());
-        Ok((state, m.cursor, m.confirmation_cursor))
+        let view = MemoryView::capture(&self.memory.lock().unwrap())?;
+        let cursor = view.cursor;
+        let confirmation = view.confirmation_sequence;
+        Ok((view.into_source_state()?, cursor, confirmation))
     }
     #[cfg(test)]
     fn page(&self, after: u64, confirmation_after: u64) -> Result<(Value, u64, u64)> {
@@ -982,6 +1122,30 @@ mod tests {
     }
     fn seed() -> Value {
         json!({"latest_cursor":0,"books":[],"markets":[],"gaps":[],"schema_version":"marketcow.polymarket.live-stream.v1","type":"state"})
+    }
+    #[tokio::test]
+    async fn expired_public_reader_does_not_poison_current_reader_or_publication() {
+        // Exercises the exact MemoryReader used by both public Rust APIs, not
+        // a synthetic socket queue. A separate HTTP/WS test is still required.
+        let mut p=Publication::start(0,Some(seed()),tokens(),2,65536,16384, |_|Ok(())).unwrap();
+        let fast=p.reader();
+        let slow=p.reader();
+        let mut fast_cursor=0;
+        let mut changed=fast.subscribe();
+        for at in (0..20).step_by(2) {
+            p.publish_with_capacity(events(at)).await.unwrap();
+            let page=fast.replay(fast_cursor,0,64,65536).unwrap();
+            assert_eq!(page.next,at+2);
+            fast_cursor=page.next;
+            while p.persisted_cursor()<at+2 {changed.changed().await.unwrap();}
+        }
+        assert!(slow.replay(0,0,64,65536).err().unwrap().to_string().contains("expired"));
+        assert_eq!(fast.capture().unwrap().cursor,20);
+        assert_eq!(slow.capture().unwrap().cursor,20);
+        p.publish_with_capacity(events(20)).await.unwrap();
+        assert_eq!(fast.replay(20,0,64,65536).unwrap().next,22);
+        assert_eq!(slow.replay(20,0,64,65536).unwrap().next,22);
+        p.finish().await.unwrap();
     }
     #[tokio::test]
     async fn blocked_disk_does_not_block_publication_or_memory_stream() {
@@ -1325,12 +1489,42 @@ mod tests {
         let tokens = ["11".to_owned(), "12".to_owned()];
         let requested = chrono::DateTime::from_timestamp(1_700_000_002, 0).unwrap();
         let received = chrono::DateTime::from_timestamp(1_700_000_003, 0).unwrap();
+        let before_confirmation = p.capture_view().unwrap();
+        let old_book = before_confirmation.books["11"].clone();
         assert_eq!(
             p.confirm_market("1", "condition", &tokens, &raw, requested, received)
                 .unwrap(),
             ConfirmationOutcome::Confirmed
         );
         assert_eq!((p.cursor().unwrap(), p.persisted_cursor()), (2, 2));
+        let after_confirmation = p.capture_view().unwrap();
+        assert_eq!(before_confirmation.confirmation_sequence, 0);
+        assert_eq!(after_confirmation.confirmation_sequence, 2);
+        assert!(Arc::ptr_eq(&old_book, &before_confirmation.books["11"]));
+        assert!(!Arc::ptr_eq(&old_book, &after_confirmation.books["11"]));
+        assert!(old_book["confirmed_at"].is_null());
+        assert!(!after_confirmation.books["11"]["confirmed_at"].is_null());
+        // Same-content responses that arrive at this stage late cannot roll
+        // back timestamps or allocate a new confirmation sequence/cursor.
+        for stale in [requested, received] {
+            assert_eq!(p.confirm_market("1", "condition", &tokens, &raw, requested, stale).unwrap(),
+                ConfirmationOutcome::Superseded);
+            let unchanged = p.capture_view().unwrap();
+            assert_eq!(unchanged.confirmation_sequence, after_confirmation.confirmation_sequence);
+            assert_eq!(unchanged.cursor, after_confirmation.cursor);
+            assert_eq!(unchanged.books, after_confirmation.books);
+        }
+        let page = p.reader().replay(0,0,1,131072).unwrap();
+        assert_eq!(page.next,2);
+        assert!(page.caught_up);
+        assert_eq!(page.confirmation_sequence,2);
+        assert_eq!(page.confirmation_books.len(),2);
+        assert_eq!(page.batches[0].validated.events().last().unwrap()["cursor"],2);
+        let no_repeat = p.reader().replay(2,2,1,131072).unwrap();
+        assert!(no_repeat.batches.is_empty());
+        assert!(no_repeat.confirmation_books.is_empty());
+        assert!(p.reader().replay(3,2,1,131072).is_err());
+        assert!(p.reader().replay(0,0,1,1).is_err());
         let stream = Stream {
             memory: p.memory.clone(),
             changed: p.changed.clone(),
@@ -1366,8 +1560,8 @@ mod tests {
         // must not overwrite the causally newer trade.
         {
             let mut memory = p.memory.lock().unwrap();
-            memory.books.get_mut("11").unwrap()["last_trade_price"] = json!("0.55");
-            memory.books.get_mut("11").unwrap()["exchange_at"] = json!("2023-11-14T22:13:24Z");
+            Arc::make_mut(memory.books.get_mut("11").unwrap())["last_trade_price"] = json!("0.55");
+            Arc::make_mut(memory.books.get_mut("11").unwrap())["exchange_at"] = json!("2023-11-14T22:13:24Z");
         }
         assert_eq!(
             p.confirm_market(
@@ -1416,7 +1610,7 @@ mod tests {
                 &tokens,
                 &partly_superseded,
                 chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
-                chrono::DateTime::from_timestamp(1_700_000_006, 0).unwrap()
+                chrono::DateTime::from_timestamp(1_700_000_007, 0).unwrap()
             )
             .unwrap(),
             ConfirmationOutcome::Confirmed
@@ -1544,6 +1738,41 @@ mod tests {
                 .contains("resync")
         );
         assert_eq!(stream.page(2, 0).unwrap().1, 4);
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_survives_count_eviction_then_expires_without_blocking_source() {
+        let mut p=Publication::start(0,Some(seed()),tokens(),1,65536,16384, |_|Ok(())).unwrap();
+        let reader=p.reader();
+        assert_eq!(reader.capture_for_resume(std::time::Duration::from_secs(5),1).unwrap().cursor,0);
+        let mut changed=p.changed.subscribe();
+        for at in [0,2] {
+            p.publish(events(at),None).unwrap();
+            while p.persisted_cursor()<at+2 {changed.changed().await.unwrap();}
+        }
+        assert_eq!(reader.replay(0,0,64,65536).unwrap().next,4);
+        assert!(reader.capture_for_resume(std::time::Duration::from_secs(5),1).is_err());
+        p.memory.lock().unwrap().snapshot_leases.insert(0,std::time::Instant::now());
+        p.publish(events(4),None).unwrap();
+        assert!(reader.replay(0,0,64,65536).is_err());
+        assert_eq!(reader.replay(4,0,64,65536).unwrap().next,6);
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_lease_never_exceeds_existing_byte_cap() {
+        let mut p=Publication::start(0,Some(seed()),tokens(),1,16384,16384, |_|Ok(())).unwrap();
+        let reader=p.reader();
+        reader.capture_for_resume(std::time::Duration::from_secs(60),1).unwrap();
+        let mut changed=p.changed.subscribe();
+        for at in (0..24).step_by(2) {
+            p.publish(events(at),None).unwrap();
+            while p.persisted_cursor()<at+2 {changed.changed().await.unwrap();}
+            assert!(p.memory.lock().unwrap().replay_bytes<=16384);
+        }
+        assert!(reader.replay(0,0,64,16384).is_err());
+        assert_eq!(reader.capture().unwrap().cursor,24);
         p.finish().await.unwrap();
     }
 

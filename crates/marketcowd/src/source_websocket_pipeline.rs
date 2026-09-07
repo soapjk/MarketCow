@@ -9,11 +9,37 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 const INPUT_BYTES: usize = 64 * 1024 * 1024;
 const FRAME_BYTES: usize = 8 * 1024 * 1024;
 const OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MARKET_QUEUE_CAPACITY: usize = 32;
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn thirty_two_waiting_inputs_fit_next_rejected_and_fifo_preserved() {
+        let (mut dispatch, mut output) = Dispatcher::start(
+            [("market".into(), ())].into(),
+            MARKET_QUEUE_CAPACITY, 6, 12, |_, item: usize| Ok(item),
+        ).unwrap();
+        for item in 0..32 { dispatch.try_submit("market", item).unwrap(); }
+        assert_eq!(dispatch.occupancy(), (32, 32, 6));
+        assert_eq!(dispatch.try_submit("market", 32), Err(32));
+        dispatch.close();
+        for expected in 0..32 {
+            assert_eq!(output.recv().await.unwrap().result.unwrap(), expected);
+        }
+        dispatch.join().await;
+        assert!(output.recv().await.is_none());
+    }
+}
 
 #[derive(Clone, Default)]
 struct Control {
     generation: u64,
     attempts: BTreeMap<String, String>,
+    // Once any post-barrier input is accepted, another loss must fence it.
+    // Before that, repeated capacity rejection cannot invalidate a new book.
+    baseline_admitted: bool,
 }
 struct State {
     adapter: Adapter,
@@ -36,6 +62,7 @@ pub(super) struct Pipeline {
     dispatch: Dispatcher<Input>,
     controls: BTreeMap<String, Arc<Mutex<Control>>>,
     bytes: Arc<Semaphore>,
+    admission: Mutex<(std::time::Instant, BTreeMap<&'static str, u64>)>,
 }
 
 // Measure without allocating another serialized copy of each full order book.
@@ -63,6 +90,14 @@ fn bounded_size(value: &impl serde::Serialize, limit: usize) -> Result<usize> {
 
 impl Pipeline {
     pub(super) fn start(router: &Adapter) -> Result<(Self, mpsc::Receiver<Completion<Output>>)> {
+        Self::start_with_workers(router, 4)
+    }
+
+    pub(super) fn start_with_workers(
+        router: &Adapter,
+        workers: usize,
+    ) -> Result<(Self, mpsc::Receiver<Completion<Output>>)> {
+        ensure!((1..=8).contains(&workers), "market workers must be 1..=8");
         let markets: BTreeSet<_> = router.identities.values().map(|(m, _)| m.clone()).collect();
         let mut controls = BTreeMap::new();
         let states = markets
@@ -80,84 +115,116 @@ impl Pipeline {
                 )
             })
             .collect();
-        // Four output reservations also bound maximum retained result bytes to
-        // 4 * OUTPUT_BYTES. At most four CPU tasks and two queued inputs/market.
-        let (dispatch, output) = Dispatcher::start(states, 2, 4, 4, |state, input: Input| {
-            let control = state
-                .control
-                .lock()
-                .map_err(|_| anyhow::anyhow!("market control poisoned"))?
-                .clone();
-            if input.generation != control.generation {
-                return Ok(Output {
-                    generation: input.generation,
-                    events: vec![],
-                });
-            }
-            if state.generation != control.generation {
-                state.adapter.reset_connection();
-                state.adapter.recoveries = control.attempts;
-                state.generation = control.generation;
-            }
-            if !input.recovery.is_empty()
-                && input
-                    .recovery
-                    .iter()
-                    .all(|(token, attempt)| state.adapter.recoveries.get(token) != Some(attempt))
-            {
-                return Ok(Output {
-                    generation: input.generation,
-                    events: vec![],
-                });
-            }
-            let events = if let Some(raw_books) = input.rest_recovery {
-                if let Some(reason) = input.replacement_reason {
-                    let tokens = state.adapter.identities.keys().cloned().collect::<Vec<_>>();
-                    let mut events = Vec::new();
-                    for token in tokens {
-                        events.push(state.adapter.invalidate(
-                            &token,
-                            &reason,
+        // At most workers CPU jobs, 32 queued inputs/market, and twice workers
+        // output reservations (including in-flight results), each <=16 MiB.
+        let (dispatch, output) = Dispatcher::start_filtered(
+            states,
+            MARKET_QUEUE_CAPACITY,
+            workers,
+            workers * 2,
+            |state: &State, input: &Input| {
+                state
+                    .control
+                    .lock()
+                    .is_ok_and(|c| input.generation != c.generation)
+            },
+            |state, input: Input| {
+                let control = state
+                    .control
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("market control poisoned"))?
+                    .clone();
+                if input.generation != control.generation {
+                    return Ok(Output {
+                        generation: input.generation,
+                        events: vec![],
+                    });
+                }
+                if state.generation != control.generation {
+                    state.adapter.reset_connection();
+                    state.adapter.recoveries = control.attempts;
+                    state.generation = control.generation;
+                }
+                if !input.recovery.is_empty()
+                    && input.recovery.iter().all(|(token, attempt)| {
+                        state.adapter.recoveries.get(token) != Some(attempt)
+                    })
+                {
+                    return Ok(Output {
+                        generation: input.generation,
+                        events: vec![],
+                    });
+                }
+                let events = if let Some(raw_books) = input.rest_recovery {
+                    if let Some(reason) = input.replacement_reason {
+                        let tokens = state.adapter.identities.keys().cloned().collect::<Vec<_>>();
+                        let mut events = Vec::new();
+                        for token in tokens {
+                            events.push(state.adapter.invalidate(
+                                &token,
+                                &reason,
+                                input.frame.received_at,
+                                events.len() as u64 + 1,
+                            )?);
+                        }
+                        let attempts = state.adapter.recoveries.clone();
+                        events.extend(state.adapter.apply_rest_recovery(
+                            raw_books,
                             input.frame.received_at,
-                            events.len() as u64 + 1,
+                            events.len() as u64,
+                            &attempts,
                         )?);
+                        events
+                    } else {
+                        let attempts = input.recovery.into_iter().collect();
+                        state.adapter.apply_rest_recovery(
+                            raw_books,
+                            input.frame.received_at,
+                            0,
+                            &attempts,
+                        )?
                     }
-                    let attempts = state.adapter.recoveries.clone();
-                    events.extend(state.adapter.apply_rest_recovery(
-                        raw_books,
-                        input.frame.received_at,
-                        events.len() as u64,
-                        &attempts,
-                    )?);
-                    events
                 } else {
-                    let attempts = input.recovery.into_iter().collect();
-                    state.adapter.apply_rest_recovery(
-                        raw_books,
+                    state.adapter.apply_isolated(
+                        input.frame.raw_payload,
                         input.frame.received_at,
                         0,
-                        &attempts,
                     )?
-                }
-            } else {
-                state
-                    .adapter
-                    .apply_isolated(input.frame.raw_payload, input.frame.received_at, 0)?
-            };
-            bounded_size(&events, OUTPUT_BYTES)?;
-            Ok(Output {
-                generation: input.generation,
-                events,
-            })
-        })?;
+                };
+                bounded_size(&events, OUTPUT_BYTES)?;
+                Ok(Output {
+                    generation: input.generation,
+                    events,
+                })
+            },
+        )?;
         Ok((
             Self {
                 dispatch,
                 controls,
                 bytes: Arc::new(Semaphore::new(INPUT_BYTES)),
+                admission: Mutex::new((std::time::Instant::now(), BTreeMap::new())),
             },
             output,
         ))
+    }
+
+    fn note(&self, category: &'static str) {
+        let mut stats = self.admission.lock().expect("admission metrics poisoned");
+        *stats.1.entry(category).or_default() += 1;
+        if stats.0.elapsed() < std::time::Duration::from_secs(5) {
+            return;
+        }
+        let (queued, maximum, cpu_available) = self.dispatch.occupancy();
+        let row = json!({"at":Utc::now(),"stage":"market_admission",
+            "interval_ms":stats.0.elapsed().as_millis(),"counts":stats.1,
+            "queued_inputs":queued,"maximum_market_queued":maximum,
+            "cpu_permits_available":cpu_available,"input_bytes_used":INPUT_BYTES-self.bytes.available_permits(),
+            "queue_snapshot_excludes_actor_held_input":true,"output_occupancy":"not_measured"});
+        stats.0 = std::time::Instant::now();
+        stats.1.clear();
+        drop(stats);
+        eprintln!("{row}");
     }
 
     fn route<'a>(router: &'a Adapter, frame: &RawTransportFrame) -> Result<&'a str> {
@@ -186,25 +253,63 @@ impl Pipeline {
             return Ok(());
         }
         let market = Self::route(router, &frame)?.to_owned();
+        {
+            let control = self.controls[&market]
+                .lock()
+                .map_err(|_| anyhow::anyhow!("market control poisoned"))?;
+            if !control.attempts.is_empty()
+                && !control.baseline_admitted
+                && matches!(
+                    frame.raw_payload["event_type"].as_str(),
+                    Some("price_change" | "best_bid_ask" | "last_trade_price")
+                )
+            {
+                // Explicitly unavailable already. Incrementals cannot install
+                // a baseline; do not consume the recovery admission slots.
+                self.note("unavailable_incremental_ignored");
+                return Ok(());
+            }
+        }
         let generation = self.controls[&market]
             .lock()
             .map_err(|_| anyhow::anyhow!("market control poisoned"))?
             .generation;
         let bytes = bounded_size(&frame, FRAME_BYTES);
-        if let Ok(bytes) = bytes
-            && let Ok(permit) = self.bytes.clone().try_acquire_many_owned(bytes as u32)
-        {
-            let input = Input {
-                generation,
-                frame,
-                recovery: recovery.into_iter().collect(),
-                rest_recovery: None,
-                replacement_reason: None,
-                _bytes: permit,
-            };
-            if self.dispatch.try_submit(&market, input).is_ok() {
-                return Ok(());
+        let rejection;
+        if let Ok(bytes) = bytes {
+            if let Ok(permit) = self.bytes.clone().try_acquire_many_owned(bytes as u32) {
+                let input = Input {
+                    generation,
+                    frame,
+                    recovery: recovery.into_iter().collect(),
+                    rest_recovery: None,
+                    replacement_reason: None,
+                    _bytes: permit,
+                };
+                if self.dispatch.try_submit(&market, input).is_ok() {
+                    self.controls[&market]
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("market control poisoned"))?
+                        .baseline_admitted = true;
+                    self.note("accepted");
+                    return Ok(());
+                }
+                rejection = if self.dispatch.queue_closed(&market) {
+                    "queue_closed_or_unknown"
+                } else {
+                    "market_input_slots_full"
+                };
+            } else {
+                rejection = "shared_input_bytes_full";
             }
+        } else {
+            rejection = "frame_size_or_encoding_rejected";
+        }
+        self.note(rejection);
+        if rejection == "queue_closed_or_unknown" {
+            return self
+                .invalidate_market(router, publication, &market, "market_actor_closed")
+                .await;
         }
         self.invalidate_market(router, publication, &market, "market_queue_capacity")
             .await
@@ -217,7 +322,7 @@ impl Pipeline {
         raw_books: Vec<Value>,
         received_at: chrono::DateTime<Utc>,
         attempts: Vec<(String, String)>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let received_at = chrono::DateTime::from_timestamp_micros(received_at.timestamp_micros())
             .context("REST recovery receipt timestamp")?;
         let token = attempts
@@ -235,7 +340,15 @@ impl Pipeline {
             .lock()
             .map_err(|_| anyhow::anyhow!("market control poisoned"))?
             .generation;
-        let bytes = bounded_size(&raw_books, FRAME_BYTES)?;
+        let bytes = match bounded_size(&raw_books, FRAME_BYTES) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.note("rest_frame_size_or_encoding_rejected");
+                self.invalidate_market(router, publication, &market, "market_queue_capacity")
+                    .await?;
+                return Ok(false);
+            }
+        };
         let frame = RawTransportFrame {
             raw_payload: raw_books
                 .first()
@@ -243,11 +356,15 @@ impl Pipeline {
                 .clone(),
             received_at,
         };
-        let permit = self
-            .bytes
-            .clone()
-            .try_acquire_many_owned(bytes as u32)
-            .map_err(|_| anyhow::anyhow!("REST recovery byte capacity"))?;
+        let permit = match self.bytes.clone().try_acquire_many_owned(bytes as u32) {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.note("rest_shared_input_bytes_full");
+                self.invalidate_market(router, publication, &market, "market_queue_capacity")
+                    .await?;
+                return Ok(false);
+            }
+        };
         let input = Input {
             generation,
             frame,
@@ -257,10 +374,19 @@ impl Pipeline {
             _bytes: permit,
         };
         match self.dispatch.try_submit(&market, input) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.controls[&market]
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("market control poisoned"))?
+                    .baseline_admitted = true;
+                self.note("rest_recovery_accepted");
+                Ok(true)
+            }
             Err(_) => {
+                self.note("rest_market_input_slots_full_or_closed");
                 self.invalidate_market(router, publication, &market, "market_queue_capacity")
-                    .await
+                    .await?;
+                Ok(false)
             }
         }
     }
@@ -302,7 +428,13 @@ impl Pipeline {
             _bytes: permit,
         };
         match self.dispatch.try_submit(market, input) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.controls[market]
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("market control poisoned"))?
+                    .baseline_admitted = true;
+                Ok(())
+            }
             Err(_) => {
                 self.invalidate_market(router, publication, market, "market_queue_capacity")
                     .await
@@ -317,12 +449,27 @@ impl Pipeline {
         market: &str,
         reason: &str,
     ) -> Result<()> {
+        {
+            let control = self.controls[market]
+                .lock()
+                .map_err(|_| anyhow::anyhow!("market control poisoned"))?;
+            if reason == "market_queue_capacity"
+                && !control.attempts.is_empty()
+                && !control.baseline_admitted
+            {
+                // No new baseline/work crossed this barrier. Preserve the
+                // attempt identity; accepted recovery is NEVER coalesced here.
+                self.note("capacity_recovery_coalesced");
+                return Ok(());
+            }
+        }
         let tokens: Vec<_> = router
             .identities
             .iter()
             .filter(|(_, (m, _))| m == market)
             .map(|(t, _)| t.clone())
             .collect();
+        self.note("new_recovery_barrier");
         let mut events = Vec::new();
         for token in &tokens {
             events.push(
@@ -345,6 +492,7 @@ impl Pipeline {
             .generation
             .checked_add(1)
             .context("market generation overflow")?;
+        control.baseline_admitted = false;
         control.attempts = tokens
             .into_iter()
             .map(|token| {
@@ -520,6 +668,83 @@ mod tests {
             .unwrap()
             .unwrap()
     }
+
+    #[tokio::test]
+    async fn admitted_recovery_is_fenced_again_and_unadmitted_retry_is_coalesced() {
+        let mut router = fixture();
+        let tokens = router
+            .identities
+            .iter()
+            .map(|(t, (m, _))| (t.clone(), m.clone()))
+            .collect();
+        let base = json!({"latest_cursor":0,"books":[],"markets":[],"gaps":[],
+            "schema_version":"marketcow.polymarket.live-stream.v1","type":"state"});
+        let mut publication =
+            Publication::start(0, Some(base), tokens, 32, 1048576, 65536, |_| Ok(())).unwrap();
+        let (pipeline, mut output) = Pipeline::start_with_workers(&router, 8).unwrap();
+        assert!(Pipeline::start_with_workers(&router, 0).is_err());
+        assert!(Pipeline::start_with_workers(&router, 9).is_err());
+        pipeline
+            .invalidate_market(&mut router, &mut publication, "1", "market_queue_capacity")
+            .await
+            .unwrap();
+        let first = router.recoveries["11"].clone();
+        pipeline
+            .invalidate_market(&mut router, &mut publication, "1", "market_queue_capacity")
+            .await
+            .unwrap();
+        assert_eq!(router.recoveries["11"], first);
+        assert_eq!(publication.cursor().unwrap(), 2);
+        let mut delta = book("11");
+        delta.raw_payload["event_type"] = json!("price_change");
+        pipeline
+            .submit(&mut router, &mut publication, delta, None)
+            .await
+            .unwrap();
+        assert!(!pipeline.controls["1"].lock().unwrap().baseline_admitted);
+        pipeline
+            .submit(
+                &mut router,
+                &mut publication,
+                book("11"),
+                Some(("11".into(), first)),
+            )
+            .await
+            .unwrap();
+        let stale = next(&mut output).await;
+        pipeline
+            .invalidate_market(&mut router, &mut publication, "1", "market_queue_capacity")
+            .await
+            .unwrap();
+        assert_eq!(publication.cursor().unwrap(), 4);
+        let current = router.recoveries["11"].clone();
+        pipeline
+            .publish(&mut router, &mut publication, stale)
+            .await
+            .unwrap();
+        assert_eq!(publication.cursor().unwrap(), 4);
+        assert_eq!(router.recoveries["11"], current);
+        pipeline
+            .submit(
+                &mut router,
+                &mut publication,
+                book("11"),
+                Some(("11".into(), current)),
+            )
+            .await
+            .unwrap();
+        pipeline
+            .publish(&mut router, &mut publication, next(&mut output).await)
+            .await
+            .unwrap();
+        assert_eq!(publication.cursor().unwrap(), 6);
+        assert!(!router.recoveries.contains_key("11"));
+        pipeline
+            .finish(&mut router, &mut publication, &mut output)
+            .await
+            .unwrap();
+        publication.finish().await.unwrap();
+    }
     #[tokio::test]
     async fn rest_replacement_is_one_atomic_two_token_recovery_batch() {
         let mut router = fixture();
@@ -659,6 +884,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(publication.cursor().unwrap(), 2); // Explicit A gaps only.
+        let first_attempts = router.recoveries.clone();
+        // Rejected snapshots while no post-barrier input was admitted cannot
+        // invalidate another version. Reuse the exact recovery and cursor.
+        for _ in 0..20 {
+            pipeline
+                .submit(&mut router, &mut publication, book("11"), None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(router.recoveries, first_attempts);
+        assert_eq!(publication.cursor().unwrap(), 2);
+        let attempts = router
+            .recoveries
+            .iter()
+            .map(|(t, a)| (t.clone(), a.clone()))
+            .collect();
+        assert!(
+            !pipeline
+                .submit_rest_recovery(
+                    &mut router,
+                    &mut publication,
+                    vec![book("11").raw_payload, book("12").raw_payload],
+                    Utc::now(),
+                    attempts
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(publication.cursor().unwrap(), 2);
+        assert_eq!(router.recoveries, first_attempts);
         pipeline
             .publish(&mut router, &mut publication, old)
             .await

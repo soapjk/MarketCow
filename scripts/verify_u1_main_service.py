@@ -1,5 +1,6 @@
 """Read-only bounded smoke: no collector or account actions."""
 import asyncio
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -17,7 +18,7 @@ def get(path):
         return json.loads(raw), hashlib.sha256(raw).hexdigest()
 
 
-async def main():
+async def main(output):
     full, sha = await asyncio.to_thread(get, '/full-sync?scope_id=' + SCOPE)
     assert len(full['scope_market_ids']) == 250
     discovery, discovery_sha = await asyncio.to_thread(get, '/discovery/full-sync')
@@ -48,11 +49,13 @@ async def main():
               'instance': full['stream_instance_id'], 'before_cursor': full['cursor'],
               'after_cursor': cursor, 'events': events, 'frames': frames, 'ready_frame': ready,
               'not_long_term_or_close_isolation_acceptance': True}
-    path = Path('/mnt/p44pro/marketcow-shadow-v3-runtime/linux/logs/main-service-smoke-cd7cf39.json')
+    path = Path(output)
     with path.open('x') as file:
         json.dump(report, file, indent=2)
     print(json.dumps(report))
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output', required=True)
+    asyncio.run(main(parser.parse_args().output))

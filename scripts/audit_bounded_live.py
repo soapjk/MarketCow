@@ -47,7 +47,7 @@ def durable():
         return {k: m[k] for k in ('latest_cursor','history_floor_cursor','recent_event_bytes','bounded_history_bytes','unresolved_gap_count')}
 
 
-async def main(report):
+async def main(report, seconds=180):
     report['before'] = durable()
     started = time.monotonic()
     cursor = None
@@ -56,7 +56,7 @@ async def main(report):
     ages = [0] * 10002
     async with websockets.connect('ws://127.0.0.1:18897/', max_size=64*1024*1024, max_queue=1) as ws:
         await ws.send(json.dumps({'type': 'subscribe'}))
-        while time.monotonic() - started < 180:
+        while time.monotonic() - started < seconds:
             try:
                 raw = await asyncio.wait_for(ws.recv(), timeout=2)
             except asyncio.TimeoutError:

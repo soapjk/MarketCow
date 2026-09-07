@@ -11,12 +11,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--downstream-diagnostics', action='store_true')
     parser.add_argument('--membership-cache', action='store_true')
+    parser.add_argument('--gap-index', action='store_true')
+    parser.add_argument('--manifest-sha256')
     args = parser.parse_args()
     runtime = Path('/mnt/p44pro/marketcow-shadow-v3-runtime/linux')
     release_name = 'bounded-v2-downstream-diag-r1' if args.downstream_diagnostics else 'bounded-v2-api-fairness-r1'
     previous_name = 'bounded-v2-api-fairness-r1' if args.downstream_diagnostics else 'bounded-v2-decode-r1'
     if args.membership_cache:
         release_name, previous_name = 'bounded-v2-membership-r1', 'bounded-v2-downstream-diag-r1'
+    if args.gap_index:
+        assert not args.membership_cache and not args.downstream_diagnostics
+        assert args.manifest_sha256 and len(args.manifest_sha256) == 64
+        release_name, previous_name = 'gap-index-aa14360-r1', 'main-cd7cf396624b'
     release = runtime / 'releases' / release_name
     name = 'marketcow-paper-read-api.service'
     active = Path('/home/czx/.config/systemd/user') / name
@@ -27,6 +33,8 @@ def main():
                 '6c1b75412728dc56226b0ae5110415cff0823042727875c5be1d29039707cefc')
     if args.membership_cache:
         expected = '3c2df18febbbd68c1d401825373a43c3118b181e446791f85bce77a0d97871a4'
+    if args.gap_index:
+        expected = args.manifest_sha256
     assert hashlib.sha256(manifest).hexdigest() == expected
     for relative, digest in json.loads(manifest).items():
         with (release / relative).open('rb') as file:
