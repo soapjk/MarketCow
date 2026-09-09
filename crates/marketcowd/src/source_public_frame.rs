@@ -222,8 +222,8 @@ mod tests {
         use crate::source_public_api::{ConfiguredScope, ConfiguredMarket, full_sync, encode_bounded, EncodeError};
         let mut scope = ConfiguredScope { schema_version:"marketcow.polymarket.scope-discovery.v1".into(),
             mode:"shadow".into(),catalog_revision:"a".repeat(64),active_scope_id:String::new(),configured_market_count:2,
-            configured_markets:vec![ConfiguredMarket{market_id:"1".into(),condition_id:"1".into(),token_ids:["a".into(),"b".into()],end_at:now.to_rfc3339()},
-                ConfiguredMarket{market_id:"2".into(),condition_id:"2".into(),token_ids:["c".into(),"d".into()],end_at:now.to_rfc3339()}] };
+            configured_markets:vec![ConfiguredMarket{market_id:"1".into(),condition_id:"1".into(),token_ids:["a".into(),"b".into()],end_at:Some(now.to_rfc3339())},
+                ConfiguredMarket{market_id:"2".into(),condition_id:"2".into(),token_ids:["c".into(),"d".into()],end_at:Some(now.to_rfc3339())}] };
         scope.active_scope_id = marketcow_polymarket::discovery_source::canonical_hash(&json!({
             "catalog_revision":scope.catalog_revision,"configured_markets":scope.configured_markets,"mode":scope.mode}));
         let sync = full_sync(&view,&scope,1,"test-instance",now).unwrap();
@@ -248,7 +248,9 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(),131072).await.unwrap();
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["scope_market_ids"],json!(["1","2"]));
-        let router = crate::source_public_api::PublicApi::router(p.reader(),scope.clone(),1,"test-instance".into(),131072,1,limits.clone()).unwrap();
+        let (router, control) = crate::source_public_api::PublicApi::router_managed(p.reader(),scope.clone(),1,
+            "test-instance".into(),131072,1,limits.clone(),std::time::Duration::from_millis(50)).unwrap();
+        let online_router = router.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
@@ -263,6 +265,34 @@ mod tests {
         ws.send(tokio_tungstenite::tungstenite::Message::Ping(vec![1,2].into())).await.unwrap();
         let pong = tokio::time::timeout(std::time::Duration::from_secs(2),ws.next()).await.unwrap().unwrap().unwrap();
         assert!(pong.is_pong());
+        // Same listener/process, retained missing market is allowed. This is
+        // actual HTTP/WS publication switching, not upstream acquisition.
+        let mut next_scope=scope.clone();
+        next_scope.configured_markets.remove(0);
+        next_scope.configured_market_count=1;
+        next_scope.active_scope_id=marketcow_polymarket::discovery_source::canonical_hash(&json!({
+            "catalog_revision":next_scope.catalog_revision,"configured_markets":next_scope.configured_markets,"mode":next_scope.mode}));
+        control.prepare(&scope.active_scope_id,1,&next_scope).unwrap();
+        assert_eq!(control.status().unwrap()["scope_id"],scope.active_scope_id);
+        assert_eq!(control.activate(&scope.active_scope_id,1,next_scope.clone()).unwrap(),2);
+        assert_eq!(control.status().unwrap()["scope_id"],next_scope.active_scope_id);
+        assert_eq!(control.status().unwrap()["revision"],2);
+        assert!(control.activate(&scope.active_scope_id,1,scope.clone()).is_err());
+        let new_path=format!("/v1/prediction-markets/polymarket/live/full-sync?scope_id={}",next_scope.active_scope_id);
+        let response=online_router.clone().oneshot(axum::http::Request::builder().uri(&new_path)
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(),axum::http::StatusCode::OK);
+        let bytes=axum::body::to_bytes(response.into_body(),131072).await.unwrap();
+        let new_sync:Value=serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(new_sync["scope_market_ids"],json!(["2"]));
+        assert_eq!(new_sync["projection_generation"],2);
+        assert_eq!(new_sync["health"]["missing_market_count"],1);
+        let retired=tokio::time::timeout(std::time::Duration::from_secs(2),ws.next()).await.unwrap().unwrap().unwrap();
+        let retired:Value=serde_json::from_str(retired.to_text().unwrap()).unwrap();
+        assert_eq!(retired["code"],"polymarket_scope_changed");
+        let old=online_router.oneshot(axum::http::Request::builder().uri(&path)
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(old.status(),axum::http::StatusCode::CONFLICT);
         ws.close(None).await.unwrap();
         server.abort();
         let _ = server.await;

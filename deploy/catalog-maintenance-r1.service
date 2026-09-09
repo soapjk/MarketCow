@@ -1,0 +1,18 @@
+[Unit]
+Description=MarketCow bounded catalog maintenance (no pool activation)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/catalog-maintenance-r1
+Environment=PYTHONPATH=/mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/catalog-maintenance-r1/src:/mnt/p44pro/marketcow-shadow-v3-runtime/linux/read-api-packages
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HTTPS_PROXY=http://127.0.0.1:17890
+Environment=HTTP_PROXY=http://127.0.0.1:17890
+Environment=NO_PROXY=127.0.0.1,localhost
+UnsetEnvironment=ALL_PROXY all_proxy
+ExecStart=/usr/bin/python3 -m marketcow.catalog_refresh_worker --config /mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/catalog-maintenance-r1/worker.json
+MemoryMax=4G
+CPUQuota=200%
+TimeoutStartSec=15000
+UMask=0077
+Restart=no

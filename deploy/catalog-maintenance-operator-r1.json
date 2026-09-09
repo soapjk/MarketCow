@@ -1,0 +1,19 @@
+{
+  "admission_path": "/mnt/p44pro/marketcow-shadow-v3-runtime/linux/phase1/admission.sqlite3",
+  "body_timeout_seconds": 10,
+  "callers_path": "/mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/hot-scope-r36-v1/callers.json",
+  "catalog_path": "/mnt/p44pro/marketcow-shadow-v3-runtime/linux/phase1/catalog-r1.sqlite",
+  "catalog_sha256": "f34ac11f5140c133229094bbf1c91b25080b61a5262f2c2629f7b78995373c50",
+  "catalog_publication_root": "/mnt/p44pro/marketcow-catalog-maintenance-r1/published",
+  "expected_active_selection_id": "legacy-discovery:16a179ea8a2517e90a2233935effc7cbf082cc995d422256295d04f84a9874d9",
+  "host": "127.0.0.1",
+  "hot_operations": {"path": "/mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/hot-scope-r36-v1/hot-operator.json", "sha256": "9982989ba0bb3b244666d6bfbf17ba123fdd31f8de71c12be165f3b43237c461"},
+  "legacy_incumbent": {
+    "binding": {"catalog_revision": "7d05e5113ee8ac6eb01d94371feb1df6bb7dd8a89348b555e01cd5af17fffa5c", "market_count": 1000, "market_ids_sha256": "2b8f23bccb7f346740612c23b8a8a9f7ef1be2cdc74edc3800422c4de3b23cca", "origin": "legacy_discovery", "schema_version": "marketcow.polymarket.legacy-incumbent-binding.v1", "universe_revision": "47797f9a60e6c22c06d6f480e634393585fbd050d7f4756031ed8791fad388cd"},
+    "manifest_path": "/mnt/p44pro/marketcow-shadow-v3-runtime/linux/bounded-discovery-candidate-r1/catalog.json"
+  },
+  "maximum_catalog_row_bytes": 2097152,
+  "port": 18898,
+  "profile_path": "/mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/phase1-control-r1/tests/contracts/phase1/profile.json",
+  "profile_sha256": "3e1e37d01cf94c0114db2765484ad61f210a816f48f42237386b8c05f0528d98"
+}

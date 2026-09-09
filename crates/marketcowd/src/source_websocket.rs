@@ -54,6 +54,27 @@ struct Adapter {
     recoveries: BTreeMap<String, String>,
 }
 impl Adapter {
+    /// The owner has already bound this exact identity to catalog metadata.
+    /// New reducers start without tick/book/freshness state; snapshots must
+    /// supply those facts. Retained pairs are never reset by admission.
+    fn admit_market(&mut self, market:&super::Market)->Result<bool> {
+        ensure!(!market.market_id.is_empty() && !market.condition_id.is_empty()
+            && market.token_ids[0]!=market.token_ids[1]
+            && market.token_ids.iter().all(|token|!token.is_empty()&&token.len()<=128),"market admission identity");
+        let expected=(market.market_id.clone(),market.condition_id.clone());
+        let existing=market.token_ids.iter().filter(|token|self.identities.contains_key(*token)).count();
+        if existing>0 {
+            ensure!(existing==2 && market.token_ids.iter().all(|token|self.identities.get(token)==Some(&expected)),"market admission ownership conflict");
+            return Ok(false);
+        }
+        ensure!(!self.identities.values().any(|(id,_)|id==&market.market_id),"market admission changed token pair");
+        ensure!(self.identities.len()+2<=marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES,"market admission token capacity");
+        for token in &market.token_ids {
+            self.identities.insert(token.clone(),expected.clone());
+            self.waiting.insert(token.clone());
+        }
+        Ok(true)
+    }
     fn market_actor(&self, market: &str) -> Self {
         let identities: BTreeMap<_, _> = self
             .identities
@@ -95,13 +116,36 @@ impl Adapter {
         self.last_trades.clear();
     }
     fn new(plan: &Plan, seed: &Value) -> Result<Self> {
-        let active: BTreeSet<_> = seed["markets"]
+        let market_states: BTreeMap<_, _> = seed["markets"]
             .as_array()
             .context("market seed")?
             .iter()
-            .filter(|m| m["lifecycle_state"] == "active")
-            .map(|m| m["identity"]["market_id"].as_str().context("market id"))
+            .map(|m| {
+                Ok((
+                    m["identity"]["market_id"]
+                        .as_str()
+                        .context("market id")?
+                        .to_owned(),
+                    m["lifecycle_state"]
+                        .as_str()
+                        .context("market lifecycle state")?
+                        .to_owned(),
+                ))
+            })
             .collect::<Result<_>>()?;
+        let terminal_tokens: BTreeSet<_> = seed["markets"]
+            .as_array()
+            .context("market seed")?
+            .iter()
+            .filter(|market| market["lifecycle_state"] == "closed" || market["lifecycle_state"] == "resolved")
+            .flat_map(|market| market["identity"]["outcomes"].as_array().into_iter().flatten())
+            .filter_map(|outcome| outcome["token_id"].as_str())
+            .collect();
+        let active: BTreeSet<_> = market_states
+            .iter()
+            .filter(|(_, state)| state.as_str() == "active")
+            .map(|(market, _)| market.as_str())
+            .collect();
         let mut identities = BTreeMap::new();
         for market in &plan.markets {
             if active.contains(market.market_id.as_str()) {
@@ -114,7 +158,7 @@ impl Adapter {
             }
         }
         ensure!(
-            !identities.is_empty() && identities.len() <= 2048,
+            !identities.is_empty() && identities.len() <= marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES,
             "bounded active WS universe required"
         );
         let mut ticks = BTreeMap::new();
@@ -131,10 +175,10 @@ impl Adapter {
                 );
             }
         }
-        ensure!(
-            identities.keys().all(|t| ticks.contains_key(t)),
-            "authoritative initial tick missing; prepare source first"
-        );
+        // A cold candidate can lack authoritative tick metadata. Keep those
+        // tokens waiting; normalization still refuses a book without a verified
+        // tick, and the existing token-local recovery/REST snapshot path supplies
+        // it. Missing metadata must not prevent unrelated markets from starting.
         let recoveries = seed
             .get("token_recoveries")
             .and_then(Value::as_array)
@@ -145,18 +189,33 @@ impl Adapter {
                     .as_str()
                     .context("recovery token")?
                     .to_owned();
-                ensure!(
-                    identities.contains_key(&token),
-                    "recovery token outside scope"
-                );
-                Ok((
+                // A terminal lifecycle overlay is authoritative for the market
+                // and retires its books. Older generations may still contain
+                // the pre-terminal coverage recovery row; preserve that row in
+                // durable history, but do not let it poison the active WS
+                // identity set or force a recovery for a retired token.
+                if !identities.contains_key(&token) {
+                    let market = recovery["market_id"]
+                        .as_str()
+                        .context("recovery market")?;
+                    ensure!(
+                        market_states
+                            .get(market)
+                            .is_some_and(|state| state == "closed" || state == "resolved"),
+                        "recovery token outside scope"
+                    );
+                    ensure!(terminal_tokens.contains(token.as_str()), "recovery token outside scope");
+                    return Ok(None);
+                }
+                Ok(Some((
                     token,
                     recovery["recovery_id"]
                         .as_str()
                         .context("recovery id")?
                         .to_owned(),
-                ))
+                )))
             })
+            .filter_map(|item| item.transpose())
             .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(Self {
             config: NormalizerConfig::new(
@@ -656,6 +715,30 @@ mod tests {
         json!({"event_type":"book","asset_id":token,"market":"condition","timestamp":now.timestamp_millis().to_string(),"hash":"upstream","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]})
     }
     #[test]
+    fn missing_initial_tick_is_local_until_authoritative_snapshot() {
+        let plan = Plan { schema_version: "test".into(), catalog_revision: "catalog".into(),
+            markets: vec![super::super::Market { market_id:"1".into(), condition_id:"condition".into(),
+                token_ids:["11".into(),"12".into()] }] };
+        let mut a = Adapter::new(&plan, &json!({"scope_id":"scope",
+            "markets":[{"identity":{"market_id":"1"},"lifecycle_state":"active"}],
+            "books":[{"token_id":"12","tick_size":"0.01"}]})).unwrap();
+        let now = Utc::now();
+        let failed = a.apply_isolated(book("11", now), now, 0).unwrap();
+        assert_eq!(failed[0]["event_type"], "recovery_started");
+        assert!(!a.ticks.contains_key("11"));
+        assert!(a.waiting.contains("11"));
+        let healthy = a.apply_isolated(book("12", now), now, failed.len() as u64).unwrap();
+        assert_eq!(healthy[0]["event_type"], "book");
+        assert!(!a.waiting.contains("12"));
+        assert!(a.waiting.contains("11"));
+        let mut authoritative = book("11", now);
+        authoritative["tick_size"] = json!("0.01");
+        let recovered = a.apply_isolated(authoritative, now, (failed.len()+healthy.len()) as u64).unwrap();
+        assert!(recovered.iter().any(|event| event["event_type"] == "book"));
+        assert!(a.ticks.contains_key("11"));
+        assert!(!a.waiting.contains("11"));
+    }
+    #[test]
     fn authoritative_snapshot_delta_and_reconnect_require_new_baseline() {
         let mut a = fixture();
         let now = Utc::now();
@@ -680,6 +763,41 @@ mod tests {
         assert!(a.apply(delta, now, 3).unwrap().is_empty());
         a.apply(book("11", now), now, 3).unwrap();
         assert!(a.waiting.is_empty());
+    }
+
+    #[test]
+    fn stale_recovery_for_terminal_market_is_not_an_active_scope_error() {
+        let plan = Plan {
+            schema_version: "test".into(),
+            catalog_revision: "catalog".into(),
+            markets: vec![
+                super::super::Market {
+                    market_id: "1".into(),
+                    condition_id: "active-condition".into(),
+                    token_ids: ["11".into(), "12".into()].into(),
+                },
+                super::super::Market {
+                    market_id: "2".into(),
+                    condition_id: "terminal-condition".into(),
+                    token_ids: ["21".into(), "22".into()].into(),
+                },
+            ],
+        };
+        let seed = json!({
+            "scope_id":"scope",
+            "markets":[
+                {"identity":{"market_id":"1"},"lifecycle_state":"active"},
+                {"identity":{"market_id":"2","outcomes":[{"token_id":"21"},{"token_id":"22"}]},"lifecycle_state":"resolved"}
+            ],
+            "books":[
+                {"token_id":"11","tick_size":"0.01"},
+                {"token_id":"12","tick_size":"0.01"}
+            ],
+            "token_recoveries":[{"token_id":"21","market_id":"2","recovery_id":"old-terminal-recovery"}]
+        });
+        let adapter = Adapter::new(&plan, &seed).unwrap();
+        assert_eq!(adapter.identities.len(), 2);
+        assert!(adapter.recoveries.is_empty());
     }
     #[test]
     fn complete_book_last_trade_survives_the_ws_reducer_and_later_price_changes() {
@@ -916,6 +1034,7 @@ pub async fn run(
     plan: &Plan,
     seed: Value,
     publication: &mut Publication,
+    acquisition:Option<tokio::sync::mpsc::Receiver<super::source_scope_control::AcquisitionRequest>>,
 ) -> Result<()> {
     ensure!(
         args.cycles.is_none(),
@@ -968,6 +1087,9 @@ pub async fn run(
         confirmation_markets,
         plan.markets.clone(),
         lifecycle_markets,
+        acquisition,
+        args.acquisition_token_budget.unwrap_or(2048),
+        args.acquisition_socket_budget.unwrap_or(1024),
     )
     .await
 }
@@ -1130,11 +1252,13 @@ async fn run_confirmations(
     interval_seconds: u64,
     sender: tokio::sync::mpsc::Sender<ConfirmationBatch>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    network:Arc<tokio::sync::Semaphore>,
+    membership:tokio::sync::watch::Receiver<BTreeSet<String>>,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(request_timeout_seconds))
         .build()?;
-    let network = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    ensure!(concurrency>0,"confirmation concurrency");
     let mut jobs = tokio::task::JoinSet::new();
     for batch in markets.chunks(market_batch_size) {
         let batch = batch.to_vec();
@@ -1142,11 +1266,14 @@ async fn run_confirmations(
         let network = network.clone();
         let sender = sender.clone();
         let mut shutdown = shutdown.clone();
+        let membership=membership.clone();
         jobs.spawn(async move {
             loop {
                 if *shutdown.borrow() {
                     return Ok::<(), anyhow::Error>(());
                 }
+                let batch:Vec<_>=batch.iter().filter(|market|membership.borrow().contains(&market.market_id)).cloned().collect();
+                if batch.is_empty(){return Ok(());}
                 let cycle_started = tokio::time::Instant::now();
                 let permit = tokio::select! {
                     permit = network.clone().acquire_owned() => permit?,
@@ -1197,37 +1324,33 @@ async fn run_connection(
     network_concurrency: usize,
     response_byte_limit: usize,
     request_timeout_seconds: u64,
-    confirmation_markets: Vec<super::Market>,
+    mut confirmation_markets: Vec<super::Market>,
     lifecycle_candidates: Vec<super::Market>,
-    lifecycle_markets: BTreeMap<String, Value>,
+    mut lifecycle_markets: BTreeMap<String, Value>,
+    mut acquisition:Option<tokio::sync::mpsc::Receiver<super::source_scope_control::AcquisitionRequest>>,
+    acquisition_token_budget:usize,
+    acquisition_socket_budget:usize,
 ) -> Result<()> {
-    let (pipeline, mut completed_markets) = pipeline::Pipeline::start_with_workers(adapter, market_workers)?;
+    let (mut pipeline, mut completed_markets) = pipeline::Pipeline::start_with_workers(adapter, market_workers)?;
+    let mut acquisition_tokens:BTreeSet<_>=adapter.identities.keys().cloned().collect();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let mut jobs = tokio::task::JoinSet::new();
-    for (shard_id, shard) in connection_shards(&adapter.identities, websocket_shard_tokens)?
-        .into_iter()
-        .enumerate()
-    {
-        let sender = sender.clone();
-        let mut shutdown = shutdown.clone();
-        jobs.spawn(async move {
-            loop {
-                let result = run_polymarket_transport(PolymarketTransportConfig::production(),
-                    shard.clone(), sender.clone(), shutdown.clone()).await;
-                if *shutdown.borrow() { return Ok::<(), anyhow::Error>(()); }
-                eprintln!("{}", json!({"stage":"connection_shard_retry","shard_id":shard_id,"token_count":shard.len(),"detail":format!("{result:?}")}));
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
-                    _ = shutdown.changed() => return Ok(()),
-                }
-            }
-        });
-    }
+    let mut jobs=super::source_acquisition_shards::Shards::new(PolymarketTransportConfig::production(),
+        sender.clone(),acquisition_token_budget,acquisition_socket_budget,websocket_shard_tokens)?;
+    let mut initial_pairs=BTreeMap::<String,Vec<String>>::new();
+    for (token,(market,_)) in &adapter.identities {initial_pairs.entry(market.clone()).or_default().push(token.clone());}
+    let initial_pairs:Vec<[String;2]>=initial_pairs.into_values().map(|pair|pair.try_into()
+        .map_err(|_|anyhow::anyhow!("initial acquisition market pair"))).collect::<Result<_>>()?;
+    jobs.add_pairs(&initial_pairs)?;
+    publication.set_acquisition_statistics(jobs.statistics());
     drop(sender);
     let (confirmation_sender, mut confirmation_receiver) =
         tokio::sync::mpsc::channel(network_concurrency);
     let confirmation_shutdown = shutdown.clone();
+    let confirmation_network=Arc::new(tokio::sync::Semaphore::new(network_concurrency));
+    let (confirmation_membership,confirmation_members)=tokio::sync::watch::channel(
+        confirmation_markets.iter().map(|market|market.market_id.clone()).collect::<BTreeSet<_>>());
+    let mut added_confirmation_jobs=tokio::task::JoinSet::new();
     let confirmation_job = tokio::spawn(run_confirmations(
         confirmation_markets.clone(),
         request_market_batch_size,
@@ -1235,8 +1358,10 @@ async fn run_connection(
         response_byte_limit,
         request_timeout_seconds,
         websocket_confirmation_seconds,
-        confirmation_sender,
+        confirmation_sender.clone(),
         confirmation_shutdown,
+        confirmation_network.clone(),
+        confirmation_members.clone(),
     ));
     let lifecycle_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(request_timeout_seconds))
@@ -1290,8 +1415,79 @@ async fn run_connection(
     let result:Result<()>=async {
         loop {
             let frames=tokio::select! {
+                request=async {match acquisition.as_mut(){Some(rx)=>rx.recv().await,None=>std::future::pending().await}}=>{
+                    let Some(request)=request else {acquisition=None;continue;};
+                    let result=(||->Result<Value>{
+                        if !request.retire_market_ids.is_empty() {
+                            let removed=&request.retire_market_ids;
+                            publication.check_retirement(removed.clone())?;
+                            if request.validate_only{return Ok(json!({"retirement_validated":true,"publication_applied":false}));}
+                            let retired_tokens:BTreeSet<_>=adapter.identities.iter().filter(|(_, (market,_))|removed.contains(market)).map(|(t,_)|t.clone()).collect();
+                            if !retired_tokens.is_empty(){jobs.begin_retire(&retired_tokens)?;}
+                            for market in removed {
+                                if pipeline.has_market(market){pipeline.remove_market(adapter,market)?;}
+                                lifecycle_markets.remove(market);lifecycle_pending.remove(market);lifecycle_terminal.remove(market);
+                                lifecycle_retry_at.remove(market);freshness_queued.remove(market);freshness_pending.remove(market);freshness_retry_at.remove(market);
+                            }
+                            confirmation_markets.retain(|m|!removed.contains(&m.market_id));
+                            confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
+                            acquisition_tokens=adapter.identities.keys().cloned().collect();
+                            publication.retire_catalog_markets(removed.clone())?;
+                            publication.set_acquisition_statistics(jobs.statistics());
+                            return Ok(json!({"retirement_queued":true,"retired_market_ids":removed,
+                                "source_cursor":publication.cursor()?,"wire_unsubscribe_confirmed":false}));
+                        }
+                        ensure!(!request.records.is_empty()&&request.records.len()<=4096,"acquisition record budget");
+                        let mut ids=BTreeSet::new();let mut added=vec![];
+                        let subscribed=jobs.tokens();
+                        for record in &request.records {
+                            let identity=&record["identity"];
+                            let id=identity["market_id"].as_str().context("acquisition market id")?;
+                            ensure!(ids.insert(id.to_owned()),"duplicate acquisition market");
+                            if record["lifecycle_state"]!="active" || !request.acquisition_market_ids.contains(id) {continue;}
+                            let tokens:Vec<String>=identity["outcomes"].as_array().context("acquisition outcomes")?.iter()
+                                .map(|outcome|outcome["token_id"].as_str().map(str::to_owned).context("acquisition token")).collect::<Result<_>>()?;
+                            let market=super::Market{market_id:id.into(),condition_id:identity["condition_id"].as_str().context("acquisition condition")?.into(),
+                                token_ids:tokens.try_into().map_err(|_|anyhow::anyhow!("acquisition binary pair"))?};
+                            let actor_absent=market.token_ids.iter().all(|t|!adapter.identities.contains_key(t));
+                            if !actor_absent {ensure!(market.token_ids.iter().all(|t|adapter.identities.get(t)==Some(&(market.market_id.clone(),market.condition_id.clone()))),
+                                "retained acquisition identity differs");}
+                            if market.token_ids.iter().all(|t|!subscribed.contains(t)){added.push(market);}
+                            else {ensure!(!actor_absent&&market.token_ids.iter().all(|t|subscribed.contains(t)),"acquisition retirement still pending");}
+                        }
+                        let pairs:Vec<_>=added.iter().map(|m|m.token_ids.clone()).collect();
+                        jobs.validate_add_pairs(&pairs)?;
+                        if request.validate_only {
+                            publication.check_catalog_admission(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,&request.acquisition_market_ids,acquisition_token_budget)?;
+                            return Ok(json!({"acquisition_validated":true,"publication_applied":false}));
+                        }
+                        publication.admit_catalog_markets_scoped(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,
+                            &request.acquisition_market_ids,acquisition_token_budget)?;
+                        for market in &added {pipeline.install_admitted_market(adapter,publication,market)?;}
+                        jobs.add_pairs(&pairs)?;
+                        publication.set_acquisition_statistics(jobs.statistics());
+                        acquisition_tokens=adapter.identities.keys().cloned().collect();
+                        for record in request.records {lifecycle_markets.insert(record["identity"]["market_id"].as_str().unwrap().to_owned(),record);}
+                        let added_ids:Vec<_>=added.iter().map(|m|m.market_id.clone()).collect();
+                        if !added.is_empty() {
+                            confirmation_markets.extend(added.clone());
+                            confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
+                            added_confirmation_jobs.spawn(run_confirmations(added,request_market_batch_size,network_concurrency,
+                                response_byte_limit,request_timeout_seconds,websocket_confirmation_seconds,
+                                confirmation_sender.clone(),shutdown.clone(),confirmation_network.clone(),confirmation_members.clone()));
+                        }
+                        Ok(json!({"acquisition_installed":true,"added_market_ids":added_ids,
+                            "requested_market_ids":ids,"source_cursor":publication.cursor()?,
+                            "books_all_ready_required":false,"publication_applied":false}))
+                    })();
+                    let _=request.receipt.send(result);continue;
+                },
+                result=added_confirmation_jobs.join_next(),if !added_confirmation_jobs.is_empty()=>{
+                    result.context("added confirmation task missing")???;
+                    continue;
+                },
                 value=receiver.recv()=>value.context("WS transport stopped")?,
-                value=jobs.join_next()=>{value.context("WS tasks stopped")???;anyhow::bail!("WS transport ended");},
+                value=jobs.failure()=>{value?;anyhow::bail!("WS transport ended");},
                 completed=completed_markets.recv()=>{
                     pipeline.publish(adapter, publication, completed.context("market workers stopped")?).await?;
                     continue;
@@ -1302,6 +1498,7 @@ async fn run_connection(
                         Err(error) => eprintln!("{}", json!({"stage":"rest_confirmation_request_failed","detail":error.to_string()})),
                         Ok((books, received_at)) => {
                             for market in confirmation.markets {
+                                if !confirmation_membership.borrow().contains(&market.market_id){continue;}
                                 for _ in 0..market_workers * 2 {
                                     match completed_markets.try_recv() {
                                         Ok(done) => pipeline.publish(adapter, publication, done).await?,
@@ -1399,6 +1596,7 @@ async fn run_connection(
                 },
                 completed=lifecycle_jobs.join_next(), if !lifecycle_jobs.is_empty()=>{
                     let (market, result) = completed.context("lifecycle task missing")??;
+                    if !lifecycle_markets.contains_key(&market.market_id){continue;}
                     lifecycle_pending.remove(&market.market_id);
                     lifecycle_retry_at.insert(
                         market.market_id.clone(),
@@ -1451,6 +1649,7 @@ async fn run_connection(
                 },
                 completed=freshness_jobs.join_next(), if !freshness_jobs.is_empty()=>{
                     let (market, requested, result) = completed.context("freshness task missing")??;
+                    if !confirmation_membership.borrow().contains(&market.market_id){continue;}
                     freshness_pending.remove(&market.market_id);
                     freshness_retry_at.insert(
                         market.market_id.clone(),
@@ -1517,6 +1716,8 @@ async fn run_connection(
                     continue;
                 },
                 _=retry_tick.tick()=>{
+                    if let Err(error)=jobs.poll_retirements(){eprintln!("{}",json!({"stage":"acquisition_retirement_error","error":error.to_string()}));}
+                    publication.set_acquisition_statistics(jobs.statistics());
                     rest_submitted.retain(|token, attempt| adapter.recoveries.get(token) == Some(attempt));
                     // A bounded number of temporary sockets; a failed token cannot
                     // occupy every retry slot forever (per-token backoff).
@@ -1542,6 +1743,7 @@ async fn run_connection(
                 _=&mut shutdown_requested=>break,
             };
             for frame in frames {
+                if !marketcow_polymarket::subscription::owned_or_unclassified(&frame.raw_payload,&acquisition_tokens){continue;}
                 // Consume completed work between admissions, not only after
                 // the whole upstream batch. A bounded drain prevents either
                 // continuously ready branch from starving the other.
@@ -1566,8 +1768,8 @@ async fn run_connection(
     while lifecycle_jobs.join_next().await.is_some() {}
     freshness_jobs.abort_all();
     while freshness_jobs.join_next().await.is_some() {}
-    jobs.abort_all();
-    while jobs.join_next().await.is_some() {}
+    jobs.stop().await;
+    added_confirmation_jobs.abort_all();while added_confirmation_jobs.join_next().await.is_some(){}
     // A confirmation mismatch submits its already-validated REST pair to the
     // market actor immediately. Apply those bounded in-flight recoveries before
     // closing; merely draining and dropping their results would persist a gap
@@ -1601,87 +1803,43 @@ async fn run_connection(
     pipeline
         .finish(adapter, publication, &mut completed_markets)
         .await?;
-    // Actor draining can itself expose a final validation failure after the
-    // normal recovery loop last observed an empty set. Resolve that exact
-    // post-drain set from complete authoritative market pairs; never erase a
-    // gap or fabricate a placeholder merely to make shutdown look clean.
+    // Missing books are valid local quality facts, including at shutdown.
+    // Do not start fresh network recovery or require all markets healthy to
+    // stop. Every outstanding recovery must already be published; the owner
+    // subsequently drains the independent durability worker before exit.
     if !adapter.recoveries.is_empty() {
-        let affected_markets: BTreeSet<_> = adapter
-            .recoveries
-            .keys()
-            .filter_map(|token| {
-                adapter
-                    .identities
-                    .get(token)
-                    .map(|(market, _)| market.clone())
-            })
-            .collect();
-        let recovery_markets: Vec<_> = confirmation_markets
-            .iter()
-            .filter(|market| affected_markets.contains(&market.market_id))
-            .cloned()
-            .collect();
-        ensure!(
-            recovery_markets.len() == affected_markets.len(),
-            "shutdown recovery market identity missing"
-        );
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(request_timeout_seconds))
-            .build()?;
-        let (cleanup, mut cleanup_output) = pipeline::Pipeline::start_with_workers(adapter, market_workers)?;
-        for batch in recovery_markets.chunks(request_market_batch_size) {
-            let (books, received_at) = super::fetch(client.clone(), batch, response_byte_limit)
-                .await
-                .context("shutdown authoritative recovery failed")?;
-            for market in batch {
-                let selected: Vec<_> = books
-                    .iter()
-                    .filter(|book| {
-                        market
-                            .token_ids
-                            .iter()
-                            .any(|token| book["asset_id"] == *token)
-                    })
-                    .cloned()
-                    .collect();
-                ensure!(
-                    selected.len() == 2,
-                    "shutdown recovery requires both token books for {}",
-                    market.market_id
-                );
-                let attempts: Vec<_> = market
-                    .token_ids
-                    .iter()
-                    .filter_map(|token| {
-                        adapter
-                            .recoveries
-                            .get(token)
-                            .map(|attempt| (token.clone(), attempt.clone()))
-                    })
-                    .collect();
-                if !attempts.is_empty() {
-                    cleanup
-                        .submit_rest_recovery(adapter, publication, selected, received_at, attempts)
-                        .await?;
-                }
-            }
-        }
-        cleanup
-            .finish(adapter, publication, &mut cleanup_output)
-            .await?;
-        ensure!(
-            adapter.recoveries.is_empty(),
-            "shutdown left unresolved token recoveries"
-        );
+        let (cursor, facts) = publication.shutdown_recovery_facts()?;
+        validate_shutdown_recovery_facts(&adapter.recoveries, &facts)?;
+        eprintln!("{}", json!({"stage":"shutdown_recoveries_preserved",
+            "token_count":adapter.recoveries.len(),"published_cursor":cursor}));
     }
     confirmation_job.abort();
     let _ = confirmation_job.await;
     result
 }
 
+fn validate_shutdown_recovery_facts(expected:&BTreeMap<String,String>,published:&BTreeMap<String,Value>)->Result<()> {
+    for (token,attempt) in expected {
+        ensure!(published.get(token).is_some_and(|fact|fact["recovery_id"]==*attempt),
+            "shutdown recovery not represented in published state");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod shard_tests {
     use super::*;
+
+    #[test]
+    fn shutdown_preserves_missing_book_recovery_and_rejects_unpublished_attempt() {
+        let expected=BTreeMap::from([("token".into(),"attempt".into())]);
+        let published=BTreeMap::from([("token".into(),json!({"recovery_id":"attempt","gap":{"resolved":false}}))]);
+        validate_shutdown_recovery_facts(&expected,&published).unwrap();
+        assert_eq!(published["token"]["gap"]["resolved"],false);
+        assert!(validate_shutdown_recovery_facts(&expected,&BTreeMap::new()).is_err());
+        let stale=BTreeMap::from([("token".into(),json!({"recovery_id":"old"}))]);
+        assert!(validate_shutdown_recovery_facts(&expected,&stale).is_err());
+    }
 
     #[test]
     fn connection_shards_are_bounded_and_never_split_market_pairs() {

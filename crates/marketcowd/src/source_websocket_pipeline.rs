@@ -59,7 +59,7 @@ pub(super) struct Output {
     events: Vec<Value>,
 }
 pub(super) struct Pipeline {
-    dispatch: Dispatcher<Input>,
+    dispatch: Dispatcher<Input, State, Output>,
     controls: BTreeMap<String, Arc<Mutex<Control>>>,
     bytes: Arc<Semaphore>,
     admission: Mutex<(std::time::Instant, BTreeMap<&'static str, u64>)>,
@@ -89,6 +89,64 @@ fn bounded_size(value: &impl serde::Serialize, limit: usize) -> Result<usize> {
 }
 
 impl Pipeline {
+    pub(super) fn has_market(&self,market:&str)->bool {self.controls.contains_key(market)}
+    /// Connect catalog admission to the actual reducer pool, not just a list
+    /// in the API. No subscription is sent until this method succeeds.
+    pub(super) fn install_admitted_market(&mut self,router:&mut Adapter,publication:&Publication,market:&super::super::Market)->Result<bool> {
+        let view=publication.capture_view()?;
+        let metadata=view.markets.get(&market.market_id).context("market metadata not admitted")?;
+        let identity=&metadata["identity"];
+        ensure!(identity["condition_id"]==market.condition_id,"admitted market condition differs");
+        let tokens:BTreeSet<_>=identity["outcomes"].as_array().context("admitted outcomes")?.iter()
+            .map(|outcome|outcome["token_id"].as_str().context("admitted token")).collect::<Result<_>>()?;
+        ensure!(tokens==market.token_ids.iter().map(String::as_str).collect(),"admitted market tokens differ");
+        ensure!(metadata["lifecycle_state"]=="active","no actor for inactive market");
+        let added=router.admit_market(market)?;
+        if !added {
+            ensure!(self.controls.contains_key(&market.market_id),"admitted actor missing");
+            return Ok(false);
+        }
+        if let Err(error)=self.add_market(router,&market.market_id) {
+            for token in &market.token_ids {router.identities.remove(token);router.waiting.remove(token);}
+            return Err(error);
+        }
+        Ok(true)
+    }
+    /// Metadata and token ownership must be admitted by the acquisition owner
+    /// before this method. Retained actors keep their reducer state unchanged.
+    pub(super) fn add_market(&mut self, router:&Adapter, market:&str)->Result<()> {
+        ensure!(!self.controls.contains_key(market),"market actor already installed");
+        let adapter=router.market_actor(market);
+        ensure!(!adapter.identities.is_empty(),"market has no admitted tokens");
+        let control=Arc::new(Mutex::new(Control::default()));
+        self.dispatch.add_entity(market.into(),State{adapter,generation:0,control:control.clone()})?;
+        self.controls.insert(market.into(),control);
+        Ok(())
+    }
+
+    /// This is final scope retirement, not terminal lifecycle observation.
+    /// In-flight results are fenced by dispatcher incarnation before metadata
+    /// disappears. The owner must stop token transport/recovery jobs as well.
+    pub(super) fn remove_market(&mut self, router:&mut Adapter, market:&str)->Result<Vec<String>> {
+        ensure!(self.controls.contains_key(market),"market actor absent");
+        self.retire_market(router,market)?;
+        ensure!(self.dispatch.remove_entity(market),"market actor queue absent");
+        self.controls.remove(market);
+        let tokens:Vec<_>=router.identities.iter().filter(|(_, (id,_))|id==market).map(|(t,_)|t.clone()).collect();
+        for token in &tokens {
+            router.identities.remove(token);
+            router.ticks.remove(token);
+            router.engines.remove(token);
+            router.epochs.remove(token);
+            router.sequences.remove(token);
+            router.waiting.remove(token);
+            router.book_received.remove(token);
+            router.last_trades.remove(token);
+            router.recoveries.remove(token);
+        }
+        Ok(tokens)
+    }
+
     pub(super) fn start(router: &Adapter) -> Result<(Self, mpsc::Receiver<Completion<Output>>)> {
         Self::start_with_workers(router, 4)
     }
@@ -530,6 +588,9 @@ impl Pipeline {
         publication: &mut Publication,
         completion: Completion<Output>,
     ) -> Result<()> {
+        // Retirement/re-addition must not accept a completion from a former
+        // actor even if its local recovery generation happens to be equal.
+        if !self.dispatch.is_current(&completion) { return Ok(()); }
         let market = completion.entity;
         let mut output = match completion.result {
             Ok(output) => output,
@@ -667,6 +728,57 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scope_actor_retirement_preserves_other_market_and_readd_is_new() {
+        let mut router=fixture();
+        let admitted=fixture();
+        let (mut pipeline,mut output)=Pipeline::start_with_workers(&router,6).unwrap();
+        let retained=pipeline.controls["2"].clone();
+        let old=pipeline.controls["1"].clone();
+        let removed=pipeline.remove_market(&mut router,"1").unwrap();
+        assert_eq!(removed,vec!["11","12"]);
+        assert!(!router.identities.contains_key("11"));
+        assert!(router.ticks.contains_key("21"));
+        assert!(Arc::ptr_eq(&retained,&pipeline.controls["2"]));
+        assert!(pipeline.add_market(&router,"1").is_err());
+        for token in removed {
+            router.identities.insert(token.clone(),admitted.identities[&token].clone());
+            router.ticks.insert(token.clone(),admitted.ticks[&token].clone());
+        }
+        pipeline.add_market(&router,"1").unwrap();
+        assert!(!Arc::ptr_eq(&old,&pipeline.controls["1"]));
+        assert!(pipeline.add_market(&router,"1").is_err());
+        assert!(Arc::ptr_eq(&retained,&pipeline.controls["2"]));
+        pipeline.dispatch.close();pipeline.dispatch.join().await;
+        assert!(output.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn installed_market_requires_admitted_metadata_and_starts_without_fabricated_book() {
+        let mut router=fixture();
+        let (mut pipeline,mut output)=Pipeline::start_with_workers(&router,6).unwrap();
+        let retained=pipeline.controls["1"].clone();
+        let tokens=router.identities.iter().map(|(token,(market,_))|(token.clone(),market.clone())).collect();
+        let mut publication=Publication::start(0,Some(json!({"latest_cursor":0,"catalog_revision":"catalog","markets":[],"books":[],"gaps":[]})),tokens,4,65536,16384,|_|Ok(())).unwrap();
+        let market=super::super::super::Market {market_id:"3".into(),condition_id:"c3".into(),token_ids:["31".into(),"32".into()]};
+        assert!(pipeline.install_admitted_market(&mut router,&publication,&market).is_err());
+        assert!(!router.identities.contains_key("31"));
+        let records=vec![json!({"identity":{"market_id":"3","condition_id":"c3","outcomes":[{"token_id":"31"},{"token_id":"32"}]},"lifecycle_state":"active"})];
+        let hash=canonical_hash(&json!(records));
+        publication.admit_catalog_markets("catalog",records,&hash).unwrap();
+        assert!(pipeline.install_admitted_market(&mut router,&publication,&market).unwrap());
+        assert!(!pipeline.install_admitted_market(&mut router,&publication,&market).unwrap());
+        assert!(Arc::ptr_eq(&retained,&pipeline.controls["1"]));
+        for token in ["31","32"] {
+            assert!(router.waiting.contains(token));assert!(!router.ticks.contains_key(token));
+            assert!(!router.book_received.contains_key(token));
+        }
+        assert!(publication.capture_view().unwrap().books.is_empty());
+        pipeline.dispatch.close();pipeline.dispatch.join().await;
+        assert!(output.recv().await.is_none());
+        publication.finish().await.unwrap();
     }
 
     #[tokio::test]

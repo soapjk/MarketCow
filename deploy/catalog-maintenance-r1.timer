@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll persistent MarketCow catalog due times
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+Unit=marketcow-catalog-maintenance.service
+
+[Install]
+WantedBy=timers.target

@@ -10,6 +10,7 @@ use tokio::sync::{Semaphore,OwnedSemaphorePermit};
 use crate::{source_publication::{MemoryReader,MemoryView},source_public_api::encode_bounded,
     source_discovery_projection::{DiscoveryConfig,DiscoveryConsumer}};
 
+#[derive(Clone)]
 pub struct DiscoveryLimits {
     pub full_sync_bytes:usize,
     pub frame_bytes:usize,
@@ -23,6 +24,54 @@ struct Api {
     reader:MemoryReader,config:Arc<DiscoveryConfig>,limits:DiscoveryLimits,
     baselines:Mutex<VecDeque<Arc<MemoryView>>>,snapshots:Arc<Semaphore>,clients:Arc<Semaphore>,
 }
+type ScopeState=Arc<crate::source_scope_registry::ScopeRegistry<Arc<Api>>>;
+pub struct DiscoveryScopeControl {state:ScopeState}
+impl DiscoveryScopeControl {
+    pub fn referenced_markets(&self)->Result<std::collections::BTreeSet<String>> {
+        let mut ids=std::collections::BTreeSet::new();
+        for lease in self.state.readable(std::time::Instant::now())? {
+            ids.extend(lease.value.config.market_ids.iter().cloned());
+            for relation in &lease.value.config.relations {
+                for member in relation["member_market_ids"].as_array().context("leased discovery relation")? {
+                    ids.insert(member.as_str().context("leased dependency market")?.into());
+                }
+            }
+        }
+        Ok(ids)
+    }
+    pub fn status(&self)->Result<Value> {
+        let active=self.state.active()?;
+        let view=active.value.reader.capture().ok();
+        let retirements=active.value.reader.retirement_status().ok();
+        Ok(json!({"pool":"discovery","projection_id":active.id,"revision":active.revision,
+            "catalog_revision":active.value.config.catalog_revision,"universe_revision":active.value.config.universe_revision,
+            "market_count":active.value.config.market_ids.len(),"source_readable":view.is_some(),
+            "source_cursor":view.as_ref().map(|v|v.cursor),"persisted_cursor":view.as_ref().map(|v|v.persisted_cursor),
+            "retirement_submitted":retirements.map(|r|r.0),"retirement_persisted":retirements.map(|r|r.1),
+            "admitted_market_ids":view.as_ref().map(|v|v.markets.keys().cloned().collect::<Vec<_>>()),
+            "referenced_market_ids":self.referenced_markets()?,
+            "acquisition":active.value.reader.acquisition_statistics()}))
+    }
+    pub fn prepare(&self,expected_projection:&str,expected_revision:u64,config:&DiscoveryConfig)->Result<()> {
+        let old=self.state.active()?;
+        ensure!(old.id==expected_projection && old.revision==expected_revision,"scope revision conflict");
+        ensure!(config.catalog_revision==old.value.config.catalog_revision,"catalog changed");
+        ensure!(config.projection_id!=old.id && config.universe_revision!=old.value.config.universe_revision,"new discovery range identities required");
+        self.state.check_activation(expected_projection,expected_revision,&config.projection_id,std::time::Instant::now())?;
+        config.full_sync(&old.value.reader.capture()?,Utc::now())?;
+        Ok(())
+    }
+    pub fn activate(&self, expected_projection:&str, expected_revision:u64, config:Arc<DiscoveryConfig>)->Result<u64> {
+        self.prepare(expected_projection,expected_revision,&config)?;
+        let old=self.state.active()?;
+        ensure!(config.catalog_revision==old.value.config.catalog_revision,"catalog changed");
+        ensure!(config.projection_id!=old.value.config.projection_id && config.universe_revision!=old.value.config.universe_revision,
+            "new discovery range identities required");
+        let api=Arc::new(Api{reader:old.value.reader.clone(),config:config.clone(),limits:old.value.limits.clone(),
+            baselines:Mutex::new(VecDeque::new()),snapshots:old.value.snapshots.clone(),clients:old.value.clients.clone()});
+        Ok(self.state.activate(expected_projection,expected_revision,config.projection_id.clone(),api,std::time::Instant::now())?.revision)
+    }
+}
 struct OwnedBytes {bytes:Vec<u8>,_permit:OwnedSemaphorePermit}
 impl AsRef<[u8]> for OwnedBytes {fn as_ref(&self)->&[u8]{&self.bytes}}
 #[derive(Deserialize)]
@@ -30,6 +79,13 @@ impl AsRef<[u8]> for OwnedBytes {fn as_ref(&self)->&[u8]{&self.bytes}}
 struct Resume {projection_id:String,after_cursor:u64}
 
 pub fn router(reader:MemoryReader,config:Arc<DiscoveryConfig>,limits:DiscoveryLimits)->Result<Router> {
+    let grace=limits.send_timeout;
+    Ok(router_managed(reader,config,limits,grace)?.0)
+}
+pub fn router_managed(reader:MemoryReader,config:Arc<DiscoveryConfig>,limits:DiscoveryLimits,grace:Duration)->Result<(Router,DiscoveryScopeControl)> {
+    router_managed_at(reader,config,limits,grace,1)
+}
+pub fn router_managed_at(reader:MemoryReader,config:Arc<DiscoveryConfig>,limits:DiscoveryLimits,grace:Duration,revision:u64)->Result<(Router,DiscoveryScopeControl)> {
     ensure!((1..=4).contains(&limits.clients)&&(1..=4).contains(&limits.cached_baselines),"explicit Discovery client/baseline limits");
     ensure!(limits.full_sync_bytes>0&&limits.full_sync_bytes<=256*1024*1024&&limits.frame_bytes>0&&limits.frame_bytes<=16*1024*1024,
         "Discovery response byte limits");
@@ -37,15 +93,19 @@ pub fn router(reader:MemoryReader,config:Arc<DiscoveryConfig>,limits:DiscoveryLi
         "Discovery state/replay/time limits");
     let api=Arc::new(Api{reader,config,clients:Arc::new(Semaphore::new(limits.clients)),limits,
         baselines:Mutex::new(VecDeque::new()),snapshots:Arc::new(Semaphore::new(1))});
-    Ok(Router::new()
+    let state=Arc::new(crate::source_scope_registry::ScopeRegistry::new(api.config.projection_id.clone(),revision,api,grace)?);
+    let control=DiscoveryScopeControl{state:state.clone()};
+    Ok((Router::new()
         .route("/v1/prediction-markets/polymarket/live/discovery/full-sync",get(full_sync))
         .route("/v1/prediction-markets/polymarket/live/discovery/status",get(status))
-        .route("/v1/prediction-markets/polymarket/live/discovery/stream",get(upgrade)).with_state(api))
+        .route("/v1/prediction-markets/polymarket/live/discovery/stream",get(upgrade)).with_state(state),control))
 }
 fn error(status:StatusCode,code:&str,retry:bool)->Response {
     (status,axum::Json(json!({"detail":{"code":code,"message":code,"retryable":retry}}))).into_response()
 }
-async fn full_sync(State(api):State<Arc<Api>>)->Response {
+async fn full_sync(State(state):State<ScopeState>)->Response {
+    let Ok(lease)=state.active() else{return error(StatusCode::SERVICE_UNAVAILABLE,"discovery_projection_unavailable",true)};
+    let api=lease.value.clone();
     let Ok(permit)=api.snapshots.clone().try_acquire_owned() else {return error(StatusCode::SERVICE_UNAVAILABLE,"discovery_full_sync_capacity",true)};
     let result=tokio::task::spawn_blocking(move ||->Result<OwnedBytes>{
         let view=Arc::new(api.reader.capture_for_resume(api.limits.send_timeout,api.limits.cached_baselines)?);
@@ -70,7 +130,9 @@ async fn full_sync(State(api):State<Arc<Api>>)->Response {
         Err(e)=>{eprintln!("discovery snapshot worker failed: {e}");error(StatusCode::SERVICE_UNAVAILABLE,"discovery_projection_unavailable",true)},
     }
 }
-async fn status(State(api):State<Arc<Api>>)->Response {
+async fn status(State(state):State<ScopeState>)->Response {
+    let Ok(lease)=state.active() else{return error(StatusCode::SERVICE_UNAVAILABLE,"discovery_projection_unavailable",true)};
+    let api=lease.value.clone();
     match api.reader.capture() {
         Ok(view)=>{
             let gaps=view.base["gaps"].as_array().map(|g|view.recoveries.len()+g.iter().filter(|g|g["resolved"]==false).count());
@@ -85,12 +147,20 @@ async fn status(State(api):State<Arc<Api>>)->Response {
             "universe_revision":api.config.universe_revision,"boundary_cursor":null})).into_response(),
     }
 }
-async fn upgrade(State(api):State<Arc<Api>>,Query(query):Query<Resume>,ws:WebSocketUpgrade)->Response {
+async fn upgrade(State(state):State<ScopeState>,Query(query):Query<Resume>,ws:WebSocketUpgrade)->Response {
+    let Ok(lease)=state.get(&query.projection_id,std::time::Instant::now()) else {
+        return error(StatusCode::CONFLICT,"discovery_projection_changed",true);
+    };
+    let api=lease.value.clone();
     let Ok(permit)=api.clients.clone().try_acquire_owned() else {return error(StatusCode::SERVICE_UNAVAILABLE,"discovery_stream_capacity",true)};
     ws.max_message_size(4096).max_frame_size(4096).on_upgrade(move |mut socket|async move {
         let _permit=permit;
         let mut query=query;
-        if let Err(e)=stream(&api,&mut socket,&mut query).await {
+        let result=tokio::select! {
+            result=stream(&api,&mut socket,&mut query)=>result,
+            _=lease.expired()=>Err(anyhow::anyhow!("discovery scope retired")),
+        };
+        if let Err(e)=result {
             eprintln!("discovery client requires resync: {e:#}");
             let _=send(&api,&mut socket,resync(&api,&query)).await;
         }
@@ -161,6 +231,49 @@ mod tests {
         "metadata_revision":"d".repeat(64),"active":true,"closed":false,"accepting_orders":true,"lifecycle_state":"active",
         "start_at":null,"end_at":null,"relations":[],"rules":{"instrument":{"price_increment":"0.01","minimum_order_size":"5"},
         "fee_schedule":{"complete":true,"schedule_id":"fee"}}})}
+    #[tokio::test]
+    async fn scope_change_keeps_listener_and_uses_native_resync() {
+        let mut second=market();
+        second["identity"]=json!({"market_id":"2","condition_id":"other","event_id":"e2","neg_risk":false,
+            "outcomes":[{"outcome":"Yes","token_id":"21"},{"outcome":"No","token_id":"22"}]});
+        let p=Publication::start(0,Some(json!({"latest_cursor":0,"books":[],"markets":[market(),second],
+            "gaps":[],"catalog_revision":"b".repeat(64)})),
+            BTreeMap::from([("11".into(),"1".into()),("12".into(),"1".into()),
+                ("21".into(),"2".into()),("22".into(),"2".into())]),8,131072,65536, |_|Ok(())).unwrap();
+        let (app,control)=router_managed(p.reader(),config(),limits(65536),Duration::from_millis(50)).unwrap();
+        let request=||axum::http::Request::builder().uri("/v1/prediction-markets/polymarket/live/discovery/full-sync")
+            .body(axum::body::Body::empty()).unwrap();
+        let response=app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        drop(axum::body::to_bytes(response.into_body(),65536).await.unwrap());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let routed=app.clone();
+        let server=tokio::spawn(async move{axum::serve(listener,routed).await.unwrap()});
+        let (mut ws,_)=tokio_tungstenite::connect_async(format!("ws://{address}/v1/prediction-markets/polymarket/live/discovery/stream?projection_id={}&after_cursor=0","a".repeat(64))).await.unwrap();
+        let next=Arc::new(DiscoveryConfig {projection_id:"e".repeat(64),catalog_revision:"b".repeat(64),
+            universe_revision:"f".repeat(64),market_ids:vec!["2".into()],relations:vec![],
+            settlements:BTreeMap::from([("2".into(),Value::Null)]),
+            policy:QuotePolicy{quantities:vec!["10".into()],maximum_book_age_ms:5000}});
+        assert_eq!(control.activate(&"a".repeat(64),1,next.clone()).unwrap(),2);
+        assert_eq!(control.referenced_markets().unwrap(),std::collections::BTreeSet::from(["1".into(),"2".into()]));
+        assert!(control.activate(&"a".repeat(64),1,next).is_err());
+        let response=app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        let body=axum::body::to_bytes(response.into_body(),65536).await.unwrap();
+        let body:Value=serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["projection_id"],"e".repeat(64));
+        assert_eq!(body["markets"].as_array().unwrap().len(),1);
+        assert_eq!(body["markets"][0]["market_id"],"2");
+        assert_eq!(body["markets"][0]["book_status"],"missing_book");
+        let raw=tokio::time::timeout(Duration::from_secs(2),ws.next()).await.unwrap().unwrap().unwrap();
+        let frame:Value=serde_json::from_str(raw.to_text().unwrap()).unwrap();
+        assert_eq!(frame["projection_id"],"a".repeat(64));
+        assert_eq!(frame["resync_required"],true);
+        assert_eq!(frame["next_cursor"],0);
+        assert_eq!(control.referenced_markets().unwrap(),std::collections::BTreeSet::from(["2".into()]));
+        ws.close(None).await.unwrap();p.finish().await.unwrap();server.abort();
+    }
     #[tokio::test]
     async fn http_baseline_and_native_ws_do_not_mix_future_book() {
         let mut p=Publication::start(0,Some(json!({"latest_cursor":0,"books":[],"markets":[market()],"gaps":[],"catalog_revision":"b".repeat(64)})),

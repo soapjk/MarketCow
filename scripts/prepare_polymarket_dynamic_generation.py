@@ -78,7 +78,8 @@ def prepare(*, source, target, scope_path, storage, registry, bridge_port, resum
                 pending.update(pair.market_id for pair in relation.outcome_pairs if pair.market_id not in markets)
     for chosen in scope.configured_markets:
         market=markets[chosen.market_id]
-        if chosen.condition_id != market.identity.condition_id or set(chosen.token_ids)!={o.token_id for o in market.identity.outcomes} or datetime.fromisoformat(chosen.end_at.replace('Z','+00:00')) != market.end_at:
+        selected_end = datetime.fromisoformat(chosen.end_at.replace('Z','+00:00')) if chosen.end_at is not None else None
+        if chosen.condition_id != market.identity.condition_id or set(chosen.token_ids)!={o.token_id for o in market.identity.outcomes} or selected_end != market.end_at:
             raise ValueError('selection identity differs:'+chosen.market_id)
     scope_body=scope.model_dump(mode='json')
     _atomic_replace(target/'configured-scope.json',scope_body)
