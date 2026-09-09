@@ -1,0 +1,26 @@
+[Unit]
+Description=MarketCow phase1 loopback catalog and admission (no activation)
+ConditionPathIsMountPoint=/mnt/p44pro/marketcow-shadow-v3-runtime/linux
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/phase1-control-r1/src:/mnt/p44pro/marketcow-shadow-v3-runtime/linux/read-api-packages
+ExecStart=/usr/bin/python3 /mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/main-cd7cf396624b/scripts/run_with_bounded_log.py --log /mnt/p44pro/marketcow-shadow-v3-runtime/linux/logs/phase1-control.log --max-bytes 8388608 -- /usr/bin/python3 -m marketcow.universe_control_server --config /mnt/p44pro/marketcow-shadow-v3-runtime/linux/phase1/operator.json
+MemoryMax=768M
+MemorySwapMax=0
+CPUQuota=200%
+Nice=10
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillMode=mixed
+NoNewPrivileges=true
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=default.target

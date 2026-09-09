@@ -62,9 +62,23 @@ fn preserve_confirmed_book_freshness(
 pub struct Batch {
     pub validated: ValidatedSourceBatch,
     pub evidence: Option<Value>,
+    /// Explicit owner-admitted identities, ordered before these exact events
+    /// on the existing disk worker. Never inferred from an untrusted event.
+    pub catalog_bindings: BTreeMap<String, String>,
     bytes: usize,
 }
+pub struct Retirement {
+    pub ticket:u64,
+    pub after:u64,
+    pub markets:std::collections::BTreeSet<String>,
+    pub catalog_bindings:BTreeMap<String,String>,
+    bytes:usize,
+}
+enum QueuedWork { Events(Arc<Batch>), Retire(Retirement) }
+pub enum PersistenceWork<'a> { Events(&'a [Arc<Batch>]), Retire(&'a Retirement) }
 struct Memory {
+    retirement_submitted:u64,retirement_persisted:u64,
+    acquisition_statistics:Option<(usize,usize,usize)>,
     recoveries: BTreeMap<String, Value>,
     source_ready: bool,
     cursor: u64,
@@ -92,9 +106,11 @@ struct Memory {
 pub struct Publication {
     memory: Arc<Mutex<Memory>>,
     changed: watch::Sender<u64>,
-    sender: Option<mpsc::Sender<Arc<Batch>>>,
+    sender: Option<mpsc::Sender<QueuedWork>>,
     worker: Option<thread::JoinHandle<()>>,
     tokens: BTreeMap<String, String>,
+    pending_bindings: BTreeMap<String, String>,
+    retirement_enabled:bool,
     max_batches: usize,
     max_bytes: usize,
     batch_cap: usize,
@@ -132,6 +148,15 @@ pub struct PublicReplay {
     pub confirmation_books: Vec<Arc<Value>>,
 }
 impl MemoryReader {
+    pub fn acquisition_statistics(&self)->Option<Value> {
+        self.memory.lock().ok()?.acquisition_statistics.map(|(tokens,sockets,retiring)|
+            json!({"tokens":tokens,"sockets":sockets,"retiring_shards":retiring}))
+    }
+    pub fn retirement_status(&self)->Result<(u64,u64)> {
+        let m=self.memory.lock().map_err(|_|anyhow::anyhow!("publication poisoned"))?;
+        ensure!(m.error.is_none(),"publication persistence failed");
+        Ok((m.retirement_submitted,m.retirement_persisted))
+    }
     pub fn capture(&self) -> Result<MemoryView> {
         MemoryView::capture(&self.memory.lock().unwrap())
     }
@@ -227,14 +252,38 @@ impl Publication {
     pub fn capture_view(&self) -> Result<MemoryView> {
         MemoryView::capture(&self.memory.lock().unwrap())
     }
+    /// Internal shutdown audit only: source readiness is deliberately false
+    /// after intake stops. This does not expose a usable consumer baseline.
+    pub fn shutdown_recovery_facts(&self) -> Result<(u64,BTreeMap<String,Value>)> {
+        let memory=self.memory.lock().map_err(|_|anyhow::anyhow!("publication poisoned"))?;
+        ensure!(memory.error.is_none(),"publication persistence failed");
+        Ok((memory.cursor,memory.recoveries.clone()))
+    }
     pub fn start(
         cursor: u64,
-        mut base: Option<Value>,
+        base: Option<Value>,
         tokens: BTreeMap<String, String>,
         max_batches: usize,
         max_bytes: usize,
         batch_cap: usize,
         mut persist: impl FnMut(&[Arc<Batch>]) -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
+        let mut publication=Self::start_managed(cursor,base,tokens,max_batches,max_bytes,batch_cap,move |work|match work {
+            PersistenceWork::Events(batches)=>persist(batches),
+            PersistenceWork::Retire(_)=>anyhow::bail!("retirement persistence not installed"),
+        })?;
+        publication.retirement_enabled=false;
+        Ok(publication)
+    }
+
+    pub fn start_managed(
+        cursor:u64,
+        mut base:Option<Value>,
+        tokens:BTreeMap<String,String>,
+        max_batches:usize,
+        max_bytes:usize,
+        batch_cap:usize,
+        mut persist:impl FnMut(PersistenceWork<'_>)->Result<()> + Send + 'static,
     ) -> Result<Self> {
         ensure!(
             (1..=4096).contains(&max_batches)
@@ -307,7 +356,7 @@ impl Publication {
             for item in items {
                 let token = item["token_id"].as_str().context("recovery token")?;
                 ensure!(
-                    tokens.contains_key(token) && recoveries.len() < 2048,
+                    tokens.contains_key(token) && recoveries.len() < marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES,
                     "recovery scope/cap"
                 );
                 recoveries.insert(token.into(), item.clone());
@@ -324,6 +373,8 @@ impl Publication {
             state["token_recoveries"] = json!([]);
         }
         let memory = Arc::new(Mutex::new(Memory {
+            retirement_submitted:0,retirement_persisted:0,
+            acquisition_statistics:None,
             recoveries,
             source_ready: true,
             cursor,
@@ -344,7 +395,7 @@ impl Publication {
             confirmation_cursor: 0,
             confirmations: BTreeMap::new(),
         }));
-        let (sender, receiver) = mpsc::channel::<Arc<Batch>>();
+        let (sender, receiver) = mpsc::channel::<QueuedWork>();
         let (changed, _) = watch::channel(cursor);
         let state = memory.clone();
         let notify = changed.clone();
@@ -352,7 +403,20 @@ impl Publication {
             .name("polymarket-durability".into())
             .spawn(move || {
                 let mut pending = None;
-                while let Some(batch) = pending.take().or_else(|| receiver.recv().ok()) {
+                while let Some(work) = pending.take().or_else(|| receiver.recv().ok()) {
+                    let batch=match work {
+                        QueuedWork::Events(batch)=>batch,
+                        QueuedWork::Retire(retirement)=>{
+                            let result=persist(PersistenceWork::Retire(&retirement));
+                            let mut memory=state.lock().expect("publication mutex poisoned");
+                            match result {
+                                Ok(())=>{memory.queued-=1;memory.queued_bytes-=retirement.bytes;memory.retirement_persisted=retirement.ticket;},
+                                Err(error)=>{memory.error=Some(format!("{error:#}"));notify.send_modify(|n|*n=n.wrapping_add(1));break;},
+                            }
+                            notify.send_modify(|n|*n=n.wrapping_add(1));
+                            continue;
+                        }
+                    };
                     let terminal = batch.validated.events()[0]["event_type"] == "market_terminal";
                     let mut count = batch.validated.events().len();
                     let mut bytes = batch.bytes;
@@ -360,12 +424,16 @@ impl Publication {
                     // Drain only available work, without a batching delay. Keep terminal
                     // evidence separate and count in-flight work against the same limits.
                     while !terminal && count < 256 {
-                        let Ok(next) = receiver.try_recv() else { break };
+                        let Ok(work) = receiver.try_recv() else { break };
+                        let next=match work {
+                            QueuedWork::Events(batch)=>batch,
+                            other=>{pending=Some(other);break;},
+                        };
                         if next.validated.events()[0]["event_type"] == "market_terminal"
                             || count + next.validated.events().len() > 256
                             || bytes + next.bytes > batch_cap
                         {
-                            pending = Some(next);
+                            pending = Some(QueuedWork::Events(next));
                             break;
                         }
                         count += next.validated.events().len();
@@ -374,7 +442,7 @@ impl Publication {
                     }
                     // Deliberately outside the memory mutex, including fsync and SQLite commit.
                     let disk_started=std::time::Instant::now();
-                    let result = persist(&group);
+                    let result = persist(PersistenceWork::Events(&group));
                     eprintln!("{}",json!({"stage":"durability_worker","elapsed_us":disk_started.elapsed().as_micros(),"event_count":count}));
                     let mut memory = state.lock().expect("publication mutex poisoned");
                     match result {
@@ -400,6 +468,8 @@ impl Publication {
             sender: Some(sender),
             worker: Some(worker),
             tokens,
+            pending_bindings: BTreeMap::new(),
+            retirement_enabled:true,
             max_batches,
             max_bytes,
             batch_cap,
@@ -410,9 +480,138 @@ impl Publication {
         ensure!(m.error.is_none(), "persistence failed: {:?}", m.error);
         Ok(m.cursor)
     }
+    /// The acquisition owner must first expire all scopes referencing these
+    /// markets and fence their actors/recovery jobs. This drops current state,
+    /// not source history, and queues disk retirement without awaiting I/O.
+    pub fn retire_catalog_markets(&mut self,markets:std::collections::BTreeSet<String>)->Result<()> {
+        self.retire_catalog_markets_inner(markets,false)
+    }
+    pub fn check_retirement(&mut self,markets:std::collections::BTreeSet<String>)->Result<()> {
+        self.retire_catalog_markets_inner(markets,true)
+    }
+    fn retire_catalog_markets_inner(&mut self,markets:std::collections::BTreeSet<String>,check_only:bool)->Result<()> {
+        ensure!(self.retirement_enabled,"retirement persistence not installed");
+        ensure!(!markets.is_empty() && markets.len()<=4096,"retirement market capacity");
+        let tokens:std::collections::BTreeSet<String>=self.tokens.iter().filter(|(_,id)|markets.contains(*id)).map(|(token,_)|token.clone()).collect();
+        let mut m=self.memory.lock().unwrap();
+        ensure!(markets.iter().all(|id|m.markets.contains_key(id)||self.tokens.values().any(|market|market==id)),"retired market not admitted");
+        ensure!(m.error.is_none(),"publication unavailable");
+        let bytes=serde_json::to_vec(&json!({"after":m.cursor,"markets":markets,"catalog_bindings":self.pending_bindings}))?.len();
+        ensure!(bytes<=self.batch_cap && m.queued<self.max_batches && bytes<=self.max_bytes-m.queued_bytes,"retirement queue capacity");
+        let removed_keys:Vec<_>=m.state_sizes.keys().filter(|(market,id)|if *market {markets.contains(id)}else{tokens.contains(id)}).cloned().collect();
+        let removed_bytes=removed_keys.iter().map(|key|m.state_sizes[key]).sum::<usize>();
+        let state_bytes=m.state_bytes.checked_sub(removed_bytes).context("retirement size accounting")?;
+        if check_only {return Ok(());}
+        let ticket=m.retirement_submitted.checked_add(1).context("retirement ticket overflow")?;
+        self.sender.as_ref().context("writer closed")?.send(QueuedWork::Retire(Retirement {
+            ticket,after:m.cursor,markets:markets.clone(),catalog_bindings:self.pending_bindings.clone(),bytes,
+        }))?;
+        self.pending_bindings.clear();
+        m.retirement_submitted=ticket;
+        for key in removed_keys {m.state_sizes.remove(&key);}
+        for token in &tokens {
+            m.books.remove(token);m.book_cursors.remove(token);m.book_exchanges.remove(token);
+            m.confirmations.remove(token);m.recoveries.remove(token);
+            self.tokens.remove(token);
+        }
+        for market in &markets {m.markets.remove(market);}
+        if let Some(gaps)=m.base.as_mut().and_then(|base|base["gaps"].as_array_mut()) {
+            gaps.retain(|gap|!gap["token_id"].as_str().is_some_and(|t|tokens.contains(t))
+                && !gap["market_id"].as_str().is_some_and(|id|markets.contains(id)));
+        }
+        m.state_bytes=state_bytes;m.queued+=1;m.queued_bytes+=bytes;
+        self.changed.send_modify(|n|*n=n.wrapping_add(1));
+        Ok(())
+    }
+    /// Admission is an in-memory control operation, not scope activation or
+    /// proof of durable metadata. The owner supplies catalog-verified records;
+    /// its persisted active plan must reconstruct them on restart. New books
+    /// remain missing until authoritative source events arrive. Existing
+    /// market/lifecycle records and confirmations are never overwritten here.
+    pub fn admit_catalog_markets(&mut self, catalog_revision:&str, records:Vec<Value>, evidence_sha256:&str)->Result<()> {
+        let ids=records.iter().map(|record|record["identity"]["market_id"].as_str()
+            .map(str::to_owned).context("catalog admission market id")).collect::<Result<std::collections::BTreeSet<_>>>()?;
+        self.admit_catalog_markets_scoped(catalog_revision,records,evidence_sha256,&ids,2048)
+    }
+    pub fn admit_catalog_markets_scoped(&mut self,catalog_revision:&str,records:Vec<Value>,evidence_sha256:&str,
+        acquisition:&std::collections::BTreeSet<String>,maximum_tokens:usize)->Result<()> {
+        self.admit_catalog_markets_inner(catalog_revision,records,evidence_sha256,acquisition,maximum_tokens,false)
+    }
+    pub fn check_catalog_admission(&mut self,catalog_revision:&str,records:Vec<Value>,evidence_sha256:&str,
+        acquisition:&std::collections::BTreeSet<String>,maximum_tokens:usize)->Result<()> {
+        self.admit_catalog_markets_inner(catalog_revision,records,evidence_sha256,acquisition,maximum_tokens,true)
+    }
+    fn admit_catalog_markets_inner(&mut self,catalog_revision:&str,records:Vec<Value>,evidence_sha256:&str,
+        acquisition:&std::collections::BTreeSet<String>,maximum_tokens:usize,check_only:bool)->Result<()> {
+        ensure!(!records.is_empty() && records.len()<=4096,"catalog admission count");
+        ensure!((2..=marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES).contains(&maximum_tokens),"explicit acquisition token limit");
+        ensure!(canonical_hash(&json!(records))==evidence_sha256,"catalog admission evidence hash");
+        let mut m=self.memory.lock().unwrap();
+        ensure!(m.error.is_none() && self.sender.is_some(),"publication unavailable");
+        ensure!(m.base.as_ref().is_some_and(|b|b["catalog_revision"]==catalog_revision),"catalog admission revision");
+        let mut additions=BTreeMap::new();
+        let mut metadata_owners=BTreeMap::new();
+        for (market,record) in &m.markets {
+            for outcome in record["identity"]["outcomes"].as_array().context("existing metadata outcomes")? {
+                let token=outcome["token_id"].as_str().context("existing metadata token")?;
+                if let Some(previous)=metadata_owners.insert(token,market.as_str()) {
+                    ensure!(previous==market,"ambiguous existing metadata ownership");
+                }
+            }
+        }
+        let mut ids=std::collections::BTreeSet::new();
+        let mut sizes=Vec::new();
+        let mut state_bytes=m.state_bytes;
+        for record in &records {
+            let identity=&record["identity"];
+            let market=identity["market_id"].as_str().filter(|s|!s.is_empty()).context("admitted market identity")?;
+            ensure!(ids.insert(market),"duplicate admitted market");
+            ensure!(identity["condition_id"].as_str().is_some_and(|s|!s.is_empty()),"admitted condition");
+            let outcomes=identity["outcomes"].as_array().context("admitted outcomes")?;
+            ensure!(outcomes.len()==2,"admitted binary market");
+            let mut pair=std::collections::BTreeSet::new();
+            for outcome in outcomes {
+                let token=outcome["token_id"].as_str().filter(|s|!s.is_empty()&&s.len()<=128).context("admitted token")?;
+                ensure!(pair.insert(token),"duplicate admitted token");
+                ensure!(self.tokens.get(token).is_none_or(|id|id==market),"admitted token ownership changed");
+                ensure!(metadata_owners.get(token).is_none_or(|id|*id==market),"admitted token conflicts with dependency metadata");
+                if let Some(id)=additions.insert(token.to_owned(),market.to_owned()) {
+                    ensure!(id==market,"duplicate admitted token owner");
+                }
+            }
+            if let Some(existing)=m.markets.get(market) {
+                ensure!(existing["identity"]==*identity,"admitted market identity changed");
+                // Keep current typed lifecycle and metadata intact.
+            } else {
+                let size=serde_json::to_vec(record)?.len();
+                state_bytes=state_bytes.checked_add(size).context("admission size overflow")?;
+                sizes.push((market.to_owned(),size,Arc::new(record.clone())));
+            }
+        }
+        ensure!(acquisition.iter().all(|id|ids.contains(id.as_str())),"acquisition lacks submitted metadata");
+        additions.retain(|token,market|acquisition.contains(market)&&!self.tokens.contains_key(token));
+        ensure!(self.tokens.len().checked_add(additions.len()).is_some_and(|n|n<=maximum_tokens),"admitted token capacity");
+        ensure!(state_bytes<=self.max_bytes,"admitted metadata byte capacity");
+        let mut pending=self.pending_bindings.clone();
+        pending.extend(additions.clone());
+        ensure!(serde_json::to_vec(&pending)?.len()<=self.batch_cap,"admitted binding byte capacity");
+        if check_only {return Ok(());}
+        // All validation/capacity checks precede mutation.
+        for (market,size,record) in sizes {
+            m.state_sizes.insert((true,market.clone()),size);
+            m.markets.insert(market,record);
+        }
+        m.state_bytes=state_bytes;
+        self.tokens.extend(additions);
+        self.pending_bindings=pending;
+        Ok(())
+    }
     pub fn set_source_ready(&self, ready: bool) {
         self.memory.lock().unwrap().source_ready = ready;
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+    pub fn set_acquisition_statistics(&self,statistics:(usize,usize,usize)) {
+        self.memory.lock().unwrap().acquisition_statistics=Some(statistics);
     }
     pub fn persisted_cursor(&self) -> u64 {
         self.memory.lock().unwrap().persisted
@@ -677,6 +876,8 @@ impl Publication {
         )?;
         let bytes = validated
             .encoded_bytes()
+            .checked_add(if self.pending_bindings.is_empty(){0}else{serde_json::to_vec(&self.pending_bindings)?.len()})
+            .context("binding byte overflow")?
             .checked_add(
                 evidence
                     .as_ref()
@@ -800,12 +1001,14 @@ impl Publication {
         let batch = Arc::new(Batch {
             validated,
             evidence,
+            catalog_bindings:self.pending_bindings.clone(),
             bytes,
         });
         self.sender
             .as_ref()
             .context("writer closed")?
-            .send(batch.clone())?;
+            .send(QueuedWork::Events(batch.clone()))?;
+        self.pending_bindings.clear();
         for event in batch.validated.events() {
             if is_token_recovery(event) {
                 continue;
@@ -1122,6 +1325,112 @@ mod tests {
     }
     fn seed() -> Value {
         json!({"latest_cursor":0,"books":[],"markets":[],"gaps":[],"schema_version":"marketcow.polymarket.live-stream.v1","type":"state"})
+    }
+    #[tokio::test]
+    async fn admitted_identity_is_ordered_on_disk_worker_and_survives_queue_rejection() {
+        let (started,wait)=mpsc::channel();
+        let (release,gate)=mpsc::channel();
+        let mut bound=tokens();
+        let mut cursor=0;
+        let mut base=seed();base["catalog_revision"]=json!("catalog");
+        let mut p=Publication::start(0,Some(base),tokens(),1,65536,16384,move |batches| {
+            for batch in batches {
+                bound.extend(batch.catalog_bindings.clone());
+                validate_source_events(batch.validated.events(),false,cursor,&bound,16384)?;
+                if cursor==0 {started.send(()).unwrap();gate.recv().unwrap();}
+                cursor=batch.validated.events().last().unwrap()["cursor"].as_u64().unwrap();
+            }
+            Ok(())
+        }).unwrap();
+        p.publish(events(0),None).unwrap();
+        wait.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let record=json!({"identity":{"market_id":"2","condition_id":"condition2","outcomes":[{"token_id":"21"},{"token_id":"22"}]}});
+        let records=vec![record.clone()];let hash=canonical_hash(&json!(records));
+        assert!(p.admit_catalog_markets("catalog",records.clone(),"wrong").is_err());
+        assert!(!p.capture_view().unwrap().markets.contains_key("2"));
+        p.admit_catalog_markets("catalog",records.clone(),&hash).unwrap();
+        p.admit_catalog_markets("catalog",records,&hash).unwrap();
+        let view=p.capture_view().unwrap();
+        assert!(view.markets.contains_key("2"));
+        assert!(!view.books.contains_key("21"));
+        assert_eq!(view.cursor,2);assert_eq!(view.persisted_cursor,0);
+        let next=|| ["21","22"].iter().enumerate().map(|(i,token)|snapshot_event(
+            &json!({"asset_id":token,"market":"condition2","tick_size":"0.01","timestamp":"1700000000000","hash":"source",
+                "bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
+            SnapshotBoundary{market_id:"2",condition_id:"condition2",token_id:token,recovery_id:"admitted",cursor:3+i as u64,
+                received_at:chrono::DateTime::from_timestamp(1700000001,0).unwrap()}).unwrap()).collect();
+        assert!(p.publish(next(),None).is_err());
+        assert_eq!(p.pending_bindings.len(),2);
+        assert_eq!(p.cursor().unwrap(),2);
+        release.send(()).unwrap();
+        let mut changed=p.reader().subscribe();
+        while p.persisted_cursor()<2 {changed.changed().await.unwrap();}
+        p.publish(next(),None).unwrap();
+        assert!(p.pending_bindings.is_empty());
+        assert_eq!(p.capture_view().unwrap().books["21"]["condition_id"],"condition2");
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_retirement_queues_after_books_without_waiting_for_disk() {
+        let (started,wait)=mpsc::channel();let (release,gate)=mpsc::channel();
+        let (observed,rows)=mpsc::channel();
+        let mut p=Publication::start_managed(0,Some(seed()),tokens(),2,65536,16384,move |work| {
+            match work {
+                PersistenceWork::Events(batches)=>{
+                    observed.send("events").unwrap();
+                    assert_eq!(batches.last().unwrap().validated.events().last().unwrap()["cursor"],2);
+                    started.send(()).unwrap();gate.recv().unwrap();
+                },
+                PersistenceWork::Retire(retirement)=>{
+                    assert_eq!(retirement.after,2);
+                    assert_eq!(retirement.markets,std::collections::BTreeSet::from(["1".into()]));
+                    observed.send("retired").unwrap();
+                },
+            }
+            Ok(())
+        }).unwrap();
+        p.publish(events(0),None).unwrap();
+        wait.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        p.retire_catalog_markets(std::collections::BTreeSet::from(["1".into()])).unwrap();
+        let view=p.capture_view().unwrap();
+        assert_eq!(view.cursor,2);assert_eq!(view.persisted_cursor,0);assert!(view.books.is_empty());
+        assert_eq!(view.queued,2);assert!(p.tokens.is_empty());
+        assert!(p.publish(events(2),None).is_err());
+        release.send(()).unwrap();
+        p.finish().await.unwrap();
+        assert_eq!(rows.into_iter().collect::<Vec<_>>(),vec!["events","retired"]);
+    }
+
+    #[tokio::test]
+    async fn dependency_metadata_does_not_implicitly_subscribe_or_spend_acquisition_budget() {
+        let mut base=seed();base["catalog_revision"]=json!("catalog");
+        let mut p=Publication::start(0,Some(base),tokens(),2,65536,16384,|_|Ok(())).unwrap();
+        let records:Vec<_>=["2","3"].into_iter().map(|id|json!({"identity":{"market_id":id,
+            "condition_id":format!("c{id}"),"outcomes":[{"token_id":format!("{id}1")},{"token_id":format!("{id}2")}]}})).collect();
+        let hash=canonical_hash(&json!(records));let selected=std::collections::BTreeSet::from(["2".into()]);
+        assert!(p.admit_catalog_markets_scoped("catalog",records.clone(),&hash,&selected,2).is_err());
+        assert!(p.capture_view().unwrap().markets.is_empty());
+        p.admit_catalog_markets_scoped("catalog",records.clone(),&hash,&selected,4).unwrap();
+        assert_eq!(p.tokens.len(),4);assert!(!p.tokens.contains_key("31"));
+        let view=p.capture_view().unwrap();assert_eq!(view.markets.len(),2);assert!(view.books.is_empty());
+        // Later promotion binds the already admitted metadata without replacing it.
+        let selected=std::collections::BTreeSet::from(["3".into()]);
+        p.admit_catalog_markets_scoped("catalog",records,&hash,&selected,6).unwrap();
+        assert_eq!(p.tokens.len(),6);assert_eq!(p.cursor().unwrap(),0);
+        p.finish().await.unwrap();
+    }
+    #[tokio::test]
+    async fn catalog_admission_cannot_steal_unsubscribed_dependency_token() {
+        let mut base=seed();base["catalog_revision"]=json!("catalog");
+        base["markets"]=json!([{"identity":{"market_id":"dependency","outcomes":[{"token_id":"x"},{"token_id":"y"}]}}]);
+        let mut p=Publication::start(0,Some(base),tokens(),2,65536,16384,|_|Ok(())).unwrap();
+        let records=vec![json!({"identity":{"market_id":"new","condition_id":"new","outcomes":[{"token_id":"x"},{"token_id":"z"}]}})];
+        let hash=canonical_hash(&json!(records));
+        assert!(p.admit_catalog_markets("catalog",records,&hash).unwrap_err().to_string().contains("dependency metadata"));
+        assert_eq!(p.tokens,tokens());assert!(p.pending_bindings.is_empty());
+        assert!(!p.capture_view().unwrap().markets.contains_key("new"));
+        p.finish().await.unwrap();
     }
     #[tokio::test]
     async fn expired_public_reader_does_not_poison_current_reader_or_publication() {
@@ -1773,6 +2082,16 @@ mod tests {
         }
         assert!(reader.replay(0,0,64,16384).is_err());
         assert_eq!(reader.capture().unwrap().cursor,24);
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_audit_does_not_reenable_public_baseline() {
+        let p=Publication::start(0,Some(seed()),tokens(),4,65536,16384, |_|Ok(())).unwrap();
+        p.set_source_ready(false);
+        assert!(p.capture_view().is_err());
+        assert_eq!(p.shutdown_recovery_facts().unwrap().0,0);
+        assert!(p.reader().capture().is_err());
         p.finish().await.unwrap();
     }
 

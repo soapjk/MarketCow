@@ -2,6 +2,7 @@
 //! crate; a frame is normalized without network, storage, or async-runtime dependencies.
 
 pub mod discovery_source;
+pub mod subscription;
 
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -145,6 +146,8 @@ pub enum TransportError {
     Backpressure,
     #[error("Polymarket WebSocket reconnect budget was exhausted")]
     ReconnectExhausted,
+    #[error("Polymarket subscription membership changed")]
+    SubscriptionConflict,
 }
 
 impl TransportError {
@@ -162,6 +165,7 @@ impl TransportError {
             Self::FrameTooLarge => "frame_too_large",
             Self::Backpressure => "strict_backpressure",
             Self::ReconnectExhausted => "reconnect_exhausted",
+            Self::SubscriptionConflict => "subscription_conflict",
         }
     }
 }
@@ -170,26 +174,85 @@ pub async fn run_polymarket_transport(
     config: PolymarketTransportConfig,
     token_ids: Vec<String>,
     output: mpsc::Sender<Vec<RawTransportFrame>>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), TransportError> {
+    run_transport(config, token_ids, output, shutdown, None).await
+}
+
+/// The owner admits metadata and installs new reducers before submitting an
+/// update. Removing the final shard is done with its shutdown handle, not an
+/// empty subscription. No consumer or venue message can call this control API.
+pub async fn run_polymarket_transport_managed(
+    config: PolymarketTransportConfig,
+    token_ids: Vec<String>,
+    output: mpsc::Sender<Vec<RawTransportFrame>>,
+    shutdown: watch::Receiver<bool>,
+    updates: mpsc::Receiver<subscription::SubscriptionUpdate>,
+) -> Result<(), TransportError> {
+    run_transport(config, token_ids, output, shutdown, Some(updates)).await
+}
+
+async fn run_transport(
+    config: PolymarketTransportConfig,
+    token_ids: Vec<String>,
+    output: mpsc::Sender<Vec<RawTransportFrame>>,
+    shutdown: watch::Receiver<bool>,
+    updates: Option<mpsc::Receiver<subscription::SubscriptionUpdate>>,
+) -> Result<(), TransportError> {
+    let mut shutdown=shutdown;
+    let mut updates=updates;
     config.validate()?;
-    let tokens = token_ids.into_iter().collect::<BTreeSet<_>>();
-    if tokens.is_empty()
-        || tokens.len() > 500
-        || tokens
-            .iter()
-            .any(|token| token.is_empty() || token.len() > 128)
-    {
+    let count=token_ids.len();
+    let mut tokens = token_ids.into_iter().collect::<BTreeSet<_>>();
+    if tokens.len()!=count {
         return Err(TransportError::InvalidConfig);
     }
+    subscription::validate_tokens(&tokens)?;
+    run_transport_attempts(&config,&mut tokens,&output,&mut shutdown,&mut updates).await
+}
+
+/// Service-owned shard supervision. Each retry group still has the configured
+/// attempt/deadline bounds; a failed group cools down without killing other
+/// shards. Current membership and the bounded control receiver survive it.
+pub async fn supervise_polymarket_transport_managed(
+    config:PolymarketTransportConfig,token_ids:Vec<String>,
+    output:mpsc::Sender<Vec<RawTransportFrame>>,mut shutdown:watch::Receiver<bool>,
+    updates:mpsc::Receiver<subscription::SubscriptionUpdate>,cooldown:Duration,
+) -> Result<(),TransportError> {
+    config.validate()?;
+    if cooldown.is_zero() || cooldown>Duration::from_secs(60) {return Err(TransportError::InvalidConfig);}
+    let count=token_ids.len();
+    let mut tokens:BTreeSet<_>=token_ids.into_iter().collect();
+    if tokens.len()!=count {return Err(TransportError::InvalidConfig);}
+    subscription::validate_tokens(&tokens)?;
+    let mut updates=Some(updates);
+    loop {
+        let result=run_transport_attempts(&config,&mut tokens,&output,&mut shutdown,&mut updates).await;
+        if *shutdown.borrow() || output.is_closed() {return Ok(());}
+        // Output capacity errors remain a real shared-consumer failure, not an
+        // excuse to drop accepted input or spin a reconnect loop.
+        if matches!(result,Err(TransportError::Backpressure)) {return result;}
+        tracing::warn!(token_count=tokens.len(),result=?result,"polymarket_shard_retry_group");
+        tokio::select! {
+            _=tokio::time::sleep(cooldown)=>{},
+            _=shutdown.changed()=>return Ok(()),
+        }
+    }
+}
+
+async fn run_transport_attempts(
+    config:&PolymarketTransportConfig,tokens:&mut BTreeSet<String>,
+    output:&mpsc::Sender<Vec<RawTransportFrame>>,shutdown:&mut watch::Receiver<bool>,
+    updates:&mut Option<mpsc::Receiver<subscription::SubscriptionUpdate>>,
+) -> Result<(),TransportError> {
     for attempt in 1..=config.maximum_reconnect_attempts {
         if *shutdown.borrow() {
             return Ok(());
         }
-        match run_polymarket_connection(&config, &tokens, &output, &mut shutdown).await {
+        match run_polymarket_connection(config, tokens, output, shutdown, updates).await {
             Ok(ConnectionEnd::Shutdown) => return Ok(()),
             Ok(ConnectionEnd::Disconnected) => {
-                if !publish_connection_gaps(&tokens, attempt, &output, &mut shutdown).await? {
+                if !publish_connection_gaps(tokens, attempt, output, shutdown).await? {
                     return Ok(());
                 }
                 tracing::warn!(
@@ -200,7 +263,7 @@ pub async fn run_polymarket_transport(
             }
             Err(TransportError::Backpressure) => return Err(TransportError::Backpressure),
             Err(error) if attempt == config.maximum_reconnect_attempts => {
-                if !publish_connection_gaps(&tokens, attempt, &output, &mut shutdown).await? {
+                if !publish_connection_gaps(tokens, attempt, output, shutdown).await? {
                     return Ok(());
                 }
                 tracing::warn!(
@@ -211,7 +274,7 @@ pub async fn run_polymarket_transport(
                 return Err(error);
             }
             Err(error) => {
-                if !publish_connection_gaps(&tokens, attempt, &output, &mut shutdown).await? {
+                if !publish_connection_gaps(tokens, attempt, output, shutdown).await? {
                     return Ok(());
                 }
                 tracing::warn!(
@@ -284,9 +347,10 @@ async fn send_bounded(
 
 async fn run_polymarket_connection(
     config: &PolymarketTransportConfig,
-    tokens: &BTreeSet<String>,
+    tokens: &mut BTreeSet<String>,
     output: &mpsc::Sender<Vec<RawTransportFrame>>,
     shutdown: &mut watch::Receiver<bool>,
+    updates: &mut Option<mpsc::Receiver<subscription::SubscriptionUpdate>>,
 ) -> Result<ConnectionEnd, TransportError> {
     let (mut socket, response) = connect_websocket(config).await?;
     if response.status() != 101 {
@@ -308,6 +372,34 @@ async fn run_polymarket_connection(
         let heartbeat = tokio::time::sleep(config.heartbeat_interval);
         tokio::pin!(heartbeat);
         tokio::select! {
+            update = async { match updates.as_mut() {
+                Some(receiver) => receiver.recv().await,
+                None => std::future::pending().await,
+            }} => {
+                let Some(update)=update else { *updates=None; continue; };
+                let (added,removed)=match subscription::diff(tokens,&update) {
+                    Ok(diff)=>diff,
+                    Err(error)=>{let _=update.receipt.send(Err(error));continue;}
+                };
+                for (operation,ids) in [("subscribe",&added),("unsubscribe",&removed)] {
+                    if ids.is_empty() {continue;}
+                    let message=Message::Text(serde_json::json!({"operation":operation,"assets_ids":ids}).to_string().into());
+                    let sent=tokio::select! {
+                        result=tokio::time::timeout(config.connect_timeout,socket.send(message)) => matches!(result,Ok(Ok(()))),
+                        _=shutdown.changed()=>false,
+                    };
+                    if !sent {
+                        // A timed-out write has uncertain delivery. Include all
+                        // possibly subscribed tokens in recovery on reconnect.
+                        tokens.extend(added.iter().cloned());
+                        let _=update.receipt.send(Err(TransportError::SendFailed));
+                        return Err(TransportError::SendFailed);
+                    }
+                    if operation=="subscribe" {tokens.extend(ids.iter().cloned());}
+                    else {for id in ids {tokens.remove(id);}}
+                }
+                let _=update.receipt.send(Ok(()));
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     let _ = socket.close(None).await;
@@ -332,9 +424,10 @@ async fn run_polymarket_connection(
                     if values.is_empty() || values.iter().any(|value| !value.is_object()) {
                         return Err(TransportError::InvalidFrame);
                     }
-                    let frames = values.into_iter().map(|raw_payload| RawTransportFrame {
+                    let frames:Vec<_> = values.into_iter().filter(|value|subscription::owned_or_unclassified(value,tokens)).map(|raw_payload| RawTransportFrame {
                         raw_payload, received_at,
                     }).collect();
+                    if frames.is_empty() {continue;}
                     if !send_bounded(output, frames, shutdown).await? {
                         let _ = socket.close(None).await;
                         return Ok(ConnectionEnd::Shutdown);
@@ -1380,6 +1473,79 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         assert_eq!(transport.await.unwrap(), Ok(()));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_transport_updates_same_socket_and_reconnects_current_membership() {
+        managed_membership_roundtrip(false).await;
+    }
+
+    #[tokio::test]
+    async fn supervised_shard_preserves_membership_when_retry_group_exhausts() {
+        managed_membership_roundtrip(true).await;
+    }
+
+    async fn managed_membership_roundtrip(supervised:bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint=Url::parse(&format!("ws://{}/ws/market",listener.local_addr().unwrap())).unwrap();
+            let server=tokio::spawn(async move {
+                let (stream,_)=listener.accept().await.unwrap();
+                let mut socket=tokio_tungstenite::accept_async(stream).await.unwrap();
+                let first=socket.next().await.unwrap().unwrap().into_text().unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&first).unwrap()["assets_ids"],serde_json::json!(["a","b"]));
+                socket.send(Message::Text(serde_json::json!({"event_type":"book","asset_id":"b"}).to_string().into())).await.unwrap();
+                for expected in [serde_json::json!({"operation":"subscribe","assets_ids":["c"]}),
+                                 serde_json::json!({"operation":"unsubscribe","assets_ids":["a"]})] {
+                    let message=socket.next().await.unwrap().unwrap().into_text().unwrap();
+                    assert_eq!(serde_json::from_str::<Value>(&message).unwrap(),expected);
+                }
+                // A frame already queued by the venue before unsubscribe is
+                // no longer owned, and must not become a global routing gap.
+                socket.send(Message::Text(serde_json::json!({"event_type":"book","asset_id":"a"}).to_string().into())).await.unwrap();
+                socket.send(Message::Text(serde_json::json!({"event_type":"book","asset_id":"c"}).to_string().into())).await.unwrap();
+                socket.close(None).await.unwrap();
+                let (stream,_)=listener.accept().await.unwrap();
+                let mut socket=tokio_tungstenite::accept_async(stream).await.unwrap();
+                let next=socket.next().await.unwrap().unwrap().into_text().unwrap();
+                assert_eq!(serde_json::from_str::<Value>(&next).unwrap()["assets_ids"],serde_json::json!(["b","c"]));
+                socket.send(Message::Text(serde_json::json!({"event_type":"book","asset_id":"b"}).to_string().into())).await.unwrap();
+                while let Some(message)=socket.next().await {
+                    match message.unwrap() {
+                        Message::Close(_)=>{let _=socket.flush().await;break;},
+                        Message::Text(text) if text=="PING"=>socket.send(Message::Text("PONG".into())).await.unwrap(),
+                        other=>panic!("unexpected subscription/control: {other:?}"),
+                    }
+                }
+            });
+            let (sender,mut receiver)=mpsc::channel(4);
+            let (stop,shutdown)=watch::channel(false);
+            let (commands,updates)=subscription::subscription_commands();
+            let worker=tokio::spawn(async move {
+                let mut config=PolymarketTransportConfig::loopback(endpoint);
+                if supervised {
+                    config.maximum_reconnect_attempts=1;
+                    supervise_polymarket_transport_managed(config,vec!["a".into(),"b".into()],sender,shutdown,updates,Duration::from_millis(5)).await
+                } else {
+                    run_polymarket_transport_managed(config,vec!["a".into(),"b".into()],sender,shutdown,updates).await
+                }
+            });
+            assert_eq!(receiver.recv().await.unwrap()[0].raw_payload["asset_id"],"b");
+            let (receipt,done)=tokio::sync::oneshot::channel();
+            commands.send(subscription::SubscriptionUpdate {expected_tokens:BTreeSet::from(["a".into(),"b".into()]),token_ids:BTreeSet::from(["b".into(),"c".into()]),receipt}).await.unwrap();
+            assert_eq!(done.await.unwrap(),Ok(()));
+            assert_eq!(receiver.recv().await.unwrap()[0].raw_payload["asset_id"],"c");
+            let gaps=receiver.recv().await.unwrap();
+            assert_eq!(gaps.iter().map(|f|f.raw_payload["asset_id"].as_str().unwrap()).collect::<Vec<_>>(),vec!["b","c"]);
+            assert!(gaps.iter().all(|f|f.raw_payload["event_type"]=="source_gap"));
+            assert_eq!(receiver.recv().await.unwrap()[0].raw_payload["asset_id"],"b");
+            let (receipt,done)=tokio::sync::oneshot::channel();
+            commands.send(subscription::SubscriptionUpdate {expected_tokens:BTreeSet::from(["a".into(),"b".into()]),token_ids:BTreeSet::from(["b".into(),"c".into()]),receipt}).await.unwrap();
+            assert_eq!(done.await.unwrap(),Err(TransportError::SubscriptionConflict));
+            stop.send(true).unwrap();
+            assert_eq!(worker.await.unwrap(),Ok(()));
+            server.await.unwrap();
+        }).await.unwrap();
     }
 
     #[tokio::test]

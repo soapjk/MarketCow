@@ -87,16 +87,12 @@ def build(
     selected = set(market_ids)
     relation_dependencies: set[str] = set()
     for market in markets:
-        if market.end_at is None:
-            raise ValueError(
-                f"configured market end_at is missing: {market.identity.market_id}"
-            )
         configured_markets.append(
             {
                 "market_id": market.identity.market_id,
                 "condition_id": market.identity.condition_id,
                 "token_ids": [item.token_id for item in market.identity.outcomes],
-                "end_at": market.end_at.isoformat().replace("+00:00", "Z"),
+                "end_at": market.end_at.isoformat().replace("+00:00", "Z") if market.end_at else None,
             }
         )
         for relation in market.relations:

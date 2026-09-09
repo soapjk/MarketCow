@@ -17,6 +17,13 @@ mod durable_bootstrap;
 mod source_dispatch;
 mod source_lifecycle;
 mod source_public_api;
+mod source_price_history;
+mod source_market_evidence;
+mod source_scope_control;
+mod source_scope_journal;
+mod source_acquisition_shards;
+mod source_rest_pool;
+mod source_scope_registry;
 mod source_public_frame;
 mod source_public_binding;
 mod source_discovery_quote;
@@ -112,6 +119,24 @@ struct Args {
     public_maximum_clients: Option<usize>,
     #[arg(long, requires = "public_listen")]
     public_send_timeout_seconds: Option<u64>,
+    /// Private publication-control socket. Does not prepare acquisition or expose a LAN manager.
+    #[arg(long, requires_all=["scope_control_bytes", "scope_control_timeout_seconds", "scope_retire_grace_seconds", "acquisition_token_budget", "acquisition_socket_budget", "scope_state_file", "scope_state_bytes"])]
+    scope_control_socket: Option<PathBuf>,
+    #[arg(long,requires="scope_control_socket")]
+    scope_state_file:Option<PathBuf>,
+    #[arg(long,requires="scope_control_socket")]
+    scope_state_bytes:Option<usize>,
+    #[arg(long, requires="scope_control_socket")]
+    scope_control_bytes: Option<usize>,
+    #[arg(long, requires="scope_control_socket")]
+    scope_control_timeout_seconds: Option<u64>,
+    #[arg(long, requires="scope_control_socket")]
+    scope_retire_grace_seconds: Option<u64>,
+    /// Concurrent acquisition tokens, including preparation and retirement.
+    #[arg(long, requires="scope_control_socket")]
+    acquisition_token_budget:Option<usize>,
+    #[arg(long, requires="scope_control_socket")]
+    acquisition_socket_budget:Option<usize>,
     /// Independent direct Rust Discovery surface over this frozen universe.
     #[arg(long, conflicts_with_all=["configured_scope", "public_listen", "live_listen"], requires_all=["discovery_seed", "discovery_seed_sha256", "discovery_state_bytes", "discovery_full_sync_bytes", "discovery_frame_bytes", "discovery_replay_bytes", "discovery_clients", "discovery_baselines", "discovery_send_timeout_seconds"])]
     discovery_listen:Option<std::net::SocketAddr>,
@@ -578,20 +603,59 @@ async fn main() -> Result<()> {
                 market.clone(),
             );
         }
-        writer.bind_catalog_tokens(
-            plan.markets
-                .iter()
-                .flat_map(|m| m.token_ids.iter().map(|t| (t.clone(), m.market_id.clone())))
-                .collect(),
-        )?;
     }
+    let mut scope_boot=if let Some(path)=&args.scope_state_file {
+        source_scope_journal::read(path,args.scope_state_bytes.context("scope state bytes")?)?
+    }else{None};
+    let manifest_sha=hex::encode(Sha256::digest(fs::read(args.root.join("catalog.json"))?));
+    if let Some(state)=scope_boot.as_mut() {
+        ensure!(state.catalog_revision==plan.catalog_revision&&state.catalog_manifest_sha256==manifest_sha
+            && state.pool==if args.discovery_listen.is_some(){"discovery"}else{"live"},"runtime source differs");
+        let bindings=state.records.iter().chain(&state.retiring_records).filter(|(id,_)|
+            state.acquisition_market_ids.contains(*id)||state.retiring_records.contains_key(*id))
+            .flat_map(|(id,record)|record["identity"]["outcomes"].as_array().unwrap().iter()
+                .map(move|outcome|(outcome["token_id"].as_str().unwrap().to_owned(),id.clone()))).collect();
+        writer.bind_catalog_tokens(bindings)?;
+        if !state.retiring_records.is_empty() {
+            // Startup-only completion of a previously durable control intent.
+            // Recent history is retained; no listener exists at this point.
+            writer.retire_catalog_markets(writer.cursor()?,&state.retiring_records.keys().cloned().collect())?;
+            state.retiring_records.clear();state.retirement_ticket=None;
+        }
+        plan.markets=state.markets()?;
+        ensure!(plan.markets.len()*2<=args.acquisition_token_budget.context("runtime acquisition budget")?,"runtime acquisition capacity");
+        lifecycle_markets=state.records.clone();
+    }
+    // Both cold Discovery and scoped Live writers require the verified plan
+    // identity map. Existing books are not a substitute for catalog binding;
+    // Discovery has no dependency-plan branch on a fresh generation.
+    writer.bind_catalog_tokens(
+        plan.markets
+            .iter()
+            .flat_map(|m| m.token_ids.iter().map(|t| (t.clone(), m.market_id.clone())))
+            .collect(),
+    )?;
     // Do not migrate durable history until the complete source binding is valid.
     if let Some(limit) = args.bounded_history_bytes {
         writer.enable_bounded_history(limit)?;
     }
     let cursor = writer.cursor()?;
     let mut discovery_config=None;
-    let base = if args.discovery_listen.is_some() {
+    let scope_revision=scope_boot.as_ref().map_or(1,|state|state.active_revision);
+    let base = if let Some(state)=scope_boot.as_mut() {
+        if state.pool=="live" {
+            let scope:source_public_api::ConfiguredScope=serde_json::from_value(state.active_config.clone())?;
+            scope.validate()?;public_scope=Some(scope);
+        } else {
+            let mut config:source_discovery_projection::DiscoveryConfig=serde_json::from_value(state.active_config.clone())?;
+            config.projection_id=canonical_hash(&json!({"previous":config.projection_id,"instance":uuid::Uuid::new_v4().simple().to_string()}));
+            state.active_config=serde_json::to_value(&config)?;discovery_config=Some(config);
+        }
+        Some(durable_bootstrap::bootstrap_managed(args.root.clone(),state.catalog_revision.clone(),manifest_sha.clone(),
+            state.records.values().cloned().collect(),state.catalog_source.clone(),
+            if state.pool=="live"{args.public_full_sync_bytes.context("public state bytes")?}else{args.discovery_state_bytes.context("Discovery state bytes")?},
+            if state.pool=="live"{Some(public_scope.as_ref().context("managed Live scope")?.active_scope_id.clone())}else{None})?)
+    } else if args.discovery_listen.is_some() {
         let (config,base)=source_discovery_startup::load(&args.root,args.discovery_seed.as_deref().context("Discovery seed")?,
             args.discovery_seed_sha256.as_deref().context("Discovery seed hash")?,args.discovery_state_bytes.context("Discovery state cap")?,&plan.markets)?;
         discovery_config=Some(config);Some(base)
@@ -610,6 +674,22 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let journal=if let Some(path)=&args.scope_state_file {
+        let initial=if let Some(state)=scope_boot {state}else{
+            let base=base.as_ref().context("managed source baseline required")?;
+            source_scope_journal::State{
+                schema_version:"marketcow.runtime-scope-state.v1".into(),catalog_revision:plan.catalog_revision.clone(),
+                catalog_manifest_sha256:manifest_sha,pool:if args.discovery_listen.is_some(){"discovery"}else{"live"}.into(),
+                active_config:if let Some(config)=&discovery_config{serde_json::to_value(config)?}else{serde_json::to_value(public_scope.as_ref().context("public config")?)?},
+                active_revision:scope_revision,catalog_source:base["catalog_source"].clone(),
+                records:base["markets"].as_array().context("managed metadata")?.iter().map(|record|Ok((record["identity"]["market_id"].as_str().context("managed market")?.into(),record.clone()))).collect::<Result<_>>()?,
+                acquisition_market_ids:plan.markets.iter().map(|m|m.market_id.clone()).collect(),retiring_records:Default::default(),retirement_ticket:None,
+            }
+        };
+        let mut journal=source_scope_journal::Journal::open(path.clone(),args.scope_state_bytes.context("scope state bytes")?,initial.clone())?;
+        // Persist completed startup retirement and the new Discovery instance.
+        journal.commit(initial)?;Some(journal)
+    }else{None};
     let bindings = plan
         .markets
         .iter()
@@ -618,15 +698,23 @@ async fn main() -> Result<()> {
     let persistence_root = args.root.clone();
     let persistence_catalog = plan.catalog_revision.clone();
     let ws_seed = base.clone();
-    let mut publication = source_publication::Publication::start(
+    let mut publication = source_publication::Publication::start_managed(
         cursor,
         base,
         bindings,
         args.persistence_queue_batches,
         args.persistence_queue_bytes,
         args.batch_byte_limit,
-        move |batches| {
+        move |work| {
+            let batches=match work {
+                source_publication::PersistenceWork::Events(batches)=>batches,
+                source_publication::PersistenceWork::Retire(retirement)=>{
+                    writer.bind_catalog_tokens(retirement.catalog_bindings.clone())?;
+                    return writer.retire_catalog_markets(retirement.after,&retirement.markets);
+                }
+            };
             for batch in batches {
+                writer.bind_catalog_tokens(batch.catalog_bindings.clone())?;
                 if let Some(evidence) = &batch.evidence {
                     source_lifecycle::persist(&persistence_root, &persistence_catalog, evidence)?;
                 }
@@ -653,30 +741,43 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    ensure!(args.scope_control_socket.is_none() || args.public_listen.is_some() || args.discovery_listen.is_some(),
+        "scope control requires a public pool");
+    let mut control_backend = None;
     let public_task = if let Some(listen) = args.public_listen {
         ensure!(listen.ip().is_loopback() || matches!(listen.ip(), std::net::IpAddr::V4(ip) if ip.is_private()),
             "public read API must bind explicit loopback or private LAN address");
-        let router = source_public_api::PublicApi::router(publication.reader(),public_scope.context("public scope")?,
-            1,uuid::Uuid::new_v4().simple().to_string(),args.public_full_sync_bytes.context("public bytes")?,
+        let (router,control) = source_public_api::PublicApi::router_managed(publication.reader(),public_scope.context("public scope")?,
+            scope_revision,uuid::Uuid::new_v4().simple().to_string(),args.public_full_sync_bytes.context("public bytes")?,
             args.public_snapshot_concurrency.context("snapshot concurrency")?,source_public_api::StreamLimits {
                 frame_bytes:args.public_frame_bytes.context("public frame bytes")?,
                 replay_bytes:args.public_replay_bytes.context("public replay bytes")?,
                 clients:args.public_maximum_clients.context("public clients")?,
                 send_timeout:Duration::from_secs(args.public_send_timeout_seconds.context("send timeout")?),
-            })?;
+            },Duration::from_secs(args.scope_retire_grace_seconds.unwrap_or(args.public_send_timeout_seconds.context("send timeout")?)))?;
+        control_backend = Some(source_scope_control::Backend::Live(control));
         let listener = tokio::net::TcpListener::bind(listen).await?;
         Some(tokio::spawn(async move {axum::serve(listener,router).await}))
     } else {None};
     let discovery_task=if let Some(listen)=args.discovery_listen {
         ensure!(listen.ip().is_loopback() || matches!(listen.ip(),std::net::IpAddr::V4(ip) if ip.is_private()),"Discovery requires explicit loopback/private address");
-        let router=source_discovery_api::router(publication.reader(),std::sync::Arc::new(discovery_config.context("Discovery config")?),
+        let (router,control)=source_discovery_api::router_managed_at(publication.reader(),std::sync::Arc::new(discovery_config.context("Discovery config")?),
             source_discovery_api::DiscoveryLimits{full_sync_bytes:args.discovery_full_sync_bytes.context("Discovery response cap")?,
                 frame_bytes:args.discovery_frame_bytes.context("Discovery frame cap")?,state_bytes:args.discovery_state_bytes.context("Discovery state cap")?,
                 replay_bytes:args.discovery_replay_bytes.context("Discovery replay cap")?,clients:args.discovery_clients.context("Discovery clients")?,
-                cached_baselines:args.discovery_baselines.context("Discovery baselines")?,send_timeout:Duration::from_secs(args.discovery_send_timeout_seconds.context("Discovery send timeout")?)})?;
+                cached_baselines:args.discovery_baselines.context("Discovery baselines")?,send_timeout:Duration::from_secs(args.discovery_send_timeout_seconds.context("Discovery send timeout")?)},
+            Duration::from_secs(args.scope_retire_grace_seconds.unwrap_or(args.discovery_send_timeout_seconds.context("Discovery send timeout")?)),scope_revision)?;
+        control_backend=Some(source_scope_control::Backend::Discovery(control));
         let listener=tokio::net::TcpListener::bind(listen).await?;
         Some(tokio::spawn(async move{axum::serve(listener,router).await}))
     }else{None};
+    let (acquisition_sender,acquisition_receiver)=tokio::sync::mpsc::channel(1);
+    let control_task = if let Some(path) = &args.scope_control_socket {
+        Some(source_scope_control::start(path,args.scope_control_bytes.context("control bytes")?,
+            Duration::from_secs(args.scope_control_timeout_seconds.context("control timeout")?),
+            control_backend.context("control backend")?,
+            Some(acquisition_sender),journal)?)
+    } else {None};
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.request_timeout_seconds))
         .build()?;
@@ -688,6 +789,7 @@ async fn main() -> Result<()> {
                 "WebSocket requires an explicit live dependency plan and seeded read stream",
             )?,
             &mut publication,
+            if args.scope_control_socket.is_some(){Some(acquisition_receiver)}else{None},
         )
         .await;
         if let Some(task) = stream_task {
@@ -695,10 +797,19 @@ async fn main() -> Result<()> {
         }
         if let Some(task) = public_task { task.abort(); }
         if let Some(task) = discovery_task { task.abort(); }
+        if let Some(task) = control_task { task.abort(); let _ = task.await; }
         let drain = publication.finish().await;
         result?;
         drain?;
         return Ok(());
+    }
+    if args.scope_control_socket.is_some() {
+        let result=source_rest_pool::run(&args,&plan,&mut publication,acquisition_receiver).await;
+        if let Some(task)=stream_task{task.abort();}
+        if let Some(task)=public_task{task.abort();}
+        if let Some(task)=discovery_task{task.abort();}
+        if let Some(task)=control_task{task.abort();let _=task.await;}
+        let drain=publication.finish().await;result?;drain?;return Ok(());
     }
     // Managed shutdown completes the current durability cycle before releasing the lease.
     let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -806,6 +917,7 @@ async fn main() -> Result<()> {
     workers.abort_all();
     if let Some(task) = public_task { task.abort(); }
     if let Some(task) = discovery_task { task.abort(); }
+    if let Some(task) = control_task { task.abort(); let _ = task.await; }
     if let Some(task) = stream_task {
         task.abort();
     }

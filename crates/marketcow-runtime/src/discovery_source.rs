@@ -14,7 +14,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAX_SCOPED_TOKEN_IDENTITIES: usize = 2048;
+/// Hard parser/storage ceiling; managed collectors enforce an explicit lower budget.
+pub const MAX_SOURCE_TOKEN_IDENTITIES: usize = 8192;
+const MAX_SCOPED_TOKEN_IDENTITIES:usize=MAX_SOURCE_TOKEN_IDENTITIES;
 
 pub fn is_token_recovery(event: &Value) -> bool {
     matches!(
@@ -46,7 +48,7 @@ pub fn apply_token_recovery(state: &mut BTreeMap<String, Value>, event: &Value) 
         let payload = &event["canonical_payload"];
         if event["event_type"] == "recovery_started" {
             ensure!(
-                state.contains_key(token) || state.len() < 2048,
+                state.contains_key(token) || state.len() < MAX_SOURCE_TOKEN_IDENTITIES,
                 "token recovery capacity"
             );
             state.insert(
@@ -84,7 +86,7 @@ pub fn load_token_recoveries(db: &Connection) -> Result<BTreeMap<String, Value>>
     )?;
     let mut rows = query.query([])?;
     while let Some(row) = rows.next()? {
-        ensure!(result.len() < 2048, "stored recovery limit");
+        ensure!(result.len() < MAX_SOURCE_TOKEN_IDENTITIES, "stored recovery limit");
         let token: String = row.get(0)?;
         let body: Vec<u8> = row.get(1)?;
         let sha: String = row.get(2)?;
@@ -393,7 +395,7 @@ impl PreparedSourceWriter {
             fs::canonicalize(&path)?.starts_with(&root),
             "index escapes generation"
         );
-        let database = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let mut database = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         database.busy_timeout(std::time::Duration::from_secs(5))?;
         let values = metadata(&database)?;
         for key in [
@@ -413,7 +415,7 @@ impl PreparedSourceWriter {
             values["schema_version"] == "marketcow.polymarket.state-index.v1",
             "wrong source schema"
         );
-        let recoveries = load_token_recoveries(&database)?;
+        let mut recoveries = load_token_recoveries(&database)?;
         ensure!(
             values["unresolved_gap_count"].parse::<usize>()? == recoveries.len(),
             "source recovery required: unaccounted gaps"
@@ -430,6 +432,55 @@ impl PreparedSourceWriter {
                 market_id TEXT PRIMARY KEY,cursor INTEGER NOT NULL,\
                 payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL)",
         )?;
+        // A lifecycle overlay is an authoritative retirement boundary. Older
+        // generations could commit the terminal row separately from the
+        // preceding coverage recovery, leaving an audit-valid but no-longer
+        // actionable recovery behind. Reconcile that state atomically at the
+        // writer boundary; the event log and lifecycle row remain untouched.
+        let terminal_markets: BTreeSet<String> = {
+            let mut statement = database.prepare(
+                "SELECT market_id,payload_json,payload_sha256 FROM market_lifecycle",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut result = BTreeSet::new();
+            while let Some(row) = rows.next()? {
+                let market: String = row.get(0)?;
+                let body: Vec<u8> = row.get(1)?;
+                let sha: String = row.get(2)?;
+                ensure!(
+                    hex::encode(Sha256::digest(&body)) == sha,
+                    "terminal lifecycle hash mismatch"
+                );
+                let model: Value = serde_json::from_slice(&body)?;
+                if matches!(model["lifecycle_state"].as_str(), Some("closed" | "resolved")) {
+                    result.insert(market);
+                }
+            }
+            result
+        };
+        if !terminal_markets.is_empty() {
+            let stale: Vec<String> = recoveries
+                .iter()
+                .filter_map(|(token, recovery)| {
+                    recovery["market_id"]
+                        .as_str()
+                        .filter(|market| terminal_markets.contains(*market))
+                        .map(|_| token.clone())
+                })
+                .collect();
+            if !stale.is_empty() {
+                let tx = database.transaction()?;
+                for token in &stale {
+                    tx.execute("DELETE FROM source_token_recoveries WHERE token_id=?", [token])?;
+                    recoveries.remove(token);
+                }
+                tx.execute(
+                    "INSERT OR REPLACE INTO metadata(key,value) VALUES('unresolved_gap_count',?)",
+                    [recoveries.len().to_string()],
+                )?;
+                tx.commit()?;
+            }
+        }
         let log_path = root.join("events.jsonl");
         let size: u64 = values["event_log_size"].parse()?;
         let cursor: u64 = values["latest_cursor"].parse()?;
@@ -459,6 +510,13 @@ impl PreparedSourceWriter {
             database.pragma_update(None, "max_page_count", i64::try_from(pages)?)?;
             let latest: Option<i64> =
                 database.query_row("SELECT MAX(cursor) FROM recent_events", [], |r| r.get(0))?;
+            if cursor == 0 {
+                ensure!(latest.is_none() && size == 0
+                    && values["recent_event_bytes"] == "0"
+                    && values["history_floor_cursor"] == "0", "invalid empty bounded boundary");
+                let books: i64 = database.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))?;
+                ensure!(books == 0 && recoveries.is_empty(), "empty boundary has source state");
+            } else {
             ensure!(
                 latest.map(|v| v as u64) == Some(cursor),
                 "bounded history boundary mismatch"
@@ -486,6 +544,7 @@ impl PreparedSourceWriter {
                         == values["history_floor_cursor"],
                 "bounded history accounting mismatch"
             );
+            }
         } else if cursor > 0 {
             let log = log.as_mut().context("legacy log missing")?;
             let (offset, length, expected): (i64, i64, String) = database.query_row(
@@ -568,6 +627,14 @@ impl PreparedSourceWriter {
             return Ok(());
         }
         let cursor = self.cursor()?;
+        let tail = if cursor == 0 {
+            let values = metadata(&self.database)?;
+            let books: i64 = self.database.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))?;
+            let offsets: i64 = self.database.query_row("SELECT COUNT(*) FROM event_offsets", [], |r| r.get(0))?;
+            ensure!(values["event_log_size"] == "0" && books == 0 && offsets == 0
+                && self.recoveries.is_empty(), "empty migration has source state");
+            None
+        } else {
         let (offset, length, hash): (i64, i64, String) = self.database.query_row(
             "SELECT byte_offset,byte_length,line_sha256 FROM event_offsets WHERE cursor=?",
             [i64::try_from(cursor)?],
@@ -581,12 +648,17 @@ impl PreparedSourceWriter {
             hex::encode(Sha256::digest(&line)) == hash,
             "migration tail hash differs"
         );
+            Some((line, hash, length))
+        };
         let tx = self.database.transaction()?;
         tx.execute_batch("CREATE TABLE recent_events(cursor INTEGER PRIMARY KEY,payload BLOB NOT NULL,sha256 TEXT NOT NULL); DELETE FROM event_offsets;")?;
-        tx.execute(
+        let length = if let Some((line, hash, length)) = tail {
+            tx.execute(
             "INSERT INTO recent_events VALUES(?,?,?)",
             params![i64::try_from(cursor)?, line, hash],
-        )?;
+            )?;
+            length
+        } else { 0 };
         let page_size =
             usize::try_from(tx.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))?)?;
         let pages =
@@ -622,7 +694,10 @@ impl PreparedSourceWriter {
     /// Catalog identities only: never creates placeholder books or events.
     pub fn bind_catalog_tokens(&mut self, bindings: BTreeMap<String, String>) -> Result<()> {
         ensure!(
-            bindings.len() <= MAX_SCOPED_TOKEN_IDENTITIES,
+            bindings.len() <= MAX_SCOPED_TOKEN_IDENTITIES
+                && self.token_markets.len().checked_add(bindings.keys()
+                    .filter(|token| !self.token_markets.contains_key(*token)).count())
+                    .is_some_and(|total|total <= MAX_SCOPED_TOKEN_IDENTITIES),
             "bounded scoped identity budget exceeded"
         );
         for (token, market) in &bindings {
@@ -640,6 +715,50 @@ impl PreparedSourceWriter {
 
     pub fn cursor(&self) -> Result<u64> {
         Ok(metadata(&self.database)?["latest_cursor"].parse()?)
+    }
+
+    /// Ordered scope retirement, not a venue resolution. Called only by the
+    /// durability owner AFTER preceding batches and after old-scope leases
+    /// expire. Recent event history remains unchanged; current unused books
+    /// and token recovery state are released without inventing event cursors.
+    pub fn retire_catalog_markets(&mut self, after:u64, markets:&BTreeSet<String>) -> Result<()> {
+        ensure!(!self.poisoned && self.cursor()?==after,"retirement boundary differs");
+        ensure!(!markets.is_empty() && markets.len()<=4096,"retirement market budget");
+        let tokens:BTreeSet<String>=self.token_markets.iter().filter(|(_,market)|markets.contains(*market)).map(|(token,_)|token.clone()).collect();
+        // The in-memory owner verified membership. Metadata-only dependencies
+        // have no acquisition tokens; their lifecycle rows may still retire.
+        let mut values=metadata(&self.database)?;
+        let mut oldest=None;
+        let mut complete=BTreeMap::<String,usize>::new();
+        let mut count=0usize;
+        for (token,health) in &self.health {
+            if tokens.contains(token) {continue;}
+            count+=1;
+            oldest=Some(oldest.map_or(health.received_at,|at:chrono::DateTime<chrono::Utc>|at.min(health.received_at)));
+            if health.complete {*complete.entry(health.market_id.clone()).or_default()+=1;}
+        }
+        values.insert("book_token_count".into(),count.to_string());
+        values.insert("book_complete_market_count".into(),complete.values().filter(|n|**n==2).count().to_string());
+        values.insert("oldest_book_received_at".into(),oldest.map_or_else(String::new,|at|at.to_rfc3339()));
+        values.insert("unresolved_gap_count".into(),self.recoveries.keys().filter(|token|!tokens.contains(*token)).count().to_string());
+        self.poisoned=true;
+        let tx=self.database.transaction()?;
+        for token in &tokens {
+            tx.execute("DELETE FROM books WHERE token_id=?",[token])?;
+            tx.execute("DELETE FROM book_confirmations WHERE token_id=?",[token])?;
+            tx.execute("DELETE FROM source_token_recoveries WHERE token_id=?",[token])?;
+        }
+        for market in markets {
+            tx.execute("DELETE FROM market_lifecycle WHERE market_id=?",[market])?;
+        }
+        for (key,value) in &values {tx.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",[key,value])?;}
+        tx.commit()?;
+        self.health.retain(|token,_|!tokens.contains(token));
+        self.recoveries.retain(|token,_|!tokens.contains(token));
+        self.token_markets.retain(|token,_|!tokens.contains(token));
+        self.write_index_manifest(&values)?;
+        self.poisoned=false;
+        Ok(())
     }
 
     /// Commit only whole binary markets. Missing token snapshots never become a
@@ -950,13 +1069,22 @@ impl PreparedSourceWriter {
         if let Some(at) = oldest {
             values.insert("oldest_book_received_at".into(), at.to_rfc3339());
         } else {
-            bail!("source contains no books");
+            // Cold start can publish recovery facts before its first book;
+            // retiring the final market also legitimately leaves no books.
+            // Match the empty index representation without inventing freshness.
+            values.insert("oldest_book_received_at".into(), String::new());
         }
         for (key, value) in &values {
             tx.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", [key, value])?;
         }
         tx.commit()?;
         self.recoveries = recoveries;
+        self.write_index_manifest(&values)?;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    fn write_index_manifest(&self, values:&BTreeMap<String,String>)->Result<()> {
         let mut manifest = json!({"schema_version":"marketcow.polymarket.state-index.v1",
             "path":self.root.join("indexes/latest-state.sqlite3")});
         for key in [
@@ -979,7 +1107,6 @@ impl PreparedSourceWriter {
         output.sync_all()?;
         fs::rename(&temporary, self.root.join("state-index.json"))?;
         File::open(&self.root)?.sync_all()?;
-        self.poisoned = false;
         Ok(())
     }
 }
@@ -1158,6 +1285,58 @@ mod tests {
         assert!(writer.recoveries.is_empty());
         assert_eq!(writer.cursor().unwrap(), 6);
     }
+    #[test]
+    fn empty_bounded_candidate_reopens_without_fabricated_event() {
+        let root = fixture();
+        let db = Connection::open(root.path().join("indexes/latest-state.sqlite3")).unwrap();
+        db.execute_batch("DELETE FROM books; UPDATE metadata SET value='' WHERE key='active_recovery_id';").unwrap();
+        drop(db);
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        writer.enable_bounded_history(16384).unwrap();
+        assert_eq!(writer.cursor().unwrap(), 0);
+        assert_eq!(writer.database.query_row("SELECT COUNT(*) FROM recent_events", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        drop(writer);
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        writer.bind_catalog_tokens(BTreeMap::from([("11".into(),"1".into()),("12".into(),"1".into())])).unwrap();
+        writer.append_market_batch(&[event("11", 1), event("12", 2)]).unwrap();
+        drop(writer);
+        assert_eq!(PreparedSourceWriter::open(root.path(), 16384).unwrap().cursor().unwrap(), 2);
+    }
+
+    #[test]
+    fn empty_bounded_migration_rejects_unpublished_books() {
+        let root = fixture(); // legacy fixture has books but cursor zero
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        assert!(writer.enable_bounded_history(16384).unwrap_err().to_string().contains("empty migration"));
+    }
+
+    #[test]
+    fn cold_recovery_persists_before_first_book() {
+        let root = fixture();
+        let db = Connection::open(root.path().join("indexes/latest-state.sqlite3")).unwrap();
+        db.execute_batch("DELETE FROM books; UPDATE metadata SET value='' WHERE key='active_recovery_id';").unwrap();
+        drop(db);
+        let tokens = BTreeMap::from([("11".into(),"1".into()),("12".into(),"1".into())]);
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        writer.bind_catalog_tokens(tokens.clone()).unwrap();
+        writer.enable_bounded_history(16384).unwrap();
+        let mut start = event("11", 1);
+        start["event_type"] = json!("recovery_started");
+        start["canonical_payload"] = json!({"recovery_scope":"token","token_id":"11","recovery_id":"cold1","reason":"missing_tick"});
+        start["gaps"] = json!([{"token_id":"11","code":"coverage_gap","resolved":false,
+            "detected_at":"2026-01-01T00:00:00Z","event_at":null,"expected":null,"observed":null,"resolution":null}]);
+        rehash(&mut start);
+        let proof = ValidatedSourceBatch::new(vec![start], false, 0, &tokens, 16384).unwrap();
+        writer.append_validated(&proof).unwrap();
+        assert_eq!(writer.health.len(), 0);
+        assert_eq!(metadata(&writer.database).unwrap()["oldest_book_received_at"], "");
+        drop(writer);
+        let writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        assert_eq!(writer.cursor().unwrap(), 1);
+        assert_eq!(writer.recoveries.len(), 1);
+        assert!(writer.health.is_empty());
+    }
+
     fn rehash(event: &mut Value) {
         event["canonical_payload_sha256"] = json!(canonical_hash(&event["canonical_payload"]));
         event["raw_payload_sha256"] = json!(canonical_hash(&event["raw_payload"]));
@@ -1217,6 +1396,51 @@ mod tests {
         }
         root
     }
+
+    #[test]
+    fn reopen_retires_recovery_for_terminal_lifecycle_atomically() {
+        let root = fixture();
+        let db_path = root.path().join("indexes/latest-state.sqlite3");
+        let db = Connection::open(&db_path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE source_token_recoveries(token_id TEXT PRIMARY KEY,payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL);
+             CREATE TABLE market_lifecycle(market_id TEXT PRIMARY KEY,cursor INTEGER NOT NULL,payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL);",
+        )
+        .unwrap();
+        let recovery = json!({"token_id":"11","market_id":"1","condition_id":"condition",
+            "recovery_id":"old","snapshot_cursor":null,
+            "gap":{"token_id":"11","code":"coverage_gap","resolved":false,
+                "detected_at":"2026-01-01T00:00:00Z"}});
+        let recovery_body = serde_json::to_vec(&recovery).unwrap();
+        db.execute(
+            "INSERT INTO source_token_recoveries VALUES (?,?,?)",
+            params!["11", recovery_body, hex::encode(Sha256::digest(&recovery_body))],
+        )
+        .unwrap();
+        let lifecycle = json!({"identity":{"market_id":"1"},"lifecycle_state":"resolved"});
+        let lifecycle_body = serde_json::to_vec(&lifecycle).unwrap();
+        db.execute(
+            "INSERT INTO market_lifecycle VALUES (?,?,?,?)",
+            params!["1", 0_i64, lifecycle_body, hex::encode(Sha256::digest(&lifecycle_body))],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE metadata SET value='1' WHERE key='unresolved_gap_count'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        assert!(writer.recoveries.is_empty());
+        assert_eq!(metadata(&writer.database).unwrap()["unresolved_gap_count"], "0");
+        let count: i64 = writer
+            .database
+            .query_row("SELECT count(*) FROM source_token_recoveries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     #[test]
     fn bounded_history_crash_child() {
         let Some(path) = std::env::var_os("MARKETCOW_CRASH_TEST_ROOT") else { return };
@@ -1501,6 +1725,45 @@ mod tests {
             .map(|index| (format!("token-{index}"), format!("market-{index}")))
             .collect();
         assert!(writer.bind_catalog_tokens(oversized).is_err());
+    }
+
+    #[test]
+    fn repeated_small_bindings_cannot_bypass_total_token_limit() {
+        let root=fixture();
+        let mut writer=PreparedSourceWriter::open(root.path(),16384).unwrap();
+        let remaining=MAX_SCOPED_TOKEN_IDENTITIES-writer.token_markets.len();
+        let additions:BTreeMap<_,_>=(0..remaining).map(|n|(format!("extra-{n}"),"market".into())).collect();
+        writer.bind_catalog_tokens(additions.clone()).unwrap();
+        writer.bind_catalog_tokens(additions).unwrap(); // Same identities are idempotent.
+        let before=writer.token_markets.clone();
+        assert!(writer.bind_catalog_tokens(BTreeMap::from([("one-too-many".into(),"market".into())])).is_err());
+        assert_eq!(writer.token_markets,before);
+        assert_eq!(writer.cursor().unwrap(),0);
+    }
+
+    #[test]
+    fn scope_retirement_releases_current_rows_preserves_history_and_reopens() {
+        let root=fixture();
+        let mut writer=PreparedSourceWriter::open(root.path(),16384).unwrap();
+        writer.append_market_batch(&[event("11",1),event("12",2)]).unwrap();
+        writer.enable_bounded_history(16384).unwrap();
+        let before=writer.database.query_row("SELECT group_concat(payload_sha256) FROM books",[],|r|r.get::<_,String>(0)).unwrap();
+        let history=writer.database.query_row("SELECT count(*) FROM recent_events",[],|r|r.get::<_,i64>(0)).unwrap();
+        let markets=BTreeSet::from(["1".into()]);
+        assert!(writer.retire_catalog_markets(1,&markets).is_err());
+        assert_eq!(before,writer.database.query_row("SELECT group_concat(payload_sha256) FROM books",[],|r|r.get::<_,String>(0)).unwrap());
+        writer.retire_catalog_markets(2,&markets).unwrap();
+        assert_eq!(writer.cursor().unwrap(),2);
+        assert_eq!(writer.database.query_row("SELECT count(*) FROM books",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(history,writer.database.query_row("SELECT count(*) FROM recent_events",[],|r|r.get::<_,i64>(0)).unwrap());
+        assert!(writer.token_markets.is_empty());
+        assert_eq!(metadata(&writer.database).unwrap()["book_token_count"],"0");
+        drop(writer);
+        let mut writer=PreparedSourceWriter::open(root.path(),16384).unwrap();
+        assert_eq!(writer.cursor().unwrap(),2);
+        writer.bind_catalog_tokens(BTreeMap::from([("11".into(),"1".into()),("12".into(),"1".into())])).unwrap();
+        writer.append_market_batch(&[event("11",3),event("12",4)]).unwrap();
+        assert_eq!(writer.cursor().unwrap(),4);
     }
 
     #[test]

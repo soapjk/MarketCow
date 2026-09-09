@@ -12,13 +12,16 @@ class PolymarketConfiguredMarket(BaseModel):
     market_id: str = Field(min_length=1)
     condition_id: str = Field(min_length=1)
     token_ids: tuple[str, ...] = Field(min_length=2, max_length=2)
-    end_at: str = Field(min_length=1)
+    end_at: str | None = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_identity(self) -> "PolymarketConfiguredMarket":
         if len(set(self.token_ids)) != 2 or any(not token for token in self.token_ids):
             raise ValueError("configured market token IDs must be distinct")
-        datetime.fromisoformat(self.end_at.replace("Z", "+00:00"))
+        if self.end_at is not None:
+            parsed = datetime.fromisoformat(self.end_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("configured end_at requires timezone")
         return self
 
 

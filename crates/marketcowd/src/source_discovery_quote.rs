@@ -7,6 +7,8 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use std::{collections::{BTreeMap, BTreeSet}, str::FromStr, sync::Arc};
 
+#[derive(serde::Deserialize,serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuotePolicy {
     pub quantities: Vec<String>,
     pub maximum_book_age_ms: i64,

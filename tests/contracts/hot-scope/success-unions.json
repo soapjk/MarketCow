@@ -1,0 +1,120 @@
+{
+  "evidence_kind": "synthetic_contract_vector_not_runtime_receipt",
+  "activated": {
+    "schema_version": "marketcow.hot-scope-activated.v1",
+    "candidate_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "selection_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "actual": {
+      "pool": "live",
+      "scope_id": "new-live",
+      "revision": 2,
+      "catalog_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "stream_instance_id": "11111111111111111111111111111111",
+      "market_count": 1,
+      "source_readable": true,
+      "source_cursor": 140,
+      "persisted_cursor": 138,
+      "retirement_submitted": 0,
+      "retirement_persisted": 0,
+      "admitted_market_ids": [
+        "1",
+        "2"
+      ],
+      "referenced_market_ids": [
+        "1",
+        "2"
+      ],
+      "acquisition": {
+        "tokens": 4,
+        "sockets": 1,
+        "retiring_shards": 0
+      }
+    },
+    "new_full_sync_required": true
+  },
+  "reconciled_active": {
+    "schema_version": "marketcow.hot-scope-reconciled.v1",
+    "candidate_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "selection_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "actual": {
+      "pool": "live",
+      "scope_id": "new-live",
+      "revision": 2,
+      "catalog_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "stream_instance_id": "11111111111111111111111111111111",
+      "market_count": 1,
+      "source_readable": true,
+      "source_cursor": 140,
+      "persisted_cursor": 138,
+      "retirement_submitted": 0,
+      "retirement_persisted": 0,
+      "admitted_market_ids": [
+        "1",
+        "2"
+      ],
+      "referenced_market_ids": [
+        "1",
+        "2"
+      ],
+      "acquisition": {
+        "tokens": 4,
+        "sockets": 1,
+        "retiring_shards": 0
+      }
+    },
+    "stage": "active",
+    "publication_applied_by_this_operation": false
+  },
+  "reconciled_prepared": {
+    "schema_version": "marketcow.hot-scope-prepared.v1",
+    "candidate_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "pool": "live",
+    "selection_id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expires_ms": 1788846900000,
+    "expected": {
+      "expected_scope_id": "new-live",
+      "expected_revision": 2
+    },
+    "requested_market_ids": [
+      "3"
+    ],
+    "acquisition": {
+      "chunks": [
+        {
+          "request_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+          "response_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "metadata_count": 1,
+          "acquisition_count": 1
+        }
+      ],
+      "all_installed": true
+    },
+    "publication_applied": false,
+    "actual": {
+      "pool": "live",
+      "scope_id": "new-live",
+      "revision": 2,
+      "catalog_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "stream_instance_id": "11111111111111111111111111111111",
+      "market_count": 1,
+      "source_readable": true,
+      "source_cursor": 140,
+      "persisted_cursor": 138,
+      "retirement_submitted": 0,
+      "retirement_persisted": 0,
+      "admitted_market_ids": [
+        "1",
+        "2"
+      ],
+      "referenced_market_ids": [
+        "1",
+        "2"
+      ],
+      "acquisition": {
+        "tokens": 4,
+        "sockets": 1,
+        "retiring_shards": 0
+      }
+    }
+  }
+}

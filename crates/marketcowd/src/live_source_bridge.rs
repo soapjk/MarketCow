@@ -26,7 +26,7 @@ use std::{
 use tokio::sync::Semaphore;
 
 const SCHEMA: &str = "marketcow.polymarket.live-stream.v1";
-const MAX_DEPENDENCY_MARKETS: usize = 1024;
+const MAX_DEPENDENCY_MARKETS: usize = 8192;
 const MAX_SCOPED_TOKEN_IDENTITIES: usize = MAX_DEPENDENCY_MARKETS * 2;
 
 /// Startup recovery only. Online publication must use the collector's memory stream.
@@ -74,12 +74,19 @@ pub(crate) fn bootstrap(root: PathBuf, plan_path: PathBuf, sha: &str, cap: usize
 /// scoped runtime or an online disk bridge. No scope-runtime file is invented.
 pub(crate) fn bootstrap_discovery(root:PathBuf,catalog_revision:String,catalog_manifest_sha256:String,
     markets:Vec<Value>,catalog_source:Value,cap:usize)->Result<Value> {
+    bootstrap_managed(root,catalog_revision,catalog_manifest_sha256,markets,catalog_source,cap,None)
+}
+
+/// Restart from the verified control journal. Live must retain its actually
+/// installed scope identity; Discovery deliberately has no Live scope.
+pub(crate) fn bootstrap_managed(root:PathBuf,catalog_revision:String,catalog_manifest_sha256:String,
+    markets:Vec<Value>,catalog_source:Value,cap:usize,scope_id:Option<String>)->Result<Value> {
     ensure!(!markets.is_empty()&&markets.len()<=MAX_DEPENDENCY_MARKETS,"Discovery seed market bounds");
     ensure!(hex::encode(Sha256::digest(fs::read(root.join("catalog.json"))?))==catalog_manifest_sha256,"Discovery catalog manifest changed");
     let bridge=Bridge{args:Args{root:fs::canonicalize(root)?,plan:PathBuf::new(),plan_sha256:String::new(),
         listen:"127.0.0.1:1".parse()?,maximum_frame_bytes:cap,maximum_clients:1,poll_ms:1},
         plan:Plan{schema_version:"marketcow.polymarket.discovery-public-seed.v1".into(),catalog_revision,
-            scope_id:None,catalog_manifest_sha256,markets,catalog_source},permits:Arc::new(Semaphore::new(1))};
+            scope_id,catalog_manifest_sha256,markets,catalog_source},permits:Arc::new(Semaphore::new(1))};
     Ok(serde_json::from_str(&bridge.snapshot()?.0)?)
 }
 
@@ -123,6 +130,42 @@ fn metadata(db: &Connection) -> Result<BTreeMap<String, String>> {
         .prepare("SELECT key,value FROM metadata")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<_, _>>()?)
+}
+
+/// Return only recoveries that can still affect the active live universe.
+///
+/// A terminal lifecycle is an authoritative retirement boundary. Older
+/// generations can legitimately retain the pre-terminal coverage row because
+/// the lifecycle event and recovery were committed by separate maintenance
+/// runs. Keep those rows in SQLite for audit/replay, but do not expose them as
+/// live gaps or ask the WS adapter to subscribe to retired tokens.
+fn effective_recoveries(
+    db: &Connection,
+    recoveries: BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>> {
+    let mut terminal = BTreeMap::new();
+    let mut rows = db.prepare("SELECT market_id,payload_json,payload_sha256 FROM market_lifecycle")?;
+    let mut query = rows.query([])?;
+    while let Some(row) = query.next()? {
+        let market: String = row.get(0)?;
+        let body: Vec<u8> = row.get(1)?;
+        let sha: String = row.get(2)?;
+        ensure!(hex::encode(Sha256::digest(&body)) == sha, "terminal lifecycle hash mismatch");
+        let model: Value = serde_json::from_slice(&body)?;
+        if matches!(model["lifecycle_state"].as_str(), Some("closed" | "resolved")) {
+            terminal.insert(market, model);
+        }
+    }
+    let mut result = BTreeMap::new();
+    for (token, recovery) in recoveries {
+        let market = recovery["market_id"]
+            .as_str()
+            .context("recovery market")?;
+        if !terminal.contains_key(market) {
+            result.insert(token, recovery);
+        }
+    }
+    Ok(result)
 }
 
 impl Bridge {
@@ -235,7 +278,10 @@ impl Bridge {
             );
             markets.insert(id, terminal);
         }
-        let token_recoveries = marketcow_runtime::discovery_source::load_token_recoveries(&db)?;
+        let token_recoveries = effective_recoveries(
+            &db,
+            marketcow_runtime::discovery_source::load_token_recoveries(&db)?,
+        )?;
         let payload = json!({"schema_version":SCHEMA,"type":"state", "catalog_revision":self.plan.catalog_revision,
             "scope_id":self.plan.scope_id,"catalog_source":self.plan.catalog_source,
             "latest_cursor":cursor,"persisted_cursor":cursor,"persistence_queue_depth":0,
@@ -477,6 +523,20 @@ mod tests {
             },
         };
         (temp, bridge)
+    }
+
+    #[test]
+    fn managed_restart_retains_live_scope_and_discovery_remains_unscoped() {
+        let (_temp, bridge) = fixture();
+        let root = bridge.args.root;
+        fs::write(root.join("catalog.json"), b"{}").unwrap();
+        let manifest = hex::encode(Sha256::digest(b"{}"));
+        for scope in [Some("new-live-scope".to_owned()), None] {
+            let base = bootstrap_managed(root.clone(), "catalog".into(), manifest.clone(),
+                vec![json!({"identity":{"market_id":"1"}})],json!({}),8192,scope.clone()).unwrap();
+            assert_eq!(base["scope_id"], json!(scope));
+            assert_eq!(base["latest_cursor"], 0);
+        }
     }
 
     #[test]

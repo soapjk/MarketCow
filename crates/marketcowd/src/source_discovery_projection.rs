@@ -13,6 +13,8 @@ fn relation_wire(relation:&Value)->Value {
     wire
 }
 
+#[derive(serde::Deserialize,serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoveryConfig {
     pub projection_id:String,
     pub catalog_revision:String,
@@ -23,6 +25,27 @@ pub struct DiscoveryConfig {
     pub policy:QuotePolicy,
 }
 impl DiscoveryConfig {
+    fn unresolved_in_scope(&self,view:&MemoryView)->Result<usize> {
+        let mut scope:BTreeSet<String>=self.market_ids.iter().cloned().collect();
+        for relation in &self.relations {
+            for member in relation["member_market_ids"].as_array().context("relation market ids")? {
+                scope.insert(member.as_str().context("relation market identity")?.to_owned());
+            }
+        }
+        let mut owners=BTreeMap::new();
+        for (id,market) in &view.markets {
+            for outcome in market["identity"]["outcomes"].as_array().context("market outcomes")? {
+                let token=outcome["token_id"].as_str().context("market token")?;
+                if let Some(previous)=owners.insert(token.to_owned(),id.clone()) {
+                    ensure!(previous==*id,"ambiguous source token ownership");
+                }
+            }
+        }
+        let recoveries=view.recoveries.keys().filter(|token|relevant_gap(Some(token),None,&scope,&owners)).count();
+        let gaps=view.base["gaps"].as_array().context("source gaps")?.iter()
+            .filter(|g|g["resolved"]==false && relevant_gap(g["token_id"].as_str(),g["market_id"].as_str(),&scope,&owners)).count();
+        Ok(recoveries+gaps)
+    }
     pub fn validate(&self,view:&MemoryView)->Result<()> {
         self.policy.validate()?;
         ensure!(view.base["catalog_revision"]==self.catalog_revision,"source catalog differs");
@@ -60,13 +83,29 @@ impl DiscoveryConfig {
     pub fn full_sync(&self,view:&MemoryView,observed:DateTime<Utc>)->Result<Value> {
         self.validate(view)?;
         let markets=self.market_ids.iter().map(|id|self.quote(view,id,observed)).collect::<Result<Vec<_>>>()?;
-        let unresolved=view.recoveries.len()+view.base["gaps"].as_array().context("source gaps")?.iter().filter(|g|g["resolved"]==false).count();
+        let unresolved=self.unresolved_in_scope(view)?;
         let ready=unresolved==0;
         let relations=self.relations.iter().map(relation_wire).collect::<Vec<_>>();
         Ok(json!({"schema_version":"marketcow.polymarket.discovery.v3","projection_id":self.projection_id,
             "catalog_revision":self.catalog_revision,"universe_revision":self.universe_revision,"boundary_cursor":view.cursor,
             "observed_at":observed,"ready":ready,"fail_closed_reason":if ready{None}else{Some("discovery_unresolved_gaps")},
             "unresolved_gap_count":unresolved,"depth_notionals":self.policy.quantities,"markets":markets,"relations":relations}))
+    }
+}
+
+/// Prepared/retired scopes may coexist in the shared source. Facts belonging
+/// exclusively to another known scope must not poison this projection. Missing
+/// or contradictory ownership remains fail-closed, never silently discarded.
+fn relevant_gap(token:Option<&str>,market:Option<&str>,scope:&BTreeSet<String>,owners:&BTreeMap<String,String>)->bool {
+    if let Some(token)=token {
+        return match owners.get(token) {
+            Some(owner)=>market.is_some_and(|id|id!=owner) || scope.contains(owner),
+            None=>true,
+        };
+    }
+    match market {
+        Some(id) if owners.values().any(|owner|owner==id)=>scope.contains(id),
+        _=>true,
     }
 }
 
@@ -80,6 +119,18 @@ mod wire_tests {
         assert_eq!(wire.as_object_mut().unwrap().remove("schema_version"),Some(json!("marketcow.polymarket.discovery-relation.v3")));
         assert_eq!(wire,fact);
         assert!(fact.get("schema_version").is_none());
+    }
+    #[test]
+    fn prepared_or_retired_market_gaps_stay_local_but_unknown_ownership_does_not() {
+        let scope=BTreeSet::from(["selected".into(),"dependency".into()]);
+        let owners=BTreeMap::from([("a".into(),"selected".into()),("b".into(),"dependency".into()),("c".into(),"other".into())]);
+        assert!(relevant_gap(Some("a"),None,&scope,&owners));
+        assert!(relevant_gap(Some("b"),None,&scope,&owners));
+        assert!(!relevant_gap(Some("c"),Some("other"),&scope,&owners));
+        assert!(!relevant_gap(None,Some("other"),&scope,&owners));
+        assert!(relevant_gap(Some("c"),Some("selected"),&scope,&owners));
+        assert!(relevant_gap(Some("unknown"),Some("other"),&scope,&owners));
+        assert!(relevant_gap(None,None,&scope,&owners));
     }
 }
 

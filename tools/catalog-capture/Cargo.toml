@@ -1,0 +1,23 @@
+[package]
+name = "marketcow-catalog-capture"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Standalone build: no collector/market runtime recompilation is required.
+[workspace]
+
+[[bin]]
+name = "catalog_capture"
+path = "../../crates/marketcowd/examples/catalog_capture.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.47", features = ["full"] }

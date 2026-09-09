@@ -16,6 +16,72 @@ use axum::{Router, extract::{State, Query}, response::{IntoResponse, Response}, 
 use tokio::sync::Semaphore;
 use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message};
 use std::time::Duration;
+use crate::source_scope_registry::{ScopeRegistry, ScopeLease};
+
+type ScopeState = Arc<ScopeRegistry<Arc<PublicApi>>>;
+
+/// Internal handle only: the acquisition owner must admit/prepare dependencies
+/// first. No public client may install arbitrary metadata through this handle.
+pub struct PublicScopeControl { state: ScopeState }
+
+impl PublicScopeControl {
+    pub fn referenced_markets(&self)->Result<BTreeSet<String>> {
+        let mut ids=BTreeSet::new();
+        for lease in self.state.readable(std::time::Instant::now())? {
+            let view=lease.value.reader.capture()?;
+            for market in &lease.value.scope.configured_markets {
+                ids.insert(market.market_id.clone());
+                let metadata=view.markets.get(&market.market_id).context("leased metadata missing")?;
+                for relation in metadata["relations"].as_array().context("leased relations")? {
+                    for pair in relation["outcome_pairs"].as_array().context("leased relation pairs")? {
+                        ids.insert(pair["market_id"].as_str().context("leased dependency market")?.into());
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+    /// Runtime truth for control-plane reconciliation, not a desired pointer.
+    /// A source outage does not erase the actually installed scope identity.
+    pub fn status(&self)->Result<Value> {
+        let active=self.state.active()?;
+        let view=active.value.reader.capture().ok();
+        let retirements=active.value.reader.retirement_status().ok();
+        Ok(json!({"pool":"live","scope_id":active.id,"revision":active.revision,
+            "catalog_revision":active.value.scope.catalog_revision,"stream_instance_id":active.value.instance,
+            "market_count":active.value.scope.configured_market_count,"source_readable":view.is_some(),
+            "source_cursor":view.as_ref().map(|v|v.cursor),"persisted_cursor":view.as_ref().map(|v|v.persisted_cursor),
+            "retirement_submitted":retirements.map(|r|r.0),"retirement_persisted":retirements.map(|r|r.1),
+            "admitted_market_ids":view.as_ref().map(|v|v.markets.keys().cloned().collect::<Vec<_>>()),
+            "referenced_market_ids":self.referenced_markets()?,
+            "acquisition":active.value.reader.acquisition_statistics()}))
+    }
+
+    pub fn prepare(&self,expected_scope:&str,expected_revision:u64,scope:&ConfiguredScope)->Result<()> {
+        scope.validate()?;
+        let active=self.state.active()?;
+        ensure!(active.id==expected_scope && active.revision==expected_revision,"scope revision conflict");
+        ensure!(scope.catalog_revision==active.value.scope.catalog_revision,"scope catalog differs");
+        ensure!(scope.active_scope_id!=active.id,"unchanged scope");
+        self.state.check_activation(expected_scope,expected_revision,&scope.active_scope_id,std::time::Instant::now())?;
+        let generation=expected_revision.checked_add(1).context("scope generation overflow")?;
+        full_sync(&active.value.reader.capture()?,scope,generation,&active.value.instance,Utc::now())?;
+        Ok(())
+    }
+    pub fn activate(&self, expected_scope: &str, expected_revision: u64,
+        scope: ConfiguredScope) -> Result<u64> {
+        self.prepare(expected_scope,expected_revision,&scope)?;
+        let active = self.state.active()?;
+        let old = &active.value;
+        ensure!(scope.catalog_revision == old.scope.catalog_revision, "scope catalog differs");
+        let generation = expected_revision.checked_add(1).context("scope generation overflow")?;
+        let id = scope.active_scope_id.clone();
+        let next = Arc::new(PublicApi { reader:old.reader.clone(), scope, generation,
+            instance:old.instance.clone(), full_sync_bytes:old.full_sync_bytes,
+            snapshots:old.snapshots.clone(), streams:old.streams.clone(), limits:old.limits.clone() });
+        Ok(self.state.activate(expected_scope,expected_revision,id,next,std::time::Instant::now())?.revision)
+    }
+}
 
 // Keep admission charged until the last response-byte owner is dropped, not
 // merely until JSON encoding completes. A slow HTTP reader cannot accumulate
@@ -50,6 +116,15 @@ pub struct PublicApi {
 impl PublicApi {
     pub fn router(reader: crate::source_publication::MemoryReader, scope: ConfiguredScope,
         generation: u64, instance: String, full_sync_bytes: usize, concurrent_snapshots: usize, limits: StreamLimits) -> Result<Router> {
+        // Legacy caller does not retain an activation handle. Managed callers
+        // must supply their explicit scope grace to router_managed.
+        let grace = limits.send_timeout;
+        Ok(Self::router_managed(reader,scope,generation,instance,full_sync_bytes,concurrent_snapshots,limits,grace)?.0)
+    }
+
+    pub fn router_managed(reader: crate::source_publication::MemoryReader, scope: ConfiguredScope,
+        generation: u64, instance: String, full_sync_bytes: usize, concurrent_snapshots: usize,
+        limits: StreamLimits, scope_grace: Duration) -> Result<(Router,PublicScopeControl)> {
         scope.validate()?;
         ensure!(generation > 0 && !instance.is_empty(), "public identity required");
         ensure!(full_sync_bytes > 0 && full_sync_bytes <= 256*1024*1024
@@ -57,17 +132,21 @@ impl PublicApi {
         ensure!(limits.frame_bytes > 0 && limits.frame_bytes <= 64*1024*1024
             && limits.replay_bytes > 0 && limits.replay_bytes <= 64*1024*1024
             && (1..=16).contains(&limits.clients) && !limits.send_timeout.is_zero(), "explicit stream budgets");
-        let state = Arc::new(Self {reader,scope,generation,instance,full_sync_bytes,
+        let id = scope.active_scope_id.clone();
+        let api = Arc::new(Self {reader,scope,generation,instance,full_sync_bytes,
             snapshots:Arc::new(Semaphore::new(concurrent_snapshots)),
             streams:Arc::new(Semaphore::new(limits.clients)),limits});
-        Ok(Router::new()
+        let state = Arc::new(ScopeRegistry::new(id,generation,api,scope_grace)?);
+        let control = PublicScopeControl{state:state.clone()};
+        Ok((Router::new()
             .route("/v1/prediction-markets/polymarket/live/full-sync",get(http_full_sync))
             .route("/v1/prediction-markets/polymarket/live/scope",get(http_scope))
             .route("/v1/prediction-markets/polymarket/live/bootstrap",get(http_bootstrap))
             .route("/v1/prediction-markets/polymarket/live/snapshot",get(http_snapshot))
             .route("/v1/prediction-markets/polymarket/live/health",get(http_health))
             .route("/v1/prediction-markets/polymarket/live/stream",get(ws_upgrade))
-            .with_state(state))
+            .with_state(state).merge(crate::source_price_history::router()?)
+            .merge(crate::source_market_evidence::router()?),control))
     }
 }
 
@@ -81,10 +160,11 @@ struct ScopeQuery { scope_id: String }
 #[serde(deny_unknown_fields)]
 struct StreamQuery { scope_id: String, after_cursor: u64 }
 
-async fn ws_upgrade(State(api): State<Arc<PublicApi>>, Query(query): Query<StreamQuery>, ws: WebSocketUpgrade) -> Response {
-    if query.scope_id != api.scope.active_scope_id {
+async fn ws_upgrade(State(state): State<ScopeState>, Query(query): Query<StreamQuery>, ws: WebSocketUpgrade) -> Response {
+    let Ok(lease) = state.get(&query.scope_id,std::time::Instant::now()) else {
         return failure(StatusCode::CONFLICT,"polymarket_scope_binding_mismatch",false);
-    }
+    };
+    let api = lease.value.clone();
     let Ok(permit) = api.streams.clone().try_acquire_owned() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE,"polymarket_stream_capacity",true);
     };
@@ -92,7 +172,15 @@ async fn ws_upgrade(State(api): State<Arc<PublicApi>>, Query(query): Query<Strea
         let _permit = permit;
         let connection=uuid::Uuid::new_v4().simple().to_string();
         let opened=Utc::now();
-        if let Err(error) = public_stream(&mut socket,&api,query.after_cursor).await {
+        let result = tokio::select! {
+            result = public_stream(&mut socket,&api,query.after_cursor) => Some(result),
+            _ = scope_expired(lease) => None,
+        };
+        if result.is_none() {
+            let _ = send_public(&mut socket,&api,json!({"type":"error","code":"polymarket_scope_changed",
+                "message":"Scope retired; obtain current scope and new full-sync","retryable":true})).await;
+        }
+        if let Some(Err(error)) = result {
             eprintln!("{}",json!({"stage":"public_live_stream_closed","at":Utc::now(),
                 "connection":connection,"opened_at":opened,
                 "instance":api.instance,"initial_cursor":query.after_cursor,"error":format!("{error:#}")}));
@@ -101,6 +189,10 @@ async fn ws_upgrade(State(api): State<Arc<PublicApi>>, Query(query): Query<Strea
         }
         let _ = tokio::time::timeout(api.limits.send_timeout,socket.send(Message::Close(None))).await;
     })
+}
+
+async fn scope_expired(lease: Arc<ScopeLease<Arc<PublicApi>>>) {
+    lease.expired().await;
 }
 
 async fn send_public(socket: &mut WebSocket, api: &PublicApi, frame: Value) -> Result<()> {
@@ -210,28 +302,35 @@ async fn public_stream(socket: &mut WebSocket, api: &PublicApi, mut cursor: u64)
     }
 }
 
-async fn http_scope(State(api): State<Arc<PublicApi>>) -> Response {
-    axum::Json(api.scope.clone()).into_response()
+async fn http_scope(State(state): State<ScopeState>) -> Response {
+    match state.active() {
+        Ok(lease) => axum::Json(lease.value.scope.clone()).into_response(),
+        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE,"polymarket_live_snapshot_unavailable",true),
+    }
 }
 
-async fn http_full_sync(State(api): State<Arc<PublicApi>>, Query(query): Query<ScopeQuery>) -> Response {
+async fn http_full_sync(State(api): State<ScopeState>, Query(query): Query<ScopeQuery>) -> Response {
     scoped_response(api,query,None).await
 }
-async fn http_bootstrap(State(api): State<Arc<PublicApi>>, Query(query): Query<ScopeQuery>) -> Response {
+async fn http_bootstrap(State(api): State<ScopeState>, Query(query): Query<ScopeQuery>) -> Response {
     scoped_response(api,query,Some("bootstrap")).await
 }
-async fn http_snapshot(State(api): State<Arc<PublicApi>>, Query(query): Query<ScopeQuery>) -> Response {
+async fn http_snapshot(State(api): State<ScopeState>, Query(query): Query<ScopeQuery>) -> Response {
     scoped_response(api,query,Some("snapshot")).await
 }
-async fn http_health(State(api): State<Arc<PublicApi>>) -> Response {
-    let query = ScopeQuery{scope_id:api.scope.active_scope_id.clone()};
+async fn http_health(State(api): State<ScopeState>) -> Response {
+    let Ok(active) = api.active() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE,"polymarket_live_snapshot_unavailable",true);
+    };
+    let query = ScopeQuery{scope_id:active.id.clone()};
     scoped_response(api,query,Some("health")).await
 }
 
-async fn scoped_response(api: Arc<PublicApi>, query: ScopeQuery, component: Option<&'static str>) -> Response {
-    if query.scope_id != api.scope.active_scope_id {
+async fn scoped_response(state: ScopeState, query: ScopeQuery, component: Option<&'static str>) -> Response {
+    let Ok(lease) = state.get(&query.scope_id,std::time::Instant::now()) else {
         return failure(StatusCode::CONFLICT,"polymarket_scope_binding_mismatch",false);
-    }
+    };
+    let api = lease.value.clone();
     let Ok(permit) = api.snapshots.clone().try_acquire_owned() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE,"polymarket_snapshot_capacity",true);
     };
@@ -370,7 +469,12 @@ pub struct ConfiguredMarket {
     pub market_id: String,
     pub condition_id: String,
     pub token_ids: [String; 2],
-    pub end_at: String,
+    #[serde(deserialize_with = "required_optional_end")]
+    pub end_at: Option<String>,
+}
+
+fn required_optional_end<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -400,7 +504,9 @@ impl ConfiguredScope {
                 && ids.insert(&market.market_id), "scope market identity");
             ensure!(market.token_ids.iter().all(|t| !t.is_empty())
                 && market.token_ids[0] != market.token_ids[1], "scope token identity");
-            chrono::DateTime::parse_from_rfc3339(&market.end_at)?;
+            if let Some(end_at) = &market.end_at {
+                chrono::DateTime::parse_from_rfc3339(end_at)?;
+            }
         }
         let expected = canonical_hash(&serde_json::json!({
             "catalog_revision": self.catalog_revision,
@@ -573,11 +679,21 @@ mod tests {
             catalog_revision: "a".repeat(64), configured_market_count: 1,
             configured_markets: vec![ConfiguredMarket { market_id: "1".into(),
                 condition_id: "condition".into(), token_ids: ["yes".into(), "no".into()],
-                end_at: "2026-09-06T00:00:00Z".into() }],
+                end_at: Some("2026-09-06T00:00:00Z".into()) }],
         };
         scope.active_scope_id = canonical_hash(&serde_json::json!({
             "catalog_revision":scope.catalog_revision,"configured_markets":scope.configured_markets,"mode":scope.mode}));
         scope.validate().unwrap();
+        let dated_hash = scope.active_scope_id.clone();
+        scope.configured_markets[0].end_at = None;
+        assert!(scope.validate().is_err()); // null changes the content identity
+        scope.active_scope_id = canonical_hash(&serde_json::json!({
+            "catalog_revision":scope.catalog_revision,"configured_markets":scope.configured_markets,"mode":scope.mode}));
+        assert_ne!(dated_hash, scope.active_scope_id);
+        scope.validate().unwrap();
+        let mut missing = serde_json::to_value(&scope).unwrap();
+        missing["configured_markets"][0].as_object_mut().unwrap().remove("end_at");
+        assert!(serde_json::from_value::<ConfiguredScope>(missing).is_err());
         let mut raw = serde_json::to_value(&scope).unwrap();
         raw["extra"] = serde_json::json!(true);
         assert!(serde_json::from_value::<ConfiguredScope>(raw).is_err());
