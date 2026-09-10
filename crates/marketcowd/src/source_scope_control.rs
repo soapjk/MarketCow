@@ -212,7 +212,10 @@ mod tests {
         let (_,control)=router_managed(p.reader(),Arc::new(serde_json::from_value(config("a","c")).unwrap()),
             DiscoveryLimits{full_sync_bytes:65536,frame_bytes:65536,state_bytes:131072,replay_bytes:65536,
                 clients:2,cached_baselines:2,send_timeout:Duration::from_secs(1)},Duration::from_millis(50)).unwrap();
-        let directory=std::env::temp_dir().canonicalize().unwrap().join(format!("mc-control-{}",uuid::Uuid::new_v4()));
+        // Unix-domain socket paths have a small platform limit. Keep the test
+        // path independent of a potentially very long Cargo worktree/TMPDIR.
+        let short_tmp=if cfg!(target_os="macos") {"/private/tmp"} else {"/tmp"};
+        let directory=PathBuf::from(short_tmp).join(format!("mc-control-{}",uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();std::fs::set_permissions(&directory,std::fs::Permissions::from_mode(0o700)).unwrap();
         let path=directory.join("s");
         let task=start(&path,65536,Duration::from_secs(1),Backend::Discovery(control),None,None).unwrap();

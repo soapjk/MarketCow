@@ -37,6 +37,47 @@ def configuration(tmp_path):
     )
 
 
+def test_explicit_resume_uses_same_capture_then_ingests(tmp_path):
+    calls = []
+    worker = RefreshWorker(configuration(tmp_path), execute=lambda command, **kwargs: calls.append(command))
+    try:
+        root = capture(worker.root, [market()])
+        report_path = root / "report.json"
+        report_path.write_text(json.dumps(dict(json.loads(report_path.read_text()), requested_market_ids=[])))
+        result = worker.resume(root)
+        assert len(calls) == 1
+        assert calls[0][:4] == ["/not-executed", "--root", str(root), "--resume"]
+        assert result["capture_id"] == root.name
+        assert worker.state["last_success"] == result
+        assert worker.state["last_error"] is None
+    finally:
+        worker.close()
+
+
+def test_resume_failure_never_ingests_or_starts_new_capture(tmp_path):
+    calls = []
+
+    def fail(command, **kwargs):
+        calls.append(command)
+        raise RuntimeError("upstream cursor rejected")
+
+    worker = RefreshWorker(configuration(tmp_path), execute=fail)
+    try:
+        root = capture(worker.root, [market()])
+        report_path = root / "report.json"
+        report_path.write_text(json.dumps(dict(json.loads(report_path.read_text()), requested_market_ids=[])))
+        with pytest.raises(RuntimeError, match="cursor rejected"):
+            worker.resume(root)
+        assert len(calls) == 1
+        assert not (worker.root / "published/current.json").exists()
+        assert not root.with_name(root.name + "-prepared").exists()
+        with pytest.raises(ValueError, match="immediate child"):
+            worker.resume(tmp_path)
+        assert len(calls) == 1
+    finally:
+        worker.close()
+
+
 def market(mid="42"):
     return dict(
         id=mid,

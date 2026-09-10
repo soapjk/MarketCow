@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import os
 import signal
 import socket
@@ -17,6 +18,24 @@ from dotenv import load_dotenv
 DEFAULT_PROJECT_DIR = Path("/Volumes/T9/projects/marketcow")
 DEFAULT_DATA_ROOT = Path("/Volumes/T9/data/marketcow/production")
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+COMPONENTS = (
+    "polymarket-discovery-collector", "polymarket-rust-data-plane",
+    "unified-api", "polymarket-opportunity-controller", "polymarket-universe-activator",
+)
+OPTIONAL_COMPONENTS = ("binance-btc",)
+
+
+def selected_components(value: str) -> set[str]:
+    if value == "all":
+        return set(COMPONENTS)
+    names = value.split(",")
+    if not names or any(name not in COMPONENTS + OPTIONAL_COMPONENTS for name in names) or len(set(names)) != len(names):
+        raise ValueError("components must be 'all' or unique comma-separated names: " + ",".join(COMPONENTS))
+    selected = set(names)
+    for dependent in ("polymarket-opportunity-controller", "polymarket-universe-activator"):
+        if dependent in selected and not {"unified-api", "polymarket-rust-data-plane"} <= selected:
+            raise ValueError(f"{dependent} requires unified-api and polymarket-rust-data-plane")
+    return selected
 
 
 @dataclass(frozen=True)
@@ -48,9 +67,35 @@ def build_services(
     environment: Mapping[str, str],
     *,
     python: str = sys.executable,
+    components: str | None = None,
 ) -> tuple[Service, ...]:
     """Build all non-storage processes in the production data-center stack."""
     project_dir = project_dir.resolve(strict=True)
+    selected = selected_components(
+        components if components is not None else environment.get("MARKETCOW_COMPONENTS", "all")
+    )
+    btc = None
+    if "binance-btc" in selected:
+        btc_python = _required_path(environment, "MARKETCOW_BINANCE_PYTHON", preserve_executable_symlink=True)
+        btc_root = environment.get("MARKETCOW_BINANCE_ROOT", "")
+        if not btc_root or not Path(btc_root).is_absolute():
+            raise ValueError("MARKETCOW_BINANCE_ROOT must be explicit absolute path")
+        btc_port = int(environment.get("MARKETCOW_BINANCE_PORT", "0"))
+        btc_bytes = int(environment.get("MARKETCOW_BINANCE_MAXIMUM_RAW_BYTES", "0"))
+        if not 1 <= btc_port <= 65535 or btc_bytes <= 0:
+            raise ValueError("explicit Binance port and raw byte budget required")
+        btc = Service("binance-btc", (str(btc_python), "-m", "marketcow.btc_nautilus_worker",
+                      "--continuous", "--output", btc_root, "--read-port", str(btc_port),
+                      "--maximum-disk-bytes", str(btc_bytes)),
+                      {**environment, "PYTHONPATH": str(project_dir / "src")}, ready_port=btc_port)
+        if selected == {"binance-btc"}:
+            return (btc,)
+
+    def component_path(component: str, name: str, **kwargs: bool) -> Path:
+        # Unselected commands are never returned or executed; their configuration
+        # must not become a prerequisite for independently selected components.
+        return _required_path(environment, name, **kwargs) if component in selected else Path(".")
+
     data_root = Path(environment.get("MARKETCOW_HOME", str(DEFAULT_DATA_ROOT)))
     if not data_root.is_absolute():
         raise ValueError("MARKETCOW_HOME must be an absolute path")
@@ -65,49 +110,56 @@ def build_services(
     discovery_stream_port = int(environment.get(
         "MARKETCOW_POLYMARKET_DISCOVERY_STREAM_PORT", "8795"
     ))
+    ports = [port for component, port in (
+        ("unified-api", api_port),
+        ("polymarket-rust-data-plane", rust_port),
+        ("polymarket-discovery-collector", discovery_stream_port),
+    ) if component in selected]
+    if btc is not None:
+        ports.append(btc.ready_port)
     for name, port in (
         ("MARKETCOW_PORT", api_port),
         ("Polymarket internal Rust data-plane port", rust_port),
         ("Polymarket internal discovery stream port", discovery_stream_port),
     ):
-        if not 1 <= port <= 65535:
+        if port in ports and not 1 <= port <= 65535:
             raise ValueError(f"{name} must be in [1, 65535]")
-    if len({api_port, rust_port, discovery_stream_port}) != 3:
+    if len(set(ports)) != len(ports):
         raise ValueError("MarketCow API and internal stream ports must differ")
 
-    rust_binary = _required_path(environment, "MARKETCOW_RUST_BINARY")
-    rust_scope = _required_path(environment, "MARKETCOW_POLYMARKET_RUST_SCOPE_FILE")
-    rust_scope_registry = _required_path(
-        environment, "MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT"
+    rust_binary = component_path("polymarket-rust-data-plane", "MARKETCOW_RUST_BINARY")
+    rust_scope = component_path("polymarket-rust-data-plane", "MARKETCOW_POLYMARKET_RUST_SCOPE_FILE")
+    rust_scope_registry = component_path(
+        "polymarket-rust-data-plane", "MARKETCOW_POLYMARKET_SCOPE_REGISTRY_ROOT"
     )
-    tradude_worktree = _required_path(environment, "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE")
-    tradude_python = _required_path(
-        environment,
+    tradude_worktree = component_path("polymarket-opportunity-controller", "MARKETCOW_POLYMARKET_TRADUDE_WORKTREE")
+    tradude_python = component_path(
+        "polymarket-opportunity-controller",
         "MARKETCOW_TRADUDE_PYTHON",
         preserve_executable_symlink=True,
     )
-    if not os.access(tradude_python, os.X_OK):
+    if "polymarket-opportunity-controller" in selected and not os.access(tradude_python, os.X_OK):
         raise ValueError("MARKETCOW_TRADUDE_PYTHON must be executable")
-    opportunity_config = _required_path(
-        environment, "MARKETCOW_POLYMARKET_OPPORTUNITY_CONTROLLER_CONFIG"
+    opportunity_config = component_path(
+        "polymarket-opportunity-controller", "MARKETCOW_POLYMARKET_OPPORTUNITY_CONTROLLER_CONFIG"
     )
-    refresh_config = _required_path(
-        environment, "MARKETCOW_POLYMARKET_UNIVERSE_REFRESH_CONFIG"
+    refresh_config = component_path(
+        "polymarket-universe-activator", "MARKETCOW_POLYMARKET_UNIVERSE_REFRESH_CONFIG"
     )
     rust_scope_id = environment.get("MARKETCOW_RUST_SCOPE_ID", "").strip()
     rust_admin_token = environment.get("MARKETCOW_RUST_ADMIN_TOKEN", "").strip()
-    if len(rust_scope_id) != 64 or any(
+    if "polymarket-rust-data-plane" in selected and (len(rust_scope_id) != 64 or any(
         value not in "0123456789abcdef" for value in rust_scope_id
-    ):
+    )):
         raise ValueError("MARKETCOW_RUST_SCOPE_ID must be a lowercase SHA-256")
-    if not rust_admin_token:
+    if "polymarket-rust-data-plane" in selected and not rust_admin_token:
         raise ValueError("MARKETCOW_RUST_ADMIN_TOKEN is required")
     depth_notionals = [
         value.strip() for value in environment.get(
             "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS", ""
         ).split(",") if value.strip()
     ]
-    if not depth_notionals:
+    if "polymarket-discovery-collector" in selected and not depth_notionals:
         raise ValueError(
             "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS is required"
         )
@@ -182,9 +234,13 @@ def build_services(
     )
     gateway_environment = dict(environment)
     gateway_environment.update({
-        "MARKETCOW_POLYMARKET_RUST_DATA_PLANE_URL": f"http://127.0.0.1:{rust_port}",
+        "MARKETCOW_POLYMARKET_RUST_DATA_PLANE_URL": (
+            f"http://127.0.0.1:{rust_port}" if "polymarket-rust-data-plane" in selected else ""
+        ),
         "MARKETCOW_POLYMARKET_LIVE_STREAM_URI": "",
     })
+    if "polymarket-discovery-collector" not in selected:
+        gateway_environment["MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS"] = ""
     unified_api = Service(
         "unified-api",
         (
@@ -201,15 +257,15 @@ def build_services(
         ),
         gateway_environment,
         ready_port=api_port,
-        start_after=("polymarket-rust-data-plane",),
+        start_after=("polymarket-rust-data-plane",) if "polymarket-rust-data-plane" in selected else (),
     )
-    return (
+    return tuple(service for service in (
         discovery_collector,
         rust_data_plane,
         unified_api,
         opportunity_controller,
         universe_activator,
-    )
+    ) if service.name in selected) + ((btc,) if btc is not None else ())
 
 
 def supervise(
@@ -326,15 +382,23 @@ def supervise(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Start selected MarketCow production components")
+    parser.add_argument("--components", help="all or comma-separated: " + ",".join(COMPONENTS + OPTIONAL_COMPONENTS))
+    parser.add_argument("--storage-required", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
     project_dir = Path(os.environ.get("MARKETCOW_PROJECT_DIR", str(DEFAULT_PROJECT_DIR)))
     env_file = Path(os.environ["MARKETCOW_ENV_FILE"])
     load_dotenv(env_file, override=False)
     environment = dict(os.environ)
+    if args.storage_required:
+        selected = selected_components(args.components if args.components is not None else environment.get("MARKETCOW_COMPONENTS", "all"))
+        print("yes" if "unified-api" in selected else "no")
+        return
     # A managed virtualenv may contain an editable install left by an older
     # worktree. Production children must always import the selected main
     # checkout, independent of site-packages state.
     environment["PYTHONPATH"] = str(project_dir.resolve(strict=True) / "src")
-    services = build_services(project_dir, environment)
+    services = build_services(project_dir, environment, components=args.components)
     raise SystemExit(supervise(services, project_dir=project_dir, environment=environment))
 
 
