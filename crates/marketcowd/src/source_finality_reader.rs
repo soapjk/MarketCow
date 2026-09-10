@@ -12,6 +12,11 @@ pub struct Profile {
     pub maximum_calls: usize,
     pub maximum_bytes: usize,
 }
+pub struct TokenBinding {
+    pub collateral: String,
+    // ABI uint256 token IDs, in payout slot order; no u128 truncation.
+    pub token_ids_hex: [String; 2],
+}
 fn hex_field(s: &str, n: usize) -> bool {
     s.len() == 2 + n && s.starts_with("0x") && s[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -22,7 +27,18 @@ fn word(v: &Value) -> Result<u128> {
     ensure!(s[2..34].bytes().all(|b| b == b'0'), "uint256 exceeds supported u128 range");
     Ok(u128::from_str_radix(&s[34..],16)?)
 }
-pub fn read<F>(profile: &Profile, condition: &str, mut transport: F) -> Result<Value>
+pub fn read<F>(profile: &Profile, condition: &str, transport: F) -> Result<Value>
+where F: FnMut(&Value) -> Result<Vec<u8>> {
+    read_inner(profile, condition, None, transport)
+}
+pub fn read_bound<F>(profile: &Profile, condition: &str, binding: &TokenBinding, transport: F) -> Result<Value>
+where F: FnMut(&Value) -> Result<Vec<u8>> {
+    ensure!(hex_field(&binding.collateral,40), "collateral identity");
+    ensure!(binding.token_ids_hex.iter().all(|s|hex_field(s,64)), "token ABI width");
+    ensure!(!binding.token_ids_hex[0].eq_ignore_ascii_case(&binding.token_ids_hex[1]), "duplicate token");
+    read_inner(profile, condition, Some(binding), transport)
+}
+fn read_inner<F>(profile: &Profile, condition: &str, binding: Option<&TokenBinding>, mut transport: F) -> Result<Value>
 where F: FnMut(&Value) -> Result<Vec<u8>> {
     ensure!(hex_field(condition,64) && hex_field(&profile.contract,40), "identity format");
     ensure!(profile.finality_policy == "rpc_finalized_hash_pinned_v1", "unsupported finality policy");
@@ -65,6 +81,23 @@ where F: FnMut(&Value) -> Result<Vec<u8>> {
         numerators.push(n.to_string());
     }
     ensure!(sum == denominator, "payout sum mismatch");
+    let mut bound_tokens = vec![];
+    if let Some(binding) = binding {
+        // Standard CTF positions with no parent collection. Negative-risk adapter
+        // conversions are not inferred or certified by this reader.
+        for i in 0..2usize {
+            let collection = call("eth_call", json!([{"to":profile.contract,
+                "data":format!("0x856296f7{}{}{:064x}","0".repeat(64),&condition[2..],1u64<<i)},pinned]))?;
+            let collection = collection.as_str().context("collection result")?;
+            ensure!(hex_field(collection,64),"collection ABI width");
+            let position = call("eth_call", json!([{"to":profile.contract,
+                "data":format!("0x39dd7530{}{}{}","0".repeat(24),&binding.collateral[2..],&collection[2..])},pinned]))?;
+            let position = position.as_str().context("position result")?;
+            ensure!(hex_field(position,64) && position.eq_ignore_ascii_case(&binding.token_ids_hex[i]), "outcome token mismatch");
+            bound_tokens.push(json!({"slot":i,"index_set":1u64<<i,"token_id_hex":position,
+                "collection_id":collection,"payout_numerator":numerators[i]}));
+        }
+    }
     // A provider's finalized tag plus code hash is not independent finality/token proof.
     Ok(json!({"schema_version":"marketcow.polymarket.ctf-observation.v1",
         "condition_id":condition,"chain_id":profile.chain_id,"ctf_address":profile.contract,
@@ -72,7 +105,10 @@ where F: FnMut(&Value) -> Result<Vec<u8>> {
         "status":if denominator==0 {"unresolved"} else {"resolved_unverified"},
         "payout_numerators":numerators,"payout_denominator":denominator.to_string(),
         "observed_at":chrono::Utc::now().to_rfc3339(),"evidence":evidence,
-        "missing_facts":["outcome_token_collateral_adapter_binding","independent_finality_verification"],
+        "standard_ctf_token_binding_verified":binding.is_some(),"bound_tokens":bound_tokens,
+        "collateral":binding.map(|b|b.collateral.as_str()),
+        "missing_facts":if binding.is_some(){vec!["independent_finality_verification","adapter_redemption_semantics"]}
+            else{vec!["outcome_token_collateral_adapter_binding","independent_finality_verification"]},
         "settlement_import_allowed":false}))
 }
 
@@ -80,6 +116,27 @@ where F: FnMut(&Value) -> Result<Vec<u8>> {
     use super::*;
     fn profile() -> Profile { Profile{chain_id:"0x89".into(),contract:format!("0x{}","1".repeat(40)),code_sha256:hex::encode(Sha256::digest([1u8])),finality_policy:"rpc_finalized_hash_pinned_v1".into(),maximum_calls:7,maximum_bytes:8192} }
     fn result(i:usize)->Value { match i {1=>json!("0x89"),2=>json!({"hash":format!("0x{}","2".repeat(64)),"number":"0x10","timestamp":"0x20"}),3=>json!("0x01"),4=>json!(format!("0x{:064x}",2)),5|7=>json!(format!("0x{:064x}",1)),_=>json!(format!("0x{:064x}",0))} }
+    #[test] fn bound_tokens_are_checked_at_same_block_without_finality_promotion() {
+        let mut p=profile();p.maximum_calls=11;
+        let binding=TokenBinding {collateral:format!("0x{}","3".repeat(40)),
+            token_ids_hex:[format!("0x{}","e".repeat(64)),format!("0x{}","f".repeat(64))]};
+        for wrong in [false,true] {
+            let result=read_bound(&p,&format!("0x{}","a".repeat(64)),&binding,|q| {
+                let i=q["id"].as_u64().unwrap() as usize;
+                if i>=8 {assert_eq!(q["params"][1]["blockHash"],format!("0x{}","2".repeat(64)));}
+                let r=match i {8|10=>json!(format!("0x{}","b".repeat(64))),
+                    9=>json!(binding.token_ids_hex[0]),
+                    11=>json!(if wrong {binding.token_ids_hex[0].clone()}else{binding.token_ids_hex[1].clone()}),
+                    _=>result(i)};
+                Ok(serde_json::to_vec(&json!({"jsonrpc":"2.0","id":i,"result":r}))?)
+            });
+            if wrong {assert!(result.is_err());}else{
+                let v=result.unwrap();assert_eq!(v["standard_ctf_token_binding_verified"],true);
+                assert_eq!(v["evidence"].as_array().unwrap().len(),11);
+                assert_eq!(v["settlement_import_allowed"],false);
+            }
+        }
+    }
     fn run(p:&Profile, bad:usize)->Result<Value> { read(p,&format!("0x{}","a".repeat(64)),|q| {let i=q["id"].as_u64().unwrap() as usize;if i>=3 {assert_eq!(q["params"][1]["requireCanonical"],true);} Ok(serde_json::to_vec(&json!({"jsonrpc":"2.0","id":i,"result":if i==bad {Value::Null} else {result(i)}}))?)}) }
     #[test] fn pinned_reader_does_not_authorize_settlement(){let v=run(&profile(),0).unwrap();assert_eq!(v["status"],"resolved_unverified");assert_eq!(v["settlement_import_allowed"],false);assert_eq!(v["evidence"].as_array().unwrap().len(),7);}
     #[test] fn failures_stop(){for i in 1..=7 {assert!(run(&profile(),i).is_err());}}

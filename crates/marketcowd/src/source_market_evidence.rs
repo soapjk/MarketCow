@@ -50,11 +50,55 @@ pub fn project(id:&str, condition:&str, raw:&[u8], observed:&str)->Result<Value>
 #[derive(Clone)] struct Service {client:reqwest::Client, slots:Arc<Semaphore>,last:Arc<Mutex<Option<Instant>>>}
 #[derive(Deserialize)] #[serde(deny_unknown_fields)]
 struct Request {market_id:String,expected_condition_id:String}
+#[derive(Deserialize)] #[serde(deny_unknown_fields)]
+struct SlugRequest {slug:String}
+pub fn slug_url(slug:&str)->Result<String> {
+    ensure!(slug.starts_with("bitcoin-up-or-down-") && slug.len()>19 && slug.len()<=160
+        && slug.bytes().all(|b|b.is_ascii_lowercase() || b.is_ascii_digit() || b==b'-'),"invalid_hour_slug");
+    Ok(format!("https://gamma-api.polymarket.com/markets/slug/{slug}"))
+}
+pub fn project_slug(slug:&str,raw:&[u8],observed:&str)->Result<Value> {
+    let url=slug_url(slug)?;
+    ensure!(raw.len()<=CAP,"response_size_exceeded");
+    let source:Value=serde_json::from_slice(raw)?;
+    ensure!(source["slug"]==slug,"slug_identity_mismatch");
+    let id=source["id"].as_str().context("market_id_missing")?;
+    let condition=source["conditionId"].as_str().context("condition_missing")?;
+    ensure!(!id.is_empty() && id.len()<=20 && id.bytes().all(|b|b.is_ascii_digit()),"invalid_market_id");
+    ensure!(condition.len()==66 && condition.starts_with("0x") && condition[2..].bytes().all(|b|b.is_ascii_hexdigit()),"invalid_condition");
+    let mut result=project(id,condition,raw,observed)?;
+    result["source_url"]=json!(url);
+    // Same evidence schema: exact raw bytes contain the queried slug. No
+    // inferred hour, rule approval, subscription or settlement authorization.
+    Ok(result)
+}
 pub fn router()->Result<Router> {
     Ok(Router::new().route("/v1/prediction-markets/polymarket/research/market-evidence",get(read))
+        .route("/v1/prediction-markets/polymarket/research/btc-hour-evidence",get(read_slug))
         .with_state(Service{client:reqwest::Client::builder().timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?,
             slots:Arc::new(Semaphore::new(1)),last:Arc::new(Mutex::new(None))}))
+}
+async fn read_slug(State(s):State<Service>,query:Result<Query<SlugRequest>,axum::extract::rejection::QueryRejection>)->Response {
+    let Ok(Query(q))=query else {return failure(StatusCode::BAD_REQUEST,"invalid_request")};
+    let Ok(url)=slug_url(&q.slug) else {return failure(StatusCode::BAD_REQUEST,"invalid_hour_slug")};
+    let Ok(_slot)=s.slots.try_acquire() else {return failure(StatusCode::TOO_MANY_REQUESTS,"busy")};
+    {let mut last=s.last.lock().await;if last.is_some_and(|t|t.elapsed()<Duration::from_secs(1)){return failure(StatusCode::TOO_MANY_REQUESTS,"rate_limited")};*last=Some(Instant::now());}
+    let operation=async {
+        let mut response=s.client.get(&url).send().await.map_err(|_|"transport_failed")?;
+        let status=response.status().as_u16();let mut body=Vec::new();
+        while let Some(chunk)=response.chunk().await.map_err(|_|"body_failed")? {
+            if chunk.len()>CAP-body.len(){return Err("response_size_exceeded")};body.extend_from_slice(&chunk);
+        }
+        let observed=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+        if status!=200 {return Ok(json!({"schema_version":"marketcow.polymarket.market-evidence-rejection.v1",
+            "upstream_status":status,"source_url":url,"observed_at":observed,"raw_complete":true,
+            "raw_bytes":body.len(),"raw_sha256":hex::encode(Sha256::digest(&body)),"raw_base64":STANDARD.encode(body)}))}
+        project_slug(&q.slug,&body,&observed).map_err(|_|"invalid_source_identity_or_schema")
+    };
+    match tokio::time::timeout(Duration::from_secs(15),operation).await {
+        Ok(Ok(v))=>Json(v).into_response(),Ok(Err(e))=>failure(StatusCode::BAD_GATEWAY,e),Err(_)=>failure(StatusCode::GATEWAY_TIMEOUT,"timeout")
+    }
 }
 fn failure(s:StatusCode,code:&str)->Response {(s,Json(json!({"schema_version":"marketcow.polymarket.market-evidence-error.v1","code":code}))).into_response()}
 async fn read(State(s):State<Service>,query:Result<Query<Request>,axum::extract::rejection::QueryRejection>)->Response {
@@ -88,4 +132,13 @@ async fn read(State(s):State<Service>,query:Result<Query<Request>,axum::extract:
     #[test] fn resolved_still_not_finality(){let mut r=raw();r["umaResolutionStatus"]=json!("resolved");let p=apply(&r);assert_eq!(p["settlement"]["reported_payouts"][0]["reported_payout"],"1");assert!(p["settlement"]["redeemable"].is_null());}
     #[test] fn identity_fails(){assert!(project("2","c",&serde_json::to_vec(&raw()).unwrap(),"2026-09-09T00:00:00Z").is_err());}
     #[test] fn missing_and_changed_rules(){let mut r=raw();let before=apply(&r);r.as_object_mut().unwrap().remove("description");let after=apply(&r);assert!(after["rules"]["description"].is_null());assert_ne!(before["rules"]["version_sha256"],after["rules"]["version_sha256"]);}
+    #[test] fn slug_discovery_preserves_raw_and_never_approves(){
+        let slug="bitcoin-up-or-down-september-10-2026-5pm-et";
+        let mut r=raw();r["slug"]=json!(slug);r["conditionId"]=json!(format!("0x{}","a".repeat(64)));
+        let bytes=serde_json::to_vec(&r).unwrap();let p=project_slug(slug,&bytes,"2026-09-10T00:00:00Z").unwrap();
+        assert_eq!(p["raw_sha256"],hex::encode(Sha256::digest(&bytes)));
+        assert_eq!(p["source_url"],slug_url(slug).unwrap());assert_eq!(p["execution_eligible"],false);
+        assert!(project_slug("bitcoin-up-or-down-wrong",&bytes,"2026-09-10T00:00:00Z").is_err());
+    }
+    #[test] fn slug_path_injection_rejected(){for s in ["bitcoin-up-or-down-../x","bitcoin-up-or-down-x?y=z","https://evil.invalid","bitcoin-up-or-down-%2f"] {assert!(slug_url(s).is_err());}}
 }

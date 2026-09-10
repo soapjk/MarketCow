@@ -1,5 +1,28 @@
 # MarketCow 统一生产启动
 
+## 选择启动组件
+
+现有启动器支持 `--components`，也可在运行配置中设置 `MARKETCOW_COMPONENTS`。
+命令行优先；未设置时仍为 `all`（原来的五组件）。不隐式补启依赖，选择不合法会报错。
+
+```bash
+# 本机股票/通用行情 API，不启动 Polymarket 采集或 Tradude 控制器
+sh ops/launchd/start-production.sh --components unified-api
+
+# 或写入现有启动配置
+MARKETCOW_COMPONENTS=unified-api
+```
+
+可选名称：`unified-api`、`polymarket-discovery-collector`、
+`polymarket-rust-data-plane`、`polymarket-opportunity-controller`、
+`polymarket-universe-activator`。多个名称用逗号分隔。
+两个控制组件要求同时选择 `unified-api` 和 `polymarket-rust-data-plane`。
+单独 API 不要求 Rust scope、二进制或 Tradude 配置，并清除继承的 Polymarket
+实时连接、Rust 转发及 Discovery materialization 设置。
+股票与 Hyperliquid 目前同属 API 内部能力，不是两个独立进程开关。
+存储启动检查仍由 shell 包装器执行，股票行情源凭据及数据库配置仍需有效。
+以下原全栈说明仅适用于默认 `all`；本修改不自动安装或重启服务。
+
 MarketCow 正式环境只有一个受支持的服务所有者和一个调用方入口：
 
 - LaunchAgent：`com.marketcow.production`
@@ -68,3 +91,23 @@ curl http://127.0.0.1:8790/v1/prediction-markets/polymarket/live/health
 
 预期只有 `com.marketcow.production` 处于运行状态；8795、8796 只绑定 loopback，业务
 调用入口只有 `8790`。
+# Explicit Binance BTC component
+
+`--components binance-btc` starts the data-only Nautilus worker independently;
+`--components unified-api,binance-btc` also starts the stock/unified read API.
+The legacy `all` selection is unchanged and does not silently enable this new
+optional component or make external subscriptions.
+
+Required explicit environment:
+
+- `MARKETCOW_BINANCE_PYTHON`: absolute existing Python executable with Nautilus 1.231.0.
+- `MARKETCOW_BINANCE_ROOT`: absolute fact archive directory.
+- `MARKETCOW_BINANCE_PORT`: loopback read HTTP/WS port, distinct from selected APIs.
+- `MARKETCOW_BINANCE_MAXIMUM_RAW_BYTES`: positive raw-log byte cap (not total directory quota).
+
+The worker uses `--continuous` instead of a scheduled capture end, but stops on
+archive/persistence failure; no unbounded storage promise. A one-second event-loop
+monitor also stops the node if its attached read server exits or the disk writer
+fails while no incoming market callback is running. TCP readiness is only listener
+readiness, not evidence that upstream data is continuous. Production installation
+and sustained running have not been verified for this new component.

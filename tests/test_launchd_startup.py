@@ -19,6 +19,48 @@ RUNNER_SPEC.loader.exec_module(RUNNER)
 
 
 class LaunchdStartupTest(unittest.TestCase):
+    def test_binance_component_is_explicit_and_independent(self):
+        config = {"MARKETCOW_BINANCE_PYTHON": sys.executable,
+                  "MARKETCOW_BINANCE_ROOT": "/private/tmp/btc-component-test",
+                  "MARKETCOW_BINANCE_PORT": "18901",
+                  "MARKETCOW_BINANCE_MAXIMUM_RAW_BYTES": "8388608"}
+        services = RUNNER.build_services(ROOT, config, components="binance-btc")
+        self.assertEqual([s.name for s in services], ["binance-btc"])
+        self.assertIn("--continuous", services[0].command)
+        self.assertNotIn("binance-btc", RUNNER.selected_components("all"))
+        with self.assertRaises(ValueError):
+            RUNNER.build_services(ROOT, {}, components="binance-btc")
+        services = RUNNER.build_services(ROOT, config, components="unified-api,binance-btc")
+        self.assertEqual({s.name for s in services}, {"unified-api", "binance-btc"})
+        config["MARKETCOW_BINANCE_PORT"] = "8790"
+        with self.assertRaises(ValueError):
+            RUNNER.build_services(ROOT, config, components="unified-api,binance-btc")
+
+    def test_api_only_needs_no_polymarket_or_tradude_configuration(self) -> None:
+        services = RUNNER.build_services(ROOT, {
+            "MARKETCOW_COMPONENTS": "unified-api",
+            "MARKETCOW_POLYMARKET_LIVE_STREAM_URI": "ws://old",
+            "MARKETCOW_POLYMARKET_RUST_DATA_PLANE_URL": "http://old",
+            "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS": "100",
+        })
+        self.assertEqual([s.name for s in services], ["unified-api"])
+        self.assertEqual(services[0].start_after, ())
+        for key in (
+            "MARKETCOW_POLYMARKET_LIVE_STREAM_URI",
+            "MARKETCOW_POLYMARKET_RUST_DATA_PLANE_URL",
+            "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS",
+        ):
+            self.assertEqual(services[0].environment[key], "")
+
+    def test_component_selection_rejects_unknown_duplicate_and_missing_dependencies(self) -> None:
+        for value in ("", "stocks", "unified-api,unified-api", "polymarket-opportunity-controller", "polymarket-universe-activator"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RUNNER.build_services(ROOT, {}, components=value)
+
+    def test_cli_selection_overrides_environment(self) -> None:
+        services = RUNNER.build_services(ROOT, {"MARKETCOW_COMPONENTS": "all"}, components="unified-api")
+        self.assertEqual(len(services), 1)
+
     def test_required_executable_path_preserves_virtualenv_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -63,7 +105,7 @@ class LaunchdStartupTest(unittest.TestCase):
             )
             self._write_executable(
                 python,
-                f"#!/bin/sh\necho api >> {log!s}\n",
+                f'#!/bin/sh\nif [ "$2" = --storage-required ]; then echo yes; exit 0; fi\necho api >> {log!s}\n',
             )
 
             subprocess.run(
@@ -73,6 +115,15 @@ class LaunchdStartupTest(unittest.TestCase):
             )
 
             self.assertEqual(log.read_text().splitlines(), ["storage", "api"])
+
+    def test_actual_storage_preflight_respects_component_selection(self):
+        for component, expected in (("binance-btc", "no"), ("unified-api", "yes"),
+                                    ("polymarket-rust-data-plane", "no")):
+            result = subprocess.run([sys.executable, str(LAUNCHD / "run-production.py"),
+                                     "--storage-required", "--components", component],
+                                    env={**os.environ, "MARKETCOW_ENV_FILE": "/nonexistent/config.env"},
+                                    check=True, capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), expected)
 
     def test_storage_bootstrap_starts_missing_dependencies_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

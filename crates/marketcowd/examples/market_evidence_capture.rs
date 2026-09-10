@@ -22,6 +22,26 @@ use std::{path::PathBuf,time::Duration};
         }
         return Ok(())
     }
+    if let Some(slug)=args[1].strip_prefix("hour:") {
+        let url=evidence::slug_url(slug)?;
+        let client=reqwest::Client::builder().timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?;
+        let mut response=client.get(&url).send().await.map_err(|_|anyhow::anyhow!("hour transport failed"))?;
+        let status=response.status().as_u16();let mut raw=Vec::new();
+        while let Some(chunk)=response.chunk().await.map_err(|_|anyhow::anyhow!("hour body failed"))? {
+            ensure!(raw.len()+chunk.len()<=262144,"hour response cap");raw.extend_from_slice(&chunk);
+        }
+        std::fs::write(root.join("response.raw"),&raw)?;
+        let observed=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+        let report=json!({"source_url":url,"status":status,"observed_at":observed,"raw_complete":true,
+            "raw_sha256":hex::encode(Sha256::digest(&raw)),"raw_bytes":raw.len(),"requests":1});
+        std::fs::write(root.join("report.json"),serde_json::to_vec_pretty(&report)?)?;
+        ensure!(status==200,"hour source rejected; raw preserved");
+        let value=evidence::project_slug(slug,&raw,&observed)?;
+        std::fs::write(root.join("evidence.json"),serde_json::to_vec_pretty(&value)?)?;
+        println!("{}",serde_json::to_string(&report)?);
+        return Ok(())
+    }
     ensure!(args[1]=="capture","mode");
     let client=reqwest::Client::builder().timeout(Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).build()?;
     for (id,condition) in [("1831352","0x6a98ff5d9296b7130ba3c6d5978e0777b98f0550341706bef86f7eb390def16b"),("1831353","0x0ab703c5bc04b87984cc9355d28a2de699d396b71a86a29991fa42bf9c96e798")] {

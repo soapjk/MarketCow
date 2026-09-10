@@ -186,6 +186,42 @@ class RefreshWorker:
             atomic_json(self.state_path, self.state)
             raise  # No automatic retry loop after upstream failure.
 
+    def resume(self, capture):
+        """Explicitly resume one capture; never silently start another traversal."""
+        if not capture.is_absolute() or capture.resolve().parent != self.root.resolve():
+            raise ValueError("resume capture must be an immediate child of configured root")
+        if capture.is_symlink() or not capture.is_dir():
+            raise ValueError("resume capture directory required")
+        if capture.with_name(capture.name + "-prepared").exists():
+            raise ValueError("capture already entered preparation; resume ingestion separately")
+        metadata = capture / "capture.json"
+        if not metadata.exists():
+            metadata = capture / "report.json"  # Pre-resume versions.
+        report = json.loads(bounded_read(metadata, 65536))
+        if type(report.get("closed_filter")) is not bool:
+            raise ValueError("capture filter missing")
+        ids = report.get("requested_market_ids")
+        if not isinstance(ids, list):
+            raise ValueError("capture identities missing")
+        self.storage_check()
+        command = [self.c["binary"], "--root", str(capture), "--resume"]
+        for field in ("maximum_pages", "maximum_bytes", "maximum_page_bytes", "maximum_seconds", "request_seconds", "interval_millis"):
+            command += ["--" + field.replace("_", "-"), str(self.c[field])]
+        if report["closed_filter"]:
+            command.append("--closed")
+        if ids:
+            ids_file = capture / "resume-ids.json"
+            atomic_json(ids_file, ids)
+            command += ["--market-ids", str(ids_file)]
+        self.execute(command, check=True, stdout=subprocess.DEVNULL,
+                     timeout=self.c["maximum_seconds"] + self.c["request_seconds"] + 5)
+        result = self.ingest(capture)
+        mode = "known" if ids else "closed" if report["closed_filter"] else "open"
+        self.state[mode + "_due"] = self.clock() + self.c[mode + "_interval_seconds"]
+        self.state["last_success"], self.state["last_error"] = result, None
+        atomic_json(self.state_path, self.state)
+        return result
+
     def ingest(self, capture):
         prepared_root = capture.with_name(capture.name + "-prepared")
         report = prepare_capture(
@@ -261,11 +297,16 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--ingest-capture", type=Path, help="Existing complete capture; no network request")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--ingest-capture", type=Path, help="Existing complete capture; no network request")
+    action.add_argument("--resume-capture", type=Path, help="Verify existing pages, resume network capture, then prepare/publish")
     args = parser.parse_args()
     config = load_config(args.config)
     worker = RefreshWorker(config)
     try:
+        if args.resume_capture is not None:
+            print(json.dumps(worker.resume(args.resume_capture)), flush=True)
+            return
         if args.ingest_capture is not None:
             if not args.ingest_capture.is_absolute():
                 raise ValueError("absolute capture path required")
