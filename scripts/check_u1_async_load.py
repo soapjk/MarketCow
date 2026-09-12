@@ -200,7 +200,7 @@ async def main():
             '--response-byte-limit','2097152','--batch-byte-limit','16777216',
             '--persistence-queue-batches','256','--persistence-queue-bytes','67108864',
             '--websocket-shard-tokens','50','--websocket-recovery-concurrency','16',
-            '--websocket-confirmation-seconds','1',
+            '--websocket-confirmation-seconds','0',
             '--poll-seconds','1','--request-timeout-seconds','10','--lifecycle-refresh-seconds','300',
             '--live-listen','127.0.0.1:18896','--live-frame-bytes','33554432','--live-maximum-clients','2']
         report['collector_command']=command; start('collector',command,'512M')

@@ -269,6 +269,23 @@ impl Adapter {
         Ok(event)
     }
 
+    /// A reconnecting shard can report the same connection boundary more than
+    /// once before its authoritative snapshot arrives. The first gap already
+    /// invalidated the book; replacing its recovery identity would make the
+    /// in-flight snapshot stale and create an unbounded recovery storm.
+    fn invalidate_once(
+        &mut self,
+        token: &str,
+        reason: &str,
+        received: chrono::DateTime<Utc>,
+        cursor: u64,
+    ) -> Result<Option<Value>> {
+        if self.recoveries.contains_key(token) {
+            return Ok(None);
+        }
+        self.invalidate(token, reason, received, cursor).map(Some)
+    }
+
     /// Preserve an upstream multi-token frame as an atomic unit. If validation
     /// fails after partially reducing it, invalidate every token in that frame,
     /// never unrelated markets. No partially reduced output escapes.
@@ -307,6 +324,12 @@ impl Adapter {
             "unsubscribed frame identity"
         );
         let source_gap = raw["event_type"] == "source_gap";
+        let source_gap_diagnostic = source_gap.then(|| json!({
+            "transport_reason":raw["transport_reason"],
+            "close_code":raw["close_code"],
+            "close_reason":raw["close_reason"],
+            "transport_attempt":raw["attempt"],
+        }));
         let full = raw["event_type"] == "book";
         // A price-change array is one atomic market observation. If any member
         // lacks continuity, do not partially advance its healthy sibling.
@@ -356,24 +379,32 @@ impl Adapter {
                 } else {
                     "source_validation_failed"
                 };
+                let invalidatable = affected.iter().filter(|token| {
+                    !source_gap || !self.recoveries.contains_key(*token)
+                }).cloned().collect::<Vec<_>>();
+                if invalidatable.is_empty() {
+                    return Ok(Vec::new());
+                }
                 eprintln!(
                     "{}",
-                    json!({"stage":"token_invalidation","tokens":affected,"reason":reason,"detail":error.to_string()})
+                    json!({"stage":"token_invalidation","tokens":invalidatable,"reason":reason,
+                        "detail":error.to_string(),"source_gap":source_gap_diagnostic})
                 );
-                affected
-                    .iter()
-                    .enumerate()
-                    .map(|(index, token)| {
-                        self.invalidate(
-                            token,
-                            reason,
-                            received,
-                            after
-                                .checked_add(index as u64 + 1)
-                                .context("cursor overflow")?,
-                        )
-                    })
-                    .collect()
+                let mut invalidations = Vec::new();
+                for token in &invalidatable {
+                    let cursor = after
+                        .checked_add(invalidations.len() as u64 + 1)
+                        .context("cursor overflow")?;
+                    let event = if source_gap {
+                        self.invalidate_once(token, reason, received, cursor)?
+                    } else {
+                        Some(self.invalidate(token, reason, received, cursor)?)
+                    };
+                    if let Some(event) = event {
+                        invalidations.push(event);
+                    }
+                }
+                Ok(invalidations)
             }
         }
     }
@@ -680,6 +711,12 @@ mod tests {
             targeted_confirmation_retry_delay(0),
             std::time::Duration::from_secs(1),
         );
+        assert_eq!(recovery_retry_delay(1), std::time::Duration::from_secs(5));
+        assert_eq!(recovery_retry_delay(2), std::time::Duration::from_secs(10));
+        assert_eq!(recovery_retry_delay(9), std::time::Duration::from_secs(60));
+        assert_eq!(audit_batch_offset(300, 0, 5), std::time::Duration::ZERO);
+        assert_eq!(audit_batch_offset(300, 1, 5), std::time::Duration::from_secs(60));
+        assert_eq!(audit_batch_offset(300, 4, 5), std::time::Duration::from_secs(240));
     }
 
     #[tokio::test]
@@ -698,6 +735,36 @@ mod tests {
                 .to_string()
                 .contains("duplicate")
         );
+    }
+
+    #[tokio::test]
+    async fn disabled_confirmation_finishes_without_network_io() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let (_membership_sender, membership) = tokio::sync::watch::channel(
+            BTreeSet::from(["1".to_owned()]),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            run_confirmations(
+                vec![super::super::Market {
+                    market_id: "1".into(),
+                    condition_id: "condition".into(),
+                    token_ids: ["11".into(), "12".into()],
+                }],
+                1,
+                1,
+                1,
+                1,
+                0,
+                sender,
+                shutdown,
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                membership,
+            ),
+        )
+        .await;
+        assert_eq!(result.unwrap().unwrap(), ());
     }
     fn fixture() -> Adapter {
         let plan = Plan {
@@ -763,6 +830,52 @@ mod tests {
         assert!(a.apply(delta, now, 3).unwrap().is_empty());
         a.apply(book("11", now), now, 3).unwrap();
         assert!(a.waiting.is_empty());
+    }
+
+    #[test]
+    fn repeated_connection_gap_keeps_one_recovery_identity() {
+        let mut adapter = fixture();
+        let now = Utc::now();
+        adapter.apply_isolated(book("11", now), now, 0).unwrap();
+        let first = adapter
+            .apply_isolated(
+                json!({"event_type":"source_gap","asset_id":"11"}),
+                now,
+                1,
+            )
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let recovery = adapter.recoveries["11"].clone();
+        let duplicate = adapter
+            .apply_isolated(
+                json!({"event_type":"source_gap","asset_id":"11"}),
+                now,
+                2,
+            )
+            .unwrap();
+        assert!(duplicate.is_empty());
+        assert_eq!(adapter.recoveries["11"], recovery);
+    }
+
+    #[test]
+    fn connection_gap_recovery_is_coalesced_by_market() {
+        let mut adapter = fixture();
+        let now = Utc::now();
+        for (cursor, token) in [(0, "11"), (1, "12")] {
+            adapter
+                .apply_isolated(
+                    json!({"event_type":"source_gap","asset_id":token}),
+                    now,
+                    cursor,
+                )
+                .unwrap();
+        }
+        let pending = pending_market_recoveries(&adapter);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending["1"].keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["11", "12"]
+        );
     }
 
     #[test]
@@ -1153,16 +1266,15 @@ async fn recover_snapshots(
     result
 }
 
-async fn recover_snapshot(token: String) -> Result<marketcow_polymarket::RawTransportFrame> {
-    recover_snapshots(vec![token])
-        .await?
-        .pop()
-        .context("target recovery snapshot missing")
-}
-
 type FreshnessResult = (
     super::Market,
     chrono::DateTime<Utc>,
+    Result<Vec<marketcow_polymarket::RawTransportFrame>>,
+);
+
+type MarketRecoveryResult = (
+    String,
+    BTreeMap<String, String>,
     Result<Vec<marketcow_polymarket::RawTransportFrame>>,
 );
 
@@ -1172,6 +1284,11 @@ fn targeted_confirmation_retry_delay(confirmation_interval_seconds: u64) -> std:
     // instead of consuming the entire five-second consumer freshness budget
     // before the next WS handshake even starts.
     std::time::Duration::from_secs(confirmation_interval_seconds.max(1))
+}
+
+fn recovery_retry_delay(failures: u32) -> std::time::Duration {
+    let multiplier = 1_u64 << failures.saturating_sub(1).min(4);
+    std::time::Duration::from_secs((5 * multiplier).min(60))
 }
 
 /// Fill the bounded targeted-confirmation worker set from a market-keyed
@@ -1243,6 +1360,15 @@ struct ConfirmationBatch {
     result: Result<(Vec<Value>, chrono::DateTime<Utc>)>,
 }
 
+fn audit_batch_offset(period_seconds: u64, index: usize, batches: usize) -> std::time::Duration {
+    if period_seconds == 0 || batches <= 1 || index == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let period_millis = u128::from(period_seconds) * 1_000;
+    let offset_millis = period_millis * index as u128 / batches as u128;
+    std::time::Duration::from_millis(offset_millis.min(u128::from(u64::MAX)) as u64)
+}
+
 async fn run_confirmations(
     markets: Vec<super::Market>,
     market_batch_size: usize,
@@ -1255,12 +1381,18 @@ async fn run_confirmations(
     network:Arc<tokio::sync::Semaphore>,
     membership:tokio::sync::watch::Receiver<BTreeSet<String>>,
 ) -> Result<()> {
+    // Healthy WebSocket operation must not imply a parallel full-book REST
+    // downloader. Zero is the production default and performs no network I/O.
+    if interval_seconds == 0 {
+        return Ok(());
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(request_timeout_seconds))
         .build()?;
     ensure!(concurrency>0,"confirmation concurrency");
     let mut jobs = tokio::task::JoinSet::new();
-    for batch in markets.chunks(market_batch_size) {
+    let batch_count = markets.len().div_ceil(market_batch_size);
+    for (batch_index, batch) in markets.chunks(market_batch_size).enumerate() {
         let batch = batch.to_vec();
         let client = client.clone();
         let network = network.clone();
@@ -1268,6 +1400,16 @@ async fn run_confirmations(
         let mut shutdown = shutdown.clone();
         let membership=membership.clone();
         jobs.spawn(async move {
+            let offset = audit_batch_offset(interval_seconds, batch_index, batch_count);
+            if !offset.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(offset) => {},
+                    value = shutdown.changed() => {
+                        value?;
+                        if *shutdown.borrow() { return Ok(()); }
+                    },
+                }
+            }
             loop {
                 if *shutdown.borrow() {
                     return Ok::<(), anyhow::Error>(());
@@ -1311,6 +1453,20 @@ async fn run_confirmations(
         result??;
     }
     Ok(())
+}
+
+fn pending_market_recoveries(adapter: &Adapter) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut pending = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for (token, attempt) in &adapter.recoveries {
+        let Some((market_id, _)) = adapter.identities.get(token) else {
+            continue;
+        };
+        pending
+            .entry(market_id.clone())
+            .or_default()
+            .insert(token.clone(), attempt.clone());
+    }
+    pending
 }
 
 async fn run_connection(
@@ -1371,18 +1527,15 @@ async fn run_connection(
     let mut lifecycle_pending = BTreeSet::new();
     let mut lifecycle_terminal = BTreeSet::new();
     let mut lifecycle_retry_at = BTreeMap::<String, tokio::time::Instant>::new();
-    let mut recovery_jobs = tokio::task::JoinSet::<(
-        String,
-        String,
-        Result<marketcow_polymarket::RawTransportFrame>,
-    )>::new();
+    let mut recovery_jobs = tokio::task::JoinSet::<MarketRecoveryResult>::new();
     let mut freshness_jobs = tokio::task::JoinSet::<FreshnessResult>::new();
-    let mut recovering = BTreeSet::new();
+    let mut recovering_markets = BTreeSet::new();
     let mut freshness_pending = BTreeSet::new();
     let mut freshness_queued = BTreeMap::<String, super::Market>::new();
     let mut freshness_retry_at = BTreeMap::<String, tokio::time::Instant>::new();
     let mut rest_submitted = BTreeMap::<String, String>::new();
-    let mut retry_at = BTreeMap::<String, tokio::time::Instant>::new();
+    let mut recovery_retry_at = BTreeMap::<String, tokio::time::Instant>::new();
+    let mut recovery_failures = BTreeMap::<String, u32>::new();
     let mut retry_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let shutdown_requested = super::shutdown_signal();
@@ -1634,15 +1787,37 @@ async fn run_connection(
                     continue;
                 },
                 completed=recovery_jobs.join_next(), if !recovery_jobs.is_empty()=>{
-                    let (token, attempt, result) = completed.context("recovery task missing")??;
-                    recovering.remove(&token);
-                    retry_at.insert(token.clone(), tokio::time::Instant::now()+std::time::Duration::from_secs(5));
-                    if adapter.recoveries.get(&token) == Some(&attempt) {
-                        match result {
-                            Ok(frame) => {
-                                pipeline.submit(adapter, publication, frame, Some((token, attempt))).await?;
+                    let (market_id, attempts, result) = completed.context("recovery task missing")??;
+                    recovering_markets.remove(&market_id);
+                    match result {
+                        Ok(frames) => {
+                            recovery_failures.remove(&market_id);
+                            recovery_retry_at.remove(&market_id);
+                            let mut by_token = frames.into_iter().filter_map(|frame| {
+                                let token = frame.raw_payload["asset_id"].as_str()?.to_owned();
+                                Some((token, frame))
+                            }).collect::<BTreeMap<_, _>>();
+                            for (token, attempt) in attempts {
+                                if adapter.recoveries.get(&token) != Some(&attempt) { continue; }
+                                match by_token.remove(&token) {
+                                    Some(frame) => pipeline.submit(
+                                        adapter, publication, frame, Some((token, attempt)),
+                                    ).await?,
+                                    None => eprintln!("{}", json!({"stage":"market_recovery_incomplete",
+                                        "market_id":market_id,"token_id":token})),
+                                }
                             }
-                            Err(error) => eprintln!("{}", json!({"stage":"token_recovery_retry","token_id":token,"detail":error.to_string()})),
+                        }
+                        Err(error) => {
+                            let failures = recovery_failures.entry(market_id.clone()).or_default();
+                            *failures = failures.saturating_add(1);
+                            recovery_retry_at.insert(
+                                market_id.clone(),
+                                tokio::time::Instant::now() + recovery_retry_delay(*failures),
+                            );
+                            eprintln!("{}", json!({"stage":"market_recovery_retry",
+                                "market_id":market_id,"token_count":attempts.len(),
+                                "consecutive_failures":*failures,"detail":error.to_string()}));
                         }
                     }
                     continue;
@@ -1719,17 +1894,22 @@ async fn run_connection(
                     if let Err(error)=jobs.poll_retirements(){eprintln!("{}",json!({"stage":"acquisition_retirement_error","error":error.to_string()}));}
                     publication.set_acquisition_statistics(jobs.statistics());
                     rest_submitted.retain(|token, attempt| adapter.recoveries.get(token) == Some(attempt));
-                    // A bounded number of temporary sockets; a failed token cannot
-                    // occupy every retry slot forever (per-token backoff).
-                    for (token, attempt) in &adapter.recoveries {
-                        if recovering.len() >= websocket_recovery_concurrency { break; }
-                        if recovering.contains(token) || retry_at.get(token).is_some_and(|at| *at > tokio::time::Instant::now()) { continue; }
-                        let token = token.clone();
-                        let attempt = attempt.clone();
-                        recovering.insert(token.clone());
+                    // Coalesce all pending token gaps for one market into one
+                    // temporary subscription. Repeated shard boundaries cannot
+                    // create a socket per token or reset an in-flight identity.
+                    let pending = pending_market_recoveries(adapter);
+                    recovery_retry_at.retain(|market_id, _| pending.contains_key(market_id));
+                    recovery_failures.retain(|market_id, _| pending.contains_key(market_id));
+                    for (market_id, attempts) in pending {
+                        if recovery_jobs.len() >= websocket_recovery_concurrency { break; }
+                        if recovering_markets.contains(&market_id)
+                            || recovery_retry_at.get(&market_id)
+                                .is_some_and(|at| *at > tokio::time::Instant::now()) { continue; }
+                        let tokens = attempts.keys().cloned().collect();
+                        recovering_markets.insert(market_id.clone());
                         recovery_jobs.spawn(async move {
-                            let result = recover_snapshot(token.clone()).await;
-                            (token, attempt, result)
+                            let result = recover_snapshots(tokens).await;
+                            (market_id, attempts, result)
                         });
                     }
                     start_freshness_jobs(
@@ -1783,16 +1963,25 @@ async fn run_connection(
             }
             completed = recovery_jobs.join_next(), if !recovery_jobs.is_empty() => {
                 let Some(completed) = completed else { continue; };
-                let (token, attempt, result) = completed?;
-                recovering.remove(&token);
-                if adapter.recoveries.get(&token) == Some(&attempt) {
-                    match result {
-                        Ok(frame) => pipeline.submit(adapter, publication, frame, Some((token, attempt))).await?,
-                        Err(error) => eprintln!("{}", json!({
-                            "stage":"shutdown_token_recovery_failed","token_id":token,
-                            "detail":error.to_string()
-                        })),
+                let (market_id, attempts, result) = completed?;
+                recovering_markets.remove(&market_id);
+                match result {
+                    Ok(frames) => {
+                        let mut by_token = frames.into_iter().filter_map(|frame| {
+                            let token = frame.raw_payload["asset_id"].as_str()?.to_owned();
+                            Some((token, frame))
+                        }).collect::<BTreeMap<_, _>>();
+                        for (token, attempt) in attempts {
+                            if adapter.recoveries.get(&token) != Some(&attempt) { continue; }
+                            if let Some(frame) = by_token.remove(&token) {
+                                pipeline.submit(adapter, publication, frame, Some((token, attempt))).await?;
+                            }
+                        }
                     }
+                    Err(error) => eprintln!("{}", json!({
+                        "stage":"shutdown_market_recovery_failed","market_id":market_id,
+                        "token_count":attempts.len(),"detail":error.to_string()
+                    })),
                 }
             }
             _ = tokio::time::sleep_until(recovery_deadline) => break,

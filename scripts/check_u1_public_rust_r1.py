@@ -135,7 +135,7 @@ def main():
         '--request-market-batch-size', '20', '--response-byte-limit', '2097152',
         '--batch-byte-limit', '16777216', '--persistence-queue-batches', '256',
         '--persistence-queue-bytes', '67108864', '--websocket-shard-tokens', '500',
-        '--websocket-recovery-concurrency', '16', '--websocket-confirmation-seconds', '1',
+        '--websocket-recovery-concurrency', '16', '--websocket-confirmation-seconds', '0',
         '--poll-seconds', '1', '--request-timeout-seconds', '10',
         '--lifecycle-refresh-seconds', '300', '--bounded-history-bytes', '67108864',
         '--public-listen', '127.0.0.1:8794', '--public-full-sync-bytes', '134217728',

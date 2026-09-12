@@ -94,9 +94,10 @@ struct Args {
     /// Bounded number of temporary authoritative snapshot subscriptions.
     #[arg(long, default_value_t = 8)]
     websocket_recovery_concurrency: usize,
-    /// Periodic authoritative REST confirmation for quiet WS books. Matching
-    /// snapshots refresh only memory freshness and never enter the event log.
-    #[arg(long, default_value_t = 2)]
+    /// Optional full-scope REST audit period. Zero disables polling while the
+    /// WebSocket stream is healthy. A non-zero audit is deliberately limited
+    /// to a five-minute-or-slower cadence; recovery remains event-driven.
+    #[arg(long, default_value_t = 0)]
     websocket_confirmation_seconds: u64,
     #[arg(long, requires_all = ["dependency_plan", "live_frame_bytes", "live_maximum_clients"])]
     live_listen: Option<std::net::SocketAddr>,
@@ -465,10 +466,11 @@ async fn main() -> Result<()> {
             && (1..=20).contains(&args.request_market_batch_size)
             && (2..=500).contains(&args.websocket_shard_tokens)
             && (1..=32).contains(&args.websocket_recovery_concurrency)
-            && (1..=300).contains(&args.websocket_confirmation_seconds)
+            && (args.websocket_confirmation_seconds == 0
+                || (300..=3600).contains(&args.websocket_confirmation_seconds))
             && args.poll_seconds > 0
             && args.request_timeout_seconds > 0,
-        "explicit positive concurrency/timeout/poll configuration required"
+        "invalid concurrency/timeout/poll/audit configuration"
     );
     ensure!(
         args.expected_market_count > 0 && args.response_byte_limit > 0 && args.batch_byte_limit > 0,
@@ -980,7 +982,7 @@ mod scope_tests {
         .unwrap();
         assert_eq!(defaults.websocket_shard_tokens, 50);
         assert_eq!(defaults.websocket_recovery_concurrency, 8);
-        assert_eq!(defaults.websocket_confirmation_seconds, 2);
+        assert_eq!(defaults.websocket_confirmation_seconds, 0);
     }
 
     #[test]
