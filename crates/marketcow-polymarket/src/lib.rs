@@ -467,7 +467,15 @@ async fn run_polymarket_connection(
                         value @ Value::Object(_) => vec![value],
                         _ => return Err(TransportError::InvalidFrame),
                     };
-                    if values.is_empty() || values.iter().any(|value| !value.is_object()) {
+                    // The venue legitimately returns an empty snapshot array
+                    // when none of the requested tokens currently has a book.
+                    // Keep those identities waiting for a later book or the
+                    // bounded recovery path; an empty batch is not transport
+                    // corruption and must not invalidate the whole shard.
+                    if values.is_empty() {
+                        continue;
+                    }
+                    if values.iter().any(|value| !value.is_object()) {
                         return Err(TransportError::InvalidFrame);
                     }
                     let frames:Vec<_> = values.into_iter().filter(|value|subscription::owned_or_unclassified(value,tokens)).map(|raw_payload| RawTransportFrame {
@@ -1510,6 +1518,10 @@ mod tests {
             let subscription: Value = serde_json::from_str(&subscription).unwrap();
             assert_eq!(subscription["type"], "market");
             assert_eq!(subscription["assets_ids"], serde_json::json!(["yes-1"]));
+            socket
+                .send(Message::Text("[]".into()))
+                .await
+                .unwrap();
             socket
                 .send(Message::Text(
                     serde_json::json!([{
