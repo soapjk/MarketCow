@@ -1,5 +1,37 @@
 # BTC hourly implementation evidence — 2026-09-10
 
+## Seven paired real hours and bounded dataset catalog — 2026-09-12
+
+The paired evidence set now contains seven real BTC Up/Down hours across
+2026-09-10 and 2026-09-11. Each dataset independently binds a complete Gamma
+rule response, ordered Up/Down token identities, all 60 official Binance 1m
+bars, the official Binance 1h bar, and two agreeing Polygon finalized-block CTF
+receipts. The minute aggregation must match the hour for OHLC, four volume
+fields and trade count; the resulting Close >= Open label must match the CTF
+payouts. The observed results are Down, Down, Up, Up, Down, Up, Up.
+
+The immutable bounded catalog is
+`/Volumes/T9/data/marketcow/research/btc-hourly/catalogs/paired-20260910-11-r2.json`.
+Its catalog ID is
+`fd341ebe427926cef70778d6008541424a23ec38b7144b79b1efd784caa9d238`
+and its file SHA-256 is
+`3769a41a76434169fdecaec7888c4d8d3e1789548ef0dc7bcb0b4fc98fc4a958`.
+The catalog verifies every manifest identity and every referenced part's exact
+byte count and hash before publication. It rejects duplicate dataset, market,
+condition and hour identities. The set is complete for its seven explicitly
+listed inputs, not an exhaustive historical market catalog.
+
+Only four of seven rules were captured before their prediction window began;
+the other three remain valid rule/result evidence but cannot prove what rule was
+historically knowable at the start of those hours. Historical L2 and historical
+first-receipt times remain absent for all seven. Standard CTF finality is proven;
+adapter redemption and Paper pUSD mapping remain explicitly unverified.
+
+`python -m marketcow.btc_paired_catalog` is the reproducible publication entry.
+It takes an explicit bounded list of absolute `manifest.json` paths and writes a
+new immutable catalog. It does not scan directories implicitly or modify any
+realtime subscription, service, scope or account.
+
 ## Paired real hour and isolated Rust research input — 2026-09-12
 
 `btc_hour_pairing` now constructs an immutable, content-addressed bundle from
