@@ -737,6 +737,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lifecycle_lookup_uses_the_exact_failed_catalog_identity() {
+        let market = catalog_market(&json!({
+            "identity": {
+                "market_id": "3418199",
+                "condition_id": "0xcondition",
+                "outcomes": [{"token_id": "yes"}, {"token_id": "no"}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(market.market_id, "3418199");
+        assert_eq!(market.condition_id, "0xcondition");
+        assert_eq!(market.token_ids, ["yes", "no"]);
+        assert!(catalog_market(&json!({
+            "identity": {
+                "market_id": "1",
+                "condition_id": "c",
+                "outcomes": [{"token_id": "only-one"}]
+            }
+        }))
+        .is_err());
+    }
+
     #[tokio::test]
     async fn disabled_confirmation_finishes_without_network_io() {
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
@@ -1278,6 +1301,34 @@ type MarketRecoveryResult = (
     Result<Vec<marketcow_polymarket::RawTransportFrame>>,
 );
 
+fn catalog_market(record: &Value) -> Result<super::Market> {
+    let identity = &record["identity"];
+    let token_ids: Vec<String> = identity["outcomes"]
+        .as_array()
+        .context("lifecycle outcomes")?
+        .iter()
+        .map(|outcome| {
+            outcome["token_id"]
+                .as_str()
+                .map(str::to_owned)
+                .context("lifecycle token")
+        })
+        .collect::<Result<_>>()?;
+    Ok(super::Market {
+        market_id: identity["market_id"]
+            .as_str()
+            .context("lifecycle market id")?
+            .to_owned(),
+        condition_id: identity["condition_id"]
+            .as_str()
+            .context("lifecycle condition")?
+            .to_owned(),
+        token_ids: token_ids
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("lifecycle market is not binary"))?,
+    })
+}
+
 fn targeted_confirmation_retry_delay(confirmation_interval_seconds: u64) -> std::time::Duration {
     // A successful targeted snapshot refreshes the book at completion. Its
     // retry cooldown must remain inside the configured confirmation cadence
@@ -1818,6 +1869,38 @@ async fn run_connection(
                             eprintln!("{}", json!({"stage":"market_recovery_retry",
                                 "market_id":market_id,"token_count":attempts.len(),
                                 "consecutive_failures":*failures,"detail":error.to_string()}));
+                            // A market that disappears from the official book
+                            // stream may have become terminal. Confirmation
+                            // polling can be disabled, so a failed bounded WS
+                            // recovery must independently trigger one bounded
+                            // lifecycle lookup. Otherwise an expired member can
+                            // remain in recovery forever and keep opening retry
+                            // sockets. This lookup is event-driven, coalesced by
+                            // market, and observes only the failed identity.
+                            let due = lifecycle_retry_at
+                                .get(&market_id)
+                                .is_none_or(|at| *at <= tokio::time::Instant::now());
+                            if !lifecycle_terminal.contains(&market_id)
+                                && !lifecycle_pending.contains(&market_id)
+                                && due
+                            {
+                                if let Some(record) = lifecycle_markets.get(&market_id) {
+                                    let market = catalog_market(record)?;
+                                    lifecycle_pending.insert(market_id.clone());
+                                    let client = lifecycle_client.clone();
+                                    let network = lifecycle_network.clone();
+                                    lifecycle_jobs.spawn(async move {
+                                        let _permit = network.acquire_owned().await;
+                                        let result = super::source_lifecycle::refresh(
+                                            client,
+                                            market.clone(),
+                                            response_byte_limit,
+                                        )
+                                        .await;
+                                        (market, result)
+                                    });
+                                }
+                            }
                         }
                     }
                     continue;
