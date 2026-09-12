@@ -49,6 +49,24 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c().await.expect("shutdown handler");
 }
 
+fn websocket_seed(
+    base: Option<Value>,
+    discovery: Option<&source_discovery_projection::DiscoveryConfig>,
+) -> Result<Option<Value>> {
+    base.map(|mut seed| {
+        if seed.get("scope_id").and_then(Value::as_str).is_none() {
+            let universe_revision = &discovery
+                .context("unscoped WebSocket seed requires Discovery identity")?
+                .universe_revision;
+            seed.as_object_mut()
+                .context("WebSocket seed must be an object")?
+                .insert("scope_id".into(), json!(universe_revision));
+        }
+        Ok(seed)
+    })
+    .transpose()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum InputMode {
     Websocket,
@@ -699,7 +717,12 @@ async fn main() -> Result<()> {
         .collect();
     let persistence_root = args.root.clone();
     let persistence_catalog = plan.catalog_revision.clone();
-    let ws_seed = base.clone();
+    // The normalizer requires a stable identity domain. Live already carries
+    // its scope ID in the baseline; Discovery is intentionally unscoped, so
+    // bind its in-memory WS events to the immutable universe revision instead.
+    // This field is added only to the adapter seed and is not exposed as a
+    // fabricated Live scope in the Discovery read contract.
+    let ws_seed = websocket_seed(base.clone(), discovery_config.as_ref())?;
     let mut publication = source_publication::Publication::start_managed(
         cursor,
         base,
@@ -983,6 +1006,34 @@ mod scope_tests {
         assert_eq!(defaults.websocket_shard_tokens, 50);
         assert_eq!(defaults.websocket_recovery_concurrency, 8);
         assert_eq!(defaults.websocket_confirmation_seconds, 0);
+    }
+
+    #[test]
+    fn discovery_websocket_seed_uses_universe_revision_without_live_scope() {
+        let config = source_discovery_projection::DiscoveryConfig {
+            projection_id: "projection".into(),
+            catalog_revision: "catalog".into(),
+            universe_revision: "universe".into(),
+            market_ids: vec!["1".into()],
+            relations: vec![],
+            settlements: Default::default(),
+            policy: source_discovery_quote::QuotePolicy {
+                quantities: vec!["1".into()],
+                maximum_book_age_ms: 1_000,
+            },
+        };
+        let seed = websocket_seed(Some(json!({"markets": [], "books": []})), Some(&config))
+            .unwrap()
+            .unwrap();
+        assert_eq!(seed["scope_id"], "universe");
+
+        let live = websocket_seed(
+            Some(json!({"scope_id": "live-scope", "markets": [], "books": []})),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(live["scope_id"], "live-scope");
     }
 
     #[test]
