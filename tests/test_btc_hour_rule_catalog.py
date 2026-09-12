@@ -36,6 +36,10 @@ def test_extracts_only_exact_hour_and_preserves_locator(tmp_path):
                                 maximum_source_bytes=size)
     assert result["record_count"] == 1
     assert result["during_window_count"] == 1
+    assert result["contiguous_segments"] == [{"start_utc": "2026-09-10T12:00:00Z",
+                                               "end_utc": "2026-09-10T13:00:00Z",
+                                               "record_count": 1}]
+    assert result["missing_hour_count_between_first_and_last"] == 0
     row = result["records"][0]
     raw = source.read_bytes()[row["raw_locator"]["offset"]:
                               row["raw_locator"]["offset"] + row["raw_locator"]["length"]]
@@ -67,3 +71,13 @@ def test_invalid_matching_identity_is_not_silently_skipped(tmp_path):
     with pytest.raises(ValueError, match="rule_catalog_identity"):
         build_rule_catalog(source, (tmp_path / "out.json").resolve(), source_sha256=digest,
                            source_observed_at="2026-09-10T11:00:00Z", maximum_source_bytes=size)
+
+
+def test_catalog_quantifies_time_gaps(tmp_path):
+    source = (tmp_path / "source.jsonl").resolve()
+    digest, size = write_source(source, [market("1", "2026-09-10T12:00:00Z", "2026-09-10T13:00:00Z"),
+                                         market("2", "2026-09-10T15:00:00Z", "2026-09-10T16:00:00Z")])
+    result = build_rule_catalog(source, (tmp_path / "out.json").resolve(), source_sha256=digest,
+                                source_observed_at="2026-09-10T11:00:00Z", maximum_source_bytes=size)
+    assert result["missing_hour_count_between_first_and_last"] == 2
+    assert [segment["record_count"] for segment in result["contiguous_segments"]] == [1, 1]

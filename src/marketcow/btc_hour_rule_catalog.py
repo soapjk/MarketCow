@@ -84,6 +84,22 @@ def build_rule_catalog(source: Path, output: Path, *, source_sha256: str,
     for key in ("market_id", "condition_id", "start_utc"):
         if len({row[key] for row in rows}) != len(rows):
             raise ValueError(f"rule_catalog_duplicate_{key}")
+    segments, missing_hours = [], 0
+    for row in rows:
+        start, end = timestamp(row["start_utc"]), timestamp(row["end_utc"])
+        if not segments or start > timestamp(segments[-1]["end_utc"]):
+            if segments:
+                gap = start - timestamp(segments[-1]["end_utc"])
+                if gap.total_seconds() % 3600:
+                    raise ValueError("rule_catalog_non_hour_gap")
+                missing_hours += int(gap.total_seconds() // 3600)
+            segments.append({"start_utc": row["start_utc"], "end_utc": row["end_utc"],
+                             "record_count": 1})
+        elif start == timestamp(segments[-1]["end_utc"]):
+            segments[-1]["end_utc"] = row["end_utc"]
+            segments[-1]["record_count"] += 1
+        else:
+            raise ValueError("rule_catalog_overlapping_hours")
     payload = {
         "schema_version": "marketcow.btc-hour.rule-catalog.v1",
         "source": {"name": "polymarket_gamma", "path": str(source),
@@ -98,6 +114,8 @@ def build_rule_catalog(source: Path, output: Path, *, source_sha256: str,
         "before_window_count": sum(row["capture_relation"] == "before_window" for row in rows),
         "during_window_count": sum(row["capture_relation"] == "during_window" for row in rows),
         "after_window_count": sum(row["capture_relation"] == "after_window" for row in rows),
+        "contiguous_segments": segments,
+        "missing_hour_count_between_first_and_last": missing_hours,
         "records": rows,
     }
     payload_raw = canonical(payload)

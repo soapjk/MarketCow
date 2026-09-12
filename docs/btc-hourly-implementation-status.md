@@ -33,12 +33,12 @@ new immutable catalog. It does not scan directories implicitly or modify any
 realtime subscription, service, scope or account.
 
 The separate historical rule directory is
-`/Volumes/T9/data/marketcow/research/btc-hourly/catalogs/rules-gamma-20260904-r1.json`.
+`/Volumes/T9/data/marketcow/research/btc-hourly/catalogs/rules-gamma-20260904-r2.json`.
 It contains 49 exact Binance BTCUSDT finalized-1H contracts from the already
 frozen 1,403,191,882-byte Gamma source. Catalog ID is
-`82ba66ff8c5fd1adcae0dc3d70c2d750fa5414fcc16db3915e2c3a8f30452fa2`;
+`9f53dbd40314844fd702287ee06ff791ae8fee083cff534e7d7acfd6e99b7103`;
 file SHA-256 is
-`008350ac7183d0d2576ec57b536eae5f40ca0b48d48333f6294728fea4108701`.
+`abb87ac2fd1894cdc747a2215000dcb574f2c164033b1437f637694d175c4379`.
 Each record has the exact raw byte path/offset/length/hash, market/condition,
 ordered Up/Down tokens, UTC hour, source timestamps and capture-state facts.
 The extractor hashes the entire bounded input and only publishes after complete
@@ -46,6 +46,11 @@ traversal; exact rule text and one-hour boundaries are required. Of these 49,
 43 were captured before the hour, one during, and five after. This is complete
 for the exact selector in the frozen source, not a complete Polymarket history;
 capture-time active/orderable flags are expressly not current facts.
+The time coverage is three explicit contiguous segments: one hour on May 20,
+27 hours from September 4 13:00 UTC, and 21 hours from September 5 17:00 UTC.
+There are 2,571 absent hours between the first and last records, including the
+one-hour hole between the two September segments; the catalog reports this
+rather than treating 49 identities as continuous coverage.
 
 ## Paired real hour and isolated Rust research input — 2026-09-12
 
