@@ -1,5 +1,44 @@
 # BTC hourly implementation evidence — 2026-09-10
 
+## Paired real hour and isolated Rust research input — 2026-09-12
+
+`btc_hour_pairing` now constructs an immutable, content-addressed bundle from
+one exact reviewed Gamma rule, official Binance 1m/1h archives and a two-provider
+CTF finality quorum. It requires all 60 final minute bars, requires their OHLC,
+four volume fields and trade count to equal the official final 1h bar, and then
+requires the Binance close/open result to equal the bound Up/Down CTF payouts.
+It copies both raw RPC observation receipts into the bundle. Standard CTF
+collateral finality remains distinct from adapter redemption and the Paper pUSD
+mapping; both are explicitly false rather than inferred.
+
+Actual bundle:
+`/Volumes/T9/data/marketcow/research/btc-hourly/datasets/4358214-20260910T0600Z-r3`.
+Dataset ID `ac0d827e3bd389c9aa864bfd87fbd7b8b05a394f9947fe87ea4af1dd21e72adc`;
+manifest file SHA-256
+`b218a93e03c8825981a3c95b1cb78ce7010234bb84c55614c75a0d524f541ed9`.
+The 2026-09-10 06:00 UTC Binance candle opened at 78536.71 and closed at
+78416.01, so the independently derived result is Down. The finality receipt is
+Up=0, Down=1. Historical first-receipt and L2 coverage remain absent.
+
+The original 2026-09-07 archive and prior bounded live export were copied from
+temporary storage without byte changes into
+`/Volumes/T9/data/marketcow/research/btc-hourly/sources/binance/` and
+`/Volumes/T9/data/marketcow/research/btc-hourly/datasets/` respectively. Their
+existing manifest/report hashes are unchanged.
+The matching Gamma and RPC originals are retained under
+`/Volumes/T9/data/marketcow/research/btc-hourly/sources/polymarket/4358214-r1`;
+the r3 bundle was rebuilt from these persistent paths rather than `/private/tmp`.
+
+The Rust example `btc_research_stream` supplies the missing out-of-pool research
+input primitive locally. It accepts at most three reviewed markets/six exact
+tokens and subscribes directly to the official market WebSocket without changing
+Discovery or Live. Transport input and persistence use separate queues; the
+persistence queue has explicit item and encoded-byte limits. Time, batches,
+frames, archive bytes and individual batch bytes are independently bounded.
+Connection boundaries remain explicit `source_gap` facts. See
+`docs/btc-hour-research-stream.md`. This example has not been deployed or used to
+open a new production subscription.
+
 ## Current delivery summary
 
 The local Binance SPOT service is installed as persistent launchd component
