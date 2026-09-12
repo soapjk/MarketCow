@@ -52,3 +52,43 @@ cargo test --offline -p marketcowd --example btc_research_stream --no-default-fe
 The tests cover exact identity validation, duplicate token rejection, queue
 resource bounds, and the parsed-payload/raw-wire distinction. They do not open a
 network connection.
+
+## Reviewable 30-minute startup package
+
+Generate a new package immediately before capture. This calls the existing Rust
+market-evidence read route exactly three times (current UTC hour and the next two),
+retains each full rule response, verifies the Binance finalized 1H BTC/USDT rule,
+and writes a content-bound Rust config. It does not start a subscription.
+
+```text
+python -m marketcow.btc_research_package --endpoint http://127.0.0.1:18898 \
+  --output /ABSOLUTE/NEW/PACKAGE
+target/release/examples/btc_research_stream \
+  /ABSOLUTE/NEW/PACKAGE/stream-config.json /ABSOLUTE/NEW/CAPTURE
+```
+
+The generated config fixes the observation at 1,800 seconds, at most three
+markets/six tokens, 250,000 application frames and 512 MiB of encoded archive
+data. Persistence is a separate 8-batch/64-MiB bounded queue. A budget breach
+exits nonzero and produces no `complete` report. This is an application archive
+bound, not a hard bound on TLS/WebSocket headers or heartbeat traffic; a NIC-byte
+cap requires OS accounting and is not claimed.
+
+Renewal is explicit: after the process ends, generate a fresh package, review
+the new current/next-two identities, and use a new output directory. Evidence
+and config hashes prevent silent identity reuse. There is no hidden daemon.
+
+## Offline L2 projection
+
+```text
+python -m marketcow.btc_research_l2 --capture /ABSOLUTE/CAPTURE \
+  --output /ABSOLUTE/NEW/L2
+```
+
+Rows bind capture config/report/archive hashes, exact identities, input line,
+book epoch and local sequence. `source_gap` invalidates that token; subsequent
+changes are rejected until a new full `book`, so epochs are never joined across
+a disconnect. A market is two-sided only while both Up and Down states are valid.
+The venue feed exposes no authoritative per-book sequence here and the transport
+archives parsed JSON, not original WebSocket bytes. `local_sequence` is therefore
+capture order within an epoch, and neither output is described as wire-exact.
