@@ -32,6 +32,21 @@ It takes an explicit bounded list of absolute `manifest.json` paths and writes a
 new immutable catalog. It does not scan directories implicitly or modify any
 realtime subscription, service, scope or account.
 
+The separate historical rule directory is
+`/Volumes/T9/data/marketcow/research/btc-hourly/catalogs/rules-gamma-20260904-r1.json`.
+It contains 49 exact Binance BTCUSDT finalized-1H contracts from the already
+frozen 1,403,191,882-byte Gamma source. Catalog ID is
+`82ba66ff8c5fd1adcae0dc3d70c2d750fa5414fcc16db3915e2c3a8f30452fa2`;
+file SHA-256 is
+`008350ac7183d0d2576ec57b536eae5f40ca0b48d48333f6294728fea4108701`.
+Each record has the exact raw byte path/offset/length/hash, market/condition,
+ordered Up/Down tokens, UTC hour, source timestamps and capture-state facts.
+The extractor hashes the entire bounded input and only publishes after complete
+traversal; exact rule text and one-hour boundaries are required. Of these 49,
+43 were captured before the hour, one during, and five after. This is complete
+for the exact selector in the frozen source, not a complete Polymarket history;
+capture-time active/orderable flags are expressly not current facts.
+
 ## Paired real hour and isolated Rust research input — 2026-09-12
 
 `btc_hour_pairing` now constructs an immutable, content-addressed bundle from
