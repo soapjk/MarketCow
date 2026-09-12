@@ -82,20 +82,42 @@ def test_projects_two_sided_and_never_crosses_gap(tmp_path):
             {
                 "event_type": "price_change",
                 "timestamp": "3",
+                "price_changes": [{"asset_id": "11", "side": "BUY", "price": "0.35", "size": "2"}],
+            }
+        ),
+        frame(
+            {
+                "event_type": "price_change",
+                "timestamp": "4",
                 "price_changes": [{"asset_id": "10", "side": "BUY", "price": "0.46", "size": "1"}],
+            }
+        ),
+        frame(
+            {
+                "event_type": "book",
+                "asset_id": "10",
+                "timestamp": "5",
+                "bids": [{"price": "0.41", "size": "2"}],
+                "asks": [{"price": "0.61", "size": "3"}],
             }
         ),
     ]
     output = tmp_path / "l2"
     report = project_archive(capture(tmp_path, frames), output)
-    assert report["l2_rows"] == 3
-    assert report["complete_two_sided_market_ids"] == []
-    assert report["missing_or_gapped_token_ids"] == ["10"]
+    assert report["l2_rows"] == 6
+    assert report["complete_two_sided_market_ids"] == ["1"]
+    assert report["missing_or_gapped_token_ids"] == []
     assert report["rejected_unapplied_changes"] == 1
     rows = [json.loads(line) for line in (output / "l2.jsonl").read_bytes().splitlines()]
-    assert rows[-1]["local_sequence"] == 2
-    assert rows[-1]["kind"] == "delta"
-    assert rows[-1]["changes"][0]["price"] == "0.45"
+    invalidation = rows[3]
+    assert invalidation["kind"] == "invalidation"
+    assert invalidation["token_id"] == "10"
+    assert invalidation["available"] is False
+    assert invalidation["state_checksum"] is None
+    assert rows[4]["token_id"] == "11" and rows[4]["kind"] == "delta"
+    assert rows[-1]["kind"] == "snapshot"
+    assert rows[-1]["token_id"] == "10"
+    assert rows[-1]["book_epoch"] > invalidation["book_epoch"]
     assert rows[-1]["raw_wire_bytes_preserved"] is False
 
 

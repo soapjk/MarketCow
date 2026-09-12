@@ -39,6 +39,8 @@ def _write_new(path: Path, raw: bytes) -> None:
 async def build_package(endpoint: str, output: Path, *, now: datetime) -> dict:
     if not output.is_absolute() or output.exists():
         raise ValueError("new_absolute_output_required")
+    if endpoint != "http://127.0.0.1:18898":
+        raise ValueError("research_endpoint_must_be_loopback_18898")
     output.mkdir(mode=0o700, parents=True)
     published = []
     try:
@@ -54,9 +56,11 @@ async def build_package(endpoint: str, output: Path, *, now: datetime) -> dict:
             review_raw = _canonical(row["review"])
             binding_raw = _canonical(row["binding"])
             evidence_path = market_root / "evidence.json"
+            review_path = market_root / "review.json"
+            binding_path = market_root / "binding.json"
             _write_new(evidence_path, evidence_raw)
-            _write_new(market_root / "review.json", review_raw)
-            _write_new(market_root / "binding.json", binding_raw)
+            _write_new(review_path, review_raw)
+            _write_new(binding_path, binding_raw)
             markets.append(
                 {
                     "market_id": market_id,
@@ -64,6 +68,10 @@ async def build_package(endpoint: str, output: Path, *, now: datetime) -> dict:
                     "token_ids": [row["binding"]["up_token"], row["binding"]["down_token"]],
                     "rule_evidence_path": str(evidence_path),
                     "rule_evidence_sha256": hashlib.sha256(evidence_raw).hexdigest(),
+                    "rule_review_path": str(review_path),
+                    "rule_review_sha256": hashlib.sha256(review_raw).hexdigest(),
+                    "binding_path": str(binding_path),
+                    "binding_sha256": hashlib.sha256(binding_raw).hexdigest(),
                 }
             )
         config = {

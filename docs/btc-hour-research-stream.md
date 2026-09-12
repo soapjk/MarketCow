@@ -8,7 +8,7 @@ Build and run locally:
 
 ```text
 cargo build --release -p marketcowd --example btc_research_stream
-target/release/examples/btc_research_stream /absolute/config.json /absolute/new-output
+target/release/examples/btc_research_stream /absolute/package /absolute/new-output
 ```
 
 The config schema is
@@ -64,7 +64,7 @@ and writes a content-bound Rust config. It does not start a subscription.
 python -m marketcow.btc_research_package --endpoint http://127.0.0.1:18898 \
   --output /ABSOLUTE/NEW/PACKAGE
 target/release/examples/btc_research_stream \
-  /ABSOLUTE/NEW/PACKAGE/stream-config.json /ABSOLUTE/NEW/CAPTURE
+  /ABSOLUTE/NEW/PACKAGE /ABSOLUTE/NEW/CAPTURE
 ```
 
 The generated config fixes the observation at 1,800 seconds, at most three
@@ -73,6 +73,13 @@ data. Persistence is a separate 8-batch/64-MiB bounded queue. A budget breach
 exits nonzero and produces no `complete` report. This is an application archive
 bound, not a hard bound on TLS/WebSocket headers or heartbeat traffic; a NIC-byte
 cap requires OS accounting and is not claimed.
+
+The Rust executable does not accept a bare config. Before any WebSocket is
+opened it requires `manifest.json`, requires its source endpoint to be exactly
+`http://127.0.0.1:18898`, binds the manifest to the config and all evidence,
+review and binding files, checks ordered Up/Down identities and exact three-hour
+windows, and rejects packages more than five minutes old. A partial package whose
+manifest publication failed is therefore not startable.
 
 Renewal is explicit: after the process ends, generate a fresh package, review
 the new current/next-two identities, and use a new output directory. Evidence
