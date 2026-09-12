@@ -95,6 +95,10 @@ struct Memory {
     // book.
     book_exchanges: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
     markets: BTreeMap<String, Arc<Value>>,
+    // Authoritative lifecycle tombstones. This bounded set prevents any late
+    // transport frame from resurrecting recovery/book state after terminal
+    // publication, even if an unsubscribe receipt is still in flight.
+    terminal_markets: std::collections::BTreeSet<String>,
     replay: VecDeque<Arc<Batch>>,
     replay_bytes: usize,
     snapshot_leases: BTreeMap<u64, std::time::Instant>,
@@ -296,7 +300,7 @@ impl Publication {
         let mut books = BTreeMap::new();
         let mut book_cursors = BTreeMap::new();
         let mut book_exchanges = BTreeMap::new();
-        let mut markets = BTreeMap::new();
+        let mut markets: BTreeMap<String, Arc<Value>> = BTreeMap::new();
         let mut state_sizes = BTreeMap::new();
         if let Some(state) = &base {
             ensure!(
@@ -372,6 +376,16 @@ impl Publication {
             }
             state["token_recoveries"] = json!([]);
         }
+        let terminal_markets = markets
+            .iter()
+            .filter(|(_, market)| {
+                matches!(
+                    market["lifecycle_state"].as_str(),
+                    Some("closed" | "resolved" | "invalid")
+                )
+            })
+            .map(|(market, _)| market.clone())
+            .collect();
         let memory = Arc::new(Mutex::new(Memory {
             retirement_submitted:0,retirement_persisted:0,
             acquisition_statistics:None,
@@ -387,6 +401,7 @@ impl Publication {
             book_cursors,
             book_exchanges,
             markets,
+            terminal_markets,
             replay: VecDeque::new(),
             replay_bytes: 0,
             snapshot_leases: BTreeMap::new(),
@@ -514,7 +529,10 @@ impl Publication {
             m.confirmations.remove(token);m.recoveries.remove(token);
             self.tokens.remove(token);
         }
-        for market in &markets {m.markets.remove(market);}
+        for market in &markets {
+            m.markets.remove(market);
+            m.terminal_markets.remove(market);
+        }
         if let Some(gaps)=m.base.as_mut().and_then(|base|base["gaps"].as_array_mut()) {
             gaps.retain(|gap|!gap["token_id"].as_str().is_some_and(|t|tokens.contains(t))
                 && !gap["market_id"].as_str().is_some_and(|id|markets.contains(id)));
@@ -949,6 +967,14 @@ impl Publication {
         ensure!(bytes <= self.batch_cap, "batch byte limit");
         let mut m = self.memory.lock().unwrap();
         ensure!(m.error.is_none(), "persistence failed: {:?}", m.error);
+        if !terminal {
+            ensure!(
+                events.iter().all(|event| event["market_id"]
+                    .as_str()
+                    .is_some_and(|market| !m.terminal_markets.contains(market))),
+                "event targets terminal market"
+            );
+        }
         let mut recoveries = m.recoveries.clone();
         if terminal {
             for token in events[0]["canonical_payload"]["retired_token_ids"]
@@ -1013,10 +1039,15 @@ impl Publication {
             if is_token_recovery(event) {
                 continue;
             }
+            if terminal {
+                m.terminal_markets
+                    .insert(event["market_id"].as_str().unwrap().to_owned());
+            }
             if m.base.is_some() {
                 if terminal {
+                    let market_id = event["market_id"].as_str().unwrap().to_owned();
                     m.markets.insert(
-                        event["market_id"].as_str().unwrap().into(),
+                        market_id,
                         Arc::new(event["canonical_payload"]["market"].clone()),
                     );
                 } else {
@@ -1320,6 +1351,21 @@ mod tests {
             SnapshotBoundary {market_id:"1",condition_id:"condition",token_id:token,recovery_id:"test",
                 cursor:after+i as u64+1, received_at:chrono::DateTime::from_timestamp(1700000001,0).unwrap()}).unwrap()).collect()
     }
+    fn terminal_event(cursor: u64) -> Value {
+        let mut terminal = events(cursor - 1).remove(0);
+        terminal["event_type"] = json!("market_terminal");
+        terminal["token_id"] = Value::Null;
+        terminal["canonical_payload"] = json!({"retired_token_ids":["11","12"],"market":{
+            "identity":{"market_id":"1","condition_id":"condition","outcomes":[{"token_id":"11"},{"token_id":"12"}]},
+            "lifecycle_state":"closed","closed":true,"accepting_orders":false,"resolution":null,
+            "lifecycle_source":"polymarket_gamma","terminal_at":"2026-01-01T00:00:00Z",
+            "lifecycle_evidence_sha256":"a".repeat(64)}});
+        terminal["canonical_payload_sha256"] =
+            json!(canonical_hash(&terminal["canonical_payload"]));
+        terminal.as_object_mut().unwrap().remove("event_id");
+        terminal["event_id"] = json!(canonical_hash(&terminal));
+        terminal
+    }
     fn tokens() -> BTreeMap<String, String> {
         [("11".into(), "1".into()), ("12".into(), "1".into())].into()
     }
@@ -1400,6 +1446,36 @@ mod tests {
         release.send(()).unwrap();
         p.finish().await.unwrap();
         assert_eq!(rows.into_iter().collect::<Vec<_>>(),vec!["events","retired"]);
+    }
+
+    #[tokio::test]
+    async fn terminal_market_cannot_be_resurrected_by_late_book_or_gap() {
+        let mut p = Publication::start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(()))
+            .unwrap();
+        p.publish(events(0), None).unwrap();
+        p.publish(vec![terminal_event(3)], None).unwrap();
+        let view = p.capture_view().unwrap();
+        assert_eq!(view.cursor, 3);
+        assert_eq!(view.markets["1"]["lifecycle_state"], "closed");
+
+        let error = p.publish(events(3), None).unwrap_err().to_string();
+        assert!(error.contains("terminal market"), "{error}");
+
+        let mut late_gap = events(3).remove(0);
+        late_gap["event_type"] = json!("recovery_started");
+        late_gap["canonical_payload"] = json!({"recovery_scope":"token","token_id":"11",
+            "recovery_id":"late-gap","reason":"source_connection_gap"});
+        late_gap["gaps"] = json!([{"token_id":"11","code":"coverage_gap","resolved":false,
+            "detected_at":"2026-01-01T00:00:00Z","event_at":null,"expected":null,
+            "observed":null,"resolution":null}]);
+        late_gap["canonical_payload_sha256"] =
+            json!(canonical_hash(&late_gap["canonical_payload"]));
+        late_gap.as_object_mut().unwrap().remove("event_id");
+        late_gap["event_id"] = json!(canonical_hash(&late_gap));
+        let error = p.publish(vec![late_gap], None).unwrap_err().to_string();
+        assert!(error.contains("terminal market"), "{error}");
+        assert_eq!(p.capture_view().unwrap().cursor, 3);
+        p.finish().await.unwrap();
     }
 
     #[tokio::test]

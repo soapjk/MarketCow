@@ -1576,8 +1576,23 @@ async fn run_connection(
     let lifecycle_network = Arc::new(tokio::sync::Semaphore::new(network_concurrency));
     let mut lifecycle_jobs = tokio::task::JoinSet::<(super::Market, Result<Option<Value>>)>::new();
     let mut lifecycle_pending = BTreeSet::new();
-    let mut lifecycle_terminal = BTreeSet::new();
+    // The durable lifecycle overlay is authoritative across process restarts.
+    // Seed the runtime fence from it instead of waiting for another Gamma read.
+    let mut lifecycle_terminal: BTreeSet<String> = lifecycle_markets
+        .iter()
+        .filter(|(_, market)| {
+            matches!(
+                market["lifecycle_state"].as_str(),
+                Some("closed" | "resolved" | "invalid")
+            )
+        })
+        .map(|(market, _)| market.clone())
+        .collect();
     let mut lifecycle_retry_at = BTreeMap::<String, tokio::time::Instant>::new();
+    // Terminal publication fences reducers immediately. Wire unsubscribe is
+    // reconciled independently because its receipt can be delayed by another
+    // bounded shard command. One entry per market keeps this state bounded.
+    let mut terminal_unsubscribes = BTreeMap::<String, BTreeSet<String>>::new();
     let mut recovery_jobs = tokio::task::JoinSet::<MarketRecoveryResult>::new();
     let mut freshness_jobs = tokio::task::JoinSet::<FreshnessResult>::new();
     let mut recovering_markets = BTreeSet::new();
@@ -1818,17 +1833,49 @@ async fn run_connection(
                             publication.publish_with_capacity_and_evidence(
                                 vec![event], Some(evidence.clone()),
                             ).await?;
-                            if adapter
-                                .identities
-                                .values()
-                                .any(|(owner, _)| owner == &market.market_id)
-                            {
-                                pipeline.retire_market(adapter, &market.market_id)?;
-                            }
                             lifecycle_terminal.insert(market.market_id.clone());
+                            let retired_tokens = if pipeline.has_market(&market.market_id) {
+                                pipeline
+                                    .remove_market(adapter, &market.market_id)?
+                                    .into_iter()
+                                    .collect::<BTreeSet<_>>()
+                            } else {
+                                BTreeSet::new()
+                            };
+                            if !retired_tokens.is_empty() {
+                                acquisition_tokens.retain(|token| !retired_tokens.contains(token));
+                                terminal_unsubscribes
+                                    .insert(market.market_id.clone(), retired_tokens.clone());
+                                recovery_retry_at.remove(&market.market_id);
+                                recovery_failures.remove(&market.market_id);
+                                recovering_markets.remove(&market.market_id);
+                                freshness_queued.remove(&market.market_id);
+                                freshness_pending.remove(&market.market_id);
+                                freshness_retry_at.remove(&market.market_id);
+                                confirmation_markets
+                                    .retain(|item| item.market_id != market.market_id);
+                                confirmation_membership.send_replace(
+                                    confirmation_markets
+                                        .iter()
+                                        .map(|item| item.market_id.clone())
+                                        .collect(),
+                                );
+                                // Local ownership is already fenced. A busy
+                                // command slot is item-local and retried by the
+                                // scheduler; it must not fail the whole source.
+                                if let Err(error) = jobs.request_retire(&retired_tokens) {
+                                    eprintln!("{}", json!({
+                                        "stage":"lifecycle_wire_retirement_retry",
+                                        "market_id":market.market_id,
+                                        "detail":error.to_string()
+                                    }));
+                                }
+                            }
                             eprintln!("{}",json!({"stage":"lifecycle_terminal_published",
                                 "market_id":market.market_id,
-                                "evidence_sha256":evidence["raw_response_sha256"]}));
+                                "evidence_sha256":evidence["raw_response_sha256"],
+                                "retired_token_count":retired_tokens.len(),
+                                "wire_unsubscribe_pending":!retired_tokens.is_empty()}));
                         }
                         Ok(None) => eprintln!("{}",json!({"stage":"lifecycle_not_terminal",
                             "market_id":market.market_id})),
@@ -1840,6 +1887,14 @@ async fn run_connection(
                 completed=recovery_jobs.join_next(), if !recovery_jobs.is_empty()=>{
                     let (market_id, attempts, result) = completed.context("recovery task missing")??;
                     recovering_markets.remove(&market_id);
+                    // A lifecycle result can retire a market while a bounded
+                    // recovery socket is still in flight. Its eventual result
+                    // must not recreate retry state or submit a late snapshot.
+                    if lifecycle_terminal.contains(&market_id) {
+                        recovery_failures.remove(&market_id);
+                        recovery_retry_at.remove(&market_id);
+                        continue;
+                    }
                     match result {
                         Ok(frames) => {
                             recovery_failures.remove(&market_id);
@@ -1907,8 +1962,16 @@ async fn run_connection(
                 },
                 completed=freshness_jobs.join_next(), if !freshness_jobs.is_empty()=>{
                     let (market, requested, result) = completed.context("freshness task missing")??;
-                    if !confirmation_membership.borrow().contains(&market.market_id){continue;}
                     freshness_pending.remove(&market.market_id);
+                    // The terminal transition removes confirmation membership,
+                    // but an already running task may complete afterward.
+                    // Fence it before it can confirm or replace retired state.
+                    if lifecycle_terminal.contains(&market.market_id)
+                        || !confirmation_membership.borrow().contains(&market.market_id)
+                    {
+                        freshness_retry_at.remove(&market.market_id);
+                        continue;
+                    }
                     freshness_retry_at.insert(
                         market.market_id.clone(),
                         tokio::time::Instant::now()
@@ -1975,6 +2038,29 @@ async fn run_connection(
                 },
                 _=retry_tick.tick()=>{
                     if let Err(error)=jobs.poll_retirements(){eprintln!("{}",json!({"stage":"acquisition_retirement_error","error":error.to_string()}));}
+                    let pending_terminal_markets = terminal_unsubscribes
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for market_id in pending_terminal_markets {
+                        let tokens = terminal_unsubscribes[&market_id].clone();
+                        match jobs.request_retire(&tokens) {
+                            Ok(true) => {
+                                terminal_unsubscribes.remove(&market_id);
+                                eprintln!("{}",json!({
+                                    "stage":"lifecycle_wire_retirement_complete",
+                                    "market_id":market_id,
+                                    "token_count":tokens.len()
+                                }));
+                            }
+                            Ok(false) => {}
+                            Err(error) => eprintln!("{}",json!({
+                                "stage":"lifecycle_wire_retirement_retry",
+                                "market_id":market_id,
+                                "detail":error.to_string()
+                            })),
+                        }
+                    }
                     publication.set_acquisition_statistics(jobs.statistics());
                     rest_submitted.retain(|token, attempt| adapter.recoveries.get(token) == Some(attempt));
                     // Coalesce all pending token gaps for one market into one
