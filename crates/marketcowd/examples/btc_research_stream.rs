@@ -266,6 +266,12 @@ async fn load_package(
         now >= created && now - audit <= chrono::Duration::seconds(MAX_PACKAGE_AGE_SECONDS),
         "package expired or future"
     );
+    let audit_hour = audit.timestamp().div_euclid(3600) * 3600;
+    let now_hour = now.timestamp().div_euclid(3600) * 3600;
+    ensure!(
+        now_hour == audit_hour,
+        "package UTC hour expired; rebuild package"
+    );
     let config_path = package.join("stream-config.json");
     ensure!(
         manifest.stream_config_path == config_path,
@@ -290,7 +296,6 @@ async fn load_package(
             && config.maximum_pending_bytes == 64 * 1024 * 1024,
         "fixed package resource profile"
     );
-    let audit_hour = audit.timestamp().div_euclid(3600) * 3600;
     for (index, market) in config.markets.iter().enumerate() {
         let root = package.join(&market.market_id);
         ensure!(
@@ -695,9 +700,11 @@ mod tests {
 
     #[tokio::test]
     async fn complete_package_is_required_and_expires() {
-        let audit = Utc::now() - chrono::Duration::seconds(2);
+        let audit = Utc.with_ymd_and_hms(2026, 9, 12, 10, 58, 0).unwrap();
         let root = package(audit);
-        let (config, _, _, _) = load_package(root.path(), Utc::now()).await.unwrap();
+        let (config, _, _, _) = load_package(root.path(), audit + chrono::Duration::seconds(2))
+            .await
+            .unwrap();
         assert_eq!(config.markets.len(), 3);
         let expired = load_package(root.path(), audit + chrono::Duration::seconds(301))
             .await
@@ -708,8 +715,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crossing_utc_hour_requires_fresh_package_even_within_five_minutes() {
+        let audit = Utc.with_ymd_and_hms(2026, 9, 12, 10, 59, 58).unwrap();
+        let root = package(audit);
+        let error = load_package(
+            root.path(),
+            Utc.with_ymd_and_hms(2026, 9, 12, 11, 0, 2).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("UTC hour expired"));
+    }
+
+    #[tokio::test]
     async fn ordered_outcome_binding_cannot_be_swapped() {
-        let audit = Utc::now() - chrono::Duration::seconds(2);
+        let audit = Utc.with_ymd_and_hms(2026, 9, 12, 10, 58, 0).unwrap();
         let root = package(audit);
         let path = root.path().join("1/evidence.json");
         let mut value: serde_json::Value =
@@ -726,7 +746,9 @@ mod tests {
                 .unwrap();
         manifest["stream_config_sha256"] = hex::encode(Sha256::digest(&config_raw)).into();
         write_value(&root.path().join("manifest.json"), &manifest);
-        let error = load_package(root.path(), Utc::now()).await.unwrap_err();
+        let error = load_package(root.path(), audit + chrono::Duration::seconds(2))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("ordered Up/Down"));
     }
 }
