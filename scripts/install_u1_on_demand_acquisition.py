@@ -122,11 +122,19 @@ def main() -> None:
                    if value.endswith("/marketcow-discovery-collector")]
         if len(indexes) != 1 or "--input-mode" not in argv or argv[argv.index("--input-mode") + 1] != "websocket":
             raise ValueError(f"unexpected {name} command")
-        if "--scope-control-socket" not in argv or "--acquisition-lease-required" in argv:
+        if "--scope-control-socket" not in argv:
             raise ValueError(f"unexpected {name} control profile")
         root = Path(argv[argv.index("--root") + 1]).resolve(strict=True)
         argv[indexes[0]] = str(release / "marketcow-discovery-collector")
-        argv.extend(lease_args)
+        if "--acquisition-lease-required" in argv:
+            if (argv.count("--acquisition-lease-required") != 1
+                    or argv.count("--acquisition-lease-capacity") != 1
+                    or argv.count("--acquisition-lease-max-seconds") != 1):
+                raise ValueError(f"ambiguous {name} lease profile")
+            argv[argv.index("--acquisition-lease-capacity") + 1] = str(args.lease_capacity)
+            argv[argv.index("--acquisition-lease-max-seconds") + 1] = str(args.lease_max_seconds)
+        else:
+            argv.extend(lease_args)
         if argv.count("--log") != 1:
             raise ValueError(f"unexpected {name} log")
         argv[argv.index("--log") + 1] = str(RUNTIME / "logs" / f"{args.release}-{pool}.log")
