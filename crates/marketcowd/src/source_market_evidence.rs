@@ -240,6 +240,9 @@ pub fn project_execution(
             "formula":"fee = shares * rate * (price * (1 - price)) ^ exponent","exponent":exponent,
             "taker_only":true,"quantum":"0.00001","rounding_decimal_places":5,"rounding_mode":null,
             "effective_at":null,"maker_base_fee_bps":maker_base_fee,"taker_base_fee_bps":taker_base_fee,
+            "applicable_parameter_source":"fd",
+            "base_fee_fields_applicability":"preserved_source_fields_not_used_for_clob_v2_dynamic_fee_calculation",
+            "applicability_basis":"CLOB V2 determines fees at match time and directs clients to fd.r/fd.e/fd.to",
             "version_sha256":hash,"complete":false,
             "missing_fields":["rounding_mode","effective_at"]
         },
@@ -557,6 +560,9 @@ mod tests {
         assert_eq!(p["instrument"]["price_increment"], "0.01");
         assert!(p["instrument"]["size_increment"].is_null());
         assert_eq!(p["fee_schedule"]["taker_rate"], "0.07");
+        assert_eq!(p["fee_schedule"]["applicable_parameter_source"], "fd");
+        assert_eq!(p["fee_schedule"]["maker_base_fee_bps"], "1000");
+        assert_eq!(p["fee_schedule"]["taker_base_fee_bps"], "1000");
         assert_eq!(p["fee_schedule"]["currency"], "USDC");
         assert!(p["fee_schedule"]["rounding_mode"].is_null());
         assert!(p["fee_schedule"]["effective_at"].is_null());
