@@ -153,6 +153,14 @@ pub struct PublicReplay {
     pub confirmation_books: Vec<Arc<Value>>,
 }
 impl MemoryReader {
+    /// Control-plane identity remains readable while acquisition is
+    /// intentionally paused. This does not expose books, cursors or a usable
+    /// market-data snapshot and therefore cannot bypass the readiness fence.
+    pub fn installed_markets(&self)->Result<BTreeMap<String,Arc<Value>>> {
+        let memory=self.memory.lock().map_err(|_|anyhow::anyhow!("publication poisoned"))?;
+        ensure!(memory.error.is_none(),"publication persistence failed");
+        Ok(memory.markets.clone())
+    }
     pub fn acquisition_statistics(&self)->Option<Value> {
         self.memory.lock().ok()?.acquisition_statistics.map(|(tokens,sockets,retiring)|
             json!({"tokens":tokens,"sockets":sockets,"retiring_shards":retiring}))
@@ -2202,6 +2210,7 @@ mod tests {
         assert!(p.fresh_tokens_ready(&BTreeSet::from(["11".into(),"12".into()])));
         p.pause_source().unwrap();
         assert!(!p.fresh_tokens_ready(&BTreeSet::from(["11".into(),"12".into()])));
+        assert!(reader.installed_markets().is_ok());
         assert!(reader.capture().is_err());assert!(reader.replay(0,0,64,65536).is_err());
         assert!(p.shutdown_recovery_facts().unwrap().1.is_empty());
         p.set_source_ready(true);assert!(reader.replay(0,0,64,65536).is_err());
