@@ -81,6 +81,7 @@ struct Memory {
     acquisition_statistics:Option<(usize,usize,usize)>,
     recoveries: BTreeMap<String, Value>,
     source_ready: bool,
+    resume_floor:u64,
     cursor: u64,
     persisted: u64,
     queued: usize,
@@ -188,6 +189,7 @@ impl MemoryReader {
         let m = self.memory.lock().unwrap();
         ensure!(m.source_ready && m.error.is_none(), "source unavailable");
         ensure!(after <= m.cursor, "future cursor");
+        ensure!(after>=m.resume_floor,"memory replay expired");
         let mut batches = Vec::new();
         let mut next = after;
         let mut bytes = 0usize;
@@ -391,6 +393,7 @@ impl Publication {
             acquisition_statistics:None,
             recoveries,
             source_ready: true,
+            resume_floor:0,
             cursor,
             persisted: cursor,
             queued: 0,
@@ -627,6 +630,25 @@ impl Publication {
     pub fn set_source_ready(&self, ready: bool) {
         self.memory.lock().unwrap().source_ready = ready;
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+    pub fn is_source_ready(&self)->bool {self.memory.lock().unwrap().source_ready}
+    pub fn fresh_tokens_ready(&self,tokens:&std::collections::BTreeSet<String>)->bool {
+        let Ok(memory)=self.memory.lock()else{return false;};
+        memory.error.is_none()&&!tokens.is_empty()&&tokens.iter().all(|token|
+            memory.book_cursors.get(token).is_some_and(|cursor|*cursor>=memory.resume_floor)
+                && !memory.recoveries.contains_key(token))
+    }
+    /// Intentionally stop acquisition without manufacturing an upstream gap.
+    /// Existing consumers cannot resume across this boundary; the next lease
+    /// must establish fresh books and obtain a new full-sync.
+    pub fn pause_source(&self)->Result<()> {
+        let mut memory=self.memory.lock().map_err(|_|anyhow::anyhow!("publication poisoned"))?;
+        memory.source_ready=false;
+        memory.resume_floor=memory.cursor.checked_add(1).context("resume floor overflow")?;
+        memory.replay.clear();memory.replay_bytes=0;memory.snapshot_leases.clear();
+        drop(memory);
+        self.changed.send_modify(|n|*n=n.wrapping_add(1));
+        Ok(())
     }
     pub fn set_acquisition_statistics(&self,statistics:(usize,usize,usize)) {
         self.memory.lock().unwrap().acquisition_statistics=Some(statistics);
@@ -1342,6 +1364,7 @@ async fn serve(mut socket: WebSocket, stream: Arc<Stream>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use futures_util::{SinkExt, StreamExt};
     use marketcow_polymarket::discovery_source::{SnapshotBoundary, snapshot_event};
     fn events(after: u64) -> Vec<Value> {
@@ -2168,6 +2191,20 @@ mod tests {
         assert!(p.capture_view().is_err());
         assert_eq!(p.shutdown_recovery_facts().unwrap().0,0);
         assert!(p.reader().capture().is_err());
+        p.finish().await.unwrap();
+    }
+    #[tokio::test]
+    async fn intentional_pause_fences_old_resume_without_creating_a_gap() {
+        let mut p=Publication::start(0,Some(seed()),tokens(),4,65536,16384, |_|Ok(())).unwrap();
+        p.publish(events(0),None).unwrap();
+        let mut changed=p.changed.subscribe();while p.persisted_cursor()<2{changed.changed().await.unwrap();}
+        let reader=p.reader();assert!(reader.replay(0,0,64,65536).is_ok());
+        assert!(p.fresh_tokens_ready(&BTreeSet::from(["11".into(),"12".into()])));
+        p.pause_source().unwrap();
+        assert!(!p.fresh_tokens_ready(&BTreeSet::from(["11".into(),"12".into()])));
+        assert!(reader.capture().is_err());assert!(reader.replay(0,0,64,65536).is_err());
+        assert!(p.shutdown_recovery_facts().unwrap().1.is_empty());
+        p.set_source_ready(true);assert!(reader.replay(0,0,64,65536).is_err());
         p.finish().await.unwrap();
     }
 

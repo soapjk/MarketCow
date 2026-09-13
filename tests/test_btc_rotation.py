@@ -109,6 +109,29 @@ def test_existing_http_routes_and_no_redirect_retry():
         operations.close()
 
 
+def test_acquisition_lease_http_contract_uses_dedicated_routes():
+    import httpx
+    seen=[]
+    def handler(request):
+        seen.append((request.method,request.url.path,request.content))
+        return httpx.Response(200,json={"schema_version":"marketcow.acquisition-lease-status.v1","source_ready":False})
+    operations=HotHttpOperations("http://127.0.0.1:18898","synthetic",timeout=1,maximum_bytes=65536,
+                                 transport=httpx.MockTransport(handler))
+    try:
+        status=operations.acquisition_lease_status("live")
+        common=dict(pool="live",lease_id="paper",expected_scope_id="scope",expected_revision=2)
+        operations.acquire_acquisition(**common,ttl_seconds=30,market_ids=["1","2"])
+        operations.renew_acquisition(**common,ttl_seconds=30)
+        operations.release_acquisition(**common)
+        assert status["source_ready"] is False
+        assert [path for _,path,_ in seen]==[
+            "/v1/prediction-markets/polymarket/acquisition-leases/status",
+            "/v1/prediction-markets/polymarket/acquisition-leases/acquire",
+            "/v1/prediction-markets/polymarket/acquisition-leases/renew",
+            "/v1/prediction-markets/polymarket/acquisition-leases/release"]
+    finally: operations.close()
+
+
 DISCOVERY = {
     "schema_version": "tradude.marketcow.discovery-selection-request.v1",
     "request_id": "1789038000000:" + "a" * 32,

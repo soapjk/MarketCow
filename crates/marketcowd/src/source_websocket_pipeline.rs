@@ -582,6 +582,22 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Fence every queued/in-flight frame at an intentional acquisition
+    /// boundary without creating recovery facts. Existing genuine recovery
+    /// identities remain attached and can only complete from a fresh book.
+    pub(super) fn pause_all(&self,router:&mut Adapter)->Result<()> {
+        router.reset_connection();
+        for (market,owner) in &self.controls {
+            let mut control=owner.lock().map_err(|_|anyhow::anyhow!("market control poisoned"))?;
+            control.generation=control.generation.checked_add(1).context("market generation overflow")?;
+            control.baseline_admitted=false;
+            control.attempts=router.recoveries.iter().filter(|(token,_)|
+                router.identities.get(*token).is_some_and(|(owner,_)|owner==market))
+                .map(|(token,attempt)|(token.clone(),attempt.clone())).collect();
+        }
+        Ok(())
+    }
+
     pub(super) async fn publish(
         &self,
         router: &mut Adapter,
@@ -779,6 +795,22 @@ mod tests {
         pipeline.dispatch.close();pipeline.dispatch.join().await;
         assert!(output.recv().await.is_none());
         publication.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intentional_pause_fences_actor_results_without_creating_recovery() {
+        let mut router=fixture();
+        let tokens=router.identities.iter().map(|(token,(market,_))|(token.clone(),market.clone())).collect();
+        let mut publication=Publication::start(0,Some(json!({"latest_cursor":0,"catalog_revision":"catalog",
+            "markets":[],"books":[],"gaps":[]})),tokens,4,65536,16384,|_|Ok(())).unwrap();
+        let (mut pipeline,mut output)=Pipeline::start_with_workers(&router,1).unwrap();
+        pipeline.submit(&mut router,&mut publication,book("11"),None).await.unwrap();
+        pipeline.pause_all(&mut router).unwrap();
+        if let Ok(Some(completed))=tokio::time::timeout(std::time::Duration::from_millis(100),output.recv()).await {
+            pipeline.publish(&mut router,&mut publication,completed).await.unwrap();
+        }
+        assert_eq!(publication.cursor().unwrap(),0);assert!(router.recoveries.is_empty());
+        pipeline.dispatch.close();pipeline.dispatch.join().await;publication.finish().await.unwrap();
     }
 
     #[tokio::test]

@@ -132,34 +132,38 @@ pub async fn run(args:&Args,plan:&Plan,publication:&mut Publication,
             request=acquisition.recv()=>{
                 let Some(request)=request else{anyhow::bail!("REST control owner stopped");};
                 let outcome=(||->Result<Value>{
-                    if !request.retire_market_ids.is_empty(){
-                        publication.check_retirement(request.retire_market_ids.clone())?;
-                        if request.validate_only{return Ok(json!({"retirement_validated":true,"publication_applied":false}));}
+                    let super::source_scope_control::AcquisitionAction::Scope{validate_only,catalog_revision,records,
+                        evidence_sha256,acquisition_market_ids,retire_market_ids}=request.action else {
+                        anyhow::bail!("acquisition leases require WebSocket input mode");
+                    };
+                    if !retire_market_ids.is_empty(){
+                        publication.check_retirement(retire_market_ids.clone())?;
+                        if validate_only{return Ok(json!({"retirement_validated":true,"publication_applied":false}));}
                         {let mut state=pool.members.write().map_err(|_|anyhow::anyhow!("REST owner poisoned"))?;
-                            for id in &request.retire_market_ids {state.rows.remove(id);}}
-                        publication.retire_catalog_markets(request.retire_market_ids.clone())?;
+                            for id in &retire_market_ids {state.rows.remove(id);}}
+                        publication.retire_catalog_markets(retire_market_ids.clone())?;
                         publication.set_acquisition_statistics(pool.statistics()?);
-                        return Ok(json!({"retirement_queued":true,"retired_market_ids":request.retire_market_ids,
+                        return Ok(json!({"retirement_queued":true,"retired_market_ids":retire_market_ids,
                             "transport":"rest_poll","late_responses_fenced":true}));
                     }
-                    publication.check_catalog_admission(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,
-                        &request.acquisition_market_ids,pool.maximum_tokens)?;
+                    publication.check_catalog_admission(&catalog_revision,records.clone(),&evidence_sha256,
+                        &acquisition_market_ids,pool.maximum_tokens)?;
                     let mut markets=vec![];
-                    for record in &request.records {
+                    for record in &records {
                         let id=record["identity"]["market_id"].as_str().context("REST market id")?;
-                        if !request.acquisition_market_ids.contains(id){continue;}
+                        if !acquisition_market_ids.contains(id){continue;}
                         let tokens:Vec<String>=record["identity"]["outcomes"].as_array().context("REST outcomes")?.iter()
                             .map(|o|o["token_id"].as_str().map(str::to_owned).context("REST token")).collect::<Result<_>>()?;
                         markets.push(Market{market_id:id.into(),condition_id:record["identity"]["condition_id"].as_str().context("REST condition")?.into(),
                             token_ids:tokens.try_into().map_err(|_|anyhow::anyhow!("REST binary pair"))?});
                     }
                     pool.validate(&markets)?;
-                    if request.validate_only{return Ok(json!({"acquisition_validated":true,"publication_applied":false}));}
-                    publication.admit_catalog_markets_scoped(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,
-                        &request.acquisition_market_ids,pool.maximum_tokens)?;
+                    if validate_only{return Ok(json!({"acquisition_validated":true,"publication_applied":false}));}
+                    publication.admit_catalog_markets_scoped(&catalog_revision,records.clone(),&evidence_sha256,
+                        &acquisition_market_ids,pool.maximum_tokens)?;
                     pool.add(markets)?;publication.set_acquisition_statistics(pool.statistics()?);
                     Ok(json!({"acquisition_installed":true,"publication_applied":false,"transport":"rest_poll",
-                        "requested_market_ids":request.acquisition_market_ids,"book_readiness_not_implied":true}))
+                        "requested_market_ids":acquisition_market_ids,"book_readiness_not_implied":true}))
                 })();let _=request.receipt.send(outcome);
             },
             message=receiver.recv()=>{

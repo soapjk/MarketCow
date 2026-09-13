@@ -41,7 +41,7 @@ def create_control_app(control: UniverseControl, *, callers: tuple[Caller, ...],
                 or not caller.scopes <= ({"catalog.read", "discovery.admit"} |
                     ({"runtime.read", "runtime.activate"} if runtime_operations is not None else set()) |
                     ({"discovery.prepare"} if discovery_preparation is not None else set()) |
-                    ({"hot.read", "hot.prepare", "hot.activate", "hot.retire"} if hot_operations is not None else set()))):
+                    ({"hot.read", "hot.prepare", "hot.activate", "hot.retire", "acquisition.lease"} if hot_operations is not None else set()))):
             raise ValueError("invalid scoped caller")
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     slots = threading.BoundedSemaphore(control.profile["catalog"]["concurrent_readers"])
@@ -181,17 +181,22 @@ def create_control_app(control: UniverseControl, *, callers: tuple[Caller, ...],
             try:
                 scope = {"status": "runtime.read", "apply": "runtime.activate", "prepare": "discovery.prepare",
                     "hot_status": "hot.read", "hot_discovery": "hot.prepare", "hot_live": "hot.prepare",
-                    "hot_activate": "hot.activate", "hot_retire": "hot.retire", "hot_collect": "hot.retire", "hot_reconcile": "hot.prepare"}[operation]
+                    "hot_activate": "hot.activate", "hot_retire": "hot.retire", "hot_collect": "hot.retire", "hot_reconcile": "hot.prepare",
+                    "lease_status": "acquisition.lease", "lease_acquire": "acquisition.lease",
+                    "lease_renew": "acquisition.lease", "lease_release": "acquisition.lease"}[operation]
                 caller = authenticate(request, scope)
                 if not runtime_slot.acquire(blocking=False):
                     raise ControlError("resource_unavailable", 429, retryable=True)
                 acquired = True
-                if operation in ("status", "hot_status"):
+                if operation in ("status", "hot_status", "lease_status"):
                     params = query(request, {"pool"})
                     if params["pool"] not in ("discovery", "live"):
                         raise ControlError("invalid_schema", 400)
-                    target = hot_operations if operation == "hot_status" else runtime_operations
-                    action = lambda: target.status(params["pool"])
+                    if operation == "lease_status":
+                        action = lambda: hot_operations.acquisition_lease_status(params["pool"])
+                    else:
+                        target = hot_operations if operation == "hot_status" else runtime_operations
+                        action = lambda: target.status(params["pool"])
                 else:
                     from marketcow.universe_generation_operations import parse_operation
                     query(request, set())
@@ -207,7 +212,7 @@ def create_control_app(control: UniverseControl, *, callers: tuple[Caller, ...],
                         if operation in ("prepare", "hot_discovery"):
                             from marketcow.universe_discovery_preparation import parse_preparation_request
                             return parse_preparation_request(raw, maximum)
-                        if operation.startswith("hot_"):
+                        if operation.startswith("hot_") or operation.startswith("lease_"):
                             from marketcow.universe_rust_control import _unique
                             def invalid_constant(_):
                                 raise ValueError("nonfinite JSON")
@@ -219,6 +224,8 @@ def create_control_app(control: UniverseControl, *, callers: tuple[Caller, ...],
                     payload = await asyncio.wait_for(read_operation(), body_timeout_seconds)
                     if operation == "hot_discovery":
                         action = lambda: hot_operations.prepare_discovery(caller, *payload)
+                    elif operation in ("lease_acquire", "lease_renew", "lease_release"):
+                        action = lambda: hot_operations.acquisition_lease(caller, payload, operation.removeprefix("lease_"))
                     elif operation in ("hot_live", "hot_activate", "hot_retire", "hot_reconcile", "hot_collect"):
                         method_name = {"hot_live": "prepare_live", "hot_activate": "activate", "hot_retire": "retire",
                                        "hot_reconcile": "reconcile", "hot_collect": "collect"}[operation]
@@ -230,7 +237,7 @@ def create_control_app(control: UniverseControl, *, callers: tuple[Caller, ...],
                 def run():
                     try:
                         body = wire_bytes(action())
-                        response_cap = control.profile["admission"]["max_response_bytes"] if operation.startswith("hot_") else 65536
+                        response_cap = control.profile["admission"]["max_response_bytes"] if operation.startswith(("hot_", "lease_")) else 65536
                         if len(body) > response_cap:
                             raise ValueError("runtime response byte cap")
                         return body
@@ -297,5 +304,21 @@ def create_control_app(control: UniverseControl, *, callers: tuple[Caller, ...],
             @app.post(PREFIX + "/hot-scopes/collect")
             async def hot_collect(request: Request):
                 return await runtime_handle(request, "hot_collect")
+
+            @app.get(PREFIX + "/acquisition-leases/status")
+            async def acquisition_lease_status(request: Request):
+                return await runtime_handle(request, "lease_status")
+
+            @app.post(PREFIX + "/acquisition-leases/acquire")
+            async def acquisition_lease_acquire(request: Request):
+                return await runtime_handle(request, "lease_acquire")
+
+            @app.post(PREFIX + "/acquisition-leases/renew")
+            async def acquisition_lease_renew(request: Request):
+                return await runtime_handle(request, "lease_renew")
+
+            @app.post(PREFIX + "/acquisition-leases/release")
+            async def acquisition_lease_release(request: Request):
+                return await runtime_handle(request, "lease_release")
 
     return app

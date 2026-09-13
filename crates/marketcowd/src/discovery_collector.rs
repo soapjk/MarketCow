@@ -22,6 +22,7 @@ mod source_market_evidence;
 mod source_scope_control;
 mod source_scope_journal;
 mod source_acquisition_shards;
+mod source_acquisition_lease;
 mod source_rest_pool;
 mod source_scope_registry;
 mod source_public_frame;
@@ -156,6 +157,14 @@ struct Args {
     acquisition_token_budget:Option<usize>,
     #[arg(long, requires="scope_control_socket")]
     acquisition_socket_budget:Option<usize>,
+    /// Keep APIs/control alive but acquire upstream sockets only while a
+    /// bounded consumer lease exists. Leases are intentionally process-local.
+    #[arg(long,requires_all=["scope_control_socket","acquisition_lease_capacity","acquisition_lease_max_seconds"])]
+    acquisition_lease_required:bool,
+    #[arg(long,requires="acquisition_lease_required")]
+    acquisition_lease_capacity:Option<usize>,
+    #[arg(long,requires="acquisition_lease_required")]
+    acquisition_lease_max_seconds:Option<u64>,
     /// Independent direct Rust Discovery surface over this frozen universe.
     #[arg(long, conflicts_with_all=["configured_scope", "public_listen", "live_listen"], requires_all=["discovery_seed", "discovery_seed_sha256", "discovery_state_bytes", "discovery_full_sync_bytes", "discovery_frame_bytes", "discovery_replay_bytes", "discovery_clients", "discovery_baselines", "discovery_send_timeout_seconds"])]
     discovery_listen:Option<std::net::SocketAddr>,
@@ -495,6 +504,11 @@ async fn main() -> Result<()> {
         "explicit universe count and byte budgets required"
     );
     ensure!(args.cycles != Some(0), "cycles must be positive");
+    ensure!(!args.acquisition_lease_required||(
+        args.input_mode==InputMode::Websocket
+        && args.acquisition_lease_capacity.is_some_and(|n|(1..=64).contains(&n))
+        && args.acquisition_lease_max_seconds.is_some_and(|n|(1..=3600).contains(&n))),
+        "on-demand acquisition requires bounded WebSocket leases");
     ensure!(
         args.lifecycle_refresh_seconds != Some(0),
         "lifecycle interval must be positive"

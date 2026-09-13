@@ -12,11 +12,16 @@ use crate::{source_public_api::{PublicScopeControl,ConfiguredScope},
 
 pub enum Backend {Live(PublicScopeControl),Discovery(DiscoveryScopeControl)}
 
+pub enum AcquisitionAction {
+    Scope {validate_only:bool,catalog_revision:String,records:Vec<Value>,evidence_sha256:String,
+        acquisition_market_ids:std::collections::BTreeSet<String>,retire_market_ids:std::collections::BTreeSet<String>},
+    LeaseStatus,
+    AcquireLease {lease_id:String,ttl_seconds:u64,market_ids:std::collections::BTreeSet<String>},
+    RenewLease {lease_id:String,ttl_seconds:u64},
+    ReleaseLease {lease_id:String},
+}
 pub struct AcquisitionRequest {
-    pub validate_only:bool,
-    pub catalog_revision:String,pub records:Vec<Value>,pub evidence_sha256:String,
-    pub acquisition_market_ids:std::collections::BTreeSet<String>,
-    pub retire_market_ids:std::collections::BTreeSet<String>,
+    pub action:AcquisitionAction,
     pub receipt:tokio::sync::oneshot::Sender<Result<Value>>,
 }
 pub type AcquisitionSender=tokio::sync::mpsc::Sender<AcquisitionRequest>;
@@ -30,6 +35,11 @@ enum Command {
     PrepareAcquisition {expected_scope_id:String,expected_revision:u64,catalog_revision:String,
         records:Vec<Value>,evidence_sha256:String,acquisition_market_ids:Vec<String>},
     RetireAcquisition {expected_scope_id:String,expected_revision:u64,market_ids:Vec<String>},
+    AcquisitionLeaseStatus,
+    AcquireAcquisitionLease {expected_scope_id:String,expected_revision:u64,lease_id:String,
+        ttl_seconds:u64,market_ids:Vec<String>},
+    RenewAcquisitionLease {expected_scope_id:String,expected_revision:u64,lease_id:String,ttl_seconds:u64},
+    ReleaseAcquisitionLease {expected_scope_id:String,expected_revision:u64,lease_id:String},
 }
 
 impl Backend {
@@ -47,6 +57,21 @@ impl Backend {
         let command:Command=serde_json::from_value(value)?;
         let (expected,revision,config,publish)=match command {
             Command::Status=>return self.status(),
+            Command::AcquisitionLeaseStatus=>return send_acquisition(acquisition,AcquisitionAction::LeaseStatus),
+            Command::AcquireAcquisitionLease{expected_scope_id,expected_revision,lease_id,ttl_seconds,market_ids}=>{
+                self.check_incumbent(&expected_scope_id,expected_revision)?;
+                ensure!(!market_ids.is_empty()&&market_ids.len()<=4096&&market_ids.windows(2).all(|p|p[0]<p[1]),"sorted unique lease market ids required");
+                ensure!(valid_lease_id(&lease_id),"invalid acquisition lease id");
+                return send_acquisition(acquisition,AcquisitionAction::AcquireLease{lease_id,ttl_seconds,market_ids:market_ids.into_iter().collect()});
+            },
+            Command::RenewAcquisitionLease{expected_scope_id,expected_revision,lease_id,ttl_seconds}=>{
+                self.check_incumbent(&expected_scope_id,expected_revision)?;ensure!(valid_lease_id(&lease_id),"invalid acquisition lease id");
+                return send_acquisition(acquisition,AcquisitionAction::RenewLease{lease_id,ttl_seconds});
+            },
+            Command::ReleaseAcquisitionLease{expected_scope_id,expected_revision,lease_id}=>{
+                self.check_incumbent(&expected_scope_id,expected_revision)?;ensure!(valid_lease_id(&lease_id),"invalid acquisition lease id");
+                return send_acquisition(acquisition,AcquisitionAction::ReleaseLease{lease_id});
+            },
             Command::RetireAcquisition{expected_scope_id,expected_revision,market_ids}=>{
                 let active=self.status()?;
                 let identity=if active["pool"]=="discovery"{&active["projection_id"]}else{&active["scope_id"]};
@@ -60,9 +85,9 @@ impl Backend {
                         if let Some(journal)=journal.as_mut(){journal.retire(&ids,active["retirement_submitted"].as_u64().context("retirement status")?.checked_add(1).context("retirement overflow")?)?;}
                     }
                     let (receipt,done)=tokio::sync::oneshot::channel();
-                    acquisition.context("managed acquisition unavailable")?.try_send(AcquisitionRequest{
+                    acquisition.context("managed acquisition unavailable")?.try_send(AcquisitionRequest{action:AcquisitionAction::Scope{
                         validate_only,catalog_revision:String::new(),records:vec![],evidence_sha256:String::new(),
-                        acquisition_market_ids:Default::default(),retire_market_ids:ids.clone(),receipt})
+                        acquisition_market_ids:Default::default(),retire_market_ids:ids.clone()},receipt})
                         .map_err(|_|anyhow::anyhow!("acquisition command busy or stopped"))?;
                     let result=done.blocking_recv().context("acquisition owner stopped")??;
                     if !validate_only{return Ok(result);}
@@ -79,9 +104,9 @@ impl Backend {
                 for validate_only in [true,false] {
                     if !validate_only {if let Some(journal)=journal.as_mut(){journal.admit(&records,&ids)?;}}
                     let (receipt,done)=tokio::sync::oneshot::channel();
-                    acquisition.context("managed acquisition unavailable")?.try_send(AcquisitionRequest{validate_only,
-                        catalog_revision:catalog_revision.clone(),records:records.clone(),evidence_sha256:evidence_sha256.clone(),receipt,
-                        acquisition_market_ids:ids.clone(),retire_market_ids:Default::default()})
+                    acquisition.context("managed acquisition unavailable")?.try_send(AcquisitionRequest{action:AcquisitionAction::Scope{validate_only,
+                        catalog_revision:catalog_revision.clone(),records:records.clone(),evidence_sha256:evidence_sha256.clone(),
+                        acquisition_market_ids:ids.clone(),retire_market_ids:Default::default()},receipt})
                         .map_err(|_|anyhow::anyhow!("acquisition command busy or stopped"))?;
                     let result=done.blocking_recv().context("acquisition owner stopped")??;
                     if !validate_only{return Ok(result);}
@@ -117,6 +142,22 @@ impl Backend {
         Ok(json!({"publication_applied":publish,"actual":self.status()?,
             "acquisition_prepared_by_this_operation":false}))
     }
+}
+
+impl Backend {
+    fn check_incumbent(&self,expected:&str,revision:u64)->Result<()> {
+        let active=self.status()?;let identity=if active["pool"]=="discovery"{&active["projection_id"]}else{&active["scope_id"]};
+        ensure!(identity==expected&&active["revision"]==revision,"acquisition lease incumbent conflict");Ok(())
+    }
+}
+fn valid_lease_id(value:&str)->bool {
+    !value.is_empty()&&value.len()<=128&&value.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'-'|b'_'|b'.'|b':'))
+}
+fn send_acquisition(sender:Option<&AcquisitionSender>,action:AcquisitionAction)->Result<Value> {
+    let (receipt,done)=tokio::sync::oneshot::channel();
+    sender.context("managed acquisition unavailable")?.try_send(AcquisitionRequest{action,receipt})
+        .map_err(|_|anyhow::anyhow!("acquisition command busy or stopped"))?;
+    done.blocking_recv().context("acquisition owner stopped")?
 }
 
 struct SocketOwner {path:PathBuf,device:u64,inode:u64}
@@ -218,10 +259,18 @@ mod tests {
         let directory=PathBuf::from(short_tmp).join(format!("mc-control-{}",uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();std::fs::set_permissions(&directory,std::fs::Permissions::from_mode(0o700)).unwrap();
         let path=directory.join("s");
-        let task=start(&path,65536,Duration::from_secs(1),Backend::Discovery(control),None,None).unwrap();
+        let (send,mut receive)=tokio::sync::mpsc::channel::<AcquisitionRequest>(1);
+        let responder=tokio::spawn(async move {let request=receive.recv().await.unwrap();
+            assert!(matches!(request.action,AcquisitionAction::AcquireLease{ttl_seconds:30,..}));
+            request.receipt.send(Ok(json!({"source_ready":false}))).unwrap();});
+        let task=start(&path,65536,Duration::from_secs(1),Backend::Discovery(control),Some(send),None).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);
         let status=command(&path,br#"{"operation":"status"}"#.to_vec()).await;
         assert_eq!(status["result"]["projection_id"],"a".repeat(64));
+        let lease=json!({"operation":"acquire_acquisition_lease","expected_scope_id":"a".repeat(64),
+            "expected_revision":1,"lease_id":"paper:1","ttl_seconds":30,"market_ids":["1"]});
+        assert_eq!(command(&path,serde_json::to_vec(&lease).unwrap()).await["result"]["source_ready"],false);
+        responder.await.unwrap();
         let rejected=command(&path,br#"{"operation":"status","operation":"status"}"#.to_vec()).await;
         assert_eq!(rejected["ok"],false);
         let mut request=json!({"operation":"prepare_publication","expected_scope_id":"a".repeat(64),

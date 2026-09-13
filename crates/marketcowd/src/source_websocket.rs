@@ -53,6 +53,10 @@ struct Adapter {
     last_trades: BTreeMap<String, Price>,
     recoveries: BTreeMap<String, String>,
 }
+struct ScopeAcquisition {
+    validate_only:bool,catalog_revision:String,records:Vec<Value>,evidence_sha256:String,
+    acquisition_market_ids:BTreeSet<String>,retire_market_ids:BTreeSet<String>,
+}
 impl Adapter {
     /// The owner has already bound this exact identity to catalog metadata.
     /// New reducers start without tick/book/freshness state; snapshots must
@@ -1226,6 +1230,9 @@ pub async fn run(
         acquisition,
         args.acquisition_token_budget.unwrap_or(2048),
         args.acquisition_socket_budget.unwrap_or(1024),
+        args.acquisition_lease_required,
+        args.acquisition_lease_capacity.unwrap_or(0),
+        args.acquisition_lease_max_seconds.unwrap_or(0),
     )
     .await
 }
@@ -1405,6 +1412,24 @@ fn connection_shards(
     Ok(shards)
 }
 
+fn eligible_markets(adapter:&Adapter)->BTreeSet<String> {
+    adapter.identities.values().map(|(market,_)|market.clone()).collect()
+}
+fn eligible_pairs(adapter:&Adapter)->Result<Vec<[String;2]>> {
+    let mut pairs=BTreeMap::<String,Vec<String>>::new();
+    for (token,(market,_)) in &adapter.identities {pairs.entry(market.clone()).or_default().push(token.clone());}
+    pairs.into_values().map(|mut pair|{pair.sort();pair.try_into().map_err(|_|anyhow::anyhow!("eligible acquisition market pair"))}).collect()
+}
+fn pause_acquisition(adapter:&mut Adapter,pipeline:&pipeline::Pipeline,publication:&Publication,jobs:&mut super::source_acquisition_shards::Shards)->Result<()> {
+    publication.pause_source()?;pipeline.pause_all(adapter)?;
+    let tokens=jobs.tokens();if !tokens.is_empty(){let _=jobs.request_retire(&tokens)?;}
+    publication.set_acquisition_statistics(jobs.statistics());Ok(())
+}
+fn lease_status(leases:&super::source_acquisition_lease::Leases,adapter:&Adapter,publication:&Publication,now:std::time::Instant)->Value {
+    let mut value=leases.status(&eligible_markets(adapter),now);
+    value["source_ready"]=json!(publication.is_source_ready());value
+}
+
 struct ConfirmationBatch {
     markets: Vec<super::Market>,
     request_started_at: chrono::DateTime<Utc>,
@@ -1449,7 +1474,7 @@ async fn run_confirmations(
         let network = network.clone();
         let sender = sender.clone();
         let mut shutdown = shutdown.clone();
-        let membership=membership.clone();
+        let mut membership=membership.clone();
         jobs.spawn(async move {
             let offset = audit_batch_offset(interval_seconds, batch_index, batch_count);
             if !offset.is_zero() {
@@ -1466,7 +1491,13 @@ async fn run_confirmations(
                     return Ok::<(), anyhow::Error>(());
                 }
                 let batch:Vec<_>=batch.iter().filter(|market|membership.borrow().contains(&market.market_id)).cloned().collect();
-                if batch.is_empty(){return Ok(());}
+                if batch.is_empty(){
+                    tokio::select! {
+                        value=membership.changed()=>{value?;continue;},
+                        value=shutdown.changed()=>{value?;if *shutdown.borrow(){return Ok(());}},
+                    }
+                    continue;
+                }
                 let cycle_started = tokio::time::Instant::now();
                 let permit = tokio::select! {
                     permit = network.clone().acquire_owned() => permit?,
@@ -1537,6 +1568,9 @@ async fn run_connection(
     mut acquisition:Option<tokio::sync::mpsc::Receiver<super::source_scope_control::AcquisitionRequest>>,
     acquisition_token_budget:usize,
     acquisition_socket_budget:usize,
+    acquisition_lease_required:bool,
+    acquisition_lease_capacity:usize,
+    acquisition_lease_max_seconds:u64,
 ) -> Result<()> {
     let (mut pipeline, mut completed_markets) = pipeline::Pipeline::start_with_workers(adapter, market_workers)?;
     let mut acquisition_tokens:BTreeSet<_>=adapter.identities.keys().cloned().collect();
@@ -1548,7 +1582,9 @@ async fn run_connection(
     for (token,(market,_)) in &adapter.identities {initial_pairs.entry(market.clone()).or_default().push(token.clone());}
     let initial_pairs:Vec<[String;2]>=initial_pairs.into_values().map(|pair|pair.try_into()
         .map_err(|_|anyhow::anyhow!("initial acquisition market pair"))).collect::<Result<_>>()?;
-    jobs.add_pairs(&initial_pairs)?;
+    let mut leases=super::source_acquisition_lease::Leases::new(acquisition_lease_required,
+        acquisition_lease_capacity,std::time::Duration::from_secs(acquisition_lease_max_seconds))?;
+    if leases.enabled(){jobs.add_pairs(&initial_pairs)?;}else{pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;}
     publication.set_acquisition_statistics(jobs.statistics());
     drop(sender);
     let (confirmation_sender, mut confirmation_receiver) =
@@ -1556,7 +1592,8 @@ async fn run_connection(
     let confirmation_shutdown = shutdown.clone();
     let confirmation_network=Arc::new(tokio::sync::Semaphore::new(network_concurrency));
     let (confirmation_membership,confirmation_members)=tokio::sync::watch::channel(
-        confirmation_markets.iter().map(|market|market.market_id.clone()).collect::<BTreeSet<_>>());
+        if leases.enabled(){confirmation_markets.iter().map(|market|market.market_id.clone()).collect::<BTreeSet<_>>()}
+        else{BTreeSet::new()});
     let mut added_confirmation_jobs=tokio::task::JoinSet::new();
     let confirmation_job = tokio::spawn(run_confirmations(
         confirmation_markets.clone(),
@@ -1609,7 +1646,7 @@ async fn run_connection(
     // A copied generation can already contain lifecycle-only terminal rows
     // from an earlier run. Re-observe only those bounded plan members whose
     // payout remained unresolved; never rescan the catalog.
-    for market in lifecycle_candidates {
+    for market in if leases.enabled(){lifecycle_candidates}else{Vec::new()} {
         let seed_market = lifecycle_markets
             .get(&market.market_id)
             .context("lifecycle candidate missing from seed")?;
@@ -1630,13 +1667,58 @@ async fn run_connection(
             });
         }
     }
-    publication.set_source_ready(true);
+    publication.set_source_ready(leases.enabled());
     let result:Result<()>=async {
         loop {
             let frames=tokio::select! {
                 request=async {match acquisition.as_mut(){Some(rx)=>rx.recv().await,None=>std::future::pending().await}}=>{
                     let Some(request)=request else {acquisition=None;continue;};
                     let result=(||->Result<Value>{
+                        use super::source_scope_control::AcquisitionAction;
+                        let command_now=std::time::Instant::now();
+                        if leases.required()&&leases.expire(command_now)>0&&!leases.enabled(){
+                            confirmation_membership.send_replace(BTreeSet::new());
+                            pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                        }
+                        let request=match request.action {
+                            AcquisitionAction::LeaseStatus=>return Ok(lease_status(&leases,adapter,publication,command_now)),
+                            AcquisitionAction::AcquireLease{lease_id,ttl_seconds,market_ids}=>{
+                                let now=std::time::Instant::now();let eligible=eligible_markets(adapter);let was_enabled=leases.enabled();
+                                leases.acquire(lease_id,std::time::Duration::from_secs(ttl_seconds),market_ids,&eligible,now)?;
+                                if !was_enabled&&jobs.tokens().is_empty() {
+                                    jobs.add_pairs(&eligible_pairs(adapter)?)?;
+                                    confirmation_membership.send_replace(eligible.clone());
+                                    publication.set_acquisition_statistics(jobs.statistics());
+                                }
+                                if !was_enabled {
+                                    for record in lifecycle_markets.values().filter(|record|matches!(record["lifecycle_state"].as_str(),
+                                        Some("closed"|"resolved"|"invalid"))&&record["resolution"].is_null()) {
+                                        let market=catalog_market(record)?;
+                                        if !lifecycle_pending.insert(market.market_id.clone()){continue;}
+                                        let client=lifecycle_client.clone();let network=lifecycle_network.clone();
+                                        lifecycle_jobs.spawn(async move {let _permit=network.acquire_owned().await;
+                                            let result=super::source_lifecycle::refresh(client,market.clone(),response_byte_limit).await;
+                                            (market,result)});
+                                    }
+                                }
+                                return Ok(lease_status(&leases,adapter,publication,now));
+                            },
+                            AcquisitionAction::RenewLease{lease_id,ttl_seconds}=>{
+                                let now=std::time::Instant::now();leases.renew(&lease_id,std::time::Duration::from_secs(ttl_seconds),now)?;
+                                return Ok(lease_status(&leases,adapter,publication,now));
+                            },
+                            AcquisitionAction::ReleaseLease{lease_id}=>{
+                                let now=std::time::Instant::now();leases.release(&lease_id)?;
+                                if !leases.enabled(){
+                                    confirmation_membership.send_replace(BTreeSet::new());
+                                    pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                                }
+                                return Ok(lease_status(&leases,adapter,publication,now));
+                            },
+                            AcquisitionAction::Scope{validate_only,catalog_revision,records,evidence_sha256,
+                                acquisition_market_ids,retire_market_ids}=>ScopeAcquisition{validate_only,catalog_revision,
+                                    records,evidence_sha256,acquisition_market_ids,retire_market_ids},
+                        };
                         if !request.retire_market_ids.is_empty() {
                             let removed=&request.retire_market_ids;
                             publication.check_retirement(removed.clone())?;
@@ -1683,12 +1765,12 @@ async fn run_connection(
                         publication.admit_catalog_markets_scoped(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,
                             &request.acquisition_market_ids,acquisition_token_budget)?;
                         for market in &added {pipeline.install_admitted_market(adapter,publication,market)?;}
-                        jobs.add_pairs(&pairs)?;
+                        if leases.enabled(){jobs.add_pairs(&pairs)?;}
                         publication.set_acquisition_statistics(jobs.statistics());
                         acquisition_tokens=adapter.identities.keys().cloned().collect();
                         for record in request.records {lifecycle_markets.insert(record["identity"]["market_id"].as_str().unwrap().to_owned(),record);}
                         let added_ids:Vec<_>=added.iter().map(|m|m.market_id.clone()).collect();
-                        if !added.is_empty() {
+                        if !added.is_empty()&&leases.enabled() {
                             confirmation_markets.extend(added.clone());
                             confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
                             added_confirmation_jobs.spawn(run_confirmations(added,request_market_batch_size,network_concurrency,
@@ -1713,6 +1795,7 @@ async fn run_connection(
                 },
                 confirmation=confirmation_receiver.recv()=>{
                     let confirmation = confirmation.context("REST confirmation stopped")?;
+                    if !leases.enabled(){continue;}
                     match confirmation.result {
                         Err(error) => eprintln!("{}", json!({"stage":"rest_confirmation_request_failed","detail":error.to_string()})),
                         Ok((books, received_at)) => {
@@ -1817,6 +1900,7 @@ async fn run_connection(
                     let (market, result) = completed.context("lifecycle task missing")??;
                     if !lifecycle_markets.contains_key(&market.market_id){continue;}
                     lifecycle_pending.remove(&market.market_id);
+                    if !leases.enabled(){continue;}
                     lifecycle_retry_at.insert(
                         market.market_id.clone(),
                         tokio::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -1887,6 +1971,7 @@ async fn run_connection(
                 completed=recovery_jobs.join_next(), if !recovery_jobs.is_empty()=>{
                     let (market_id, attempts, result) = completed.context("recovery task missing")??;
                     recovering_markets.remove(&market_id);
+                    if !leases.enabled(){continue;}
                     // A lifecycle result can retire a market while a bounded
                     // recovery socket is still in flight. Its eventual result
                     // must not recreate retry state or submit a late snapshot.
@@ -1963,6 +2048,7 @@ async fn run_connection(
                 completed=freshness_jobs.join_next(), if !freshness_jobs.is_empty()=>{
                     let (market, requested, result) = completed.context("freshness task missing")??;
                     freshness_pending.remove(&market.market_id);
+                    if !leases.enabled(){continue;}
                     // The terminal transition removes confirmation membership,
                     // but an already running task may complete afterward.
                     // Fence it before it can confirm or replace retired state.
@@ -2037,7 +2123,17 @@ async fn run_connection(
                     continue;
                 },
                 _=retry_tick.tick()=>{
+                    if leases.required()&&leases.expire(std::time::Instant::now())>0&&!leases.enabled(){
+                        confirmation_membership.send_replace(BTreeSet::new());
+                        pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                        eprintln!("{}",json!({"stage":"acquisition_lease_expired","acquisition_enabled":false}));
+                    }
                     if let Err(error)=jobs.poll_retirements(){eprintln!("{}",json!({"stage":"acquisition_retirement_error","error":error.to_string()}));}
+                    if leases.enabled()&&jobs.tokens().is_empty(){
+                        jobs.add_pairs(&eligible_pairs(adapter)?)?;
+                        confirmation_membership.send_replace(eligible_markets(adapter));
+                        publication.set_acquisition_statistics(jobs.statistics());
+                    }
                     let pending_terminal_markets = terminal_unsubscribes
                         .keys()
                         .cloned()
@@ -2062,6 +2158,11 @@ async fn run_connection(
                         }
                     }
                     publication.set_acquisition_statistics(jobs.statistics());
+                    if leases.enabled()&&!publication.is_source_ready()&&publication.fresh_tokens_ready(&acquisition_tokens){
+                        publication.set_source_ready(true);
+                        eprintln!("{}",json!({"stage":"acquisition_lease_ready","source_cursor":publication.cursor()?}));
+                    }
+                    if !leases.enabled(){continue;}
                     rest_submitted.retain(|token, attempt| adapter.recoveries.get(token) == Some(attempt));
                     // Coalesce all pending token gaps for one market into one
                     // temporary subscription. Repeated shard boundaries cannot
@@ -2092,6 +2193,7 @@ async fn run_connection(
                 _=&mut shutdown_requested=>break,
             };
             for frame in frames {
+                if !leases.enabled(){continue;}
                 if !marketcow_polymarket::subscription::owned_or_unclassified(&frame.raw_payload,&acquisition_tokens){continue;}
                 // Consume completed work between admissions, not only after
                 // the whole upstream batch. A bounded drain prevents either
