@@ -18,6 +18,7 @@ from .btc_discovery import discover
 
 
 SCHEMA = "marketcow.btc-hour.rust-research-stream-config.v1"
+RESEARCH_ENDPOINT = "http://192.168.124.3:8793"
 
 
 def _canonical(value) -> bytes:
@@ -39,8 +40,8 @@ def _write_new(path: Path, raw: bytes) -> None:
 async def build_package(endpoint: str, output: Path, *, now: datetime) -> dict:
     if not output.is_absolute() or output.exists():
         raise ValueError("new_absolute_output_required")
-    if endpoint != "http://127.0.0.1:18898":
-        raise ValueError("research_endpoint_must_be_loopback_18898")
+    if endpoint != RESEARCH_ENDPOINT:
+        raise ValueError("research_endpoint_must_be_formal_rust_live_api")
     output.mkdir(mode=0o700, parents=True)
     published = []
     try:

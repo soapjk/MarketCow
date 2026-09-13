@@ -36,7 +36,7 @@ async def test_builds_exact_reviewed_fixed_budget_package(tmp_path, monkeypatch)
 
     monkeypatch.setattr(subject, "discover", discover)
     root = tmp_path / "package"
-    result = await subject.build_package("http://127.0.0.1:18898", root, now=datetime(2026, 9, 12, tzinfo=timezone.utc))
+    result = await subject.build_package(subject.RESEARCH_ENDPOINT, root, now=datetime(2026, 9, 12, tzinfo=timezone.utc))
     config_raw = (root / "stream-config.json").read_bytes()
     config = json.loads(config_raw)
     assert result["stream_config_sha256"] == hashlib.sha256(config_raw).hexdigest()
@@ -55,17 +55,17 @@ async def test_incomplete_discovery_does_not_publish_manifest(tmp_path, monkeypa
     monkeypatch.setattr(subject, "discover", discover)
     root = tmp_path / "incomplete"
     with pytest.raises(ValueError, match="three_reviewed_hours_required"):
-        await subject.build_package("http://127.0.0.1:18898", root, now=datetime(2026, 9, 12, tzinfo=timezone.utc))
+        await subject.build_package(subject.RESEARCH_ENDPOINT, root, now=datetime(2026, 9, 12, tzinfo=timezone.utc))
     assert not (root / "manifest.json").exists()
 
 
 @pytest.mark.asyncio
-async def test_rejects_data_plane_or_unconfigured_endpoint_before_io(tmp_path, monkeypatch):
+async def test_rejects_unconfigured_endpoint_before_io(tmp_path, monkeypatch):
     async def forbidden(*args, **kwargs):
         raise AssertionError("network called")
 
     monkeypatch.setattr(subject, "discover", forbidden)
-    with pytest.raises(ValueError, match="loopback_18898"):
+    with pytest.raises(ValueError, match="formal_rust_live_api"):
         await subject.build_package(
             "http://127.0.0.1:8793",
             tmp_path / "wrong-endpoint",

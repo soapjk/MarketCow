@@ -24,7 +24,7 @@ use tokio::{
 };
 
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
-const RESEARCH_ENDPOINT: &str = "http://127.0.0.1:18898";
+const RESEARCH_ENDPOINT: &str = "http://192.168.124.3:8793";
 const MAX_PACKAGE_AGE_SECONDS: i64 = 300;
 const BINANCE_HOUR_RULE: &str = "This market will resolve to \"Up\" if the close price is greater than or equal to the open price for the BTC/USDT 1 hour candle that begins on the time and date specified in the title. Otherwise, this market will resolve to \"Down\".\n\nThe resolution source for this market is information from Binance, specifically the BTC/USDT pair (https://www.binance.com/en/trade/BTC_USDT). The close « C » and open « O » displayed at the top of the graph for the relevant \"1H\" candle will be used once the data for that candle is finalized.\n\nPlease note that this market is about the price according to Binance BTC/USDT, not according to other exchanges or trading pairs.";
 

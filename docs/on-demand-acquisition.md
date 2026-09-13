@@ -142,6 +142,7 @@ conditions.
 
 The independent BTC research package is outside this lease lifecycle. Its
 `btc_research_stream` opens its own explicitly bounded official WebSocket and
-does not use the shared Live/Discovery pools. Its bounded 18898 rule/evidence
-reads remain available while acquisition is paused because the resident control
-service and catalog/evidence routes do not depend on a Live/Discovery lease.
+does not use the shared Live/Discovery pools. Its bounded rule/evidence reads
+use the Rust Live API at `192.168.124.3:8793`, not the 18898 control listener,
+and remain available while acquisition is paused because that route does not
+depend on a Live/Discovery lease.

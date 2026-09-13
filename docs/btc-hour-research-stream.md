@@ -61,7 +61,7 @@ retains each full rule response, verifies the Binance finalized 1H BTC/USDT rule
 and writes a content-bound Rust config. It does not start a subscription.
 
 ```text
-python -m marketcow.btc_research_package --endpoint http://127.0.0.1:18898 \
+python -m marketcow.btc_research_package --endpoint http://192.168.124.3:8793 \
   --output /ABSOLUTE/NEW/PACKAGE
 target/release/examples/btc_research_stream \
   /ABSOLUTE/NEW/PACKAGE /ABSOLUTE/NEW/CAPTURE
@@ -76,7 +76,7 @@ cap requires OS accounting and is not claimed.
 
 The Rust executable does not accept a bare config. Before any WebSocket is
 opened it requires `manifest.json`, requires its source endpoint to be exactly
-`http://127.0.0.1:18898`, binds the manifest to the config and all evidence,
+`http://192.168.124.3:8793`, binds the manifest to the config and all evidence,
 review and binding files, checks ordered Up/Down identities and exact three-hour
 windows, and rejects packages more than five minutes old. A partial package whose
 manifest publication failed is therefore not startable.
