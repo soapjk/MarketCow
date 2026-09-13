@@ -15,8 +15,9 @@ pub enum Backend {Live(PublicScopeControl),Discovery(DiscoveryScopeControl)}
 pub enum AcquisitionAction {
     Scope {validate_only:bool,catalog_revision:String,records:Vec<Value>,evidence_sha256:String,
         acquisition_market_ids:std::collections::BTreeSet<String>,retire_market_ids:std::collections::BTreeSet<String>},
-    LeaseStatus,
-    AcquireLease {lease_id:String,ttl_seconds:u64,market_ids:std::collections::BTreeSet<String>},
+    LeaseStatus {eligible_market_ids:std::collections::BTreeSet<String>},
+    AcquireLease {lease_id:String,ttl_seconds:u64,market_ids:std::collections::BTreeSet<String>,
+        eligible_market_ids:std::collections::BTreeSet<String>},
     RenewLease {lease_id:String,ttl_seconds:u64},
     ReleaseLease {lease_id:String},
 }
@@ -57,12 +58,14 @@ impl Backend {
         let command:Command=serde_json::from_value(value)?;
         let (expected,revision,config,publish)=match command {
             Command::Status=>return self.status(),
-            Command::AcquisitionLeaseStatus=>return send_acquisition(acquisition,AcquisitionAction::LeaseStatus),
+            Command::AcquisitionLeaseStatus=>return send_acquisition(acquisition,AcquisitionAction::LeaseStatus{
+                eligible_market_ids:self.referenced_markets()?}),
             Command::AcquireAcquisitionLease{expected_scope_id,expected_revision,lease_id,ttl_seconds,market_ids}=>{
                 self.check_incumbent(&expected_scope_id,expected_revision)?;
                 ensure!(!market_ids.is_empty()&&market_ids.len()<=4096&&market_ids.windows(2).all(|p|p[0]<p[1]),"sorted unique lease market ids required");
                 ensure!(valid_lease_id(&lease_id),"invalid acquisition lease id");
-                return send_acquisition(acquisition,AcquisitionAction::AcquireLease{lease_id,ttl_seconds,market_ids:market_ids.into_iter().collect()});
+                return send_acquisition(acquisition,AcquisitionAction::AcquireLease{lease_id,ttl_seconds,
+                    market_ids:market_ids.into_iter().collect(),eligible_market_ids:self.referenced_markets()?});
             },
             Command::RenewAcquisitionLease{expected_scope_id,expected_revision,lease_id,ttl_seconds}=>{
                 self.check_incumbent(&expected_scope_id,expected_revision)?;ensure!(valid_lease_id(&lease_id),"invalid acquisition lease id");
@@ -145,6 +148,9 @@ impl Backend {
 }
 
 impl Backend {
+    fn referenced_markets(&self)->Result<std::collections::BTreeSet<String>> {
+        match self {Self::Live(control)=>control.referenced_markets(),Self::Discovery(control)=>control.referenced_markets()}
+    }
     fn check_incumbent(&self,expected:&str,revision:u64)->Result<()> {
         let active=self.status()?;let identity=if active["pool"]=="discovery"{&active["projection_id"]}else{&active["scope_id"]};
         ensure!(identity==expected&&active["revision"]==revision,"acquisition lease incumbent conflict");Ok(())

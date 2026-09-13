@@ -45,6 +45,9 @@ impl Leases {
     pub fn enabled(&self) -> bool {
         !self.required || !self.leases.is_empty()
     }
+    pub fn market_ids(&self) -> BTreeSet<String> {
+        self.leases.values().flat_map(|lease|lease.markets.iter().cloned()).collect()
+    }
     pub fn acquire(
         &mut self,
         id: String,

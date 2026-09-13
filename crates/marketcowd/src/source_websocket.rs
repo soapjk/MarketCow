@@ -1412,12 +1412,14 @@ fn connection_shards(
     Ok(shards)
 }
 
-fn eligible_markets(adapter:&Adapter)->BTreeSet<String> {
-    adapter.identities.values().map(|(market,_)|market.clone()).collect()
+fn eligible_markets(adapter:&Adapter, requested:&BTreeSet<String>)->BTreeSet<String> {
+    adapter.identities.values().map(|(market,_)|market.clone()).filter(|market|requested.contains(market)).collect()
 }
-fn eligible_pairs(adapter:&Adapter)->Result<Vec<[String;2]>> {
+fn eligible_pairs(adapter:&Adapter, markets:&BTreeSet<String>)->Result<Vec<[String;2]>> {
     let mut pairs=BTreeMap::<String,Vec<String>>::new();
-    for (token,(market,_)) in &adapter.identities {pairs.entry(market.clone()).or_default().push(token.clone());}
+    for (token,(market,_)) in &adapter.identities {
+        if markets.contains(market){pairs.entry(market.clone()).or_default().push(token.clone());}
+    }
     pairs.into_values().map(|mut pair|{pair.sort();pair.try_into().map_err(|_|anyhow::anyhow!("eligible acquisition market pair"))}).collect()
 }
 fn pause_acquisition(adapter:&mut Adapter,pipeline:&pipeline::Pipeline,publication:&Publication,jobs:&mut super::source_acquisition_shards::Shards)->Result<()> {
@@ -1425,8 +1427,9 @@ fn pause_acquisition(adapter:&mut Adapter,pipeline:&pipeline::Pipeline,publicati
     let tokens=jobs.tokens();if !tokens.is_empty(){let _=jobs.request_retire(&tokens)?;}
     publication.set_acquisition_statistics(jobs.statistics());Ok(())
 }
-fn lease_status(leases:&super::source_acquisition_lease::Leases,adapter:&Adapter,publication:&Publication,now:std::time::Instant)->Value {
-    let mut value=leases.status(&eligible_markets(adapter),now);
+fn lease_status(leases:&super::source_acquisition_lease::Leases,adapter:&Adapter,publication:&Publication,
+    requested:&BTreeSet<String>,now:std::time::Instant)->Value {
+    let mut value=leases.status(&eligible_markets(adapter,requested),now);
     value["source_ready"]=json!(publication.is_source_ready());value
 }
 
@@ -1681,13 +1684,16 @@ async fn run_connection(
                             pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
                         }
                         let request=match request.action {
-                            AcquisitionAction::LeaseStatus=>return Ok(lease_status(&leases,adapter,publication,command_now)),
-                            AcquisitionAction::AcquireLease{lease_id,ttl_seconds,market_ids}=>{
-                                let now=std::time::Instant::now();let eligible=eligible_markets(adapter);let was_enabled=leases.enabled();
+                            AcquisitionAction::LeaseStatus{eligible_market_ids}=>return Ok(
+                                lease_status(&leases,adapter,publication,&eligible_market_ids,command_now)),
+                            AcquisitionAction::AcquireLease{lease_id,ttl_seconds,market_ids,eligible_market_ids}=>{
+                                let now=std::time::Instant::now();let eligible=eligible_markets(adapter,&eligible_market_ids);
+                                let was_enabled=leases.enabled();
                                 leases.acquire(lease_id,std::time::Duration::from_secs(ttl_seconds),market_ids,&eligible,now)?;
                                 if !was_enabled&&jobs.tokens().is_empty() {
-                                    jobs.add_pairs(&eligible_pairs(adapter)?)?;
+                                    jobs.add_pairs(&eligible_pairs(adapter,&eligible)?)?;
                                     confirmation_membership.send_replace(eligible.clone());
+                                    acquisition_tokens=jobs.tokens();
                                     publication.set_acquisition_statistics(jobs.statistics());
                                 }
                                 if !was_enabled {
@@ -1701,11 +1707,12 @@ async fn run_connection(
                                             (market,result)});
                                     }
                                 }
-                                return Ok(lease_status(&leases,adapter,publication,now));
+                                return Ok(lease_status(&leases,adapter,publication,&eligible_market_ids,now));
                             },
                             AcquisitionAction::RenewLease{lease_id,ttl_seconds}=>{
                                 let now=std::time::Instant::now();leases.renew(&lease_id,std::time::Duration::from_secs(ttl_seconds),now)?;
-                                return Ok(lease_status(&leases,adapter,publication,now));
+                                let active=leases.market_ids();
+                                return Ok(lease_status(&leases,adapter,publication,&active,now));
                             },
                             AcquisitionAction::ReleaseLease{lease_id}=>{
                                 let now=std::time::Instant::now();leases.release(&lease_id)?;
@@ -1713,7 +1720,8 @@ async fn run_connection(
                                     confirmation_membership.send_replace(BTreeSet::new());
                                     pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
                                 }
-                                return Ok(lease_status(&leases,adapter,publication,now));
+                                let active=leases.market_ids();
+                                return Ok(lease_status(&leases,adapter,publication,&active,now));
                             },
                             AcquisitionAction::Scope{validate_only,catalog_revision,records,evidence_sha256,
                                 acquisition_market_ids,retire_market_ids}=>ScopeAcquisition{validate_only,catalog_revision,
@@ -1732,7 +1740,7 @@ async fn run_connection(
                             }
                             confirmation_markets.retain(|m|!removed.contains(&m.market_id));
                             confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
-                            acquisition_tokens=adapter.identities.keys().cloned().collect();
+                            acquisition_tokens=if leases.required(){jobs.tokens()}else{adapter.identities.keys().cloned().collect()};
                             publication.retire_catalog_markets(removed.clone())?;
                             publication.set_acquisition_statistics(jobs.statistics());
                             return Ok(json!({"retirement_queued":true,"retired_market_ids":removed,
@@ -1765,15 +1773,22 @@ async fn run_connection(
                         publication.admit_catalog_markets_scoped(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,
                             &request.acquisition_market_ids,acquisition_token_budget)?;
                         for market in &added {pipeline.install_admitted_market(adapter,publication,market)?;}
-                        if leases.enabled(){jobs.add_pairs(&pairs)?;}
+                        if leases.enabled(){
+                            let active=leases.market_ids();
+                            let leased_pairs:Vec<_>=added.iter().filter(|market|active.contains(&market.market_id))
+                                .map(|market|market.token_ids.clone()).collect();
+                            jobs.add_pairs(&leased_pairs)?;
+                        }
                         publication.set_acquisition_statistics(jobs.statistics());
-                        acquisition_tokens=adapter.identities.keys().cloned().collect();
+                        acquisition_tokens=if leases.required(){jobs.tokens()}else{adapter.identities.keys().cloned().collect()};
                         for record in request.records {lifecycle_markets.insert(record["identity"]["market_id"].as_str().unwrap().to_owned(),record);}
                         let added_ids:Vec<_>=added.iter().map(|m|m.market_id.clone()).collect();
-                        if !added.is_empty()&&leases.enabled() {
-                            confirmation_markets.extend(added.clone());
+                        let active=leases.market_ids();
+                        let leased_added:Vec<_>=added.iter().filter(|market|active.contains(&market.market_id)).cloned().collect();
+                        if !leased_added.is_empty()&&leases.enabled() {
+                            confirmation_markets.extend(leased_added.clone());
                             confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
-                            added_confirmation_jobs.spawn(run_confirmations(added,request_market_batch_size,network_concurrency,
+                            added_confirmation_jobs.spawn(run_confirmations(leased_added,request_market_batch_size,network_concurrency,
                                 response_byte_limit,request_timeout_seconds,websocket_confirmation_seconds,
                                 confirmation_sender.clone(),shutdown.clone(),confirmation_network.clone(),confirmation_members.clone()));
                         }
@@ -2130,8 +2145,10 @@ async fn run_connection(
                     }
                     if let Err(error)=jobs.poll_retirements(){eprintln!("{}",json!({"stage":"acquisition_retirement_error","error":error.to_string()}));}
                     if leases.enabled()&&jobs.tokens().is_empty(){
-                        jobs.add_pairs(&eligible_pairs(adapter)?)?;
-                        confirmation_membership.send_replace(eligible_markets(adapter));
+                        let active=leases.market_ids();
+                        jobs.add_pairs(&eligible_pairs(adapter,&active)?)?;
+                        confirmation_membership.send_replace(active);
+                        acquisition_tokens=jobs.tokens();
                         publication.set_acquisition_statistics(jobs.statistics());
                     }
                     let pending_terminal_markets = terminal_unsubscribes
@@ -2158,7 +2175,7 @@ async fn run_connection(
                         }
                     }
                     publication.set_acquisition_statistics(jobs.statistics());
-                    if leases.enabled()&&!publication.is_source_ready()&&publication.fresh_tokens_ready(&acquisition_tokens){
+                    if leases.enabled()&&!publication.is_source_ready()&&publication.fresh_tokens_ready(&jobs.tokens()){
                         publication.set_source_ready(true);
                         eprintln!("{}",json!({"stage":"acquisition_lease_ready","source_cursor":publication.cursor()?}));
                     }
