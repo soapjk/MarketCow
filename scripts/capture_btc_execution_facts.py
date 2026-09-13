@@ -109,6 +109,9 @@ def project(market: dict[str, Any], raw: bytes, received_at: str, url: str) -> d
         raise ValueError("fee_exponent_invalid")
     if source.get("fd", {}).get("to") is not True:
         raise ValueError("unsupported_fee_curve")
+    if not isinstance(source.get("itode"), bool):
+        raise ValueError("taker_order_delay_missing")
+    taker_delay_enabled = source["itode"]
     digest = sha256(raw)
     return {
         "schema_version": "marketcow.polymarket.market-execution-facts.v1",
@@ -134,6 +137,15 @@ def project(market: dict[str, Any], raw: bytes, received_at: str, url: str) -> d
             "version_sha256": digest,
             "complete": False,
             "missing_fields": ["size_increment"],
+        },
+        "order_execution": {
+            "taker_order_delay_enabled": taker_delay_enabled,
+            "marketable_order_hold_milliseconds": 250 if taker_delay_enabled else None,
+            "semantics": "marketable orders are held before synchronous processing",
+            "source_field": "itode",
+            "version_sha256": digest,
+            "complete": taker_delay_enabled,
+            "missing_fields": [] if taker_delay_enabled else ["disabled_delay_duration"],
         },
         "fee_schedule": {
             "model": "clob_v2_dynamic",

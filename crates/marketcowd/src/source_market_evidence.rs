@@ -222,6 +222,7 @@ pub fn project_execution(
         exponent > 0 && v["fd"]["to"].as_bool() == Some(true),
         "unsupported_fee_curve"
     );
+    let taker_delay_enabled = v["itode"].as_bool().context("taker_order_delay_missing")?;
     let hash = hex::encode(Sha256::digest(raw));
     let source_url = format!("https://clob.polymarket.com/clob-markets/{condition}");
     Ok(json!({
@@ -234,6 +235,14 @@ pub fn project_execution(
             "price_increment":price_increment,"price_unit":"probability",
             "minimum_order_size":minimum_order_size,"size_unit":"shares","size_increment":null,
             "version_sha256":hash,"complete":false,"missing_fields":["size_increment"]
+        },
+        "order_execution":{
+            "taker_order_delay_enabled":taker_delay_enabled,
+            "marketable_order_hold_milliseconds":if taker_delay_enabled {Some(250_u64)} else {None},
+            "semantics":"marketable orders are held before synchronous processing",
+            "source_field":"itode","version_sha256":hash,
+            "complete":taker_delay_enabled,
+            "missing_fields":if taker_delay_enabled {Vec::<String>::new()} else {vec!["disabled_delay_duration".to_owned()]}
         },
         "fee_schedule":{
             "model":"clob_v2_dynamic","currency":"USDC","maker_rate":"0","taker_rate":rate,
@@ -536,7 +545,7 @@ mod tests {
     fn execution_raw(condition: &str, up: &str, down: &str) -> Value {
         json!({
             "c":condition,"mos":"5","mts":"0.010","mbf":1000,"tbf":"1000",
-            "fd":{"r":"0.070","e":1,"to":true},
+        "fd":{"r":"0.070","e":1,"to":true},"itode":true,
             "t":[{"o":"Up","t":up},{"o":"Down","t":down}]
         })
     }
@@ -564,6 +573,11 @@ mod tests {
         assert_eq!(p["fee_schedule"]["maker_base_fee_bps"], "1000");
         assert_eq!(p["fee_schedule"]["taker_base_fee_bps"], "1000");
         assert_eq!(p["fee_schedule"]["currency"], "USDC");
+        assert_eq!(p["order_execution"]["taker_order_delay_enabled"], true);
+        assert_eq!(
+            p["order_execution"]["marketable_order_hold_milliseconds"],
+            250
+        );
         assert!(p["fee_schedule"]["rounding_mode"].is_null());
         assert!(p["fee_schedule"]["effective_at"].is_null());
         assert_eq!(p["execution_eligible"], false);
