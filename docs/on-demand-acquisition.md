@@ -74,6 +74,12 @@ renew before TTL, then release on orderly shutdown. A crash needs no cleanup;
 TTL performs it. Hot scope changes still use the existing prepare/activate
 protocol and require the consumer to bind the resulting scope/revision.
 
+`source_ready` is connection-generation readiness, not an all-markets-health
+gate. It becomes true after the first subscribed market publishes an
+authoritative post-resume book. Full-sync omits every pre-resume book until that
+market independently crosses the resume boundary; such markets remain locally
+unavailable without blocking healthy markets or manufacturing a global gap.
+
 ## Validation boundary
 
 Local tests cover lease capacity/idempotency/expiry, caller isolation, private

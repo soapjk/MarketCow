@@ -230,15 +230,24 @@ impl MemoryView {
     fn capture(m: &Memory) -> Result<Self> {
         ensure!(m.source_ready, "upstream WebSocket recovery pending");
         ensure!(m.error.is_none(), "persistence failed");
+        // A pause establishes a new acquisition generation.  Do not expose a
+        // pre-pause book as fresh merely because another market has proved the
+        // resumed source connection alive.  Markets that have not crossed the
+        // resume floor are omitted and remain locally unavailable.
+        let fresh = |token: &&String| {
+            m.book_cursors
+                .get(*token)
+                .is_some_and(|cursor| *cursor >= m.resume_floor)
+        };
         Ok(Self {
             cursor: m.cursor,
             persisted_cursor: m.persisted,
             confirmation_sequence: m.confirmation_cursor,
-            books: m.books.clone(),
+            books: m.books.iter().filter(|(token, _)| fresh(token)).map(|(token, book)| (token.clone(), book.clone())).collect(),
             markets: m.markets.clone(),
             recoveries: m.recoveries.clone(),
-            book_cursors: m.book_cursors.clone(),
-            confirmation_versions: m.confirmations.clone(),
+            book_cursors: m.book_cursors.iter().filter(|(token, _)| fresh(token)).map(|(token, cursor)| (token.clone(), *cursor)).collect(),
+            confirmation_versions: m.confirmations.iter().filter(|(token, _)| fresh(token)).map(|(token, version)| (token.clone(), *version)).collect(),
             base: m.base.clone().context("missing stream seed")?,
             queued: m.queued,
         })
@@ -640,9 +649,9 @@ impl Publication {
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
     pub fn is_source_ready(&self)->bool {self.memory.lock().unwrap().source_ready}
-    pub fn fresh_tokens_ready(&self,tokens:&std::collections::BTreeSet<String>)->bool {
+    pub fn fresh_acquisition_started(&self,tokens:&std::collections::BTreeSet<String>)->bool {
         let Ok(memory)=self.memory.lock()else{return false;};
-        memory.error.is_none()&&!tokens.is_empty()&&tokens.iter().all(|token|
+        memory.error.is_none()&&!tokens.is_empty()&&tokens.iter().any(|token|
             memory.book_cursors.get(token).is_some_and(|cursor|*cursor>=memory.resume_floor)
                 && !memory.recoveries.contains_key(token))
     }
@@ -2207,13 +2216,14 @@ mod tests {
         p.publish(events(0),None).unwrap();
         let mut changed=p.changed.subscribe();while p.persisted_cursor()<2{changed.changed().await.unwrap();}
         let reader=p.reader();assert!(reader.replay(0,0,64,65536).is_ok());
-        assert!(p.fresh_tokens_ready(&BTreeSet::from(["11".into(),"12".into()])));
+        assert!(p.fresh_acquisition_started(&BTreeSet::from(["11".into(),"12".into()])));
         p.pause_source().unwrap();
-        assert!(!p.fresh_tokens_ready(&BTreeSet::from(["11".into(),"12".into()])));
+        assert!(!p.fresh_acquisition_started(&BTreeSet::from(["11".into(),"12".into()])));
         assert!(reader.installed_markets().is_ok());
         assert!(reader.capture().is_err());assert!(reader.replay(0,0,64,65536).is_err());
         assert!(p.shutdown_recovery_facts().unwrap().1.is_empty());
-        p.set_source_ready(true);assert!(reader.replay(0,0,64,65536).is_err());
+        p.set_source_ready(true);assert!(reader.capture().unwrap().books.is_empty());
+        assert!(reader.replay(0,0,64,65536).is_err());
         p.finish().await.unwrap();
     }
 

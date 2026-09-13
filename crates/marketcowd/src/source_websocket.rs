@@ -2175,7 +2175,7 @@ async fn run_connection(
                         }
                     }
                     publication.set_acquisition_statistics(jobs.statistics());
-                    if leases.enabled()&&!publication.is_source_ready()&&publication.fresh_tokens_ready(&jobs.tokens()){
+                    if leases.enabled()&&!publication.is_source_ready()&&publication.fresh_acquisition_started(&jobs.tokens()){
                         publication.set_source_ready(true);
                         eprintln!("{}",json!({"stage":"acquisition_lease_ready","source_cursor":publication.cursor()?}));
                     }
