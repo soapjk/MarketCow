@@ -493,6 +493,32 @@ help works. The added route has NOT been deployed or tested against current
 hourly source responses. Continuous scheduling, review policy and automatic
 parent-pool admission remain necessary before claiming autonomous rotation.
 
+## CLOB execution facts — 2026-09-13
+
+The same bounded Rust evidence service now exposes GET
+`/v1/prediction-markets/polymarket/research/market-execution-facts` with exact
+`market_id`, condition, Up token and Down token query bindings. It reads the
+official CLOB V2 `clob-markets/{condition_id}` endpoint with one request,
+15-second timeout, 256KiB cap, no redirect and no retry. The response preserves
+the complete raw body and SHA-256 and rejects changed condition or ordered token
+identity before projecting minimum order size, price tick and dynamic fee
+parameters.
+
+The source does not expose a size increment, fee-policy effective timestamp or
+rounding tie mode. These remain explicit nulls, so the source projection is not
+marked execution-eligible. A separate, labelled Paper-only assumption uses a
+conservative upward fee rounding mode, a six-decimal share increment, and a
+1:1 pUSD/USDC face-value conversion. None of those three values is represented
+as a source fact. CLOB's `mbf`/`tbf` fields are preserved but are not substituted
+for the documented dynamic fee curve.
+
+Three current BTC hourly conditions were read independently through the
+existing U1 proxy on 2026-09-13. Each returned `mos=5`, `mts=0.01`,
+`fd={r:0.07,e:1,to:true}`, `mbf=1000`, `tbf=1000`, and its ordered Up/Down
+tokens matched the reviewed package. The raw response hashes and receipt times
+are reported separately with the package identity; this code does not start a
+subscription, change a shared scope or make a production deployment.
+
 ## Continuous discovery and startup prerequisite fix — 2026-09-10
 
 Discovery now supports `--continuous --interval-seconds N
