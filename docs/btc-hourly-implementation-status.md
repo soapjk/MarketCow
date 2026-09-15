@@ -1,5 +1,96 @@
 # BTC hourly implementation evidence — 2026-09-10
 
+## Seven paired real hours and bounded dataset catalog — 2026-09-12
+
+The paired evidence set now contains seven real BTC Up/Down hours across
+2026-09-10 and 2026-09-11. Each dataset independently binds a complete Gamma
+rule response, ordered Up/Down token identities, all 60 official Binance 1m
+bars, the official Binance 1h bar, and two agreeing Polygon finalized-block CTF
+receipts. The minute aggregation must match the hour for OHLC, four volume
+fields and trade count; the resulting Close >= Open label must match the CTF
+payouts. The observed results are Down, Down, Up, Up, Down, Up, Up.
+
+The immutable bounded catalog is
+`/Volumes/T9/data/marketcow/research/btc-hourly/catalogs/paired-20260910-11-r2.json`.
+Its catalog ID is
+`fd341ebe427926cef70778d6008541424a23ec38b7144b79b1efd784caa9d238`
+and its file SHA-256 is
+`3769a41a76434169fdecaec7888c4d8d3e1789548ef0dc7bcb0b4fc98fc4a958`.
+The catalog verifies every manifest identity and every referenced part's exact
+byte count and hash before publication. It rejects duplicate dataset, market,
+condition and hour identities. The set is complete for its seven explicitly
+listed inputs, not an exhaustive historical market catalog.
+
+Only four of seven rules were captured before their prediction window began;
+the other three remain valid rule/result evidence but cannot prove what rule was
+historically knowable at the start of those hours. Historical L2 and historical
+first-receipt times remain absent for all seven. Standard CTF finality is proven;
+adapter redemption and Paper pUSD mapping remain explicitly unverified.
+
+`python -m marketcow.btc_paired_catalog` is the reproducible publication entry.
+It takes an explicit bounded list of absolute `manifest.json` paths and writes a
+new immutable catalog. It does not scan directories implicitly or modify any
+realtime subscription, service, scope or account.
+
+The separate historical rule directory is
+`/Volumes/T9/data/marketcow/research/btc-hourly/catalogs/rules-gamma-20260904-r2.json`.
+It contains 49 exact Binance BTCUSDT finalized-1H contracts from the already
+frozen 1,403,191,882-byte Gamma source. Catalog ID is
+`9f53dbd40314844fd702287ee06ff791ae8fee083cff534e7d7acfd6e99b7103`;
+file SHA-256 is
+`abb87ac2fd1894cdc747a2215000dcb574f2c164033b1437f637694d175c4379`.
+Each record has the exact raw byte path/offset/length/hash, market/condition,
+ordered Up/Down tokens, UTC hour, source timestamps and capture-state facts.
+The extractor hashes the entire bounded input and only publishes after complete
+traversal; exact rule text and one-hour boundaries are required. Of these 49,
+43 were captured before the hour, one during, and five after. This is complete
+for the exact selector in the frozen source, not a complete Polymarket history;
+capture-time active/orderable flags are expressly not current facts.
+The time coverage is three explicit contiguous segments: one hour on May 20,
+27 hours from September 4 13:00 UTC, and 21 hours from September 5 17:00 UTC.
+There are 2,571 absent hours between the first and last records, including the
+one-hour hole between the two September segments; the catalog reports this
+rather than treating 49 identities as continuous coverage.
+
+## Paired real hour and isolated Rust research input — 2026-09-12
+
+`btc_hour_pairing` now constructs an immutable, content-addressed bundle from
+one exact reviewed Gamma rule, official Binance 1m/1h archives and a two-provider
+CTF finality quorum. It requires all 60 final minute bars, requires their OHLC,
+four volume fields and trade count to equal the official final 1h bar, and then
+requires the Binance close/open result to equal the bound Up/Down CTF payouts.
+It copies both raw RPC observation receipts into the bundle. Standard CTF
+collateral finality remains distinct from adapter redemption and the Paper pUSD
+mapping; both are explicitly false rather than inferred.
+
+Actual bundle:
+`/Volumes/T9/data/marketcow/research/btc-hourly/datasets/4358214-20260910T0600Z-r3`.
+Dataset ID `ac0d827e3bd389c9aa864bfd87fbd7b8b05a394f9947fe87ea4af1dd21e72adc`;
+manifest file SHA-256
+`b218a93e03c8825981a3c95b1cb78ce7010234bb84c55614c75a0d524f541ed9`.
+The 2026-09-10 06:00 UTC Binance candle opened at 78536.71 and closed at
+78416.01, so the independently derived result is Down. The finality receipt is
+Up=0, Down=1. Historical first-receipt and L2 coverage remain absent.
+
+The original 2026-09-07 archive and prior bounded live export were copied from
+temporary storage without byte changes into
+`/Volumes/T9/data/marketcow/research/btc-hourly/sources/binance/` and
+`/Volumes/T9/data/marketcow/research/btc-hourly/datasets/` respectively. Their
+existing manifest/report hashes are unchanged.
+The matching Gamma and RPC originals are retained under
+`/Volumes/T9/data/marketcow/research/btc-hourly/sources/polymarket/4358214-r1`;
+the r3 bundle was rebuilt from these persistent paths rather than `/private/tmp`.
+
+The Rust example `btc_research_stream` supplies the missing out-of-pool research
+input primitive locally. It accepts at most three reviewed markets/six exact
+tokens and subscribes directly to the official market WebSocket without changing
+Discovery or Live. Transport input and persistence use separate queues; the
+persistence queue has explicit item and encoded-byte limits. Time, batches,
+frames, archive bytes and individual batch bytes are independently bounded.
+Connection boundaries remain explicit `source_gap` facts. See
+`docs/btc-hour-research-stream.md`. This example has not been deployed or used to
+open a new production subscription.
+
 ## Current delivery summary
 
 The local Binance SPOT service is installed as persistent launchd component
@@ -401,6 +492,32 @@ Six Rust evidence tests and three Python discovery tests passed locally; CLI
 help works. The added route has NOT been deployed or tested against current
 hourly source responses. Continuous scheduling, review policy and automatic
 parent-pool admission remain necessary before claiming autonomous rotation.
+
+## CLOB execution facts — 2026-09-13
+
+The same bounded Rust evidence service now exposes GET
+`/v1/prediction-markets/polymarket/research/market-execution-facts` with exact
+`market_id`, condition, Up token and Down token query bindings. It reads the
+official CLOB V2 `clob-markets/{condition_id}` endpoint with one request,
+15-second timeout, 256KiB cap, no redirect and no retry. The response preserves
+the complete raw body and SHA-256 and rejects changed condition or ordered token
+identity before projecting minimum order size, price tick and dynamic fee
+parameters.
+
+The source does not expose a size increment, fee-policy effective timestamp or
+rounding tie mode. These remain explicit nulls, so the source projection is not
+marked execution-eligible. A separate, labelled Paper-only assumption uses a
+conservative upward fee rounding mode, a six-decimal share increment, and a
+1:1 pUSD/USDC face-value conversion. None of those three values is represented
+as a source fact. CLOB's `mbf`/`tbf` fields are preserved but are not substituted
+for the documented dynamic fee curve.
+
+Three current BTC hourly conditions were read independently through the
+existing U1 proxy on 2026-09-13. Each returned `mos=5`, `mts=0.01`,
+`fd={r:0.07,e:1,to:true}`, `mbf=1000`, `tbf=1000`, and its ordered Up/Down
+tokens matched the reviewed package. The raw response hashes and receipt times
+are reported separately with the package identity; this code does not start a
+subscription, change a shared scope or make a production deployment.
 
 ## Continuous discovery and startup prerequisite fix — 2026-09-10
 

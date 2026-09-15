@@ -105,6 +105,40 @@ class HotScopeOperations:
             raise ValueError("unbound actual Discovery selection")
         return selection
 
+    @staticmethod
+    def _lease_identity(caller, lease_id):
+        if (not isinstance(lease_id, str) or not lease_id or len(lease_id) > 96
+                or any(not (c.isascii() and (c.isalnum() or c in "-_.:")) for c in lease_id)):
+            raise ValueError("invalid acquisition lease id")
+        return hashlib.sha256(caller.encode()).hexdigest()[:16]+":"+lease_id
+
+    def acquisition_lease_status(self, pool):
+        if pool not in self.clients:
+            raise ValueError("invalid hot pool")
+        return self.clients[pool].request({"operation": "acquisition_lease_status"})
+
+    def acquisition_lease(self, caller, body, action):
+        if action not in {"acquire", "renew", "release"}:
+            raise ValueError("invalid acquisition lease action")
+        common = {"schema_version", "pool", "expected_scope_id", "expected_revision", "lease_id"}
+        expected = common | ({"ttl_seconds", "market_ids"} if action == "acquire" else ({"ttl_seconds"} if action == "renew" else set()))
+        if (set(body) != expected or body.get("schema_version") != "marketcow.acquisition-lease.v1"
+                or body.get("pool") not in self.clients or type(body.get("expected_revision")) is not int
+                or body["expected_revision"] <= 0 or not isinstance(body.get("expected_scope_id"), str)):
+            raise ValueError("invalid acquisition lease request")
+        command = {"operation": action+"_acquisition_lease", "expected_scope_id": body["expected_scope_id"],
+            "expected_revision": body["expected_revision"], "lease_id": self._lease_identity(caller, body["lease_id"])}
+        if action != "release":
+            if type(body["ttl_seconds"]) is not int or body["ttl_seconds"] <= 0:
+                raise ValueError("invalid acquisition lease TTL")
+            command["ttl_seconds"] = body["ttl_seconds"]
+        if action == "acquire":
+            ids = body["market_ids"]
+            if not isinstance(ids, list) or not ids or any(not isinstance(i, str) or not i for i in ids) or ids != sorted(set(ids)):
+                raise ValueError("sorted unique lease market ids required")
+            command["market_ids"] = ids
+        return self.clients[body["pool"]].request(command)
+
     def _build(self, *, pool, ids, selection, policy, protected, parent):
         c = self.config
         return self.builder(source_root=c["source_root"], source=self.control.source, pool=pool,

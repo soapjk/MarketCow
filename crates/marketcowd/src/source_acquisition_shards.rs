@@ -49,6 +49,25 @@ mod tests {
         assert_eq!(pool.tokens(),BTreeSet::from(["21".into(),"22".into()]));
         pool.stop().await;
     }
+    #[tokio::test]
+    async fn terminal_retirement_is_idempotent_while_wire_receipt_is_pending() {
+        let (output,_)=mpsc::channel(1);
+        let mut pool=Shards::new(PolymarketTransportConfig::production(),output,4,2,4).unwrap();
+        let (commands,mut receiver)=subscription_commands();let (stop,_)=watch::channel(false);
+        let original=BTreeSet::from(["11".into(),"12".into(),"21".into(),"22".into()]);
+        pool.shards.insert(0,Shard{tokens:original.clone(),stop,commands,pending:None,stopping:false,retirement_target:None});
+        let removed=BTreeSet::from(["11".into(),"12".into()]);
+        assert!(!pool.request_retire(&removed).unwrap());
+        // Reconciliation can run on every scheduler tick without replacing an
+        // in-flight command or manufacturing an "unknown token" failure.
+        assert!(!pool.request_retire(&removed).unwrap());
+        let command=receiver.try_recv().unwrap();
+        assert!(receiver.try_recv().is_err());
+        command.receipt.send(Ok(())).unwrap();
+        assert_eq!(pool.poll_retirements().unwrap(),vec![0]);
+        assert!(pool.request_retire(&removed).unwrap());
+        pool.stop().await;
+    }
 }
 pub struct Shards {
     config:PolymarketTransportConfig,output:mpsc::Sender<Vec<RawTransportFrame>>,
@@ -132,6 +151,27 @@ impl Shards {
             receipts.push(id);
         }
         Ok(receipts)
+    }
+    /// Idempotent retirement reconciliation for lifecycle-terminal markets.
+    ///
+    /// A terminal fact fences the local reducer immediately, while the venue
+    /// unsubscribe is an eventually acknowledged wire operation. Repeated
+    /// scheduler ticks must therefore be able to observe an in-flight command
+    /// without replacing it, and a completed command must make the same request
+    /// a no-op. `true` means none of the requested tokens remain wire-owned.
+    pub fn request_retire(&mut self,removed:&BTreeSet<String>)->Result<bool> {
+        ensure!(!removed.is_empty(),"empty retirement token set");
+        let owned=self.tokens();
+        let remaining:BTreeSet<_>=removed.intersection(&owned).cloned().collect();
+        if remaining.is_empty(){return Ok(true);}
+        if self.shards.values().any(|shard| {
+            !shard.tokens.is_disjoint(&remaining)
+                && (shard.retirement_target.is_some() || shard.stopping)
+        }) {
+            return Ok(false);
+        }
+        self.begin_retire(&remaining)?;
+        Ok(false)
     }
     /// Only actual successful wire receipts release partial-shard ownership.
     /// Until then, the old token set continues counting against capacity.

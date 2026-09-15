@@ -173,9 +173,13 @@ def test_hot_routes_auth_strict_json_and_not_cold_activation(control):
             raise RuntimeError("synthetic uncertain receipt")
         def retire(self, caller, payload):
             return {"resources_released": False}
+        def acquisition_lease_status(self, pool):
+            calls.append(("lease_status", pool)); return {"source_ready": False}
+        def acquisition_lease(self, caller, payload, action):
+            calls.append((action, caller, payload)); return {"source_ready": action != "release"}
     secret = "synthetic-hot-route-token"
     app = create_control_app(c, callers=(Caller("test", hashlib.sha256(secret.encode()).hexdigest(),
-        frozenset({"hot.read", "hot.prepare", "hot.activate", "hot.retire"})),), body_timeout_seconds=2, hot_operations=Hot())
+        frozenset({"hot.read", "hot.prepare", "hot.activate", "hot.retire", "acquisition.lease"})),), body_timeout_seconds=2, hot_operations=Hot())
     with TestClient(app, client=("127.0.0.1", 45000)) as client:
         root = PREFIX+"/hot-scopes"
         assert client.get(root+"/status?pool=live").status_code == 401
@@ -189,7 +193,15 @@ def test_hot_routes_auth_strict_json_and_not_cold_activation(control):
         assert failed.json()["retryable"] is False
         assert client.post(PREFIX+"/generations/apply", json={}).status_code == 404
         assert client.post(PREFIX+"/discovery-selections/admit", json={}).status_code == 403
-    assert len(calls) == 2
+        lease=PREFIX+"/acquisition-leases"
+        assert client.get(lease+"/status?pool=live").json()["source_ready"] is False
+        body={"schema_version":"marketcow.acquisition-lease.v1","pool":"live",
+            "expected_scope_id":"scope","expected_revision":7,"lease_id":"paper","ttl_seconds":30,"market_ids":["1"]}
+        assert client.post(lease+"/acquire",json=body).json()["source_ready"] is True
+        assert client.post(lease+"/renew",json={k:v for k,v in body.items() if k!="market_ids"}).status_code==200
+        released={k:v for k,v in body.items() if k not in {"market_ids","ttl_seconds"}}
+        assert client.post(lease+"/release",json=released).json()["source_ready"] is False
+    assert len(calls) == 6
     with pytest.raises(ValueError, match="mutually exclusive"):
         create_control_app(c, callers=(), body_timeout_seconds=2, hot_operations=Hot(), runtime_operations=object())
 

@@ -44,7 +44,7 @@ systemd-run --user --unit="$collector" -p MemoryMax=3072M -p MemorySwapMax=0 -p 
   --dependency-plan "$root/live-bridge-plan-r1.json" --dependency-plan-sha256 d449f3aa8ed82b81b6ec66be7e4bef1602219ef0eda55abd41a82d38e219ca45 \
   --expected-market-count 250 --concurrency 16 --request-market-batch-size 20 --response-byte-limit 2097152 --batch-byte-limit 16777216 \
   --persistence-queue-batches 256 --persistence-queue-bytes 67108864 --websocket-shard-tokens 500 --websocket-recovery-concurrency 16 \
-  --websocket-confirmation-seconds 1 --poll-seconds 1 --request-timeout-seconds 10 --lifecycle-refresh-seconds 300 \
+  --websocket-confirmation-seconds 0 --poll-seconds 1 --request-timeout-seconds 10 --lifecycle-refresh-seconds 300 \
   --live-listen 127.0.0.1:18897 --live-frame-bytes 67108864 --live-maximum-clients 2
 sleep 10
 systemctl --user is-active --quiet "$collector"

@@ -53,6 +53,10 @@ struct Adapter {
     last_trades: BTreeMap<String, Price>,
     recoveries: BTreeMap<String, String>,
 }
+struct ScopeAcquisition {
+    validate_only:bool,catalog_revision:String,records:Vec<Value>,evidence_sha256:String,
+    acquisition_market_ids:BTreeSet<String>,retire_market_ids:BTreeSet<String>,
+}
 impl Adapter {
     /// The owner has already bound this exact identity to catalog metadata.
     /// New reducers start without tick/book/freshness state; snapshots must
@@ -269,6 +273,23 @@ impl Adapter {
         Ok(event)
     }
 
+    /// A reconnecting shard can report the same connection boundary more than
+    /// once before its authoritative snapshot arrives. The first gap already
+    /// invalidated the book; replacing its recovery identity would make the
+    /// in-flight snapshot stale and create an unbounded recovery storm.
+    fn invalidate_once(
+        &mut self,
+        token: &str,
+        reason: &str,
+        received: chrono::DateTime<Utc>,
+        cursor: u64,
+    ) -> Result<Option<Value>> {
+        if self.recoveries.contains_key(token) {
+            return Ok(None);
+        }
+        self.invalidate(token, reason, received, cursor).map(Some)
+    }
+
     /// Preserve an upstream multi-token frame as an atomic unit. If validation
     /// fails after partially reducing it, invalidate every token in that frame,
     /// never unrelated markets. No partially reduced output escapes.
@@ -307,6 +328,12 @@ impl Adapter {
             "unsubscribed frame identity"
         );
         let source_gap = raw["event_type"] == "source_gap";
+        let source_gap_diagnostic = source_gap.then(|| json!({
+            "transport_reason":raw["transport_reason"],
+            "close_code":raw["close_code"],
+            "close_reason":raw["close_reason"],
+            "transport_attempt":raw["attempt"],
+        }));
         let full = raw["event_type"] == "book";
         // A price-change array is one atomic market observation. If any member
         // lacks continuity, do not partially advance its healthy sibling.
@@ -356,24 +383,32 @@ impl Adapter {
                 } else {
                     "source_validation_failed"
                 };
+                let invalidatable = affected.iter().filter(|token| {
+                    !source_gap || !self.recoveries.contains_key(*token)
+                }).cloned().collect::<Vec<_>>();
+                if invalidatable.is_empty() {
+                    return Ok(Vec::new());
+                }
                 eprintln!(
                     "{}",
-                    json!({"stage":"token_invalidation","tokens":affected,"reason":reason,"detail":error.to_string()})
+                    json!({"stage":"token_invalidation","tokens":invalidatable,"reason":reason,
+                        "detail":error.to_string(),"source_gap":source_gap_diagnostic})
                 );
-                affected
-                    .iter()
-                    .enumerate()
-                    .map(|(index, token)| {
-                        self.invalidate(
-                            token,
-                            reason,
-                            received,
-                            after
-                                .checked_add(index as u64 + 1)
-                                .context("cursor overflow")?,
-                        )
-                    })
-                    .collect()
+                let mut invalidations = Vec::new();
+                for token in &invalidatable {
+                    let cursor = after
+                        .checked_add(invalidations.len() as u64 + 1)
+                        .context("cursor overflow")?;
+                    let event = if source_gap {
+                        self.invalidate_once(token, reason, received, cursor)?
+                    } else {
+                        Some(self.invalidate(token, reason, received, cursor)?)
+                    };
+                    if let Some(event) = event {
+                        invalidations.push(event);
+                    }
+                }
+                Ok(invalidations)
             }
         }
     }
@@ -680,6 +715,12 @@ mod tests {
             targeted_confirmation_retry_delay(0),
             std::time::Duration::from_secs(1),
         );
+        assert_eq!(recovery_retry_delay(1), std::time::Duration::from_secs(5));
+        assert_eq!(recovery_retry_delay(2), std::time::Duration::from_secs(10));
+        assert_eq!(recovery_retry_delay(9), std::time::Duration::from_secs(60));
+        assert_eq!(audit_batch_offset(300, 0, 5), std::time::Duration::ZERO);
+        assert_eq!(audit_batch_offset(300, 1, 5), std::time::Duration::from_secs(60));
+        assert_eq!(audit_batch_offset(300, 4, 5), std::time::Duration::from_secs(240));
     }
 
     #[tokio::test]
@@ -698,6 +739,59 @@ mod tests {
                 .to_string()
                 .contains("duplicate")
         );
+    }
+
+    #[test]
+    fn lifecycle_lookup_uses_the_exact_failed_catalog_identity() {
+        let market = catalog_market(&json!({
+            "identity": {
+                "market_id": "3418199",
+                "condition_id": "0xcondition",
+                "outcomes": [{"token_id": "yes"}, {"token_id": "no"}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(market.market_id, "3418199");
+        assert_eq!(market.condition_id, "0xcondition");
+        assert_eq!(market.token_ids, ["yes", "no"]);
+        assert!(catalog_market(&json!({
+            "identity": {
+                "market_id": "1",
+                "condition_id": "c",
+                "outcomes": [{"token_id": "only-one"}]
+            }
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_confirmation_finishes_without_network_io() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let (_membership_sender, membership) = tokio::sync::watch::channel(
+            BTreeSet::from(["1".to_owned()]),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            run_confirmations(
+                vec![super::super::Market {
+                    market_id: "1".into(),
+                    condition_id: "condition".into(),
+                    token_ids: ["11".into(), "12".into()],
+                }],
+                1,
+                1,
+                1,
+                1,
+                0,
+                sender,
+                shutdown,
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                membership,
+            ),
+        )
+        .await;
+        assert_eq!(result.unwrap().unwrap(), ());
     }
     fn fixture() -> Adapter {
         let plan = Plan {
@@ -763,6 +857,52 @@ mod tests {
         assert!(a.apply(delta, now, 3).unwrap().is_empty());
         a.apply(book("11", now), now, 3).unwrap();
         assert!(a.waiting.is_empty());
+    }
+
+    #[test]
+    fn repeated_connection_gap_keeps_one_recovery_identity() {
+        let mut adapter = fixture();
+        let now = Utc::now();
+        adapter.apply_isolated(book("11", now), now, 0).unwrap();
+        let first = adapter
+            .apply_isolated(
+                json!({"event_type":"source_gap","asset_id":"11"}),
+                now,
+                1,
+            )
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let recovery = adapter.recoveries["11"].clone();
+        let duplicate = adapter
+            .apply_isolated(
+                json!({"event_type":"source_gap","asset_id":"11"}),
+                now,
+                2,
+            )
+            .unwrap();
+        assert!(duplicate.is_empty());
+        assert_eq!(adapter.recoveries["11"], recovery);
+    }
+
+    #[test]
+    fn connection_gap_recovery_is_coalesced_by_market() {
+        let mut adapter = fixture();
+        let now = Utc::now();
+        for (cursor, token) in [(0, "11"), (1, "12")] {
+            adapter
+                .apply_isolated(
+                    json!({"event_type":"source_gap","asset_id":token}),
+                    now,
+                    cursor,
+                )
+                .unwrap();
+        }
+        let pending = pending_market_recoveries(&adapter);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending["1"].keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["11", "12"]
+        );
     }
 
     #[test]
@@ -1090,6 +1230,9 @@ pub async fn run(
         acquisition,
         args.acquisition_token_budget.unwrap_or(2048),
         args.acquisition_socket_budget.unwrap_or(1024),
+        args.acquisition_lease_required,
+        args.acquisition_lease_capacity.unwrap_or(0),
+        args.acquisition_lease_max_seconds.unwrap_or(0),
     )
     .await
 }
@@ -1153,18 +1296,45 @@ async fn recover_snapshots(
     result
 }
 
-async fn recover_snapshot(token: String) -> Result<marketcow_polymarket::RawTransportFrame> {
-    recover_snapshots(vec![token])
-        .await?
-        .pop()
-        .context("target recovery snapshot missing")
-}
-
 type FreshnessResult = (
     super::Market,
     chrono::DateTime<Utc>,
     Result<Vec<marketcow_polymarket::RawTransportFrame>>,
 );
+
+type MarketRecoveryResult = (
+    String,
+    BTreeMap<String, String>,
+    Result<Vec<marketcow_polymarket::RawTransportFrame>>,
+);
+
+fn catalog_market(record: &Value) -> Result<super::Market> {
+    let identity = &record["identity"];
+    let token_ids: Vec<String> = identity["outcomes"]
+        .as_array()
+        .context("lifecycle outcomes")?
+        .iter()
+        .map(|outcome| {
+            outcome["token_id"]
+                .as_str()
+                .map(str::to_owned)
+                .context("lifecycle token")
+        })
+        .collect::<Result<_>>()?;
+    Ok(super::Market {
+        market_id: identity["market_id"]
+            .as_str()
+            .context("lifecycle market id")?
+            .to_owned(),
+        condition_id: identity["condition_id"]
+            .as_str()
+            .context("lifecycle condition")?
+            .to_owned(),
+        token_ids: token_ids
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("lifecycle market is not binary"))?,
+    })
+}
 
 fn targeted_confirmation_retry_delay(confirmation_interval_seconds: u64) -> std::time::Duration {
     // A successful targeted snapshot refreshes the book at completion. Its
@@ -1172,6 +1342,11 @@ fn targeted_confirmation_retry_delay(confirmation_interval_seconds: u64) -> std:
     // instead of consuming the entire five-second consumer freshness budget
     // before the next WS handshake even starts.
     std::time::Duration::from_secs(confirmation_interval_seconds.max(1))
+}
+
+fn recovery_retry_delay(failures: u32) -> std::time::Duration {
+    let multiplier = 1_u64 << failures.saturating_sub(1).min(4);
+    std::time::Duration::from_secs((5 * multiplier).min(60))
 }
 
 /// Fill the bounded targeted-confirmation worker set from a market-keyed
@@ -1237,10 +1412,40 @@ fn connection_shards(
     Ok(shards)
 }
 
+fn eligible_markets(adapter:&Adapter, requested:&BTreeSet<String>)->BTreeSet<String> {
+    adapter.identities.values().map(|(market,_)|market.clone()).filter(|market|requested.contains(market)).collect()
+}
+fn eligible_pairs(adapter:&Adapter, markets:&BTreeSet<String>)->Result<Vec<[String;2]>> {
+    let mut pairs=BTreeMap::<String,Vec<String>>::new();
+    for (token,(market,_)) in &adapter.identities {
+        if markets.contains(market){pairs.entry(market.clone()).or_default().push(token.clone());}
+    }
+    pairs.into_values().map(|mut pair|{pair.sort();pair.try_into().map_err(|_|anyhow::anyhow!("eligible acquisition market pair"))}).collect()
+}
+fn pause_acquisition(adapter:&mut Adapter,pipeline:&pipeline::Pipeline,publication:&Publication,jobs:&mut super::source_acquisition_shards::Shards)->Result<()> {
+    publication.pause_source()?;pipeline.pause_all(adapter)?;
+    let tokens=jobs.tokens();if !tokens.is_empty(){let _=jobs.request_retire(&tokens)?;}
+    publication.set_acquisition_statistics(jobs.statistics());Ok(())
+}
+fn lease_status(leases:&super::source_acquisition_lease::Leases,adapter:&Adapter,publication:&Publication,
+    requested:&BTreeSet<String>,now:std::time::Instant)->Value {
+    let mut value=leases.status(&eligible_markets(adapter,requested),now);
+    value["source_ready"]=json!(publication.is_source_ready());value
+}
+
 struct ConfirmationBatch {
     markets: Vec<super::Market>,
     request_started_at: chrono::DateTime<Utc>,
     result: Result<(Vec<Value>, chrono::DateTime<Utc>)>,
+}
+
+fn audit_batch_offset(period_seconds: u64, index: usize, batches: usize) -> std::time::Duration {
+    if period_seconds == 0 || batches <= 1 || index == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let period_millis = u128::from(period_seconds) * 1_000;
+    let offset_millis = period_millis * index as u128 / batches as u128;
+    std::time::Duration::from_millis(offset_millis.min(u128::from(u64::MAX)) as u64)
 }
 
 async fn run_confirmations(
@@ -1255,25 +1460,47 @@ async fn run_confirmations(
     network:Arc<tokio::sync::Semaphore>,
     membership:tokio::sync::watch::Receiver<BTreeSet<String>>,
 ) -> Result<()> {
+    // Healthy WebSocket operation must not imply a parallel full-book REST
+    // downloader. Zero is the production default and performs no network I/O.
+    if interval_seconds == 0 {
+        return Ok(());
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(request_timeout_seconds))
         .build()?;
     ensure!(concurrency>0,"confirmation concurrency");
     let mut jobs = tokio::task::JoinSet::new();
-    for batch in markets.chunks(market_batch_size) {
+    let batch_count = markets.len().div_ceil(market_batch_size);
+    for (batch_index, batch) in markets.chunks(market_batch_size).enumerate() {
         let batch = batch.to_vec();
         let client = client.clone();
         let network = network.clone();
         let sender = sender.clone();
         let mut shutdown = shutdown.clone();
-        let membership=membership.clone();
+        let mut membership=membership.clone();
         jobs.spawn(async move {
+            let offset = audit_batch_offset(interval_seconds, batch_index, batch_count);
+            if !offset.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(offset) => {},
+                    value = shutdown.changed() => {
+                        value?;
+                        if *shutdown.borrow() { return Ok(()); }
+                    },
+                }
+            }
             loop {
                 if *shutdown.borrow() {
                     return Ok::<(), anyhow::Error>(());
                 }
                 let batch:Vec<_>=batch.iter().filter(|market|membership.borrow().contains(&market.market_id)).cloned().collect();
-                if batch.is_empty(){return Ok(());}
+                if batch.is_empty(){
+                    tokio::select! {
+                        value=membership.changed()=>{value?;continue;},
+                        value=shutdown.changed()=>{value?;if *shutdown.borrow(){return Ok(());}},
+                    }
+                    continue;
+                }
                 let cycle_started = tokio::time::Instant::now();
                 let permit = tokio::select! {
                     permit = network.clone().acquire_owned() => permit?,
@@ -1313,6 +1540,20 @@ async fn run_confirmations(
     Ok(())
 }
 
+fn pending_market_recoveries(adapter: &Adapter) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut pending = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for (token, attempt) in &adapter.recoveries {
+        let Some((market_id, _)) = adapter.identities.get(token) else {
+            continue;
+        };
+        pending
+            .entry(market_id.clone())
+            .or_default()
+            .insert(token.clone(), attempt.clone());
+    }
+    pending
+}
+
 async fn run_connection(
     adapter: &mut Adapter,
     publication: &mut Publication,
@@ -1330,6 +1571,9 @@ async fn run_connection(
     mut acquisition:Option<tokio::sync::mpsc::Receiver<super::source_scope_control::AcquisitionRequest>>,
     acquisition_token_budget:usize,
     acquisition_socket_budget:usize,
+    acquisition_lease_required:bool,
+    acquisition_lease_capacity:usize,
+    acquisition_lease_max_seconds:u64,
 ) -> Result<()> {
     let (mut pipeline, mut completed_markets) = pipeline::Pipeline::start_with_workers(adapter, market_workers)?;
     let mut acquisition_tokens:BTreeSet<_>=adapter.identities.keys().cloned().collect();
@@ -1341,7 +1585,9 @@ async fn run_connection(
     for (token,(market,_)) in &adapter.identities {initial_pairs.entry(market.clone()).or_default().push(token.clone());}
     let initial_pairs:Vec<[String;2]>=initial_pairs.into_values().map(|pair|pair.try_into()
         .map_err(|_|anyhow::anyhow!("initial acquisition market pair"))).collect::<Result<_>>()?;
-    jobs.add_pairs(&initial_pairs)?;
+    let mut leases=super::source_acquisition_lease::Leases::new(acquisition_lease_required,
+        acquisition_lease_capacity,std::time::Duration::from_secs(acquisition_lease_max_seconds))?;
+    if leases.enabled(){jobs.add_pairs(&initial_pairs)?;}else{pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;}
     publication.set_acquisition_statistics(jobs.statistics());
     drop(sender);
     let (confirmation_sender, mut confirmation_receiver) =
@@ -1349,7 +1595,8 @@ async fn run_connection(
     let confirmation_shutdown = shutdown.clone();
     let confirmation_network=Arc::new(tokio::sync::Semaphore::new(network_concurrency));
     let (confirmation_membership,confirmation_members)=tokio::sync::watch::channel(
-        confirmation_markets.iter().map(|market|market.market_id.clone()).collect::<BTreeSet<_>>());
+        if leases.enabled(){confirmation_markets.iter().map(|market|market.market_id.clone()).collect::<BTreeSet<_>>()}
+        else{BTreeSet::new()});
     let mut added_confirmation_jobs=tokio::task::JoinSet::new();
     let confirmation_job = tokio::spawn(run_confirmations(
         confirmation_markets.clone(),
@@ -1369,20 +1616,32 @@ async fn run_connection(
     let lifecycle_network = Arc::new(tokio::sync::Semaphore::new(network_concurrency));
     let mut lifecycle_jobs = tokio::task::JoinSet::<(super::Market, Result<Option<Value>>)>::new();
     let mut lifecycle_pending = BTreeSet::new();
-    let mut lifecycle_terminal = BTreeSet::new();
+    // The durable lifecycle overlay is authoritative across process restarts.
+    // Seed the runtime fence from it instead of waiting for another Gamma read.
+    let mut lifecycle_terminal: BTreeSet<String> = lifecycle_markets
+        .iter()
+        .filter(|(_, market)| {
+            matches!(
+                market["lifecycle_state"].as_str(),
+                Some("closed" | "resolved" | "invalid")
+            )
+        })
+        .map(|(market, _)| market.clone())
+        .collect();
     let mut lifecycle_retry_at = BTreeMap::<String, tokio::time::Instant>::new();
-    let mut recovery_jobs = tokio::task::JoinSet::<(
-        String,
-        String,
-        Result<marketcow_polymarket::RawTransportFrame>,
-    )>::new();
+    // Terminal publication fences reducers immediately. Wire unsubscribe is
+    // reconciled independently because its receipt can be delayed by another
+    // bounded shard command. One entry per market keeps this state bounded.
+    let mut terminal_unsubscribes = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut recovery_jobs = tokio::task::JoinSet::<MarketRecoveryResult>::new();
     let mut freshness_jobs = tokio::task::JoinSet::<FreshnessResult>::new();
-    let mut recovering = BTreeSet::new();
+    let mut recovering_markets = BTreeSet::new();
     let mut freshness_pending = BTreeSet::new();
     let mut freshness_queued = BTreeMap::<String, super::Market>::new();
     let mut freshness_retry_at = BTreeMap::<String, tokio::time::Instant>::new();
     let mut rest_submitted = BTreeMap::<String, String>::new();
-    let mut retry_at = BTreeMap::<String, tokio::time::Instant>::new();
+    let mut recovery_retry_at = BTreeMap::<String, tokio::time::Instant>::new();
+    let mut recovery_failures = BTreeMap::<String, u32>::new();
     let mut retry_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let shutdown_requested = super::shutdown_signal();
@@ -1390,7 +1649,7 @@ async fn run_connection(
     // A copied generation can already contain lifecycle-only terminal rows
     // from an earlier run. Re-observe only those bounded plan members whose
     // payout remained unresolved; never rescan the catalog.
-    for market in lifecycle_candidates {
+    for market in if leases.enabled(){lifecycle_candidates}else{Vec::new()} {
         let seed_market = lifecycle_markets
             .get(&market.market_id)
             .context("lifecycle candidate missing from seed")?;
@@ -1411,13 +1670,63 @@ async fn run_connection(
             });
         }
     }
-    publication.set_source_ready(true);
+    publication.set_source_ready(leases.enabled());
     let result:Result<()>=async {
         loop {
             let frames=tokio::select! {
                 request=async {match acquisition.as_mut(){Some(rx)=>rx.recv().await,None=>std::future::pending().await}}=>{
                     let Some(request)=request else {acquisition=None;continue;};
                     let result=(||->Result<Value>{
+                        use super::source_scope_control::AcquisitionAction;
+                        let command_now=std::time::Instant::now();
+                        if leases.required()&&leases.expire(command_now)>0&&!leases.enabled(){
+                            confirmation_membership.send_replace(BTreeSet::new());
+                            pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                        }
+                        let request=match request.action {
+                            AcquisitionAction::LeaseStatus{eligible_market_ids}=>return Ok(
+                                lease_status(&leases,adapter,publication,&eligible_market_ids,command_now)),
+                            AcquisitionAction::AcquireLease{lease_id,ttl_seconds,market_ids,eligible_market_ids}=>{
+                                let now=std::time::Instant::now();let eligible=eligible_markets(adapter,&eligible_market_ids);
+                                let was_enabled=leases.enabled();
+                                leases.acquire(lease_id,std::time::Duration::from_secs(ttl_seconds),market_ids,&eligible,now)?;
+                                if !was_enabled&&jobs.tokens().is_empty() {
+                                    jobs.add_pairs(&eligible_pairs(adapter,&eligible)?)?;
+                                    confirmation_membership.send_replace(eligible.clone());
+                                    acquisition_tokens=jobs.tokens();
+                                    publication.set_acquisition_statistics(jobs.statistics());
+                                }
+                                if !was_enabled {
+                                    for record in lifecycle_markets.values().filter(|record|matches!(record["lifecycle_state"].as_str(),
+                                        Some("closed"|"resolved"|"invalid"))&&record["resolution"].is_null()) {
+                                        let market=catalog_market(record)?;
+                                        if !lifecycle_pending.insert(market.market_id.clone()){continue;}
+                                        let client=lifecycle_client.clone();let network=lifecycle_network.clone();
+                                        lifecycle_jobs.spawn(async move {let _permit=network.acquire_owned().await;
+                                            let result=super::source_lifecycle::refresh(client,market.clone(),response_byte_limit).await;
+                                            (market,result)});
+                                    }
+                                }
+                                return Ok(lease_status(&leases,adapter,publication,&eligible_market_ids,now));
+                            },
+                            AcquisitionAction::RenewLease{lease_id,ttl_seconds}=>{
+                                let now=std::time::Instant::now();leases.renew(&lease_id,std::time::Duration::from_secs(ttl_seconds),now)?;
+                                let active=leases.market_ids();
+                                return Ok(lease_status(&leases,adapter,publication,&active,now));
+                            },
+                            AcquisitionAction::ReleaseLease{lease_id}=>{
+                                let now=std::time::Instant::now();leases.release(&lease_id)?;
+                                if !leases.enabled(){
+                                    confirmation_membership.send_replace(BTreeSet::new());
+                                    pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                                }
+                                let active=leases.market_ids();
+                                return Ok(lease_status(&leases,adapter,publication,&active,now));
+                            },
+                            AcquisitionAction::Scope{validate_only,catalog_revision,records,evidence_sha256,
+                                acquisition_market_ids,retire_market_ids}=>ScopeAcquisition{validate_only,catalog_revision,
+                                    records,evidence_sha256,acquisition_market_ids,retire_market_ids},
+                        };
                         if !request.retire_market_ids.is_empty() {
                             let removed=&request.retire_market_ids;
                             publication.check_retirement(removed.clone())?;
@@ -1431,7 +1740,7 @@ async fn run_connection(
                             }
                             confirmation_markets.retain(|m|!removed.contains(&m.market_id));
                             confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
-                            acquisition_tokens=adapter.identities.keys().cloned().collect();
+                            acquisition_tokens=if leases.required(){jobs.tokens()}else{adapter.identities.keys().cloned().collect()};
                             publication.retire_catalog_markets(removed.clone())?;
                             publication.set_acquisition_statistics(jobs.statistics());
                             return Ok(json!({"retirement_queued":true,"retired_market_ids":removed,
@@ -1464,15 +1773,22 @@ async fn run_connection(
                         publication.admit_catalog_markets_scoped(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,
                             &request.acquisition_market_ids,acquisition_token_budget)?;
                         for market in &added {pipeline.install_admitted_market(adapter,publication,market)?;}
-                        jobs.add_pairs(&pairs)?;
+                        if leases.enabled(){
+                            let active=leases.market_ids();
+                            let leased_pairs:Vec<_>=added.iter().filter(|market|active.contains(&market.market_id))
+                                .map(|market|market.token_ids.clone()).collect();
+                            jobs.add_pairs(&leased_pairs)?;
+                        }
                         publication.set_acquisition_statistics(jobs.statistics());
-                        acquisition_tokens=adapter.identities.keys().cloned().collect();
+                        acquisition_tokens=if leases.required(){jobs.tokens()}else{adapter.identities.keys().cloned().collect()};
                         for record in request.records {lifecycle_markets.insert(record["identity"]["market_id"].as_str().unwrap().to_owned(),record);}
                         let added_ids:Vec<_>=added.iter().map(|m|m.market_id.clone()).collect();
-                        if !added.is_empty() {
-                            confirmation_markets.extend(added.clone());
+                        let active=leases.market_ids();
+                        let leased_added:Vec<_>=added.iter().filter(|market|active.contains(&market.market_id)).cloned().collect();
+                        if !leased_added.is_empty()&&leases.enabled() {
+                            confirmation_markets.extend(leased_added.clone());
                             confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
-                            added_confirmation_jobs.spawn(run_confirmations(added,request_market_batch_size,network_concurrency,
+                            added_confirmation_jobs.spawn(run_confirmations(leased_added,request_market_batch_size,network_concurrency,
                                 response_byte_limit,request_timeout_seconds,websocket_confirmation_seconds,
                                 confirmation_sender.clone(),shutdown.clone(),confirmation_network.clone(),confirmation_members.clone()));
                         }
@@ -1494,6 +1810,7 @@ async fn run_connection(
                 },
                 confirmation=confirmation_receiver.recv()=>{
                     let confirmation = confirmation.context("REST confirmation stopped")?;
+                    if !leases.enabled(){continue;}
                     match confirmation.result {
                         Err(error) => eprintln!("{}", json!({"stage":"rest_confirmation_request_failed","detail":error.to_string()})),
                         Ok((books, received_at)) => {
@@ -1598,6 +1915,7 @@ async fn run_connection(
                     let (market, result) = completed.context("lifecycle task missing")??;
                     if !lifecycle_markets.contains_key(&market.market_id){continue;}
                     lifecycle_pending.remove(&market.market_id);
+                    if !leases.enabled(){continue;}
                     lifecycle_retry_at.insert(
                         market.market_id.clone(),
                         tokio::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -1614,17 +1932,49 @@ async fn run_connection(
                             publication.publish_with_capacity_and_evidence(
                                 vec![event], Some(evidence.clone()),
                             ).await?;
-                            if adapter
-                                .identities
-                                .values()
-                                .any(|(owner, _)| owner == &market.market_id)
-                            {
-                                pipeline.retire_market(adapter, &market.market_id)?;
-                            }
                             lifecycle_terminal.insert(market.market_id.clone());
+                            let retired_tokens = if pipeline.has_market(&market.market_id) {
+                                pipeline
+                                    .remove_market(adapter, &market.market_id)?
+                                    .into_iter()
+                                    .collect::<BTreeSet<_>>()
+                            } else {
+                                BTreeSet::new()
+                            };
+                            if !retired_tokens.is_empty() {
+                                acquisition_tokens.retain(|token| !retired_tokens.contains(token));
+                                terminal_unsubscribes
+                                    .insert(market.market_id.clone(), retired_tokens.clone());
+                                recovery_retry_at.remove(&market.market_id);
+                                recovery_failures.remove(&market.market_id);
+                                recovering_markets.remove(&market.market_id);
+                                freshness_queued.remove(&market.market_id);
+                                freshness_pending.remove(&market.market_id);
+                                freshness_retry_at.remove(&market.market_id);
+                                confirmation_markets
+                                    .retain(|item| item.market_id != market.market_id);
+                                confirmation_membership.send_replace(
+                                    confirmation_markets
+                                        .iter()
+                                        .map(|item| item.market_id.clone())
+                                        .collect(),
+                                );
+                                // Local ownership is already fenced. A busy
+                                // command slot is item-local and retried by the
+                                // scheduler; it must not fail the whole source.
+                                if let Err(error) = jobs.request_retire(&retired_tokens) {
+                                    eprintln!("{}", json!({
+                                        "stage":"lifecycle_wire_retirement_retry",
+                                        "market_id":market.market_id,
+                                        "detail":error.to_string()
+                                    }));
+                                }
+                            }
                             eprintln!("{}",json!({"stage":"lifecycle_terminal_published",
                                 "market_id":market.market_id,
-                                "evidence_sha256":evidence["raw_response_sha256"]}));
+                                "evidence_sha256":evidence["raw_response_sha256"],
+                                "retired_token_count":retired_tokens.len(),
+                                "wire_unsubscribe_pending":!retired_tokens.is_empty()}));
                         }
                         Ok(None) => eprintln!("{}",json!({"stage":"lifecycle_not_terminal",
                             "market_id":market.market_id})),
@@ -1634,23 +1984,95 @@ async fn run_connection(
                     continue;
                 },
                 completed=recovery_jobs.join_next(), if !recovery_jobs.is_empty()=>{
-                    let (token, attempt, result) = completed.context("recovery task missing")??;
-                    recovering.remove(&token);
-                    retry_at.insert(token.clone(), tokio::time::Instant::now()+std::time::Duration::from_secs(5));
-                    if adapter.recoveries.get(&token) == Some(&attempt) {
-                        match result {
-                            Ok(frame) => {
-                                pipeline.submit(adapter, publication, frame, Some((token, attempt))).await?;
+                    let (market_id, attempts, result) = completed.context("recovery task missing")??;
+                    recovering_markets.remove(&market_id);
+                    if !leases.enabled(){continue;}
+                    // A lifecycle result can retire a market while a bounded
+                    // recovery socket is still in flight. Its eventual result
+                    // must not recreate retry state or submit a late snapshot.
+                    if lifecycle_terminal.contains(&market_id) {
+                        recovery_failures.remove(&market_id);
+                        recovery_retry_at.remove(&market_id);
+                        continue;
+                    }
+                    match result {
+                        Ok(frames) => {
+                            recovery_failures.remove(&market_id);
+                            recovery_retry_at.remove(&market_id);
+                            let mut by_token = frames.into_iter().filter_map(|frame| {
+                                let token = frame.raw_payload["asset_id"].as_str()?.to_owned();
+                                Some((token, frame))
+                            }).collect::<BTreeMap<_, _>>();
+                            for (token, attempt) in attempts {
+                                if adapter.recoveries.get(&token) != Some(&attempt) { continue; }
+                                match by_token.remove(&token) {
+                                    Some(frame) => pipeline.submit(
+                                        adapter, publication, frame, Some((token, attempt)),
+                                    ).await?,
+                                    None => eprintln!("{}", json!({"stage":"market_recovery_incomplete",
+                                        "market_id":market_id,"token_id":token})),
+                                }
                             }
-                            Err(error) => eprintln!("{}", json!({"stage":"token_recovery_retry","token_id":token,"detail":error.to_string()})),
+                        }
+                        Err(error) => {
+                            let failures = recovery_failures.entry(market_id.clone()).or_default();
+                            *failures = failures.saturating_add(1);
+                            recovery_retry_at.insert(
+                                market_id.clone(),
+                                tokio::time::Instant::now() + recovery_retry_delay(*failures),
+                            );
+                            eprintln!("{}", json!({"stage":"market_recovery_retry",
+                                "market_id":market_id,"token_count":attempts.len(),
+                                "consecutive_failures":*failures,"detail":error.to_string()}));
+                            // A market that disappears from the official book
+                            // stream may have become terminal. Confirmation
+                            // polling can be disabled, so a failed bounded WS
+                            // recovery must independently trigger one bounded
+                            // lifecycle lookup. Otherwise an expired member can
+                            // remain in recovery forever and keep opening retry
+                            // sockets. This lookup is event-driven, coalesced by
+                            // market, and observes only the failed identity.
+                            let due = lifecycle_retry_at
+                                .get(&market_id)
+                                .is_none_or(|at| *at <= tokio::time::Instant::now());
+                            if !lifecycle_terminal.contains(&market_id)
+                                && !lifecycle_pending.contains(&market_id)
+                                && due
+                            {
+                                if let Some(record) = lifecycle_markets.get(&market_id) {
+                                    let market = catalog_market(record)?;
+                                    lifecycle_pending.insert(market_id.clone());
+                                    let client = lifecycle_client.clone();
+                                    let network = lifecycle_network.clone();
+                                    lifecycle_jobs.spawn(async move {
+                                        let _permit = network.acquire_owned().await;
+                                        let result = super::source_lifecycle::refresh(
+                                            client,
+                                            market.clone(),
+                                            response_byte_limit,
+                                        )
+                                        .await;
+                                        (market, result)
+                                    });
+                                }
+                            }
                         }
                     }
                     continue;
                 },
                 completed=freshness_jobs.join_next(), if !freshness_jobs.is_empty()=>{
                     let (market, requested, result) = completed.context("freshness task missing")??;
-                    if !confirmation_membership.borrow().contains(&market.market_id){continue;}
                     freshness_pending.remove(&market.market_id);
+                    if !leases.enabled(){continue;}
+                    // The terminal transition removes confirmation membership,
+                    // but an already running task may complete afterward.
+                    // Fence it before it can confirm or replace retired state.
+                    if lifecycle_terminal.contains(&market.market_id)
+                        || !confirmation_membership.borrow().contains(&market.market_id)
+                    {
+                        freshness_retry_at.remove(&market.market_id);
+                        continue;
+                    }
                     freshness_retry_at.insert(
                         market.market_id.clone(),
                         tokio::time::Instant::now()
@@ -1716,20 +2138,65 @@ async fn run_connection(
                     continue;
                 },
                 _=retry_tick.tick()=>{
+                    if leases.required()&&leases.expire(std::time::Instant::now())>0&&!leases.enabled(){
+                        confirmation_membership.send_replace(BTreeSet::new());
+                        pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                        eprintln!("{}",json!({"stage":"acquisition_lease_expired","acquisition_enabled":false}));
+                    }
                     if let Err(error)=jobs.poll_retirements(){eprintln!("{}",json!({"stage":"acquisition_retirement_error","error":error.to_string()}));}
+                    if leases.enabled()&&jobs.tokens().is_empty(){
+                        let active=leases.market_ids();
+                        jobs.add_pairs(&eligible_pairs(adapter,&active)?)?;
+                        confirmation_membership.send_replace(active);
+                        acquisition_tokens=jobs.tokens();
+                        publication.set_acquisition_statistics(jobs.statistics());
+                    }
+                    let pending_terminal_markets = terminal_unsubscribes
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for market_id in pending_terminal_markets {
+                        let tokens = terminal_unsubscribes[&market_id].clone();
+                        match jobs.request_retire(&tokens) {
+                            Ok(true) => {
+                                terminal_unsubscribes.remove(&market_id);
+                                eprintln!("{}",json!({
+                                    "stage":"lifecycle_wire_retirement_complete",
+                                    "market_id":market_id,
+                                    "token_count":tokens.len()
+                                }));
+                            }
+                            Ok(false) => {}
+                            Err(error) => eprintln!("{}",json!({
+                                "stage":"lifecycle_wire_retirement_retry",
+                                "market_id":market_id,
+                                "detail":error.to_string()
+                            })),
+                        }
+                    }
                     publication.set_acquisition_statistics(jobs.statistics());
+                    if leases.enabled()&&!publication.is_source_ready()&&publication.fresh_acquisition_started(&jobs.tokens()){
+                        publication.set_source_ready(true);
+                        eprintln!("{}",json!({"stage":"acquisition_lease_ready","source_cursor":publication.cursor()?}));
+                    }
+                    if !leases.enabled(){continue;}
                     rest_submitted.retain(|token, attempt| adapter.recoveries.get(token) == Some(attempt));
-                    // A bounded number of temporary sockets; a failed token cannot
-                    // occupy every retry slot forever (per-token backoff).
-                    for (token, attempt) in &adapter.recoveries {
-                        if recovering.len() >= websocket_recovery_concurrency { break; }
-                        if recovering.contains(token) || retry_at.get(token).is_some_and(|at| *at > tokio::time::Instant::now()) { continue; }
-                        let token = token.clone();
-                        let attempt = attempt.clone();
-                        recovering.insert(token.clone());
+                    // Coalesce all pending token gaps for one market into one
+                    // temporary subscription. Repeated shard boundaries cannot
+                    // create a socket per token or reset an in-flight identity.
+                    let pending = pending_market_recoveries(adapter);
+                    recovery_retry_at.retain(|market_id, _| pending.contains_key(market_id));
+                    recovery_failures.retain(|market_id, _| pending.contains_key(market_id));
+                    for (market_id, attempts) in pending {
+                        if recovery_jobs.len() >= websocket_recovery_concurrency { break; }
+                        if recovering_markets.contains(&market_id)
+                            || recovery_retry_at.get(&market_id)
+                                .is_some_and(|at| *at > tokio::time::Instant::now()) { continue; }
+                        let tokens = attempts.keys().cloned().collect();
+                        recovering_markets.insert(market_id.clone());
                         recovery_jobs.spawn(async move {
-                            let result = recover_snapshot(token.clone()).await;
-                            (token, attempt, result)
+                            let result = recover_snapshots(tokens).await;
+                            (market_id, attempts, result)
                         });
                     }
                     start_freshness_jobs(
@@ -1743,6 +2210,7 @@ async fn run_connection(
                 _=&mut shutdown_requested=>break,
             };
             for frame in frames {
+                if !leases.enabled(){continue;}
                 if !marketcow_polymarket::subscription::owned_or_unclassified(&frame.raw_payload,&acquisition_tokens){continue;}
                 // Consume completed work between admissions, not only after
                 // the whole upstream batch. A bounded drain prevents either
@@ -1783,16 +2251,25 @@ async fn run_connection(
             }
             completed = recovery_jobs.join_next(), if !recovery_jobs.is_empty() => {
                 let Some(completed) = completed else { continue; };
-                let (token, attempt, result) = completed?;
-                recovering.remove(&token);
-                if adapter.recoveries.get(&token) == Some(&attempt) {
-                    match result {
-                        Ok(frame) => pipeline.submit(adapter, publication, frame, Some((token, attempt))).await?,
-                        Err(error) => eprintln!("{}", json!({
-                            "stage":"shutdown_token_recovery_failed","token_id":token,
-                            "detail":error.to_string()
-                        })),
+                let (market_id, attempts, result) = completed?;
+                recovering_markets.remove(&market_id);
+                match result {
+                    Ok(frames) => {
+                        let mut by_token = frames.into_iter().filter_map(|frame| {
+                            let token = frame.raw_payload["asset_id"].as_str()?.to_owned();
+                            Some((token, frame))
+                        }).collect::<BTreeMap<_, _>>();
+                        for (token, attempt) in attempts {
+                            if adapter.recoveries.get(&token) != Some(&attempt) { continue; }
+                            if let Some(frame) = by_token.remove(&token) {
+                                pipeline.submit(adapter, publication, frame, Some((token, attempt))).await?;
+                            }
+                        }
                     }
+                    Err(error) => eprintln!("{}", json!({
+                        "stage":"shutdown_market_recovery_failed","market_id":market_id,
+                        "token_count":attempts.len(),"detail":error.to_string()
+                    })),
                 }
             }
             _ = tokio::time::sleep_until(recovery_deadline) => break,

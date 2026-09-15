@@ -22,6 +22,7 @@ mod source_market_evidence;
 mod source_scope_control;
 mod source_scope_journal;
 mod source_acquisition_shards;
+mod source_acquisition_lease;
 mod source_rest_pool;
 mod source_scope_registry;
 mod source_public_frame;
@@ -47,6 +48,24 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await.expect("shutdown handler");
+}
+
+fn websocket_seed(
+    base: Option<Value>,
+    discovery: Option<&source_discovery_projection::DiscoveryConfig>,
+) -> Result<Option<Value>> {
+    base.map(|mut seed| {
+        if seed.get("scope_id").and_then(Value::as_str).is_none() {
+            let universe_revision = &discovery
+                .context("unscoped WebSocket seed requires Discovery identity")?
+                .universe_revision;
+            seed.as_object_mut()
+                .context("WebSocket seed must be an object")?
+                .insert("scope_id".into(), json!(universe_revision));
+        }
+        Ok(seed)
+    })
+    .transpose()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -94,9 +113,10 @@ struct Args {
     /// Bounded number of temporary authoritative snapshot subscriptions.
     #[arg(long, default_value_t = 8)]
     websocket_recovery_concurrency: usize,
-    /// Periodic authoritative REST confirmation for quiet WS books. Matching
-    /// snapshots refresh only memory freshness and never enter the event log.
-    #[arg(long, default_value_t = 2)]
+    /// Optional full-scope REST audit period. Zero disables polling while the
+    /// WebSocket stream is healthy. A non-zero audit is deliberately limited
+    /// to a five-minute-or-slower cadence; recovery remains event-driven.
+    #[arg(long, default_value_t = 0)]
     websocket_confirmation_seconds: u64,
     #[arg(long, requires_all = ["dependency_plan", "live_frame_bytes", "live_maximum_clients"])]
     live_listen: Option<std::net::SocketAddr>,
@@ -137,6 +157,14 @@ struct Args {
     acquisition_token_budget:Option<usize>,
     #[arg(long, requires="scope_control_socket")]
     acquisition_socket_budget:Option<usize>,
+    /// Keep APIs/control alive but acquire upstream sockets only while a
+    /// bounded consumer lease exists. Leases are intentionally process-local.
+    #[arg(long,requires_all=["scope_control_socket","acquisition_lease_capacity","acquisition_lease_max_seconds"])]
+    acquisition_lease_required:bool,
+    #[arg(long,requires="acquisition_lease_required")]
+    acquisition_lease_capacity:Option<usize>,
+    #[arg(long,requires="acquisition_lease_required")]
+    acquisition_lease_max_seconds:Option<u64>,
     /// Independent direct Rust Discovery surface over this frozen universe.
     #[arg(long, conflicts_with_all=["configured_scope", "public_listen", "live_listen"], requires_all=["discovery_seed", "discovery_seed_sha256", "discovery_state_bytes", "discovery_full_sync_bytes", "discovery_frame_bytes", "discovery_replay_bytes", "discovery_clients", "discovery_baselines", "discovery_send_timeout_seconds"])]
     discovery_listen:Option<std::net::SocketAddr>,
@@ -465,16 +493,22 @@ async fn main() -> Result<()> {
             && (1..=20).contains(&args.request_market_batch_size)
             && (2..=500).contains(&args.websocket_shard_tokens)
             && (1..=32).contains(&args.websocket_recovery_concurrency)
-            && (1..=300).contains(&args.websocket_confirmation_seconds)
+            && (args.websocket_confirmation_seconds == 0
+                || (300..=3600).contains(&args.websocket_confirmation_seconds))
             && args.poll_seconds > 0
             && args.request_timeout_seconds > 0,
-        "explicit positive concurrency/timeout/poll configuration required"
+        "invalid concurrency/timeout/poll/audit configuration"
     );
     ensure!(
         args.expected_market_count > 0 && args.response_byte_limit > 0 && args.batch_byte_limit > 0,
         "explicit universe count and byte budgets required"
     );
     ensure!(args.cycles != Some(0), "cycles must be positive");
+    ensure!(!args.acquisition_lease_required||(
+        args.input_mode==InputMode::Websocket
+        && args.acquisition_lease_capacity.is_some_and(|n|(1..=64).contains(&n))
+        && args.acquisition_lease_max_seconds.is_some_and(|n|(1..=3600).contains(&n))),
+        "on-demand acquisition requires bounded WebSocket leases");
     ensure!(
         args.lifecycle_refresh_seconds != Some(0),
         "lifecycle interval must be positive"
@@ -697,7 +731,12 @@ async fn main() -> Result<()> {
         .collect();
     let persistence_root = args.root.clone();
     let persistence_catalog = plan.catalog_revision.clone();
-    let ws_seed = base.clone();
+    // The normalizer requires a stable identity domain. Live already carries
+    // its scope ID in the baseline; Discovery is intentionally unscoped, so
+    // bind its in-memory WS events to the immutable universe revision instead.
+    // This field is added only to the adapter seed and is not exposed as a
+    // fabricated Live scope in the Discovery read contract.
+    let ws_seed = websocket_seed(base.clone(), discovery_config.as_ref())?;
     let mut publication = source_publication::Publication::start_managed(
         cursor,
         base,
@@ -980,7 +1019,35 @@ mod scope_tests {
         .unwrap();
         assert_eq!(defaults.websocket_shard_tokens, 50);
         assert_eq!(defaults.websocket_recovery_concurrency, 8);
-        assert_eq!(defaults.websocket_confirmation_seconds, 2);
+        assert_eq!(defaults.websocket_confirmation_seconds, 0);
+    }
+
+    #[test]
+    fn discovery_websocket_seed_uses_universe_revision_without_live_scope() {
+        let config = source_discovery_projection::DiscoveryConfig {
+            projection_id: "projection".into(),
+            catalog_revision: "catalog".into(),
+            universe_revision: "universe".into(),
+            market_ids: vec!["1".into()],
+            relations: vec![],
+            settlements: Default::default(),
+            policy: source_discovery_quote::QuotePolicy {
+                quantities: vec!["1".into()],
+                maximum_book_age_ms: 1_000,
+            },
+        };
+        let seed = websocket_seed(Some(json!({"markets": [], "books": []})), Some(&config))
+            .unwrap()
+            .unwrap();
+        assert_eq!(seed["scope_id"], "universe");
+
+        let live = websocket_seed(
+            Some(json!({"scope_id": "live-scope", "markets": [], "books": []})),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(live["scope_id"], "live-scope");
     }
 
     #[test]

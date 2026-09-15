@@ -28,6 +28,8 @@ class Runtime:
         self.commands.append(copy.deepcopy(command))
         if self.fail == command["operation"]:
             raise RuntimeError("synthetic lost receipt")
+        if command["operation"] == "acquisition_lease_status":
+            return {"schema_version": "marketcow.acquisition-lease-status.v1", "source_ready": False}
         key = "scope_id" if self.pool == "live" else "projection_id"
         if command["expected_scope_id"] != self.actual[key] or command["expected_revision"] != self.actual["revision"]:
             raise ValueError("scope revision conflict")
@@ -39,6 +41,8 @@ class Runtime:
         if command["operation"] == "retire_acquisition":
             self.actual["retirement_submitted"] += 1
             return dict(retirement_queued=True)
+        if command["operation"] in {"acquire_acquisition_lease", "renew_acquisition_lease", "release_acquisition_lease"}:
+            return {"schema_version": "marketcow.acquisition-lease-status.v1", "source_ready": False}
         assert command["operation"] == "publish_scope"
         config = command["config"]
         self.actual[key] = config["active_scope_id" if self.pool == "live" else "projection_id"]
@@ -76,6 +80,20 @@ def operations(tmp_path):
 def activation(c, expected="old-discovery", revision=1):
     return dict(schema_version="marketcow.hot-scope-activate.v1", pool=c["pool"], candidate_id=c["candidate_id"],
         expected_scope_id=expected, expected_revision=revision, protected_market_ids=[])
+
+
+def test_acquisition_leases_are_caller_scoped_and_exact(operations):
+    ops, runtimes = operations
+    body = {"schema_version": "marketcow.acquisition-lease.v1", "pool": "live",
+            "expected_scope_id": "old-live", "expected_revision": 1, "lease_id": "paper-a",
+            "ttl_seconds": 30, "market_ids": ["1", "2"]}
+    ops.acquisition_lease("tradude", body, "acquire")
+    command = runtimes["live"].commands[-1]
+    assert command["operation"] == "acquire_acquisition_lease"
+    assert command["lease_id"].endswith(":paper-a") and not command["lease_id"].startswith("tradude:")
+    assert ops.acquisition_lease_status("live")["source_ready"] is False
+    with pytest.raises(ValueError, match="sorted unique"):
+        ops.acquisition_lease("tradude", {**body, "market_ids": ["2", "1"]}, "acquire")
 
 
 def test_prepare_does_not_publish_and_cas_reads_runtime(operations):

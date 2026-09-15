@@ -2,7 +2,7 @@
 //! JSONL is authoritative; SQLite and state-index.json publish only after fsync.
 //! A crash leaving an unindexed tail fails closed on reopen, never truncates it.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use marketcow_polymarket::discovery_source::canonical_hash;
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
@@ -340,6 +340,7 @@ impl ValidatedSourceBatch {
 
 pub struct PreparedSourceWriter {
     recoveries: BTreeMap<String, Value>,
+    terminal_markets: BTreeSet<String>,
     root: PathBuf,
     database: Connection,
     log: Option<File>,
@@ -607,6 +608,7 @@ impl PreparedSourceWriter {
             history_limit,
             health,
             recoveries,
+            terminal_markets,
             token_markets,
         })
     }
@@ -755,6 +757,7 @@ impl PreparedSourceWriter {
         tx.commit()?;
         self.health.retain(|token,_|!tokens.contains(token));
         self.recoveries.retain(|token,_|!tokens.contains(token));
+        self.terminal_markets.retain(|market|!markets.contains(market));
         self.token_markets.retain(|token,_|!tokens.contains(token));
         self.write_index_manifest(&values)?;
         self.poisoned=false;
@@ -870,6 +873,14 @@ impl PreparedSourceWriter {
         terminal: bool,
         cursor: u64,
     ) -> Result<()> {
+        if !terminal {
+            ensure!(
+                events.iter().all(|event| event["market_id"]
+                    .as_str()
+                    .is_some_and(|market| !self.terminal_markets.contains(market))),
+                "event targets durable terminal market"
+            );
+        }
         if let Some(limit) = self.history_limit {
             let wal_path = self.root.join("indexes/latest-state.sqlite3-wal");
             let wal_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
@@ -1079,6 +1090,10 @@ impl PreparedSourceWriter {
         }
         tx.commit()?;
         self.recoveries = recoveries;
+        if terminal {
+            self.terminal_markets
+                .insert(required(&events[0], "market_id")?.to_owned());
+        }
         self.write_index_manifest(&values)?;
         self.poisoned = false;
         Ok(())
@@ -1130,7 +1145,7 @@ mod tests {
             "detected_at":"2026-01-01T00:00:00Z","event_at":null,"expected":null,
             "observed":null,"resolution":null}]);
         rehash(&mut start);
-        writer.append_market_batch(&[start]).unwrap();
+        writer.append_market_batch(&[start.clone()]).unwrap();
         let mut terminal = event("11", 4);
         terminal["event_type"] = json!("market_terminal");
         terminal["token_id"] = Value::Null;
@@ -1154,6 +1169,17 @@ mod tests {
         writer.append_terminal(&terminal).unwrap();
         assert_eq!(writer.cursor().unwrap(), 4);
         assert!(writer.recoveries.is_empty());
+        assert_eq!(writer.terminal_markets, BTreeSet::from(["1".into()]));
+        // A late shard boundary cannot reopen a durable recovery after the
+        // authoritative terminal row has committed.
+        start["cursor"] = json!(5);
+        rehash(&mut start);
+        assert!(writer
+            .append_market_batch(&[start])
+            .unwrap_err()
+            .to_string()
+            .contains("durable terminal"));
+        assert_eq!(writer.cursor().unwrap(), 4);
         let n: i64 = writer
             .database
             .query_row("SELECT count(*) FROM books", [], |r| r.get(0))

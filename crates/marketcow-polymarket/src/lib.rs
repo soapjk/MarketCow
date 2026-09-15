@@ -251,19 +251,41 @@ async fn run_transport_attempts(
         }
         match run_polymarket_connection(config, tokens, output, shutdown, updates).await {
             Ok(ConnectionEnd::Shutdown) => return Ok(()),
-            Ok(ConnectionEnd::Disconnected) => {
-                if !publish_connection_gaps(tokens, attempt, output, shutdown).await? {
+            Ok(ConnectionEnd::Disconnected { close_code, close_reason }) => {
+                if !publish_connection_gaps(
+                    tokens,
+                    attempt,
+                    "upstream_close",
+                    close_code,
+                    close_reason.as_deref(),
+                    output,
+                    shutdown,
+                )
+                .await?
+                {
                     return Ok(());
                 }
                 tracing::warn!(
                     attempt,
+                    close_code,
+                    close_reason,
                     reason = "upstream_disconnected",
                     "polymarket_transport_retry"
                 );
             }
             Err(TransportError::Backpressure) => return Err(TransportError::Backpressure),
             Err(error) if attempt == config.maximum_reconnect_attempts => {
-                if !publish_connection_gaps(tokens, attempt, output, shutdown).await? {
+                if !publish_connection_gaps(
+                    tokens,
+                    attempt,
+                    error.reason_code(),
+                    None,
+                    None,
+                    output,
+                    shutdown,
+                )
+                .await?
+                {
                     return Ok(());
                 }
                 tracing::warn!(
@@ -274,7 +296,17 @@ async fn run_transport_attempts(
                 return Err(error);
             }
             Err(error) => {
-                if !publish_connection_gaps(tokens, attempt, output, shutdown).await? {
+                if !publish_connection_gaps(
+                    tokens,
+                    attempt,
+                    error.reason_code(),
+                    None,
+                    None,
+                    output,
+                    shutdown,
+                )
+                .await?
+                {
                     return Ok(());
                 }
                 tracing::warn!(
@@ -288,7 +320,7 @@ async fn run_transport_attempts(
             return Err(TransportError::ReconnectExhausted);
         }
         tokio::select! {
-            _ = tokio::time::sleep(config.reconnect_delay) => {}
+            _ = tokio::time::sleep(reconnect_backoff(config.reconnect_delay, attempt)) => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { return Ok(()); }
             }
@@ -297,15 +329,26 @@ async fn run_transport_attempts(
     Err(TransportError::ReconnectExhausted)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn reconnect_backoff(base: Duration, attempt: u32) -> Duration {
+    let multiplier = 1_u32 << attempt.saturating_sub(1).min(6);
+    base.saturating_mul(multiplier).min(Duration::from_secs(60))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ConnectionEnd {
     Shutdown,
-    Disconnected,
+    Disconnected {
+        close_code: Option<u16>,
+        close_reason: Option<String>,
+    },
 }
 
 async fn publish_connection_gaps(
     tokens: &BTreeSet<String>,
     attempt: u32,
+    transport_reason: &str,
+    close_code: Option<u16>,
+    close_reason: Option<&str>,
     output: &mpsc::Sender<Vec<RawTransportFrame>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<bool, TransportError> {
@@ -317,6 +360,9 @@ async fn publish_connection_gaps(
             raw_payload: serde_json::json!({
                 "event_type":"source_gap", "asset_id":token_id,
                 "reason":"upstream_connection_boundary", "attempt":attempt,
+                "transport_reason":transport_reason,
+                "close_code":close_code,
+                "close_reason":close_reason,
                 "timestamp":timestamp,
             }),
             received_at,
@@ -421,7 +467,15 @@ async fn run_polymarket_connection(
                         value @ Value::Object(_) => vec![value],
                         _ => return Err(TransportError::InvalidFrame),
                     };
-                    if values.is_empty() || values.iter().any(|value| !value.is_object()) {
+                    // The venue legitimately returns an empty snapshot array
+                    // when none of the requested tokens currently has a book.
+                    // Keep those identities waiting for a later book or the
+                    // bounded recovery path; an empty batch is not transport
+                    // corruption and must not invalidate the whole shard.
+                    if values.is_empty() {
+                        continue;
+                    }
+                    if values.iter().any(|value| !value.is_object()) {
                         return Err(TransportError::InvalidFrame);
                     }
                     let frames:Vec<_> = values.into_iter().filter(|value|subscription::owned_or_unclassified(value,tokens)).map(|raw_payload| RawTransportFrame {
@@ -436,12 +490,22 @@ async fn run_polymarket_connection(
                 Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await
                     .map_err(|_| TransportError::SendFailed)?,
                 Some(Ok(Message::Pong(_))) => {}
-                Some(Ok(Message::Close(_))) | None => return Ok(ConnectionEnd::Disconnected),
+                Some(Ok(Message::Close(frame))) => return Ok(ConnectionEnd::Disconnected {
+                    close_code: frame.as_ref().map(|frame| u16::from(frame.code)),
+                    close_reason: frame.map(|frame| frame.reason.to_string()),
+                }),
+                None => return Ok(ConnectionEnd::Disconnected {
+                    close_code: None,
+                    close_reason: Some("stream_ended_without_close_frame".into()),
+                }),
                 Some(Ok(Message::Binary(_) | Message::Frame(_))) => {
                     let _ = socket.close(None).await;
                     return Err(TransportError::InvalidFrame);
                 }
-                Some(Err(_)) => return Err(TransportError::ReadFailed),
+                Some(Err(error)) => {
+                    tracing::warn!(detail=%error,"polymarket_websocket_read_failed");
+                    return Err(TransportError::ReadFailed);
+                },
             },
             _ = &mut heartbeat => socket.send(Message::Text("PING".into())).await
                 .map_err(|_| TransportError::SendFailed)?,
@@ -1083,6 +1147,16 @@ mod tests {
     use super::*;
     use marketcow_core::{DurableLog, PersistedEvent, SingleWriter};
 
+    #[test]
+    fn reconnect_backoff_is_exponential_and_bounded() {
+        let base = Duration::from_secs(1);
+        assert_eq!(reconnect_backoff(base, 1), Duration::from_secs(1));
+        assert_eq!(reconnect_backoff(base, 2), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(base, 6), Duration::from_secs(32));
+        assert_eq!(reconnect_backoff(base, 7), Duration::from_secs(60));
+        assert_eq!(reconnect_backoff(base, 32), Duration::from_secs(60));
+    }
+
     struct MemoryLog(Vec<PersistedEvent>);
     impl DurableLog for MemoryLog {
         fn append(&mut self, _: &CanonicalEvent) -> Result<(), marketcow_core::CoreError> {
@@ -1444,6 +1518,10 @@ mod tests {
             let subscription: Value = serde_json::from_str(&subscription).unwrap();
             assert_eq!(subscription["type"], "market");
             assert_eq!(subscription["assets_ids"], serde_json::json!(["yes-1"]));
+            socket
+                .send(Message::Text("[]".into()))
+                .await
+                .unwrap();
             socket
                 .send(Message::Text(
                     serde_json::json!([{

@@ -70,6 +70,33 @@ class HotHttpOperations:
             raise ValueError("invalid_hot_pool")
         return self._request("GET", "hot-scopes/status?pool=" + pool)[0]
 
+    def acquisition_lease_status(self, pool):
+        if pool not in ("discovery", "live"):
+            raise ValueError("invalid_hot_pool")
+        return self._request("GET", "acquisition-leases/status?pool=" + pool)[0]
+
+    def acquire_acquisition(self, *, pool, lease_id, ttl_seconds, expected_scope_id,
+                            expected_revision, market_ids):
+        return self._request("POST", "acquisition-leases/acquire", {
+            "schema_version": "marketcow.acquisition-lease.v1", "pool": pool,
+            "expected_scope_id": expected_scope_id, "expected_revision": expected_revision,
+            "lease_id": lease_id, "ttl_seconds": ttl_seconds, "market_ids": list(market_ids),
+        })[0]
+
+    def renew_acquisition(self, *, pool, lease_id, ttl_seconds, expected_scope_id, expected_revision):
+        return self._request("POST", "acquisition-leases/renew", {
+            "schema_version": "marketcow.acquisition-lease.v1", "pool": pool,
+            "expected_scope_id": expected_scope_id, "expected_revision": expected_revision,
+            "lease_id": lease_id, "ttl_seconds": ttl_seconds,
+        })[0]
+
+    def release_acquisition(self, *, pool, lease_id, expected_scope_id, expected_revision):
+        return self._request("POST", "acquisition-leases/release", {
+            "schema_version": "marketcow.acquisition-lease.v1", "pool": pool,
+            "expected_scope_id": expected_scope_id, "expected_revision": expected_revision,
+            "lease_id": lease_id,
+        })[0]
+
     def prepare_live(self, caller, request):
         return self._post("live/prepare", request)
 

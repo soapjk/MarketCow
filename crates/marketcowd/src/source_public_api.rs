@@ -28,10 +28,10 @@ impl PublicScopeControl {
     pub fn referenced_markets(&self)->Result<BTreeSet<String>> {
         let mut ids=BTreeSet::new();
         for lease in self.state.readable(std::time::Instant::now())? {
-            let view=lease.value.reader.capture()?;
+            let markets=lease.value.reader.installed_markets()?;
             for market in &lease.value.scope.configured_markets {
                 ids.insert(market.market_id.clone());
-                let metadata=view.markets.get(&market.market_id).context("leased metadata missing")?;
+                let metadata=markets.get(&market.market_id).context("leased metadata missing")?;
                 for relation in metadata["relations"].as_array().context("leased relations")? {
                     for pair in relation["outcome_pairs"].as_array().context("leased relation pairs")? {
                         ids.insert(pair["market_id"].as_str().context("leased dependency market")?.into());

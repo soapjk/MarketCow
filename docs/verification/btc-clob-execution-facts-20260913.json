@@ -1,0 +1,81 @@
+{
+  "schema_version": "marketcow.polymarket.execution-facts-evidence-manifest.v1",
+  "created_at": "2026-09-13T06:30:21Z",
+  "package_manifest_sha256": "c38026d41e18b927dafdeef0b285e607127b089cdb70f8d65fcbcad1072bb276",
+  "market_responses": [
+    {
+      "market_id": "4463079",
+      "condition_id": "0xa5e5df12d202e45d46c2109d48a72414ad1df8df8e680eed8202b26d8ded5c4d",
+      "received_at": "2026-09-13T06:19:59.961464Z",
+      "raw_sha256": "aab4cafe7620ae0e9f6300351fb28083f263e9a7e1446e4414ce4265d62728a6",
+      "raw_bytes_saved": false
+    },
+    {
+      "market_id": "4463618",
+      "condition_id": "0x708192fa9c3c172ad655b429a76f715282fe547389f4c0ce870840e5c9de294e",
+      "received_at": "2026-09-13T06:20:01.905026Z",
+      "raw_sha256": "cacdabae60e35c47bc5923e08737159a6513c1af70322c35fb507a47301a3ed1",
+      "raw_bytes_saved": false
+    },
+    {
+      "market_id": "4464116",
+      "condition_id": "0x56065177219da07c1e0a9fcca3fe15308956c1b119f8ed854184833f671d5c2f",
+      "received_at": "2026-09-13T06:20:03.645813Z",
+      "raw_sha256": "b7679b623c658a4faba4c458dfb0f983ff78e47741465db302f1e0b78f27ff96",
+      "raw_bytes_saved": false
+    }
+  ],
+  "common_projected_source_facts": {
+    "minimum_order_size": "5",
+    "minimum_order_size_unit": "shares",
+    "minimum_tick_size": "0.01",
+    "minimum_tick_size_unit": "probability",
+    "maker_base_fee_bps": "1000",
+    "taker_base_fee_bps": "1000",
+    "fee_details": {"rate": "0.07", "exponent": 1, "taker_only": true},
+    "taker_order_delay_enabled": true,
+    "wire_version": "v1"
+  },
+  "fee_parameter_resolution": {
+    "applicable_parameter_source": "fd",
+    "base_fee_fields_applicability": "preserved_source_fields_not_used_for_clob_v2_dynamic_fee_calculation",
+    "reason": "The CLOB V2 migration contract removes order feeRateBps, determines fees at match time, and directs clients to getClobMarketInfo fd.r/fd.e/fd.to."
+  },
+  "unknown_source_facts": ["size_increment", "fee_effective_at", "fee_rounding_tie_mode"],
+  "paper_assumption": {
+    "schema_version": "marketcow.polymarket.paper-execution-assumption.v1",
+    "fee_currency_conversion": "1 pUSD = 1 USDC face value",
+    "fee_rounding_mode": "ROUND_UP",
+    "size_increment": "0.000001",
+    "purpose": "conservative_simulation_only",
+    "not_source_facts": ["fee_currency_conversion", "fee_rounding_mode", "size_increment"]
+  },
+  "raw_retention": {
+    "status": "not_persisted",
+    "explanation": "The three complete response bodies were retained only in the bounded diagnostic tool result and were not written to a durable file. They cannot be reconstructed from their hashes. No replacement GET was made to manufacture original evidence."
+  },
+  "documentation_observation": {
+    "capture_started_after": "2026-09-13T06:25:47Z",
+    "capture_finished_before": "2026-09-13T06:30:21Z",
+    "raw_pages_saved": false,
+    "pages": [
+      {
+        "url": "https://docs.polymarket.com/api-reference/markets/get-clob-market-info",
+        "response_bytes": 599989,
+        "response_sha256": "9eaad31d5ec4b0a8e9a92784723743149ed106326dd9e0b38c8595a86c6ea09d"
+      },
+      {
+        "url": "https://docs.polymarket.com/trading/fees",
+        "response_bytes": 431658,
+        "response_sha256": "8e0273dd003740318b158e0b7de5236765422da9e32d2d3636e347a354974e75"
+      },
+      {
+        "url": "https://docs.polymarket.com/v2-migration",
+        "response_bytes": 741258,
+        "response_sha256": "5b153c6455386fa7a4d00edf36a0083a1eb20f3df9bdc9478e0c55e098b5b650"
+      }
+    ],
+    "limits": {"per_request_timeout_seconds": 20, "redirects": 0},
+    "interpretation": "Official docs state that V2 fees are set at match time and getClobMarketInfo fd carries rate/exponent/takerOnly. mbf/tbf remain response facts but are not selected over fd for the V2 dynamic calculation."
+  }
+}
