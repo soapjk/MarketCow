@@ -18,7 +18,9 @@ MARKETCOW_COMPONENTS=unified-api
 `polymarket-universe-activator`。多个名称用逗号分隔。
 两个控制组件要求同时选择 `unified-api` 和 `polymarket-rust-data-plane`。
 单独 API 不要求 Rust scope、二进制或 Tradude 配置，并清除继承的 Polymarket
-实时连接、Rust 转发及 Discovery materialization 设置。
+实时连接与 Rust 转发设置。Discovery 读取接口（`/live/discovery/*`）由统一 API
+作为读取方从磁盘 materialized 快照提供，即使未选择 discovery collector 写入进程
+也保持可用，因此 `MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS` 不被清除。
 股票与 Hyperliquid 目前同属 API 内部能力，不是两个独立进程开关。
 存储启动检查仍由 shell 包装器执行，股票行情源凭据及数据库配置仍需有效。
 以下原全栈说明仅适用于默认 `all`；本修改不自动安装或重启服务。

@@ -239,8 +239,13 @@ def build_services(
         ),
         "MARKETCOW_POLYMARKET_LIVE_STREAM_URI": "",
     })
-    if "polymarket-discovery-collector" not in selected:
-        gateway_environment["MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS"] = ""
+    # The unified-api gateway is the *reader* of the durable discovery
+    # projection. Discovery read endpoints (/live/discovery/*) serve from the
+    # on-disk materialized snapshot and must remain available even when the
+    # discovery-collector *writer* process is not selected for this launch.
+    # Clearing MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS here would disable
+    # the read store (polymarket_discovery becomes None) and break Tradude's
+    # delivery chain with 503/500. Keep the depth config intact.
     unified_api = Service(
         "unified-api",
         (

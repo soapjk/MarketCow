@@ -45,12 +45,19 @@ class LaunchdStartupTest(unittest.TestCase):
         })
         self.assertEqual([s.name for s in services], ["unified-api"])
         self.assertEqual(services[0].start_after, ())
+        # Live stream URI and Rust forwarding are cleared for a standalone API,
+        # but the discovery *read* configuration must survive: the gateway serves
+        # /live/discovery/* from the durable materialized snapshot and must not
+        # disable that read store when the collector writer is not selected.
         for key in (
             "MARKETCOW_POLYMARKET_LIVE_STREAM_URI",
             "MARKETCOW_POLYMARKET_RUST_DATA_PLANE_URL",
-            "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS",
         ):
             self.assertEqual(services[0].environment[key], "")
+        self.assertEqual(
+            services[0].environment["MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS"],
+            "100",
+        )
 
     def test_component_selection_rejects_unknown_duplicate_and_missing_dependencies(self) -> None:
         for value in ("", "stocks", "unified-api,unified-api", "polymarket-opportunity-controller", "polymarket-universe-activator"):
