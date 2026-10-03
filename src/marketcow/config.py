@@ -105,6 +105,12 @@ class Settings:
     hyperliquid_base_url: str = "https://api.hyperliquid.xyz"
     hyperliquid_timeout_seconds: float = 3.0
     hyperliquid_request_budget_seconds: float = 10.0
+    alpaca_credentials_file: Path | None = None
+    alpaca_timeout_seconds: float = 15.0
+    alpaca_request_budget_seconds: float = 300.0
+    alpaca_maximum_requests: int = 200
+    alpaca_maximum_bytes: int = 268435456
+    alpaca_maximum_retries: int = 3
     dashboard_registry_json: str = ""
     admin_auth_required: bool = False
     admin_tokens_json: str = ""
@@ -326,6 +332,26 @@ class Settings:
             hyperliquid_request_budget_seconds=float(os.getenv(
                 "MARKETCOW_HYPERLIQUID_REQUEST_BUDGET_SECONDS", "10"
             )),
+            alpaca_credentials_file=(
+                Path(os.environ["MARKETCOW_ALPACA_CREDENTIALS_FILE"]).expanduser()
+                if os.getenv("MARKETCOW_ALPACA_CREDENTIALS_FILE", "").strip()
+                else None
+            ),
+            alpaca_timeout_seconds=float(os.getenv(
+                "MARKETCOW_ALPACA_TIMEOUT_SECONDS", "15"
+            )),
+            alpaca_request_budget_seconds=float(os.getenv(
+                "MARKETCOW_ALPACA_REQUEST_BUDGET_SECONDS", "300"
+            )),
+            alpaca_maximum_requests=int(os.getenv(
+                "MARKETCOW_ALPACA_MAXIMUM_REQUESTS", "200"
+            )),
+            alpaca_maximum_bytes=int(os.getenv(
+                "MARKETCOW_ALPACA_MAXIMUM_BYTES", "268435456"
+            )),
+            alpaca_maximum_retries=int(os.getenv(
+                "MARKETCOW_ALPACA_MAXIMUM_RETRIES", "3"
+            )),
             dashboard_registry_json=os.getenv("MARKETCOW_DASHBOARD_REGISTRY_JSON", ""),
             admin_auth_required=_bool_env(
                 "MARKETCOW_ADMIN_AUTH_REQUIRED", profile == "production"
@@ -471,6 +497,16 @@ class Settings:
             raise ValueError(
                 "Polymarket live stream replay capacity must be between 1 and 100000"
             )
+        if not 0.1 <= self.alpaca_timeout_seconds <= 120:
+            raise ValueError("Alpaca timeout must be between 0.1 and 120 seconds")
+        if not self.alpaca_timeout_seconds <= self.alpaca_request_budget_seconds <= 86400:
+            raise ValueError("Alpaca request budget must cover one request and be bounded")
+        if not 1 <= self.alpaca_maximum_requests <= 100000:
+            raise ValueError("Alpaca request count budget must be between 1 and 100000")
+        if not 1 <= self.alpaca_maximum_bytes <= 1099511627776:
+            raise ValueError("Alpaca byte budget must be positive and bounded")
+        if not 0 <= self.alpaca_maximum_retries <= 10:
+            raise ValueError("Alpaca retry count must be between 0 and 10")
         if not 0.1 <= self.polymarket_consumer_maximum_book_age_seconds <= 60:
             raise ValueError(
                 "Polymarket consumer maximum book age must be between 0.1 and 60 seconds"

@@ -87,6 +87,11 @@ DEFAULT_PROVIDER_MANIFESTS = (
             MARKET_BAR_HISTORY, frozenset({"CRYPTO"}), "fetch_history"
         ),
     )),
+    ProviderManifest("alpaca_sip", "alpaca_historical_sip", (
+        CapabilityDeclaration(
+            MARKET_BAR_HISTORY, frozenset({"US"}), "fetch_history"
+        ),
+    )),
 )
 
 

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MarketCow BTC five-minute management health v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "manager_updated_at", "valid_until", "manager_stale_after_seconds", "process_state", "data_state", "entry_ready", "readiness_requires_status_and_full_sync", "generation", "profile_id", "profile_document_sha256", "manager_phase", "windows", "blocked_reason", "blocked_reasons", "resources", "publication"],
+  "properties": {
+    "schema_version": {"const": "marketcow.btc-5m-management-health.v1"},
+    "as_of": {"type": "string", "format": "date-time"},
+    "manager_updated_at": {"$ref": "#/$defs/nullable_time"},
+    "valid_until": {"$ref": "#/$defs/nullable_time"},
+    "manager_stale_after_seconds": {"const": 60},
+    "process_state": {"const": "running"},
+    "data_state": {"enum": ["capture_required", "unavailable"]},
+    "entry_ready": {"type": "null"},
+    "readiness_requires_status_and_full_sync": {"const": true},
+    "generation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["process_instance_id", "profile_epoch", "profile_revision"],
+      "properties": {
+        "process_instance_id": {"type": "string", "minLength": 1},
+        "profile_epoch": {"type": ["string", "null"]},
+        "profile_revision": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "profile_id": {"type": ["string", "null"]},
+    "profile_document_sha256": {"type": ["string", "null"]},
+    "manager_phase": {"type": ["string", "null"]},
+    "windows": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/window"}},
+    "blocked_reason": {"anyOf": [{"$ref": "#/$defs/block_code"}, {"type": "null"}]},
+    "blocked_reasons": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/block_code"}},
+    "resources": {
+      "type": "object", "additionalProperties": false,
+      "required": ["metadata_market_count", "hot_binding_tokens", "wire_tokens", "wire_sockets", "component_token_limit", "prepared_tokens", "active_tokens", "draining_tokens", "phase_counts_authoritative", "hot_binding_count_semantics", "wire_token_count_semantics", "shared_token_count_semantics", "phase_count_semantics"],
+      "properties": {
+        "metadata_market_count": {"$ref": "#/$defs/nullable_count"},
+        "hot_binding_tokens": {"$ref": "#/$defs/count_with_limit"},
+        "wire_tokens": {"$ref": "#/$defs/count_with_limit"},
+        "wire_sockets": {"$ref": "#/$defs/count_with_limit"},
+        "component_token_limit": {"$ref": "#/$defs/nullable_count"},
+        "prepared_tokens": {"$ref": "#/$defs/nullable_count"},
+        "active_tokens": {"$ref": "#/$defs/nullable_count"},
+        "draining_tokens": {"$ref": "#/$defs/nullable_count"},
+        "phase_counts_authoritative": {"type": "boolean"},
+        "hot_binding_count_semantics": {"type": "string"},
+        "wire_token_count_semantics": {"type": "string"},
+        "shared_token_count_semantics": {"type": "string"},
+        "phase_count_semantics": {"type": "string"}
+      }
+    },
+    "publication": {"type": "object", "description": "Nested MarketCow publication-management.v1 diagnostic; not a trading readiness proof."}
+  },
+  "$defs": {
+    "nullable_time": {"type": ["string", "null"], "format": "date-time"},
+    "nullable_count": {"type": ["integer", "null"], "minimum": 0},
+    "count_with_limit": {"type": "object", "additionalProperties": false, "required": ["used", "limit"], "properties": {"used": {"$ref": "#/$defs/nullable_count"}, "limit": {"$ref": "#/$defs/nullable_count"}}},
+    "block_code": {"enum": ["profile_missing", "persistence_failed", "manager_missing", "manager_stale", "current_window_expired", "source_not_ready", "capacity_exhausted", "lease_invalid", "recovery_in_progress", "manager_recovering", "manager_failed"]},
+    "window": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "window_id", "market_id", "start_at", "end_at", "profile_revision", "ready", "readiness_reason"],
+      "properties": {
+        "role": {"enum": ["current", "next"]},
+        "window_id": {"type": "string"},
+        "market_id": {"type": "string"},
+        "start_at": {"type": "string", "format": "date-time"},
+        "end_at": {"type": "string", "format": "date-time"},
+        "profile_revision": {"type": "integer", "minimum": 0},
+        "ready": {"enum": [false, null]},
+        "readiness_reason": {"enum": ["capture_required", "window_expired", "persistence_failed", "manager_missing", "manager_stale", "source_not_ready", "capacity_exhausted", "lease_invalid", "recovery_in_progress", "manager_failed", "manager_recovering"]}
+      }
+    }
+  }
+}

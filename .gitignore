@@ -31,3 +31,4 @@ artifacts/mcvi-*-evidence.json
 AGENTS.md
 # Corptie local Agent configuration
 /.corptie
+/docs/btc-fact-log-fast-start.md

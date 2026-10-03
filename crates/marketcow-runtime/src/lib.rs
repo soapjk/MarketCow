@@ -339,7 +339,10 @@ impl PolymarketRuntime {
             verified_book_tick,
         )?;
         for event in &mut events {
-            let duplicate = projection.recent_event_ids.contains(&event.event_id);
+            let duplicate = projection
+                .recent_event_ids
+                .iter()
+                .any(|id| id.as_ref() == event.event_id);
             let closes_durable_gap = match &event.kind {
                 EventKind::FullBook { token_id, .. } => projection.token_has_recovery_gap(token_id),
                 _ => false,
@@ -351,7 +354,12 @@ impl PolymarketRuntime {
                 bind_full_book_recovery_identity(event);
             }
         }
-        events.retain(|event| !projection.recent_event_ids.contains(&event.event_id));
+        events.retain(|event| {
+            !projection
+                .recent_event_ids
+                .iter()
+                .any(|id| id.as_ref() == event.event_id)
+        });
         for (offset, event) in events.iter_mut().enumerate() {
             event.cursor = next_cursor + u64::try_from(offset).expect("bounded frame offset");
         }
@@ -518,10 +526,12 @@ impl PolymarketRuntime {
                 event
             })
             .collect::<Vec<_>>();
-        if events
-            .iter()
-            .any(|event| projection.recent_event_ids.contains(&event.event_id))
-        {
+        if events.iter().any(|event| {
+            projection
+                .recent_event_ids
+                .iter()
+                .any(|id| id.as_ref() == event.event_id)
+        }) {
             for event in &mut events {
                 bind_full_book_recovery_identity(event);
             }

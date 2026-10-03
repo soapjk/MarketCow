@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, ensure};
 use marketcow_polymarket::discovery_source::canonical_hash;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,7 +16,7 @@ use std::{
 
 /// Hard parser/storage ceiling; managed collectors enforce an explicit lower budget.
 pub const MAX_SOURCE_TOKEN_IDENTITIES: usize = 8192;
-const MAX_SCOPED_TOKEN_IDENTITIES:usize=MAX_SOURCE_TOKEN_IDENTITIES;
+const MAX_SCOPED_TOKEN_IDENTITIES: usize = MAX_SOURCE_TOKEN_IDENTITIES;
 
 pub fn is_token_recovery(event: &Value) -> bool {
     matches!(
@@ -86,7 +86,10 @@ pub fn load_token_recoveries(db: &Connection) -> Result<BTreeMap<String, Value>>
     )?;
     let mut rows = query.query([])?;
     while let Some(row) = rows.next()? {
-        ensure!(result.len() < MAX_SOURCE_TOKEN_IDENTITIES, "stored recovery limit");
+        ensure!(
+            result.len() < MAX_SOURCE_TOKEN_IDENTITIES,
+            "stored recovery limit"
+        );
         let token: String = row.get(0)?;
         let body: Vec<u8> = row.get(1)?;
         let sha: String = row.get(2)?;
@@ -431,7 +434,15 @@ impl PreparedSourceWriter {
                 token_id TEXT PRIMARY KEY,payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL);\
              CREATE TABLE IF NOT EXISTS market_lifecycle(\
                 market_id TEXT PRIMARY KEY,cursor INTEGER NOT NULL,\
-                payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL)",
+                payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL);\
+             CREATE TABLE IF NOT EXISTS cold_market_catalog(\
+                market_id TEXT NOT NULL,retired_after INTEGER NOT NULL,\
+                payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL,\
+                PRIMARY KEY(market_id,payload_sha256));\
+             CREATE TABLE IF NOT EXISTS cold_market_evidence(\
+                market_id TEXT NOT NULL,retired_after INTEGER NOT NULL,\
+                payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL,\
+                PRIMARY KEY(market_id,retired_after))",
         )?;
         // A lifecycle overlay is an authoritative retirement boundary. Older
         // generations could commit the terminal row separately from the
@@ -439,9 +450,9 @@ impl PreparedSourceWriter {
         // actionable recovery behind. Reconcile that state atomically at the
         // writer boundary; the event log and lifecycle row remain untouched.
         let terminal_markets: BTreeSet<String> = {
-            let mut statement = database.prepare(
-                "SELECT market_id,payload_json,payload_sha256 FROM market_lifecycle",
-            )?;
+            let mut statement = database
+                .prepare("SELECT market_id,payload_json,payload_sha256 FROM market_lifecycle \
+                    WHERE market_id NOT IN (SELECT market_id FROM cold_market_catalog)")?;
             let mut rows = statement.query([])?;
             let mut result = BTreeSet::new();
             while let Some(row) = rows.next()? {
@@ -453,7 +464,10 @@ impl PreparedSourceWriter {
                     "terminal lifecycle hash mismatch"
                 );
                 let model: Value = serde_json::from_slice(&body)?;
-                if matches!(model["lifecycle_state"].as_str(), Some("closed" | "resolved")) {
+                if matches!(
+                    model["lifecycle_state"].as_str(),
+                    Some("closed" | "resolved")
+                ) {
                     result.insert(market);
                 }
             }
@@ -472,7 +486,10 @@ impl PreparedSourceWriter {
             if !stale.is_empty() {
                 let tx = database.transaction()?;
                 for token in &stale {
-                    tx.execute("DELETE FROM source_token_recoveries WHERE token_id=?", [token])?;
+                    tx.execute(
+                        "DELETE FROM source_token_recoveries WHERE token_id=?",
+                        [token],
+                    )?;
                     recoveries.remove(token);
                 }
                 tx.execute(
@@ -512,39 +529,47 @@ impl PreparedSourceWriter {
             let latest: Option<i64> =
                 database.query_row("SELECT MAX(cursor) FROM recent_events", [], |r| r.get(0))?;
             if cursor == 0 {
-                ensure!(latest.is_none() && size == 0
-                    && values["recent_event_bytes"] == "0"
-                    && values["history_floor_cursor"] == "0", "invalid empty bounded boundary");
-                let books: i64 = database.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))?;
-                ensure!(books == 0 && recoveries.is_empty(), "empty boundary has source state");
+                ensure!(
+                    latest.is_none()
+                        && size == 0
+                        && values["recent_event_bytes"] == "0"
+                        && values["history_floor_cursor"] == "0",
+                    "invalid empty bounded boundary"
+                );
+                let books: i64 =
+                    database.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))?;
+                ensure!(
+                    books == 0 && recoveries.is_empty(),
+                    "empty boundary has source state"
+                );
             } else {
-            ensure!(
-                latest.map(|v| v as u64) == Some(cursor),
-                "bounded history boundary mismatch"
-            );
-            let (body, sha): (Vec<u8>, String) = database.query_row(
-                "SELECT payload,sha256 FROM recent_events WHERE cursor=?",
-                [i64::try_from(cursor)?],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            ensure!(
-                hex::encode(Sha256::digest(&body)) == sha,
-                "bounded history checksum mismatch"
-            );
-            let (stored_bytes, first): (i64, i64) = database.query_row(
-                "SELECT SUM(length(payload)),MIN(cursor) FROM recent_events",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            ensure!(
-                stored_bytes.to_string() == values["recent_event_bytes"]
-                    && first
-                        .checked_sub(1)
-                        .context("history floor overflow")?
-                        .to_string()
-                        == values["history_floor_cursor"],
-                "bounded history accounting mismatch"
-            );
+                ensure!(
+                    latest.map(|v| v as u64) == Some(cursor),
+                    "bounded history boundary mismatch"
+                );
+                let (body, sha): (Vec<u8>, String) = database.query_row(
+                    "SELECT payload,sha256 FROM recent_events WHERE cursor=?",
+                    [i64::try_from(cursor)?],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                ensure!(
+                    hex::encode(Sha256::digest(&body)) == sha,
+                    "bounded history checksum mismatch"
+                );
+                let (stored_bytes, first): (i64, i64) = database.query_row(
+                    "SELECT SUM(length(payload)),MIN(cursor) FROM recent_events",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                ensure!(
+                    stored_bytes.to_string() == values["recent_event_bytes"]
+                        && first
+                            .checked_sub(1)
+                            .context("history floor overflow")?
+                            .to_string()
+                            == values["history_floor_cursor"],
+                    "bounded history accounting mismatch"
+                );
             }
         } else if cursor > 0 {
             let log = log.as_mut().context("legacy log missing")?;
@@ -591,7 +616,10 @@ impl PreparedSourceWriter {
         let pending = root.join("state-index.rust-pending.json");
         match fs::symlink_metadata(&pending) {
             Ok(info) => {
-                ensure!(info.file_type().is_file(), "pending manifest is not a regular file");
+                ensure!(
+                    info.file_type().is_file(),
+                    "pending manifest is not a regular file"
+                );
                 fs::remove_file(&pending)?;
                 File::open(&root)?.sync_all()?;
             }
@@ -631,36 +659,47 @@ impl PreparedSourceWriter {
         let cursor = self.cursor()?;
         let tail = if cursor == 0 {
             let values = metadata(&self.database)?;
-            let books: i64 = self.database.query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))?;
-            let offsets: i64 = self.database.query_row("SELECT COUNT(*) FROM event_offsets", [], |r| r.get(0))?;
-            ensure!(values["event_log_size"] == "0" && books == 0 && offsets == 0
-                && self.recoveries.is_empty(), "empty migration has source state");
+            let books: i64 = self
+                .database
+                .query_row("SELECT COUNT(*) FROM books", [], |r| r.get(0))?;
+            let offsets: i64 =
+                self.database
+                    .query_row("SELECT COUNT(*) FROM event_offsets", [], |r| r.get(0))?;
+            ensure!(
+                values["event_log_size"] == "0"
+                    && books == 0
+                    && offsets == 0
+                    && self.recoveries.is_empty(),
+                "empty migration has source state"
+            );
             None
         } else {
-        let (offset, length, hash): (i64, i64, String) = self.database.query_row(
-            "SELECT byte_offset,byte_length,line_sha256 FROM event_offsets WHERE cursor=?",
-            [i64::try_from(cursor)?],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let mut line = vec![0; usize::try_from(length)?];
-        let log = self.log.as_mut().context("legacy migration log missing")?;
-        log.seek(SeekFrom::Start(u64::try_from(offset)?))?;
-        log.read_exact(&mut line)?;
-        ensure!(
-            hex::encode(Sha256::digest(&line)) == hash,
-            "migration tail hash differs"
-        );
+            let (offset, length, hash): (i64, i64, String) = self.database.query_row(
+                "SELECT byte_offset,byte_length,line_sha256 FROM event_offsets WHERE cursor=?",
+                [i64::try_from(cursor)?],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let mut line = vec![0; usize::try_from(length)?];
+            let log = self.log.as_mut().context("legacy migration log missing")?;
+            log.seek(SeekFrom::Start(u64::try_from(offset)?))?;
+            log.read_exact(&mut line)?;
+            ensure!(
+                hex::encode(Sha256::digest(&line)) == hash,
+                "migration tail hash differs"
+            );
             Some((line, hash, length))
         };
         let tx = self.database.transaction()?;
         tx.execute_batch("CREATE TABLE recent_events(cursor INTEGER PRIMARY KEY,payload BLOB NOT NULL,sha256 TEXT NOT NULL); DELETE FROM event_offsets;")?;
         let length = if let Some((line, hash, length)) = tail {
             tx.execute(
-            "INSERT INTO recent_events VALUES(?,?,?)",
-            params![i64::try_from(cursor)?, line, hash],
+                "INSERT INTO recent_events VALUES(?,?,?)",
+                params![i64::try_from(cursor)?, line, hash],
             )?;
             length
-        } else { 0 };
+        } else {
+            0
+        };
         let page_size =
             usize::try_from(tx.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))?)?;
         let pages =
@@ -697,9 +736,16 @@ impl PreparedSourceWriter {
     pub fn bind_catalog_tokens(&mut self, bindings: BTreeMap<String, String>) -> Result<()> {
         ensure!(
             bindings.len() <= MAX_SCOPED_TOKEN_IDENTITIES
-                && self.token_markets.len().checked_add(bindings.keys()
-                    .filter(|token| !self.token_markets.contains_key(*token)).count())
-                    .is_some_and(|total|total <= MAX_SCOPED_TOKEN_IDENTITIES),
+                && self
+                    .token_markets
+                    .len()
+                    .checked_add(
+                        bindings
+                            .keys()
+                            .filter(|token| !self.token_markets.contains_key(*token))
+                            .count()
+                    )
+                    .is_some_and(|total| total <= MAX_SCOPED_TOKEN_IDENTITIES),
             "bounded scoped identity budget exceeded"
         );
         for (token, market) in &bindings {
@@ -723,45 +769,215 @@ impl PreparedSourceWriter {
     /// durability owner AFTER preceding batches and after old-scope leases
     /// expire. Recent event history remains unchanged; current unused books
     /// and token recovery state are released without inventing event cursors.
-    pub fn retire_catalog_markets(&mut self, after:u64, markets:&BTreeSet<String>) -> Result<()> {
-        ensure!(!self.poisoned && self.cursor()?==after,"retirement boundary differs");
-        ensure!(!markets.is_empty() && markets.len()<=4096,"retirement market budget");
-        let tokens:BTreeSet<String>=self.token_markets.iter().filter(|(_,market)|markets.contains(*market)).map(|(token,_)|token.clone()).collect();
+    pub fn retire_catalog_markets(
+        &mut self,
+        after: u64,
+        markets: &BTreeSet<String>,
+        cold_records: &BTreeMap<String, Value>,
+    ) -> Result<()> {
+        ensure!(
+            !self.poisoned && self.cursor()? == after,
+            "retirement boundary differs"
+        );
+        ensure!(
+            !markets.is_empty() && markets.len() <= 4096,
+            "retirement market budget"
+        );
+        ensure!(cold_records.keys().cloned().collect::<BTreeSet<_>>() == *markets,
+            "retirement cold catalog identity set");
+        for (market, record) in cold_records {
+            ensure!(record["identity"]["market_id"] == *market,
+                "retirement cold catalog market identity");
+        }
+        let tokens: BTreeSet<String> = self
+            .token_markets
+            .iter()
+            .filter(|(_, market)| markets.contains(*market))
+            .map(|(token, _)| token.clone())
+            .collect();
         // The in-memory owner verified membership. Metadata-only dependencies
         // have no acquisition tokens; their lifecycle rows may still retire.
-        let mut values=metadata(&self.database)?;
-        let mut oldest=None;
-        let mut complete=BTreeMap::<String,usize>::new();
-        let mut count=0usize;
-        for (token,health) in &self.health {
-            if tokens.contains(token) {continue;}
-            count+=1;
-            oldest=Some(oldest.map_or(health.received_at,|at:chrono::DateTime<chrono::Utc>|at.min(health.received_at)));
-            if health.complete {*complete.entry(health.market_id.clone()).or_default()+=1;}
+        let mut values = metadata(&self.database)?;
+        let mut oldest = None;
+        let mut complete = BTreeMap::<String, usize>::new();
+        let mut count = 0usize;
+        for (token, health) in &self.health {
+            if tokens.contains(token) {
+                continue;
+            }
+            count += 1;
+            oldest = Some(
+                oldest.map_or(health.received_at, |at: chrono::DateTime<chrono::Utc>| {
+                    at.min(health.received_at)
+                }),
+            );
+            if health.complete {
+                *complete.entry(health.market_id.clone()).or_default() += 1;
+            }
         }
-        values.insert("book_token_count".into(),count.to_string());
-        values.insert("book_complete_market_count".into(),complete.values().filter(|n|**n==2).count().to_string());
-        values.insert("oldest_book_received_at".into(),oldest.map_or_else(String::new,|at|at.to_rfc3339()));
-        values.insert("unresolved_gap_count".into(),self.recoveries.keys().filter(|token|!tokens.contains(*token)).count().to_string());
-        self.poisoned=true;
-        let tx=self.database.transaction()?;
+        values.insert("book_token_count".into(), count.to_string());
+        values.insert(
+            "book_complete_market_count".into(),
+            complete.values().filter(|n| **n == 2).count().to_string(),
+        );
+        values.insert(
+            "oldest_book_received_at".into(),
+            oldest.map_or_else(String::new, |at| at.to_rfc3339()),
+        );
+        values.insert(
+            "unresolved_gap_count".into(),
+            self.recoveries
+                .keys()
+                .filter(|token| !tokens.contains(*token))
+                .count()
+                .to_string(),
+        );
+        self.poisoned = true;
+        let tx = self.database.transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS cold_market_catalog(\
+            market_id TEXT NOT NULL,retired_after INTEGER NOT NULL,\
+            payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL,\
+            PRIMARY KEY(market_id,payload_sha256));\
+            CREATE TABLE IF NOT EXISTS cold_market_evidence(\
+            market_id TEXT NOT NULL,retired_after INTEGER NOT NULL,\
+            payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL,\
+            PRIMARY KEY(market_id,retired_after))")?;
+        for (market, record) in cold_records {
+            let bytes = serde_json::to_vec(record)?;
+            ensure!(bytes.len() <= 256 * 1024,
+                "retirement cold catalog record exceeds read budget");
+            let hash = hex::encode(Sha256::digest(&bytes));
+            let previous: Option<(Vec<u8>, String)> = tx.query_row(
+                "SELECT payload_json,payload_sha256 FROM cold_market_catalog \
+                    WHERE market_id=? LIMIT 1",
+                [market], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if let Some((body, prior_hash)) = previous {
+                ensure!(hex::encode(Sha256::digest(&body)) == prior_hash,
+                    "retirement prior cold catalog hash mismatch");
+                let prior: Value = serde_json::from_slice(&body)?;
+                ensure!(prior["identity"] == record["identity"],
+                    "retirement cold catalog identity changed");
+            }
+            tx.execute("INSERT OR IGNORE INTO cold_market_catalog VALUES (?,?,?,?)",
+                params![market, i64::try_from(after)?, bytes, hash])?;
+            let existing_evidence: Option<(Vec<u8>, String)> = tx.query_row(
+                "SELECT payload_json,payload_sha256 FROM cold_market_evidence \
+                    WHERE market_id=? AND retired_after=?",
+                params![market,i64::try_from(after)?],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            ).optional()?;
+            if let Some((body, expected)) = existing_evidence {
+                ensure!(hex::encode(Sha256::digest(&body)) == expected,
+                    "retirement prior cold evidence hash mismatch");
+                let prior: Value = serde_json::from_slice(&body)?;
+                ensure!(prior["market_id"] == *market
+                    && prior["retired_after_cursor"] == after
+                    && prior["catalog_record_sha256"] == hash,
+                    "retirement prior cold evidence binding mismatch");
+                continue; // An idempotent crash replay must keep the first snapshot.
+            }
+            let mut books = BTreeMap::new();
+            let mut recoveries = BTreeMap::new();
+            let mut confirmations = Vec::new();
+            for token in self.token_markets.iter()
+                .filter(|(_, owner)| *owner == market).map(|(token, _)| token) {
+                for (table, target) in [
+                    ("books", &mut books),
+                    ("source_token_recoveries", &mut recoveries),
+                ] {
+                    let sql = format!("SELECT payload_json,payload_sha256 FROM {table} WHERE token_id=?");
+                    let row: Option<(Vec<u8>, String)> = tx.query_row(&sql, [token], |row|
+                        Ok((row.get(0)?, row.get(1)?))).optional()?;
+                    if let Some((body, expected)) = row {
+                        ensure!(hex::encode(Sha256::digest(&body)) == expected,
+                            "retirement source state hash mismatch");
+                        target.insert(token.clone(), serde_json::json!({
+                            "payload_sha256":expected,
+                            "payload":serde_json::from_slice::<Value>(&body)?,
+                        }));
+                    }
+                }
+                let present: i64 = tx.query_row(
+                    "SELECT count(*) FROM book_confirmations WHERE token_id=?",
+                    [token], |row| row.get(0))?;
+                if present > 0 { confirmations.push(token.clone()); }
+            }
+            let lifecycle: Option<(Vec<u8>, String)> = tx.query_row(
+                "SELECT payload_json,payload_sha256 FROM market_lifecycle WHERE market_id=?",
+                [market], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+            let lifecycle_sha256 = lifecycle.as_ref().map(|(_, expected)| expected.clone());
+            let lifecycle = lifecycle.map(|(body, expected)| -> Result<Value> {
+                ensure!(hex::encode(Sha256::digest(&body)) == expected,
+                    "retirement lifecycle hash mismatch");
+                Ok(serde_json::from_slice(&body)?)
+            }).transpose()?;
+            let evidence = serde_json::json!({"schema_version":"marketcow.cold-market-evidence.v1",
+                "market_id":market,"retired_after_cursor":after,
+                "catalog_record_sha256":hash,"books":books,"recoveries":recoveries,
+                "confirmed_token_ids":confirmations,"lifecycle":lifecycle,
+                "lifecycle_sha256":lifecycle_sha256});
+            let evidence_bytes = serde_json::to_vec(&evidence)?;
+            let evidence_hash = hex::encode(Sha256::digest(&evidence_bytes));
+            tx.execute("INSERT OR IGNORE INTO cold_market_evidence VALUES (?,?,?,?)",
+                params![market, i64::try_from(after)?, evidence_bytes, evidence_hash])?;
+        }
         for token in &tokens {
-            tx.execute("DELETE FROM books WHERE token_id=?",[token])?;
-            tx.execute("DELETE FROM book_confirmations WHERE token_id=?",[token])?;
-            tx.execute("DELETE FROM source_token_recoveries WHERE token_id=?",[token])?;
+            tx.execute("DELETE FROM books WHERE token_id=?", [token])?;
+            tx.execute("DELETE FROM book_confirmations WHERE token_id=?", [token])?;
+            tx.execute(
+                "DELETE FROM source_token_recoveries WHERE token_id=?",
+                [token],
+            )?;
         }
-        for market in markets {
-            tx.execute("DELETE FROM market_lifecycle WHERE market_id=?",[market])?;
+        // A terminal or resolved lifecycle row is historical evidence, not a
+        // hot subscription. Retiring the book must not erase its finality link.
+        for (key, value) in &values {
+            tx.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", [key, value])?;
         }
-        for (key,value) in &values {tx.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",[key,value])?;}
         tx.commit()?;
-        self.health.retain(|token,_|!tokens.contains(token));
-        self.recoveries.retain(|token,_|!tokens.contains(token));
-        self.terminal_markets.retain(|market|!markets.contains(market));
-        self.token_markets.retain(|token,_|!tokens.contains(token));
+        self.health.retain(|token, _| !tokens.contains(token));
+        self.recoveries.retain(|token, _| !tokens.contains(token));
+        self.terminal_markets
+            .retain(|market| !markets.contains(market));
+        self.token_markets
+            .retain(|token, _| !tokens.contains(token));
         self.write_index_manifest(&values)?;
-        self.poisoned=false;
+        self.poisoned = false;
         Ok(())
+    }
+
+    /// Read a retired market without re-admitting its token or wire demand.
+    pub fn cold_market_record(&self, market_id: &str) -> Result<Option<Value>> {
+        let row: Option<(Vec<u8>, String)> = self.database.query_row(
+            "SELECT payload_json,payload_sha256 FROM cold_market_catalog \
+                WHERE market_id=? ORDER BY retired_after DESC,rowid DESC LIMIT 1",
+            [market_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        row.map(|(bytes, expected)| {
+            ensure!(hex::encode(Sha256::digest(&bytes)) == expected,
+                "cold market catalog hash mismatch");
+            let record: Value = serde_json::from_slice(&bytes)?;
+            ensure!(record["identity"]["market_id"] == market_id,
+                "cold market catalog identity mismatch");
+            Ok(record)
+        }).transpose()
+    }
+
+    pub fn cold_market_evidence(&self, market_id: &str) -> Result<Option<Value>> {
+        let row: Option<(Vec<u8>, String)> = self.database.query_row(
+            "SELECT payload_json,payload_sha256 FROM cold_market_evidence \
+                WHERE market_id=? ORDER BY retired_after DESC LIMIT 1",
+            [market_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        row.map(|(bytes, expected)| {
+            ensure!(hex::encode(Sha256::digest(&bytes)) == expected,
+                "cold market evidence hash mismatch");
+            let evidence: Value = serde_json::from_slice(&bytes)?;
+            ensure!(evidence["market_id"] == market_id,
+                "cold market evidence identity mismatch");
+            Ok(evidence)
+        }).transpose()
     }
 
     /// Commit only whole binary markets. Missing token snapshots never become a
@@ -787,19 +1003,35 @@ impl PreparedSourceWriter {
             &self.token_markets,
             self.maximum_batch_bytes,
         )?;
-        self.commit_encoded(events, &lines, terminal, cursor)
+        self.commit_encoded(events, &lines, terminal, cursor, &BTreeMap::new())
     }
 
     /// Coalesce already validated, contiguous batches on the disk worker only.
     /// The original JSONL bytes are retained; no publication waits for this commit.
     pub fn append_validated_group(&mut self, batches: &[&ValidatedSourceBatch]) -> Result<()> {
+        let empty = BTreeMap::new();
+        self.append_validated_group_with_books(
+            &batches
+                .iter()
+                .map(|batch| (*batch, &empty))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Persist compact replay facts while updating the durable latest-state
+    /// table from their separately validated complete post-state books.
+    pub fn append_validated_group_with_books(
+        &mut self,
+        batches: &[(&ValidatedSourceBatch, &BTreeMap<u64, Value>)],
+    ) -> Result<()> {
         let first = batches.first().context("empty persistence group")?;
-        let mut after = first.after;
+        let mut after = first.0.after;
         let mut bytes = 0usize;
         let mut count = 0usize;
-        for batch in batches {
+        let mut materialized_books = BTreeMap::new();
+        for (batch, books) in batches {
             ensure!(
-                batch.after == after && batch.terminal == first.terminal,
+                batch.after == after && batch.terminal == first.0.terminal,
                 "incompatible persistence group"
             );
             bytes = bytes
@@ -813,23 +1045,37 @@ impl PreparedSourceWriter {
             after = batch.events.last().context("empty batch")?["cursor"]
                 .as_u64()
                 .context("cursor")?;
+            for (cursor, book) in *books {
+                ensure!(
+                    materialized_books.insert(*cursor, book.clone()).is_none(),
+                    "duplicate materialized book cursor"
+                );
+            }
         }
         let merged = ValidatedSourceBatch {
             events: batches
                 .iter()
-                .flat_map(|b| b.events.iter().cloned())
+                .flat_map(|(b, _)| b.events.iter().cloned())
                 .collect(),
             lines: batches
                 .iter()
-                .flat_map(|b| b.lines.iter().cloned())
+                .flat_map(|(b, _)| b.lines.iter().cloned())
                 .collect(),
-            terminal: first.terminal,
-            after: first.after,
+            terminal: first.0.terminal,
+            after: first.0.after,
         };
-        self.append_validated(&merged)
+        self.append_validated_with_books(&merged, &materialized_books)
     }
 
     pub fn append_validated(&mut self, batch: &ValidatedSourceBatch) -> Result<()> {
+        self.append_validated_with_books(batch, &BTreeMap::new())
+    }
+
+    fn append_validated_with_books(
+        &mut self,
+        batch: &ValidatedSourceBatch,
+        materialized_books: &BTreeMap<u64, Value>,
+    ) -> Result<()> {
         ensure!(
             !self.poisoned && self.cursor()? == batch.after,
             "validated batch boundary differs"
@@ -863,7 +1109,13 @@ impl PreparedSourceWriter {
                 );
             }
         }
-        self.commit_encoded(&batch.events, &batch.lines, batch.terminal, batch.after)
+        self.commit_encoded(
+            &batch.events,
+            &batch.lines,
+            batch.terminal,
+            batch.after,
+            materialized_books,
+        )
     }
 
     fn commit_encoded(
@@ -872,6 +1124,7 @@ impl PreparedSourceWriter {
         lines: &[Vec<u8>],
         terminal: bool,
         cursor: u64,
+        materialized_books: &BTreeMap<u64, Value>,
     ) -> Result<()> {
         if !terminal {
             ensure!(
@@ -986,7 +1239,16 @@ impl PreparedSourceWriter {
                 continue;
             }
             let token = token.context("missing book token")?;
-            let book = serde_json::to_vec(&event["canonical_payload"])?;
+            let state = materialized_books
+                .get(&event_cursor)
+                .unwrap_or(&event["canonical_payload"]);
+            if event["canonical_payload"]["payload_semantics"].is_string() {
+                ensure!(
+                    event["canonical_payload"]["canonical_book_sha256"] == canonical_hash(state),
+                    "compact durable book commitment differs"
+                );
+            }
+            let book = serde_json::to_vec(state)?;
             tx.execute(
                 "INSERT INTO books(cursor,payload_json,payload_sha256,token_id,market_id) VALUES (?,?,?,?,?) ON CONFLICT(token_id) DO UPDATE SET cursor=excluded.cursor,payload_json=excluded.payload_json,payload_sha256=excluded.payload_sha256",
                 params![
@@ -1000,10 +1262,7 @@ impl PreparedSourceWriter {
             tx.execute("DELETE FROM book_confirmations WHERE token_id=?", [token])?;
             self.health.insert(
                 token.to_owned(),
-                BookHealth::from_book(
-                    required(event, "market_id")?.to_owned(),
-                    &event["canonical_payload"],
-                )?,
+                BookHealth::from_book(required(event, "market_id")?.to_owned(), state)?,
             );
             offset += line.len() as u64;
         }
@@ -1099,7 +1358,7 @@ impl PreparedSourceWriter {
         Ok(())
     }
 
-    fn write_index_manifest(&self, values:&BTreeMap<String,String>)->Result<()> {
+    fn write_index_manifest(&self, values: &BTreeMap<String, String>) -> Result<()> {
         let mut manifest = json!({"schema_version":"marketcow.polymarket.state-index.v1",
             "path":self.root.join("indexes/latest-state.sqlite3")});
         for key in [
@@ -1174,11 +1433,13 @@ mod tests {
         // authoritative terminal row has committed.
         start["cursor"] = json!(5);
         rehash(&mut start);
-        assert!(writer
-            .append_market_batch(&[start])
-            .unwrap_err()
-            .to_string()
-            .contains("durable terminal"));
+        assert!(
+            writer
+                .append_market_batch(&[start])
+                .unwrap_err()
+                .to_string()
+                .contains("durable terminal")
+        );
         assert_eq!(writer.cursor().unwrap(), 4);
         let n: i64 = writer
             .database
@@ -1315,34 +1576,66 @@ mod tests {
     fn empty_bounded_candidate_reopens_without_fabricated_event() {
         let root = fixture();
         let db = Connection::open(root.path().join("indexes/latest-state.sqlite3")).unwrap();
-        db.execute_batch("DELETE FROM books; UPDATE metadata SET value='' WHERE key='active_recovery_id';").unwrap();
+        db.execute_batch(
+            "DELETE FROM books; UPDATE metadata SET value='' WHERE key='active_recovery_id';",
+        )
+        .unwrap();
         drop(db);
         let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
         writer.enable_bounded_history(16384).unwrap();
         assert_eq!(writer.cursor().unwrap(), 0);
-        assert_eq!(writer.database.query_row("SELECT COUNT(*) FROM recent_events", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            writer
+                .database
+                .query_row("SELECT COUNT(*) FROM recent_events", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         drop(writer);
         let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
-        writer.bind_catalog_tokens(BTreeMap::from([("11".into(),"1".into()),("12".into(),"1".into())])).unwrap();
-        writer.append_market_batch(&[event("11", 1), event("12", 2)]).unwrap();
+        writer
+            .bind_catalog_tokens(BTreeMap::from([
+                ("11".into(), "1".into()),
+                ("12".into(), "1".into()),
+            ]))
+            .unwrap();
+        writer
+            .append_market_batch(&[event("11", 1), event("12", 2)])
+            .unwrap();
         drop(writer);
-        assert_eq!(PreparedSourceWriter::open(root.path(), 16384).unwrap().cursor().unwrap(), 2);
+        assert_eq!(
+            PreparedSourceWriter::open(root.path(), 16384)
+                .unwrap()
+                .cursor()
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
     fn empty_bounded_migration_rejects_unpublished_books() {
         let root = fixture(); // legacy fixture has books but cursor zero
         let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
-        assert!(writer.enable_bounded_history(16384).unwrap_err().to_string().contains("empty migration"));
+        assert!(
+            writer
+                .enable_bounded_history(16384)
+                .unwrap_err()
+                .to_string()
+                .contains("empty migration")
+        );
     }
 
     #[test]
     fn cold_recovery_persists_before_first_book() {
         let root = fixture();
         let db = Connection::open(root.path().join("indexes/latest-state.sqlite3")).unwrap();
-        db.execute_batch("DELETE FROM books; UPDATE metadata SET value='' WHERE key='active_recovery_id';").unwrap();
+        db.execute_batch(
+            "DELETE FROM books; UPDATE metadata SET value='' WHERE key='active_recovery_id';",
+        )
+        .unwrap();
         drop(db);
-        let tokens = BTreeMap::from([("11".into(),"1".into()),("12".into(),"1".into())]);
+        let tokens = BTreeMap::from([("11".into(), "1".into()), ("12".into(), "1".into())]);
         let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
         writer.bind_catalog_tokens(tokens.clone()).unwrap();
         writer.enable_bounded_history(16384).unwrap();
@@ -1355,7 +1648,10 @@ mod tests {
         let proof = ValidatedSourceBatch::new(vec![start], false, 0, &tokens, 16384).unwrap();
         writer.append_validated(&proof).unwrap();
         assert_eq!(writer.health.len(), 0);
-        assert_eq!(metadata(&writer.database).unwrap()["oldest_book_received_at"], "");
+        assert_eq!(
+            metadata(&writer.database).unwrap()["oldest_book_received_at"],
+            ""
+        );
         drop(writer);
         let writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
         assert_eq!(writer.cursor().unwrap(), 1);
@@ -1440,14 +1736,23 @@ mod tests {
         let recovery_body = serde_json::to_vec(&recovery).unwrap();
         db.execute(
             "INSERT INTO source_token_recoveries VALUES (?,?,?)",
-            params!["11", recovery_body, hex::encode(Sha256::digest(&recovery_body))],
+            params![
+                "11",
+                recovery_body,
+                hex::encode(Sha256::digest(&recovery_body))
+            ],
         )
         .unwrap();
         let lifecycle = json!({"identity":{"market_id":"1"},"lifecycle_state":"resolved"});
         let lifecycle_body = serde_json::to_vec(&lifecycle).unwrap();
         db.execute(
             "INSERT INTO market_lifecycle VALUES (?,?,?,?)",
-            params!["1", 0_i64, lifecycle_body, hex::encode(Sha256::digest(&lifecycle_body))],
+            params![
+                "1",
+                0_i64,
+                lifecycle_body,
+                hex::encode(Sha256::digest(&lifecycle_body))
+            ],
         )
         .unwrap();
         db.execute(
@@ -1459,21 +1764,30 @@ mod tests {
 
         let writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
         assert!(writer.recoveries.is_empty());
-        assert_eq!(metadata(&writer.database).unwrap()["unresolved_gap_count"], "0");
+        assert_eq!(
+            metadata(&writer.database).unwrap()["unresolved_gap_count"],
+            "0"
+        );
         let count: i64 = writer
             .database
-            .query_row("SELECT count(*) FROM source_token_recoveries", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM source_token_recoveries", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
 
     #[test]
     fn bounded_history_crash_child() {
-        let Some(path) = std::env::var_os("MARKETCOW_CRASH_TEST_ROOT") else { return };
+        let Some(path) = std::env::var_os("MARKETCOW_CRASH_TEST_ROOT") else {
+            return;
+        };
         let mut writer = PreparedSourceWriter::open(Path::new(&path), 16384).unwrap();
         for _ in 0..20000 {
             let at = writer.cursor().unwrap();
-            writer.append_market_batch(&[event("11", at+1), event("12", at+2)]).unwrap();
+            writer
+                .append_market_batch(&[event("11", at + 1), event("12", at + 2)])
+                .unwrap();
         }
     }
 
@@ -1484,46 +1798,79 @@ mod tests {
     fn bounded_history_sigkill_reopens_committed_boundary_and_continues() {
         let root = fixture();
         let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
-        writer.append_market_batch(&[event("11",1),event("12",2)]).unwrap();
+        writer
+            .append_market_batch(&[event("11", 1), event("12", 2)])
+            .unwrap();
         writer.enable_bounded_history(16384).unwrap();
         drop(writer);
         fs::remove_file(root.path().join("events.jsonl")).unwrap();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact","discovery_source::tests::bounded_history_crash_child","--nocapture"])
-            .env("MARKETCOW_CRASH_TEST_ROOT",root.path())
-            .stdout(std::process::Stdio::null()).spawn().unwrap();
+            .args([
+                "--exact",
+                "discovery_source::tests::bounded_history_crash_child",
+                "--nocapture",
+            ])
+            .env("MARKETCOW_CRASH_TEST_ROOT", root.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
         let db = Connection::open(root.path().join("indexes/latest-state.sqlite3")).unwrap();
-        let deadline = std::time::Instant::now()+std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let progressed = loop {
-            let at: String = db.query_row("SELECT value FROM metadata WHERE key='latest_cursor'",[],|r|r.get(0)).unwrap();
-            if at.parse::<u64>().unwrap() >= 10 { break true; }
-            if std::time::Instant::now() >= deadline { break false; }
+            let at: String = db
+                .query_row(
+                    "SELECT value FROM metadata WHERE key='latest_cursor'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            if at.parse::<u64>().unwrap() >= 10 {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
             std::thread::sleep(std::time::Duration::from_millis(1));
         };
-        child.kill().unwrap(); child.wait().unwrap();
-        assert!(progressed,"child never committed");
-        assert_eq!(db.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
-        let mut reopened = PreparedSourceWriter::open(root.path(),16384).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(progressed, "child never committed");
+        assert_eq!(
+            db.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        let mut reopened = PreparedSourceWriter::open(root.path(), 16384).unwrap();
         let at = reopened.cursor().unwrap();
-        assert_eq!(at % 2,0,"atomic pair was split");
-        reopened.append_market_batch(&[event("11",at+1),event("12",at+2)]).unwrap();
-        assert_eq!(reopened.cursor().unwrap(),at+2);
+        assert_eq!(at % 2, 0, "atomic pair was split");
+        reopened
+            .append_market_batch(&[event("11", at + 1), event("12", at + 2)])
+            .unwrap();
+        assert_eq!(reopened.cursor().unwrap(), at + 2);
         assert!(!root.path().join("events.jsonl").exists());
     }
 
     #[test]
     fn bounded_history_partial_manifest_is_not_a_recovery_boundary() {
         let root = fixture();
-        let mut writer = PreparedSourceWriter::open(root.path(),16384).unwrap();
-        writer.append_market_batch(&[event("11",1),event("12",2)]).unwrap();
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        writer
+            .append_market_batch(&[event("11", 1), event("12", 2)])
+            .unwrap();
         writer.enable_bounded_history(16384).unwrap();
         drop(writer);
-        fs::write(root.path().join("state-index.rust-pending.json"),b"{\"latest_cursor\":999").unwrap();
-        let mut writer = PreparedSourceWriter::open(root.path(),16384).unwrap();
-        assert_eq!(writer.cursor().unwrap(),2);
+        fs::write(
+            root.path().join("state-index.rust-pending.json"),
+            b"{\"latest_cursor\":999",
+        )
+        .unwrap();
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        assert_eq!(writer.cursor().unwrap(), 2);
         assert!(!root.path().join("state-index.rust-pending.json").exists());
-        writer.append_market_batch(&[event("11",3),event("12",4)]).unwrap();
-        assert_eq!(writer.cursor().unwrap(),4);
+        writer
+            .append_market_batch(&[event("11", 3), event("12", 4)])
+            .unwrap();
+        assert_eq!(writer.cursor().unwrap(), 4);
     }
 
     #[test]
@@ -1755,41 +2102,156 @@ mod tests {
 
     #[test]
     fn repeated_small_bindings_cannot_bypass_total_token_limit() {
-        let root=fixture();
-        let mut writer=PreparedSourceWriter::open(root.path(),16384).unwrap();
-        let remaining=MAX_SCOPED_TOKEN_IDENTITIES-writer.token_markets.len();
-        let additions:BTreeMap<_,_>=(0..remaining).map(|n|(format!("extra-{n}"),"market".into())).collect();
+        let root = fixture();
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        let remaining = MAX_SCOPED_TOKEN_IDENTITIES - writer.token_markets.len();
+        let additions: BTreeMap<_, _> = (0..remaining)
+            .map(|n| (format!("extra-{n}"), "market".into()))
+            .collect();
         writer.bind_catalog_tokens(additions.clone()).unwrap();
         writer.bind_catalog_tokens(additions).unwrap(); // Same identities are idempotent.
-        let before=writer.token_markets.clone();
-        assert!(writer.bind_catalog_tokens(BTreeMap::from([("one-too-many".into(),"market".into())])).is_err());
-        assert_eq!(writer.token_markets,before);
-        assert_eq!(writer.cursor().unwrap(),0);
+        let before = writer.token_markets.clone();
+        assert!(
+            writer
+                .bind_catalog_tokens(BTreeMap::from([("one-too-many".into(), "market".into())]))
+                .is_err()
+        );
+        assert_eq!(writer.token_markets, before);
+        assert_eq!(writer.cursor().unwrap(), 0);
     }
 
     #[test]
     fn scope_retirement_releases_current_rows_preserves_history_and_reopens() {
-        let root=fixture();
-        let mut writer=PreparedSourceWriter::open(root.path(),16384).unwrap();
-        writer.append_market_batch(&[event("11",1),event("12",2)]).unwrap();
+        let root = fixture();
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        writer
+            .append_market_batch(&[event("11", 1), event("12", 2)])
+            .unwrap();
         writer.enable_bounded_history(16384).unwrap();
-        let before=writer.database.query_row("SELECT group_concat(payload_sha256) FROM books",[],|r|r.get::<_,String>(0)).unwrap();
-        let history=writer.database.query_row("SELECT count(*) FROM recent_events",[],|r|r.get::<_,i64>(0)).unwrap();
-        let markets=BTreeSet::from(["1".into()]);
-        assert!(writer.retire_catalog_markets(1,&markets).is_err());
-        assert_eq!(before,writer.database.query_row("SELECT group_concat(payload_sha256) FROM books",[],|r|r.get::<_,String>(0)).unwrap());
-        writer.retire_catalog_markets(2,&markets).unwrap();
-        assert_eq!(writer.cursor().unwrap(),2);
-        assert_eq!(writer.database.query_row("SELECT count(*) FROM books",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(history,writer.database.query_row("SELECT count(*) FROM recent_events",[],|r|r.get::<_,i64>(0)).unwrap());
+        let before = writer
+            .database
+            .query_row("SELECT group_concat(payload_sha256) FROM books", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        let history = writer
+            .database
+            .query_row("SELECT count(*) FROM recent_events", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        let terminal = json!({"identity":{"market_id":"1"},"lifecycle_state":"resolved"});
+        let terminal_bytes = serde_json::to_vec(&terminal).unwrap();
+        let terminal_hash = hex::encode(Sha256::digest(&terminal_bytes));
+        writer.database.execute("INSERT INTO market_lifecycle VALUES (?,?,?,?)",
+            params!["1", 2_i64, terminal_bytes, terminal_hash.clone()]).unwrap();
+        let markets = BTreeSet::from(["1".into()]);
+        let cold = BTreeMap::from([("1".into(), json!({"identity":{
+            "market_id":"1","condition_id":"condition","outcomes":[
+                {"token_id":"11"},{"token_id":"12"}]}}))]);
+        assert!(writer.retire_catalog_markets(1, &markets, &cold).is_err());
+        assert_eq!(
+            before,
+            writer
+                .database
+                .query_row("SELECT group_concat(payload_sha256) FROM books", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+        );
+        writer.retire_catalog_markets(2, &markets, &cold).unwrap();
+        assert_eq!(writer.cold_market_record("1").unwrap(), Some(cold["1"].clone()));
+        let archived = writer.cold_market_evidence("1").unwrap().unwrap();
+        assert_eq!(archived["retired_after_cursor"],2);
+        assert_eq!(archived["books"].as_object().unwrap().len(),2);
+        assert_eq!(archived["lifecycle"],terminal);
+        assert_eq!(writer.database.query_row(
+            "SELECT payload_sha256 FROM market_lifecycle WHERE market_id='1'", [],
+            |row| row.get::<_, String>(0)).unwrap(), terminal_hash);
+        assert_eq!(writer.cursor().unwrap(), 2);
+        assert_eq!(
+            writer
+                .database
+                .query_row("SELECT count(*) FROM books", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            history,
+            writer
+                .database
+                .query_row("SELECT count(*) FROM recent_events", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap()
+        );
         assert!(writer.token_markets.is_empty());
-        assert_eq!(metadata(&writer.database).unwrap()["book_token_count"],"0");
+        assert_eq!(metadata(&writer.database).unwrap()["book_token_count"], "0");
         drop(writer);
-        let mut writer=PreparedSourceWriter::open(root.path(),16384).unwrap();
-        assert_eq!(writer.cursor().unwrap(),2);
-        writer.bind_catalog_tokens(BTreeMap::from([("11".into(),"1".into()),("12".into(),"1".into())])).unwrap();
-        writer.append_market_batch(&[event("11",3),event("12",4)]).unwrap();
-        assert_eq!(writer.cursor().unwrap(),4);
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        assert_eq!(writer.cursor().unwrap(), 2);
+        assert_eq!(writer.cold_market_record("1").unwrap(), Some(cold["1"].clone()));
+        assert_eq!(writer.cold_market_evidence("1").unwrap().unwrap()["books"]
+            .as_object().unwrap().len(),2);
+        assert!(writer.terminal_markets.is_empty(),
+            "cold lifecycle history must not recreate hot terminal cache");
+        writer.retire_catalog_markets(2,&markets,&cold).unwrap();
+        assert_eq!(writer.cold_market_evidence("1").unwrap().unwrap()["books"]
+            .as_object().unwrap().len(),2,
+            "idempotent crash replay must preserve the original archived books");
+        writer.database.execute("UPDATE cold_market_catalog SET payload_sha256='bad' WHERE market_id='1'", [])
+            .unwrap();
+        assert!(writer.cold_market_record("1").is_err(),
+            "cold evidence must fail closed if its stored hash is corrupt");
+        writer
+            .bind_catalog_tokens(BTreeMap::from([
+                ("11".into(), "1".into()),
+                ("12".into(), "1".into()),
+            ]))
+            .unwrap();
+        writer
+            .append_market_batch(&[event("11", 3), event("12", 4)])
+            .unwrap();
+        assert_eq!(writer.cursor().unwrap(), 4);
+        writer.database.execute("UPDATE cold_market_evidence SET payload_sha256='bad' WHERE market_id='1'", [])
+            .unwrap();
+        assert!(writer.cold_market_evidence("1").is_err(),
+            "archived evidence corruption must fail closed");
+    }
+
+    #[test]
+    fn ten_thousand_rotations_keep_hot_identity_bounded_and_cold_evidence_addressable() {
+        let root = fixture();
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        let initial = BTreeSet::from(["1".to_owned()]);
+        let initial_record = serde_json::json!({"identity":{"market_id":"1",
+            "condition_id":"c1","outcomes":[{"token_id":"11"},{"token_id":"12"}]}});
+        writer.retire_catalog_markets(0, &initial,
+            &BTreeMap::from([("1".to_owned(),initial_record)])).unwrap();
+        for n in 2..=10_001 {
+            let id = n.to_string();
+            let up = format!("{id}-up");
+            let down = format!("{id}-down");
+            writer.bind_catalog_tokens(BTreeMap::from([
+                (up.clone(),id.clone()),(down.clone(),id.clone()),
+            ])).unwrap();
+            assert_eq!(writer.token_markets.len(),2);
+            let record = serde_json::json!({"identity":{"market_id":id,
+                "condition_id":format!("c{n}"),"outcomes":[
+                    {"token_id":up},{"token_id":down}]}});
+            writer.retire_catalog_markets(0,&BTreeSet::from([id.clone()]),
+                &BTreeMap::from([(id.clone(),record)])).unwrap();
+            assert!(writer.token_markets.is_empty());
+            assert!(writer.health.is_empty());
+            assert!(writer.recoveries.is_empty());
+        }
+        assert_eq!(writer.database.query_row(
+            "SELECT count(*) FROM cold_market_evidence",[],|row| row.get::<_,i64>(0))
+            .unwrap(),10_001);
+        assert!(writer.cold_market_evidence("10001").unwrap().is_some());
+        drop(writer);
+        let writer = PreparedSourceWriter::open(root.path(),16384).unwrap();
+        assert!(writer.token_markets.is_empty());
+        assert!(writer.cold_market_record("2").unwrap().is_some());
     }
 
     #[test]

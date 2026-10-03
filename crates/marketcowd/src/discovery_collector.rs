@@ -9,30 +9,38 @@ use marketcow_runtime::discovery_source::PreparedSourceWriter;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, fs, path::PathBuf, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::PathBuf, time::Duration};
 use tokio::task::JoinSet;
+mod btc_research;
 #[allow(dead_code)]
 #[path = "live_source_bridge.rs"]
 mod durable_bootstrap;
-mod source_dispatch;
-mod source_lifecycle;
-mod source_public_api;
-mod source_price_history;
-mod source_market_evidence;
-mod source_scope_control;
-mod source_scope_journal;
-mod source_acquisition_shards;
 mod source_acquisition_lease;
-mod source_rest_pool;
-mod source_scope_registry;
-mod source_public_frame;
-mod source_public_binding;
-mod source_discovery_quote;
+mod source_acquisition_shards;
+#[allow(dead_code)]
+mod source_btc5m_api;
+mod source_btc5m_manager;
+mod source_cold_catalog;
+mod source_discovery_api;
 mod source_discovery_history;
 mod source_discovery_projection;
-mod source_discovery_api;
+mod source_discovery_quote;
 mod source_discovery_startup;
+mod source_dispatch;
+mod source_finality_reader;
+mod source_finality_service;
+mod source_lifecycle;
+mod source_market_evidence;
+mod source_price_history;
+mod source_public_api;
+mod source_public_binding;
+mod source_public_frame;
 mod source_publication;
+mod source_rest_pool;
+mod source_scope_control;
+mod source_scope_journal;
+mod source_scope_migration;
+mod source_scope_registry;
 mod source_websocket;
 
 async fn shutdown_signal() {
@@ -66,6 +74,17 @@ fn websocket_seed(
         Ok(seed)
     })
     .transpose()
+}
+
+/// Keep the immutable cold catalog in the journal and metadata projection,
+/// but never turn its old books or recovery rows into current hot evidence.
+fn restrict_bootstrap_to_hot(mut base: Value, hot_tokens: &BTreeSet<String>) -> Result<Value> {
+    for field in ["books", "gaps", "token_recoveries"] {
+        let entries = base[field].as_array_mut().context("managed bootstrap entries")?;
+        entries.retain(|entry| entry["token_id"].as_str()
+            .is_some_and(|token| hot_tokens.contains(token)));
+    }
+    Ok(base)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -142,50 +161,62 @@ struct Args {
     /// Private publication-control socket. Does not prepare acquisition or expose a LAN manager.
     #[arg(long, requires_all=["scope_control_bytes", "scope_control_timeout_seconds", "scope_retire_grace_seconds", "acquisition_token_budget", "acquisition_socket_budget", "scope_state_file", "scope_state_bytes"])]
     scope_control_socket: Option<PathBuf>,
-    #[arg(long,requires="scope_control_socket")]
-    scope_state_file:Option<PathBuf>,
-    #[arg(long,requires="scope_control_socket")]
-    scope_state_bytes:Option<usize>,
-    #[arg(long, requires="scope_control_socket")]
+    #[arg(long, requires = "scope_control_socket")]
+    scope_state_file: Option<PathBuf>,
+    #[arg(long, requires = "scope_control_socket")]
+    scope_state_bytes: Option<usize>,
+    /// Offline, quiesced copy-only hot/cold migration; never starts a service.
+    #[arg(long, requires_all=["scope_state_file","scope_state_bytes","offline_cold_state_sha256",
+        "offline_cold_index_sha256","offline_cold_copy_budget_bytes"])]
+    offline_cold_output: Option<PathBuf>,
+    #[arg(long)]
+    offline_cold_state_sha256: Option<String>,
+    #[arg(long)]
+    offline_cold_index_sha256: Option<String>,
+    #[arg(long)]
+    offline_cold_events_sha256: Option<String>,
+    #[arg(long)]
+    offline_cold_copy_budget_bytes: Option<u64>,
+    #[arg(long, requires = "scope_control_socket")]
     scope_control_bytes: Option<usize>,
-    #[arg(long, requires="scope_control_socket")]
+    #[arg(long, requires = "scope_control_socket")]
     scope_control_timeout_seconds: Option<u64>,
-    #[arg(long, requires="scope_control_socket")]
+    #[arg(long, requires = "scope_control_socket")]
     scope_retire_grace_seconds: Option<u64>,
     /// Concurrent acquisition tokens, including preparation and retirement.
-    #[arg(long, requires="scope_control_socket")]
-    acquisition_token_budget:Option<usize>,
-    #[arg(long, requires="scope_control_socket")]
-    acquisition_socket_budget:Option<usize>,
+    #[arg(long, requires = "scope_control_socket")]
+    acquisition_token_budget: Option<usize>,
+    #[arg(long, requires = "scope_control_socket")]
+    acquisition_socket_budget: Option<usize>,
     /// Keep APIs/control alive but acquire upstream sockets only while a
     /// bounded consumer lease exists. Leases are intentionally process-local.
     #[arg(long,requires_all=["scope_control_socket","acquisition_lease_capacity","acquisition_lease_max_seconds"])]
-    acquisition_lease_required:bool,
-    #[arg(long,requires="acquisition_lease_required")]
-    acquisition_lease_capacity:Option<usize>,
-    #[arg(long,requires="acquisition_lease_required")]
-    acquisition_lease_max_seconds:Option<u64>,
+    acquisition_lease_required: bool,
+    #[arg(long, requires = "acquisition_lease_required")]
+    acquisition_lease_capacity: Option<usize>,
+    #[arg(long, requires = "acquisition_lease_required")]
+    acquisition_lease_max_seconds: Option<u64>,
     /// Independent direct Rust Discovery surface over this frozen universe.
     #[arg(long, conflicts_with_all=["configured_scope", "public_listen", "live_listen"], requires_all=["discovery_seed", "discovery_seed_sha256", "discovery_state_bytes", "discovery_full_sync_bytes", "discovery_frame_bytes", "discovery_replay_bytes", "discovery_clients", "discovery_baselines", "discovery_send_timeout_seconds"])]
-    discovery_listen:Option<std::net::SocketAddr>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_seed:Option<PathBuf>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_seed_sha256:Option<String>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_state_bytes:Option<usize>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_full_sync_bytes:Option<usize>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_frame_bytes:Option<usize>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_replay_bytes:Option<usize>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_clients:Option<usize>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_baselines:Option<usize>,
-    #[arg(long,requires="discovery_listen")]
-    discovery_send_timeout_seconds:Option<u64>,
+    discovery_listen: Option<std::net::SocketAddr>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_seed: Option<PathBuf>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_seed_sha256: Option<String>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_state_bytes: Option<usize>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_full_sync_bytes: Option<usize>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_frame_bytes: Option<usize>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_replay_bytes: Option<usize>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_clients: Option<usize>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_baselines: Option<usize>,
+    #[arg(long, requires = "discovery_listen")]
+    discovery_send_timeout_seconds: Option<u64>,
     #[arg(long)]
     poll_seconds: u64,
     #[arg(long)]
@@ -205,6 +236,78 @@ struct Args {
     /// Refresh only known failed market IDs; terminal evidence expires after this interval.
     #[arg(long, requires = "dependency_plan")]
     lifecycle_refresh_seconds: Option<u64>,
+    /// Native BTCUSDT bootstrap/realtime component on the same public listener.
+    #[arg(long, requires_all=["public_listen","btc_research_archive_bytes","btc_research_queue_records","btc_research_queue_bytes","btc_research_response_bytes","btc_research_clients","btc_research_send_timeout_seconds"])]
+    btc_research_root: Option<PathBuf>,
+    #[arg(long, requires = "btc_research_root")]
+    btc_research_archive_bytes: Option<usize>,
+    #[arg(long, requires = "btc_research_root")]
+    btc_research_queue_records: Option<usize>,
+    #[arg(long, requires = "btc_research_root")]
+    btc_research_queue_bytes: Option<usize>,
+    #[arg(long, requires = "btc_research_root")]
+    btc_research_response_bytes: Option<usize>,
+    #[arg(long, requires = "btc_research_root")]
+    btc_research_clients: Option<usize>,
+    #[arg(long, requires = "btc_research_root")]
+    btc_research_send_timeout_seconds: Option<u64>,
+    /// Bounded BTC five-minute market projection over the same publication
+    /// and listener. Acquisition membership is prepared through the existing
+    /// managed control plane; this option never starts a sidecar source.
+    #[arg(long, requires_all=["public_listen","btc_5m_profile_sha256","btc_5m_snapshot_bytes","btc_5m_frame_bytes","btc_5m_replay_bytes","btc_5m_clients","btc_5m_send_timeout_seconds","btc_5m_snapshot_lease_capacity"])]
+    btc_5m_profile: Option<PathBuf>,
+    #[arg(long, requires = "btc_5m_profile")]
+    btc_5m_profile_sha256: Option<String>,
+    #[arg(long)]
+    btc_5m_snapshot_bytes: Option<usize>,
+    #[arg(long)]
+    btc_5m_frame_bytes: Option<usize>,
+    #[arg(long)]
+    btc_5m_replay_bytes: Option<usize>,
+    #[arg(long)]
+    btc_5m_clients: Option<usize>,
+    #[arg(long)]
+    btc_5m_send_timeout_seconds: Option<u64>,
+    #[arg(long)]
+    btc_5m_snapshot_lease_capacity: Option<usize>,
+    /// Same-process UTC rotation manager. It reuses the private scope control,
+    /// shared acquisition lease and publication path; no sidecar/listener is
+    /// created. The fixed timing values are intentionally explicit.
+    #[arg(long, requires_all=["public_listen","scope_control_socket","btc_5m_snapshot_bytes","btc_5m_frame_bytes","btc_5m_replay_bytes","btc_5m_clients","btc_5m_send_timeout_seconds","btc_5m_snapshot_lease_capacity","btc_5m_manager_lease_ttl_seconds","btc_5m_manager_renew_seconds","btc_5m_manager_prereview_seconds","btc_5m_manager_control_timeout_seconds","btc_5m_manager_response_bytes","btc_5m_manager_evidence_files"])]
+    btc_5m_manager_root: Option<PathBuf>,
+    #[arg(long, requires = "btc_5m_manager_root")]
+    btc_5m_manager_lease_ttl_seconds: Option<u64>,
+    #[arg(long, requires = "btc_5m_manager_root")]
+    btc_5m_manager_renew_seconds: Option<u64>,
+    #[arg(long, requires = "btc_5m_manager_root")]
+    btc_5m_manager_prereview_seconds: Option<u64>,
+    #[arg(long, requires = "btc_5m_manager_root")]
+    btc_5m_manager_control_timeout_seconds: Option<u64>,
+    #[arg(long, requires = "btc_5m_manager_root")]
+    btc_5m_manager_response_bytes: Option<usize>,
+    #[arg(long, requires = "btc_5m_manager_root")]
+    btc_5m_manager_evidence_files: Option<usize>,
+    /// Durable two-provider CTF finality quorum on the unified public listener.
+    #[arg(long, requires_all=["public_listen","finality_profile_a","finality_profile_b","finality_caller_token_file","finality_archive_bytes","finality_queue_records","finality_queue_bytes","finality_clients","finality_request_timeout_seconds","finality_retry_after_seconds"])]
+    finality_root: Option<PathBuf>,
+    #[arg(long, requires = "finality_root")]
+    finality_profile_a: Option<PathBuf>,
+    #[arg(long, requires = "finality_root")]
+    finality_profile_b: Option<PathBuf>,
+    #[arg(long, requires = "finality_root")]
+    finality_caller_token_file: Option<PathBuf>,
+    #[arg(long, requires = "finality_root")]
+    finality_archive_bytes: Option<usize>,
+    #[arg(long, requires = "finality_root")]
+    finality_queue_records: Option<usize>,
+    #[arg(long, requires = "finality_root")]
+    finality_queue_bytes: Option<usize>,
+    #[arg(long, requires = "finality_root")]
+    finality_clients: Option<usize>,
+    #[arg(long, requires = "finality_root")]
+    finality_request_timeout_seconds: Option<u64>,
+    #[arg(long, requires = "finality_root")]
+    finality_retry_after_seconds: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -484,9 +587,46 @@ fn dependency_closure(configured: &[Market], raw: &Value) -> Result<Vec<Market>>
     Ok(out)
 }
 
+/// Finish a journaled retirement before any listener or supplier socket is
+/// opened. A crash after the writer commits but before the journal settles
+/// replays the same immutable cold record; the writer verifies its existing
+/// hash and never replaces it with an empty post-retirement hot snapshot.
+fn replay_pending_retirement(
+    writer: &mut PreparedSourceWriter,
+    state: &mut source_scope_journal::State,
+) -> Result<()> {
+    if state.retiring_records.is_empty() {
+        return Ok(());
+    }
+    writer.retire_catalog_markets(
+        writer.cursor()?,
+        &state.retiring_records.keys().cloned().collect(),
+        &state.retiring_records,
+    )?;
+    state.retiring_records.clear();
+    state.retirement_ticket = None;
+    state.retiring_acquisition_market_ids = None;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(output) = &args.offline_cold_output {
+        let report = source_scope_migration::migrate(source_scope_migration::Inputs {
+            source_root: &args.root,
+            state_path: args.scope_state_file.as_deref().context("offline scope state")?,
+            output_root: output,
+            state_max_bytes: args.scope_state_bytes.context("offline state byte budget")?,
+            batch_bytes: args.batch_byte_limit,
+            expected_state_sha256: args.offline_cold_state_sha256.as_deref().context("offline state SHA")?,
+            expected_index_sha256: args.offline_cold_index_sha256.as_deref().context("offline index SHA")?,
+            expected_events_sha256: args.offline_cold_events_sha256.as_deref(),
+            copy_budget_bytes: args.offline_cold_copy_budget_bytes.context("offline copy byte budget")?,
+        })?;
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
     ensure!(
         (1..=32).contains(&args.concurrency)
             && (1..=8).contains(&args.market_workers)
@@ -504,11 +644,17 @@ async fn main() -> Result<()> {
         "explicit universe count and byte budgets required"
     );
     ensure!(args.cycles != Some(0), "cycles must be positive");
-    ensure!(!args.acquisition_lease_required||(
-        args.input_mode==InputMode::Websocket
-        && args.acquisition_lease_capacity.is_some_and(|n|(1..=64).contains(&n))
-        && args.acquisition_lease_max_seconds.is_some_and(|n|(1..=3600).contains(&n))),
-        "on-demand acquisition requires bounded WebSocket leases");
+    ensure!(
+        !args.acquisition_lease_required
+            || (args.input_mode == InputMode::Websocket
+                && args
+                    .acquisition_lease_capacity
+                    .is_some_and(|n| (1..=64).contains(&n))
+                && args
+                    .acquisition_lease_max_seconds
+                    .is_some_and(|n| (1..=3600).contains(&n))),
+        "on-demand acquisition requires bounded WebSocket leases"
+    );
     ensure!(
         args.lifecycle_refresh_seconds != Some(0),
         "lifecycle interval must be positive"
@@ -560,6 +706,81 @@ async fn main() -> Result<()> {
         "source catalog revision differs"
     );
     let mut public_scope = None;
+    let btc_5m_manager_config = if let Some(root) = &args.btc_5m_manager_root {
+        fs::create_dir_all(root)?;
+        let canonical_root = fs::canonicalize(root)?;
+        ensure!(
+            canonical_root.starts_with(fs::canonicalize(&args.root)?),
+            "BTC 5m manager root escapes source root"
+        );
+        Some(source_btc5m_manager::Config {
+            root: canonical_root,
+            control_socket: args
+                .scope_control_socket
+                .clone()
+                .context("BTC 5m manager control socket")?,
+            ttl: Duration::from_secs(
+                args.btc_5m_manager_lease_ttl_seconds
+                    .context("BTC 5m manager lease TTL")?,
+            ),
+            renew: Duration::from_secs(
+                args.btc_5m_manager_renew_seconds
+                    .context("BTC 5m manager renewal")?,
+            ),
+            prereview: Duration::from_secs(
+                args.btc_5m_manager_prereview_seconds
+                    .context("BTC 5m manager prereview")?,
+            ),
+            control_timeout: Duration::from_secs(
+                args.btc_5m_manager_control_timeout_seconds
+                    .context("BTC 5m manager control timeout")?,
+            ),
+            response_bytes: args
+                .btc_5m_manager_response_bytes
+                .context("BTC 5m manager response bytes")?,
+            evidence_files: args
+                .btc_5m_manager_evidence_files
+                .context("BTC 5m manager evidence files")?,
+        })
+    } else {
+        None
+    };
+    let mut btc_5m_manager_bootstrap = None;
+    let btc_5m_profile = if let Some(path) = &args.btc_5m_profile {
+        ensure!(
+            fs::canonicalize(path)?.starts_with(fs::canonicalize(&args.root)?),
+            "BTC 5m profile escapes source root"
+        );
+        ensure!(
+            fs::metadata(path)?.len() <= 1024 * 1024,
+            "oversized BTC 5m profile"
+        );
+        let bytes = fs::read(path)?;
+        ensure!(
+            Some(&hex::encode(Sha256::digest(&bytes))) == args.btc_5m_profile_sha256.as_ref(),
+            "BTC 5m profile file hash differs"
+        );
+        let profile: source_btc5m_api::Profile = serde_json::from_slice(&bytes)?;
+        profile.validate()?;
+        Some(profile)
+    } else if let Some(config) = &btc_5m_manager_config {
+        match source_btc5m_manager::load_persisted_profile(config, &plan.catalog_revision)? {
+            Some(profile) => Some(profile),
+            None => {
+                // First activation performs one bounded current+next audit.
+                // Every later restart loads the last validated profile before
+                // networking, so a BTC supplier outage cannot prevent the
+                // rest of the unified MarketCow service from starting.
+                let bootstrap =
+                    source_btc5m_manager::bootstrap(config, &plan.catalog_revision).await?;
+                let profile = bootstrap.profile.clone();
+                btc_5m_manager_bootstrap = Some(bootstrap);
+                Some(profile)
+            }
+        }
+    } else {
+        None
+    };
     if let Some(path) = &args.configured_scope {
         ensure!(
             fs::canonicalize(path)?.starts_with(fs::canonicalize(&args.root)?),
@@ -638,27 +859,48 @@ async fn main() -> Result<()> {
             );
         }
     }
-    let mut scope_boot=if let Some(path)=&args.scope_state_file {
-        source_scope_journal::read(path,args.scope_state_bytes.context("scope state bytes")?)?
-    }else{None};
-    let manifest_sha=hex::encode(Sha256::digest(fs::read(args.root.join("catalog.json"))?));
-    if let Some(state)=scope_boot.as_mut() {
-        ensure!(state.catalog_revision==plan.catalog_revision&&state.catalog_manifest_sha256==manifest_sha
-            && state.pool==if args.discovery_listen.is_some(){"discovery"}else{"live"},"runtime source differs");
-        let bindings=state.records.iter().chain(&state.retiring_records).filter(|(id,_)|
-            state.acquisition_market_ids.contains(*id)||state.retiring_records.contains_key(*id))
-            .flat_map(|(id,record)|record["identity"]["outcomes"].as_array().unwrap().iter()
-                .map(move|outcome|(outcome["token_id"].as_str().unwrap().to_owned(),id.clone()))).collect();
-        writer.bind_catalog_tokens(bindings)?;
-        if !state.retiring_records.is_empty() {
-            // Startup-only completion of a previously durable control intent.
-            // Recent history is retained; no listener exists at this point.
-            writer.retire_catalog_markets(writer.cursor()?,&state.retiring_records.keys().cloned().collect())?;
-            state.retiring_records.clear();state.retirement_ticket=None;
+    let mut scope_boot = if let Some(path) = &args.scope_state_file {
+        source_scope_journal::read(path, args.scope_state_bytes.context("scope state bytes")?)?
+    } else {
+        None
+    };
+    let manifest_sha = hex::encode(Sha256::digest(fs::read(args.root.join("catalog.json"))?));
+    if let Some(state) = scope_boot.as_mut() {
+        ensure!(
+            state.catalog_revision == plan.catalog_revision
+                && state.catalog_manifest_sha256 == manifest_sha
+                && state.pool
+                    == if args.discovery_listen.is_some() {
+                        "discovery"
+                    } else {
+                        "live"
+                    },
+            "runtime source differs"
+        );
+        let restart_markets = state.restart_markets(args.acquisition_lease_required)?;
+        let mut bindings: BTreeMap<String, String> = restart_markets
+            .iter()
+            .flat_map(|market| market.token_ids.iter().map(move |token| (token.clone(), market.market_id.clone())))
+            .collect();
+        for (id, record) in &state.retiring_records {
+            // A pending durable retirement needs its writer identity, but is
+            // never placed back into the active subscription plan.
+            for outcome in record["identity"]["outcomes"].as_array().context("retiring outcomes")? {
+                let token = outcome["token_id"].as_str().context("retiring token")?;
+                ensure!(bindings.insert(token.to_owned(), id.clone()).is_none(), "retiring token overlaps active hot binding");
+            }
         }
-        plan.markets=state.markets()?;
-        ensure!(plan.markets.len()*2<=args.acquisition_token_budget.context("runtime acquisition budget")?,"runtime acquisition capacity");
-        lifecycle_markets=state.records.clone();
+        writer.bind_catalog_tokens(bindings)?;
+        replay_pending_retirement(&mut writer, state)?;
+        plan.markets = restart_markets;
+        ensure!(
+            plan.markets.len() * 2
+                <= args
+                    .acquisition_token_budget
+                    .context("runtime acquisition budget")?,
+            "runtime acquisition capacity"
+        );
+        lifecycle_markets = state.records.clone();
     }
     // Both cold Discovery and scoped Live writers require the verified plan
     // identity map. Existing books are not a substitute for catalog binding;
@@ -674,25 +916,61 @@ async fn main() -> Result<()> {
         writer.enable_bounded_history(limit)?;
     }
     let cursor = writer.cursor()?;
-    let mut discovery_config=None;
-    let scope_revision=scope_boot.as_ref().map_or(1,|state|state.active_revision);
-    let base = if let Some(state)=scope_boot.as_mut() {
-        if state.pool=="live" {
-            let scope:source_public_api::ConfiguredScope=serde_json::from_value(state.active_config.clone())?;
-            scope.validate()?;public_scope=Some(scope);
+    let mut discovery_config = None;
+    let scope_revision = scope_boot.as_ref().map_or(1, |state| state.active_revision);
+    let base = if let Some(state) = scope_boot.as_mut() {
+        if state.pool == "live" {
+            let scope: source_public_api::ConfiguredScope =
+                serde_json::from_value(state.active_config.clone())?;
+            scope.validate()?;
+            public_scope = Some(scope);
         } else {
-            let mut config:source_discovery_projection::DiscoveryConfig=serde_json::from_value(state.active_config.clone())?;
-            config.projection_id=canonical_hash(&json!({"previous":config.projection_id,"instance":uuid::Uuid::new_v4().simple().to_string()}));
-            state.active_config=serde_json::to_value(&config)?;discovery_config=Some(config);
+            let mut config: source_discovery_projection::DiscoveryConfig =
+                serde_json::from_value(state.active_config.clone())?;
+            config.projection_id = canonical_hash(
+                &json!({"previous":config.projection_id,"instance":uuid::Uuid::new_v4().simple().to_string()}),
+            );
+            state.active_config = serde_json::to_value(&config)?;
+            discovery_config = Some(config);
         }
-        Some(durable_bootstrap::bootstrap_managed(args.root.clone(),state.catalog_revision.clone(),manifest_sha.clone(),
-            state.records.values().cloned().collect(),state.catalog_source.clone(),
-            if state.pool=="live"{args.public_full_sync_bytes.context("public state bytes")?}else{args.discovery_state_bytes.context("Discovery state bytes")?},
-            if state.pool=="live"{Some(public_scope.as_ref().context("managed Live scope")?.active_scope_id.clone())}else{None})?)
+        let hot_tokens: BTreeSet<String> = plan.markets.iter()
+            .flat_map(|market| market.token_ids.iter().cloned()).collect();
+        Some(restrict_bootstrap_to_hot(durable_bootstrap::bootstrap_managed(
+            args.root.clone(),
+                state.catalog_revision.clone(),
+                manifest_sha.clone(),
+                state.records.values().cloned().collect(),
+            state.catalog_source.clone(),
+            if state.pool == "live" {
+                args.public_full_sync_bytes.context("public state bytes")?
+            } else {
+                args.discovery_state_bytes
+                    .context("Discovery state bytes")?
+            },
+            if state.pool == "live" {
+                Some(
+                    public_scope
+                        .as_ref()
+                        .context("managed Live scope")?
+                        .active_scope_id
+                        .clone(),
+                )
+            } else {
+                None
+            },
+        )?, &hot_tokens)?)
     } else if args.discovery_listen.is_some() {
-        let (config,base)=source_discovery_startup::load(&args.root,args.discovery_seed.as_deref().context("Discovery seed")?,
-            args.discovery_seed_sha256.as_deref().context("Discovery seed hash")?,args.discovery_state_bytes.context("Discovery state cap")?,&plan.markets)?;
-        discovery_config=Some(config);Some(base)
+        let (config, base) = source_discovery_startup::load(
+            &args.root,
+            args.discovery_seed.as_deref().context("Discovery seed")?,
+            args.discovery_seed_sha256
+                .as_deref()
+                .context("Discovery seed hash")?,
+            args.discovery_state_bytes.context("Discovery state cap")?,
+            &plan.markets,
+        )?;
+        discovery_config = Some(config);
+        Some(base)
     } else if args.live_listen.is_some() || args.public_listen.is_some() {
         Some(durable_bootstrap::bootstrap(
             args.root.clone(),
@@ -702,28 +980,68 @@ async fn main() -> Result<()> {
             args.dependency_plan_sha256
                 .as_deref()
                 .context("missing stream plan hash")?,
-            if args.public_listen.is_some() { args.public_full_sync_bytes.context("public seed cap")? }
-                else { args.live_frame_bytes.context("missing frame cap")? },
+            if args.public_listen.is_some() {
+                args.public_full_sync_bytes.context("public seed cap")?
+            } else {
+                args.live_frame_bytes.context("missing frame cap")?
+            },
         )?)
     } else {
         None
     };
-    let journal=if let Some(path)=&args.scope_state_file {
-        let initial=if let Some(state)=scope_boot {state}else{
-            let base=base.as_ref().context("managed source baseline required")?;
-            source_scope_journal::State{
-                schema_version:"marketcow.runtime-scope-state.v1".into(),catalog_revision:plan.catalog_revision.clone(),
-                catalog_manifest_sha256:manifest_sha,pool:if args.discovery_listen.is_some(){"discovery"}else{"live"}.into(),
-                active_config:if let Some(config)=&discovery_config{serde_json::to_value(config)?}else{serde_json::to_value(public_scope.as_ref().context("public config")?)?},
-                active_revision:scope_revision,catalog_source:base["catalog_source"].clone(),
-                records:base["markets"].as_array().context("managed metadata")?.iter().map(|record|Ok((record["identity"]["market_id"].as_str().context("managed market")?.into(),record.clone()))).collect::<Result<_>>()?,
-                acquisition_market_ids:plan.markets.iter().map(|m|m.market_id.clone()).collect(),retiring_records:Default::default(),retirement_ticket:None,
+    let journal = if let Some(path) = &args.scope_state_file {
+        let initial = if let Some(state) = scope_boot {
+            state
+        } else {
+            let base = base.as_ref().context("managed source baseline required")?;
+            source_scope_journal::State {
+                schema_version: "marketcow.runtime-scope-state.v1".into(),
+                catalog_revision: plan.catalog_revision.clone(),
+                catalog_manifest_sha256: manifest_sha,
+                pool: if args.discovery_listen.is_some() {
+                    "discovery"
+                } else {
+                    "live"
+                }
+                .into(),
+                active_config: if let Some(config) = &discovery_config {
+                    serde_json::to_value(config)?
+                } else {
+                    serde_json::to_value(public_scope.as_ref().context("public config")?)?
+                },
+                active_revision: scope_revision,
+                catalog_source: base["catalog_source"].clone(),
+                records: base["markets"]
+                    .as_array()
+                    .context("managed metadata")?
+                    .iter()
+                    .map(|record| {
+                        Ok((
+                            record["identity"]["market_id"]
+                                .as_str()
+                                .context("managed market")?
+                                .into(),
+                            record.clone(),
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+                acquisition_market_ids: plan.markets.iter().map(|m| m.market_id.clone()).collect(),
+                retiring_records: Default::default(),
+                retirement_ticket: None,
+                retiring_acquisition_market_ids: Default::default(),
             }
         };
-        let mut journal=source_scope_journal::Journal::open(path.clone(),args.scope_state_bytes.context("scope state bytes")?,initial.clone())?;
+        let mut journal = source_scope_journal::Journal::open(
+            path.clone(),
+            args.scope_state_bytes.context("scope state bytes")?,
+            initial.clone(),
+        )?;
         // Persist completed startup retirement and the new Discovery instance.
-        journal.commit(initial)?;Some(journal)
-    }else{None};
+        journal.commit(initial)?;
+        Some(journal)
+    } else {
+        None
+    };
     let bindings = plan
         .markets
         .iter()
@@ -745,11 +1063,12 @@ async fn main() -> Result<()> {
         args.persistence_queue_bytes,
         args.batch_byte_limit,
         move |work| {
-            let batches=match work {
-                source_publication::PersistenceWork::Events(batches)=>batches,
-                source_publication::PersistenceWork::Retire(retirement)=>{
+            let batches = match work {
+                source_publication::PersistenceWork::Events(batches) => batches,
+                source_publication::PersistenceWork::Retire(retirement) => {
                     writer.bind_catalog_tokens(retirement.catalog_bindings.clone())?;
-                    return writer.retire_catalog_markets(retirement.after,&retirement.markets);
+                    return writer.retire_catalog_markets(
+                        retirement.after, &retirement.markets, &retirement.cold_records);
                 }
             };
             for batch in batches {
@@ -758,7 +1077,26 @@ async fn main() -> Result<()> {
                     source_lifecycle::persist(&persistence_root, &persistence_catalog, evidence)?;
                 }
             }
-            writer.append_validated_group(&batches.iter().map(|b| &b.validated).collect::<Vec<_>>())
+            let materialized = batches
+                .iter()
+                .map(|batch| {
+                    Ok((
+                        &batch.validated,
+                        batch
+                            .materialized_books
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("materialized books poisoned"))?
+                            .take()
+                            .context("materialized books already persisted")?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            writer.append_validated_group_with_books(
+                &materialized
+                    .iter()
+                    .map(|(validated, books)| (*validated, books.as_ref()))
+                    .collect::<Vec<_>>(),
+            )
         },
     )?;
     if args.input_mode == InputMode::Websocket {
@@ -780,43 +1118,211 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    ensure!(args.scope_control_socket.is_none() || args.public_listen.is_some() || args.discovery_listen.is_some(),
-        "scope control requires a public pool");
+    ensure!(
+        args.scope_control_socket.is_none()
+            || args.public_listen.is_some()
+            || args.discovery_listen.is_some(),
+        "scope control requires a public pool"
+    );
+    let btc_service = if let Some(root) = args.btc_research_root.clone() {
+        Some(
+            btc_research::Service::start(btc_research::Config {
+                root,
+                archive_bytes: args
+                    .btc_research_archive_bytes
+                    .context("BTC archive bytes")?,
+                queue_records: args
+                    .btc_research_queue_records
+                    .context("BTC queue records")?,
+                queue_bytes: args.btc_research_queue_bytes.context("BTC queue bytes")?,
+                response_bytes: args
+                    .btc_research_response_bytes
+                    .context("BTC response bytes")?,
+                clients: args.btc_research_clients.context("BTC clients")?,
+                send_timeout: Duration::from_secs(
+                    args.btc_research_send_timeout_seconds
+                        .context("BTC send timeout")?,
+                ),
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
+    let finality_service = if let Some(root) = args.finality_root.clone() {
+        Some(
+            source_finality_service::Service::start(source_finality_service::Config {
+                root,
+                profile_paths: [
+                    args.finality_profile_a
+                        .clone()
+                        .context("finality profile A")?,
+                    args.finality_profile_b
+                        .clone()
+                        .context("finality profile B")?,
+                ],
+                caller_token_path: args
+                    .finality_caller_token_file
+                    .clone()
+                    .context("finality caller token file")?,
+                archive_bytes: args
+                    .finality_archive_bytes
+                    .context("finality archive bytes")?,
+                queue_records: args
+                    .finality_queue_records
+                    .context("finality queue records")?,
+                queue_bytes: args.finality_queue_bytes.context("finality queue bytes")?,
+                clients: args.finality_clients.context("finality clients")?,
+                request_timeout: Duration::from_secs(
+                    args.finality_request_timeout_seconds
+                        .context("finality request timeout")?,
+                ),
+                retry_after: Duration::from_secs(
+                    args.finality_retry_after_seconds
+                        .context("finality retry interval")?,
+                ),
+            })
+            .await?,
+        )
+    } else {
+        None
+    };
     let mut control_backend = None;
+    let mut btc_5m_control = None;
     let public_task = if let Some(listen) = args.public_listen {
-        ensure!(listen.ip().is_loopback() || matches!(listen.ip(), std::net::IpAddr::V4(ip) if ip.is_private()),
-            "public read API must bind explicit loopback or private LAN address");
-        let (router,control) = source_public_api::PublicApi::router_managed(publication.reader(),public_scope.context("public scope")?,
-            scope_revision,uuid::Uuid::new_v4().simple().to_string(),args.public_full_sync_bytes.context("public bytes")?,
-            args.public_snapshot_concurrency.context("snapshot concurrency")?,source_public_api::StreamLimits {
-                frame_bytes:args.public_frame_bytes.context("public frame bytes")?,
-                replay_bytes:args.public_replay_bytes.context("public replay bytes")?,
-                clients:args.public_maximum_clients.context("public clients")?,
-                send_timeout:Duration::from_secs(args.public_send_timeout_seconds.context("send timeout")?),
-            },Duration::from_secs(args.scope_retire_grace_seconds.unwrap_or(args.public_send_timeout_seconds.context("send timeout")?)))?;
+        ensure!(
+            listen.ip().is_loopback()
+                || matches!(listen.ip(), std::net::IpAddr::V4(ip) if ip.is_private()),
+            "public read API must bind explicit loopback or private LAN address"
+        );
+        let (mut router, control) = source_public_api::PublicApi::router_managed(
+            publication.reader(),
+            public_scope.context("public scope")?,
+            scope_revision,
+            uuid::Uuid::new_v4().simple().to_string(),
+            args.public_full_sync_bytes.context("public bytes")?,
+            args.public_snapshot_concurrency
+                .context("snapshot concurrency")?,
+            source_public_api::StreamLimits {
+                frame_bytes: args.public_frame_bytes.context("public frame bytes")?,
+                replay_bytes: args.public_replay_bytes.context("public replay bytes")?,
+                clients: args.public_maximum_clients.context("public clients")?,
+                send_timeout: Duration::from_secs(
+                    args.public_send_timeout_seconds.context("send timeout")?,
+                ),
+            },
+            Duration::from_secs(
+                args.scope_retire_grace_seconds
+                    .unwrap_or(args.public_send_timeout_seconds.context("send timeout")?),
+            ),
+        )?;
+        if let Some(service) = &btc_service {
+            router = router.merge(service.router());
+        }
+        if let Some(service) = &finality_service {
+            router = router.merge(service.router());
+        }
+        router = router.merge(source_cold_catalog::router(args.root.clone())?);
+        if let Some(profile) = btc_5m_profile {
+            let (btc_router, control) = source_btc5m_api::Api::router(
+                publication.reader(),
+                profile,
+                uuid::Uuid::new_v4().simple().to_string(),
+                source_btc5m_api::Limits {
+                    snapshot_bytes: args
+                        .btc_5m_snapshot_bytes
+                        .context("BTC 5m snapshot bytes")?,
+                    frame_bytes: args.btc_5m_frame_bytes.context("BTC 5m frame bytes")?,
+                    replay_bytes: args.btc_5m_replay_bytes.context("BTC 5m replay bytes")?,
+                    clients: args.btc_5m_clients.context("BTC 5m clients")?,
+                    send_timeout: Duration::from_secs(
+                        args.btc_5m_send_timeout_seconds
+                            .context("BTC 5m send timeout")?,
+                    ),
+                    snapshot_lease_capacity: args
+                        .btc_5m_snapshot_lease_capacity
+                        .context("BTC 5m snapshot lease capacity")?,
+                },
+            )?;
+            btc_5m_control = Some(control);
+            router = router.merge(btc_router);
+        }
         control_backend = Some(source_scope_control::Backend::Live(control));
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        Some(tokio::spawn(async move {axum::serve(listener,router).await}))
-    } else {None};
-    let discovery_task=if let Some(listen)=args.discovery_listen {
-        ensure!(listen.ip().is_loopback() || matches!(listen.ip(),std::net::IpAddr::V4(ip) if ip.is_private()),"Discovery requires explicit loopback/private address");
-        let (router,control)=source_discovery_api::router_managed_at(publication.reader(),std::sync::Arc::new(discovery_config.context("Discovery config")?),
-            source_discovery_api::DiscoveryLimits{full_sync_bytes:args.discovery_full_sync_bytes.context("Discovery response cap")?,
-                frame_bytes:args.discovery_frame_bytes.context("Discovery frame cap")?,state_bytes:args.discovery_state_bytes.context("Discovery state cap")?,
-                replay_bytes:args.discovery_replay_bytes.context("Discovery replay cap")?,clients:args.discovery_clients.context("Discovery clients")?,
-                cached_baselines:args.discovery_baselines.context("Discovery baselines")?,send_timeout:Duration::from_secs(args.discovery_send_timeout_seconds.context("Discovery send timeout")?)},
-            Duration::from_secs(args.scope_retire_grace_seconds.unwrap_or(args.discovery_send_timeout_seconds.context("Discovery send timeout")?)),scope_revision)?;
-        control_backend=Some(source_scope_control::Backend::Discovery(control));
-        let listener=tokio::net::TcpListener::bind(listen).await?;
-        Some(tokio::spawn(async move{axum::serve(listener,router).await}))
-    }else{None};
-    let (acquisition_sender,acquisition_receiver)=tokio::sync::mpsc::channel(1);
+        Some(tokio::spawn(
+            async move { axum::serve(listener, router).await },
+        ))
+    } else {
+        None
+    };
+    let discovery_task = if let Some(listen) = args.discovery_listen {
+        ensure!(
+            listen.ip().is_loopback()
+                || matches!(listen.ip(),std::net::IpAddr::V4(ip) if ip.is_private()),
+            "Discovery requires explicit loopback/private address"
+        );
+        let (router, control) = source_discovery_api::router_managed_at(
+            publication.reader(),
+            std::sync::Arc::new(discovery_config.context("Discovery config")?),
+            source_discovery_api::DiscoveryLimits {
+                full_sync_bytes: args
+                    .discovery_full_sync_bytes
+                    .context("Discovery response cap")?,
+                frame_bytes: args.discovery_frame_bytes.context("Discovery frame cap")?,
+                state_bytes: args.discovery_state_bytes.context("Discovery state cap")?,
+                replay_bytes: args
+                    .discovery_replay_bytes
+                    .context("Discovery replay cap")?,
+                clients: args.discovery_clients.context("Discovery clients")?,
+                cached_baselines: args.discovery_baselines.context("Discovery baselines")?,
+                send_timeout: Duration::from_secs(
+                    args.discovery_send_timeout_seconds
+                        .context("Discovery send timeout")?,
+                ),
+            },
+            Duration::from_secs(
+                args.scope_retire_grace_seconds.unwrap_or(
+                    args.discovery_send_timeout_seconds
+                        .context("Discovery send timeout")?,
+                ),
+            ),
+            scope_revision,
+        )?;
+        control_backend = Some(source_scope_control::Backend::Discovery(control));
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        Some(tokio::spawn(
+            async move { axum::serve(listener, router).await },
+        ))
+    } else {
+        None
+    };
+    let (acquisition_sender, acquisition_receiver) = tokio::sync::mpsc::channel(1);
+    let btc_5m_manager_control = btc_5m_control.clone();
     let control_task = if let Some(path) = &args.scope_control_socket {
-        Some(source_scope_control::start(path,args.scope_control_bytes.context("control bytes")?,
-            Duration::from_secs(args.scope_control_timeout_seconds.context("control timeout")?),
+        Some(source_scope_control::start(
+            path,
+            args.scope_control_bytes.context("control bytes")?,
+            Duration::from_secs(
+                args.scope_control_timeout_seconds
+                    .context("control timeout")?,
+            ),
             control_backend.context("control backend")?,
-            Some(acquisition_sender),journal)?)
-    } else {None};
+            Some(acquisition_sender),
+            btc_5m_control.clone(),
+            journal,
+        )?)
+    } else {
+        None
+    };
+    let btc_5m_manager_task = if let Some(config) = btc_5m_manager_config {
+        Some(source_btc5m_manager::start(
+            config,
+            btc_5m_manager_control.context("BTC 5m manager projection")?,
+            btc_5m_manager_bootstrap,
+        )?)
+    } else {
+        None
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.request_timeout_seconds))
         .build()?;
@@ -828,27 +1334,57 @@ async fn main() -> Result<()> {
                 "WebSocket requires an explicit live dependency plan and seeded read stream",
             )?,
             &mut publication,
-            if args.scope_control_socket.is_some(){Some(acquisition_receiver)}else{None},
+            if args.scope_control_socket.is_some() {
+                Some(acquisition_receiver)
+            } else {
+                None
+            },
         )
         .await;
         if let Some(task) = stream_task {
             task.abort();
         }
-        if let Some(task) = public_task { task.abort(); }
-        if let Some(task) = discovery_task { task.abort(); }
-        if let Some(task) = control_task { task.abort(); let _ = task.await; }
+        if let Some(task) = public_task {
+            task.abort();
+        }
+        if let Some(task) = discovery_task {
+            task.abort();
+        }
+        if let Some(task) = btc_5m_manager_task {
+            task.abort();
+        }
+        if let Some(task) = control_task {
+            task.abort();
+            let _ = task.await;
+        }
         let drain = publication.finish().await;
         result?;
         drain?;
         return Ok(());
     }
     if args.scope_control_socket.is_some() {
-        let result=source_rest_pool::run(&args,&plan,&mut publication,acquisition_receiver).await;
-        if let Some(task)=stream_task{task.abort();}
-        if let Some(task)=public_task{task.abort();}
-        if let Some(task)=discovery_task{task.abort();}
-        if let Some(task)=control_task{task.abort();let _=task.await;}
-        let drain=publication.finish().await;result?;drain?;return Ok(());
+        let result =
+            source_rest_pool::run(&args, &plan, &mut publication, acquisition_receiver).await;
+        if let Some(task) = stream_task {
+            task.abort();
+        }
+        if let Some(task) = public_task {
+            task.abort();
+        }
+        if let Some(task) = discovery_task {
+            task.abort();
+        }
+        if let Some(task) = btc_5m_manager_task {
+            task.abort();
+        }
+        if let Some(task) = control_task {
+            task.abort();
+            let _ = task.await;
+        }
+        let drain = publication.finish().await;
+        result?;
+        drain?;
+        return Ok(());
     }
     // Managed shutdown completes the current durability cycle before releasing the lease.
     let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -954,9 +1490,16 @@ async fn main() -> Result<()> {
         Ok(())
     }.await;
     workers.abort_all();
-    if let Some(task) = public_task { task.abort(); }
-    if let Some(task) = discovery_task { task.abort(); }
-    if let Some(task) = control_task { task.abort(); let _ = task.await; }
+    if let Some(task) = public_task {
+        task.abort();
+    }
+    if let Some(task) = discovery_task {
+        task.abort();
+    }
+    if let Some(task) = control_task {
+        task.abort();
+        let _ = task.await;
+    }
     if let Some(task) = stream_task {
         task.abort();
     }
@@ -971,6 +1514,162 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod scope_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn process_kill_replays_retirement_intent_unknown_wire_and_writer_commit() {
+        fn record(id: &str) -> Value {
+            json!({"identity":{"market_id":id,"condition_id":format!("condition-{id}"),
+                "outcomes":[{"token_id":format!("{id}1")},
+                            {"token_id":format!("{id}2")} ]}})
+        }
+        fn initial() -> source_scope_journal::State {
+            source_scope_journal::State {
+                schema_version:"marketcow.runtime-scope-state.v1".into(),
+                catalog_revision:"catalog".into(),
+                catalog_manifest_sha256:"manifest".into(), pool:"live".into(),
+                active_config:json!({"catalog_revision":"catalog",
+                    "configured_markets":[{"market_id":"1"}]}),
+                active_revision:1, catalog_source:Value::Null,
+                records:BTreeMap::from([("1".into(),record("1")),
+                    ("2".into(),record("2"))]),
+                acquisition_market_ids:BTreeSet::from(["1".into(),"2".into()]),
+                retiring_records:Default::default(),retirement_ticket:None,
+                retiring_acquisition_market_ids:None,
+            }
+        }
+        fn bindings() -> BTreeMap<String, String> {
+            BTreeMap::from([("11".into(),"1".into()),("12".into(),"1".into()),
+                ("21".into(),"2".into()),("22".into(),"2".into())])
+        }
+        if let Some(root) = std::env::var_os("MARKETCOW_CRASH_REPLAY_ROOT") {
+            let root = PathBuf::from(root);
+            let stage = std::env::var("MARKETCOW_CRASH_REPLAY_STAGE").unwrap();
+            let mut journal = source_scope_journal::Journal::open(
+                root.join("private/runtime-scope-state.json"),65536,initial()).unwrap();
+            journal.retire(&BTreeSet::from(["2".into()]),1).unwrap();
+            let _unanswered_wire = if stage == "wire_result_unknown" {
+                let (mut pool, mut receiver) =
+                    source_acquisition_shards::unanswered_retirement_fixture();
+                assert!(!pool.request_retire(&BTreeSet::from(["21".into(),"22".into()])).unwrap());
+                let command = receiver.try_recv().unwrap();
+                assert_eq!(command.token_ids,BTreeSet::from(["11".into(),"12".into()]));
+                // Deliberately retain the command and its receipt sender until
+                // SIGKILL: the process never learns whether venue removal won.
+                Some((pool, command))
+            } else { None };
+            if stage == "writer_committed" {
+                let mut writer = PreparedSourceWriter::open(&root,16384).unwrap();
+                writer.bind_catalog_tokens(bindings()).unwrap();
+                replay_pending_retirement(&mut writer,&mut journal.state).unwrap();
+                assert_eq!(writer.cold_market_record("2").unwrap(),Some(record("2")));
+            } else {
+                assert!(matches!(stage.as_str(),"intent_committed" | "wire_result_unknown"));
+            }
+            std::fs::write(root.join("kill-ready"),stage).unwrap();
+            // The parent sends SIGKILL: no Rust destructors, journal settle or
+            // graceful writer drain may run after the stage marker.
+            loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+        }
+        for stage in ["intent_committed","wire_result_unknown","writer_committed"] {
+            let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+            std::fs::create_dir(root.path().join("private")).unwrap();
+            std::fs::set_permissions(root.path().join("private"),
+                std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::create_dir(root.path().join("indexes")).unwrap();
+            std::fs::File::create(root.path().join("events.jsonl")).unwrap();
+            let db = rusqlite::Connection::open(
+                root.path().join("indexes/latest-state.sqlite3")).unwrap();
+            db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE gaps(resolved INTEGER NOT NULL);
+                CREATE TABLE books(token_id TEXT PRIMARY KEY,market_id TEXT,cursor INTEGER,
+                    payload_json BLOB,payload_sha256 TEXT);
+                CREATE TABLE book_confirmations(token_id TEXT PRIMARY KEY);
+                CREATE TABLE event_offsets(cursor INTEGER PRIMARY KEY,byte_offset INTEGER,
+                    byte_length INTEGER,event_id TEXT,market_id TEXT,token_id TEXT,line_sha256 TEXT);").unwrap();
+            for (key,value) in [("schema_version","marketcow.polymarket.state-index.v1"),
+                ("unresolved_gap_count","0"),("event_log_size","0"),
+                ("latest_cursor","0"),("catalog_revision","catalog"),
+                ("active_recovery_id","recovery")] {
+                db.execute("INSERT INTO metadata VALUES (?,?)",[key,value]).unwrap();
+            }
+            drop(db);
+            let mut writer = PreparedSourceWriter::open(root.path(),16384).unwrap();
+            writer.bind_catalog_tokens(bindings()).unwrap();
+            drop(writer);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("process_kill_replays_retirement_intent_unknown_wire_and_writer_commit")
+                .env("MARKETCOW_CRASH_REPLAY_ROOT",root.path())
+                .env("MARKETCOW_CRASH_REPLAY_STAGE",stage)
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now()+std::time::Duration::from_secs(10);
+            while !root.path().join("kill-ready").exists() {
+                assert!(std::time::Instant::now()<deadline,
+                    "child did not reach {stage}; status={:?}",child.try_wait().unwrap());
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            assert!(!child.wait().unwrap().success());
+            let path = root.path().join("private/runtime-scope-state.json");
+            let mut state = source_scope_journal::read(&path,65536).unwrap().unwrap();
+            assert_eq!(state.retirement_ticket,Some(1));
+            assert_eq!(state.retiring_records["2"],record("2"));
+            assert_eq!(state.restart_markets(true).unwrap().len(),1,
+                "a crashed retirement must not revive the old subscription");
+            let mut writer = PreparedSourceWriter::open(root.path(),16384).unwrap();
+            writer.bind_catalog_tokens(bindings()).unwrap();
+            let before = writer.cold_market_evidence("2").unwrap();
+            assert_eq!(before.is_some(),stage=="writer_committed");
+            replay_pending_retirement(&mut writer,&mut state).unwrap();
+            let after = writer.cold_market_evidence("2").unwrap();
+            assert!(after.is_some());
+            if let Some(before) = before { assert_eq!(after,Some(before)); }
+            assert_eq!(writer.cold_market_record("2").unwrap(),Some(record("2")));
+            let mut journal = source_scope_journal::Journal::open(path.clone(),65536,initial()).unwrap();
+            journal.commit(state).unwrap();
+            assert!(source_scope_journal::read(&path,65536).unwrap().unwrap()
+                .retiring_records.is_empty());
+        }
+    }
+
+    #[test]
+    fn managed_restart_read_only_source_smoke_when_requested() {
+        let Ok(root) = std::env::var("MARKETCOW_RESTART_SMOKE_ROOT") else { return };
+        let Ok(state_path) = std::env::var("MARKETCOW_RESTART_SMOKE_STATE") else { return };
+        let state = source_scope_journal::read(std::path::Path::new(&state_path), 134_217_728)
+            .unwrap().unwrap();
+        let hot = state.restart_markets(true).unwrap();
+        let hot_tokens: BTreeSet<String> = hot.iter()
+            .flat_map(|market| market.token_ids.iter().cloned()).collect();
+        let base = durable_bootstrap::bootstrap_managed(
+            root.into(), state.catalog_revision.clone(),
+            state.catalog_manifest_sha256.clone(),
+            state.records.values().cloned().collect(),
+            state.catalog_source.clone(), 134_217_728,
+            Some(state.active_config["active_scope_id"].as_str().unwrap().to_owned()),
+        ).unwrap();
+        let base = restrict_bootstrap_to_hot(base, &hot_tokens).unwrap();
+        assert_eq!(base["markets"].as_array().unwrap().len(), state.records.len());
+        assert!(base["books"].as_array().unwrap().iter().all(|book|
+            hot_tokens.contains(book["token_id"].as_str().unwrap())));
+        assert!(base["token_recoveries"].as_array().unwrap().iter().all(|recovery|
+            hot_tokens.contains(recovery["token_id"].as_str().unwrap())));
+    }
+
+    #[test]
+    fn managed_restart_keeps_cold_metadata_but_not_cold_book_freshness() {
+        let hot = BTreeSet::from(["hot-up".to_owned(), "hot-down".to_owned()]);
+        let base = json!({"markets":[{"identity":{"market_id":"hot"}},
+            {"identity":{"market_id":"cold"}}],
+            "books":[{"token_id":"hot-up"},{"token_id":"cold-up"}],
+            "gaps":[{"token_id":"cold-up"}],
+            "token_recoveries":[{"token_id":"cold-up"}]});
+        let filtered = restrict_bootstrap_to_hot(base, &hot).unwrap();
+        assert_eq!(filtered["markets"].as_array().unwrap().len(), 2);
+        assert_eq!(filtered["books"], json!([{"token_id":"hot-up"}]));
+        assert_eq!(filtered["gaps"], json!([]));
+        assert_eq!(filtered["token_recoveries"], json!([]));
+    }
 
     #[test]
     fn upstream_defaults_to_websocket_with_explicit_rest_option() {

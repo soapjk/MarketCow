@@ -46,7 +46,18 @@ impl Leases {
         !self.required || !self.leases.is_empty()
     }
     pub fn market_ids(&self) -> BTreeSet<String> {
-        self.leases.values().flat_map(|lease|lease.markets.iter().cloned()).collect()
+        self.leases
+            .values()
+            .flat_map(|lease| lease.markets.iter().cloned())
+            .collect()
+    }
+    pub fn lease_market_ids(&self, id: &str, now: Instant) -> Result<BTreeSet<String>> {
+        let lease = self
+            .leases
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("acquisition lease not found"))?;
+        ensure!(lease.expires > now, "acquisition lease expired");
+        Ok(lease.markets.clone())
     }
     pub fn acquire(
         &mut self,
@@ -56,24 +67,11 @@ impl Leases {
         eligible: &BTreeSet<String>,
         now: Instant,
     ) -> Result<()> {
-        ensure!(self.required, "acquisition leases are not enabled");
-        self.validate_ttl(ttl)?;
-        ensure!(
-            !markets.is_empty() && markets == *eligible,
-            "lease must bind the complete eligible market set"
-        );
+        self.validate_acquire(&id, ttl, &markets, eligible, now)?;
         if let Some(existing) = self.leases.get_mut(&id) {
-            ensure!(
-                existing.markets == markets,
-                "acquisition lease identity conflict"
-            );
             existing.expires = now + ttl;
             return Ok(());
         }
-        ensure!(
-            self.leases.len() < self.maximum,
-            "acquisition lease capacity exhausted"
-        );
         self.leases.insert(
             id,
             Lease {
@@ -81,6 +79,34 @@ impl Leases {
                 expires: now + ttl,
             },
         );
+        Ok(())
+    }
+    pub fn validate_acquire(
+        &self,
+        id: &str,
+        ttl: Duration,
+        markets: &BTreeSet<String>,
+        eligible: &BTreeSet<String>,
+        now: Instant,
+    ) -> Result<()> {
+        ensure!(self.required, "acquisition leases are not enabled");
+        self.validate_ttl(ttl)?;
+        ensure!(
+            !markets.is_empty() && markets.is_subset(eligible),
+            "lease markets must be a nonempty eligible subset"
+        );
+        if let Some(existing) = self.leases.get(id) {
+            ensure!(existing.expires > now, "acquisition lease expired");
+            ensure!(
+                existing.markets == *markets,
+                "acquisition lease identity conflict"
+            );
+        } else {
+            ensure!(
+                self.leases.len() < self.maximum,
+                "acquisition lease capacity exhausted"
+            );
+        }
         Ok(())
     }
     pub fn renew(&mut self, id: &str, ttl: Duration, now: Instant) -> Result<()> {
@@ -93,6 +119,81 @@ impl Leases {
         ensure!(lease.expires > now, "acquisition lease expired");
         lease.expires = now + ttl;
         Ok(())
+    }
+    /// Atomically change one component lease after the shared wire union has
+    /// been reconciled. The expected set is a CAS fence; other component
+    /// leases remain untouched and overlapping markets stay subscribed.
+    pub fn replace(
+        &mut self,
+        id: &str,
+        ttl: Duration,
+        expected_markets: &BTreeSet<String>,
+        markets: BTreeSet<String>,
+        eligible: &BTreeSet<String>,
+        now: Instant,
+    ) -> Result<()> {
+        self.validate_replace(id, ttl, expected_markets, &markets, eligible, now)?;
+        let lease = self
+            .leases
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("acquisition lease not found"))?;
+        lease.markets = markets;
+        lease.expires = now + ttl;
+        Ok(())
+    }
+    pub fn validate_replace(
+        &self,
+        id: &str,
+        ttl: Duration,
+        expected_markets: &BTreeSet<String>,
+        markets: &BTreeSet<String>,
+        eligible: &BTreeSet<String>,
+        now: Instant,
+    ) -> Result<()> {
+        ensure!(self.required, "acquisition leases are not enabled");
+        self.validate_ttl(ttl)?;
+        ensure!(
+            !markets.is_empty() && markets.is_subset(eligible),
+            "replacement lease markets must be an eligible subset"
+        );
+        let lease = self
+            .leases
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("acquisition lease not found"))?;
+        ensure!(lease.expires > now, "acquisition lease expired");
+        ensure!(
+            lease.markets == *expected_markets,
+            "acquisition lease replacement incumbent conflict"
+        );
+        Ok(())
+    }
+    pub fn union_after_replacement(
+        &self,
+        id: &str,
+        markets: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        ensure!(self.leases.contains_key(id), "acquisition lease not found");
+        Ok(self
+            .leases
+            .iter()
+            .flat_map(|(lease_id, lease)| {
+                if lease_id == id {
+                    markets.iter()
+                } else {
+                    lease.markets.iter()
+                }
+            })
+            .cloned()
+            .collect())
+    }
+    pub fn union_after_release(&self, id: &str) -> Result<BTreeSet<String>> {
+        ensure!(self.leases.contains_key(id), "acquisition lease not found");
+        Ok(self
+            .leases
+            .iter()
+            .filter(|(lease_id, _)| lease_id.as_str() != id)
+            .flat_map(|(_, lease)| lease.markets.iter().cloned())
+            .collect())
     }
     pub fn release(&mut self, id: &str) -> Result<()> {
         ensure!(self.required, "acquisition leases are not enabled");
@@ -113,6 +214,7 @@ impl Leases {
             "maximum_leases":self.maximum,"maximum_ttl_seconds":self.maximum_ttl.as_secs(),
             "eligible_market_ids":eligible,"leases":self.leases.iter().map(|(id,lease)|json!({
                 "lease_id":id,"market_count":lease.markets.len(),
+                "market_ids":lease.markets,
                 "remaining_milliseconds":lease.expires.saturating_duration_since(now).as_millis() as u64
             })).collect::<Vec<_>>()})
     }
@@ -172,5 +274,144 @@ mod tests {
         let mut leases = Leases::new(false, 0, Duration::ZERO).unwrap();
         assert!(leases.enabled());
         assert!(leases.release("missing").is_err());
+    }
+    #[test]
+    fn profile_rotation_replaces_the_complete_union_without_a_fourth_market() {
+        let now = Instant::now();
+        let old = BTreeSet::from(["retiring".into(), "current".into(), "next".into()]);
+        let new = BTreeSet::from(["current".into(), "next".into(), "new-next".into()]);
+        let mut leases = Leases::new(true, 1, Duration::from_secs(120)).unwrap();
+        leases
+            .acquire(
+                "btc5m-manager".into(),
+                Duration::from_secs(120),
+                old.clone(),
+                &old,
+                now,
+            )
+            .unwrap();
+        leases
+            .replace(
+                "btc5m-manager",
+                Duration::from_secs(120),
+                &old,
+                new.clone(),
+                &new,
+                now,
+            )
+            .unwrap();
+        assert_eq!(leases.market_ids(), new);
+        assert_eq!(leases.status(&new, now)["active_leases"], 1);
+        assert!(
+            leases
+                .replace(
+                    "btc5m-manager",
+                    Duration::from_secs(120),
+                    &old,
+                    old.clone(),
+                    &old,
+                    now
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn component_leases_form_a_deduplicated_union() {
+        let now = Instant::now();
+        let eligible = BTreeSet::from([
+            "base-1".into(),
+            "base-2".into(),
+            "btc-current".into(),
+            "btc-next".into(),
+            "btc-new-next".into(),
+        ]);
+        let mut leases = Leases::new(true, 4, Duration::from_secs(120)).unwrap();
+        leases
+            .acquire(
+                "paper".into(),
+                Duration::from_secs(120),
+                BTreeSet::from(["base-1".into(), "base-2".into()]),
+                &eligible,
+                now,
+            )
+            .unwrap();
+        let btc = BTreeSet::from(["btc-current".into(), "btc-next".into()]);
+        leases
+            .acquire(
+                "btc".into(),
+                Duration::from_secs(120),
+                btc.clone(),
+                &eligible,
+                now,
+            )
+            .unwrap();
+        assert_eq!(leases.market_ids().len(), 4);
+        let next = BTreeSet::from(["btc-next".into(), "btc-new-next".into()]);
+        leases
+            .validate_replace("btc", Duration::from_secs(120), &btc, &next, &eligible, now)
+            .unwrap();
+        assert_eq!(
+            leases.union_after_replacement("btc", &next).unwrap().len(),
+            4
+        );
+        leases
+            .replace("btc", Duration::from_secs(120), &btc, next, &eligible, now)
+            .unwrap();
+        assert_eq!(leases.union_after_release("paper").unwrap().len(), 2);
+    }
+    #[test]
+    fn freshness_scope_is_exactly_the_live_component_lease() {
+        let now = Instant::now();
+        let eligible = BTreeSet::from(["current".into(), "next".into(), "unrelated".into()]);
+        let owned = BTreeSet::from(["current".into(), "next".into()]);
+        let mut leases = Leases::new(true, 2, Duration::from_secs(120)).unwrap();
+        leases
+            .acquire(
+                "btc5m-manager".into(),
+                Duration::from_secs(120),
+                owned.clone(),
+                &eligible,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            leases.lease_market_ids("btc5m-manager", now).unwrap(),
+            owned
+        );
+        assert!(
+            leases
+                .lease_market_ids("btc5m-manager", now + Duration::from_secs(121))
+                .is_err()
+        );
+        assert!(leases.lease_market_ids("other", now).is_err());
+    }
+    #[test]
+    fn ten_thousand_rotations_do_not_accumulate_component_demand() {
+        let start = Instant::now();
+        let ttl = Duration::from_secs(120);
+        let mut leases = Leases::new(true, 2, ttl).unwrap();
+        let mut btc = BTreeSet::from(["btc-0".to_owned(), "btc-1".to_owned()]);
+        let shared = BTreeSet::from(["btc-0".to_owned()]);
+        leases.acquire("btc".into(), ttl, btc.clone(), &btc, start).unwrap();
+        leases.acquire("shared".into(), ttl, shared.clone(), &btc, start).unwrap();
+        for index in 1..=10_000 {
+            let now = start + Duration::from_secs(index);
+            leases.renew("shared", ttl, now).unwrap();
+            let next = BTreeSet::from([
+                format!("btc-{index}"), format!("btc-{}", index + 1),
+            ]);
+            let eligible = btc.union(&next).chain(shared.iter()).cloned().collect();
+            leases.replace("btc", ttl, &btc, next.clone(), &eligible, now).unwrap();
+            assert_eq!(leases.market_ids().len(), 3);
+            assert_eq!(leases.union_after_release("shared").unwrap(), next);
+            btc = next;
+        }
+        leases.release("shared").unwrap();
+        assert_eq!(leases.market_ids().len(), 2);
+        // A process restart starts with no lease objects, regardless of the
+        // previous process's historical admitted market identities.
+        let restarted = Leases::new(true, 2, ttl).unwrap();
+        assert!(!restarted.enabled());
+        assert!(restarted.market_ids().is_empty());
     }
 }

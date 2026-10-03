@@ -3025,7 +3025,12 @@ fn start_polymarket_live(
             }
         };
         'service: loop {
-            let (sender, mut receiver) = mpsc::channel(POLYMARKET_TRANSPORT_CHANNEL_CAPACITY);
+            let (sender, mut receiver) = marketcow_polymarket::transport_output(
+                POLYMARKET_TRANSPORT_CHANNEL_CAPACITY,
+                64 * 1024 * 1024,
+                8 * 1024 * 1024,
+            )
+            .expect("fixed transport queue budgets are valid");
             let (transport_shutdown_tx, transport_shutdown_rx) = watch::channel(false);
             let transport_tokens = live.token_ids.clone();
             let mut transport = tokio::spawn(async move {
@@ -3154,7 +3159,7 @@ fn start_polymarket_live(
                                 None => break 'service,
                             }
                         };
-                        match apply_polymarket_transport_frames(&state, frames).await {
+                        match apply_polymarket_transport_frames(&state, frames.into_frames()).await {
                             Ok(events) => {
                                 events_since_checkpoint += events;
                                 if events_since_checkpoint >= 50_000 {

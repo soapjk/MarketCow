@@ -126,3 +126,68 @@ def test_rejects_changed_archive(tmp_path):
     (root / "frames.jsonl").write_bytes(b"{}\n")
     with pytest.raises(ValueError, match="archive_integrity"):
         project_archive(root, tmp_path / "bad")
+
+
+def test_crossed_token_is_invalidated_while_other_token_continues(tmp_path):
+    frames = [
+        frame(
+            {
+                "event_type": "book",
+                "asset_id": "10",
+                "bids": [{"price": "0.4", "size": "2"}],
+                "asks": [{"price": "0.6", "size": "3"}],
+            }
+        ),
+        frame(
+            {
+                "event_type": "book",
+                "asset_id": "11",
+                "bids": [{"price": "0.3", "size": "4"}],
+                "asks": [{"price": "0.7", "size": "5"}],
+            }
+        ),
+        frame(
+            {
+                "event_type": "price_change",
+                "price_changes": [{"asset_id": "10", "side": "BUY", "price": "0.6", "size": "1"}],
+            },
+            "2026-09-12T00:00:01Z",
+        ),
+        frame(
+            {
+                "event_type": "price_change",
+                "price_changes": [{"asset_id": "11", "side": "BUY", "price": "0.35", "size": "2"}],
+            },
+            "2026-09-12T00:00:02Z",
+        ),
+        frame(
+            {
+                "event_type": "price_change",
+                "price_changes": [{"asset_id": "10", "side": "BUY", "price": "0.45", "size": "1"}],
+            },
+            "2026-09-12T00:00:03Z",
+        ),
+        frame(
+            {
+                "event_type": "book",
+                "asset_id": "10",
+                "bids": [{"price": "0.41", "size": "2"}],
+                "asks": [{"price": "0.61", "size": "3"}],
+            },
+            "2026-09-12T00:00:04Z",
+        ),
+    ]
+    output = tmp_path / "crossed"
+    report = project_archive(capture(tmp_path, frames), output)
+    rows = [json.loads(line) for line in (output / "l2.jsonl").read_bytes().splitlines()]
+
+    assert rows[2]["kind"] == "invalidation"
+    assert rows[2]["token_id"] == "10"
+    assert rows[2]["reason"] == "crossed_book"
+    assert rows[2]["available"] is False
+    assert rows[2]["input_ordinal"] == 3
+    assert rows[3]["kind"] == "delta" and rows[3]["token_id"] == "11"
+    assert rows[-1]["kind"] == "snapshot" and rows[-1]["token_id"] == "10"
+    assert rows[-1]["book_epoch"] > rows[2]["book_epoch"]
+    assert report["rejected_unapplied_changes"] == 1
+    assert report["complete_two_sided_market_ids"] == ["1"]

@@ -624,7 +624,10 @@ pub struct Projection {
     #[serde(default)]
     pub market_recovery_token_ids: BTreeMap<String, BTreeSet<String>>,
     pub unresolved_gaps: BTreeSet<String>,
-    pub recent_event_ids: VecDeque<String>,
+    // Cloning a projection for each book update must not allocate and copy
+    // up to 10,000 event-id strings. Arc<str> keeps the JSON/checkpoint wire
+    // representation unchanged while sharing immutable IDs across versions.
+    pub recent_event_ids: VecDeque<Arc<str>>,
     pub ready: bool,
     pub fail_closed_reason: Option<String>,
     pub published_at: DateTime<Utc>,
@@ -1287,6 +1290,9 @@ impl<T> BoundedClientQueue<T> {
 
 pub struct SingleWriter<L> {
     current: ArcSwap<Projection>,
+    // The checkpoint keeps FIFO order; this index makes the hot duplicate
+    // check independent of the 10,000-entry checkpoint window length.
+    recent_event_index: HashSet<Arc<str>>,
     log: L,
     enforce_source_freshness: bool,
 }
@@ -1295,6 +1301,7 @@ impl<L: DurableLog> SingleWriter<L> {
     pub fn new(scope_id: String, log: L) -> Self {
         Self {
             current: ArcSwap::from_pointee(Projection::bootstrap(scope_id)),
+            recent_event_index: HashSet::new(),
             log,
             enforce_source_freshness: true,
         }
@@ -1306,6 +1313,7 @@ impl<L: DurableLog> SingleWriter<L> {
     pub fn new_data_delivery(scope_id: String, log: L) -> Self {
         Self {
             current: ArcSwap::from_pointee(Projection::bootstrap(scope_id)),
+            recent_event_index: HashSet::new(),
             log,
             enforce_source_freshness: false,
         }
@@ -1327,8 +1335,10 @@ impl<L: DurableLog> SingleWriter<L> {
             return Err(CoreError::PersistedWatermarkMismatch);
         }
         projection.prune_stale_scope_gaps();
+        let recent_event_index = projection.recent_event_ids.iter().cloned().collect();
         Ok(Self {
             current: ArcSwap::from_pointee(projection),
+            recent_event_index,
             log,
             enforce_source_freshness: true,
         })
@@ -1359,13 +1369,9 @@ impl<L: DurableLog> SingleWriter<L> {
         let mut next = (*self.current.load_full()).clone();
         // A provider frame can contain many logical updates. Scan the bounded duplicate window
         // once instead of linearly scanning it for every event in the same batch.
-        let mut event_ids = next
-            .recent_event_ids
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
+        let mut event_ids = self.recent_event_index.clone();
         for event in &events {
-            if !event_ids.insert(event.event_id.clone()) {
+            if !event_ids.insert(Arc::from(event.event_id.as_str())) {
                 return Err(CoreError::DuplicateEvent(event.event_id.clone()));
             }
         }
@@ -1382,6 +1388,7 @@ impl<L: DurableLog> SingleWriter<L> {
         let final_projection = Arc::new(next);
         let publication_started = std::time::Instant::now();
         self.current.store(final_projection.clone());
+        self.recent_event_index = final_projection.recent_event_ids.iter().cloned().collect();
         let publication_latency_us = publication_started.elapsed().as_micros() as u64;
         Ok(persisted
             .into_iter()
@@ -1427,7 +1434,12 @@ impl<L: DurableLog> SingleWriter<L> {
         {
             return Err(CoreError::InvalidSourceEvidence);
         }
-        if validate_duplicate && next.recent_event_ids.contains(&event.event_id) {
+        if validate_duplicate
+            && next
+                .recent_event_ids
+                .iter()
+                .any(|id| id.as_ref() == event.event_id)
+        {
             return Err(CoreError::DuplicateEvent(event.event_id));
         }
         if event.cursor != next.cursor + 1 {
@@ -1487,9 +1499,21 @@ impl<L: DurableLog> SingleWriter<L> {
             });
         let atomic_delta_superseded_by_book =
             delayed_atomic_delta_superseded_by_book || queued_atomic_delta_superseded_by_refresh;
+        let best_bid_ask_superseded_by_book = event.normalizer_version
+            == "marketcow.polymarket.normalizer.v2"
+            && matches!(event.kind, EventKind::BestBidAsk { .. })
+            && next.books.get(event.kind.token_id()).is_some_and(|book| {
+                book.authoritative_refresh_received_at
+                    .is_some_and(|refresh_at| event.received_at < refresh_at)
+                    || book
+                        .source_observed_at
+                        .is_some_and(|book_at| event.source_observed_at < book_at)
+            });
+        let incremental_superseded_by_book =
+            atomic_delta_superseded_by_book || best_bid_ask_superseded_by_book;
         if !event.source.missing
             && (!event.source.delayed || !enforce_source_freshness)
-            && !atomic_delta_superseded_by_book
+            && !incremental_superseded_by_book
             && event.normalizer_version == "marketcow.polymarket.normalizer.v2"
             && let EventKind::AtomicDelta {
                 token_id,
@@ -1503,7 +1527,7 @@ impl<L: DurableLog> SingleWriter<L> {
                 book.replay_complete_atomic_changes(changes, best_bid.as_ref(), best_ask.as_ref());
         }
         if event.source.missing
-            || enforce_source_freshness && event.source.delayed && !atomic_delta_superseded_by_book
+            || enforce_source_freshness && event.source.delayed && !incremental_superseded_by_book
         {
             next.unresolved_gaps.insert(event.kind.token_id().into());
             applied = false;
@@ -1512,7 +1536,7 @@ impl<L: DurableLog> SingleWriter<L> {
             } else {
                 "source_data_delayed".into()
             });
-        } else if atomic_delta_superseded_by_book {
+        } else if incremental_superseded_by_book {
             // The frame is older than an already applied authoritative full book. This includes
             // WS frames queued while a periodic HTTP snapshot was in flight. Keep its durable
             // cursor/evidence, but do not mutate the newer projection or reopen the gap. The
@@ -2163,7 +2187,7 @@ impl<L: DurableLog> SingleWriter<L> {
         };
         next.persisted_cursor = event_cursor;
         next.recent_event_ids
-            .push_back(persisted.event.event_id.clone());
+            .push_back(Arc::from(persisted.event.event_id.as_str()));
         if next.recent_event_ids.len() > 10_000 {
             next.recent_event_ids.pop_front();
         }
@@ -2175,12 +2199,18 @@ impl<L: DurableLog> SingleWriter<L> {
         event: CanonicalEvent,
         validate_raw_payload: bool,
     ) -> Result<ApplyOutcome, CoreError> {
+        if self.recent_event_index.contains(event.event_id.as_str()) {
+            return Err(CoreError::DuplicateEvent(event.event_id));
+        }
         let previous = (*self.current.load_full()).clone();
+        let evicted_id = (previous.recent_event_ids.len() == 10_000)
+            .then(|| previous.recent_event_ids.front().cloned())
+            .flatten();
         let (next, persisted) = Self::evaluate_event(
             previous,
             event,
             validate_raw_payload,
-            true,
+            false,
             self.enforce_source_freshness,
         )?;
         let persistence_started = std::time::Instant::now();
@@ -2189,6 +2219,11 @@ impl<L: DurableLog> SingleWriter<L> {
         let published = Arc::new(next);
         let publication_started = std::time::Instant::now();
         self.current.store(published.clone());
+        if let Some(evicted_id) = evicted_id {
+            self.recent_event_index.remove(&evicted_id);
+        }
+        self.recent_event_index
+            .insert(Arc::from(persisted.event.event_id.as_str()));
         let publication_latency_us = publication_started.elapsed().as_micros() as u64;
         Ok(ApplyOutcome {
             projection: published,
@@ -2887,6 +2922,90 @@ mod tests {
     }
     fn levels(price: &str, quantity: &str) -> Vec<Level> {
         vec![Level::new(price, quantity).unwrap()]
+    }
+
+    #[test]
+    fn cloned_recent_ids_share_storage_without_changing_checkpoint_json() {
+        let mut projection = Projection::bootstrap("scope");
+        projection
+            .recent_event_ids
+            .push_back(Arc::from("event-sha-1"));
+        let cloned = projection.clone();
+        assert!(Arc::ptr_eq(
+            projection.recent_event_ids.front().unwrap(),
+            cloned.recent_event_ids.front().unwrap()
+        ));
+        let json = serde_json::to_value(&projection).unwrap();
+        assert_eq!(json["recent_event_ids"], serde_json::json!(["event-sha-1"]));
+        let decoded: Projection = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.hash(), projection.hash());
+    }
+
+    #[test]
+    fn resumed_duplicate_index_evicts_only_the_oldest_id() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+        let mut projection = Projection::bootstrap("scope");
+        projection.cursor = 10_000;
+        projection.persisted_cursor = 10_000;
+        projection.recent_event_ids = (1..=10_000)
+            .map(|n| Arc::<str>::from(format!("e-{n}")))
+            .collect();
+        let mut writer = SingleWriter::resume(projection, MemoryLog).unwrap();
+        let kind = || EventKind::NewMarket {
+            condition_id: "condition".into(),
+        };
+        let mut duplicate = event(10_001, kind());
+        duplicate.event_id = "e-10000".into();
+        assert!(matches!(
+            writer.apply(duplicate),
+            Err(CoreError::DuplicateEvent(_))
+        ));
+        assert_eq!(writer.projection().cursor, 10_000);
+        writer.apply(event(10_001, kind())).unwrap();
+        let mut evicted = event(10_002, kind());
+        evicted.event_id = "e-1".into();
+        writer.apply(evicted).unwrap();
+        assert_eq!(writer.projection().recent_event_ids.len(), 10_000);
+        assert_eq!(
+            writer
+                .projection()
+                .recent_event_ids
+                .front()
+                .unwrap()
+                .as_ref(),
+            "e-3"
+        );
+    }
+
+    #[test]
+    fn batch_updates_duplicate_index_for_subsequent_single_event() {
+        struct MemoryLog;
+        impl DurableLog for MemoryLog {
+            fn append(&mut self, _: &CanonicalEvent) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog);
+        let kind = || EventKind::NewMarket {
+            condition_id: "condition".into(),
+        };
+        let first = event(1, kind());
+        let mut second = event(2, kind());
+        second.raw_payload = first.raw_payload.clone();
+        second.source.raw_sha256 = first.source.raw_sha256.clone();
+        writer.apply_batch(vec![first, second]).unwrap();
+        let mut duplicate = event(3, kind());
+        duplicate.event_id = "e-2".into();
+        assert!(matches!(
+            writer.apply(duplicate),
+            Err(CoreError::DuplicateEvent(_))
+        ));
+        assert_eq!(writer.projection().cursor, 2);
     }
 
     #[test]

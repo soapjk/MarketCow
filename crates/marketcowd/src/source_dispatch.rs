@@ -1,12 +1,20 @@
 //! Bounded per-entity FIFO actors. CPU work is concurrent across entities;
 //! failures are results for that entity, never a global worker termination.
 use anyhow::{Result, ensure};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use tokio::sync::{Semaphore, mpsc};
 
 pub struct Completion<O> {
     pub entity: String,
     pub incarnation: u64,
+    /// Time the complete actor batch became available to the owner.
+    pub completed_at: std::time::Instant,
     pub result: Result<O>,
 }
 
@@ -18,11 +26,50 @@ pub struct Dispatcher<I, S, O> {
     process: Arc<dyn Fn(&mut S, I) -> Result<O> + Send + Sync>,
     obsolete: Arc<dyn Fn(&S, &I) -> bool + Send + Sync>,
     per_entity_capacity: usize,
-    incarnations: BTreeMap<String,u64>,
+    actor_batch: usize,
+    incarnations: BTreeMap<String, u64>,
     next_incarnation: u64,
+    waits: Arc<DispatchWaits>,
+}
+
+#[derive(Default)]
+struct WaitSample {
+    count: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+}
+
+impl WaitSample {
+    fn record(&self, elapsed: std::time::Duration) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.total_us.fetch_add(us, Ordering::Relaxed);
+        self.max_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    fn take(&self) -> serde_json::Value {
+        serde_json::json!({
+            "count":self.count.swap(0, Ordering::Relaxed),
+            "total_us":self.total_us.swap(0, Ordering::Relaxed),
+            "max_us":self.max_us.swap(0, Ordering::Relaxed),
+        })
+    }
+}
+
+#[derive(Default)]
+struct DispatchWaits {
+    output_reserve: WaitSample,
+    cpu_permit: WaitSample,
 }
 
 impl<I: Send + 'static, S: Send + 'static, O: Send + 'static> Dispatcher<I, S, O> {
+    pub fn take_wait_timing(&self) -> serde_json::Value {
+        serde_json::json!({
+            "output_reserve":self.waits.output_reserve.take(),
+            "cpu_permit":self.waits.cpu_permit.take(),
+        })
+    }
+
     pub fn start(
         states: BTreeMap<String, S>,
         per_entity_capacity: usize,
@@ -48,94 +95,172 @@ impl<I: Send + 'static, S: Send + 'static, O: Send + 'static> Dispatcher<I, S, O
         obsolete: impl Fn(&S, &I) -> bool + Send + Sync + 'static,
         process: impl Fn(&mut S, I) -> Result<O> + Send + Sync + 'static,
     ) -> Result<(Self, mpsc::Receiver<Completion<O>>)> {
+        Self::start_filtered_batched(
+            states,
+            per_entity_capacity,
+            cpu_workers,
+            output_capacity,
+            1,
+            obsolete,
+            process,
+        )
+    }
+
+    /// Like [`Self::start_filtered`], but drains a bounded number of already
+    /// queued inputs for one entity into one blocking CPU dispatch. Each item
+    /// still produces its own ordered completion and retains its own failure;
+    /// batching only removes scheduler and semaphore churn during bursts.
+    pub fn start_filtered_batched(
+        states: BTreeMap<String, S>,
+        per_entity_capacity: usize,
+        cpu_workers: usize,
+        output_capacity: usize,
+        actor_batch: usize,
+        obsolete: impl Fn(&S, &I) -> bool + Send + Sync + 'static,
+        process: impl Fn(&mut S, I) -> Result<O> + Send + Sync + 'static,
+    ) -> Result<(Self, mpsc::Receiver<Completion<O>>)> {
         ensure!(!states.is_empty() && states.len() <= 2048, "entity limit");
         ensure!(
-            (1..=64).contains(&per_entity_capacity),
+            (1..=4096).contains(&per_entity_capacity),
             "entity queue limit"
         );
         ensure!((1..=32).contains(&cpu_workers), "CPU worker limit");
         ensure!((1..=256).contains(&output_capacity), "output queue limit");
+        ensure!(
+            (1..=output_capacity).contains(&actor_batch),
+            "actor batch must fit output queue"
+        );
         let process = Arc::new(process);
         let obsolete = Arc::new(obsolete);
         let workers = Arc::new(Semaphore::new(cpu_workers));
         let (output, receive) = mpsc::channel(output_capacity);
-        let mut dispatcher=Self {queues:BTreeMap::new(),jobs:tokio::task::JoinSet::new(),workers,
-            output:Some(output),process,obsolete,per_entity_capacity,
-            incarnations:BTreeMap::new(),next_incarnation:1};
-        for (entity,state) in states {dispatcher.add_entity(entity,state)?;}
-        Ok((dispatcher,receive))
+        let mut dispatcher = Self {
+            queues: BTreeMap::new(),
+            jobs: tokio::task::JoinSet::new(),
+            workers,
+            output: Some(output),
+            process,
+            obsolete,
+            per_entity_capacity,
+            actor_batch,
+            incarnations: BTreeMap::new(),
+            next_incarnation: 1,
+            waits: Arc::new(DispatchWaits::default()),
+        };
+        for (entity, state) in states {
+            dispatcher.add_entity(entity, state)?;
+        }
+        Ok((dispatcher, receive))
     }
 
     /// Add an admitted actor without restarting retained actors or replacing
     /// the shared CPU/output budgets. Retiring tasks also count toward the cap.
-    pub fn add_entity(&mut self, entity:String, mut state:S)->Result<()> {
-        while let Some(result)=self.jobs.try_join_next() {result?;}
-        ensure!(!entity.is_empty()&&!self.queues.contains_key(&entity),"duplicate/empty actor");
-        ensure!(self.jobs.len()<2048,"active and retiring actor limit");
-        let output=self.output.as_ref().ok_or_else(||anyhow::anyhow!("dispatcher closed"))?.clone();
-        let incarnation=self.next_incarnation;
-        self.next_incarnation=incarnation.checked_add(1).ok_or_else(||anyhow::anyhow!("actor identity exhausted"))?;
-        self.incarnations.insert(entity.clone(),incarnation);
-        let (send,mut input)=mpsc::channel(self.per_entity_capacity);
-        self.queues.insert(entity.clone(),send);
-        let process=self.process.clone();
-        let obsolete=self.obsolete.clone();
-        let workers=self.workers.clone();
+    pub fn add_entity(&mut self, entity: String, mut state: S) -> Result<()> {
+        while let Some(result) = self.jobs.try_join_next() {
+            result?;
+        }
+        ensure!(
+            !entity.is_empty() && !self.queues.contains_key(&entity),
+            "duplicate/empty actor"
+        );
+        ensure!(self.jobs.len() < 2048, "active and retiring actor limit");
+        let output = self
+            .output
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("dispatcher closed"))?
+            .clone();
+        let incarnation = self.next_incarnation;
+        self.next_incarnation = incarnation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("actor identity exhausted"))?;
+        self.incarnations.insert(entity.clone(), incarnation);
+        let (send, mut input) = mpsc::channel(self.per_entity_capacity);
+        self.queues.insert(entity.clone(), send);
+        let process = self.process.clone();
+        let obsolete = self.obsolete.clone();
+        let workers = self.workers.clone();
+        let waits = self.waits.clone();
+        let actor_batch = self.actor_batch;
         self.jobs.spawn(async move {
-                while let Some(item) = input.recv().await {
-                    // Only caller-proven fenced work can bypass execution.
-                    if obsolete(&state, &item) {
-                        continue;
+            while let Some(first) = input.recv().await {
+                let mut items = Vec::with_capacity(actor_batch);
+                items.push(first);
+                while items.len() < actor_batch {
+                    match input.try_recv() {
+                        Ok(item) => items.push(item),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
                     }
-                    // Reserve bounded result capacity before allocating a result.
-                    let Ok(slot) = output.reserve().await else {
-                        break;
-                    };
-                    if obsolete(&state, &item) {
-                        continue;
-                    }
-                    let Ok(permit) = workers.clone().acquire_owned().await else {
-                        break;
-                    };
-                    let process = process.clone();
-                    let processed = tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        let result = process(&mut state, item);
-                        (state, result)
-                    })
-                    .await;
-                    match processed {
-                        Ok((next, result)) => {
-                            state = next;
+                }
+                // Only caller-proven fenced work can bypass execution. Check
+                // before reserving output and again afterwards because an
+                // invalidation may race the bounded wait for capacity.
+                items.retain(|item| !obsolete(&state, item));
+                if items.is_empty() {
+                    continue;
+                }
+                let reserve_started = std::time::Instant::now();
+                let Ok(slots) = output.reserve_many(items.len()).await else {
+                    break;
+                };
+                waits.output_reserve.record(reserve_started.elapsed());
+                items.retain(|item| !obsolete(&state, item));
+                if items.is_empty() {
+                    continue;
+                }
+                let permit_started = std::time::Instant::now();
+                let Ok(permit) = workers.clone().acquire_owned().await else {
+                    break;
+                };
+                waits.cpu_permit.record(permit_started.elapsed());
+                let process = process.clone();
+                let processed = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let results = items
+                        .into_iter()
+                        .map(|item| process(&mut state, item))
+                        .collect::<Vec<_>>();
+                    (state, results)
+                })
+                .await;
+                match processed {
+                    Ok((next, results)) => {
+                        state = next;
+                        for (slot, result) in slots.zip(results) {
                             slot.send(Completion {
                                 entity: entity.clone(),
                                 incarnation,
+                                completed_at: std::time::Instant::now(),
                                 result,
                             });
                         }
-                        Err(error) => {
+                    }
+                    Err(error) => {
+                        if let Some(slot) = slots.into_iter().next() {
                             slot.send(Completion {
                                 entity: entity.clone(),
                                 incarnation,
+                                completed_at: std::time::Instant::now(),
                                 result: Err(error.into()),
                             });
-                            break; // Only this actor lost its state; others remain alive.
                         }
+                        break; // Only this actor lost its state; others remain alive.
                     }
                 }
+            }
         });
         Ok(())
     }
 
     /// Caller must fence old completions BEFORE retirement. Closing admission
     /// drains bounded queued work; it never kills shared workers or other actors.
-    pub fn remove_entity(&mut self, entity:&str)->bool {
+    pub fn remove_entity(&mut self, entity: &str) -> bool {
         self.incarnations.remove(entity);
         self.queues.remove(entity).is_some()
     }
 
-    pub fn is_current(&self, completion:&Completion<O>)->bool {
-        self.incarnations.get(&completion.entity)==Some(&completion.incarnation)
+    pub fn is_current(&self, completion: &Completion<O>) -> bool {
+        self.incarnations.get(&completion.entity) == Some(&completion.incarnation)
     }
 
     /// Full/unknown queues return ownership to the caller for explicit entity
@@ -153,15 +278,20 @@ impl<I: Send + 'static, S: Send + 'static, O: Send + 'static> Dispatcher<I, S, O
 
     /// Diagnostic snapshot; waiting actors holding one input are not counted
     /// as queued. CPU permits bound admitted blocking work, not CPU utilization.
-    pub fn occupancy(&self) -> (usize, usize, usize) {
+    pub fn occupancy(&self) -> (usize, usize, usize, usize) {
         let queued = self
             .queues
             .values()
             .map(|q| q.max_capacity() - q.capacity());
+        let output_used = self
+            .output
+            .as_ref()
+            .map_or(0, |q| q.max_capacity() - q.capacity());
         (
             queued.clone().sum(),
             queued.max().unwrap_or(0),
             self.workers.available_permits(),
+            output_used,
         )
     }
 
@@ -187,40 +317,98 @@ mod tests {
 
     #[tokio::test]
     async fn add_remove_keeps_retained_actor_state_and_budgets() {
-        let (mut d,mut rx)=Dispatcher::start([("a".into(),0_usize)].into(),2,2,4,
-            |state,item:usize|{*state+=item;Ok(*state)}).unwrap();
-        d.try_submit("a",1).unwrap();
-        assert_eq!(rx.recv().await.unwrap().result.unwrap(),1);
-        d.add_entity("b".into(),10).unwrap();
-        assert!(d.add_entity("a".into(),999).is_err());
-        d.try_submit("b",2).unwrap();
-        assert_eq!(rx.recv().await.unwrap().result.unwrap(),12);
+        let (mut d, mut rx) = Dispatcher::start(
+            [("a".into(), 0_usize)].into(),
+            2,
+            2,
+            4,
+            |state, item: usize| {
+                *state += item;
+                Ok(*state)
+            },
+        )
+        .unwrap();
+        d.try_submit("a", 1).unwrap();
+        assert_eq!(rx.recv().await.unwrap().result.unwrap(), 1);
+        d.add_entity("b".into(), 10).unwrap();
+        assert!(d.add_entity("a".into(), 999).is_err());
+        d.try_submit("b", 2).unwrap();
+        assert_eq!(rx.recv().await.unwrap().result.unwrap(), 12);
         assert!(d.remove_entity("b"));
-        assert_eq!(d.try_submit("b",3),Err(3));
-        d.try_submit("a",4).unwrap();
-        assert_eq!(rx.recv().await.unwrap().result.unwrap(),5);
-        assert!(d.workers.available_permits()<=2);
+        assert_eq!(d.try_submit("b", 3), Err(3));
+        d.try_submit("a", 4).unwrap();
+        assert_eq!(rx.recv().await.unwrap().result.unwrap(), 5);
+        let timing = d.take_wait_timing();
+        assert_eq!(timing["output_reserve"]["count"], 3);
+        assert_eq!(timing["cpu_permit"]["count"], 3);
+        assert_eq!(d.take_wait_timing()["output_reserve"]["count"], 0);
+        assert!(d.workers.available_permits() <= 2);
         d.close();
-        assert!(d.add_entity("c".into(),0).is_err());
+        assert!(d.add_entity("c".into(), 0).is_err());
         d.join().await;
         assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
     async fn retired_completion_cannot_land_after_same_market_readded() {
-        let (mut d,mut rx)=Dispatcher::start([("a".into(),())].into(),2,2,4,
-            |_,item:usize|Ok(item)).unwrap();
-        d.try_submit("a",1).unwrap();
-        let old=rx.recv().await.unwrap();
+        let (mut d, mut rx) =
+            Dispatcher::start([("a".into(), ())].into(), 2, 2, 4, |_, item: usize| {
+                Ok(item)
+            })
+            .unwrap();
+        d.try_submit("a", 1).unwrap();
+        let old = rx.recv().await.unwrap();
         assert!(d.is_current(&old));
         assert!(d.remove_entity("a"));
-        d.add_entity("a".into(),()).unwrap();
+        d.add_entity("a".into(), ()).unwrap();
         assert!(!d.is_current(&old));
-        d.try_submit("a",2).unwrap();
-        let new=rx.recv().await.unwrap();
+        d.try_submit("a", 2).unwrap();
+        let new = rx.recv().await.unwrap();
         assert!(d.is_current(&new));
-        assert_ne!(old.incarnation,new.incarnation);
-        d.close();d.join().await;
+        assert_ne!(old.incarnation, new.incarnation);
+        d.close();
+        d.join().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_actor_batch_preserves_per_item_fifo_and_failures() {
+        let (mut dispatch, mut output) = Dispatcher::start_filtered_batched(
+            [("a".into(), 0_i64), ("b".into(), 100_i64)].into(),
+            8,
+            2,
+            8,
+            4,
+            |_, _| false,
+            |state, item: i64| {
+                if item < 0 {
+                    anyhow::bail!("item rejected");
+                }
+                *state += item;
+                Ok(*state)
+            },
+        )
+        .unwrap();
+        for item in [1, 2, -1, 3] {
+            dispatch.try_submit("a", item).unwrap();
+        }
+        dispatch.try_submit("b", 7).unwrap();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for _ in 0..5 {
+            let completion = output.recv().await.unwrap();
+            if completion.entity == "a" {
+                a.push(completion.result.map_err(|error| error.to_string()));
+            } else {
+                b.push(completion.result.map_err(|error| error.to_string()));
+            }
+        }
+        assert_eq!(a[0], Ok(1));
+        assert_eq!(a[1], Ok(3));
+        assert!(a[2].as_ref().unwrap_err().contains("item rejected"));
+        assert_eq!(a[3], Ok(6));
+        assert_eq!(b, vec![Ok(107)]);
+        dispatch.close();
+        dispatch.join().await;
     }
 
     // Diagnostic reproduction: input slots can reject a burst before any CPU
@@ -229,11 +417,15 @@ mod tests {
     async fn burst_rejects_with_all_eight_cpu_permits_idle() {
         let (mut dispatch, mut output) = Dispatcher::start(
             [("a".into(), ()), ("b".into(), ())].into(),
-            2, 8, 16, |_, item: usize| Ok(item),
-        ).unwrap();
+            2,
+            8,
+            16,
+            |_, item: usize| Ok(item),
+        )
+        .unwrap();
         dispatch.try_submit("a", 1).unwrap();
         dispatch.try_submit("a", 2).unwrap();
-        assert_eq!(dispatch.occupancy(), (2, 2, 8));
+        assert_eq!(dispatch.occupancy(), (2, 2, 8, 0));
         assert_eq!(dispatch.try_submit("a", 3), Err(3));
         dispatch.try_submit("b", 4).unwrap();
         dispatch.close();
@@ -241,8 +433,11 @@ mod tests {
         let mut b = Vec::new();
         for _ in 0..3 {
             let item = output.recv().await.unwrap();
-            if item.entity == "a" { a.push(item.result.unwrap()); }
-            else { b.push(item.result.unwrap()); }
+            if item.entity == "a" {
+                a.push(item.result.unwrap());
+            } else {
+                b.push(item.result.unwrap());
+            }
         }
         assert_eq!(a, [1, 2]);
         assert_eq!(b, [4]);

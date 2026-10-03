@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "marketcow.polymarket.btc-5m-event.v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "type", "epoch", "publisher_cursor", "durability"
+  ],
+  "properties": {
+    "schema_version": { "const": "marketcow.polymarket.btc-5m-event.v2" },
+    "type": {
+      "enum": [
+        "book_snapshot", "book_change", "last_trade", "source_gap",
+        "recovery_started", "recovery_completed", "book_confirmations"
+      ]
+    },
+    "epoch": { "type": "string", "minLength": 1 },
+    "publisher_cursor": { "type": "integer", "minimum": 0 },
+    "confirmation_sequence": { "type": "integer", "minimum": 1 },
+    "source_event_cursor": { "type": ["integer", "null"], "minimum": 0 },
+    "source_event_type": { "type": "string", "minLength": 1 },
+    "market_id": { "type": "string", "minLength": 1 },
+    "token_id": { "type": "string", "minLength": 1 },
+    "availability": {
+      "enum": ["authoritative_snapshot", "unchanged", "unavailable"]
+    },
+    "payload_semantics": {
+      "enum": [
+        "complete_post_state", "control_record",
+        "ordered_depth_delta_with_complete_post_state_commitment",
+        "last_trade_with_unchanged_depth_commitment",
+        "freshness_confirmation_without_depth_or_publisher_cursor_mutation"
+      ]
+    },
+    "durability": {
+      "enum": [
+        "published_not_necessarily_durable",
+        "memory_confirmation_not_persisted"
+      ]
+    },
+    "confirmations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "items": { "$ref": "#/$defs/confirmation" }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version", "source_schema_version", "publication_event_type",
+        "raw_source_event_type", "event_id", "book_epoch", "sequence",
+        "exchange_at", "received_at", "canonical_payload_sha256",
+        "raw_payload_sha256", "applied", "fail_closed_reason", "gaps"
+      ],
+      "properties": {
+        "contract_version": { "type": "string", "minLength": 1 },
+        "source_schema_version": { "type": "string", "minLength": 1 },
+        "publication_event_type": { "type": "string", "minLength": 1 },
+        "raw_source_event_type": { "type": "string", "minLength": 1 },
+        "event_id": { "$ref": "#/$defs/hash" },
+        "book_epoch": { "type": ["string", "null"] },
+        "sequence": { "type": ["integer", "null"], "minimum": 0 },
+        "exchange_at": { "type": ["string", "null"] },
+        "received_at": { "type": "string", "minLength": 1 },
+        "canonical_payload_sha256": { "$ref": "#/$defs/hash" },
+        "raw_payload_sha256": { "$ref": "#/$defs/hash" },
+        "applied": { "type": "boolean" },
+        "fail_closed_reason": { "type": ["string", "null"] },
+        "gaps": { "type": "array", "items": { "type": "object" } },
+        "canonical_payload": { "type": "object" },
+        "delta": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["changes"],
+          "properties": {
+            "changes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["asset_id", "side", "price", "size"],
+                "properties": {
+                  "asset_id": { "type": "string", "minLength": 1 },
+                  "side": { "enum": ["BUY", "SELL"] },
+                  "price": { "type": "string", "minLength": 1 },
+                  "size": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "trade": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["price", "exchange_at", "received_at"],
+          "properties": {
+            "price": { "type": "string", "minLength": 1 },
+            "exchange_at": { "type": ["string", "null"] },
+            "received_at": { "type": "string", "minLength": 1 }
+          }
+        },
+        "post_state": { "$ref": "#/$defs/post_state" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "book_confirmations" } } },
+      "then": {
+        "required": ["confirmation_sequence", "payload_semantics", "confirmations"],
+        "properties": {
+          "payload_semantics": {
+            "const": "freshness_confirmation_without_depth_or_publisher_cursor_mutation"
+          },
+          "durability": { "const": "memory_confirmation_not_persisted" }
+        },
+        "not": { "anyOf": [
+          { "required": ["payload"] },
+          { "required": ["source_event_cursor"] },
+          { "required": ["market_id"] },
+          { "required": ["token_id"] }
+        ] }
+      },
+      "else": {
+        "required": [
+          "source_event_cursor", "source_event_type", "market_id", "token_id",
+          "availability", "payload_semantics", "payload"
+        ],
+        "properties": {
+          "durability": { "const": "published_not_necessarily_durable" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "book_change" } } },
+      "then": {
+        "properties": {
+          "payload_semantics": {
+            "const": "ordered_depth_delta_with_complete_post_state_commitment"
+          },
+          "payload": {
+            "required": ["delta", "post_state"],
+            "not": { "required": ["canonical_payload"] }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "last_trade" } } },
+      "then": {
+        "properties": {
+          "payload_semantics": {
+            "const": "last_trade_with_unchanged_depth_commitment"
+          },
+          "payload": {
+            "required": ["trade", "post_state"],
+            "not": { "required": ["canonical_payload"] }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "book_snapshot" } } },
+      "then": {
+        "properties": {
+          "payload_semantics": { "const": "complete_post_state" },
+          "payload": { "required": ["canonical_payload"] }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "confirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "token_id", "condition_id", "book_epoch", "book_sequence",
+        "state_checksum", "book_received_at", "confirmed_at",
+        "confirmation_source", "confirmation_evidence_sha256"
+      ],
+      "properties": {
+        "token_id": { "type": "string", "minLength": 1 },
+        "condition_id": { "type": "string", "pattern": "^0x[0-9a-f]{64}$" },
+        "book_epoch": { "type": "string", "minLength": 1 },
+        "book_sequence": { "type": "integer", "minimum": 0 },
+        "state_checksum": { "$ref": "#/$defs/hash" },
+        "book_received_at": { "type": "string", "format": "date-time" },
+        "confirmed_at": { "type": "string", "format": "date-time" },
+        "confirmation_source": { "type": "string", "minLength": 1 },
+        "confirmation_evidence_sha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "post_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "token_id", "condition_id", "book_epoch", "sequence",
+        "sequence_semantics", "exchange_at", "received_at", "tick_version",
+        "tick_size", "last_trade_price", "state_checksum", "source_hash",
+        "canonical_book_sha256"
+      ],
+      "properties": {
+        "token_id": { "type": "string", "minLength": 1 },
+        "condition_id": { "type": "string", "pattern": "^0x[0-9a-f]{64}$" },
+        "book_epoch": { "type": "string", "minLength": 1 },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "sequence_semantics": { "const": "deterministic_normalized" },
+        "exchange_at": { "type": ["string", "null"] },
+        "received_at": { "type": "string", "minLength": 1 },
+        "tick_version": { "$ref": "#/$defs/hash" },
+        "tick_size": { "type": "string", "minLength": 1 },
+        "last_trade_price": { "type": ["string", "null"] },
+        "state_checksum": { "$ref": "#/$defs/hash" },
+        "source_hash": { "$ref": "#/$defs/hash" },
+        "canonical_book_sha256": { "$ref": "#/$defs/hash" }
+      }
+    }
+  }
+}

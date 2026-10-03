@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     net::SocketAddr,
@@ -53,7 +53,10 @@ pub(crate) fn bootstrap(root: PathBuf, plan_path: PathBuf, sha: &str, cap: usize
         "catalog manifest changed"
     );
     let scope: Value = serde_json::from_slice(&fs::read(root.join("scope-runtime.json"))?)?;
-    ensure!(plan.scope_id.is_some() && scope["scope_id"] == json!(plan.scope_id), "scope changed");
+    ensure!(
+        plan.scope_id.is_some() && scope["scope_id"] == json!(plan.scope_id),
+        "scope changed"
+    );
     let bridge = Bridge {
         args: Args {
             root: fs::canonicalize(root)?,
@@ -72,21 +75,66 @@ pub(crate) fn bootstrap(root: PathBuf, plan_path: PathBuf, sha: &str, cap: usize
 
 /// Explicit unscoped Discovery startup. Reuses bounded SQLite recovery, not a
 /// scoped runtime or an online disk bridge. No scope-runtime file is invented.
-pub(crate) fn bootstrap_discovery(root:PathBuf,catalog_revision:String,catalog_manifest_sha256:String,
-    markets:Vec<Value>,catalog_source:Value,cap:usize)->Result<Value> {
-    bootstrap_managed(root,catalog_revision,catalog_manifest_sha256,markets,catalog_source,cap,None)
+pub(crate) fn bootstrap_discovery(
+    root: PathBuf,
+    catalog_revision: String,
+    catalog_manifest_sha256: String,
+    markets: Vec<Value>,
+    catalog_source: Value,
+    cap: usize,
+) -> Result<Value> {
+    bootstrap_managed(
+        root,
+        catalog_revision,
+        catalog_manifest_sha256,
+        markets,
+        catalog_source,
+        cap,
+        None,
+    )
 }
 
 /// Restart from the verified control journal. Live must retain its actually
 /// installed scope identity; Discovery deliberately has no Live scope.
-pub(crate) fn bootstrap_managed(root:PathBuf,catalog_revision:String,catalog_manifest_sha256:String,
-    markets:Vec<Value>,catalog_source:Value,cap:usize,scope_id:Option<String>)->Result<Value> {
-    ensure!(!markets.is_empty()&&markets.len()<=MAX_DEPENDENCY_MARKETS,"Discovery seed market bounds");
-    ensure!(hex::encode(Sha256::digest(fs::read(root.join("catalog.json"))?))==catalog_manifest_sha256,"Discovery catalog manifest changed");
-    let bridge=Bridge{args:Args{root:fs::canonicalize(root)?,plan:PathBuf::new(),plan_sha256:String::new(),
-        listen:"127.0.0.1:1".parse()?,maximum_frame_bytes:cap,maximum_clients:1,poll_ms:1},
-        plan:Plan{schema_version:"marketcow.polymarket.discovery-public-seed.v1".into(),catalog_revision,
-            scope_id,catalog_manifest_sha256,markets,catalog_source},permits:Arc::new(Semaphore::new(1))};
+pub(crate) fn bootstrap_managed(
+    root: PathBuf,
+    catalog_revision: String,
+    catalog_manifest_sha256: String,
+    markets: Vec<Value>,
+    catalog_source: Value,
+    cap: usize,
+    scope_id: Option<String>,
+) -> Result<Value> {
+    ensure!(
+        !markets.is_empty()
+            && markets.len() <= marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES / 2,
+        "managed cold metadata market bounds"
+    );
+    ensure!(
+        hex::encode(Sha256::digest(fs::read(root.join("catalog.json"))?))
+            == catalog_manifest_sha256,
+        "Discovery catalog manifest changed"
+    );
+    let bridge = Bridge {
+        args: Args {
+            root: fs::canonicalize(root)?,
+            plan: PathBuf::new(),
+            plan_sha256: String::new(),
+            listen: "127.0.0.1:1".parse()?,
+            maximum_frame_bytes: cap,
+            maximum_clients: 1,
+            poll_ms: 1,
+        },
+        plan: Plan {
+            schema_version: "marketcow.polymarket.discovery-public-seed.v1".into(),
+            catalog_revision,
+            scope_id,
+            catalog_manifest_sha256,
+            markets,
+            catalog_source,
+        },
+        permits: Arc::new(Semaphore::new(1)),
+    };
     Ok(serde_json::from_str(&bridge.snapshot()?.0)?)
 }
 
@@ -144,23 +192,28 @@ fn effective_recoveries(
     recoveries: BTreeMap<String, Value>,
 ) -> Result<BTreeMap<String, Value>> {
     let mut terminal = BTreeMap::new();
-    let mut rows = db.prepare("SELECT market_id,payload_json,payload_sha256 FROM market_lifecycle")?;
+    let mut rows =
+        db.prepare("SELECT market_id,payload_json,payload_sha256 FROM market_lifecycle")?;
     let mut query = rows.query([])?;
     while let Some(row) = query.next()? {
         let market: String = row.get(0)?;
         let body: Vec<u8> = row.get(1)?;
         let sha: String = row.get(2)?;
-        ensure!(hex::encode(Sha256::digest(&body)) == sha, "terminal lifecycle hash mismatch");
+        ensure!(
+            hex::encode(Sha256::digest(&body)) == sha,
+            "terminal lifecycle hash mismatch"
+        );
         let model: Value = serde_json::from_slice(&body)?;
-        if matches!(model["lifecycle_state"].as_str(), Some("closed" | "resolved")) {
+        if matches!(
+            model["lifecycle_state"].as_str(),
+            Some("closed" | "resolved")
+        ) {
             terminal.insert(market, model);
         }
     }
     let mut result = BTreeMap::new();
     for (token, recovery) in recoveries {
-        let market = recovery["market_id"]
-            .as_str()
-            .context("recovery market")?;
+        let market = recovery["market_id"].as_str().context("recovery market")?;
         if !terminal.contains_key(market) {
             result.insert(token, recovery);
         }
@@ -210,21 +263,32 @@ impl Bridge {
     fn snapshot(&self) -> Result<(String, u64)> {
         let db = self.database()?;
         let (cursor, values) = self.boundary(&db)?;
+        let scoped_markets: BTreeSet<String> = self.plan.markets.iter()
+            .map(|record| record["identity"]["market_id"].as_str()
+                .map(str::to_owned).context("snapshot scoped market"))
+            .collect::<Result<_>>()?;
+        let scoped_tokens: BTreeSet<String> = self.plan.markets.iter()
+            .flat_map(|record| record["identity"]["outcomes"].as_array().into_iter().flatten())
+            .map(|outcome| outcome["token_id"].as_str()
+                .map(str::to_owned).context("snapshot scoped token"))
+            .collect::<Result<_>>()?;
         let mut books = Vec::new();
         let mut bytes = 0usize;
         let mut statement =
-            db.prepare("SELECT cursor,payload_json,payload_sha256 FROM books ORDER BY token_id")?;
+            db.prepare("SELECT token_id,cursor,payload_json,payload_sha256 FROM books ORDER BY token_id")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            let at: i64 = row.get(0)?;
+            let token: String = row.get(0)?;
+            if !scoped_tokens.contains(&token) { continue; }
+            let at: i64 = row.get(1)?;
             ensure!(u64::try_from(at)? <= cursor, "future book");
-            let body: Vec<u8> = row.get(1)?;
+            let body: Vec<u8> = row.get(2)?;
             bytes = bytes.checked_add(body.len()).context("byte overflow")?;
             ensure!(
                 bytes <= self.args.maximum_frame_bytes && books.len() < MAX_SCOPED_TOKEN_IDENTITIES,
                 "snapshot budget exceeded"
             );
-            let expected: String = row.get(2)?;
+            let expected: String = row.get(3)?;
             ensure!(
                 hex::encode(Sha256::digest(&body)) == expected,
                 "book hash mismatch"
@@ -259,6 +323,7 @@ impl Bridge {
                 "terminal market budget exceeded"
             );
             let id: String = row.get(0)?;
+            if !scoped_markets.contains(&id) { continue; }
             let at: i64 = row.get(1)?;
             let body: Vec<u8> = row.get(2)?;
             let sha: String = row.get(3)?;
@@ -281,7 +346,7 @@ impl Bridge {
         let token_recoveries = effective_recoveries(
             &db,
             marketcow_runtime::discovery_source::load_token_recoveries(&db)?,
-        )?;
+        )?.into_iter().filter(|(token, _)| scoped_tokens.contains(token)).collect::<BTreeMap<_, _>>();
         let payload = json!({"schema_version":SCHEMA,"type":"state", "catalog_revision":self.plan.catalog_revision,
             "scope_id":self.plan.scope_id,"catalog_source":self.plan.catalog_source,
             "latest_cursor":cursor,"persisted_cursor":cursor,"persistence_queue_depth":0,
@@ -470,7 +535,10 @@ async fn main() -> Result<()> {
         "catalog manifest changed"
     );
     let scope: Value = serde_json::from_slice(&fs::read(args.root.join("scope-runtime.json"))?)?;
-    ensure!(plan.scope_id.is_some() && scope["scope_id"] == json!(plan.scope_id), "scope changed");
+    ensure!(
+        plan.scope_id.is_some() && scope["scope_id"] == json!(plan.scope_id),
+        "scope changed"
+    );
     let listen = args.listen;
     let permits = Arc::new(Semaphore::new(args.maximum_clients));
     let bridge = Arc::new(Bridge {
@@ -532,11 +600,39 @@ mod tests {
         fs::write(root.join("catalog.json"), b"{}").unwrap();
         let manifest = hex::encode(Sha256::digest(b"{}"));
         for scope in [Some("new-live-scope".to_owned()), None] {
-            let base = bootstrap_managed(root.clone(), "catalog".into(), manifest.clone(),
-                vec![json!({"identity":{"market_id":"1"}})],json!({}),8192,scope.clone()).unwrap();
+            let base = bootstrap_managed(
+                root.clone(),
+                "catalog".into(),
+                manifest.clone(),
+                vec![json!({"identity":{"market_id":"1"}})],
+                json!({}),
+                8192,
+                scope.clone(),
+            )
+            .unwrap();
             assert_eq!(base["scope_id"], json!(scope));
             assert_eq!(base["latest_cursor"], 0);
         }
+    }
+
+    #[test]
+    fn scoped_restart_omits_cold_books_without_erasing_disk_history() {
+        let (_temp, mut bridge) = fixture();
+        bridge.plan.markets = vec![json!({"identity":{"market_id":"hot",
+            "outcomes":[{"token_id":"h1"},{"token_id":"h2"}]}})];
+        let db = Connection::open(bridge.args.root.join("indexes/latest-state.sqlite3")).unwrap();
+        for token in ["h1", "h2", "cold1", "cold2"] {
+            let body = serde_json::to_vec(&json!({"token_id":token,"cursor":0})).unwrap();
+            let sha = hex::encode(Sha256::digest(&body));
+            db.execute("INSERT INTO books VALUES (0,?,?,?)",
+                rusqlite::params![body, sha, token]).unwrap();
+        }
+        let (bytes, _) = bridge.snapshot().unwrap();
+        let snapshot: Value = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(snapshot["books"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot["markets"].as_array().unwrap().len(), 1);
+        let retained: i64 = db.query_row("SELECT count(*) FROM books", [], |row| row.get(0)).unwrap();
+        assert_eq!(retained, 4);
     }
 
     #[test]
@@ -583,15 +679,29 @@ mod tests {
             INSERT INTO metadata VALUES ('bounded_history_bytes','8192'),('history_floor_cursor','10');
             UPDATE metadata SET value='11' WHERE key='latest_cursor';").unwrap();
         let body = b"{\"cursor\":11}\n";
-        db.execute("INSERT INTO recent_events VALUES(11,?,?)",rusqlite::params![body.as_slice(),hex::encode(Sha256::digest(body))]).unwrap();
+        db.execute(
+            "INSERT INTO recent_events VALUES(11,?,?)",
+            rusqlite::params![body.as_slice(), hex::encode(Sha256::digest(body))],
+        )
+        .unwrap();
         fs::remove_file(bridge.args.root.join("events.jsonl")).unwrap();
-        assert!(bridge.page(9).unwrap_err().to_string().contains("resume_cursor_expired"));
-        assert_eq!(bridge.snapshot().unwrap().1,11);
+        assert!(
+            bridge
+                .page(9)
+                .unwrap_err()
+                .to_string()
+                .contains("resume_cursor_expired")
+        );
+        assert_eq!(bridge.snapshot().unwrap().1, 11);
         let (page, cursor) = bridge.page(10).unwrap();
-        assert_eq!(cursor,11);
-        assert_eq!(serde_json::from_str::<Value>(&page).unwrap()["events"][0]["cursor"],11);
-        assert_eq!(bridge.page(11).unwrap().1,11);
-        db.execute("UPDATE recent_events SET payload=x'00'",[]).unwrap();
+        assert_eq!(cursor, 11);
+        assert_eq!(
+            serde_json::from_str::<Value>(&page).unwrap()["events"][0]["cursor"],
+            11
+        );
+        assert_eq!(bridge.page(11).unwrap().1, 11);
+        db.execute("UPDATE recent_events SET payload=x'00'", [])
+            .unwrap();
         assert!(bridge.page(10).is_err());
     }
 

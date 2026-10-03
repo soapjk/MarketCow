@@ -83,6 +83,27 @@ class SettingsTest(unittest.TestCase):
                 settings = Settings.from_env()
             self.assertFalse(settings.mcp_enabled)
 
+    def test_alpaca_sip_budget_and_secret_file_binding(self):
+        with tempfile.TemporaryDirectory(suffix="-test") as folder:
+            root = Path(folder)
+            secret = root / "alpaca.json"
+            env = {
+                "MARKETCOW_PROFILE": "test", "MARKETCOW_HOME": str(root),
+                "MARKETCOW_ALLOWED_ROOT": str(root.parent),
+                "MARKETCOW_POSTGRES_DSN":
+                    "postgresql://user:password@127.0.0.1/marketcow_test",
+                "MARKETCOW_CLICKHOUSE_PASSWORD": "secret",
+                "MARKETCOW_ALPACA_CREDENTIALS_FILE": str(secret),
+                "MARKETCOW_ALPACA_MAXIMUM_REQUESTS": "42",
+                "MARKETCOW_ALPACA_MAXIMUM_BYTES": "1048576",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                settings = Settings.from_env()
+            settings.validate_preflight()
+            self.assertEqual(settings.alpaca_credentials_file, secret)
+            self.assertEqual(settings.alpaca_maximum_requests, 42)
+            self.assertEqual(settings.alpaca_maximum_bytes, 1048576)
+
     def test_explicit_env_file_supports_launchd_safe_copy(self):
         with tempfile.TemporaryDirectory(suffix="-test") as folder:
             root = Path(folder)
