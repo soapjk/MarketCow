@@ -9,7 +9,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::{fd::AsRawFd, unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt}};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -839,6 +839,7 @@ struct SocketOwner {
     path: PathBuf,
     device: u64,
     inode: u64,
+    _lease: std::fs::File,
 }
 impl Drop for SocketOwner {
     fn drop(&mut self) {
@@ -851,7 +852,51 @@ impl Drop for SocketOwner {
     }
 }
 
-pub fn start(
+/// Serialize startup and retain the lease for the listener's entire lifetime.
+/// A crashed process releases flock but can leave its Unix pathname behind.
+/// Only ECONNREFUSED proves that such a private socket has no listener; live
+/// legacy listeners, timeouts, regular files and symlinks are never removed.
+async fn bind_private_socket(path: &Path, timeout: Duration)
+    -> Result<(tokio::net::UnixListener, SocketOwner)>
+{
+    let lock_path = path.with_extension("sock.lock");
+    let lease = std::fs::OpenOptions::new().read(true).write(true).create(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&lock_path)?;
+    let lock_meta = lease.metadata()?;
+    ensure!(lock_meta.is_file() && lock_meta.uid() == unsafe { libc::geteuid() }
+        && lock_meta.permissions().mode() & 0o077 == 0,
+        "control socket lease must be same-user private regular file");
+    ensure!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "control socket has an active owner lease");
+    match std::fs::symlink_metadata(path) {
+        Ok(old) => {
+            ensure!(old.file_type().is_socket() && old.uid() == unsafe { libc::geteuid() }
+                && old.permissions().mode() & 0o077 == 0,
+                "existing control path is not a same-user private socket");
+            match tokio::time::timeout(timeout.min(Duration::from_secs(1)),
+                tokio::net::UnixStream::connect(path)).await {
+                Ok(Err(error)) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {}
+                Ok(Ok(_)) => anyhow::bail!("control socket has an active listener"),
+                Ok(Err(error)) => return Err(error).context("control socket ownership unknown"),
+                Err(_) => anyhow::bail!("control socket ownership probe timed out"),
+            }
+            let current = std::fs::symlink_metadata(path)?;
+            ensure!(current.file_type().is_socket() && current.dev() == old.dev()
+                && current.ino() == old.ino(), "control socket changed during recovery");
+            std::fs::remove_file(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = tokio::net::UnixListener::bind(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    let owner = SocketOwner { path: path.to_owned(), device: metadata.dev(),
+        inode: metadata.ino(), _lease: lease };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok((listener, owner))
+}
+
+pub async fn start(
     path: &Path,
     maximum_bytes: usize,
     timeout: Duration,
@@ -875,15 +920,7 @@ pub fn start(
             && std::fs::canonicalize(parent)? == parent,
         "control directory must be private and canonical"
     );
-    // Never unlink an existing socket on startup: it may have a live owner.
-    let listener = tokio::net::UnixListener::bind(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    let owner = SocketOwner {
-        path: path.to_owned(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let (listener, owner) = bind_private_socket(path, timeout).await?;
     let backend = Arc::new(Mutex::new((backend, journal)));
     Ok(tokio::spawn(async move {
         let _owner = owner;
@@ -1300,6 +1337,42 @@ mod tests {
         serde_json::from_slice(&response).unwrap()
     }
     #[tokio::test]
+    async fn private_socket_recovers_crashed_owner_but_never_unlinks_live_or_non_socket() {
+        let directory = std::env::temp_dir().join(format!("mcw-sock-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("scope.sock");
+        // A legacy live owner has no lease: the connect probe still protects it.
+        let legacy = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let legacy_inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        assert!(bind_private_socket(&path, Duration::from_secs(1)).await.is_err());
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), legacy_inode);
+        drop(legacy); // Simulate crash: pathname remains, listener is gone.
+        let (listener, owner) = bind_private_socket(&path, Duration::from_secs(1)).await.unwrap();
+        assert!(tokio::net::UnixStream::connect(&path).await.is_ok());
+        // A competing owner cannot clear our endpoint, even if it looks stale.
+        let owned_inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        assert!(bind_private_socket(&path, Duration::from_secs(1)).await.is_err());
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), owned_inode);
+        drop(listener);
+        drop(owner);
+        assert!(!path.exists());
+        std::fs::write(&path, b"not a socket").unwrap();
+        assert!(bind_private_socket(&path, Duration::from_secs(1)).await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+        std::fs::remove_file(&path).unwrap();
+        let target = directory.join("target");
+        std::fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(bind_private_socket(&path, Duration::from_secs(1)).await.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_file(directory.join("scope.sock.lock")).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+    #[tokio::test]
     async fn private_socket_reports_actual_cas_and_releases_its_path() {
         // Synthetic source; exercises actual Unix framing, not an upstream load claim.
         let market = json!({"identity":{"market_id":"1","condition_id":"condition","event_id":"e","neg_risk":false,
@@ -1369,6 +1442,7 @@ mod tests {
             None,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1413,6 +1487,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert!(!path.exists());
+        std::fs::remove_file(path.with_extension("sock.lock")).unwrap();
         std::fs::remove_dir(&directory).unwrap();
         p.finish().await.unwrap();
     }
@@ -1610,6 +1685,7 @@ mod tests {
             Some(btc_control.clone()),
             None,
         )
+        .await
         .unwrap();
         let request = json!({"operation":"publish_btc5m_profile",
             "expected_profile_id":initial.profile_id,"expected_revision":1,
@@ -1631,6 +1707,7 @@ mod tests {
         responder.await.unwrap();
         task.abort();
         let _ = task.await;
+        std::fs::remove_file(socket.with_extension("sock.lock")).unwrap();
         std::fs::remove_dir(&directory).unwrap();
         publication.finish().await.unwrap();
     }

@@ -155,54 +155,80 @@ impl Book {
             return changes.to_vec();
         }
 
-        let mut candidate_bids = self.bids.clone();
-        let mut candidate_asks = self.asks.clone();
+        // A venue BBO only requires explicit removals for levels outside its
+        // final range. Do not clone and replay the entire book just to find
+        // those levels on every incremental frame. Record the final assignment
+        // for each touched price, including zero-size deletions.
+        let mut bid_writes = BTreeMap::new();
+        let mut ask_writes = BTreeMap::new();
         for change in changes {
             let target = match change.side {
-                Side::Bid => &mut candidate_bids,
-                Side::Ask => &mut candidate_asks,
+                Side::Bid => &mut bid_writes,
+                Side::Ask => &mut ask_writes,
             };
             for level in &change.levels {
-                if level.quantity.is_zero() {
-                    target.remove(&level.price);
-                } else {
-                    target.insert(level.price.clone(), level.quantity);
-                }
+                target.insert(level.price.clone(), level.quantity);
             }
         }
 
         let expected_bid = best_bid.filter(|price| !price.is_zero());
         let expected_ask = best_ask.filter(|price| !price.is_one());
-        let bid_removals = candidate_bids
+        let mut bid_removals = self
+            .bids
             .keys()
             .filter(|price| expected_bid.is_none_or(|expected| *price > expected))
+            .filter(|price| bid_writes.get(*price).is_none_or(|quantity| !quantity.is_zero()))
             .cloned()
-            .map(|price| Level {
-                price,
-                quantity: Decimal::ZERO,
-            })
-            .collect::<Vec<_>>();
-        let ask_removals = candidate_asks
+            .collect::<BTreeSet<_>>();
+        bid_removals.extend(
+            bid_writes
+                .iter()
+                .filter(|(price, quantity)| {
+                    !quantity.is_zero()
+                        && expected_bid.is_none_or(|expected| *price > expected)
+                })
+                .map(|(price, _)| price.clone()),
+        );
+        let mut ask_removals = self
+            .asks
             .keys()
             .filter(|price| expected_ask.is_none_or(|expected| *price < expected))
+            .filter(|price| ask_writes.get(*price).is_none_or(|quantity| !quantity.is_zero()))
             .cloned()
-            .map(|price| Level {
-                price,
-                quantity: Decimal::ZERO,
-            })
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
+        ask_removals.extend(
+            ask_writes
+                .iter()
+                .filter(|(price, quantity)| {
+                    !quantity.is_zero()
+                        && expected_ask.is_none_or(|expected| *price < expected)
+                })
+                .map(|(price, _)| price.clone()),
+        );
 
         let mut replay_complete = changes.to_vec();
         if !bid_removals.is_empty() {
             replay_complete.push(SideLevels {
                 side: Side::Bid,
-                levels: bid_removals,
+                levels: bid_removals
+                    .into_iter()
+                    .map(|price| Level {
+                        price,
+                        quantity: Decimal::ZERO,
+                    })
+                    .collect(),
             });
         }
         if !ask_removals.is_empty() {
             replay_complete.push(SideLevels {
                 side: Side::Ask,
-                levels: ask_removals,
+                levels: ask_removals
+                    .into_iter()
+                    .map(|price| Level {
+                        price,
+                        quantity: Decimal::ZERO,
+                    })
+                    .collect(),
             });
         }
         replay_complete
@@ -2922,6 +2948,55 @@ mod tests {
     }
     fn levels(price: &str, quantity: &str) -> Vec<Level> {
         vec![Level::new(price, quantity).unwrap()]
+    }
+
+    #[test]
+    fn bbo_replay_removals_match_final_assignments_without_cloning_the_book() {
+        let mut book = Book::default();
+        for (price, quantity) in [("0.49", "10"), ("0.51", "7")] {
+            book.bids.insert(
+                Price::parse(price).unwrap(),
+                Decimal::from_str(quantity).unwrap(),
+            );
+        }
+        for (price, quantity) in [("0.53", "9"), ("0.55", "11")] {
+            book.asks.insert(
+                Price::parse(price).unwrap(),
+                Decimal::from_str(quantity).unwrap(),
+            );
+        }
+        let changes = vec![
+            SideLevels { side: Side::Bid, levels: levels("0.51", "0") },
+            SideLevels { side: Side::Bid, levels: levels("0.51", "3") },
+            SideLevels { side: Side::Bid, levels: levels("0.52", "4") },
+            SideLevels { side: Side::Ask, levels: levels("0.53", "0") },
+            SideLevels { side: Side::Ask, levels: levels("0.53", "2") },
+            SideLevels { side: Side::Ask, levels: levels("0.54", "1") },
+        ];
+        let best_bid = Price::parse("0.49").unwrap();
+        let best_ask = Price::parse("0.55").unwrap();
+        let replay = book.replay_complete_atomic_changes(
+            &changes,
+            Some(&best_bid),
+            Some(&best_ask),
+        );
+        assert_eq!(
+            replay[changes.len()].levels.iter().map(|level| level.price.0.to_string()).collect::<Vec<_>>(),
+            vec!["0.51".to_owned(), "0.52".to_owned()]
+        );
+        assert_eq!(
+            replay[changes.len() + 1].levels.iter().map(|level| level.price.0.to_string()).collect::<Vec<_>>(),
+            vec!["0.53".to_owned(), "0.54".to_owned()]
+        );
+        let at = Utc::now();
+        let mut compact_replayed = book.clone();
+        compact_replayed.apply_batch(&replay, at);
+        let mut original_then_pruned = book;
+        original_then_pruned.apply_batch(&changes, at);
+        original_then_pruned.bids.retain(|price, _| price <= &best_bid);
+        original_then_pruned.asks.retain(|price, _| price >= &best_ask);
+        assert_eq!(compact_replayed.bids, original_then_pruned.bids);
+        assert_eq!(compact_replayed.asks, original_then_pruned.asks);
     }
 
     #[test]

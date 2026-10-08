@@ -42,7 +42,7 @@ ExecStart=/usr/bin/python3 /mnt/p44pro/marketcow-shadow-v3-runtime/linux/release
  --btc-research-queue-bytes 8388608 --btc-research-response-bytes 4194304 \
  --btc-research-clients 4 --btc-research-send-timeout-seconds 5 \
  --btc-5m-snapshot-bytes 8388608 --btc-5m-frame-bytes 2097152 \
- --btc-5m-replay-bytes 8388608 --btc-5m-clients 4 --btc-5m-send-timeout-seconds 5 \
+ --btc-5m-replay-bytes 8388608 --btc-5m-clients 12 --btc-5m-send-timeout-seconds 5 \
  --btc-5m-snapshot-lease-capacity 2 \
  --btc-5m-manager-root /mnt/p44pro/marketcow-shadow-v3-runtime/linux/bounded-scoped-candidate-r1/btc-5m-manager-r1 \
  --btc-5m-manager-lease-ttl-seconds 120 --btc-5m-manager-renew-seconds 40 \

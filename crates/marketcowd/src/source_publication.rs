@@ -22,9 +22,30 @@ use std::{
     thread,
 };
 use tokio::sync::{Semaphore, watch};
+use crate::source_market_replay::{MarketPage, MarketReplay};
+use crate::source_market_persistence::{
+    Limits as MarketPersistenceLimits, MarketDrainTimeout, MarketPersistence,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const WS_STATE_CONFIRMATION_MIN_INTERVAL_MS: i64 = 1_000;
 pub(crate) const BTC5M_TRACE_SAMPLE_MODULUS: u64 = 4096;
+const MAX_NON_QUEUE_STATE_BYTES: usize = 512 * 1024 * 1024;
+
+fn market_persistence_lane_limits(
+    aggregate_batches: usize,
+    aggregate_bytes: usize,
+    batch_cap: usize,
+) -> MarketPersistenceLimits {
+    // The production 4 GiB / 16384-batch aggregate holds four full
+    // 1 GiB / 4096-batch lanes. Smaller explicit test configurations retain
+    // their historical half-aggregate limit, never exceeding the aggregate.
+    MarketPersistenceLimits {
+        batches: (aggregate_batches / 2).max(1).min(4096),
+        bytes: (aggregate_bytes / 2).min(1024 * 1024 * 1024)
+            .max(batch_cap).min(aggregate_bytes),
+    }
+}
 
 pub(crate) fn btc5m_trace_sample(cursor: u64) -> bool {
     cursor != 0 && cursor % BTC5M_TRACE_SAMPLE_MODULUS == 0
@@ -124,6 +145,131 @@ fn materialized_declared_bytes(events: &[Value]) -> Result<usize> {
     })
 }
 
+enum ProjectionAction {
+    Terminal { market_id: String, model: Arc<Value>, state_bytes: usize },
+    Book {
+        token_id: String,
+        physical_cursor: u64,
+        exchange_at: Option<DateTime<Utc>>,
+        clear_confirmation: bool,
+        model: Arc<Value>,
+        state_bytes: usize,
+    },
+}
+
+/// Immutable, market-local projection work prepared by the market actor.
+/// Only the publisher's physical cursor is assigned later by the owner.
+pub(super) struct PreparedProjection {
+    actions: BTreeMap<u64, ProjectionAction>,
+}
+
+impl PreparedProjection {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.actions.values().map(|action| match action {
+            ProjectionAction::Book { model, token_id, .. } =>
+                marketcow_runtime::discovery_source::json_retained_bytes(model) + token_id.capacity() + 256,
+            ProjectionAction::Terminal { model, market_id, .. } =>
+                marketcow_runtime::discovery_source::json_retained_bytes(model) + market_id.capacity() + 256,
+        }).sum()
+    }
+    pub(super) fn rebase(&mut self, after: u64) -> Result<()> {
+        self.rebase_from(0, after)
+    }
+
+    pub(super) fn rebase_from(&mut self, old_after: u64, new_after: u64) -> Result<()> {
+        self.actions = std::mem::take(&mut self.actions).into_iter().map(|(cursor, mut action)| {
+            let cursor = new_after.checked_add(cursor.checked_sub(old_after)
+                .context("projection cursor before actor boundary")?)
+                .context("projection cursor overflow")?;
+            if let ProjectionAction::Book { physical_cursor, .. } = &mut action {
+                *physical_cursor = cursor;
+            }
+            Ok((cursor, action))
+        }).collect::<Result<_>>()?;
+        Ok(())
+    }
+
+    pub(super) fn take_for(&mut self, events: &[Value]) -> Result<Self> {
+        let mut actions = BTreeMap::new();
+        for event in events {
+            let cursor = event["cursor"].as_u64().context("projection event cursor")?;
+            if is_token_recovery(event) {
+                ensure!(!self.actions.contains_key(&cursor), "recovery has projection action");
+            } else {
+                let action = self.actions.remove(&cursor)
+                    .context("market projection action missing")?;
+                ensure!(actions.insert(cursor, action).is_none(), "duplicate projection cursor");
+            }
+        }
+        Ok(Self { actions })
+    }
+
+    pub(super) fn is_empty(&self) -> bool { self.actions.is_empty() }
+
+    fn into_actions(self) -> Vec<ProjectionAction> {
+        self.actions.into_values().collect()
+    }
+}
+
+pub(super) fn prepare_market_projection(
+    events: &[Value], materialized_books: &BTreeMap<u64, Value>,
+) -> Result<PreparedProjection> {
+    validate_materialized_books(events, materialized_books)?;
+    let actions = prepare_projection_actions(events, materialized_books)?;
+    let cursors = events.iter().filter(|event| !is_token_recovery(event))
+        .map(|event| event["cursor"].as_u64().context("projection cursor"))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(cursors.len() == actions.len(), "projection action count differs");
+    let actions: BTreeMap<_, _> = cursors.into_iter().zip(actions).collect();
+    ensure!(actions.len() == events.iter().filter(|event| !is_token_recovery(event)).count(),
+        "duplicate prepared projection cursor");
+    Ok(PreparedProjection { actions })
+}
+
+/// Parse and clone immutable post-states before taking the shared publication
+/// lock. The accepted-batch commit below is then infallible and cheap enough
+/// to be one market-local visibility boundary.
+fn prepare_projection_actions(
+    events: &[Value], materialized_books: &BTreeMap<u64, Value>,
+) -> Result<Vec<ProjectionAction>> {
+    let mut actions = Vec::with_capacity(events.len());
+    for event in events {
+        if is_token_recovery(event) { continue; }
+        if event["event_type"] == "market_terminal" {
+            let model = &event["canonical_payload"]["market"];
+            let state_bytes = match event["canonical_payload"]["materialized_book_bytes"].as_u64() {
+                Some(declared) => usize::try_from(declared)?,
+                None => serde_json::to_vec(model)?.len(),
+            };
+            actions.push(ProjectionAction::Terminal {
+                market_id: event["market_id"].as_str().context("terminal market identity")?.to_owned(),
+                model: Arc::new(model.clone()), state_bytes,
+            });
+            continue;
+        }
+        let token_id = event["token_id"].as_str().context("book token identity")?.to_owned();
+        let physical_cursor = event["cursor"].as_u64().context("book event cursor")?;
+        let clear_confirmation = advances_book_confirmation_fence(event["event_type"].as_str());
+        let exchange_at = if clear_confirmation {
+            Some(DateTime::parse_from_rfc3339(
+                event["canonical_payload"]["exchange_at"].as_str()
+                    .context("book event exchange_at")?
+            )?.with_timezone(&Utc))
+        } else { None };
+        let model = materialized_books.get(&physical_cursor)
+            .unwrap_or(&event["canonical_payload"]);
+        let state_bytes = match event["canonical_payload"]["materialized_book_bytes"].as_u64() {
+            Some(declared) => usize::try_from(declared)?,
+            None => serde_json::to_vec(model)?.len(),
+        };
+        actions.push(ProjectionAction::Book {
+            token_id, physical_cursor, exchange_at, clear_confirmation,
+            model: Arc::new(model.clone()), state_bytes,
+        });
+    }
+    Ok(actions)
+}
+
 pub struct Batch {
     pub validated: ValidatedSourceBatch,
     /// Complete post-state books keyed by publisher cursor for compact
@@ -142,6 +288,7 @@ pub struct Batch {
     // batch and never changes event bytes, canonical hashes or cursor order.
     timing: Mutex<Option<SourceBatchTiming>>,
     bytes: usize,
+    replay_retained_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -162,6 +309,7 @@ pub struct SourceBatchTiming {
 }
 
 impl Batch {
+    pub(super) fn retained_bytes(&self) -> usize { self.replay_retained_bytes }
     pub fn timing_snapshot(&self) -> Option<SourceBatchTiming> {
         self.timing.lock().ok().and_then(|timing| timing.clone())
     }
@@ -170,6 +318,8 @@ pub struct Retirement {
     pub ticket: u64,
     pub after: u64,
     pub markets: std::collections::BTreeSet<String>,
+    market_epochs: BTreeMap<String, String>,
+    live_only_markets: std::collections::BTreeSet<String>,
     /// Immutable catalog identity is committed to the cold index before hot
     /// bindings are removed. It is never reconstructed from a later book.
     pub cold_records: BTreeMap<String, Value>,
@@ -185,6 +335,14 @@ pub enum PersistenceWork<'a> {
     Retire(&'a Retirement),
 }
 struct Memory {
+    // A carried next market keeps its generation across profile rotation;
+    // retiring and later re-admitting the same market creates a new epoch.
+    market_stream_epochs: BTreeMap<String, String>,
+    market_published_cursors: BTreeMap<String, u64>,
+    market_durable_cursors: BTreeMap<String, u64>,
+    market_confirmation_sequences: BTreeMap<String, u64>,
+    market_confirmation_versions: BTreeMap<String, u64>,
+    retiring_markets: BTreeSet<String>,
     retirement_submitted: u64,
     retirement_persisted: u64,
     acquisition_statistics: Option<(usize, usize, usize)>,
@@ -192,6 +350,7 @@ struct Memory {
     // Publication identity bindings are not the same thing as active wire
     // subscriptions. Keep both counts visible during hot/cold reconciliation.
     binding_token_ids: BTreeSet<String>,
+    token_market_ids: BTreeMap<String, String>,
     wire_token_ids: Option<BTreeSet<String>>,
     draining_token_ids: Option<BTreeSet<String>>,
     recoveries: BTreeMap<String, Value>,
@@ -205,6 +364,10 @@ struct Memory {
     base: Option<Value>,
     books: BTreeMap<String, Arc<Value>>,
     book_cursors: BTreeMap<String, u64>,
+    // A book can have a physical archive cursor without having crossed this
+    // process incarnation's market-local publication boundary. Never seed a
+    // market stream from such a pre-restart/pre-acquisition book.
+    market_book_cursors: BTreeMap<String, u64>,
     // Venue time of the latest order-book mutation. `LiveBook.exchange_at`
     // also advances on last_trade_price, so it cannot fence REST book
     // confirmations without falsely treating an independent trade as a newer
@@ -226,7 +389,12 @@ struct Memory {
 }
 pub struct Publication {
     memory: Arc<Mutex<Memory>>,
+    market_health: Arc<MarketHealth>,
     changed: watch::Sender<u64>,
+    market_replay: Arc<MarketReplay<Batch, Option<MarketReadState>>>,
+    market_persistence: Arc<MarketPersistence<Batch>>,
+    market_worker: Option<thread::JoinHandle<()>>,
+    market_publishers: std::sync::RwLock<BTreeMap<String, Arc<MarketPublisher>>>,
     sender: Option<mpsc::Sender<QueuedWork>>,
     worker: Option<thread::JoinHandle<()>>,
     tokens: BTreeMap<String, String>,
@@ -234,8 +402,27 @@ pub struct Publication {
     retirement_enabled: bool,
     max_batches: usize,
     max_bytes: usize,
+    replay_max_batches: usize,
+    replay_max_bytes: usize,
     batch_cap: usize,
     hot_timing: PublicationTiming,
+}
+
+/// Cloneable selected-market hot path. Catalog admission creates the handle;
+/// no book mutation takes a process-wide publication or metadata mutex.
+pub(super) struct MarketPublisher {
+    market_id: String,
+    gate: Mutex<()>,
+    replay: Arc<MarketReplay<Batch, Option<MarketReadState>>>,
+    persistence: Arc<MarketPersistence<Batch>>,
+    health: Arc<MarketHealth>,
+    catalog_bindings: BTreeMap<String, String>,
+    batch_cap: usize,
+    confirmation_byte_limit: usize,
+    // One-way for a stream epoch: after a disk admission gap, later groups
+    // remain live-only. They cannot be appended behind a missing durable group.
+    volatile: AtomicBool,
+    volatile_groups: AtomicU64,
 }
 
 #[derive(Default)]
@@ -290,7 +477,199 @@ pub struct MemoryView {
 #[derive(Clone)]
 pub struct MemoryReader {
     memory: Arc<Mutex<Memory>>,
+    market_health: Arc<MarketHealth>,
     changed: watch::Sender<u64>,
+    market_replay: Arc<MarketReplay<Batch, Option<MarketReadState>>>,
+    market_persistence: Arc<MarketPersistence<Batch>>,
+}
+struct MarketHealth {
+    source_ready: AtomicBool,
+    accepting_events: AtomicBool,
+    persistence_failed: AtomicBool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketStreamWatermark {
+    pub stream_epoch: String,
+    pub market_id: String,
+    pub published_cursor: u64,
+    pub durable_cursor: u64,
+    pub replay_floor: u64,
+}
+/// One selected market's books and replay boundary captured while holding only
+/// its market lane. It does not clone unrelated markets' depth or claim that
+/// the latest published books are already durable.
+pub struct MarketMemorySnapshot {
+    pub watermark: MarketStreamWatermark,
+    /// Last event in the selected market's published stream, including
+    /// recovery/terminal facts that do not replace either token's book.
+    /// This is not the market-group resume cursor or a disk archive offset.
+    pub last_market_event_cursor: u64,
+    pub market: Option<Arc<Value>>,
+    pub books: BTreeMap<String, Arc<Value>>,
+    pub physical_book_cursors: BTreeMap<String, u64>,
+    /// Cursor of the source event that installed this book. This is the
+    /// recovery snapshot identity, not a physical archive offset and not the
+    /// market group's resume cursor.
+    pub event_book_cursors: BTreeMap<String, u64>,
+    pub market_book_cursors: BTreeMap<String, u64>,
+    pub recoveries: BTreeMap<String, Value>,
+    pub unresolved_seed_gaps: BTreeSet<String>,
+    pub capacity_fenced: bool,
+    pub confirmation_sequence: u64,
+    pub confirmation_facts: BTreeMap<String, Arc<Value>>,
+    pub market_confirmation_versions: BTreeMap<String, u64>,
+}
+
+/// Selected-market read projection. Depth is the exact immutable Arc installed
+/// by the reducer, not a second book state machine. BTC market readers never
+/// take the discovery component's aggregate publication lock.
+#[derive(Clone, Default)]
+struct MarketReadState {
+    token_ids: BTreeSet<String>,
+    native_cursor_domain: bool,
+    last_event_cursor: u64,
+    market: Option<Arc<Value>>,
+    books: BTreeMap<String, Arc<Value>>,
+    book_exchanges: BTreeMap<String, DateTime<Utc>>,
+    physical_book_cursors: BTreeMap<String, u64>,
+    event_book_cursors: BTreeMap<String, u64>,
+    market_book_cursors: BTreeMap<String, u64>,
+    recoveries: BTreeMap<String, Value>,
+    unresolved_seed_gaps: BTreeSet<String>,
+    capacity_fenced: bool,
+    confirmation_sequence: u64,
+    confirmation_facts: BTreeMap<String, Arc<Value>>,
+    market_confirmation_versions: BTreeMap<String, u64>,
+}
+
+impl MarketReadState {
+    fn bootstrap(market: Arc<Value>, token_ids: BTreeSet<String>) -> Self {
+        Self { token_ids, native_cursor_domain: true, market: Some(market),
+            ..Self::default() }
+    }
+    /// Prepare a native market group's selected-lane projection from the
+    /// actor's already validated immutable post-states. Cloning this small
+    /// map only clones book Arcs, never full depth. The caller installs it
+    /// with replay under the same market lane after writer admission.
+    fn prepare_native_group(&self, market_id: &str, market_cursor: u64,
+        events: &[Value], actions: Vec<ProjectionAction>) -> Result<Self> {
+        ensure!(market_cursor > 0 && !events.is_empty(), "native market group identity");
+        ensure!(events.iter().all(|event| event["market_id"] == market_id),
+            "native projection crosses market boundary");
+        let mut next = self.clone();
+        if next.capacity_fenced {
+            ensure!(events.iter().any(|event| event["event_type"] == "recovery_started")
+                || !next.recoveries.is_empty(),
+                "capacity-fenced market requires recovery barrier");
+        }
+        next.native_cursor_domain = true;
+        let mut actions = actions.into_iter();
+        for event in events {
+            let cursor = event["cursor"].as_u64().context("native event cursor")?;
+            ensure!(cursor == next.last_event_cursor.checked_add(1)
+                .context("native event cursor overflow")?,
+                "native market event cursor is not contiguous");
+            next.last_event_cursor = cursor;
+            apply_token_recovery(&mut next.recoveries, event)?;
+            if is_token_recovery(event) {
+                let token = event["token_id"].as_str().context("recovery token identity")?;
+                ensure!(next.token_ids.contains(token), "recovery token outside market binding");
+                next.confirmation_facts.remove(token);
+                next.market_confirmation_versions.remove(token);
+                continue;
+            }
+            let action = actions.next().context("native projection action missing")?;
+            match action {
+                ProjectionAction::Terminal { market_id: action_market, model, .. } => {
+                    ensure!(action_market == market_id, "terminal projection market differs");
+                    let retired = event["canonical_payload"]["retired_token_ids"]
+                        .as_array().context("terminal retired tokens")?;
+                    for token in retired {
+                        let token = token.as_str().context("terminal token identity")?;
+                        ensure!(next.token_ids.contains(token), "terminal token outside market binding");
+                        next.books.remove(token);
+                        next.market_book_cursors.remove(token);
+                        next.physical_book_cursors.remove(token);
+                        next.event_book_cursors.remove(token);
+                        next.book_exchanges.remove(token);
+                        next.recoveries.remove(token);
+                        next.confirmation_facts.remove(token);
+                        next.market_confirmation_versions.remove(token);
+                    }
+                    next.market = Some(model);
+                }
+                ProjectionAction::Book { token_id, physical_cursor, exchange_at,
+                    clear_confirmation, model, .. } => {
+                    ensure!(next.token_ids.contains(&token_id), "book token outside market binding");
+                    ensure!(event["token_id"] == token_id && event["cursor"] == physical_cursor,
+                        "native projection action identity differs");
+                    // The native source cursor is a public event position; a
+                    // physical archive position does not exist until the
+                    // asynchronous writer commits. Never alias the two.
+                    next.physical_book_cursors.remove(&token_id);
+                    next.event_book_cursors.insert(token_id.clone(), physical_cursor);
+                    next.market_book_cursors.insert(token_id.clone(), market_cursor);
+                    if event["event_type"] == "book" {
+                        next.unresolved_seed_gaps.remove(&token_id);
+                    }
+                    if let Some(exchange_at) = exchange_at {
+                        next.book_exchanges.insert(token_id.clone(), exchange_at);
+                    }
+                    if clear_confirmation || next.books.get(&token_id).is_some_and(|old|
+                        old["book_epoch"] != model["book_epoch"]
+                            || old["sequence"] != model["sequence"])
+                    {
+                        next.confirmation_facts.remove(&token_id);
+                        next.market_confirmation_versions.remove(&token_id);
+                    }
+                    next.books.insert(token_id, model);
+                }
+            }
+        }
+        ensure!(actions.next().is_none(), "native projection action surplus");
+        if next.capacity_fenced && next.unresolved_seed_gaps.is_empty()
+            && next.recoveries.is_empty()
+            && next.token_ids.iter().all(|token| next.books.contains_key(token)) {
+            next.capacity_fenced = false;
+        }
+        Ok(next)
+    }
+
+    fn project(memory: &Memory, market_id: &str, token_ids: BTreeSet<String>) -> Self {
+        let mut state = Self { token_ids, market: memory.markets.get(market_id).cloned(),
+            confirmation_sequence: memory.market_confirmation_sequences.get(market_id)
+                .copied().unwrap_or(0), ..Self::default() };
+        for token in &state.token_ids {
+            if memory.base.as_ref().and_then(|base| base["gaps"].as_array())
+                .is_some_and(|gaps| gaps.iter().any(|gap|
+                    gap["token_id"] == token.as_str() && gap["resolved"] != true)) {
+                state.unresolved_seed_gaps.insert(token.clone());
+            }
+            if let Some(recovery) = memory.recoveries.get(token) {
+                state.recoveries.insert(token.clone(), recovery.clone());
+            }
+            let (Some(market_cursor), Some(physical_cursor), Some(book)) = (
+                memory.market_book_cursors.get(token), memory.book_cursors.get(token),
+                memory.books.get(token)) else { continue; };
+            if *physical_cursor < memory.resume_floor { continue; }
+            state.books.insert(token.clone(), book.clone());
+            state.physical_book_cursors.insert(token.clone(), *physical_cursor);
+            state.event_book_cursors.insert(token.clone(), *physical_cursor);
+            state.market_book_cursors.insert(token.clone(), *market_cursor);
+            if !state.recoveries.contains_key(token) && !state.unresolved_seed_gaps.contains(token) {
+                if let Some(fact) = memory.confirmation_facts.get(token) {
+                    if fact["book_epoch"] == book["book_epoch"] && fact["sequence"] == book["sequence"]
+                        && fact["state_checksum"] == book["state_checksum"] {
+                        state.confirmation_facts.insert(token.clone(), fact.clone());
+                        if let Some(version) = memory.market_confirmation_versions.get(token) {
+                            state.market_confirmation_versions.insert(token.clone(), *version);
+                        }
+                    }
+                }
+            }
+        }
+        state
+    }
 }
 pub struct PublicReplay {
     pub batches: Vec<Arc<Batch>>,
@@ -301,10 +680,86 @@ pub struct PublicReplay {
     pub confirmation_books: Vec<Arc<Value>>,
 }
 impl MemoryReader {
+    pub fn subscribe_market(&self, market_id: &str, stream_epoch: &str) -> Result<watch::Receiver<u64>> {
+        self.market_replay.subscribe(market_id, stream_epoch)
+    }
+    pub fn capture_market(&self, market_id: &str, token_ids: &[String]) -> Result<MarketMemorySnapshot> {
+        ensure!(!market_id.is_empty() && !token_ids.is_empty(), "market snapshot identity");
+        ensure!(token_ids.iter().collect::<BTreeSet<_>>().len() == token_ids.len(),
+            "duplicate market snapshot token");
+        // Physical durability is a separate watermark. A failed writer must
+        // not hide a still-live, market-local in-memory stream.
+        ensure!(self.market_health.source_ready.load(Ordering::Acquire), "source unavailable");
+        let snapshot = self.market_replay.read_state(market_id, |state, watermark| {
+            let state = state.as_ref().context("market snapshot unavailable")?;
+            ensure!(state.native_cursor_domain, "market snapshot uses obsolete cursor domain");
+            ensure!(token_ids.iter().all(|token| state.token_ids.contains(token)),
+                "market snapshot token binding differs");
+            ensure!(state.last_event_cursor > 0
+                && state.event_book_cursors.values().all(|cursor| *cursor <= state.last_event_cursor),
+                "market snapshot event boundary differs");
+            fn selected<T: Clone>(values: &BTreeMap<String, T>, tokens: &[String]) -> BTreeMap<String, T> {
+                tokens.iter().filter_map(|token| values.get(token)
+                    .map(|value| (token.clone(), value.clone()))).collect()
+            }
+            Ok(MarketMemorySnapshot {
+                watermark: MarketStreamWatermark {
+                    stream_epoch: watermark.stream_epoch, market_id: watermark.market_id,
+                    published_cursor: watermark.published_cursor, durable_cursor: watermark.durable_cursor,
+                    replay_floor: watermark.replay_floor,
+                },
+                last_market_event_cursor: state.last_event_cursor,
+                market: state.market.clone(), books: selected(&state.books, token_ids),
+                physical_book_cursors: selected(&state.physical_book_cursors, token_ids),
+                event_book_cursors: selected(&state.event_book_cursors, token_ids),
+                market_book_cursors: selected(&state.market_book_cursors, token_ids),
+                recoveries: selected(&state.recoveries, token_ids),
+                unresolved_seed_gaps: token_ids.iter().filter(|token|
+                    state.unresolved_seed_gaps.contains(*token)).cloned().collect(),
+                capacity_fenced: state.capacity_fenced,
+                confirmation_sequence: state.confirmation_sequence,
+                confirmation_facts: selected(&state.confirmation_facts, token_ids),
+                market_confirmation_versions: selected(&state.market_confirmation_versions, token_ids),
+            })
+        })?;
+        // A pause or disk failure racing the selected-lane read cannot pass
+        // merely because the source was ready when the request began.
+        ensure!(self.market_health.source_ready.load(Ordering::Acquire), "source unavailable");
+        Ok(snapshot)
+    }
+    /// Replay one market's complete observation groups without traversing or
+    /// retaining any unrelated market's events.
+    pub fn replay_market(
+        &self, market_id: &str, stream_epoch: &str, after_cursor: u64,
+        maximum_groups: usize, maximum_bytes: usize,
+    ) -> Result<MarketPage<Batch>> {
+        ensure!(self.market_health.source_ready.load(Ordering::Acquire), "source unavailable");
+        self.market_replay.read_state(market_id, |state, _| {
+            ensure!(state.as_ref().is_some_and(|state| state.native_cursor_domain),
+                "market replay uses obsolete cursor domain");
+            Ok(())
+        })?;
+        self.market_replay.replay(
+            market_id, stream_epoch, after_cursor, maximum_groups, maximum_bytes,
+        )
+    }
+    pub fn market_stream_watermark(&self, market_id: &str) -> Result<Option<MarketStreamWatermark>> {
+        let Some(_) = self.market_replay.watermark_optional(market_id)? else {
+            return Ok(None);
+        };
+        self.market_replay.inspect_lane(market_id, |_, replay| Ok(Some(MarketStreamWatermark {
+            stream_epoch: replay.stream_epoch.clone(),
+            market_id: market_id.to_owned(),
+            published_cursor: replay.published_cursor,
+            durable_cursor: replay.durable_cursor,
+            replay_floor: replay.replay_floor,
+        })))
+    }
     /// Bounded control-plane observation. This deliberately does not capture
     /// books and remains readable when the market-data snapshot is unavailable.
     pub fn management_status(&self) -> Result<Value> {
         let m = self.memory.lock().map_err(|_| anyhow::anyhow!("publication poisoned"))?;
+        let queued = self.market_persistence.used();
         let (wire_tokens, wire_sockets, retiring_shards) = m.acquisition_statistics
             .map(|(tokens, sockets, retiring)| (Some(tokens), Some(sockets), Some(retiring)))
             .unwrap_or((None, None, None));
@@ -334,8 +789,8 @@ impl MemoryReader {
             "wire_socket_limit":m.acquisition_detail.as_ref().and_then(|detail| detail["socket_limit"].as_u64()),
             "published_cursor":m.cursor,
             "durable_cursor":m.persisted,
-            "persistence_queue_batches":m.queued,
-            "persistence_queue_bytes":m.queued_bytes,
+            "persistence_queue_batches":m.queued.saturating_add(queued.batches),
+            "persistence_queue_bytes":m.queued_bytes.saturating_add(queued.bytes),
             "retirement_submitted":m.retirement_submitted,
             "retirement_persisted":m.retirement_persisted,
         }))
@@ -349,6 +804,15 @@ impl MemoryReader {
                 .find(|event| event["cursor"].as_u64() == Some(cursor))
                 .map(|event| (event.clone(), batch.timing_snapshot()))
         }))
+    }
+    pub fn market_timeline_event(&self, market: &str, stream_epoch: &str,
+        event_cursor: u64) -> Result<Option<(Value, Option<SourceBatchTiming>)>> {
+        ensure!(event_cursor > 0, "market timeline event cursor zero");
+        self.market_replay.find_payload(market, stream_epoch, |batch| {
+            batch.validated.events().iter()
+                .find(|event| event["cursor"].as_u64() == Some(event_cursor))
+                .map(|event| (event.clone(), batch.timing_snapshot()))
+        })
     }
     /// Control-plane identity remains readable while acquisition is
     /// intentionally paused. This does not expose books, cursors or a usable
@@ -413,6 +877,27 @@ impl MemoryReader {
         Ok(m.persisted)
     }
 
+    /// Constant-time diagnostics for a client that fell behind the shared
+    /// replay. It does not extend retention or make an expired cursor usable.
+    pub fn replay_window(&self, after: u64) -> Result<Value> {
+        let m = self.memory.lock().map_err(|_| anyhow::anyhow!("publication poisoned"))?;
+        Ok(Self::replay_window_locked(&m, after))
+    }
+
+    fn replay_window_locked(m: &Memory, after: u64) -> Value {
+        let oldest = m.replay.front();
+        let oldest_visible_at = oldest.and_then(|batch|
+            batch.timing_snapshot().and_then(|timing| timing.shared_replay_visible_at));
+        json!({"after_cursor":after,"current_cursor":m.cursor,
+            "durable_cursor":m.persisted,"resume_floor":m.resume_floor,
+            "oldest_cursor":oldest.and_then(|batch|batch.validated.events().first())
+                .and_then(|event|event["cursor"].as_u64()),
+            "oldest_replay_visible_at":oldest_visible_at,
+            "oldest_replay_age_ms":oldest_visible_at.map(|at|
+                (Utc::now()-at).num_milliseconds().max(0)),
+            "retained_batches":m.replay.len(),"retained_bytes":m.replay_bytes})
+    }
+
     /// Shared immutable batches, not per-client copies. Confirmation baseline
     /// is captured under the same lock only if this page reaches its boundary.
     pub fn replay(
@@ -422,9 +907,19 @@ impl MemoryReader {
         max_batches: usize,
         max_bytes: usize,
     ) -> Result<PublicReplay> {
+        let m = self.memory.lock().map_err(|_| anyhow::anyhow!("publication poisoned"))?;
+        Self::replay_locked(&m, after, confirmation_after, max_batches, max_bytes)
+    }
+
+    fn replay_locked(
+        m: &Memory,
+        after: u64,
+        confirmation_after: u64,
+        max_batches: usize,
+        max_bytes: usize,
+    ) -> Result<PublicReplay> {
         ensure!((1..=64).contains(&max_batches), "replay batch budget");
         ensure!(max_bytes > 0, "replay byte budget");
-        let m = self.memory.lock().unwrap();
         ensure!(m.source_ready && m.error.is_none(), "source unavailable");
         ensure!(after <= m.cursor, "future cursor");
         ensure!(after >= m.resume_floor, "memory replay expired");
@@ -482,6 +977,21 @@ impl MemoryReader {
                 confirmation_after
             },
         })
+    }
+
+    /// Include the cursor actually requested by this replay call, rather
+    /// than the initial cursor of a long-lived WS connection, on failure.
+    pub fn replay_with_diagnostics(
+        &self,
+        after: u64,
+        confirmation_after: u64,
+        max_batches: usize,
+        max_bytes: usize,
+    ) -> Result<PublicReplay> {
+        let m = self.memory.lock().map_err(|_| anyhow::anyhow!("publication poisoned"))?;
+        Self::replay_locked(&m, after, confirmation_after, max_batches, max_bytes)
+            .with_context(|| format!("replay after cursor {after}; window={}",
+                Self::replay_window_locked(&m, after)))
     }
 }
 
@@ -555,7 +1065,10 @@ impl Publication {
     pub fn reader(&self) -> MemoryReader {
         MemoryReader {
             memory: self.memory.clone(),
+            market_health: self.market_health.clone(),
             changed: self.changed.clone(),
+            market_replay: self.market_replay.clone(),
+            market_persistence: self.market_persistence.clone(),
         }
     }
     pub fn capture_view(&self) -> Result<MemoryView> {
@@ -563,13 +1076,23 @@ impl Publication {
     }
     /// Internal shutdown audit only: source readiness is deliberately false
     /// after intake stops. This does not expose a usable consumer baseline.
-    pub fn shutdown_recovery_facts(&self) -> Result<(u64, BTreeMap<String, Value>)> {
-        let memory = self
-            .memory
-            .lock()
-            .map_err(|_| anyhow::anyhow!("publication poisoned"))?;
-        ensure!(memory.error.is_none(), "publication persistence failed");
-        Ok((memory.cursor, memory.recoveries.clone()))
+    pub fn shutdown_recovery_facts(&self) -> Result<(BTreeMap<String, u64>, BTreeMap<String, Value>)> {
+        ensure!(!self.market_health.persistence_failed.load(Ordering::Acquire),
+            "publication persistence failed");
+        let markets = self.memory.lock()
+            .map_err(|_| anyhow::anyhow!("publication poisoned"))?
+            .market_stream_epochs.keys().cloned().collect::<Vec<_>>();
+        let mut event_cursors = BTreeMap::new();
+        let mut facts = BTreeMap::new();
+        for market in markets {
+            let (cursor, recoveries) = self.market_replay.inspect_lane(&market, |state, _| {
+                let state = state.as_ref().context("shutdown market state missing")?;
+                Ok((state.last_event_cursor, state.recoveries.clone()))
+            })?;
+            event_cursors.insert(market, cursor);
+            facts.extend(recoveries);
+        }
+        Ok((event_cursors, facts))
     }
     pub fn start(
         cursor: u64,
@@ -598,20 +1121,46 @@ impl Publication {
 
     pub fn start_managed(
         cursor: u64,
-        mut base: Option<Value>,
+        base: Option<Value>,
         tokens: BTreeMap<String, String>,
         max_batches: usize,
         max_bytes: usize,
         batch_cap: usize,
-        mut persist: impl FnMut(PersistenceWork<'_>) -> Result<()> + Send + 'static,
+        persist: impl FnMut(PersistenceWork<'_>) -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
+        Self::start_managed_with_replay(
+            cursor, base, tokens, max_batches, max_bytes, max_batches, max_bytes,
+            batch_cap, persist,
+        )
+    }
+
+    /// The persistence work queue and the in-memory WS replay retain different
+    /// things and must have independent bounds. A slow client may need several
+    /// seconds of replay even when the disk writer's queue is nearly empty.
+    pub fn start_managed_with_replay(
+        cursor: u64,
+        mut base: Option<Value>,
+        tokens: BTreeMap<String, String>,
+        max_batches: usize,
+        max_bytes: usize,
+        replay_max_batches: usize,
+        replay_max_bytes: usize,
+        batch_cap: usize,
+        persist: impl FnMut(PersistenceWork<'_>) -> Result<()> + Send + 'static,
     ) -> Result<Self> {
         ensure!(
-            (1..=4096).contains(&max_batches)
+            (1..=16384).contains(&max_batches)
                 && max_bytes >= batch_cap
-                && max_bytes <= 256 * 1024 * 1024
+                && max_bytes <= 4 * 1024 * 1024 * 1024
                 && batch_cap > 0
                 && batch_cap <= 32 * 1024 * 1024,
             "explicit bounded queue limits required"
+        );
+        ensure!(
+            (1..=65536).contains(&replay_max_batches)
+                && replay_max_bytes >= batch_cap
+                && replay_max_bytes <= 6 * 1024 * 1024 * 1024,
+            "explicit bounded replay limits required"
         );
         let mut books = BTreeMap::new();
         let mut book_cursors = BTreeMap::new();
@@ -664,7 +1213,7 @@ impl Publication {
             .transpose()?
             .map_or(0, |v| v.len());
         ensure!(
-            state_bytes <= max_bytes,
+            state_bytes <= max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
             "initial memory state exceeds byte budget"
         );
         if let Some(state) = &mut base {
@@ -705,11 +1254,18 @@ impl Publication {
             .map(|(market, _)| market.clone())
             .collect();
         let memory = Arc::new(Mutex::new(Memory {
+            market_stream_epochs: BTreeMap::new(),
+            market_confirmation_sequences: BTreeMap::new(),
+            market_confirmation_versions: BTreeMap::new(),
+            market_published_cursors: BTreeMap::new(),
+            market_durable_cursors: BTreeMap::new(),
+            retiring_markets: BTreeSet::new(),
             retirement_submitted: 0,
             retirement_persisted: 0,
             acquisition_statistics: None,
             acquisition_detail: None,
             binding_token_ids: tokens.keys().cloned().collect(),
+            token_market_ids: tokens.clone(),
             wire_token_ids: None,
             draining_token_ids: None,
             recoveries,
@@ -723,6 +1279,7 @@ impl Publication {
             base,
             books,
             book_cursors,
+            market_book_cursors: BTreeMap::new(),
             book_exchanges,
             markets,
             terminal_markets,
@@ -735,8 +1292,60 @@ impl Publication {
             confirmations: BTreeMap::new(),
             confirmation_facts: BTreeMap::new(),
         }));
+        // The physical archive has one writer identity. Market queues select
+        // work fairly; the archive lock is acquired only on the disk worker,
+        // never by a live market publisher.
+        let persist: Arc<Mutex<Box<dyn for<'a> FnMut(PersistenceWork<'a>) -> Result<()> + Send>>> =
+            Arc::new(Mutex::new(Box::new(persist)));
+        let legacy_persist = persist.clone();
         let (sender, receiver) = mpsc::channel::<QueuedWork>();
         let (changed, _) = watch::channel(cursor);
+        // Reserve one eighth for in-flight admission. The remaining bytes are
+        // divided into whole market partitions before any publication; no
+        // market can borrow another market's resumable history. Small offline
+        // configurations reduce the slot count if one legal group would not
+        // fit each slot. The production 2 GiB / 4-slot configuration yields
+        // four independent 448 MiB replay lanes.
+        let replay_headroom = (replay_max_bytes / 8)
+            .min(replay_max_bytes.saturating_sub(batch_cap));
+        let partitioned_bytes = replay_max_bytes - replay_headroom;
+        // A blocked disk may fill the configured writer queue without
+        // stopping memory publication. Do not split a tiny replay count into
+        // so many lanes that one market cannot retain that in-flight prefix.
+        // Parsed trees and materialized books can cost more than wire bytes;
+        // small configured budgets may therefore support fewer partitions.
+        let persistence_lane_limits = market_persistence_lane_limits(max_batches, max_bytes, batch_cap);
+        let replay_market_slots = 4usize.min(replay_max_batches)
+            .min((replay_max_batches / persistence_lane_limits.batches).max(1))
+            .min((partitioned_bytes / (batch_cap * 4)).max(1));
+        let replay_per_market_bytes = partitioned_bytes / replay_market_slots;
+        let replay_per_market_groups = (replay_max_batches / replay_market_slots).max(1);
+        // Tiny bounded fixtures deliberately exercise prefix rejection. In
+        // production-sized queues the replay lane must hold one complete
+        // undurable persistence lane, or the new disk capacity is unusable.
+        if max_bytes >= 512 * 1024 * 1024 {
+            ensure!(replay_per_market_bytes >= persistence_lane_limits.bytes,
+                "market replay lane cannot retain its undurable persistence prefix");
+        }
+        let market_replay = Arc::new(MarketReplay::<Batch, Option<MarketReadState>>::new_partitioned_with_state(
+            replay_per_market_groups, replay_per_market_bytes, replay_max_bytes,
+            replay_market_slots,
+        )?);
+        marketcow_polymarket::async_eprintln!("{}", json!({"stage":"market_replay_limits",
+            "market_slots":replay_market_slots,"groups_per_market":replay_per_market_groups,
+            "bytes_per_market":replay_per_market_bytes,
+            "total_bytes":replay_max_bytes,"admission_headroom_bytes":replay_headroom}));
+        let market_persistence = Arc::new(MarketPersistence::new(MarketPersistenceLimits {
+            batches: max_batches, bytes: max_bytes,
+        })?);
+        let replay_ack = market_replay.clone();
+        let market_health = Arc::new(MarketHealth {
+            source_ready: AtomicBool::new(true),
+            accepting_events: AtomicBool::new(true),
+            persistence_failed: AtomicBool::new(false),
+        });
+        let worker_health = market_health.clone();
+        let retirement_queue = market_persistence.clone();
         let state = memory.clone();
         let notify = changed.clone();
         let worker = thread::Builder::new()
@@ -747,11 +1356,110 @@ impl Publication {
                     let batch=match work {
                         QueuedWork::Events(batch)=>batch,
                         QueuedWork::Retire(retirement)=>{
-                            let result=persist(PersistenceWork::Retire(&retirement));
+                            let result = (|| -> Result<()> {
+                                for (market, epoch) in &retirement.market_epochs {
+                                    if retirement_queue.is_registered(market)? {
+                                        retirement_queue.wait_drained(market, epoch,
+                                            std::time::Duration::from_secs(30))?;
+                                    }
+                                }
+                                (*legacy_persist.lock().expect("physical writer poisoned"))
+                                    (PersistenceWork::Retire(&retirement))
+                            })();
                             let mut memory=state.lock().expect("publication mutex poisoned");
                             match result {
-                                Ok(())=>{memory.queued-=1;memory.queued_bytes-=retirement.bytes;memory.retirement_persisted=retirement.ticket;},
-                                Err(error)=>{memory.error=Some(format!("{error:#}"));notify.send_modify(|n|*n=n.wrapping_add(1));break;},
+                                Ok(())=>{
+                                    let released = (|| -> Result<()> {
+                                        for market in &retirement.markets {
+                                            if let Some(epoch) = retirement.market_epochs.get(market) {
+                                                if retirement_queue.is_registered(market)? {
+                                                    retirement_queue.finish_retire(market, epoch)?;
+                                                }
+                                            }
+                                            if replay_ack.is_registered(market)? {
+                                                let epoch = memory.market_stream_epochs.get(market)
+                                                    .context("retired market epoch missing")?;
+                                                replay_ack.retire_with_durability_gap(market, epoch,
+                                                    retirement.live_only_markets.contains(market))?;
+                                            }
+                                            memory.market_published_cursors.remove(market);
+                                            memory.market_durable_cursors.remove(market);
+                                            memory.market_stream_epochs.remove(market);
+                                            memory.market_confirmation_sequences.remove(market);
+                                            memory.retiring_markets.remove(market);
+                                        }
+                                        Ok(())
+                                    })();
+                                    if let Err(error) = released {
+                                        marketcow_polymarket::async_eprintln!("{}", json!({
+                                            "stage":"publication_durability_failed",
+                                            "worker":"retirement_release",
+                                            "ticket":retirement.ticket,
+                                            "markets":retirement.markets,
+                                            "error":format!("{error:#}"),
+                                        }));
+                                        worker_health.persistence_failed.store(true, Ordering::Release);
+                                        memory.error=Some(format!("{error:#}"));
+                                        notify.send_modify(|n|*n=n.wrapping_add(1));
+                                        let _=replay_ack.notify_all();
+                                        break;
+                                    }
+                                    let Some((remaining, remaining_bytes)) = memory.queued
+                                        .checked_sub(1).zip(memory.queued_bytes.checked_sub(retirement.bytes))
+                                    else {
+                                        marketcow_polymarket::async_eprintln!("{}", json!({
+                                            "stage":"publication_durability_failed",
+                                            "worker":"retirement_accounting",
+                                            "ticket":retirement.ticket,
+                                            "error":"retirement queue accounting underflow",
+                                        }));
+                                        worker_health.persistence_failed.store(true, Ordering::Release);
+                                        memory.error = Some("retirement queue accounting underflow".into());
+                                        notify.send_modify(|n| *n = n.wrapping_add(1));
+                                        break;
+                                    };
+                                    memory.queued = remaining;
+                                    memory.queued_bytes = remaining_bytes;
+                                    memory.retirement_persisted=retirement.ticket;
+                                },
+                                Err(error)=>{
+                                    if error.downcast_ref::<MarketDrainTimeout>().is_some() {
+                                        if worker_health.persistence_failed.load(Ordering::Acquire) {
+                                            // Another worker has already supplied the fatal
+                                            // physical error. Do not spin a pending retirement
+                                            // forever while shutdown joins this thread.
+                                            break;
+                                        }
+                                        marketcow_polymarket::async_eprintln!("{}", json!({
+                                            "stage":"retirement_drain_pending",
+                                            "ticket":retirement.ticket,
+                                            "market_count":retirement.markets.len(),
+                                            "markets":retirement.markets.iter().take(4).collect::<Vec<_>>(),
+                                            "error":format!("{error:#}"),
+                                        }));
+                                        // No physical retirement was attempted. Keep the
+                                        // original reservation, fence and ticket. The fair
+                                        // market writer may still drain; reusing this exact
+                                        // immutable work preserves ordered crash recovery.
+                                        pending = Some(QueuedWork::Retire(retirement));
+                                        drop(memory);
+                                        thread::sleep(std::time::Duration::from_millis(250));
+                                        continue;
+                                    }
+                                    marketcow_polymarket::async_eprintln!("{}", json!({
+                                        "stage":"publication_durability_failed",
+                                        "worker":"retirement_writer",
+                                        "ticket":retirement.ticket,
+                                        "market_count":retirement.markets.len(),
+                                        "markets":retirement.markets.iter().take(4).collect::<Vec<_>>(),
+                                        "error":format!("{error:#}"),
+                                    }));
+                                    worker_health.persistence_failed.store(true, Ordering::Release);
+                                    memory.error=Some(format!("{error:#}"));
+                                    notify.send_modify(|n|*n=n.wrapping_add(1));
+                                    let _=replay_ack.notify_all();
+                                    break;
+                                },
                             }
                             notify.send_modify(|n|*n=n.wrapping_add(1));
                             continue;
@@ -784,7 +1492,9 @@ impl Publication {
                     let first_cursor = group.first().unwrap().validated.events().first().unwrap()["cursor"].as_u64().unwrap();
                     let last_cursor = group.last().unwrap().validated.events().last().unwrap()["cursor"].as_u64().unwrap();
                     let disk_started=std::time::Instant::now();
-                    let result = persist(PersistenceWork::Events(&group));
+                    let result = (*legacy_persist.lock().expect("physical writer poisoned"))
+                        (PersistenceWork::Events(&group));
+                    let disk_elapsed = disk_started.elapsed();
                     let durable_at = result.is_ok().then(Utc::now);
                     if let Some(at) = durable_at {
                         for batch in &group {
@@ -793,29 +1503,148 @@ impl Publication {
                             }
                         }
                     }
-                    eprintln!("{}",json!({"stage":"durability_worker","elapsed_us":disk_started.elapsed().as_micros(),"event_count":count,
-                        "first_cursor":first_cursor,"last_cursor":last_cursor,"persist_succeeded_at":durable_at}));
+                    marketcow_polymarket::async_eprintln!("{}",json!({"stage":"durability_worker",
+                        "elapsed_us":disk_elapsed.as_micros(),"event_count":count,
+                        "first_cursor":first_cursor,"last_cursor":last_cursor,
+                        "persist_succeeded_at":durable_at,
+                        "persist_succeeded":result.is_ok()}));
                     let mut memory = state.lock().expect("publication mutex poisoned");
                     match result {
                         Ok(()) => {
+                            let updates = (|| -> Result<BTreeMap<String, u64>> {
+                                let mut updates = BTreeMap::new();
+                                for batch in &group {
+                                    let (market, epoch, cursor) = batch.validated
+                                        .single_market_group().context("durable market group missing")?;
+                                    ensure!(memory.market_stream_epochs.get(market)
+                                        .is_some_and(|current| current == epoch),
+                                        "durable market epoch differs");
+                                    let previous = updates.get(market).copied()
+                                        .or_else(|| memory.market_durable_cursors.get(market).copied())
+                                        .unwrap_or(0);
+                                    ensure!(previous.checked_add(1) == Some(cursor),
+                                        "durable market group gap");
+                                    replay_ack.acknowledge_durable(market, epoch, cursor)?;
+                                    updates.insert(market.to_owned(), cursor);
+                                }
+                                Ok(updates)
+                            })();
+                            let updates = match updates {
+                                Ok(updates) => updates,
+                                Err(error) => {
+                                    worker_health.persistence_failed.store(true, Ordering::Release);
+                                    memory.error = Some(format!("{error:#}"));
+                                    notify.send_modify(|n| *n = n.wrapping_add(1));
+                                    let _ = replay_ack.notify_all();
+                                    break;
+                                }
+                            };
+                            memory.market_durable_cursors.extend(updates);
                             memory.persisted = group.last().unwrap().validated.events().last().unwrap()["cursor"]
                                 .as_u64()
                                 .unwrap();
-                            memory.queued -= group.len();
-                            memory.queued_bytes -= bytes;
+                            let Some((remaining, remaining_bytes)) = memory.queued
+                                .checked_sub(group.len()).zip(memory.queued_bytes.checked_sub(bytes))
+                            else {
+                                worker_health.persistence_failed.store(true, Ordering::Release);
+                                memory.error = Some("event queue accounting underflow".into());
+                                notify.send_modify(|n| *n = n.wrapping_add(1));
+                                break;
+                            };
+                            memory.queued = remaining;
+                            memory.queued_bytes = remaining_bytes;
                         }
                         Err(error) => {
+                            marketcow_polymarket::async_eprintln!("{}", json!({
+                                "stage":"publication_durability_failed",
+                                "worker":"legacy_event_writer",
+                                "first_cursor":first_cursor,
+                                "last_cursor":last_cursor,
+                                "error":format!("{error:#}"),
+                            }));
+                            worker_health.persistence_failed.store(true, Ordering::Release);
                             memory.error = Some(format!("{error:#}"));
                             notify.send_modify(|n| *n = n.wrapping_add(1));
+                            let _ = replay_ack.notify_all();
                             break;
                         }
                     }
                     notify.send_modify(|n| *n = n.wrapping_add(1));
                 }
             })?;
+        let fair_queue = market_persistence.clone();
+        let fair_replay = market_replay.clone();
+        let fair_health = market_health.clone();
+        let fair_memory = memory.clone();
+        let fair_notify = changed.clone();
+        let market_worker = thread::Builder::new()
+            .name("polymarket-market-durability".into())
+            .spawn(move || {
+                let result = fair_queue.run_writer(&fair_replay, |work| {
+                    let group = [work.payload.clone()];
+                    (*persist.lock().expect("physical writer poisoned"))
+                        (PersistenceWork::Events(&group))?;
+                    if let Some(timing) = work.payload.timing.lock()
+                        .map_err(|_| anyhow::anyhow!("batch timing poisoned"))?.as_mut() {
+                        timing.durable_at = Some(Utc::now());
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    marketcow_polymarket::async_eprintln!("{}", json!({
+                        "stage":"publication_durability_failed",
+                        "worker":"market_writer",
+                        "error":format!("{error:#}"),
+                    }));
+                    fair_health.persistence_failed.store(true, Ordering::Release);
+                    if let Err(abandon_error) = fair_queue.abandon_pending() {
+                        marketcow_polymarket::async_eprintln!("{}", json!({
+                            "stage":"publication_durability_failed",
+                            "worker":"market_writer_cleanup",
+                            "error":format!("{abandon_error:#}"),
+                        }));
+                    }
+                    if let Ok(mut memory) = fair_memory.lock() {
+                        memory.error = Some(format!("{error:#}"));
+                    }
+                    fair_notify.send_modify(|n| *n = n.wrapping_add(1));
+                    let _ = fair_replay.notify_all();
+                }
+            })?;
+        let mut market_publishers = BTreeMap::new();
+        {
+            let mut control = memory.lock().map_err(|_| anyhow::anyhow!("publication poisoned"))?;
+            for market in tokens.values().cloned().collect::<BTreeSet<_>>() {
+                let metadata = control.markets.get(&market).cloned()
+                    .context("configured market metadata missing")?;
+                let epoch = uuid::Uuid::new_v4().simple().to_string();
+                control.market_stream_epochs.insert(market.clone(), epoch.clone());
+                market_replay.register(&market, &epoch)?;
+                market_persistence.register(&market, &epoch,
+                    market_persistence_lane_limits(max_batches, max_bytes, batch_cap))?;
+                let bindings = tokens.iter().filter(|(_, owner)| *owner == &market)
+                    .map(|(token, owner)| (token.clone(), owner.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                market_replay.update_state(&market, |state| {
+                    *state = Some(MarketReadState::bootstrap(metadata, bindings.keys().cloned().collect()));
+                })?;
+                market_publishers.insert(market.clone(), Arc::new(MarketPublisher {
+                    market_id: market, gate: Mutex::new(()), replay: market_replay.clone(),
+                    persistence: market_persistence.clone(), health: market_health.clone(),
+                    catalog_bindings: bindings, batch_cap,
+                    confirmation_byte_limit: max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
+                    volatile: AtomicBool::new(false), volatile_groups: AtomicU64::new(0),
+                }));
+            }
+        }
         Ok(Self {
             memory,
+            market_health,
             changed,
+            market_replay,
+            market_persistence,
+            market_worker: Some(market_worker),
+            market_publishers: std::sync::RwLock::new(market_publishers),
             sender: Some(sender),
             worker: Some(worker),
             tokens,
@@ -823,6 +1652,8 @@ impl Publication {
             retirement_enabled: true,
             max_batches,
             max_bytes,
+            replay_max_batches,
+            replay_max_bytes,
             batch_cap,
             hot_timing: PublicationTiming::default(),
         })
@@ -889,17 +1720,7 @@ impl Publication {
             "retired market not admitted"
         );
         ensure!(m.error.is_none(), "publication unavailable");
-        let bytes = serde_json::to_vec(
-            &json!({"after":m.cursor,"markets":markets,"cold_records":cold_records,
-                "catalog_bindings":self.pending_bindings}),
-        )?
-        .len();
-        ensure!(
-            bytes <= self.batch_cap
-                && m.queued < self.max_batches
-                && bytes <= self.max_bytes - m.queued_bytes,
-            "retirement queue capacity"
-        );
+        ensure!(markets.is_disjoint(&m.retiring_markets), "market retirement already pending");
         let removed_keys: Vec<_> = m
             .state_sizes
             .keys()
@@ -920,42 +1741,97 @@ impl Publication {
             .state_bytes
             .checked_sub(removed_bytes)
             .context("retirement size accounting")?;
-        if check_only {
-            return Ok(());
-        }
-        let ticket = m
-            .retirement_submitted
-            .checked_add(1)
+        // Keep the owner registry fenced while capturing the irreversible
+        // live-only suffix and admitting its immutable retirement work item.
+        let mut owners = self.market_publishers.write()
+            .map_err(|_| anyhow::anyhow!("market owner registry poisoned"))?;
+        let live_only_markets = markets.iter().filter(|market|
+            owners.get(*market).is_some_and(|owner| owner.volatile.load(Ordering::Acquire)))
+            .cloned().collect::<std::collections::BTreeSet<_>>();
+        let bytes = serde_json::to_vec(&json!({"after":m.cursor,"markets":markets,
+            "cold_records":cold_records,"catalog_bindings":self.pending_bindings,
+            "live_only_markets":live_only_markets}))?.len();
+        let queued = m.queued.checked_add(1).context("retirement queue count overflow")?;
+        let queued_bytes = m.queued_bytes.checked_add(bytes)
+            .context("retirement queue byte overflow")?;
+        ensure!(bytes <= self.batch_cap && queued <= self.max_batches
+            && queued_bytes <= self.max_bytes, "retirement queue capacity");
+        if check_only { return Ok(()); }
+        let ticket = m.retirement_submitted.checked_add(1)
             .context("retirement ticket overflow")?;
-        self.sender
-            .as_ref()
-            .context("writer closed")?
-            .send(QueuedWork::Retire(Retirement {
+        let market_epochs = markets.iter().filter_map(|market|
+            m.market_stream_epochs.get(market).map(|epoch| (market.clone(), epoch.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let sender = self.sender.as_ref().context("writer closed")?;
+        let registered = market_epochs.iter().map(|(market, epoch)|
+            Ok((market.clone(), epoch.clone(), self.market_persistence.is_registered(market)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut fenced: Vec<(String, String)> = Vec::new();
+        for (market, epoch, has_lane) in &registered {
+            if *has_lane {
+                if let Err(error) = self.market_persistence.begin_drain(market, epoch) {
+                    for (market, epoch) in fenced {
+                        let _ = self.market_persistence.cancel_unstarted_drain(&market, &epoch);
+                    }
+                    return Err(error);
+                }
+                fenced.push((market.clone(), epoch.clone()));
+            }
+        }
+        // The writer may finish immediately after send. Its debit must see
+        // the reservation even when a retirement has no replay lane.
+        let old_queued = m.queued;
+        let old_queued_bytes = m.queued_bytes;
+        m.queued = queued;
+        m.queued_bytes = queued_bytes;
+        let sent = sender.send(QueuedWork::Retire(Retirement {
                 ticket,
                 after: m.cursor,
                 markets: markets.clone(),
+                market_epochs,
+                live_only_markets,
                 cold_records,
                 catalog_bindings: self.pending_bindings.clone(),
                 bytes,
-            }))?;
+            }));
+        if let Err(error) = sent {
+            m.queued = old_queued;
+            m.queued_bytes = old_queued_bytes;
+            for (market, epoch) in fenced {
+                let _ = self.market_persistence.cancel_unstarted_drain(&market, &epoch);
+            }
+            return Err(error.into());
+        }
         self.pending_bindings.clear();
         m.retirement_submitted = ticket;
+        m.retiring_markets.extend(markets.iter().cloned());
+        // The selected persistence lanes are already draining. An old actor
+        // handle must not be reused if this market is admitted again with a
+        // new stream epoch after the durable retirement receipt.
+        for market in &markets {
+            owners.remove(market);
+        }
+        drop(owners);
         for key in removed_keys {
             m.state_sizes.remove(&key);
         }
         for token in &tokens {
             m.books.remove(token);
             m.book_cursors.remove(token);
+            m.market_book_cursors.remove(token);
             m.book_exchanges.remove(token);
             m.confirmations.remove(token);
             m.confirmation_facts.remove(token);
+            m.market_confirmation_versions.remove(token);
             m.recoveries.remove(token);
+            m.token_market_ids.remove(token);
             self.tokens.remove(token);
         }
         m.binding_token_ids = self.tokens.keys().cloned().collect();
         for market in &markets {
             m.markets.remove(market);
             m.terminal_markets.remove(market);
+            self.market_replay.clear_state_after_retirement_enqueue(market);
         }
         if let Some(gaps) = m.base.as_mut().and_then(|base| base["gaps"].as_array_mut()) {
             gaps.retain(|gap| {
@@ -966,8 +1842,6 @@ impl Publication {
             });
         }
         m.state_bytes = state_bytes;
-        m.queued += 1;
-        m.queued_bytes += bytes;
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }
@@ -1085,6 +1959,7 @@ impl Publication {
                 .filter(|s| !s.is_empty())
                 .context("admitted market identity")?;
             ensure!(ids.insert(market), "duplicate admitted market");
+            ensure!(!m.retiring_markets.contains(market), "market retirement pending");
             ensure!(
                 identity["condition_id"]
                     .as_str()
@@ -1145,7 +2020,7 @@ impl Publication {
         reserved.extend(additions.keys().cloned());
         ensure!(reserved.len() <= maximum_tokens, "admitted token capacity");
         ensure!(
-            state_bytes <= self.max_bytes,
+            state_bytes <= self.max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
             "admitted metadata byte capacity"
         );
         let mut pending = self.pending_bindings.clone();
@@ -1160,39 +2035,86 @@ impl Publication {
         // All validation/capacity checks precede mutation.
         for (market, size, record) in sizes {
             m.state_sizes.insert((true, market.clone()), size);
-            m.markets.insert(market, record);
+            m.markets.insert(market.clone(), record);
         }
         m.state_bytes = state_bytes;
         self.tokens.extend(additions);
         m.binding_token_ids = self.tokens.keys().cloned().collect();
+        m.token_market_ids = self.tokens.clone();
         self.pending_bindings = pending;
+        // Registration is a control-plane operation. Hot observations use
+        // their selected lane, not this catalog/metadata lock.
+        for market in acquisition {
+            let epoch = m.market_stream_epochs.entry(market.clone())
+                .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string()).clone();
+            self.market_replay.ensure_registered(market, &epoch)?;
+            self.market_persistence.register(market, &epoch,
+                market_persistence_lane_limits(self.max_batches, self.max_bytes, self.batch_cap))?;
+            let record = m.markets.get(market).cloned()
+                .context("acquired market metadata missing")?;
+            let tokens = self.tokens.iter().filter(|(_, owner)| *owner == market)
+                .map(|(token, _)| token.clone()).collect();
+            self.market_replay.update_state(market, |state| {
+                if state.is_none() {
+                    *state = Some(MarketReadState::bootstrap(record.clone(), tokens));
+                } else if let Some(current) = state.as_mut() {
+                    current.market = Some(record.clone());
+                }
+            })?;
+            let bindings = self.tokens.iter().filter(|(_, owner)| *owner == market)
+                .map(|(token, owner)| (token.clone(), owner.clone())).collect();
+            self.market_publishers.write()
+                .map_err(|_| anyhow::anyhow!("market owner registry poisoned"))?
+                .entry(market.clone()).or_insert_with(|| Arc::new(MarketPublisher {
+                    market_id: market.clone(), gate: Mutex::new(()),
+                    replay: self.market_replay.clone(),
+                    persistence: self.market_persistence.clone(),
+                    health: self.market_health.clone(), catalog_bindings: bindings,
+                    batch_cap: self.batch_cap,
+                    confirmation_byte_limit: self.max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
+                    volatile: AtomicBool::new(false), volatile_groups: AtomicU64::new(0),
+                }));
+        }
         Ok(())
     }
     pub fn set_source_ready(&self, ready: bool) {
+        if !ready { self.market_health.source_ready.store(false, Ordering::Release); }
         self.memory.lock().unwrap().source_ready = ready;
+        if ready {
+            self.market_health.accepting_events.store(true, Ordering::Release);
+            self.market_health.source_ready.store(true, Ordering::Release);
+        }
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        let _ = self.market_replay.notify_all();
+    }
+    /// A valid lease may admit the first authoritative books before the
+    /// public source-ready fence is opened. Public readers remain unavailable
+    /// until fresh native market state has actually been published.
+    pub fn resume_acquisition(&self) {
+        self.market_health.accepting_events.store(true, Ordering::Release);
     }
     pub fn is_source_ready(&self) -> bool {
         self.memory.lock().unwrap().source_ready
     }
     pub fn fresh_acquisition_started(&self, tokens: &std::collections::BTreeSet<String>) -> bool {
-        let Ok(memory) = self.memory.lock() else {
+        if self.market_health.persistence_failed.load(Ordering::Acquire) || tokens.is_empty() {
             return false;
-        };
-        memory.error.is_none()
-            && !tokens.is_empty()
-            && tokens.iter().any(|token| {
-                memory
-                    .book_cursors
-                    .get(token)
-                    .is_some_and(|cursor| *cursor >= memory.resume_floor)
-                    && !memory.recoveries.contains_key(token)
-            })
+        }
+        tokens.iter().any(|token| self.tokens.get(token).is_some_and(|market| {
+            self.market_replay.inspect_lane(market, |state, _| {
+                let Some(state) = state.as_ref() else { return Ok(false); };
+                Ok(state.native_cursor_domain && state.books.contains_key(token)
+                    && !state.recoveries.contains_key(token)
+                    && !state.unresolved_seed_gaps.contains(token))
+            }).unwrap_or(false)
+        }))
     }
     /// Intentionally stop acquisition without manufacturing an upstream gap.
     /// Existing consumers cannot resume across this boundary; the next lease
     /// must establish fresh books and obtain a new full-sync.
     pub fn pause_source(&self) -> Result<()> {
+        self.market_health.accepting_events.store(false, Ordering::Release);
+        self.market_health.source_ready.store(false, Ordering::Release);
         let mut memory = self
             .memory
             .lock()
@@ -1206,6 +2128,21 @@ impl Publication {
         memory.replay_bytes = 0;
         memory.snapshot_leases.clear();
         drop(memory);
+        self.market_replay.invalidate_all_with(|state| {
+            if let Some(previous) = state.take() {
+                if previous.native_cursor_domain {
+                    let mut fresh = MarketReadState {
+                        last_event_cursor: previous.last_event_cursor,
+                        token_ids: previous.token_ids,
+                        native_cursor_domain: true,
+                        market: previous.market,
+                        ..MarketReadState::default()
+                    };
+                    fresh.unresolved_seed_gaps = fresh.token_ids.clone();
+                    *state = Some(fresh);
+                }
+            }
+        })?;
         self.changed.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }
@@ -1238,6 +2175,16 @@ impl Publication {
     /// so there is no event cursor or durable record to manufacture. Exact raw
     /// replays are rejected by the reducer before reaching this method.
     pub fn confirm_reduced_token(
+        &self, market: &str, condition: &str, token: &str, state_checksum: &str,
+        exchange_at: DateTime<Utc>, received_at: DateTime<Utc>, source_hash: &str,
+    ) -> Result<bool> {
+        self.market_publisher(market)?.confirm_reduced_token(
+            market, condition, token, state_checksum, exchange_at, received_at, source_hash)
+    }
+}
+
+impl MarketPublisher {
+    pub(super) fn confirm_reduced_token(
         &self,
         market: &str,
         condition: &str,
@@ -1251,92 +2198,57 @@ impl Publication {
             .context("reduced confirmation receipt timestamp")?;
         let _exchange_at = chrono::DateTime::from_timestamp_micros(exchange_at.timestamp_micros())
             .context("reduced confirmation exchange timestamp")?;
-        let mut memory = self
-            .memory
-            .lock()
-            .map_err(|_| anyhow::anyhow!("publication poisoned"))?;
-        let current = memory
-            .books
-            .get(token)
-            .context("reduced confirmation book unavailable")?;
         ensure!(
-            current["token_id"] == token,
-            "reduced confirmation token differs"
-        );
-        ensure!(
-            current["condition_id"] == condition,
-            "reduced confirmation condition differs"
-        );
-        ensure!(
-            self.tokens.get(token).is_some_and(|owner| owner == market),
+            market == self.market_id
+                && self.catalog_bindings.get(token).is_some_and(|owner| owner == market),
             "reduced confirmation market differs"
         );
-        ensure!(
-            current["state_checksum"] == state_checksum,
-            "reduced confirmation state differs"
-        );
-        let mut freshness_fence = chrono::DateTime::parse_from_rfc3339(
-            current["received_at"]
-                .as_str()
-                .context("reduced confirmation current received_at")?,
-        )?
-        .with_timezone(&chrono::Utc);
-        if let Some(fact) = memory.confirmation_facts.get(token) {
-            if let Some(value) = fact["confirmed_at"].as_str() {
-                freshness_fence = freshness_fence
-                    .max(chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc));
+        self.replay.transition_state(market, |state| {
+            let current_state = state.as_ref().context("market projection unavailable")?;
+            ensure!(current_state.native_cursor_domain, "confirmation cursor domain differs");
+            ensure!(!current_state.recoveries.contains_key(token)
+                && !current_state.unresolved_seed_gaps.contains(token),
+                "confirmation during market recovery");
+            let current = current_state.books.get(token)
+                .context("reduced confirmation book unavailable")?;
+            ensure!(current["token_id"] == token && current["condition_id"] == condition,
+                "reduced confirmation book identity differs");
+            ensure!(current["state_checksum"] == state_checksum,
+                "reduced confirmation state differs");
+            let mut freshness_fence = chrono::DateTime::parse_from_rfc3339(
+                current["received_at"].as_str().context("reduced confirmation book time")?)?
+                .with_timezone(&Utc);
+            if let Some(fact) = current_state.confirmation_facts.get(token) {
+                freshness_fence = freshness_fence.max(DateTime::parse_from_rfc3339(
+                    fact["confirmed_at"].as_str().context("previous confirmation time")?)?
+                    .with_timezone(&Utc));
             }
-        }
-        // Repeated identical venue observations prove liveness, but publishing
-        // each one would turn a quiet four-token profile into a high-rate
-        // downstream control stream. One confirmation per second remains well
-        // inside the BTC5m profile's five-second quote-age budget while
-        // bounding CPU, memory wakeups, and LAN traffic.
-        if received_at - freshness_fence
-            < chrono::TimeDelta::milliseconds(WS_STATE_CONFIRMATION_MIN_INTERVAL_MS)
-        {
-            return Ok(false);
-        }
-        let mut next = current.as_ref().clone();
-        if next["book_received_at"].is_null() {
-            next["book_received_at"] = current["received_at"].clone();
-        }
-        let received_wire = received_at.to_rfc3339_opts(SecondsFormat::Micros, true);
-        next["confirmed_at"] = json!(received_wire);
-        next["confirmation_source"] = json!("polymarket_websocket_state_confirmation");
-        next["confirmation_evidence_sha256"] = json!(source_hash);
-        let fact = json!({
-            "token_id":next["token_id"],
-            "condition_id":next["condition_id"],
-            "book_epoch":next["book_epoch"],
-            "sequence":next["sequence"],
-            "state_checksum":next["state_checksum"],
-            "book_received_at":current["received_at"],
-            "confirmed_at":next["confirmed_at"],
-            "confirmation_source":next["confirmation_source"],
-            "confirmation_evidence_sha256":next["confirmation_evidence_sha256"]
-        });
-        let mut facts = memory.confirmation_facts.clone();
-        facts.insert(token.to_owned(), Arc::new(fact.clone()));
-        ensure!(
-            memory.state_bytes + serde_json::to_vec(&facts)?.len() <= self.max_bytes,
-            "confirmation state byte budget exhausted"
-        );
-        memory
-            .confirmation_facts
-            .insert(token.to_owned(), Arc::new(fact));
-        memory.confirmation_cursor = memory
-            .confirmation_cursor
-            .checked_add(1)
-            .context("confirmation cursor overflow")?;
-        let confirmation_cursor = memory.confirmation_cursor;
-        memory
-            .confirmations
-            .insert(token.to_owned(), confirmation_cursor);
-        drop(memory);
-        self.changed.send_modify(|n| *n = n.wrapping_add(1));
-        Ok(true)
+            if received_at - freshness_fence < chrono::TimeDelta::milliseconds(
+                WS_STATE_CONFIRMATION_MIN_INTERVAL_MS) {
+                return Ok((None, false));
+            }
+            let fact = Arc::new(json!({
+                "token_id":current["token_id"],"condition_id":current["condition_id"],
+                "book_epoch":current["book_epoch"],"sequence":current["sequence"],
+                "state_checksum":current["state_checksum"],
+                "book_received_at":current["received_at"],
+                "confirmed_at":received_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+                "confirmation_source":"polymarket_websocket_state_confirmation",
+                "confirmation_evidence_sha256":source_hash,
+            }));
+            let mut next = current_state.clone();
+            next.confirmation_sequence = next.confirmation_sequence.checked_add(1)
+                .context("market confirmation sequence overflow")?;
+            next.market_confirmation_versions.insert(token.to_owned(), next.confirmation_sequence);
+            next.confirmation_facts.insert(token.to_owned(), fact);
+            ensure!(serde_json::to_vec(&next.confirmation_facts)?.len() <= self.confirmation_byte_limit,
+                "confirmation state byte budget exhausted");
+            Ok((Some(Some(next)), true))
+        })
     }
+}
+
+impl Publication {
     /// Confirm a complete market pair from an independent authoritative REST
     /// observation. Matching content refreshes only the hot projection and is
     /// broadcast without consuming a causal event cursor or touching disk.
@@ -1436,11 +2348,17 @@ impl Publication {
             tokens.iter().all(|token| candidates.contains_key(token)),
             "confirmation pair incomplete"
         );
-        let mut memory = self.memory.lock().unwrap();
+        self.market_replay.transition_state(market, |state| {
+        let incumbent = state.as_ref().context("market confirmation projection unavailable")?;
+        ensure!(incumbent.native_cursor_domain, "market confirmation cursor domain differs");
         let mut confirmed = Vec::new();
         let mut superseded = 0usize;
         for token in tokens {
-            let current = memory
+            ensure!(incumbent.token_ids.contains(token)
+                && !incumbent.recoveries.contains_key(token)
+                && !incumbent.unresolved_seed_gaps.contains(token),
+                "confirmation token outside ready market");
+            let current = incumbent
                 .books
                 .get(token)
                 .context("confirmation book unavailable")?;
@@ -1455,7 +2373,7 @@ impl Publication {
             // price/size alone does not make its older receipt a fresh proof.
             // Never move either the original-book or confirmation time back.
             let mut freshness_fence = current_received;
-            if let Some(fact) = memory.confirmation_facts.get(token) {
+            if let Some(fact) = incumbent.confirmation_facts.get(token) {
                 if let Some(value) = fact["confirmed_at"].as_str() {
                     freshness_fence = freshness_fence.max(
                         chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc),
@@ -1467,7 +2385,7 @@ impl Publication {
                 continue;
             }
             let candidate = &candidates[token];
-            let current_book_exchange = memory
+            let current_book_exchange = incumbent
                 .book_exchanges
                 .get(token)
                 .context("book exchange fence unavailable")?;
@@ -1499,7 +2417,7 @@ impl Publication {
                 // A non-racing divergence still requires an atomic two-token
                 // replacement. Do not partially apply confirmations collected
                 // earlier in this loop.
-                return Ok(ConfirmationOutcome::Mismatch);
+                return Ok((None, ConfirmationOutcome::Mismatch));
             }
             let mut next = current.as_ref().clone();
             if next["book_received_at"].is_null() {
@@ -1523,8 +2441,9 @@ impl Publication {
                 superseded == tokens.len(),
                 "confirmation outcome unavailable"
             );
-            return Ok(ConfirmationOutcome::Superseded);
+            return Ok((None, ConfirmationOutcome::Superseded));
         }
+        let mut next_state = incumbent.clone();
         for (token, book) in confirmed {
             let fact = json!({
                 "token_id":book["token_id"],
@@ -1537,25 +2456,18 @@ impl Publication {
                 "confirmation_source":book["confirmation_source"],
                 "confirmation_evidence_sha256":book["confirmation_evidence_sha256"]
             });
-            let mut facts = memory.confirmation_facts.clone();
-            facts.insert(token.clone(), Arc::new(fact.clone()));
-            ensure!(
-                memory.state_bytes + serde_json::to_vec(&facts)?.len() <= self.max_bytes,
-                "confirmation state byte budget exhausted"
-            );
-            memory
-                .confirmation_facts
+            let market_sequence = next_state.confirmation_sequence.checked_add(1)
+                .context("market confirmation sequence overflow")?;
+            next_state.confirmation_sequence = market_sequence;
+            next_state.market_confirmation_versions.insert(token.clone(), market_sequence);
+            next_state.confirmation_facts
                 .insert(token.clone(), Arc::new(fact));
-            memory.confirmation_cursor = memory
-                .confirmation_cursor
-                .checked_add(1)
-                .context("confirmation cursor overflow")?;
-            let confirmation_cursor = memory.confirmation_cursor;
-            memory.confirmations.insert(token, confirmation_cursor);
         }
-        drop(memory);
-        self.changed.send_modify(|n| *n = n.wrapping_add(1));
-        Ok(ConfirmationOutcome::Confirmed)
+        ensure!(serde_json::to_vec(&next_state.confirmation_facts)?.len()
+            <= self.max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
+            "confirmation state byte budget exhausted");
+        Ok((Some(Some(next_state)), ConfirmationOutcome::Confirmed))
+        })
     }
     /// Only capacity exhaustion waits. The normal memory publication path never
     /// waits for durability. One bounded incoming batch is retained while the
@@ -1595,6 +2507,19 @@ impl Publication {
         evidence: Option<Value>,
         timing: Option<SourceBatchTiming>,
     ) -> Result<()> {
+        self.publish_with_capacity_and_materialized_prepared(
+            events, materialized_books, evidence, timing, None,
+        ).await
+    }
+
+    pub(super) async fn publish_with_capacity_and_materialized_prepared(
+        &mut self,
+        events: Vec<Value>,
+        materialized_books: BTreeMap<u64, Value>,
+        evidence: Option<Value>,
+        timing: Option<SourceBatchTiming>,
+        prepared: Option<PreparedProjection>,
+    ) -> Result<()> {
         let validation_started = std::time::Instant::now();
         let terminal = events
             .first()
@@ -1606,9 +2531,40 @@ impl Publication {
             &self.tokens,
             self.batch_cap,
         )?;
+        self.hot_timing.validation.record(validation_started.elapsed());
+        self.publish_actor_validated(validated, materialized_books, evidence, timing, prepared).await
+    }
+
+    pub(super) async fn publish_actor_validated(
+        &mut self,
+        validated: ValidatedSourceBatch,
+        materialized_books: BTreeMap<u64, Value>,
+        evidence: Option<Value>,
+        timing: Option<SourceBatchTiming>,
+        prepared: Option<PreparedProjection>,
+    ) -> Result<()> {
+        ensure!(validated.after_cursor() == self.cursor()?,
+            "actor batch publisher cursor changed");
+        let events = validated.events();
+        let market = events.first().and_then(|event| event["market_id"].as_str())
+            .context("actor batch market identity")?;
+        ensure!(events.iter().all(|event| event["market_id"] == market),
+            "actor batch crosses market boundary");
+        for event in events {
+            if let Some(token) = event["token_id"].as_str() {
+                ensure!(self.tokens.get(token).is_some_and(|owner| owner == market),
+                    "actor token binding changed before publication");
+            } else if event["event_type"] == "market_terminal" {
+                for token in event["canonical_payload"]["retired_token_ids"]
+                    .as_array().context("terminal retired tokens")? {
+                    let token = token.as_str().context("terminal retired token identity")?;
+                    ensure!(self.tokens.get(token).is_some_and(|owner| owner == market),
+                        "actor terminal binding changed before publication");
+                }
+            }
+        }
         let bytes = self.batch_bytes(&validated, evidence.as_ref())?;
         ensure!(bytes <= self.batch_cap, "batch byte limit");
-        self.hot_timing.validation.record(validation_started.elapsed());
         self.hot_timing.validated_events = self.hot_timing.validated_events
             .saturating_add(validated.events().len() as u64);
         self.hot_timing.validated_bytes = self.hot_timing.validated_bytes
@@ -1637,12 +2593,178 @@ impl Publication {
         .context("persistence capacity exhausted for 10 seconds")??;
         if waited {
             self.hot_timing.capacity_wait.record(started.elapsed());
-            eprintln!(
+            marketcow_polymarket::async_eprintln!(
                 "{}",
                 json!({"stage":"persistence_capacity_wait","elapsed_us":started.elapsed().as_micros(),"batch_bytes":bytes})
             );
         }
-        self.publish_validated(validated, materialized_books, evidence, bytes, timing)
+        self.publish_validated(validated, materialized_books, evidence, bytes, timing, prepared)
+    }
+}
+
+impl MarketPublisher {
+    /// The live market path binds actor-local event positions to this one
+    /// market's event domain. Archive positions are assigned later by the
+    /// fair disk worker and never rewrite the public bytes or group hash.
+    /// Neither projection nor writer admission takes the shared Memory lock.
+    pub(super) fn publish(
+        &self,
+        validated: ValidatedSourceBatch,
+        materialized_books: BTreeMap<u64, Value>,
+        mut prepared: PreparedProjection,
+        evidence: Option<Value>,
+        timing: Option<SourceBatchTiming>,
+    ) -> Result<Arc<Batch>> {
+        let actor_events = validated.events();
+        let market = actor_events.first().and_then(|event| event["market_id"].as_str())
+            .context("native actor market identity")?.to_owned();
+        ensure!(actor_events.iter().all(|event| event["market_id"] == market),
+            "native actor batch crosses markets");
+        ensure!(market == self.market_id, "market owner identity differs");
+        let _owner = self.gate.lock().map_err(|_| anyhow::anyhow!("market owner poisoned"))?;
+        ensure!(self.health.accepting_events.load(Ordering::Acquire), "source acquisition paused");
+        let (stream_epoch, next_group, event_after) = self.replay.inspect_lane(
+            &market, |state, watermark| {
+                let state = state.as_ref().context("market owner projection absent")?;
+                ensure!(state.native_cursor_domain, "market owner cursor domain differs");
+                Ok((watermark.stream_epoch.clone(),
+                    watermark.published_cursor.checked_add(1).context("market group cursor overflow")?,
+                    state.last_event_cursor))
+            })?;
+        let old_after = validated.after_cursor();
+        let validated = validated.rebase_after(event_after, self.batch_cap)?;
+        let materialized_books = materialized_books.into_iter().map(|(cursor, book)| {
+            Ok((event_after.checked_add(cursor.checked_sub(old_after)
+                .context("materialized cursor before actor boundary")?)
+                .context("market materialized cursor overflow")?, book))
+        }).collect::<Result<BTreeMap<_, _>>>()?;
+        prepared.rebase_from(old_after, event_after)?;
+        validate_materialized_books(validated.events(), &materialized_books)?;
+        let validated = validated.with_native_market_group(&stream_epoch, next_group)?;
+        let catalog_bindings = self.catalog_bindings.clone();
+        let binding_bytes = serde_json::to_vec(&catalog_bindings)?.len();
+        let evidence_bytes = evidence.as_ref().map(serde_json::to_vec)
+            .transpose()?.map_or(0, |data| data.len());
+        let materialized_bytes = materialized_declared_bytes(validated.events())?;
+        let bytes = validated.encoded_bytes()
+            .checked_add(materialized_bytes)
+            .and_then(|size| size.checked_add(binding_bytes))
+            .and_then(|size| size.checked_add(evidence_bytes))
+            .context("native group byte overflow")?;
+        ensure!(bytes <= self.batch_cap, "native group exceeds batch cap");
+        let materialized_retained = materialized_books.values().try_fold(0usize,
+            |total, book| total.checked_add(
+                marketcow_runtime::discovery_source::json_retained_bytes(book)
+                    .checked_add(std::mem::size_of::<(u64, Value)>() + 64)
+                    .context("native book retained charge overflow")?
+            ).context("native materialized retained charge overflow"))?;
+        let durable_retained = validated.retained_bytes()
+            .checked_add(std::mem::size_of::<Batch>() + 256)
+            .and_then(|size| size.checked_add(catalog_bindings.iter().map(|(token, owner)|
+                token.capacity() + owner.capacity() + 256).sum::<usize>()))
+            .and_then(|size| size.checked_add(evidence.as_ref().map_or(0,
+                marketcow_runtime::discovery_source::json_retained_bytes)))
+            .context("native durable retained byte overflow")?.max(bytes);
+        let retained = durable_retained.checked_add(materialized_retained)
+            .context("native retained byte overflow")?;
+        let batch = Arc::new(Batch {
+            validated, materialized_books: Mutex::new(Some(Arc::new(materialized_books))),
+            evidence, catalog_bindings, timing: Mutex::new(timing), bytes,
+            replay_retained_bytes: retained,
+        });
+        let actions = prepared.into_actions();
+        let was_volatile = self.volatile.load(Ordering::Acquire);
+        self.persistence.publish_with_replay_prepared_charged(
+            &self.replay, &market, &stream_epoch, next_group,
+            batch.validated.events(), batch.clone(), bytes, retained,
+            durable_retained, Some(&self.volatile),
+            |state| {
+                ensure!(self.health.accepting_events.load(Ordering::Acquire),
+                    "source acquisition paused");
+                state.as_ref().context("market projection absent")?
+                    .prepare_native_group(&market, next_group, batch.validated.events(), actions)
+            },
+            |state, next| {
+                *state = Some(next);
+                if let Ok(mut timing) = batch.timing.lock() {
+                    if let Some(timing) = timing.as_mut() {
+                        timing.shared_replay_visible_at = Some(Utc::now());
+                        timing.shared_replay_visible_mono = Some(std::time::Instant::now());
+                    }
+                }
+            },
+        )?;
+        if self.volatile.load(Ordering::Acquire) {
+            // No writer owns this group's post-state. The live projection has
+            // already installed its Arc; retaining a second writer-only copy
+            // would unnecessarily consume the bounded replay allowance.
+            batch.materialized_books.lock()
+                .map_err(|_| anyhow::anyhow!("materialized books poisoned"))?.take();
+            let count = self.volatile_groups.fetch_add(1, Ordering::AcqRel) + 1;
+            if !was_volatile || count % 256 == 0 {
+                marketcow_polymarket::async_eprintln!("{}", json!({
+                    "stage":"market_durability_gap", "market_id":market,
+                    "stream_epoch":stream_epoch,"first_non_durable_cursor":
+                        if was_volatile {Value::Null} else {json!(next_group)},
+                    "live_only_groups":count,
+                    "reason":if self.health.persistence_failed.load(Ordering::Acquire)
+                        {"persistence_writer_failed"} else {"persistence_queue_capacity"},
+                }));
+            }
+        }
+        Ok(batch)
+    }
+}
+
+impl Publication {
+    pub(super) fn market_publisher(&self, market: &str) -> Result<Arc<MarketPublisher>> {
+        self.market_publishers.read()
+            .map_err(|_| anyhow::anyhow!("market owner registry poisoned"))?
+            .get(market).cloned().context("market owner not admitted")
+    }
+    pub(super) fn next_market_event_cursor(&self, market: &str) -> Result<u64> {
+        self.market_replay.inspect_lane(market, |state, _| {
+            let state = state.as_ref().context("market event state missing")?;
+            ensure!(state.native_cursor_domain, "market event cursor domain differs");
+            state.last_event_cursor.checked_add(1).context("market event cursor overflow")
+        })
+    }
+
+    /// A selected market whose bounded queue cannot accept even its gap
+    /// marker becomes unavailable immediately. No other market is poisoned;
+    /// the next authoritative pair must carry the recovery barrier after
+    /// writer capacity returns. Existing clients are woken and closed rather
+    /// than allowed to keep quoting the old books.
+    pub(super) fn fence_market_capacity(&self, market: &str) -> Result<()> {
+        ensure!(self.market_replay.is_registered(market)?,
+            "market capacity fence has no registered stream");
+        self.market_replay.inspect_lane(market, |state, _| {
+            ensure!(state.is_some(), "market capacity fence has no projection");
+            Ok(())
+        })?;
+        self.market_replay.update_state(market, |state| {
+            if let Some(state) = state.as_mut() {
+                state.capacity_fenced = true;
+                state.unresolved_seed_gaps = state.token_ids.clone();
+                state.confirmation_facts.clear();
+                state.market_confirmation_versions.clear();
+            }
+        })
+    }
+
+    pub(super) fn publish_native_events(&self, events: Vec<Value>, evidence: Option<Value>) -> Result<()> {
+        let first = events.first().context("empty native source group")?;
+        let first_cursor = first["cursor"].as_u64().context("native event cursor")?;
+        let after = first_cursor.checked_sub(1).context("native event cursor zero")?;
+        let terminal = first["event_type"] == "market_terminal";
+        let validated = ValidatedSourceBatch::new_native(
+            events, terminal, after, &self.tokens, self.batch_cap)?;
+        let prepared = prepare_market_projection(validated.events(), &BTreeMap::new())?;
+        let market = validated.events()[0]["market_id"].as_str()
+            .context("native event market identity")?;
+        self.market_publisher(market)?.publish(
+            validated, BTreeMap::new(), prepared, evidence, None)?;
+        Ok(())
     }
 
     pub fn publish(&mut self, events: Vec<Value>, evidence: Option<Value>) -> Result<()> {
@@ -1659,7 +2781,7 @@ impl Publication {
             .saturating_add(validated.events().len() as u64);
         self.hot_timing.validated_bytes = self.hot_timing.validated_bytes
             .saturating_add(bytes as u64);
-        self.publish_validated(validated, BTreeMap::new(), evidence, bytes, None)
+        self.publish_validated(validated, BTreeMap::new(), evidence, bytes, None, None)
     }
     fn batch_bytes(
         &self,
@@ -1691,12 +2813,23 @@ impl Publication {
         evidence: Option<Value>,
         bytes: usize,
         timing: Option<SourceBatchTiming>,
+        prepared: Option<PreparedProjection>,
     ) -> Result<()> {
         let events = validated.events();
         let terminal = events
             .first()
             .is_some_and(|e| e["event_type"] == "market_terminal");
         ensure!(bytes <= self.batch_cap, "batch byte limit");
+        // This only checks the immutable batch and its materialized post-state.
+        // Keep it outside the shared publication lock so another market need
+        // not wait for a full-depth book comparison.
+        let projection_actions = if let Some(prepared) = prepared {
+            prepared.into_actions()
+        } else {
+            validate_materialized_books(events, &materialized_books)?;
+            prepare_projection_actions(events, &materialized_books)?
+        };
+        let materialized_books = Arc::new(materialized_books);
         let lock_started = std::time::Instant::now();
         let mut m = self.memory.lock().unwrap();
         self.hot_timing.memory_lock_wait.record(lock_started.elapsed());
@@ -1710,8 +2843,6 @@ impl Publication {
                 "event targets terminal market"
             );
         }
-        validate_materialized_books(events, &materialized_books)?;
-        let materialized_books = Arc::new(materialized_books);
         let recovery_transition = terminal
             || events.iter().any(|event| {
                 is_token_recovery(event)
@@ -1747,31 +2878,21 @@ impl Publication {
             "persistence queue capacity exhausted; publication rejected without advancing cursor"
         );
         let mut state_bytes = m.state_bytes;
-        let mut size_updates = Vec::new();
+        let mut size_updates = BTreeMap::new();
         if m.base.is_some() {
-            for event in events {
-                if is_token_recovery(event) {
-                    continue;
-                }
-                let (key, model) = if terminal {
-                    (&event["market_id"], &event["canonical_payload"]["market"])
-                } else {
-                    (
-                        &event["token_id"],
-                        materialized_books
-                            .get(&event["cursor"].as_u64().context("book event cursor")?)
-                            .unwrap_or(&event["canonical_payload"]),
-                    )
+            for action in &projection_actions {
+                let (cache_key, new_size) = match action {
+                    ProjectionAction::Terminal { market_id, state_bytes, .. } =>
+                        ((true, market_id.clone()), *state_bytes),
+                    ProjectionAction::Book { token_id, state_bytes, .. } =>
+                        ((false, token_id.clone()), *state_bytes),
                 };
-                let key = key.as_str().context("missing state identity")?;
-                let cache_key = (terminal, key.to_owned());
-                let old = m.state_sizes.get(&cache_key).copied().unwrap_or(0);
-                let new_size = match event["canonical_payload"]["materialized_book_bytes"].as_u64()
-                {
-                    Some(declared) => usize::try_from(declared)?,
-                    None => serde_json::to_vec(model)?.len(),
-                };
-                size_updates.push((cache_key, new_size));
+                // An atomic group may update the same token more than once.
+                // Account against the preceding update in this group, not
+                // repeatedly against the pre-group projection.
+                let old = size_updates.get(&cache_key).copied()
+                    .or_else(|| m.state_sizes.get(&cache_key).copied()).unwrap_or(0);
+                size_updates.insert(cache_key, new_size);
                 state_bytes = state_bytes
                     .checked_sub(old)
                     .context("state accounting underflow")?
@@ -1779,10 +2900,26 @@ impl Publication {
                     .context("state bytes overflow")?;
             }
             ensure!(
-                state_bytes <= self.max_bytes,
+                state_bytes <= self.max_bytes.min(MAX_NON_QUEUE_STATE_BYTES),
                 "memory state byte budget exhausted"
-            );
+                );
         }
+        let market_id = events.first().and_then(|event| event["market_id"].as_str())
+            .context("publication market identity")?.to_owned();
+        ensure!(events.iter().all(|event| event["market_id"] == market_id),
+            "publication batch crosses market boundary");
+        let market_cursor = m.market_published_cursors.get(&market_id).copied().unwrap_or(0)
+            .checked_add(1).context("market publication cursor overflow")?;
+        let market_epoch = m.market_stream_epochs.entry(market_id.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().simple().to_string()).clone();
+        let validated = validated.with_market_group(&market_epoch, market_cursor)?;
+        let replay_retained_bytes = validated.retained_bytes()
+            .checked_add(std::mem::size_of::<Batch>() + 256)
+            .and_then(|bytes| bytes.checked_add(evidence.as_ref().map_or(0,
+                marketcow_runtime::discovery_source::json_retained_bytes)))
+            .and_then(|bytes| bytes.checked_add(self.pending_bindings.iter().map(|(token, market)|
+                token.capacity() + market.capacity() + 256).sum::<usize>()))
+            .context("replay retained byte overflow")?.max(bytes);
         let batch = Arc::new(Batch {
             validated,
             materialized_books: Mutex::new(Some(materialized_books.clone())),
@@ -1790,97 +2927,83 @@ impl Publication {
             catalog_bindings: self.pending_bindings.clone(),
             timing: Mutex::new(timing),
             bytes,
+            replay_retained_bytes,
         });
-        self.sender
-            .as_ref()
-            .context("writer closed")?
-            .send(QueuedWork::Events(batch.clone()))?;
-        self.pending_bindings.clear();
-        for event in batch.validated.events() {
-            if is_token_recovery(event) {
-                continue;
-            }
-            if terminal {
-                m.terminal_markets
-                    .insert(event["market_id"].as_str().unwrap().to_owned());
-            }
-            if m.base.is_some() {
-                if terminal {
-                    let market_id = event["market_id"].as_str().unwrap().to_owned();
-                    m.markets.insert(
-                        market_id,
-                        Arc::new(event["canonical_payload"]["market"].clone()),
-                    );
-                } else {
-                    let token = event["token_id"].as_str().unwrap().to_owned();
-                    m.book_cursors.insert(
-                        token.clone(),
-                        event["cursor"].as_u64().context("book event cursor")?,
-                    );
-                    // best_bid_ask authenticates only the top quote already
-                    // present in the local book; it neither refreshes full
-                    // depth nor supersedes an independent REST full-book
-                    // observation. last_trade_price is likewise separate.
-                    if advances_book_confirmation_fence(event["event_type"].as_str()) {
-                        m.book_exchanges.insert(
-                            token.clone(),
-                            chrono::DateTime::parse_from_rfc3339(
-                                event["canonical_payload"]["exchange_at"]
-                                    .as_str()
-                                    .context("book event exchange_at")?,
-                            )?
-                            .with_timezone(&chrono::Utc),
-                        );
+        let sender = self.sender.as_ref().context("writer closed")?.clone();
+        let changed = self.changed.clone();
+        let replay_max_batches = self.replay_max_batches;
+        let replay_max_bytes = self.replay_max_bytes;
+        let market_id_for_commit = market_id.clone();
+        self.market_replay.ensure_registered(&market_id, &market_epoch)?;
+        let market_tokens = self.tokens.iter().filter(|(_, market)| *market == &market_id)
+            .map(|(token, _)| token.clone()).collect();
+        self.market_replay.publish_with_state_commit(
+            &market_id, market_cursor, batch.validated.events(), batch.clone(), bytes, replay_retained_bytes,
+            move |group| sender.send(QueuedWork::Events(group.payload.clone()))
+                .map_err(Into::into),
+            |market_state| {
+                m.market_published_cursors.insert(market_id_for_commit, market_cursor);
+                for action in projection_actions {
+                    match action {
+                        ProjectionAction::Terminal { market_id, model, .. } => {
+                            m.terminal_markets.insert(market_id.clone());
+                            if m.base.is_some() { m.markets.insert(market_id, model); }
+                        }
+                        ProjectionAction::Book { token_id, physical_cursor, exchange_at,
+                            clear_confirmation, model, .. } => {
+                            if m.base.is_none() { continue; }
+                            m.book_cursors.insert(token_id.clone(), physical_cursor);
+                            m.market_book_cursors.insert(token_id.clone(), market_cursor);
+                            // Top quotes and trades do not both advance the
+                            // venue book-confirmation fence.
+                            if let Some(exchange_at) = exchange_at {
+                                m.book_exchanges.insert(token_id.clone(), exchange_at);
+                            }
+                            if clear_confirmation {
+                                m.confirmations.remove(&token_id);
+                                m.confirmation_facts.remove(&token_id);
+                                m.market_confirmation_versions.remove(&token_id);
+                            }
+                            m.books.insert(token_id, model);
+                        }
                     }
-                    let next = materialized_books
-                        .get(&event["cursor"].as_u64().context("book event cursor")?)
-                        .unwrap_or(&event["canonical_payload"])
-                        .clone();
-                    if advances_book_confirmation_fence(event["event_type"].as_str()) {
-                        m.confirmations.remove(&token);
-                        m.confirmation_facts.remove(&token);
-                    }
-                    m.books.insert(token, Arc::new(next));
                 }
-            }
-        }
-        m.state_bytes = state_bytes;
-        if let Some(recoveries) = recoveries {
-            m.recoveries = recoveries;
-        }
-        m.state_sizes.extend(size_updates);
-        m.cursor = batch.validated.events().last().unwrap()["cursor"]
-            .as_u64()
-            .unwrap();
-        m.queued += 1;
-        m.queued_bytes += bytes;
-        m.replay.push_back(batch.clone());
-        m.replay_bytes += bytes;
-        m.snapshot_leases
-            .retain(|_, until| *until > std::time::Instant::now());
-        while m.replay.len() > self.max_batches || m.replay_bytes > self.max_bytes {
-            let pinned = m.snapshot_leases.keys().next().is_some_and(|after| {
-                m.replay
-                    .front()
-                    .and_then(|b| b.validated.events().last())
-                    .and_then(|e| e["cursor"].as_u64())
-                    .is_some_and(|end| end > *after)
-            });
-            if pinned && m.replay_bytes <= self.max_bytes {
-                break;
-            }
-            let old = m.replay.pop_front().unwrap();
-            m.replay_bytes -= old.bytes;
-        }
-        if let Some(timing) = batch.timing.lock().expect("batch timing poisoned").as_mut() {
-            timing.shared_replay_visible_mono = Some(std::time::Instant::now());
-            timing.shared_replay_visible_at = Some(Utc::now());
-        }
-        self.changed.send_modify(|n| *n = n.wrapping_add(1));
+                m.state_bytes = state_bytes;
+                if let Some(recoveries) = recoveries { m.recoveries = recoveries; }
+                m.state_sizes.extend(size_updates);
+                m.cursor = batch.validated.events().last().unwrap()["cursor"].as_u64().unwrap();
+                m.queued += 1;
+                m.queued_bytes += bytes;
+                m.replay.push_back(batch.clone());
+                m.replay_bytes += replay_retained_bytes;
+                m.snapshot_leases.retain(|_, until| *until > std::time::Instant::now());
+                while m.replay.len() > replay_max_batches || m.replay_bytes > replay_max_bytes {
+                    let pinned = m.snapshot_leases.keys().next().is_some_and(|after| {
+                        m.replay.front().and_then(|b| b.validated.events().last())
+                            .and_then(|e| e["cursor"].as_u64()).is_some_and(|end| end > *after)
+                    });
+                    if pinned && m.replay_bytes <= replay_max_bytes { break; }
+                    let old = m.replay.pop_front().unwrap();
+                    m.replay_bytes -= old.replay_retained_bytes;
+                }
+                if let Some(timing) = batch.timing.lock().expect("batch timing poisoned").as_mut() {
+                    timing.shared_replay_visible_mono = Some(std::time::Instant::now());
+                    timing.shared_replay_visible_at = Some(Utc::now());
+                }
+                *market_state = Some(MarketReadState::project(&m, &market_id, market_tokens));
+                changed.send_modify(|n| *n = n.wrapping_add(1));
+            },
+        )?;
+        self.pending_bindings.clear();
         self.hot_timing.memory_lock_held.record(held_started.elapsed());
         Ok(())
     }
     pub async fn finish(mut self) -> Result<()> {
+        self.market_persistence.close();
+        if let Some(worker) = self.market_worker.take() {
+            tokio::task::spawn_blocking(move || worker.join()
+                .map_err(|_| anyhow::anyhow!("market disk worker panicked"))).await??;
+        }
         self.sender.take();
         let worker = self.worker.take().unwrap();
         tokio::task::spawn_blocking(move || {
@@ -2038,7 +3161,7 @@ async fn upgrade(
                 return;
             };
             if let Err(error) = serve(socket, state).await {
-                eprintln!("memory stream closed: {error:#}");
+                marketcow_polymarket::async_eprintln!("memory stream closed: {error:#}");
             }
         })
 }
@@ -2092,7 +3215,7 @@ async fn serve(mut socket: WebSocket, stream: Arc<Stream>) -> Result<()> {
         ) {
             Ok(page) => page,
             Err(error) => {
-                eprintln!(
+                marketcow_polymarket::async_eprintln!(
                     "{}",
                     json!({"stage":"source_stream_error","at":chrono::Utc::now(),
                     "stream_id":stream_id,"window":stream.window(cursor),"error":format!("{error:#}")})
@@ -2110,7 +3233,7 @@ async fn serve(mut socket: WebSocket, stream: Arc<Stream>) -> Result<()> {
             stage_max_us[i] = stage_max_us[i].max(value);
         }
         if last_report.elapsed() >= std::time::Duration::from_secs(5) {
-            eprintln!(
+            marketcow_polymarket::async_eprintln!(
                 "{}",
                 json!({"stage":"source_stream_stages","at":chrono::Utc::now(),
                 "stream_id":stream_id,"window":stream.window(next),"frames":frames,"bytes":sent_bytes,
@@ -2147,6 +3270,55 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use marketcow_polymarket::discovery_source::{SnapshotBoundary, snapshot_event};
     use std::collections::BTreeSet;
+    #[test]
+    fn production_market_persistence_lanes_have_1_gib_and_4096_batches() {
+        let aggregate = MarketPersistenceLimits {
+            batches: 16384,
+            bytes: 4 * 1024 * 1024 * 1024,
+        };
+        let lane = market_persistence_lane_limits(aggregate.batches, aggregate.bytes,
+            16 * 1024 * 1024);
+        assert_eq!(lane.batches, 4096);
+        assert_eq!(lane.bytes, 1024 * 1024 * 1024);
+        assert!(lane.batches * 4 <= aggregate.batches);
+        assert!(lane.bytes * 4 <= aggregate.bytes);
+    }
+
+    // Tests of the legacy public queue deliberately use tiny disk limits to
+    // exercise backpressure. Keep replay's retained-allocation budget
+    // independent so those tests do not reject before reaching the disk gate.
+    fn test_start(
+        cursor: u64,
+        base: Option<Value>,
+        tokens: BTreeMap<String, String>,
+        max_batches: usize,
+        max_bytes: usize,
+        batch_cap: usize,
+        mut persist: impl FnMut(&[Arc<Batch>]) -> Result<()> + Send + 'static,
+    ) -> Result<Publication> {
+        test_start_with_replay(cursor, base, tokens, max_batches, max_bytes,
+            1024, 16 * 1024 * 1024, batch_cap, move |batches| persist(batches))
+    }
+    fn test_start_with_replay(
+        cursor: u64,
+        base: Option<Value>,
+        tokens: BTreeMap<String, String>,
+        max_batches: usize,
+        max_bytes: usize,
+        replay_batches: usize,
+        replay_bytes: usize,
+        batch_cap: usize,
+        mut persist: impl FnMut(&[Arc<Batch>]) -> Result<()> + Send + 'static,
+    ) -> Result<Publication> {
+        let mut publication = Publication::start_managed_with_replay(cursor, base, tokens,
+            max_batches, max_bytes, replay_batches, replay_bytes, batch_cap,
+            move |work| match work {
+                PersistenceWork::Events(batches) => persist(batches),
+                PersistenceWork::Retire(_) => anyhow::bail!("test writer has no retirement support"),
+            })?;
+        publication.retirement_enabled = false;
+        Ok(publication)
+    }
     #[tokio::test]
     async fn management_phase_counts_are_unique_and_fail_closed_when_metrics_missing() {
         let mut p = Publication::start_managed(0, Some(seed_with_market()), tokens(), 8, 131072, 65536,
@@ -2193,7 +3365,7 @@ mod tests {
     #[tokio::test]
     async fn timed_batch_survives_replay_and_records_visibility_and_durability() {
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
+            test_start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
         let admitted_mono = std::time::Instant::now();
         let timing = SourceBatchTiming {
             raw_batch_first_received_at: Utc::now(),
@@ -2229,6 +3401,399 @@ mod tests {
             SnapshotBoundary {market_id:"1",condition_id:"condition",token_id:token,recovery_id:"test",
                 cursor:after+i as u64+1, received_at:chrono::DateTime::from_timestamp(1700000001,0).unwrap()}).unwrap()).collect()
     }
+    fn other_market_events(after: u64) -> Vec<Value> {
+        ["21", "22"].iter().enumerate().map(|(i,token)| snapshot_event(
+            &json!({"asset_id":token,"market":"condition2","tick_size":"0.01","timestamp":"1700000000000",
+                "hash":"source","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
+            SnapshotBoundary {market_id:"2",condition_id:"condition2",token_id:token,recovery_id:"test",
+                cursor:after+i as u64+1, received_at:chrono::DateTime::from_timestamp(1700000001,0).unwrap()}).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn projection_size_accounting_replaces_existing_token_sizes() {
+        let mut p = test_start(
+            0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(()),
+        ).unwrap();
+        let initial = p.memory.lock().unwrap().state_bytes;
+        let first = events(0);
+        let first_sizes = first.iter().map(|event|
+            serde_json::to_vec(&event["canonical_payload"]).unwrap().len()
+        ).collect::<Vec<_>>();
+        p.publish(first, None).unwrap();
+        assert_eq!(p.memory.lock().unwrap().state_bytes,
+            initial + first_sizes.iter().sum::<usize>());
+        let second = events(2);
+        let second_sizes = second.iter().map(|event|
+            serde_json::to_vec(&event["canonical_payload"]).unwrap().len()
+        ).collect::<Vec<_>>();
+        p.publish(second, None).unwrap();
+        let memory = p.memory.lock().unwrap();
+        assert_eq!(memory.state_sizes[&(false, "11".to_owned())], second_sizes[0]);
+        assert_eq!(memory.state_sizes[&(false, "12".to_owned())], second_sizes[1]);
+        assert_eq!(memory.state_bytes, initial + second_sizes.iter().sum::<usize>());
+        drop(memory);
+        p.finish().await.unwrap();
+    }
+
+
+    #[test]
+    fn immutable_materialized_validation_does_not_wait_for_global_publication_lock() {
+        let mut publication = test_start(
+            0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(()),
+        ).unwrap();
+        let immutable = ValidatedSourceBatch::new(
+            events(0), false, 0, &tokens(), 65536,
+        ).unwrap();
+        let bytes = immutable.encoded_bytes();
+        let memory = publication.memory.clone();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let held = memory.lock().unwrap();
+        let worker = std::thread::spawn(move || {
+            let invalid = BTreeMap::from([(999, json!({}))]);
+            let result = publication.publish_validated(
+                immutable, invalid, None, bytes, None, None,
+            );
+            result_sender.send(result.map_err(|error| error.to_string())).unwrap();
+        });
+        let result = result_receiver.recv_timeout(std::time::Duration::from_millis(500));
+        drop(held);
+        worker.join().unwrap();
+        assert!(result.unwrap().unwrap_err().contains("materialized compact-book cursor set differs"));
+    }
+
+    #[tokio::test]
+    async fn actor_prepared_projection_rebases_and_preserves_ordered_commit() {
+        let mut prepared = prepare_market_projection(&events(0), &BTreeMap::new()).unwrap();
+        prepared.rebase(2).unwrap();
+        let mut first = prepared.take_for(&events(2)[..1]).unwrap();
+        assert!(prepared.take_for(&events(2)[..1]).is_err(),
+            "a prepared action cannot be consumed twice");
+        let second = prepared.take_for(&events(2)[1..]).unwrap();
+        assert!(prepared.is_empty());
+        match first.actions.remove(&3).unwrap() {
+            ProjectionAction::Book { physical_cursor, token_id, .. } => {
+                assert_eq!((physical_cursor, token_id.as_str()), (3, "11"));
+            }
+            _ => panic!("expected book projection"),
+        }
+        let mut publication = test_start(
+            0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(()),
+        ).unwrap();
+        let complete = prepare_market_projection(&events(0), &BTreeMap::new()).unwrap();
+        publication.publish_with_capacity_and_materialized_prepared(
+            events(0), BTreeMap::new(), None, None, Some(complete),
+        ).await.unwrap();
+        assert_eq!(publication.memory.lock().unwrap().cursor, 2);
+        assert_eq!(second.actions.len(), 1);
+        publication.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_proof_cannot_publish_after_owner_token_binding_changes() {
+        let mut publication = test_start(
+            0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(()),
+        ).unwrap();
+        let actor_events = events(0);
+        let prepared = prepare_market_projection(&actor_events, &BTreeMap::new()).unwrap();
+        let validated = ValidatedSourceBatch::new(
+            actor_events, false, 0, &tokens(), 65536,
+        ).unwrap();
+        publication.tokens.insert("11".into(), "other-market".into());
+        assert!(publication.publish_actor_validated(
+            validated, BTreeMap::new(), None, None, Some(prepared),
+        ).await.unwrap_err().to_string().contains("binding changed"));
+        assert_eq!(publication.cursor().unwrap(), 0);
+        publication.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn production_batches_commit_independent_market_stream_watermarks() {
+        let observed = Arc::new(Mutex::new(Vec::<(String, String, u64)>::new()));
+        let persisted = observed.clone();
+        let identities = tokens().into_iter().chain([
+            ("21".into(), "2".into()), ("22".into(), "2".into()),
+        ]).collect();
+        let mut p = test_start(0, Some(seed_with_second_market("21", "22")), identities,
+            16, 1024 * 1024, 65536, move |batches| {
+            for batch in batches {
+                let (market, epoch, cursor) = batch.validated.single_market_group()
+                    .context("market group proof")?;
+                persisted.lock().unwrap().push((market.into(), epoch.into(), cursor));
+            }
+            Ok(())
+        }).unwrap();
+        let reader = p.reader();
+        p.publish_native_events(events(0), None).unwrap();
+        p.publish_native_events(other_market_events(2), None).unwrap();
+        p.publish_native_events(events(4), None).unwrap();
+        assert_eq!(reader.market_stream_watermark("1").unwrap().unwrap().published_cursor, 2);
+        assert_eq!(reader.market_stream_watermark("2").unwrap().unwrap().published_cursor, 1);
+        p.finish().await.unwrap();
+        let a = reader.market_stream_watermark("1").unwrap().unwrap();
+        let b = reader.market_stream_watermark("2").unwrap().unwrap();
+        assert_eq!((a.published_cursor, a.durable_cursor), (2, 2));
+        assert_eq!((b.published_cursor, b.durable_cursor), (1, 1));
+        let held = reader.memory.lock().unwrap();
+        let isolated = reader.clone();
+        let epoch = a.stream_epoch.clone();
+        let (done, read_result) = std::sync::mpsc::channel();
+        let market_read = std::thread::spawn(move || {
+            let watermark = isolated.market_stream_watermark("1").unwrap().unwrap();
+            let page = isolated.replay_market("1", &epoch, 0, 2, 131072).unwrap();
+            let snapshot = isolated.capture_market("1", &["11".into(), "12".into()]).unwrap();
+            assert_eq!(snapshot.books.len(), 2);
+            assert_eq!(snapshot.watermark.published_cursor, watermark.published_cursor);
+            assert!(snapshot.market_book_cursors.values().all(|cursor| *cursor == 2));
+            done.send((watermark.published_cursor, page.next_cursor)).unwrap();
+        });
+        assert_eq!(read_result.recv_timeout(std::time::Duration::from_millis(500)).unwrap(), (2, 2),
+            "selected-market replay AND snapshot must not wait for the global projection lock");
+        drop(held);
+        market_read.join().unwrap();
+        let a_tokens = vec!["11".to_owned(), "12".to_owned()];
+        let b_tokens = vec!["21".to_owned(), "22".to_owned()];
+        let a_snapshot = reader.capture_market("1", &a_tokens).unwrap();
+        let b_snapshot = reader.capture_market("2", &b_tokens).unwrap();
+        assert_eq!(a_snapshot.watermark, a);
+        assert_eq!(b_snapshot.watermark, b);
+        assert_eq!(a_snapshot.market_book_cursors.values().copied().collect::<Vec<_>>(), vec![2, 2]);
+        assert_eq!(b_snapshot.market_book_cursors.values().copied().collect::<Vec<_>>(), vec![1, 1]);
+        assert!(a_snapshot.books.keys().all(|token| a_tokens.contains(token)));
+        assert!(b_snapshot.books.keys().all(|token| b_tokens.contains(token)));
+        assert!(reader.capture_market("1", &b_tokens).err().unwrap().to_string()
+            .contains("market snapshot token binding differs"));
+        let a_page = reader.replay_market("1", &a.stream_epoch, 0, 2, 131072).unwrap();
+        let b_page = reader.replay_market("2", &b.stream_epoch, 0, 2, 131072).unwrap();
+        assert_eq!((a_page.groups.len(), b_page.groups.len()), (2, 1));
+        assert_eq!(a_page.groups.iter().map(|group| group.market_cursor).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(a_page.groups[0].payload.validated.events()[0]["market_id"], "1");
+        assert_eq!(b_page.groups[0].payload.validated.events()[0]["market_id"], "2");
+        assert_eq!(a_page.durable_cursor, 2);
+        assert_eq!(b_page.durable_cursor, 1);
+        assert_ne!(a.stream_epoch, b.stream_epoch);
+        assert_eq!(observed.lock().unwrap().iter().map(|(market, _, cursor)| (market.as_str(), *cursor)).collect::<Vec<_>>(),
+            vec![("1", 1), ("2", 1), ("1", 2)]);
+    }
+
+    #[tokio::test]
+    async fn full_market_writer_lane_keeps_live_books_without_false_durable_progress() {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let identities = BTreeMap::from([
+            ("11".into(), "1".into()), ("12".into(), "1".into()),
+            ("21".into(), "2".into()), ("22".into(), "2".into()),
+        ]);
+        let p = Publication::start_managed_with_replay(0,
+            Some(seed_with_second_market("21", "22")), identities,
+            2, 1024 * 1024, 64, 2 * 1024 * 1024, 65536, move |_| {
+                gate.recv_timeout(std::time::Duration::from_secs(3))?;
+                Ok(())
+            }).unwrap();
+        let reader = p.reader();
+        p.publish_native_events(events(0), None).unwrap();
+        p.publish_native_events(events(2), None).unwrap();
+        p.publish_native_events(other_market_events(2), None).unwrap();
+        p.publish_native_events(events(4), None).unwrap();
+        let ids = vec!["11".to_owned(), "12".to_owned()];
+        let live = reader.capture_market("1", &ids).unwrap();
+        assert_eq!(live.watermark.published_cursor, 3);
+        assert_eq!(live.watermark.durable_cursor, 0);
+        assert!(!live.capacity_fenced);
+        assert_eq!(live.books.len(), 2);
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        p.finish().await.unwrap();
+        let final_watermark = reader.market_stream_watermark("1").unwrap().unwrap();
+        assert_eq!(final_watermark.durable_cursor, 1);
+        assert_eq!(final_watermark.published_cursor, 3);
+        let other = reader.market_stream_watermark("2").unwrap().unwrap();
+        assert_eq!((other.published_cursor, other.durable_cursor), (1, 1));
+    }
+    #[tokio::test]
+    async fn market_snapshot_never_rebinds_old_confirmation_after_last_trade() {
+        let source = crate::source_websocket::btc5m_reducer_fixture_sequence().unwrap();
+        let condition = format!("0x{}", "1".repeat(64));
+        let tokens = BTreeMap::from([
+            ("101".to_owned(), "4944030".to_owned()),
+            ("102".to_owned(), "4944030".to_owned()),
+        ]);
+        let mut p = test_start(42, Some(json!({"latest_cursor":42,
+            "live_stream_connected":true,"gaps":[],"books":[],"markets":[{
+                "identity":{"market_id":"4944030","condition_id":condition,
+                    "outcomes":[{"token_id":"101"},{"token_id":"102"}]}}]})),
+            tokens, 16, 8 * 1024 * 1024, 512 * 1024, |_| Ok(())).unwrap();
+        for event in &source[..3] { p.publish_native_events(vec![event.clone()], None).unwrap(); }
+        let ids = vec!["101".to_owned(), "102".to_owned()];
+        let before = p.reader().capture_market("4944030", &ids).unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339(
+            before.books["101"]["received_at"].as_str().unwrap())
+            .unwrap().with_timezone(&chrono::Utc) + chrono::TimeDelta::seconds(1);
+        assert!(p.confirm_reduced_token("4944030", &condition, "101",
+            before.books["101"]["state_checksum"].as_str().unwrap(),
+            at, at, &"a".repeat(64)).unwrap());
+        let confirmed = p.reader().capture_market("4944030", &ids).unwrap();
+        assert_eq!(confirmed.confirmation_facts.len(), 1);
+        assert_eq!(source[3]["raw_payload"]["event_type"], "last_trade_price");
+        p.publish_native_events(vec![source[3].clone()], None).unwrap();
+        let after = p.reader().capture_market("4944030", &ids).unwrap();
+        assert_eq!(after.books["101"]["received_at"], before.books["101"]["received_at"],
+            "trade must not refresh depth receive time");
+        assert_eq!(after.confirmation_sequence, confirmed.confirmation_sequence,
+            "trade must not manufacture a confirmation");
+        for (token, fact) in &after.confirmation_facts {
+            let book = &after.books[token];
+            assert_eq!(fact["book_epoch"], book["book_epoch"]);
+            assert_eq!(fact["sequence"], book["sequence"]);
+            assert_eq!(fact["state_checksum"], book["state_checksum"]);
+        }
+        assert_eq!(after.books["101"]["sequence"].as_u64().unwrap(),
+            confirmed.books["101"]["sequence"].as_u64().unwrap() + 1);
+        assert!(!after.confirmation_facts.contains_key("101"));
+        assert!(!after.market_confirmation_versions.contains_key("101"));
+        // Even a retained stale fact must not escape the coherent capture.
+        // This tests the second fence independently of mutation cleanup.
+        p.memory.lock().unwrap().confirmation_facts.insert("101".into(),
+            confirmed.confirmation_facts["101"].clone());
+        assert!(p.reader().capture_market("4944030", &ids).unwrap()
+            .confirmation_facts.is_empty());
+        p.finish().await.unwrap();
+    }
+    #[test]
+    fn native_market_projection_keeps_event_cursor_separate_from_archive_position() {
+        let replay = MarketReplay::<usize, Option<MarketReadState>>::new_with_state(
+            8, 131072, 262144).unwrap();
+        for (market, tokens) in [("1", ["11", "12"]), ("2", ["21", "22"])] {
+            replay.register(market, "epoch").unwrap();
+            replay.update_state(market, |state| *state = Some(MarketReadState {
+                token_ids: tokens.into_iter().map(str::to_owned).collect(),
+                ..MarketReadState::default()
+            })).unwrap();
+        }
+        for (market, cursor, events) in [("1", 1, events(0)),
+            ("2", 1, other_market_events(0)), ("1", 2, events(2))] {
+            let prepared = prepare_market_projection(&events, &BTreeMap::new()).unwrap();
+            replay.publish_with_state_prepare(market, cursor, &events,
+                Arc::new(cursor as usize), 1024, 2048,
+                |state| state.as_ref().context("native state missing")?
+                    .prepare_native_group(market, cursor, &events, prepared.into_actions()),
+                |_| Ok(()), |state, next| *state = Some(next)).unwrap();
+        }
+        for (market, cursor, tokens) in [("1", 2, ["11", "12"]),
+            ("2", 1, ["21", "22"])] {
+            replay.read_state(market, |state, watermark| {
+                let state = state.as_ref().unwrap();
+                assert_eq!(watermark.published_cursor, cursor);
+                assert_eq!(state.books.len(), 2);
+                assert!(tokens.iter().all(|token| state.market_book_cursors[*token] == cursor));
+                let expected_event_cursors = if market == "1" { [3, 4] } else { [1, 2] };
+                assert_eq!(tokens.map(|token| state.event_book_cursors[token]),
+                    expected_event_cursors);
+                assert!(state.physical_book_cursors.is_empty(),
+                    "unpersisted native books must not borrow physical archive positions");
+                Ok(())
+            }).unwrap();
+        }
+        replay.update_state("1", |state| {
+            let state = state.as_mut().unwrap();
+            state.confirmation_sequence = 1;
+            state.confirmation_facts.insert("11".into(), Arc::new(json!({"sequence":1})));
+            state.market_confirmation_versions.insert("11".into(), 1);
+        }).unwrap();
+        let next_events = events(4);
+        let prepared = prepare_market_projection(&next_events, &BTreeMap::new()).unwrap();
+        replay.publish_with_state_prepare("1", 3, &next_events, Arc::new(3), 1024, 2048,
+            |state| state.as_ref().unwrap().prepare_native_group(
+                "1", 3, &next_events, prepared.into_actions()),
+            |_| Ok(()), |state, next| *state = Some(next)).unwrap();
+        replay.read_state("1", |state, watermark| {
+            let state = state.as_ref().unwrap();
+            assert_eq!(watermark.published_cursor, 3);
+            assert_eq!(state.last_event_cursor, 6);
+            assert_eq!((state.event_book_cursors["11"], state.event_book_cursors["12"]), (5, 6));
+            assert!(state.confirmation_facts.is_empty());
+            assert!(state.market_confirmation_versions.is_empty());
+            assert_eq!(state.confirmation_sequence, 1,
+                "a book mutation invalidates facts without forging a new confirmation");
+            Ok(())
+        }).unwrap();
+        for invalid_events in [events(4), events(8)] {
+            let prepared = prepare_market_projection(&invalid_events, &BTreeMap::new()).unwrap();
+            let error = replay.publish_with_state_prepare("1", 4, &invalid_events,
+                Arc::new(4), 1024, 2048,
+                |state| state.as_ref().unwrap().prepare_native_group(
+                    "1", 4, &invalid_events, prepared.into_actions()),
+                |_| panic!("noncontiguous event group reached writer admission"),
+                |state, next| *state = Some(next)).err().unwrap();
+            assert!(error.to_string().contains("native market event cursor is not contiguous"));
+        }
+        let wrong_token = other_market_events(2);
+        let prepared = prepare_market_projection(&wrong_token, &BTreeMap::new()).unwrap();
+        assert!(replay.publish_with_state_prepare("1", 4, &wrong_token,
+            Arc::new(4), 1024, 2048,
+            |state| state.as_ref().unwrap().prepare_native_group(
+                "1", 4, &wrong_token, prepared.into_actions()),
+            |_| panic!("invalid projection reached writer admission"),
+            |state, next| *state = Some(next)).is_err());
+        replay.read_state("1", |_, watermark| {
+            assert_eq!(watermark.published_cursor, 3);
+            Ok(())
+        }).unwrap();
+    }
+    #[tokio::test]
+    async fn market_confirmations_are_isolated_and_mutations_clear_old_facts() {
+        let identities = tokens().into_iter().chain([
+            ("21".into(), "2".into()), ("22".into(), "2".into()),
+        ]).collect();
+        let mut p = test_start(0, Some(seed_with_second_market("21", "22")), identities,
+            8, 131072, 65536, |_| Ok(())).unwrap();
+        p.publish_native_events(events(0), None).unwrap();
+        p.publish_native_events(other_market_events(2), None).unwrap();
+        let reader = p.reader();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while reader.market_stream_watermark("1").unwrap().unwrap().durable_cursor < 1
+                || reader.market_stream_watermark("2").unwrap().unwrap().durable_cursor < 1 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        // Drain completion notifications before testing the selected-market
+        // confirmation wakeup; durability is a separate notification source.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let a_tokens = vec!["11".to_owned(), "12".to_owned()];
+        let b_tokens = vec!["21".to_owned(), "22".to_owned()];
+        let a = reader.capture_market("1", &a_tokens).unwrap();
+        let b = reader.capture_market("2", &b_tokens).unwrap();
+        let mut a_watch = reader.subscribe_market("1", &a.watermark.stream_epoch).unwrap();
+        let mut b_watch = reader.subscribe_market("2", &b.watermark.stream_epoch).unwrap();
+        a_watch.borrow_and_update();
+        b_watch.borrow_and_update();
+        let at = chrono::DateTime::from_timestamp(1700000010, 0).unwrap();
+        assert!(p.confirm_reduced_token("1", "condition", "11",
+            a.books["11"]["state_checksum"].as_str().unwrap(), at, at, &"a".repeat(64)).unwrap());
+        assert!(a_watch.has_changed().unwrap());
+        assert!(!b_watch.has_changed().unwrap());
+        let confirmed_a = reader.capture_market("1", &a_tokens).unwrap();
+        let untouched_b = reader.capture_market("2", &b_tokens).unwrap();
+        assert_eq!(confirmed_a.confirmation_sequence, 1);
+        assert_eq!(confirmed_a.market_confirmation_versions["11"], 1);
+        assert_eq!(untouched_b.confirmation_sequence, 0);
+        assert!(untouched_b.confirmation_facts.is_empty());
+        assert_eq!(untouched_b.books, b.books);
+        assert_eq!(untouched_b.watermark, b.watermark);
+        a_watch.borrow_and_update();
+        assert!(p.confirm_reduced_token("2", "condition2", "21",
+            b.books["21"]["state_checksum"].as_str().unwrap(), at, at, &"b".repeat(64)).unwrap());
+        assert!(b_watch.has_changed().unwrap());
+        assert!(!a_watch.has_changed().unwrap());
+        assert_eq!(reader.capture_market("2", &b_tokens).unwrap().confirmation_sequence, 1,
+            "market sequence must not inherit another market's confirmation count");
+        p.publish_native_events(events(4), None).unwrap();
+        let replaced_a = reader.capture_market("1", &a_tokens).unwrap();
+        assert!(replaced_a.confirmation_facts.is_empty());
+        assert!(replaced_a.market_confirmation_versions.is_empty());
+        assert_eq!(replaced_a.confirmation_sequence, 1,
+            "mutation does not manufacture a confirmation");
+        assert_eq!(reader.capture_market("2", &b_tokens).unwrap().confirmation_facts.len(), 1);
+        p.finish().await.unwrap();
+    }
     fn terminal_event(cursor: u64) -> Value {
         let mut terminal = events(cursor - 1).remove(0);
         terminal["event_type"] = json!("market_terminal");
@@ -2248,7 +3813,16 @@ mod tests {
         [("11".into(), "1".into()), ("12".into(), "1".into())].into()
     }
     fn seed() -> Value {
-        json!({"latest_cursor":0,"books":[],"markets":[],"gaps":[],"schema_version":"marketcow.polymarket.live-stream.v1","type":"state"})
+        json!({"latest_cursor":0,"books":[],"markets":[{"identity":{"market_id":"1",
+            "condition_id":"condition","outcomes":[{"token_id":"11"},{"token_id":"12"}]}}],
+            "gaps":[],"schema_version":"marketcow.polymarket.live-stream.v1","type":"state"})
+    }
+    fn seed_with_second_market(first: &str, second: &str) -> Value {
+        let mut state = seed();
+        state["markets"].as_array_mut().unwrap().push(json!({"identity":{
+            "market_id":"2","condition_id":"condition2",
+            "outcomes":[{"token_id":first},{"token_id":second}]}}));
+        state
     }
     fn seed_with_market() -> Value {
         let mut state = seed();
@@ -2272,9 +3846,38 @@ mod tests {
         publication.finish().await.unwrap();
     }
     #[tokio::test]
+    async fn metadata_only_retirement_reserves_queue_before_writer_debit() {
+        let persisted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let receipt = persisted.clone();
+        let mut publication = Publication::start_managed_with_replay(0,
+            Some(seed_with_market()), BTreeMap::new(), 2, 131072, 8,
+            512 * 1024, 65536, move |work| {
+                match work {
+                    PersistenceWork::Retire(retirement) => {
+                        assert_eq!(retirement.markets, BTreeSet::from(["1".into()]));
+                        assert!(retirement.market_epochs.is_empty());
+                        receipt.fetch_add(1, Ordering::AcqRel);
+                        Ok(())
+                    }
+                    PersistenceWork::Events(_) => anyhow::bail!("unexpected events"),
+                }
+            }).unwrap();
+        publication.retire_catalog_markets(BTreeSet::from(["1".into()])).unwrap();
+        let mut changed = publication.reader().subscribe();
+        while publication.reader().retirement_status().unwrap().1 < 1 {
+            changed.changed().await.unwrap();
+        }
+        assert_eq!(persisted.load(Ordering::Acquire), 1);
+        let view = publication.capture_view().unwrap();
+        assert_eq!(view.queued, 0);
+        assert_eq!(publication.memory.lock().unwrap().queued_bytes, 0);
+        assert!(view.markets.is_empty());
+        publication.finish().await.unwrap();
+    }
+    #[tokio::test]
     async fn hot_path_timing_is_aggregated_and_reset_without_changing_publication() {
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| Ok(())).unwrap();
+            test_start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| Ok(())).unwrap();
         p.publish(events(0), None).unwrap();
         let timing = p.take_hot_path_timing();
         assert_eq!(timing["validation"]["count"], 1);
@@ -2289,7 +3892,7 @@ mod tests {
     #[tokio::test]
     async fn async_publication_records_the_same_validation_and_commit_stages() {
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| Ok(())).unwrap();
+            test_start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| Ok(())).unwrap();
         p.publish_with_capacity_and_materialized(events(0), BTreeMap::new(), None)
             .await
             .unwrap();
@@ -2308,7 +3911,7 @@ mod tests {
         let mut cursor = 0;
         let mut base = seed();
         base["catalog_revision"] = json!("catalog");
-        let mut p = Publication::start(0, Some(base), tokens(), 1, 65536, 16384, move |batches| {
+        let mut p = test_start(0, Some(base), tokens(), 1, 65536, 16384, move |batches| {
             for batch in batches {
                 bound.extend(batch.catalog_bindings.clone());
                 validate_source_events(batch.validated.events(), false, cursor, &bound, 16384)?;
@@ -2371,8 +3974,11 @@ mod tests {
         let (started, wait) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let (observed, rows) = mpsc::channel();
+        let mut state = seed_with_market();
+        state["catalog_revision"] = json!("catalog");
+        let retired_record = state["markets"][0].clone();
         let mut p =
-            Publication::start_managed(0, Some(seed_with_market()), tokens(), 2, 65536, 16384, move |work| {
+            Publication::start_managed_with_replay(0, Some(state), tokens(), 2, 65536, 8, 512 * 1024, 16384, move |work| {
                 match work {
                     PersistenceWork::Events(batches) => {
                         observed.send("events").unwrap();
@@ -2407,18 +4013,104 @@ mod tests {
         assert_eq!(view.queued, 2);
         assert!(p.tokens.is_empty());
         assert!(p.publish(events(2), None).is_err());
+        let attempted = vec![retired_record];
+        let attempted_sha = canonical_hash(&json!(attempted));
+        let admission_error = p.check_catalog_admission("catalog", attempted,
+            &attempted_sha, &BTreeSet::from(["1".into()]), 2).unwrap_err();
+        assert!(admission_error.to_string().contains("market retirement pending"));
+        let reader = p.reader();
+        assert_eq!(reader.market_stream_watermark("1").unwrap().unwrap().published_cursor, 1);
         release.send(()).unwrap();
         p.finish().await.unwrap();
+        assert!(reader.market_stream_watermark("1").unwrap().is_none());
+        assert_eq!(reader.market_replay.total_bytes(), 0);
         assert_eq!(
             rows.into_iter().collect::<Vec<_>>(),
             vec!["events", "retired"]
         );
     }
 
+    /// Exercises the production 30-second drain deadline, not a shortened
+    /// test-only timeout. A backlog is pending work, never proof of disk
+    /// corruption or permission to discard the journal ticket.
+    #[tokio::test]
+    #[ignore = "31-second physical-writer stall fault injection"]
+    async fn retirement_timeout_retries_same_ticket_and_other_market_stays_live() {
+        let (started, wait) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let first_write = AtomicBool::new(true);
+        let identities = tokens().into_iter().chain([
+            ("21".into(), "2".into()), ("22".into(), "2".into()),
+        ]).collect();
+        let mut p = Publication::start_managed_with_replay(
+            0, Some(seed_with_second_market("21", "22")), identities,
+            16, 1024 * 1024, 1024, 16 * 1024 * 1024, 65536,
+            move |work| {
+                if matches!(work, PersistenceWork::Events(_))
+                    && first_write.swap(false, Ordering::AcqRel) {
+                    started.send(()).unwrap();
+                    let _ = gate.recv();
+                }
+                Ok(())
+            }).unwrap();
+        p.publish_native_events(events(0), None).unwrap();
+        wait.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        p.retire_catalog_markets(BTreeSet::from(["1".into()])).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(31));
+        {
+            let m = p.memory.lock().unwrap();
+            assert!(m.error.is_none(), "waiting for earlier writes must not poison publication");
+            assert_eq!((m.retirement_submitted, m.retirement_persisted), (1, 0));
+            assert!(m.retiring_markets.contains("1"));
+        }
+        p.publish_native_events(other_market_events(2), None).unwrap();
+        let b = p.reader().market_stream_watermark("2").unwrap().unwrap();
+        assert_eq!((b.published_cursor, b.durable_cursor), (1, 0));
+        release.send(()).unwrap();
+        let mut changed = p.changed.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if p.memory.lock().unwrap().retirement_persisted == 1 { break; }
+                changed.changed().await.unwrap();
+            }
+        }).await.unwrap();
+        assert!(p.reader().market_stream_watermark("1").unwrap().is_none());
+        assert!(p.reader().market_stream_watermark("2").unwrap().is_some());
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readmitted_market_starts_new_stream_epoch_after_durable_retirement() {
+        let mut state = seed_with_market();
+        state["catalog_revision"] = json!("catalog");
+        let record = state["markets"][0].clone();
+        let mut p = Publication::start_managed(0, Some(state), tokens(), 8, 131072, 65536,
+            |_| Ok(())).unwrap();
+        p.publish(events(0), None).unwrap();
+        let reader = p.reader();
+        let old = reader.market_stream_watermark("1").unwrap().unwrap();
+        p.retire_catalog_markets(BTreeSet::from(["1".into()])).unwrap();
+        let mut changed = reader.subscribe();
+        while reader.retirement_status().unwrap().1 < 1 {
+            changed.changed().await.unwrap();
+        }
+        assert!(reader.market_stream_watermark("1").unwrap().is_none());
+        let records = vec![record];
+        let sha = canonical_hash(&json!(records));
+        p.admit_catalog_markets_scoped("catalog", records, &sha,
+            &BTreeSet::from(["1".into()]), 2).unwrap();
+        p.publish(events(2), None).unwrap();
+        let fresh = reader.market_stream_watermark("1").unwrap().unwrap();
+        assert_ne!(fresh.stream_epoch, old.stream_epoch);
+        assert_eq!(fresh.published_cursor, 1);
+        assert!(reader.replay_market("1", &old.stream_epoch, 0, 1, 65536).is_err());
+        p.finish().await.unwrap();
+    }
+
     #[tokio::test]
     async fn terminal_market_cannot_be_resurrected_by_late_book_or_gap() {
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
+            test_start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
         p.publish(events(0), None).unwrap();
         p.publish(vec![terminal_event(3)], None).unwrap();
         let view = p.capture_view().unwrap();
@@ -2450,7 +4142,7 @@ mod tests {
         let mut base = seed();
         base["catalog_revision"] = json!("catalog");
         let mut p =
-            Publication::start(0, Some(base), tokens(), 2, 65536, 16384, |_| Ok(())).unwrap();
+            test_start(0, Some(base), tokens(), 2, 65536, 16384, |_| Ok(())).unwrap();
         let records:Vec<_>=["2","3"].into_iter().map(|id|json!({"identity":{"market_id":id,
             "condition_id":format!("c{id}"),"outcomes":[{"token_id":format!("{id}1")},{"token_id":format!("{id}2")}]}})).collect();
         let hash = canonical_hash(&json!(records));
@@ -2459,13 +4151,13 @@ mod tests {
             p.admit_catalog_markets_scoped("catalog", records.clone(), &hash, &selected, 2)
                 .is_err()
         );
-        assert!(p.capture_view().unwrap().markets.is_empty());
+        assert_eq!(p.capture_view().unwrap().markets.len(), 1);
         p.admit_catalog_markets_scoped("catalog", records.clone(), &hash, &selected, 4)
             .unwrap();
         assert_eq!(p.tokens.len(), 4);
         assert!(!p.tokens.contains_key("31"));
         let view = p.capture_view().unwrap();
-        assert_eq!(view.markets.len(), 2);
+        assert_eq!(view.markets.len(), 3);
         assert!(view.books.is_empty());
         // Later promotion binds the already admitted metadata without replacing it.
         let selected = std::collections::BTreeSet::from(["3".into()]);
@@ -2479,9 +4171,10 @@ mod tests {
     async fn catalog_admission_cannot_steal_unsubscribed_dependency_token() {
         let mut base = seed();
         base["catalog_revision"] = json!("catalog");
-        base["markets"] = json!([{"identity":{"market_id":"dependency","outcomes":[{"token_id":"x"},{"token_id":"y"}]}}]);
+        base["markets"].as_array_mut().unwrap().push(json!({"identity":{
+            "market_id":"dependency","outcomes":[{"token_id":"x"},{"token_id":"y"}]}}));
         let mut p =
-            Publication::start(0, Some(base), tokens(), 2, 65536, 16384, |_| Ok(())).unwrap();
+            test_start(0, Some(base), tokens(), 2, 65536, 16384, |_| Ok(())).unwrap();
         let records = vec![
             json!({"identity":{"market_id":"new","condition_id":"new","outcomes":[{"token_id":"x"},{"token_id":"z"}]}}),
         ];
@@ -2502,7 +4195,8 @@ mod tests {
         // Exercises the exact MemoryReader used by both public Rust APIs, not
         // a synthetic socket queue. A separate HTTP/WS test is still required.
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 2, 65536, 16384, |_| Ok(())).unwrap();
+            test_start_with_replay(0, Some(seed()), tokens(), 2, 65536,
+                2, 512 * 1024, 16384, |_| Ok(())).unwrap();
         let fast = p.reader();
         let slow = p.reader();
         let mut fast_cursor = 0;
@@ -2535,7 +4229,7 @@ mod tests {
         let (started, wait) = mpsc::channel();
         let (release, gate) = mpsc::channel();
         let mut first = true;
-        let mut p = Publication::start(0, Some(seed()), tokens(), 4, 65536, 16384, move |_| {
+        let mut p = Publication::start_managed_with_replay(0, Some(seed()), tokens(), 4, 65536, 4, 262144, 16384, move |_| {
             if first {
                 first = false;
                 started.send(()).unwrap();
@@ -2573,7 +4267,7 @@ mod tests {
         let counts = Arc::new(Mutex::new(Vec::new()));
         let captured = counts.clone();
         let mut first = true;
-        let mut p = Publication::start(0, None, tokens(), 8, 131072, 65536, move |group| {
+        let mut p = test_start(0, Some(seed()), tokens(), 8, 131072, 65536, move |group| {
             captured.lock().unwrap().push(
                 group
                     .iter()
@@ -2607,7 +4301,7 @@ mod tests {
     async fn capacity_wait_resumes_without_dropping_or_advancing_early() {
         let (release, gate) = mpsc::channel();
         let mut first = true;
-        let mut p = Publication::start(0, None, tokens(), 1, 65536, 16384, move |_| {
+        let mut p = test_start(0, Some(seed()), tokens(), 1, 65536, 16384, move |_| {
             if first {
                 first = false;
                 gate.recv_timeout(std::time::Duration::from_secs(3))?;
@@ -2637,7 +4331,7 @@ mod tests {
     async fn token_gap_is_streamed_without_stopping_other_books_or_snapshot() {
         use marketcow_polymarket::discovery_source::canonical_hash;
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
+            test_start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
         p.publish(events(0), None).unwrap();
         let mut status = events(2).remove(0);
         status["event_type"] = json!("recovery_started");
@@ -2673,7 +4367,7 @@ mod tests {
     #[tokio::test]
     async fn queue_limit_includes_inflight_and_does_not_advance_cursor() {
         let (release, gate) = mpsc::channel();
-        let mut p = Publication::start(0, None, tokens(), 1, 16384, 16384, move |_| {
+        let mut p = Publication::start_managed_with_replay(0, Some(seed()), tokens(), 1, 16384, 1, 512 * 1024, 16384, move |_| {
             gate.recv_timeout(std::time::Duration::from_secs(3))?;
             Ok(())
         })
@@ -2686,12 +4380,18 @@ mod tests {
                 .contains("capacity")
         );
         assert_eq!(p.cursor().unwrap(), 2);
+        let watermark = p.reader().market_stream_watermark("1").unwrap().unwrap();
+        assert_eq!((watermark.published_cursor, watermark.durable_cursor), (1, 0));
+        // Global batches cannot be replayed under a native market cursor.
+        assert!(p.reader().replay_market("1", &watermark.stream_epoch, 0, 2, 16384).is_err());
         release.send(()).unwrap();
+        let reader = p.reader();
         p.finish().await.unwrap();
+        assert_eq!(reader.market_stream_watermark("1").unwrap().unwrap().durable_cursor, 1);
     }
     #[tokio::test]
     async fn disk_failure_is_visible_and_drain_fails() {
-        let mut p = Publication::start(0, None, tokens(), 4, 65536, 16384, |_| {
+        let mut p = test_start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| {
             anyhow::bail!("injected disk failure")
         })
         .unwrap();
@@ -2707,6 +4407,28 @@ mod tests {
         assert!(p.publish(events(2), None).is_err());
         assert!(p.finish().await.is_err());
     }
+
+    #[tokio::test]
+    async fn native_market_remains_live_only_after_physical_writer_failure() {
+        let p = test_start(0, Some(seed()), tokens(), 8, 1024 * 1024, 65536,
+            |_| anyhow::bail!("injected physical write failure")).unwrap();
+        let reader = p.reader();
+        p.publish_native_events(events(0), None).unwrap();
+        let mut changed = p.changed.subscribe();
+        while p.memory.lock().unwrap().error.is_none() {
+            changed.changed().await.unwrap();
+        }
+        let before = reader.market_stream_watermark("1").unwrap().unwrap();
+        assert_eq!((before.published_cursor, before.durable_cursor), (1, 0));
+        p.publish_native_events(events(2), None).unwrap();
+        let after = reader.market_stream_watermark("1").unwrap().unwrap();
+        assert_eq!((after.published_cursor, after.durable_cursor), (2, 0));
+        assert_eq!(reader.replay_market("1", &after.stream_epoch, 0, 2, 65536)
+            .unwrap().groups.len(), 2);
+        assert_eq!(reader.capture_market("1", &["11".into(), "12".into()])
+            .unwrap().watermark.durable_cursor, 0);
+        assert!(p.finish().await.is_err(), "failed archive remains explicitly failed");
+    }
     #[tokio::test]
     async fn byte_budget_rejects_before_item_budget() {
         let batch = events(0);
@@ -2716,7 +4438,7 @@ mod tests {
             .map(Vec::len)
             .sum::<usize>();
         let (release, gate) = mpsc::channel();
-        let mut p = Publication::start(0, None, tokens(), 100, cap, cap, move |_| {
+        let mut p = Publication::start_managed_with_replay(0, Some(seed()), tokens(), 100, cap, 100, 512 * 1024, cap, move |_| {
             gate.recv_timeout(std::time::Duration::from_secs(3))?;
             Ok(())
         })
@@ -2734,7 +4456,7 @@ mod tests {
     }
     #[tokio::test]
     async fn corrupt_batch_never_publishes_or_reaches_disk() {
-        let mut p = Publication::start(0, None, tokens(), 4, 65536, 16384, |_| {
+        let mut p = test_start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| {
             panic!("invalid event persisted")
         })
         .unwrap();
@@ -2795,7 +4517,7 @@ mod tests {
                 .map(|e| e["canonical_payload"].clone())
                 .collect::<Vec<_>>()
         );
-        let mut p = Publication::start(2, Some(base), tokens(), 8, 131072, 16384, move |batches| {
+        let mut p = test_start(2, Some(base), tokens(), 8, 131072, 16384, move |batches| {
             writer.append_validated_group(&batches.iter().map(|b| &b.validated).collect::<Vec<_>>())
         })
         .unwrap();
@@ -2859,7 +4581,7 @@ mod tests {
     #[tokio::test]
     async fn raw_websocket_delivers_before_blocked_disk_completes() {
         let (release, gate) = mpsc::channel();
-        let mut p = Publication::start(0, Some(seed()), tokens(), 4, 65536, 16384, move |_| {
+        let mut p = test_start(0, Some(seed()), tokens(), 4, 65536, 16384, move |_| {
             gate.recv_timeout(std::time::Duration::from_secs(3))?;
             Ok(())
         })
@@ -2896,7 +4618,7 @@ mod tests {
         assert_eq!(frame["persisted_cursor"], 0);
         assert_eq!(frame["events"][0]["cursor"], 1);
         assert_eq!(frame["events"][1]["cursor"], 2);
-        eprintln!(
+        marketcow_polymarket::async_eprintln!(
             "blocked-disk raw WS latency_us={} published=2 persisted=0",
             start.elapsed().as_micros()
         );
@@ -2906,324 +4628,63 @@ mod tests {
     }
     #[tokio::test]
     async fn matching_rest_pair_refreshes_memory_without_cursor_or_disk_event() {
-        let mut p =
-            Publication::start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
-        p.publish(events(0), None).unwrap();
-        let mut changed = p.changed.subscribe();
-        while p.persisted_cursor() < 2 {
-            changed.changed().await.unwrap();
-        }
-        let raw = vec![
-            json!({"asset_id":"11","market":"condition","tick_size":"0.01","timestamp":"1700000000000","hash":"confirm-11","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
-            json!({"asset_id":"12","market":"condition","tick_size":"0.01","timestamp":"1700000000000","hash":"confirm-12","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
-        ];
-        let tokens = ["11".to_owned(), "12".to_owned()];
+        let p = test_start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
+        p.publish_native_events(events(0), None).unwrap();
+        let ids = vec!["11".to_owned(), "12".to_owned()];
+        let before = p.reader().capture_market("1", &ids).unwrap();
+        let raw = ids.iter().map(|token| json!({"asset_id":token,"market":"condition",
+            "tick_size":"0.01","timestamp":"1700000000000","hash":"confirm",
+            "bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]})).collect::<Vec<_>>();
         let requested = chrono::DateTime::from_timestamp(1_700_000_002, 0).unwrap();
         let received = chrono::DateTime::from_timestamp(1_700_000_003, 0).unwrap();
-        let before_confirmation = p.capture_view().unwrap();
-        let old_book = before_confirmation.books["11"].clone();
-        assert_eq!(
-            p.confirm_market("1", "condition", &tokens, &raw, requested, received)
-                .unwrap(),
-            ConfirmationOutcome::Confirmed
-        );
-        assert_eq!((p.cursor().unwrap(), p.persisted_cursor()), (2, 2));
-        let after_confirmation = p.capture_view().unwrap();
-        assert_eq!(before_confirmation.confirmation_sequence, 0);
-        assert_eq!(after_confirmation.confirmation_sequence, 2);
-        assert!(Arc::ptr_eq(&old_book, &before_confirmation.books["11"]));
-        assert!(Arc::ptr_eq(&old_book, &after_confirmation.books["11"]));
-        assert!(old_book["confirmed_at"].is_null());
-        assert!(!after_confirmation.confirmation_facts["11"]["confirmed_at"].is_null());
-        // Same-content responses that arrive at this stage late cannot roll
-        // back timestamps or allocate a new confirmation sequence/cursor.
-        for stale in [requested, received] {
-            assert_eq!(
-                p.confirm_market("1", "condition", &tokens, &raw, requested, stale)
-                    .unwrap(),
-                ConfirmationOutcome::Superseded
-            );
-            let unchanged = p.capture_view().unwrap();
-            assert_eq!(
-                unchanged.confirmation_sequence,
-                after_confirmation.confirmation_sequence
-            );
-            assert_eq!(unchanged.cursor, after_confirmation.cursor);
-            assert_eq!(unchanged.books, after_confirmation.books);
-        }
-        let page = p.reader().replay(0, 0, 1, 131072).unwrap();
-        assert_eq!(page.next, 2);
-        assert!(page.caught_up);
-        assert_eq!(page.confirmation_sequence, 2);
-        assert_eq!(page.confirmation_books.len(), 2);
-        assert_eq!(
-            page.batches[0].validated.events().last().unwrap()["cursor"],
-            2
-        );
-        let no_repeat = p.reader().replay(2, 2, 1, 131072).unwrap();
-        assert!(no_repeat.batches.is_empty());
-        assert!(no_repeat.confirmation_books.is_empty());
-        assert!(p.reader().replay(3, 2, 1, 131072).is_err());
-        assert!(p.reader().replay(0, 0, 1, 1).is_err());
-        let stream = Stream {
-            memory: p.memory.clone(),
-            changed: p.changed.clone(),
-            frame_cap: 131072,
-            permits: Arc::new(Semaphore::new(1)),
-        };
-        let (frame, cursor, confirmation_cursor) = stream.page(2, 0).unwrap();
-        assert_eq!(cursor, 2);
-        assert_eq!(confirmation_cursor, 2);
-        assert_eq!(frame["type"], "book_confirmations");
-        assert_eq!(frame["books"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            frame["books"][0]["confirmation_evidence_sha256"],
-            canonical_hash(&raw[0])
-        );
-        assert_ne!(
-            frame["books"][0]["confirmation_evidence_sha256"],
-            raw[0]["hash"]
-        );
-        assert_eq!(
-            frame["books"][0]["book_received_at"],
-            "2023-11-14T22:13:21Z"
-        );
-        assert_eq!(frame["books"][0]["confirmed_at"], "2023-11-14T22:13:23Z");
-        let (causal, event_cursor, confirmation_cursor) = stream.page(0, 0).unwrap();
-        assert_eq!(causal["type"], "events");
-        assert_eq!(event_cursor, 2);
-        assert_eq!(confirmation_cursor, 0);
-        let (priority, event_cursor, confirmation_cursor) =
-            stream.page(event_cursor, confirmation_cursor).unwrap();
-        assert_eq!(priority["type"], "book_confirmations");
-        assert_eq!(event_cursor, 2);
-        assert_eq!(confirmation_cursor, 2);
-        // The venue sends last trades independently from order-book changes.
-        // A REST book may therefore have the same levels while its trade field
-        // lags the newer WS value.  That still confirms book freshness and
-        // must not overwrite the causally newer trade.
-        {
-            let mut memory = p.memory.lock().unwrap();
-            Arc::make_mut(memory.books.get_mut("11").unwrap())["last_trade_price"] = json!("0.55");
-            Arc::make_mut(memory.books.get_mut("11").unwrap())["exchange_at"] =
-                json!("2023-11-14T22:13:24Z");
-        }
-        assert_eq!(
-            p.confirm_market(
-                "1",
-                "condition",
-                &tokens,
-                &raw,
-                chrono::DateTime::from_timestamp(1_700_000_005, 0).unwrap(),
-                chrono::DateTime::from_timestamp(1_700_000_006, 0).unwrap(),
-            )
-            .unwrap(),
-            ConfirmationOutcome::Confirmed
-        );
-        let (confirmation, _, next_confirmation_cursor) =
-            stream.page(2, confirmation_cursor).unwrap();
-        assert_eq!(confirmation["type"], "book_confirmations");
-        assert_eq!(
-            p.capture_view().unwrap().books["11"]["last_trade_price"],
-            "0.55"
-        );
-        assert!(confirmation["books"][0].get("last_trade_price").is_none());
-        assert!(confirmation["books"][0].get("exchange_at").is_none());
-        assert_eq!(next_confirmation_cursor, confirmation_cursor + 2);
-        let mut divergent = raw.clone();
-        divergent[0]["bids"][0]["size"] = json!("9");
-        assert_eq!(
-            p.confirm_market(
-                "1",
-                "condition",
-                &tokens,
-                &divergent,
-                chrono::DateTime::from_timestamp(1_700_000_007, 0).unwrap(),
-                chrono::DateTime::from_timestamp(1_700_000_008, 0).unwrap()
-            )
-            .unwrap(),
-            ConfirmationOutcome::Mismatch
-        );
-        // A newer, divergent WS state for one token must not prevent its quiet,
-        // exactly matching sibling from receiving an independent freshness
-        // confirmation. The newer token itself is never overwritten.
-        let mut partly_superseded = raw.clone();
-        partly_superseded[0]["bids"][0]["size"] = json!("9");
-        assert_eq!(
-            p.confirm_market(
-                "1",
-                "condition",
-                &tokens,
-                &partly_superseded,
-                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
-                chrono::DateTime::from_timestamp(1_700_000_007, 0).unwrap()
-            )
-            .unwrap(),
-            ConfirmationOutcome::Confirmed
-        );
-        let (_, _, partial_confirmation_cursor) = stream.page(2, next_confirmation_cursor).unwrap();
-        assert_eq!(partial_confirmation_cursor, next_confirmation_cursor + 1);
-        divergent[1]["bids"][0]["size"] = json!("9");
-        assert_eq!(
-            p.confirm_market(
-                "1",
-                "condition",
-                &tokens,
-                &divergent,
-                chrono::DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
-                chrono::DateTime::from_timestamp(1_700_000_006, 0).unwrap()
-            )
-            .unwrap(),
-            ConfirmationOutcome::Superseded
-        );
-        // Venue time fences a REST snapshot older than the current WS state,
-        // even when the WS frame arrived before this request began.
-        let mut stale = divergent.clone();
-        stale[0]["timestamp"] = json!("1699999999000");
-        stale[1]["timestamp"] = json!("1699999999000");
-        assert_eq!(
-            p.confirm_market(
-                "1",
-                "condition",
-                &tokens,
-                &stale,
-                chrono::DateTime::from_timestamp(1_700_000_010, 0).unwrap(),
-                chrono::DateTime::from_timestamp(1_700_000_011, 0).unwrap()
-            )
-            .unwrap(),
-            ConfirmationOutcome::Superseded
-        );
-        // A newly opened targeted official WS stream is itself the current
-        // baseline. Its venue timestamp may be older than the main stream's
-        // last mutation, so only a concurrent local receipt fences it.
-        assert_eq!(
-            p.confirm_targeted_market(
-                "1",
-                "condition",
-                &tokens,
-                &stale,
-                chrono::DateTime::from_timestamp(1_700_000_010, 0).unwrap(),
-                chrono::DateTime::from_timestamp(1_700_000_011, 0).unwrap()
-            )
-            .unwrap(),
-            ConfirmationOutcome::Mismatch
-        );
+        assert_eq!(p.confirm_market("1", "condition", &[ids[0].clone(), ids[1].clone()],
+            &raw, requested, received).unwrap(), ConfirmationOutcome::Confirmed);
+        let after = p.reader().capture_market("1", &ids).unwrap();
+        assert_eq!(after.watermark.stream_epoch, before.watermark.stream_epoch);
+        assert_eq!(after.watermark.published_cursor, before.watermark.published_cursor);
+        assert_eq!(after.confirmation_sequence, before.confirmation_sequence + 2);
+        assert_eq!(after.books, before.books);
+        assert_eq!(after.confirmation_facts.len(), 2);
+        assert_eq!(p.confirm_market("1", "condition", &[ids[0].clone(), ids[1].clone()],
+            &raw, requested, received).unwrap(), ConfirmationOutcome::Superseded);
         p.finish().await.unwrap();
     }
     #[tokio::test]
     async fn websocket_precision_is_canonicalized_for_confirmation_boundary() {
-        let mut p =
-            Publication::start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
-        p.publish(events(0), None).unwrap();
-        let raw = vec![
-            json!({"asset_id":"11","market":"condition","tick_size":"0.01","timestamp":"1700000000000","hash":"confirm-11","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
-            json!({"asset_id":"12","market":"condition","tick_size":"0.01","timestamp":"1700000000000","hash":"confirm-12","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
-        ];
-        let tokens = ["11".to_owned(), "12".to_owned()];
+        let p = test_start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
+        p.publish_native_events(events(0), None).unwrap();
+        let ids = vec!["11".to_owned(), "12".to_owned()];
+        let raw = ids.iter().map(|token| json!({"asset_id":token,"market":"condition",
+            "tick_size":"0.01","timestamp":"1700000000000","hash":"confirm",
+            "bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]})).collect::<Vec<_>>();
         let requested = chrono::DateTime::from_timestamp(1_700_000_002, 123_456_789).unwrap();
         let received = chrono::DateTime::from_timestamp(1_700_000_003, 987_654_321).unwrap();
-        assert_eq!(
-            p.confirm_market("1", "condition", &tokens, &raw, requested, received)
-                .unwrap(),
-            ConfirmationOutcome::Confirmed
-        );
-        let stream = Stream {
-            memory: p.memory.clone(),
-            changed: p.changed.clone(),
-            frame_cap: 131072,
-            permits: Arc::new(Semaphore::new(1)),
-        };
-        let (frame, _, _) = stream.page(2, 0).unwrap();
-        assert_eq!(
-            frame["books"][0]["confirmed_at"],
-            "2023-11-14T22:13:23.987654Z"
-        );
+        assert_eq!(p.confirm_market("1", "condition", &[ids[0].clone(), ids[1].clone()],
+            &raw, requested, received).unwrap(), ConfirmationOutcome::Confirmed);
+        let after = p.reader().capture_market("1", &ids).unwrap();
+        assert_eq!(after.confirmation_facts["11"]["confirmed_at"],
+            "2023-11-14T22:13:23.987654Z");
         p.finish().await.unwrap();
     }
     #[tokio::test]
     async fn reduced_ws_confirmation_advances_only_memory_confirmation_fence() {
-        let mut p =
-            Publication::start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
-        p.publish(events(0), None).unwrap();
-        for _ in 0..100 {
-            if p.persisted_cursor() == p.cursor().unwrap() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(p.persisted_cursor(), p.cursor().unwrap());
-        let initial = p.capture_view().unwrap();
-        let book = initial.books["11"].clone();
-        let cursor = initial.cursor;
-        let persisted = initial.persisted_cursor;
-        let confirmation = initial.confirmation_sequence;
-        let received = chrono::DateTime::from_timestamp(1_700_000_010, 123_456_789).unwrap();
-        let exchange = chrono::DateTime::from_timestamp(1_700_000_010, 100_000_000).unwrap();
-        assert!(
-            p.confirm_reduced_token(
-                "1",
-                "condition",
-                "11",
-                book["state_checksum"].as_str().unwrap(),
-                exchange,
-                received,
-                "fresh-observation-hash",
-            )
-            .unwrap()
-        );
-        let after = p.capture_view().unwrap();
-        assert_eq!(after.cursor, cursor);
-        assert_eq!(after.persisted_cursor, persisted);
-        assert_eq!(after.confirmation_sequence, confirmation + 1);
-        assert_eq!(after.books["12"], initial.books["12"]);
-        assert_eq!(
-            after.confirmation_facts["11"]["confirmed_at"],
-            "2023-11-14T22:13:30.123456Z"
-        );
-        assert_eq!(
-            after.confirmation_facts["11"]["confirmation_source"],
-            "polymarket_websocket_state_confirmation"
-        );
-        assert!(
-            !p.confirm_reduced_token(
-                "1",
-                "condition",
-                "11",
-                book["state_checksum"].as_str().unwrap(),
-                exchange,
-                received,
-                "same-receipt",
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            p.capture_view().unwrap().confirmation_sequence,
-            confirmation + 1
-        );
-        assert!(
-            !p.confirm_reduced_token(
-                "1",
-                "condition",
-                "11",
-                book["state_checksum"].as_str().unwrap(),
-                exchange,
-                received + chrono::Duration::milliseconds(999),
-                "too-soon-observation",
-            )
-            .unwrap()
-        );
-        assert!(
-            p.confirm_reduced_token(
-                "1",
-                "condition",
-                "11",
-                "wrong-state",
-                exchange,
-                received + chrono::Duration::seconds(1),
-                "wrong-state-hash",
-            )
-            .is_err()
-        );
+        let p = test_start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
+        p.publish_native_events(events(0), None).unwrap();
+        let ids = vec!["11".to_owned(), "12".to_owned()];
+        let before = p.reader().capture_market("1", &ids).unwrap();
+        let at = chrono::DateTime::from_timestamp(1_700_000_010, 123_456_789).unwrap();
+        assert!(p.confirm_reduced_token("1", "condition", "11",
+            before.books["11"]["state_checksum"].as_str().unwrap(), at, at,
+            "fresh-observation-hash").unwrap());
+        let after = p.reader().capture_market("1", &ids).unwrap();
+        assert_eq!(after.watermark.stream_epoch, before.watermark.stream_epoch);
+        assert_eq!(after.watermark.published_cursor, before.watermark.published_cursor);
+        assert_eq!(after.books, before.books);
+        assert_eq!(after.confirmation_sequence, before.confirmation_sequence + 1);
+        assert_eq!(after.confirmation_facts["11"]["confirmed_at"],
+            "2023-11-14T22:13:30.123456Z");
+        assert_eq!(after.confirmation_facts["11"]["confirmation_source"],
+            "polymarket_websocket_state_confirmation");
         p.finish().await.unwrap();
     }
     #[test]
@@ -3236,34 +4697,25 @@ mod tests {
     }
     #[tokio::test]
     async fn newer_causal_book_state_invalidates_the_older_freshness_confirmation() {
-        let mut p =
-            Publication::start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
-        p.publish(events(0), None).unwrap();
-        let raw = vec![
-            json!({"asset_id":"11","market":"condition","tick_size":"0.01","timestamp":"1700000000000","hash":"confirm-11","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
-            json!({"asset_id":"12","market":"condition","tick_size":"0.01","timestamp":"1700000000000","hash":"confirm-12","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
-        ];
-        let tokens = ["11".to_owned(), "12".to_owned()];
-        p.confirm_market(
-            "1",
-            "condition",
-            &tokens,
-            &raw,
-            chrono::DateTime::from_timestamp(1_700_000_002, 0).unwrap(),
-            chrono::DateTime::from_timestamp(1_700_000_003, 0).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(p.capture_view().unwrap().confirmation_facts.len(), 2);
-        p.publish(events(2), None).unwrap();
-        let after = p.capture_view().unwrap();
-        assert!(after.confirmation_versions.is_empty());
+        let p = test_start(0, Some(seed()), tokens(), 8, 1024 * 1024, 65536, |_| Ok(())).unwrap();
+        p.publish_native_events(events(0), None).unwrap();
+        let ids = vec!["11".to_owned(), "12".to_owned()];
+        let before = p.reader().capture_market("1", &ids).unwrap();
+        let at = chrono::DateTime::from_timestamp(1_700_000_010, 0).unwrap();
+        assert!(p.confirm_reduced_token("1", "condition", "11",
+            before.books["11"]["state_checksum"].as_str().unwrap(), at, at,
+            "fresh-observation-hash").unwrap());
+        assert_eq!(p.reader().capture_market("1", &ids).unwrap().confirmation_facts.len(), 1);
+        p.publish_native_events(events(2), None).unwrap();
+        let after = p.reader().capture_market("1", &ids).unwrap();
         assert!(after.confirmation_facts.is_empty());
+        assert!(after.market_confirmation_versions.is_empty());
         p.finish().await.unwrap();
     }
     #[tokio::test]
     async fn replay_eviction_requires_resync_instead_of_skipping() {
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 1, 16384, 16384, |_| Ok(())).unwrap();
+            Publication::start_managed_with_replay(0, Some(seed()), tokens(), 1, 16384, 1, 512 * 1024, 16384, |_| Ok(())).unwrap();
         p.publish(events(0), None).unwrap();
         let mut changed = p.changed.subscribe();
         while p.persisted_cursor() < 2 {
@@ -3288,9 +4740,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_failure_diagnostics_use_progressed_client_cursor() {
+        let mut p = test_start_with_replay(
+            0, Some(seed()), tokens(), 1, 65536,
+            1, 512 * 1024, 16384, |_| Ok(()),
+        ).unwrap();
+        let reader = p.reader();
+        let mut changed = reader.subscribe();
+        p.publish(events(0), None).unwrap();
+        while p.persisted_cursor() < 2 {
+            changed.changed().await.unwrap();
+        }
+        // The connection started at zero, then actually applied through two.
+        let progressed = reader.replay_with_diagnostics(0, 0, 64, 65536).unwrap().next;
+        assert_eq!(progressed, 2);
+        for at in [2, 4] {
+            p.publish(events(at), None).unwrap();
+            while p.persisted_cursor() < at + 2 {
+                changed.changed().await.unwrap();
+            }
+        }
+        let error = reader.replay_with_diagnostics(progressed, 0, 64, 65536)
+            .err().expect("progressed client must expire");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("replay after cursor 2;"));
+        assert!(detail.contains("\"after_cursor\":2"));
+        assert!(detail.contains("\"oldest_cursor\":5"));
+        assert!(detail.contains("\"current_cursor\":6"));
+        assert!(detail.contains("memory replay expired"));
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_retention_is_independent_of_persistence_queue_capacity() {
+        let mut p = Publication::start_managed_with_replay(
+            0, Some(seed()), tokens(), 1, 16384, 8, 512 * 1024, 16384,
+            |work| match work {
+                PersistenceWork::Events(_) => Ok(()),
+                PersistenceWork::Retire(_) => unreachable!(),
+            },
+        ).unwrap();
+        let reader = p.reader();
+        let mut changed = reader.subscribe();
+        for at in (0..16).step_by(2) {
+            p.publish(events(at), None).unwrap();
+            while p.persisted_cursor() < at + 2 {
+                changed.changed().await.unwrap();
+            }
+        }
+        let page = reader.replay(0, 0, 64, 65536).unwrap();
+        assert_eq!(page.next, 16);
+        assert_eq!(page.batches.len(), 8);
+        let window = reader.replay_window(0).unwrap();
+        assert_eq!(window["retained_batches"], 8);
+        assert_eq!(window["oldest_cursor"], 1);
+        assert_eq!(window["current_cursor"], 16);
+        let memory = p.memory.lock().unwrap();
+        assert!(memory.replay_bytes <= 512 * 1024);
+        assert_eq!(memory.queued, 0);
+        drop(memory);
+        p.publish(events(16), None).unwrap();
+        assert!(reader.replay(0, 0, 64, 65536).is_err());
+        assert_eq!(reader.replay(2, 0, 64, 65536).unwrap().next, 18);
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn high_churn_replay_remains_contiguous_for_a_slow_reader() {
+        // The reader remains at zero while more batches than the persistence
+        // queue can hold pass through the writer. It then catches up through
+        // bounded 64-batch pages without skipping a cursor.
+        let mut p = Publication::start_managed_with_replay(
+            0, Some(seed()), tokens(), 1, 16384, 1024, 64 * 1024 * 1024, 16384,
+            |work| match work {
+                PersistenceWork::Events(_) => Ok(()),
+                PersistenceWork::Retire(_) => unreachable!(),
+            },
+        ).unwrap();
+        let reader = p.reader();
+        let mut changed = reader.subscribe();
+        for at in (0..1024).step_by(2) {
+            p.publish(events(at), None).unwrap();
+            while p.persisted_cursor() < at + 2 {
+                changed.changed().await.unwrap();
+            }
+        }
+        let mut cursor = 0;
+        let mut pages = 0;
+        while cursor < 1024 {
+            let page = reader.replay(cursor, 0, 64, 1024 * 1024).unwrap();
+            assert!(page.next > cursor);
+            cursor = page.next;
+            pages += 1;
+        }
+        assert_eq!(cursor, 1024);
+        assert_eq!(pages, 8);
+        assert!(p.memory.lock().unwrap().replay_bytes <= 64 * 1024 * 1024);
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parsed_replay_budget_evicts_both_arc_owners_after_durability() {
+        let mut p = Publication::start_managed_with_replay(
+            0, Some(seed()), tokens(), 8, 131072, 100, 512 * 1024, 16384,
+            |_| Ok(()),
+        ).unwrap();
+        let mut changed = p.changed.subscribe();
+        p.publish(events(0), None).unwrap();
+        let first = {
+            let memory = p.memory.lock().unwrap();
+            let batch = memory.replay.front().unwrap();
+            assert!(batch.replay_retained_bytes > batch.bytes);
+            Arc::downgrade(batch)
+        };
+        for after in (2..100).step_by(2) {
+            while p.persisted_cursor() < after { changed.changed().await.unwrap(); }
+            p.publish(events(after), None).unwrap();
+            assert!(p.memory.lock().unwrap().replay_bytes <= 512 * 1024);
+            assert!(p.market_replay.total_bytes() <= 512 * 1024);
+        }
+        while p.persisted_cursor() < 100 { changed.changed().await.unwrap(); }
+        assert!(first.upgrade().is_none(), "neither replay nor writer may retain the evicted batch");
+        assert!(p.reader().replay(0, 0, 64, 65536).is_err());
+        assert_eq!(p.cursor().unwrap(), 100);
+        p.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn larger_replay_does_not_enlarge_blocked_persistence_queue() {
+        let (started, wait) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let mut p = Publication::start_managed_with_replay(
+            0, Some(seed()), tokens(), 1, 16384, 64, 131072, 16384,
+            move |work| match work {
+                PersistenceWork::Events(_) => {
+                    started.send(()).unwrap();
+                    gate.recv().unwrap();
+                    Ok(())
+                }
+                PersistenceWork::Retire(_) => unreachable!(),
+            },
+        ).unwrap();
+        p.publish(events(0), None).unwrap();
+        wait.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(p.publish(events(2), None).is_err());
+        assert_eq!(p.cursor().unwrap(), 2);
+        release.send(()).unwrap();
+        p.finish().await.unwrap();
+    }
+
+    #[test]
+    fn independent_replay_limits_must_be_explicitly_bounded() {
+        let invalid = Publication::start_managed_with_replay(
+            0, Some(seed()), tokens(), 1, 16384, 0, 65536, 16384,
+            |_| Ok(()),
+        );
+        assert!(invalid.is_err());
+        let invalid = Publication::start_managed_with_replay(
+            0, Some(seed()), tokens(), 1, 16384, 8, 16383, 16384,
+            |_| Ok(()),
+        );
+        assert!(invalid.is_err());
+    }
+
+    #[tokio::test]
     async fn snapshot_lease_survives_count_eviction_then_expires_without_blocking_source() {
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 1, 65536, 16384, |_| Ok(())).unwrap();
+            Publication::start_managed_with_replay(0, Some(seed()), tokens(), 1, 65536, 1, 262144, 16384, |_| Ok(())).unwrap();
         let reader = p.reader();
         assert_eq!(
             reader
@@ -3326,7 +4942,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_lease_never_exceeds_existing_byte_cap() {
         let mut p =
-            Publication::start(0, Some(seed()), tokens(), 1, 16384, 16384, |_| Ok(())).unwrap();
+            Publication::start_managed_with_replay(0, Some(seed()), tokens(), 1, 16384, 1, 128 * 1024, 16384, |_| Ok(())).unwrap();
         let reader = p.reader();
         reader
             .capture_for_resume(std::time::Duration::from_secs(60), 1)
@@ -3337,7 +4953,7 @@ mod tests {
             while p.persisted_cursor() < at + 2 {
                 changed.changed().await.unwrap();
             }
-            assert!(p.memory.lock().unwrap().replay_bytes <= 16384);
+            assert!(p.memory.lock().unwrap().replay_bytes <= 128 * 1024);
         }
         assert!(reader.replay(0, 0, 64, 16384).is_err());
         assert_eq!(reader.capture().unwrap().cursor, 24);
@@ -3346,34 +4962,33 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_audit_does_not_reenable_public_baseline() {
-        let p = Publication::start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| Ok(())).unwrap();
+        let p = test_start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| Ok(())).unwrap();
         p.set_source_ready(false);
         assert!(p.capture_view().is_err());
-        assert_eq!(p.shutdown_recovery_facts().unwrap().0, 0);
+        assert!(p.shutdown_recovery_facts().unwrap().0.values().all(|cursor| *cursor == 0));
         assert!(p.reader().capture().is_err());
         p.finish().await.unwrap();
     }
     #[tokio::test]
     async fn intentional_pause_fences_old_resume_without_creating_a_gap() {
-        let mut p =
-            Publication::start(0, Some(seed()), tokens(), 4, 65536, 16384, |_| Ok(())).unwrap();
-        p.publish(events(0), None).unwrap();
-        let mut changed = p.changed.subscribe();
-        while p.persisted_cursor() < 2 {
-            changed.changed().await.unwrap();
-        }
+        let p =
+            test_start(0, Some(seed()), tokens(), 4, 1024 * 1024, 512 * 1024, |_| Ok(())).unwrap();
+        p.publish_native_events(events(0), None).unwrap();
         let reader = p.reader();
-        assert!(reader.replay(0, 0, 64, 65536).is_ok());
+        let market = reader.market_stream_watermark("1").unwrap().unwrap();
+        assert!(reader.replay_market("1", &market.stream_epoch, 0, 1, 16384).is_ok());
         assert!(p.fresh_acquisition_started(&BTreeSet::from(["11".into(), "12".into()])));
         p.pause_source().unwrap();
         assert!(!p.fresh_acquisition_started(&BTreeSet::from(["11".into(), "12".into()])));
         assert!(reader.installed_markets().is_ok());
-        assert!(reader.capture().is_err());
-        assert!(reader.replay(0, 0, 64, 65536).is_err());
+        assert!(reader.replay_market("1", &market.stream_epoch, 0, 1, 16384).is_err());
         assert!(p.shutdown_recovery_facts().unwrap().1.is_empty());
+        p.resume_acquisition();
+        assert!(!p.is_source_ready());
+        p.publish_native_events(events(2), None).unwrap();
+        assert!(p.fresh_acquisition_started(&BTreeSet::from(["11".into(), "12".into()])));
         p.set_source_ready(true);
-        assert!(reader.capture().unwrap().books.is_empty());
-        assert!(reader.replay(0, 0, 64, 65536).is_err());
+        assert!(reader.replay_market("1", &market.stream_epoch, 0, 1, 16384).is_err());
         p.finish().await.unwrap();
     }
 
@@ -3383,7 +4998,7 @@ mod tests {
         bindings.insert("13".into(), "2".into());
         bindings.insert("14".into(), "2".into());
         let mut p =
-            Publication::start(0, Some(seed()), bindings, 8, 131072, 16384, |_| Ok(())).unwrap();
+            test_start(0, Some(seed_with_second_market("13", "14")), bindings, 8, 131072, 16384, |_| Ok(())).unwrap();
         p.publish(events(0), None).unwrap();
         let other = ["13","14"].iter().enumerate().map(|(i,token)| snapshot_event(
             &json!({"asset_id":token,"market":"condition2","tick_size":"0.01","timestamp":"1700000000000",

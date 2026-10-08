@@ -1,5 +1,6 @@
-//! Bounded BTC five-minute research projection over the shared MarketCow
-//! publication.  It owns no upstream connection or persistence path.
+//! Bounded BTC five-minute market-local read surface over MarketCow's
+//! per-market publisher and replay lanes. It owns no upstream connection or
+//! persistence path.
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
@@ -7,62 +8,120 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use marketcow_polymarket::discovery_source::canonical_hash;
+use marketcow_runtime::discovery_source::{DurableMarketPageBoundary, read_durable_market_page};
+use marketcow_contracts::btc5m_market_local_v2::{self as market_proto, wire as proto};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeSet, VecDeque},
-    sync::{Arc, Mutex, OnceLock, RwLock, atomic::{AtomicU64, Ordering}},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    path::PathBuf,
+    sync::{Arc, Mutex, RwLock, atomic::{AtomicU64, Ordering}},
     time::Duration,
 };
 use tokio::sync::{Semaphore, watch};
 
-use crate::source_public_api::encode_bounded;
-use crate::source_publication::{MemoryReader, MemoryView, SourceBatchTiming};
+use crate::source_btc5m_proto as proto_convert;
+use crate::source_publication::{Batch, MarketMemorySnapshot, MemoryReader, SourceBatchTiming};
 
 const PROFILE_SCHEMA: &str = "marketcow.polymarket.btc-5m-profile.v1";
-const STATUS_SCHEMA: &str = "marketcow.polymarket.btc-5m-status.v1";
-const FULL_SYNC_SCHEMA: &str = "marketcow.polymarket.btc-5m-full-sync.v1";
-const EVENT_SCHEMA: &str = "marketcow.polymarket.btc-5m-event.v1";
-const COMPACT_EVENT_SCHEMA: &str = "marketcow.polymarket.btc-5m-event.v2";
+const STATUS_SCHEMA: &str = "marketcow.polymarket.btc-5m-status.v4";
 const ERROR_SCHEMA: &str = "marketcow.polymarket.btc-5m-error.v1";
+const MARKET_PROTO_SUBPROTOCOL: &str = "marketcow.btc5m.market-local.v2";
 // Fixed v1 management-contract TTL, not an implicit runtime fallback.
 const MANAGER_STALE_AFTER_SECONDS: i64 = 60;
 const MAX_MARKETS: usize = 3;
+const MAX_STREAM_CLIENTS: usize = 12;
+
+fn market_stream_client_limit(total_clients: usize) -> usize {
+    total_clients.div_ceil(MAX_MARKETS).max(1)
+}
 const MAX_TOKENS: usize = 6;
 const TIMELINE_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const TIMELINE_RECEIPT_COUNT: usize = 16_384;
-// At most four writer-watermark control frames per second per connection.
-// This does not delay book events or the writer's own fsync notification.
-const DURABLE_WATERMARK_MIN_INTERVAL: Duration = Duration::from_millis(250);
-static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+// This is a diagnostic threshold, not a readiness or trading freshness rule.
+const SLOW_GROUP_THRESHOLD_US: i64 = 100_000;
+const SLOW_GROUP_QUEUE: usize = 256;
+// Bound independent confirmation control frames without delaying book groups.
+const CONFIRMATION_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct TimelineArchive {
-    entries: VecDeque<(String, u64, String, Value, usize)>,
+    entries: VecDeque<(String, String, String, u64, String, Value, usize)>,
     bytes: usize,
 }
+struct MarketTimelineGroup {
+    profile_epoch: String,
+    market_id: String,
+    stream_epoch: String,
+    market_cursor: u64,
+    group: Arc<Batch>,
+    group_commit_sent_at: DateTime<Utc>,
+}
+struct SlowMarketGroup {
+    connection_id: String,
+    profile_epoch: String,
+    market_id: String,
+    stream_epoch: String,
+    market_cursor: u64,
+    market_event_cursor: u64,
+    event_id: String,
+    event_count: usize,
+    group_commit_sent_at: DateTime<Utc>,
+    raw_last_to_send_us: i64,
+    timing: SourceBatchTiming,
+}
+
+fn slow_group_elapsed_us(timing: &SourceBatchTiming, sent_at: DateTime<Utc>) -> Option<i64> {
+    let elapsed = sent_at.signed_duration_since(timing.raw_batch_last_received_at)
+        .num_microseconds()?;
+    (elapsed >= SLOW_GROUP_THRESHOLD_US).then_some(elapsed)
+}
+
+fn slow_group_json(group: &SlowMarketGroup) -> Value {
+    json!({
+        "stage":"btc_5m_slow_market_group",
+        "threshold_us":SLOW_GROUP_THRESHOLD_US,
+        "connection_id":group.connection_id,
+        "profile_epoch":group.profile_epoch,
+        "market_id":group.market_id,
+        "stream_epoch":group.stream_epoch,
+        "market_cursor":group.market_cursor,
+        "market_event_cursor":group.market_event_cursor,
+        "event_id":group.event_id,
+        "event_count":group.event_count,
+        "raw_last_to_group_commit_sent_us":group.raw_last_to_send_us,
+        "group_commit_sent_at":group.group_commit_sent_at,
+        "source_batch_timing":source_timing_json(&group.timing),
+        "clock_error_bound_ms":Value::Null,
+    })
+}
 impl TimelineArchive {
-    fn push(&mut self, epoch: &str, cursor: u64, event_id: &str, receipt: Value) {
+    fn push(&mut self, epoch: &str, market_id: &str, stream_epoch: &str,
+        event_cursor: u64, event_id: &str, receipt: Value) {
         let Ok(bytes) = serde_json::to_vec(&receipt).map(|v| v.len()) else { return; };
         if bytes > TIMELINE_RECEIPT_BYTES { return; }
         self.bytes += bytes;
-        self.entries.push_back((epoch.to_owned(), cursor, event_id.to_owned(), receipt, bytes));
+        self.entries.push_back((epoch.to_owned(), market_id.to_owned(),
+            stream_epoch.to_owned(), event_cursor, event_id.to_owned(), receipt, bytes));
         while self.entries.len() > TIMELINE_RECEIPT_COUNT || self.bytes > TIMELINE_RECEIPT_BYTES {
-            if let Some((_, _, _, _, evicted_bytes)) = self.entries.pop_front() {
+            if let Some((_, _, _, _, _, _, evicted_bytes)) = self.entries.pop_front() {
                 self.bytes -= evicted_bytes;
             }
         }
     }
-    fn lookup(&self, epoch: &str, cursor: u64, event_id: &str) -> Vec<Value> {
-        self.entries.iter().filter(|(e, c, id, _, _)|
-            e == epoch && *c == cursor && id == event_id
-        ).take(8).map(|(_, _, _, receipt, _)| receipt.clone()).collect()
+    fn lookup(&self, epoch: &str, market_id: &str, stream_epoch: &str,
+        event_cursor: u64, event_id: &str) -> Vec<Value> {
+        self.entries.iter().filter(|(e, m, s, c, id, _, _)|
+            e == epoch && m == market_id && s == stream_epoch
+                && *c == event_cursor && id == event_id
+        ).take(8).map(|(_, _, _, _, _, receipt, _)| receipt.clone()).collect()
     }
 }
 
@@ -309,12 +368,6 @@ impl Profile {
     pub fn market_ids_owned(&self) -> BTreeSet<String> {
         self.markets.iter().map(|m| m.market_id.clone()).collect()
     }
-    fn token_ids(&self) -> BTreeSet<&str> {
-        self.markets
-            .iter()
-            .flat_map(|m| m.outcomes.iter().map(|o| o.token_id.as_str()))
-            .collect()
-    }
 }
 
 #[derive(Clone)]
@@ -341,7 +394,7 @@ impl Limits {
             "BTC 5m replay bytes"
         );
         ensure!(
-            (1..=8).contains(&self.clients)
+            (1..=MAX_STREAM_CLIENTS).contains(&self.clients)
                 && (1..=4).contains(&self.snapshot_lease_capacity)
                 && !self.send_timeout.is_zero(),
             "BTC 5m client budget"
@@ -378,505 +431,19 @@ fn best_price(book: &Value, side: &str, maximum: bool) -> Result<Option<String>>
     .map(|v| v.1.clone()))
 }
 
-fn token_snapshot(
-    view: &MemoryView,
-    outcome: &OutcomeBinding,
-    now: DateTime<Utc>,
-    window_reason: Option<&str>,
-    maximum_quote_age_ms: u64,
-) -> Result<Value> {
-    let token = &outcome.token_id;
-    let recovery = view.recoveries.get(token);
-    let unresolved_seed_gap = view.base["gaps"].as_array().is_some_and(|gaps| {
-        gaps.iter()
-            .any(|gap| gap["token_id"] == token.as_str() && gap["resolved"].as_bool() != Some(true))
-    });
-    let book = view.books.get(token);
-    let confirmation = view.confirmation_facts.get(token);
-    let mut reason: Option<&str> = None;
-    if window_reason.is_some() {
-        reason = window_reason;
-    } else if recovery.is_some() || unresolved_seed_gap {
-        reason = Some("source_gap");
-    } else if book.is_none() {
-        reason = Some("book_unavailable");
-    }
-    let (best_bid, best_ask, received, confirmed, exchange, crossed, two_sided) =
-        if let Some(book) = book {
-            let bid = best_price(book, "bids", true)?;
-            let ask = best_price(book, "asks", false)?;
-            let crossed = match (&bid, &ask) {
-                (Some(b), Some(a)) => {
-                    b.parse::<rust_decimal::Decimal>()? >= a.parse::<rust_decimal::Decimal>()?
-                }
-                _ => false,
-            };
-            (
-                bid,
-                ask,
-                Some(instant(book, "received_at")?),
-                confirmation
-                    .and_then(|value| value["confirmed_at"].as_str())
-                    .map(DateTime::parse_from_rfc3339)
-                    .transpose()?
-                    .map(|value| value.with_timezone(&Utc)),
-                book["exchange_at"].as_str().map(str::to_owned),
-                crossed,
-                !levels(book, "bids")?.is_empty() && !levels(book, "asks")?.is_empty(),
-            )
-        } else {
-            (None, None, None, None, None, false, false)
-        };
-    if reason.is_none() && crossed {
-        reason = Some("crossed_book");
-    }
-    let freshness_at = match (received, confirmed) {
-        (Some(book), Some(confirmation)) => Some(book.max(confirmation)),
-        (book, None) => book,
-        (None, confirmation) => confirmation,
-    };
-    let signed_age_ms = freshness_at.map(|at| (now - at).num_milliseconds());
-    if reason.is_none() {
-        if signed_age_ms.is_some_and(|age| age < 0) {
-            reason = Some("future_received_at");
-        } else if signed_age_ms.is_some_and(|age| age > maximum_quote_age_ms as i64) {
-            reason = Some("quote_stale");
-        }
-    }
-    if reason.is_none() && !two_sided {
-        reason = Some("incomplete_book");
-    }
-    let available = reason.is_none();
-    // Quote availability and replay continuity are separate facts.  A stale
-    // but structurally valid canonical book is not tradable, yet it remains
-    // the exact baseline for a later ordered delta.  During token recovery it
-    // becomes a valid baseline only after the authoritative snapshot recorded
-    // by the recovery state has actually replaced the pre-gap book.
-    let recovery_snapshot_matches = recovery.is_some_and(|state| {
-        state["snapshot_cursor"]
-            .as_u64()
-            .zip(view.book_cursors.get(token).copied())
-            .is_some_and(|(snapshot, book_cursor)| snapshot == book_cursor)
-    });
-    let replay_baseline_valid = book.is_some()
-        && !crossed
-        && signed_age_ms.is_some_and(|age| age >= 0)
-        && !unresolved_seed_gap
-        && (recovery.is_none() || recovery_snapshot_matches);
-    Ok(
-        json!({"outcome":outcome.outcome,"token_id":token,"available":available,
-        "replay_baseline_valid":replay_baseline_valid,
-        "confirmation_sequence":view.confirmation_versions.get(token),
-        "confirmed_at":confirmed.map(|value|value.to_rfc3339()),
-        "confirmation_source":confirmation.and_then(|value|value.get("confirmation_source")).cloned(),
-        "confirmation_evidence_sha256":confirmation.and_then(|value|value.get("confirmation_evidence_sha256")).cloned(),
-        "recovery_id":recovery.and_then(|value|value["recovery_id"].as_str()),
-        "recovery_snapshot_cursor":recovery.and_then(|value|value["snapshot_cursor"].as_u64()),
-        "unavailable_reason":reason,"publisher_cursor":view.book_cursors.get(token),
-        "source_event_cursor":book.and_then(|b|b.get("source_sequence")).cloned(),
-        "book_epoch":book.and_then(|b|b.get("book_epoch")).cloned(),
-        "state_checksum":book.and_then(|b|b.get("state_checksum")).cloned(),
-        "canonical_book_sha256":book.map(|value|canonical_hash(value.as_ref())),
-        "tick_version":book.and_then(|b|b.get("tick_version")).cloned(),
-        "tick_size":book.and_then(|b|b.get("tick_size")).cloned(),
-        "source_hash":book.and_then(|b|b.get("source_hash")).cloned(),
-        "canonical_book":book.cloned(),
-        "exchange_at":exchange,"received_at":received.map(|v|v.to_rfc3339()),
-        "freshness_at":freshness_at.map(|v|v.to_rfc3339()),
-        "quote_age_ms":signed_age_ms.filter(|age|*age>=0),
-        "future_skew_ms":signed_age_ms.filter(|age|*age<0).map(|age|-age),
-        "best_bid":best_bid,"best_ask":best_ask,
-        "last_trade_price":book.and_then(|b|b.get("last_trade_price")).cloned(),
-        "bids":if available {book.map(|b|b["bids"].clone())} else {None},
-        "asks":if available {book.map(|b|b["asks"].clone())} else {None}}),
-    )
-}
-
-pub fn full_sync(
-    view: &MemoryView,
-    profile: &Profile,
-    epoch: &str,
-    now: DateTime<Utc>,
-) -> Result<Value> {
-    profile.validate()?;
-    ensure!(
-        !epoch.is_empty() && view.persisted_cursor <= view.cursor,
-        "BTC 5m publication identity"
-    );
-    ensure!(
-        view.base["catalog_revision"] == profile.catalog_revision,
-        "BTC 5m catalog revision"
-    );
-    let mut markets = Vec::new();
-    let mut current_ready = false;
-    let mut unavailable = 0usize;
-    for configured in &profile.markets {
-        let metadata = view
-            .markets
-            .get(&configured.market_id)
-            .context("BTC 5m metadata absent")?;
-        ensure!(
-            metadata["identity"]["condition_id"] == configured.condition_id,
-            "BTC 5m condition changed"
-        );
-        let identities = metadata["identity"]["outcomes"]
-            .as_array()
-            .context("BTC 5m outcomes")?;
-        ensure!(
-            identities.len() == 2
-                && identities[0]["outcome"] == "Up"
-                && identities[0]["token_id"] == configured.outcomes[0].token_id
-                && identities[1]["outcome"] == "Down"
-                && identities[1]["token_id"] == configured.outcomes[1].token_id,
-            "BTC 5m ordered token binding changed"
-        );
-        let end = DateTime::parse_from_rfc3339(&configured.end_at)?.with_timezone(&Utc);
-        let start = DateTime::parse_from_rfc3339(&configured.start_at)?.with_timezone(&Utc);
-        let window_reason = match configured.role {
-            WindowRole::Current if now < start || now >= end => Some("market_window_inactive"),
-            WindowRole::Next if now >= end => Some("market_window_inactive"),
-            WindowRole::Retiring if now >= end => Some("market_window_ended"),
-            _ => None,
-        };
-        let terminated = window_reason == Some("market_window_ended");
-        let tokens = configured
-            .outcomes
-            .iter()
-            .map(|o| token_snapshot(view, o, now, window_reason, profile.maximum_quote_age_ms))
-            .collect::<Result<Vec<_>>>()?;
-        let ready = tokens.iter().all(|t| t["available"] == true) && !terminated;
-        unavailable += tokens.iter().filter(|t| t["available"] == false).count();
-        if configured.role == WindowRole::Current {
-            current_ready = ready;
-        }
-        markets.push(json!({"role":configured.role,"window_id":configured.window_id,
-            "start_at":configured.start_at,"end_at":configured.end_at,"market_id":configured.market_id,
-            "condition_id":configured.condition_id,"rule_sha256":configured.rule_sha256,
-            "status":if terminated{"book_terminated"}else if ready{"ready"}else{"unavailable"},
-            "book_terminated":terminated,"settlement_status":"independent","cross_token_atomic":false,
-            "tokens":tokens}));
-    }
-    Ok(
-        json!({"schema_version":FULL_SYNC_SCHEMA,"profile_id":profile.profile_id,
-        "profile_revision":profile.profile_revision,"profile_document_sha256":profile.document_sha256(),
-        "profile":profile,"epoch":epoch,"publisher_cursor":view.cursor,
-        "manager":null,
-        "durable_cursor":view.persisted_cursor,"confirmation_sequence":view.confirmation_sequence,
-        "ready":current_ready,
-        "maximum_quote_age_ms":profile.maximum_quote_age_ms,
-        "crossed_book_rule":"best_bid_greater_than_or_equal_to_best_ask_is_invalid",
-        "acquisition_membership_semantics":"component_subset_leases_deduplicated_shared_union_before_profile_cas",
-        "ready_barrier":"full_sync_cursor_then_stream_after_cursor_strictly_greater",
-        "after_cursor_semantics":"exclusive","replay_expiry_recovery":"new_full_sync",
-        "source_event_cursor_semantics":"upstream_optional_and_never_comparable_to_publisher_cursor",
-        "transport_alive":view.base.get("live_stream_connected").cloned().unwrap_or(Value::Null),
-        "heartbeat_and_quote_freshness_are_independent":true,"unavailable_token_count":unavailable,
-        "observed_at":now.to_rfc3339(),"markets":markets}),
-    )
-}
-
-pub fn status(
-    view: &MemoryView,
-    profile: &Profile,
-    epoch: &str,
-    now: DateTime<Utc>,
-) -> Result<Value> {
-    let sync = full_sync(view, profile, epoch, now)?;
-    let windows = sync["markets"]
-        .as_array()
-        .context("BTC 5m markets")?
-        .iter()
-        .map(|m| {
-            json!({
-        "role":m["role"],"window_id":m["window_id"],"start_at":m["start_at"],"end_at":m["end_at"],
-        "market_id":m["market_id"],"condition_id":m["condition_id"],"status":m["status"]})
-        })
-        .collect::<Vec<_>>();
-    Ok(
-        json!({"schema_version":STATUS_SCHEMA,"profile_id":profile.profile_id,
-        "profile_revision":profile.profile_revision,"profile_document_sha256":profile.document_sha256(),
-        "profile":profile,"epoch":epoch,"published_cursor":view.cursor,
-        "manager":null,
-        "durable_cursor":view.persisted_cursor,"confirmation_sequence":view.confirmation_sequence,
-        "ready":sync["ready"],
-        "reason":if sync["ready"]==true {Value::Null}else{json!("current_market_not_ready")},
-        "transport_alive":sync["transport_alive"],"heartbeat_and_quote_freshness_are_independent":true,
-        "maximum_markets":MAX_MARKETS,"maximum_tokens":MAX_TOKENS,"windows":windows}),
-    )
-}
-
-fn event_frame(profile: &Profile, epoch: &str, event: &Value) -> Result<Option<Value>> {
-    let cursor = event["cursor"].as_u64().context("publisher cursor")?;
-    let market = event["market_id"].as_str();
-    let token = event["token_id"].as_str();
-    if !market.is_some_and(|m| profile.market_ids().contains(m))
-        && !token.is_some_and(|t| profile.token_ids().contains(t))
-    {
-        return Ok(None);
-    }
-    let publication_type = event["event_type"]
-        .as_str()
-        .context("publication event type")?;
-    let source_type = if publication_type == "book" {
-        event["raw_payload"]["event_type"]
-            .as_str()
-            .context("raw source event type")?
-    } else {
-        event["raw_payload"]["source_event_type"]
-            .as_str()
-            .unwrap_or(publication_type)
-    };
-    let event_type = match (publication_type, source_type) {
-        ("recovery_started", _) => "recovery_started",
-        ("recovery_completed", _) => "recovery_completed",
-        ("book", "book") => "book_snapshot",
-        // Tick changes advance the canonical token sequence. Expose the
-        // reducer's complete committed post-state so compact consumers do not
-        // observe an unexplained sequence hole.
-        ("book", "tick_size_change") => "book_snapshot",
-        ("book", "price_change") => "book_change",
-        ("book", "last_trade_price") => "last_trade",
-        _ => return Ok(None),
-    };
-    let canonical = event
-        .get("canonical_payload")
-        .context("canonical payload")?;
-    ensure!(
-        !canonical["payload_semantics"].is_string(),
-        "BTC 5m wire v1 cannot replay compact incremental facts; use wire_version=2 and a fresh full-sync"
-    );
-    let semantics = match source_type {
-        "book" | "price_change" | "last_trade_price" | "tick_size_change" => {
-            for field in [
-                "token_id",
-                "condition_id",
-                "book_epoch",
-                "sequence",
-                "exchange_at",
-                "received_at",
-                "tick_version",
-                "tick_size",
-                "bids",
-                "asks",
-                "last_trade_price",
-                "state_checksum",
-                "source_hash",
-            ] {
-                ensure!(
-                    canonical.get(field).is_some(),
-                    "BTC 5m incomplete canonical book state"
-                );
-            }
-            "complete_post_state"
-        }
-        _ => "control_record",
-    };
-    let invalidated = publication_type == "recovery_started";
-    Ok(Some(
-        json!({"schema_version":EVENT_SCHEMA,"type":event_type,"epoch":epoch,
-        "publisher_cursor":cursor,"source_event_cursor":canonical.get("sequence").cloned(),
-        "source_event_type":source_type,"market_id":event["market_id"],"token_id":event["token_id"],
-        "availability":if invalidated{"unavailable"}else if source_type=="book"{"authoritative_snapshot"}else{"unchanged"},
-        "payload_semantics":semantics,
-        "payload":{"contract_version":event["contract_version"],"source_schema_version":event["schema_version"],
-            "publication_event_type":publication_type,"raw_source_event_type":source_type,
-            "event_id":event["event_id"],"book_epoch":event["book_epoch"],"sequence":event["sequence"],
-            "exchange_at":event["exchange_at"],"received_at":event["received_at"],
-            "canonical_payload_sha256":event["canonical_payload_sha256"],"canonical_payload":canonical,
-            "raw_payload_sha256":event["raw_payload_sha256"],"applied":event["applied"],
-            "fail_closed_reason":event["fail_closed_reason"],"gaps":event["gaps"]},
-        "durability":"published_not_necessarily_durable"}),
-    ))
-}
-
-/// Version 2 keeps authoritative snapshots complete, but represents ordinary
-/// price/trade increments as the exact normalized mutation plus a commitment
-/// to the complete post-state. A consumer starts from full-sync, applies the
-/// ordered delta, then must reproduce both `state_checksum` and
-/// `canonical_book_sha256`; a mismatch is a resync boundary, never permission
-/// to keep an approximate book.
-fn compact_event_frame(profile: &Profile, epoch: &str, event: &Value) -> Result<Option<Value>> {
-    if event["canonical_payload"]["payload_semantics"].is_string() {
-        let cursor = event["cursor"].as_u64().context("publisher cursor")?;
-        let market = event["market_id"].as_str();
-        let token = event["token_id"].as_str();
-        if !market.is_some_and(|m| profile.market_ids().contains(m))
-            && !token.is_some_and(|t| profile.token_ids().contains(t))
-        {
-            return Ok(None);
-        }
-        let token = token.context("BTC 5m compact token")?;
-        let canonical = &event["canonical_payload"];
-        let semantics = canonical["payload_semantics"]
-            .as_str()
-            .context("BTC 5m compact semantics")?;
-        let (kind, source_type) = match semantics {
-            "ordered_depth_delta_with_complete_post_state_commitment" => {
-                ("book_change", "price_change")
-            }
-            "last_trade_with_unchanged_depth_commitment" => ("last_trade", "last_trade_price"),
-            _ => anyhow::bail!("unknown BTC 5m compact semantics"),
-        };
-        let post_state = json!({
-            "token_id":canonical["token_id"],"condition_id":canonical["condition_id"],
-            "book_epoch":canonical["book_epoch"],"sequence":canonical["sequence"],
-            "sequence_semantics":canonical["sequence_semantics"],
-            "exchange_at":canonical["exchange_at"],"received_at":canonical["received_at"],
-            "tick_version":canonical["tick_version"],"tick_size":canonical["tick_size"],
-            "last_trade_price":canonical["last_trade_price"],
-            "state_checksum":canonical["state_checksum"],"source_hash":canonical["source_hash"],
-            "canonical_book_sha256":canonical["canonical_book_sha256"]
-        });
-        let mut payload = json!({
-            "contract_version":event["contract_version"],
-            "source_schema_version":event["schema_version"],
-            "publication_event_type":event["event_type"],
-            "raw_source_event_type":source_type,"event_id":event["event_id"],
-            "book_epoch":event["book_epoch"],"sequence":event["sequence"],
-            "exchange_at":event["exchange_at"],"received_at":event["received_at"],
-            "canonical_payload_sha256":event["canonical_payload_sha256"],
-            "raw_payload_sha256":event["raw_payload_sha256"],"applied":event["applied"],
-            "fail_closed_reason":event["fail_closed_reason"],"gaps":event["gaps"],
-            "post_state":post_state
-        });
-        if kind == "book_change" {
-            payload["delta"] = canonical["delta"].clone();
-        } else {
-            payload["trade"] = canonical["trade"].clone();
-        }
-        return Ok(Some(json!({
-            "schema_version":COMPACT_EVENT_SCHEMA,"type":kind,"epoch":epoch,
-            "publisher_cursor":cursor,"source_event_cursor":canonical["sequence"],
-            "source_event_type":source_type,"market_id":event["market_id"],
-            "token_id":token,"availability":"unchanged","payload_semantics":semantics,
-            "payload":payload,"durability":"published_not_necessarily_durable"
-        })));
-    }
-    let Some(mut frame) = event_frame(profile, epoch, event)? else {
-        return Ok(None);
-    };
-    frame["schema_version"] = json!(COMPACT_EVENT_SCHEMA);
-    let kind = frame["type"]
-        .as_str()
-        .context("BTC 5m event type")?
-        .to_owned();
-    if !matches!(kind.as_str(), "book_change" | "last_trade") {
-        return Ok(Some(frame));
-    }
-    let token = frame["token_id"]
-        .as_str()
-        .context("BTC 5m compact token")?
-        .to_owned();
-    let canonical = event["canonical_payload"].clone();
-    let post_state = json!({
-        "token_id":canonical["token_id"],"condition_id":canonical["condition_id"],
-        "book_epoch":canonical["book_epoch"],"sequence":canonical["sequence"],
-        "sequence_semantics":canonical["sequence_semantics"],
-        "exchange_at":canonical["exchange_at"],"received_at":canonical["received_at"],
-        "tick_version":canonical["tick_version"],"tick_size":canonical["tick_size"],
-        "last_trade_price":canonical["last_trade_price"],
-        "state_checksum":canonical["state_checksum"],"source_hash":canonical["source_hash"],
-        "canonical_book_sha256":event["canonical_payload_sha256"]
-    });
-    frame["payload_semantics"] = json!(if kind == "book_change" {
-        "ordered_depth_delta_with_complete_post_state_commitment"
-    } else {
-        "last_trade_with_unchanged_depth_commitment"
-    });
-    frame["payload"]
-        .as_object_mut()
-        .context("BTC 5m event payload")?
-        .remove("canonical_payload");
-    frame["payload"]["post_state"] = post_state;
-    if kind == "book_change" {
-        let changes = event["raw_payload"]["price_changes"]
-            .as_array()
-            .context("BTC 5m price changes")?
-            .iter()
-            .filter(|change| change["asset_id"] == token)
-            .map(|change| {
-                json!({"asset_id":change["asset_id"],"side":change["side"],
-                    "price":change["price"],"size":change["size"]})
-            })
-            .collect::<Vec<_>>();
-        ensure!(!changes.is_empty(), "BTC 5m token delta absent");
-        frame["payload"]["delta"] = json!({"changes":changes});
-    } else {
-        frame["payload"]["trade"] = json!({
-            "price":canonical["last_trade_price"],
-            "exchange_at":event["exchange_at"],"received_at":event["received_at"]
-        });
-    }
-    Ok(Some(frame))
-}
-
-fn confirmation_frame(
-    profile: &Profile,
-    epoch: &str,
-    publisher_cursor: u64,
-    confirmation_sequence: u64,
-    books: &[Arc<Value>],
-) -> Result<Option<Value>> {
-    let allowed = profile.token_ids();
-    let mut confirmations = Vec::new();
-    for book in books {
-        let token = book["token_id"]
-            .as_str()
-            .context("BTC 5m confirmation token")?;
-        if !allowed.contains(token) {
-            continue;
-        }
-        let confirmed_at = book["confirmed_at"]
-            .as_str()
-            .context("BTC 5m confirmation time")?;
-        DateTime::parse_from_rfc3339(confirmed_at)?;
-        confirmations.push(json!({
-            "token_id":token,
-            "condition_id":book["condition_id"],
-            "book_epoch":book["book_epoch"],
-            "book_sequence":book["sequence"],
-            "state_checksum":book["state_checksum"],
-            "book_received_at":book["book_received_at"],
-            "confirmed_at":confirmed_at,
-            "confirmation_source":book["confirmation_source"],
-            "confirmation_evidence_sha256":book["confirmation_evidence_sha256"]
-        }));
-    }
-    if confirmations.is_empty() {
-        return Ok(None);
-    }
-    confirmations.sort_by(|left, right| left["token_id"].as_str().cmp(&right["token_id"].as_str()));
-    Ok(Some(json!({
-        "schema_version":COMPACT_EVENT_SCHEMA,
-        "type":"book_confirmations",
-        "epoch":epoch,
-        "publisher_cursor":publisher_cursor,
-        "confirmation_sequence":confirmation_sequence,
-        "payload_semantics":"freshness_confirmation_without_depth_or_publisher_cursor_mutation",
-        "confirmations":confirmations,
-        "durability":"memory_confirmation_not_persisted"
-    })))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StreamQuery {
-    epoch: String,
-    after_cursor: u64,
-    #[serde(default)]
-    after_confirmation_sequence: Option<u64>,
-    #[serde(default)]
-    wire_version: Option<u8>,
-}
-
 #[derive(Clone)]
 pub struct Api {
     reader: MemoryReader,
     control: Control,
     limits: Limits,
+    archive_root: Option<PathBuf>,
     snapshots: Arc<Semaphore>,
     streams: Arc<Semaphore>,
+    market_stream_slots: Arc<Mutex<BTreeMap<String, Arc<Semaphore>>>>,
     timeline: Arc<Mutex<TimelineArchive>>,
+    timeline_tx: std::sync::mpsc::SyncSender<MarketTimelineGroup>,
+    slow_group_tx: std::sync::mpsc::SyncSender<SlowMarketGroup>,
+    slow_group_dropped: Arc<AtomicU64>,
 }
 #[derive(Clone)]
 struct Active {
@@ -1069,6 +636,26 @@ impl Api {
         epoch: String,
         limits: Limits,
     ) -> Result<(Router, Control)> {
+        Self::router_inner(reader, profile, epoch, limits, None)
+    }
+    /// The archive root must be the same prepared generation used by the
+    /// managed writer. This route never establishes another source service.
+    pub fn router_with_archive(
+        reader: MemoryReader,
+        profile: Profile,
+        epoch: String,
+        limits: Limits,
+        archive_root: PathBuf,
+    ) -> Result<(Router, Control)> {
+        Self::router_inner(reader, profile, epoch, limits, Some(archive_root))
+    }
+    fn router_inner(
+        reader: MemoryReader,
+        profile: Profile,
+        epoch: String,
+        limits: Limits,
+        archive_root: Option<PathBuf>,
+    ) -> Result<(Router, Control)> {
         profile.validate()?;
         limits.validate()?;
         ensure!(!epoch.is_empty(), "BTC 5m epoch");
@@ -1083,12 +670,67 @@ impl Api {
             changed,
             manager: Arc::new(RwLock::new(None)),
         };
+        let timeline = Arc::new(Mutex::new(TimelineArchive::default()));
+        // Diagnostic serialization and bounded retention run off the WS path.
+        // A full diagnostics queue drops a receipt, never a market group.
+        let (timeline_tx, timeline_rx) = std::sync::mpsc::sync_channel::<MarketTimelineGroup>(4);
+        let timeline_archive = timeline.clone();
+        std::thread::Builder::new().name("btc5m-market-timeline".into()).spawn(move || {
+            while let Ok(sent) = timeline_rx.recv() {
+                let timing = sent.group.timing_snapshot();
+                for event in sent.group.validated.events() {
+                    if let (Some(cursor), Some(event_id)) =
+                        (event["cursor"].as_u64(), event["event_id"].as_str()) {
+                        let receipt = json!({
+                            "stage":"market_group_commit_sent",
+                            "profile_epoch":&sent.profile_epoch,"market_id":&sent.market_id,
+                            "stream_epoch":&sent.stream_epoch,
+                            "market_cursor":sent.market_cursor,
+                            "market_event_cursor":cursor,"event_id":event_id,
+                            "group_commit_sent_at":&sent.group_commit_sent_at,
+                            "source_batch_timing":timing.as_ref().map(source_timing_json),
+                            "clock_error_bound_ms":Value::Null,
+                        });
+                        if let Ok(mut archive) = timeline_archive.lock() {
+                            archive.push(&sent.profile_epoch, &sent.market_id,
+                                &sent.stream_epoch, cursor, event_id, receipt);
+                        }
+                    }
+                }
+            }
+        })?;
+        let (slow_group_tx, slow_group_rx) =
+            std::sync::mpsc::sync_channel::<SlowMarketGroup>(SLOW_GROUP_QUEUE);
+        let slow_group_dropped = Arc::new(AtomicU64::new(0));
+        let dropped_for_writer = slow_group_dropped.clone();
+        std::thread::Builder::new().name("btc5m-slow-group-log".into()).spawn(move || {
+            loop {
+                match slow_group_rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(group) => marketcow_polymarket::async_eprintln!("{}", slow_group_json(&group)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                let dropped = dropped_for_writer.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    marketcow_polymarket::async_eprintln!("{}", json!({
+                        "stage":"btc_5m_slow_market_group_dropped",
+                        "count":dropped,
+                        "queue_capacity":SLOW_GROUP_QUEUE,
+                    }));
+                }
+            }
+        })?;
         let state = Self {
             reader,
             control: control.clone(),
+            archive_root,
             snapshots: Arc::new(Semaphore::new(limits.snapshot_lease_capacity)),
             streams: Arc::new(Semaphore::new(limits.clients)),
-            timeline: Arc::new(Mutex::new(TimelineArchive::default())),
+            market_stream_slots: Arc::new(Mutex::new(BTreeMap::new())),
+            timeline,
+            timeline_tx,
+            slow_group_tx,
+            slow_group_dropped,
             limits,
         };
         Ok((
@@ -1102,21 +744,432 @@ impl Api {
                     get(http_management_health),
                 )
                 .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/full-sync",
-                    get(http_full_sync),
-                )
-                .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/stream",
-                    get(http_stream),
-                )
-                .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/timeline",
+                    "/v1/prediction-markets/polymarket/research/btc-5m/market-timeline",
                     get(http_timeline),
+                )
+                .route(
+                    "/v1/prediction-markets/polymarket/research/btc-5m/market-replay",
+                    get(http_market_replay),
+                )
+                .route(
+                    "/v1/prediction-markets/polymarket/research/market-archive-replay",
+                    get(http_market_archive_replay),
+                )
+                .route(
+                    "/v1/prediction-markets/polymarket/research/btc-5m/market-streams",
+                    get(http_market_streams),
+                )
+                .route(
+                    "/v1/prediction-markets/polymarket/research/btc-5m/market-full-sync",
+                    get(http_market_full_sync),
+                )
+                .route(
+                    "/v1/prediction-markets/polymarket/research/btc-5m/market-stream",
+                    get(http_market_stream),
                 )
                 .with_state(state),
             control,
         ))
     }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketFullSyncQuery {
+    market_id: String,
+}
+fn proto_market_identity(active: &Active, binding: &MarketBinding,
+    stream_epoch: Option<&str>) -> proto::MarketIdentity {
+    proto::MarketIdentity {
+        market_id: binding.market_id.clone(), condition_id: binding.condition_id.clone(),
+        profile_id: active.profile.profile_id.clone(),
+        profile_revision: active.profile.profile_revision,
+        profile_epoch: active.epoch.clone(),
+        stream_epoch: stream_epoch.map(str::to_owned),
+    }
+}
+fn proto_market_binding(active: &Active, binding: &MarketBinding,
+    stream_epoch: Option<&str>) -> Result<proto::MarketBinding> {
+    Ok(proto::MarketBinding {
+        identity: Some(proto_market_identity(active, binding, stream_epoch)),
+        role: match &binding.role {
+            WindowRole::Current => "current",
+            WindowRole::Next => "next",
+            WindowRole::Retiring => "retiring",
+        }.into(),
+        window_id: binding.window_id.clone(),
+        start_at: binding.start_at.clone(), end_at: binding.end_at.clone(),
+        outcomes: binding.outcomes.iter().map(|outcome| proto::OutcomeBinding {
+            outcome: outcome.outcome.clone(), token_id: outcome.token_id.clone(),
+        }).collect(),
+        rule_sha256: proto_convert::hash32(&binding.rule_sha256)?,
+        maximum_quote_age_ms: active.profile.maximum_quote_age_ms,
+    })
+}
+fn proto_market_watermark(active: &Active, binding: &MarketBinding,
+    snapshot: &MarketMemorySnapshot) -> proto::MarketWatermark {
+    proto::MarketWatermark {
+        identity: Some(proto_market_identity(active, binding,
+            Some(&snapshot.watermark.stream_epoch))),
+        published_market_cursor: Some(snapshot.watermark.published_cursor),
+        replay_floor_market_cursor: Some(snapshot.watermark.replay_floor),
+        last_market_event_cursor: Some(snapshot.last_market_event_cursor),
+        confirmation_sequence: Some(snapshot.confirmation_sequence),
+    }
+}
+fn market_replay_baseline_valid(snapshot: &MarketMemorySnapshot, token: &str,
+    now: DateTime<Utc>) -> bool {
+    if snapshot.unresolved_seed_gaps.contains(token) { return false; }
+    if snapshot.capacity_fenced { return false; }
+    let Some(book) = snapshot.books.get(token) else { return false; };
+    if !instant(book, "received_at").is_ok_and(|received| received <= now) { return false; }
+    if snapshot.recoveries.get(token).is_some_and(|recovery|
+        recovery["snapshot_cursor"].as_u64() != snapshot.event_book_cursors.get(token).copied()) {
+        return false;
+    }
+    match (best_price(book, "bids", true), best_price(book, "asks", false)) {
+        (Ok(Some(bid)), Ok(Some(ask))) => {
+            match (bid.parse::<rust_decimal::Decimal>(), ask.parse::<rust_decimal::Decimal>()) {
+                (Ok(bid), Ok(ask)) => bid < ask,
+                _ => false,
+            }
+        }
+        (Ok(_), Ok(_)) => true,
+        _ => false,
+    }
+}
+
+/// Explain the exact quote gate without promoting a missing side, an old book,
+/// or a recovery baseline to a tradable quote. This reads only the already
+/// captured market lane and never performs I/O or refreshes book freshness.
+fn market_token_quote_readiness(snapshot: &MarketMemorySnapshot, token: &str,
+    now: &DateTime<Utc>, maximum_age_ms: u64) -> (bool, Value) {
+    let mut reasons = Vec::new();
+    if snapshot.capacity_fenced { reasons.push("market_capacity_fenced"); }
+    if snapshot.unresolved_seed_gaps.contains(token) { reasons.push("source_gap"); }
+    let book = snapshot.books.get(token);
+    if book.is_none() { reasons.push("book_missing"); }
+    // A replayable canonical baseline inside an active recovery is not an
+    // execution-ready quote. Completion must clear the recovery barrier.
+    if snapshot.recoveries.contains_key(token) { reasons.push("recovery_in_progress"); }
+    let received = book.and_then(|book| instant(book, "received_at").ok());
+    if book.is_some() && received.is_none() { reasons.push("book_clock_invalid"); }
+    let confirmed = market_token_confirmation(snapshot, token)
+        .and_then(|fact| instant(&fact, "confirmed_at").ok());
+    let freshness = match (received, confirmed.clone()) {
+        (Some(received), Some(confirmed)) => Some(received.max(confirmed)),
+        (Some(received), None) => Some(received),
+        (None, _) => None,
+    };
+    let age_ms = freshness.as_ref().map(|at|
+        (*now).clone().signed_duration_since((*at).clone()).num_milliseconds());
+    if let Some(age_ms) = age_ms {
+        if age_ms < 0 { reasons.push("book_clock_invalid"); }
+        else if age_ms > maximum_age_ms as i64 { reasons.push("book_stale"); }
+    }
+    let bid_levels = book.and_then(|book| book["bids"].as_array()).map(Vec::len);
+    let ask_levels = book.and_then(|book| book["asks"].as_array()).map(Vec::len);
+    if let Some(book) = book {
+        match (best_price(book, "bids", true), best_price(book, "asks", false)) {
+            (Ok(Some(bid)), Ok(Some(ask))) => {
+                match (bid.parse::<rust_decimal::Decimal>(), ask.parse::<rust_decimal::Decimal>()) {
+                    (Ok(bid), Ok(ask)) if bid >= ask => reasons.push("crossed_book"),
+                    (Ok(_), Ok(_)) => {},
+                    _ => reasons.push("book_invalid"),
+                }
+            }
+            (Ok(_), Ok(_)) => reasons.push("incomplete_book"),
+            _ => reasons.push("book_invalid"),
+        }
+    }
+    let ready = reasons.is_empty();
+    (ready, json!({
+        "token_id":token,
+        "ready":ready,
+        "reasons":reasons,
+        "book_market_cursor":snapshot.market_book_cursors.get(token),
+        "book_market_event_cursor":snapshot.event_book_cursors.get(token),
+        "book_received_at":book.and_then(|book| book["received_at"].as_str()),
+        "confirmed_at":confirmed.map(|at| at.to_rfc3339()),
+        "effective_freshness_at":freshness.map(|at| at.to_rfc3339()),
+        "age_ms":age_ms,
+        "bid_levels":bid_levels,
+        "ask_levels":ask_levels,
+    }))
+}
+fn proto_document_response<T: prost::Message>(document: &T, maximum_bytes: usize) -> Response {
+    match market_proto::encode_document(document, maximum_bytes) {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, market_proto::CONTENT_TYPE)], bytes).into_response(),
+        Err(_) => failure(StatusCode::PAYLOAD_TOO_LARGE, "btc_5m_proto_document_too_large", false),
+    }
+}
+async fn http_market_full_sync(State(api): State<Api>, Query(query): Query<MarketFullSyncQuery>) -> Response {
+    if query.market_id.is_empty() {
+        return failure(StatusCode::BAD_REQUEST, "btc_5m_market_full_sync_query", false);
+    }
+    let Ok(permit) = api.snapshots.clone().try_acquire_owned() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_snapshot_capacity", true);
+    };
+    let Ok(active) = api.control.active() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
+    };
+    let Some(binding) = active.profile.markets.iter()
+        .find(|market| market.market_id == query.market_id) else {
+        return failure(StatusCode::NOT_FOUND, "btc_5m_market_not_in_profile", false);
+    };
+    let token_ids = binding.outcomes.iter().map(|outcome| outcome.token_id.clone()).collect::<Vec<_>>();
+    let Ok(snapshot) = api.reader.capture_market(&query.market_id, &token_ids) else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_snapshot_unavailable", true);
+    };
+    let Ok(still_active) = api.control.active() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
+    };
+    if active.epoch != still_active.epoch
+        || active.profile.profile_id != still_active.profile.profile_id
+        || active.profile.profile_revision != still_active.profile.profile_revision {
+        return failure(StatusCode::CONFLICT, "btc_5m_profile_changed", true);
+    }
+    let books = binding.outcomes.iter().map(|outcome| -> Result<proto::BookBaseline> {
+        let token = &outcome.token_id;
+        let book = snapshot.books.get(token);
+        let recovery = snapshot.recoveries.get(token).map(|value| -> Result<proto::RecoveryState> {
+            Ok(proto::RecoveryState {
+                token_id: token.clone(),
+                recovery_id: required_recovery_string(value, "recovery_id")?.into(),
+                gap_code: required_recovery_string(&value["gap"], "code")?.into(),
+                gap_detected_at: required_recovery_string(&value["gap"], "detected_at")?.into(),
+                snapshot_cursor: value["snapshot_cursor"].as_u64(),
+            })
+        }).transpose()?;
+        Ok(proto::BookBaseline {
+            outcome: outcome.outcome.clone(), token_id: token.clone(),
+            replay_baseline_valid: Some(market_replay_baseline_valid(&snapshot, token, Utc::now())),
+            book_market_cursor: snapshot.market_book_cursors.get(token).copied(),
+            book_market_event_cursor: snapshot.event_book_cursors.get(token).copied(),
+            canonical_book_sha256: book.map(|book| proto_convert::hash32(&canonical_hash(book.as_ref()))).transpose()?,
+            canonical_book: book.map(|book| proto_convert::canonical_book(book.as_ref())).transpose()?,
+            active_recovery: recovery,
+            confirmation: market_token_confirmation(&snapshot, token)
+                .map(|value| proto_convert::confirmation(&value)).transpose()?,
+        })
+    }).collect::<Result<Vec<_>>>();
+    let document = books.and_then(|books| Ok(proto::MarketFullSync {
+        binding: Some(proto_market_binding(&active, binding, Some(&snapshot.watermark.stream_epoch))?),
+        watermark: Some(proto_market_watermark(&active, binding, &snapshot)),
+        books,
+        market_unavailable_reason: snapshot.capacity_fenced.then(|| "market_persistence_capacity".into()),
+        snapshot_is_not_execution_readiness: true,
+    }));
+    drop(permit);
+    match document {
+        Ok(document) => proto_document_response(&document, api.limits.snapshot_bytes),
+        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_snapshot_invalid", true),
+    }
+}
+fn required_recovery_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value[key].as_str().with_context(|| format!("missing recovery {key}"))
+}
+async fn http_market_streams(State(api): State<Api>) -> Response {
+    let Ok(active) = api.control.active() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
+    };
+    let mut markets = Vec::new();
+    let mut watermarks = Vec::new();
+    for binding in &active.profile.markets {
+        let watermark = match api.reader.market_stream_watermark(&binding.market_id) {
+            Ok(value) => value,
+            Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
+        };
+        let market = match proto_market_binding(&active, binding,
+            watermark.as_ref().map(|value| value.stream_epoch.as_str())) {
+            Ok(value) => value,
+            Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_binding_invalid", true),
+        };
+        markets.push(market);
+        if let Some(watermark) = watermark {
+            let tokens = binding.outcomes.iter().map(|outcome| outcome.token_id.clone()).collect::<Vec<_>>();
+            let snapshot = match api.reader.capture_market(&binding.market_id, &tokens) {
+                Ok(value) if value.watermark.stream_epoch == watermark.stream_epoch => value,
+                _ => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_snapshot_unavailable", true),
+            };
+            watermarks.push(proto_market_watermark(&active, binding, &snapshot));
+        }
+    }
+    let Ok(still_active) = api.control.active() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
+    };
+    if active.epoch != still_active.epoch
+        || active.profile.profile_id != still_active.profile.profile_id
+        || active.profile.profile_revision != still_active.profile.profile_revision {
+        return failure(StatusCode::CONFLICT, "btc_5m_profile_changed", true);
+    }
+    proto_document_response(&proto::MarketStreams {
+        profile_id: active.profile.profile_id.clone(),
+        profile_revision: active.profile.profile_revision,
+        profile_epoch: active.epoch,
+        markets, watermarks,
+    }, api.limits.snapshot_bytes)
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketReplayQuery {
+    market_id: String,
+    stream_epoch: String,
+    after_market_cursor: u64,
+    maximum_groups: usize,
+}
+fn archive_checkpoint_within_publication(
+    before: &crate::source_publication::MarketStreamWatermark,
+    after: &crate::source_publication::MarketStreamWatermark,
+    archived_durable: u64,
+) -> bool {
+    before.market_id == after.market_id && before.stream_epoch == after.stream_epoch
+        && before.published_cursor <= after.published_cursor
+        && before.durable_cursor <= after.durable_cursor
+        && archived_durable <= after.durable_cursor
+        && after.durable_cursor <= after.published_cursor
+}
+async fn http_market_replay(State(api): State<Api>, Query(query): Query<MarketReplayQuery>) -> Response {
+    if query.market_id.is_empty() || query.stream_epoch.is_empty()
+        || !(1..=64).contains(&query.maximum_groups)
+    {
+        return failure(StatusCode::BAD_REQUEST, "btc_5m_market_replay_query", false);
+    }
+    let Ok(active) = api.control.active() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
+    };
+    if !active.profile.markets.iter().any(|market| market.market_id == query.market_id) {
+        return failure(StatusCode::NOT_FOUND, "btc_5m_market_not_in_profile", false);
+    }
+    let watermark = match api.reader.market_stream_watermark(&query.market_id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return failure(StatusCode::NOT_FOUND, "btc_5m_market_not_published", false),
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
+    };
+    if query.stream_epoch != watermark.stream_epoch {
+        return failure(StatusCode::CONFLICT, "btc_5m_market_epoch_changed", false);
+    }
+    if query.after_market_cursor > watermark.durable_cursor {
+        return failure(StatusCode::BAD_REQUEST, "btc_5m_market_future_cursor", false);
+    }
+    let Some(root) = api.archive_root.clone() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_archive_unavailable", true);
+    };
+    let Ok(permit) = api.snapshots.clone().try_acquire_owned() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_snapshot_capacity", true);
+    };
+    let maximum_bytes = api.limits.replay_bytes;
+    let read_query = query.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read_durable_market_page(&root, &read_query.market_id, &read_query.stream_epoch,
+            read_query.after_market_cursor, read_query.maximum_groups, maximum_bytes)
+    }).await;
+    let page = match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => match error.downcast_ref::<DurableMarketPageBoundary>() {
+            Some(DurableMarketPageBoundary::NotFound) =>
+                return failure(StatusCode::NOT_FOUND, "btc_5m_market_archive_not_found", false),
+            Some(DurableMarketPageBoundary::Expired { .. }) =>
+                return failure(StatusCode::GONE, "btc_5m_market_replay_expired", false),
+            Some(DurableMarketPageBoundary::Future { .. }) =>
+                return failure(StatusCode::CONFLICT, "btc_5m_market_archive_behind", true),
+            None => return failure(StatusCode::SERVICE_UNAVAILABLE,
+                "btc_5m_market_archive_unavailable", true),
+        },
+        _ => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_archive_unavailable", true),
+    };
+    let Ok(still_active) = api.control.active() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
+    };
+    if still_active.epoch != active.epoch
+        || still_active.profile.profile_id != active.profile.profile_id
+        || still_active.profile.profile_revision != active.profile.profile_revision {
+        return failure(StatusCode::CONFLICT, "btc_5m_profile_changed", true);
+    }
+    // Disk IO is asynchronous: a committed checkpoint may advance after the
+    // first memory capture. Recheck the *same stream* after the read rather
+    // than misclassifying legitimate writer progress against an old bound.
+    let latest_watermark = match api.reader.market_stream_watermark(&query.market_id) {
+        Ok(Some(value)) if value.stream_epoch == query.stream_epoch => value,
+        Ok(_) => return failure(StatusCode::CONFLICT, "btc_5m_market_epoch_changed", false),
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
+    };
+    if !archive_checkpoint_within_publication(&watermark, &latest_watermark,
+        page.checkpoint.durable_cursor) {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_archive_ahead_of_publisher", true);
+    }
+    let Some(binding) = active.profile.markets.iter()
+        .find(|binding| binding.market_id == query.market_id) else {
+        return failure(StatusCode::CONFLICT, "btc_5m_profile_changed", true);
+    };
+    let groups = match proto_convert::replay_groups(&page.groups) {
+        Ok(groups) => groups,
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_replay_invalid", true),
+    };
+    proto_document_response(&proto::MarketReplayPage {
+        market_id: page.checkpoint.market_id,
+        stream_epoch: page.checkpoint.stream_epoch.clone(),
+        active_identity: Some(proto_market_identity(&active, binding, Some(&page.checkpoint.stream_epoch))),
+        after_market_cursor: Some(query.after_market_cursor),
+        next_market_cursor: Some(page.next_cursor),
+        replay_floor_market_cursor: Some(page.checkpoint.replay_floor),
+        durable_market_cursor: Some(page.checkpoint.durable_cursor),
+        published_market_cursor: Some(latest_watermark.published_cursor),
+        caught_up: page.caught_up, archive_only: false, groups,
+    }, api.limits.replay_bytes)
+}
+/// Cold, selective evidence remains addressable after a market leaves the hot
+/// BTC profile or a process restart starts a new stream epoch. This endpoint
+/// never asserts current-book availability or execution readiness.
+async fn http_market_archive_replay(
+    State(api): State<Api>, Query(query): Query<MarketReplayQuery>,
+) -> Response {
+    if query.market_id.is_empty() || query.stream_epoch.is_empty()
+        || !(1..=64).contains(&query.maximum_groups)
+    {
+        return failure(StatusCode::BAD_REQUEST, "market_archive_replay_query", false);
+    }
+    let Some(root) = api.archive_root.clone() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "market_archive_unavailable", true);
+    };
+    let Ok(permit) = api.snapshots.clone().try_acquire_owned() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "market_archive_read_capacity", true);
+    };
+    let maximum_bytes = api.limits.replay_bytes;
+    let read_query = query.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read_durable_market_page(&root, &read_query.market_id, &read_query.stream_epoch,
+            read_query.after_market_cursor, read_query.maximum_groups, maximum_bytes)
+    }).await;
+    let page = match result {
+        Ok(Ok(page)) => page,
+        Ok(Err(error)) => match error.downcast_ref::<DurableMarketPageBoundary>() {
+            Some(DurableMarketPageBoundary::NotFound) =>
+                return failure(StatusCode::NOT_FOUND, "market_archive_not_found", false),
+            Some(DurableMarketPageBoundary::Expired { .. }) =>
+                return failure(StatusCode::GONE, "market_archive_replay_expired", false),
+            Some(DurableMarketPageBoundary::Future { .. }) =>
+                return failure(StatusCode::CONFLICT, "market_archive_future_cursor", false),
+            None => return failure(StatusCode::SERVICE_UNAVAILABLE, "market_archive_unavailable", true),
+        },
+        _ => return failure(StatusCode::SERVICE_UNAVAILABLE, "market_archive_unavailable", true),
+    };
+    let groups = match proto_convert::replay_groups(&page.groups) {
+        Ok(groups) => groups,
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "market_archive_replay_invalid", true),
+    };
+    proto_document_response(&proto::MarketReplayPage {
+        market_id: page.checkpoint.market_id,
+        stream_epoch: page.checkpoint.stream_epoch,
+        active_identity: None,
+        after_market_cursor: Some(query.after_market_cursor),
+        next_market_cursor: Some(page.next_cursor),
+        replay_floor_market_cursor: Some(page.checkpoint.replay_floor),
+        durable_market_cursor: Some(page.checkpoint.durable_cursor),
+        published_market_cursor: None,
+        caught_up: page.caught_up, archive_only: true, groups,
+    }, api.limits.replay_bytes)
 }
 fn failure(status: StatusCode, code: &str, retryable: bool) -> Response {
     (
@@ -1130,16 +1183,78 @@ async fn http_status(State(api): State<Api>) -> Response {
     let Ok(active) = api.control.active() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
     };
-    let Ok(view) = api.reader.capture() else {
+    let now = Utc::now();
+    let mut windows = Vec::with_capacity(active.profile.markets.len());
+    let mut current_ready = false;
+    for binding in &active.profile.markets {
+        let tokens = binding.outcomes.iter().map(|outcome| outcome.token_id.clone())
+            .collect::<Vec<_>>();
+        let snapshot = match api.reader.capture_market(&binding.market_id, &tokens) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                windows.push(json!({"role":binding.role,"window_id":binding.window_id,
+                    "start_at":binding.start_at,"end_at":binding.end_at,
+                    "market_id":binding.market_id,"condition_id":binding.condition_id,
+                    "stream_epoch":Value::Null,"published_cursor":Value::Null,
+                    "confirmation_sequence":Value::Null,
+                    "status":"unavailable","readiness_reasons":["market_capture_unavailable"],
+                    "token_quotes":[]}));
+                continue;
+            }
+        };
+        let start = match DateTime::parse_from_rfc3339(&binding.start_at) {
+            Ok(start) => start.with_timezone(&Utc),
+            Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_profile_invalid", false),
+        };
+        let end = match DateTime::parse_from_rfc3339(&binding.end_at) {
+            Ok(end) => end.with_timezone(&Utc),
+            Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_profile_invalid", false),
+        };
+        let window_reason = match binding.role {
+            WindowRole::Current if now < start => Some("window_not_started"),
+            WindowRole::Current if now >= end => Some("window_ended"),
+            WindowRole::Next if now >= end => Some("window_ended"),
+            WindowRole::Retiring => Some("window_retiring"),
+            _ => None,
+        };
+        let token_quotes = tokens.iter().map(|token|
+        market_token_quote_readiness(&snapshot, token, &now, active.profile.maximum_quote_age_ms))
+            .collect::<Vec<_>>();
+        let books_ready = token_quotes.iter().all(|(ready, _)| *ready);
+        let mut readiness_reasons = Vec::new();
+        if let Some(reason) = window_reason { readiness_reasons.push(reason); }
+        if !books_ready { readiness_reasons.push("token_quote_unavailable"); }
+        let window_active = window_reason.is_none();
+        let ready = window_active && books_ready;
+        if binding.role == WindowRole::Current { current_ready = ready; }
+        windows.push(json!({"role":binding.role,"window_id":binding.window_id,
+            "start_at":binding.start_at,"end_at":binding.end_at,
+            "market_id":binding.market_id,"condition_id":binding.condition_id,
+            "stream_epoch":snapshot.watermark.stream_epoch,
+            "published_cursor":snapshot.watermark.published_cursor,
+            "confirmation_sequence":snapshot.confirmation_sequence,
+            "status":if ready {"ready"} else {"unavailable"},
+            "readiness_reasons":readiness_reasons,
+            "token_quotes":token_quotes.into_iter().map(|(_, detail)| detail).collect::<Vec<_>>()}));
+    }
+    let Ok(still_active) = api.control.active() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
     };
-    match status(&view, &active.profile, &active.epoch, Utc::now()) {
-        Ok(mut v) => {
-            v["manager"] = api.control.manager_status().unwrap_or(Value::Null);
-            Json(v).into_response()
-        }
-        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
+    if active.epoch != still_active.epoch
+        || active.profile.profile_id != still_active.profile.profile_id
+        || active.profile.profile_revision != still_active.profile.profile_revision {
+        return failure(StatusCode::CONFLICT, "btc_5m_profile_changed", true);
     }
+    Json(json!({"schema_version":STATUS_SCHEMA,"profile_id":active.profile.profile_id,
+        "profile_revision":active.profile.profile_revision,
+        "profile_document_sha256":active.profile.document_sha256(),
+        "profile":active.profile,"epoch":active.epoch,"observed_at":now.to_rfc3339(),
+        "ready":current_ready,
+        "reason":if current_ready {Value::Null} else {json!("current_market_not_ready")},
+        "manager":api.control.manager_status().unwrap_or(Value::Null),
+        "maximum_markets":MAX_MARKETS,"maximum_tokens":MAX_TOKENS,
+        "cursor_semantics":"market_local_only_no_global_publisher_cursor",
+        "windows":windows})).into_response()
 }
 /// Management visibility must not depend on a usable market-data capture.
 /// HTTP 200 means the control plane answered, never that trading is ready.
@@ -1246,46 +1361,12 @@ async fn http_management_health(State(api): State<Api>) -> Response {
     Json(management_health(&api.control.process_instance_id,
         profile.as_ref(), &manager, publication, Utc::now())).into_response()
 }
-async fn http_full_sync(State(api): State<Api>) -> Response {
-    let Ok(permit) = api.snapshots.clone().try_acquire_owned() else {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "btc_5m_snapshot_capacity",
-            true,
-        );
-    };
-    let Ok(active) = api.control.active() else {
-        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
-    };
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let _permit = permit;
-        let view = api
-            .reader
-            .capture_for_resume(api.limits.send_timeout, api.limits.snapshot_lease_capacity)?;
-        let mut value = full_sync(&view, &active.profile, &active.epoch, Utc::now())?;
-        value["manager"] = api.control.manager_status()?;
-        Ok(encode_bounded(&value, api.limits.snapshot_bytes)?)
-    })
-    .await;
-    match result {
-        Ok(Ok(v)) => ([(axum::http::header::CONTENT_TYPE, "application/json")], v).into_response(),
-        Ok(Err(e))
-            if e.downcast_ref::<crate::source_public_api::EncodeError>()
-                .is_some() =>
-        {
-            failure(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "btc_5m_snapshot_too_large",
-                false,
-            )
-        }
-        _ => failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
-    }
-}
 #[derive(Deserialize)]
 struct TimelineQuery {
-    epoch: String,
-    publisher_cursor: u64,
+    profile_epoch: String,
+    market_id: String,
+    stream_epoch: String,
+    market_event_cursor: u64,
     event_id: String,
 }
 async fn http_timeline(State(api): State<Api>, Query(q): Query<TimelineQuery>) -> Response {
@@ -1295,11 +1376,16 @@ async fn http_timeline(State(api): State<Api>, Query(q): Query<TimelineQuery>) -
     let Ok(active) = api.control.active() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
     };
-    if q.publisher_cursor == 0 || !hex64(&q.event_id) {
+    if q.market_id.is_empty() || q.stream_epoch.is_empty()
+        || q.market_event_cursor == 0 || !hex64(&q.event_id) {
         return failure(StatusCode::BAD_REQUEST, "btc_5m_timeline_identity", false);
     }
-    let replay_event = if q.epoch == active.epoch {
-        api.reader.timeline_event(q.publisher_cursor)
+    if !active.profile.markets.iter().any(|market| market.market_id == q.market_id) {
+        return failure(StatusCode::NOT_FOUND, "btc_5m_market_not_in_profile", false);
+    }
+    let replay_event = if q.profile_epoch == active.epoch {
+        api.reader.market_timeline_event(&q.market_id, &q.stream_epoch,
+            q.market_event_cursor)
     } else {
         Ok(None)
     };
@@ -1307,7 +1393,7 @@ async fn http_timeline(State(api): State<Api>, Query(q): Query<TimelineQuery>) -
         Ok(Some((event, timing))) if event["event_id"] == q.event_id => Some(json!({
             "market_id":event["market_id"], "token_id":event["token_id"],
             "book_epoch":event["book_epoch"], "sequence":event["sequence"],
-            "publisher_cursor":event["cursor"], "event_id":event["event_id"],
+            "market_event_cursor":event["cursor"], "event_id":event["event_id"],
             "event_received_at":event["received_at"],
             "canonical_book_received_at":event["canonical_payload"]["received_at"],
             "source_batch_timing":timing.as_ref().map(source_timing_json),
@@ -1317,105 +1403,383 @@ async fn http_timeline(State(api): State<Api>, Query(q): Query<TimelineQuery>) -
         Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
     };
     let sent = match api.timeline.lock() {
-        Ok(archive) => archive.lookup(&q.epoch, q.publisher_cursor, &q.event_id),
+        Ok(archive) => archive.lookup(&q.profile_epoch, &q.market_id,
+            &q.stream_epoch, q.market_event_cursor, &q.event_id),
         Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
     };
     if publication.is_none() && sent.is_empty() {
         return failure(StatusCode::GONE, "btc_5m_timeline_evicted_or_unknown", false);
     }
     Json(json!({
-        "schema_version":"marketcow.polymarket.btc-5m-timeline.v1",
-        "epoch":q.epoch,"publisher_cursor":q.publisher_cursor,"event_id":q.event_id,
+        "schema_version":"marketcow.polymarket.btc-5m-market-timeline.v2",
+        "profile_epoch":q.profile_epoch,"market_id":q.market_id,
+        "stream_epoch":q.stream_epoch,"market_event_cursor":q.market_event_cursor,
+        "event_id":q.event_id,
         "publication_if_still_in_replay":publication,
         "connection_sends":sent,
         "receipt_capacity":{"max_entries":TIMELINE_RECEIPT_COUNT,"max_bytes":TIMELINE_RECEIPT_BYTES},
         "clock_error_bound_ms":Value::Null,
     })).into_response()
 }
-async fn http_stream(
-    State(api): State<Api>,
-    Query(q): Query<StreamQuery>,
-    ws: WebSocketUpgrade,
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketStreamQuery {
+    market_id: String,
+    stream_epoch: String,
+    profile_epoch: String,
+    after_market_cursor: u64,
+    after_confirmation_sequence: u64,
+}
+
+async fn http_market_stream(
+    State(api): State<Api>, Query(query): Query<MarketStreamQuery>,
+    headers: HeaderMap, ws: WebSocketUpgrade,
 ) -> Response {
-    let wire_version = q.wire_version.unwrap_or(1);
-    if !matches!(wire_version, 1 | 2) {
-        return failure(StatusCode::BAD_REQUEST, "btc_5m_wire_version", false);
+    if !headers.get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|offered| offered.trim() == MARKET_PROTO_SUBPROTOCOL)) {
+        return failure(StatusCode::UPGRADE_REQUIRED, "btc_5m_proto_subprotocol_required", false);
+    }
+    if query.market_id.is_empty() || query.stream_epoch.is_empty() || query.profile_epoch.is_empty() {
+        return failure(StatusCode::BAD_REQUEST, "btc_5m_market_stream_query", false);
     }
     let Ok((active, profile_changed)) = api.control.active_with_watch() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
     };
-    if q.epoch != active.epoch {
-        return failure(StatusCode::CONFLICT, "btc_5m_epoch_changed", false);
+    if query.profile_epoch != active.epoch {
+        return failure(StatusCode::CONFLICT, "btc_5m_profile_changed", true);
     }
-    let current = match api.reader.capture() {
-        Ok(view) => view,
-        Err(_) => {
-            return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
-        }
+    let Some(binding) = active.profile.markets.iter()
+        .find(|market| market.market_id == query.market_id).cloned() else {
+        return failure(StatusCode::NOT_FOUND, "btc_5m_market_not_in_profile", false);
     };
-    if q.after_cursor > current.cursor
-        || q.after_confirmation_sequence.unwrap_or(0) > current.confirmation_sequence
-    {
-        return failure(StatusCode::CONFLICT, "btc_5m_future_cursor", false);
+    let watermark = match api.reader.market_stream_watermark(&query.market_id) {
+        Ok(Some(value)) => value,
+        Ok(None) => return failure(StatusCode::NOT_FOUND, "btc_5m_market_not_published", false),
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
+    };
+    if watermark.stream_epoch != query.stream_epoch {
+        return failure(StatusCode::CONFLICT, "btc_5m_market_epoch_changed", false);
     }
-    match api.reader.replay(
-        q.after_cursor,
-        q.after_confirmation_sequence.unwrap_or(0),
-        1,
-        api.limits.replay_bytes,
-    ) {
-        Err(error) if error.to_string().contains("replay expired") => {
-            return failure(StatusCode::GONE, "btc_5m_replay_expired", false);
-        }
-        Err(_) => {
-            return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true);
-        }
-        Ok(_) => {}
+    if query.after_market_cursor > watermark.published_cursor {
+        return failure(StatusCode::CONFLICT, "btc_5m_market_future_cursor", false);
     }
+    if query.after_market_cursor < watermark.replay_floor {
+        return failure(StatusCode::GONE, "btc_5m_market_replay_expired", false);
+    }
+    let tokens = binding.outcomes.iter().map(|outcome| outcome.token_id.clone()).collect::<Vec<_>>();
+    match api.reader.capture_market(&query.market_id, &tokens) {
+        Ok(snapshot) if query.after_confirmation_sequence <= snapshot.confirmation_sequence => {},
+        Ok(_) => return failure(StatusCode::BAD_REQUEST, "btc_5m_market_future_confirmation", false),
+        Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
+    }
+    if api.reader.replay_market(&query.market_id, &query.stream_epoch,
+        query.after_market_cursor, 1, api.limits.replay_bytes).is_err() {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_stream_unavailable", true);
+    }
+    // One market's slow or excessive consumers cannot occupy every WS slot
+    // needed by current/next. The shared cap remains an absolute bound; each
+    // market also has its own admission and send task.
+    let market_slots = {
+        let Ok(mut slots) = api.market_stream_slots.lock() else {
+            return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_stream_capacity", true);
+        };
+        slots.retain(|market, _| active.profile.markets.iter()
+            .any(|binding| &binding.market_id == market));
+        slots.entry(query.market_id.clone()).or_insert_with(||
+            Arc::new(Semaphore::new(market_stream_client_limit(api.limits.clients))))
+            .clone()
+    };
+    let Ok(market_permit) = market_slots.try_acquire_owned() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_stream_capacity", true);
+    };
     let Ok(permit) = api.streams.clone().try_acquire_owned() else {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "btc_5m_stream_capacity",
-            true,
-        );
+        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_stream_capacity", true);
     };
-    let connection_id = format!(
-        "{}:{}:{}",
-        std::process::id(),
-        active.epoch,
-        NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed),
-    );
-    ws.max_message_size(4096)
-        .max_frame_size(4096)
+    ws.protocols([MARKET_PROTO_SUBPROTOCOL]).max_message_size(4096).max_frame_size(4096)
         .on_upgrade(move |mut socket| async move {
             let _permit = permit;
-            if let Err(error) = stream(
-                &mut socket,
-                &api,
-                active,
-                profile_changed,
-                q.after_cursor,
-                q.after_confirmation_sequence.unwrap_or(0),
-                wire_version,
-                &connection_id,
-            )
-            .await
-            {
-                eprintln!("BTC 5m stream closed: {error:#}");
+            let _market_permit = market_permit;
+            if let Err(error) = market_stream(&mut socket, &api, active,
+                profile_changed, binding, query.clone()).await {
+                marketcow_polymarket::async_eprintln!("{}", json!({"stage":"btc_5m_market_stream_closed",
+                    "at":Utc::now(),"market_id":query.market_id,
+                    "stream_epoch":query.stream_epoch,"initial_after_market_cursor":query.after_market_cursor,
+                    "error":format!("{error:#}")}));
             }
-            let _ = socket.send(Message::Close(None)).await;
+            // Release this selected market's and the shared WS permits even
+            // when the peer cannot drain the closing handshake.
+            let _ = tokio::time::timeout(api.limits.send_timeout,
+                socket.send(Message::Close(None))).await;
         })
 }
-async fn send(socket: &mut WebSocket, api: &Api, value: Value) -> Result<()> {
-    let body = String::from_utf8(encode_bounded(&value, api.limits.frame_bytes)?)?;
-    tokio::time::timeout(
-        api.limits.send_timeout,
-        socket.send(Message::Text(body.into())),
-    )
-    .await??;
+
+/// Split only on event boundaries. A consumer must stage all chunks and
+/// validate the group hash before applying a single book update or advancing
+/// its exclusive market cursor. Disconnect in a partial group resumes from
+/// the preceding complete group.
+fn market_group_frames(active: &Active, query: &MarketStreamQuery,
+    market_cursor: u64, group_sha256: &str, events: &[Value],
+    frame_bytes: usize) -> Result<Vec<Vec<u8>>> {
+    let binding = active.profile.markets.iter().find(|binding| binding.market_id == query.market_id)
+        .context("market group not in active profile")?;
+    let identity = proto_market_identity(active, binding, Some(&query.stream_epoch));
+    proto_convert::encode_market_group(&identity, market_cursor, group_sha256, events, frame_bytes)
+}
+
+async fn send_market_frame(socket: &mut WebSocket, api: &Api, bytes: Vec<u8>) -> Result<DateTime<Utc>> {
+    tokio::time::timeout(api.limits.send_timeout,
+        socket.send(Message::Binary(bytes.into()))).await??;
+    Ok(Utc::now())
+}
+
+// A busy market can have a replay page ready on every iteration. Poll the
+// control side between data frames so that client Ping/Close is not gated on
+// replay catching up. This does not advance a group cursor: a disconnect in
+// the middle of begin/chunk/commit still replays the whole group.
+async fn poll_market_client_control(socket: &mut WebSocket, send_timeout: Duration) -> Result<bool> {
+    match socket.recv().now_or_never() {
+        None | Some(Some(Ok(Message::Pong(_)))) => Ok(false),
+        Some(None | Some(Ok(Message::Close(_)))) => Ok(true),
+        Some(Some(Ok(Message::Ping(bytes)))) => {
+            tokio::time::timeout(send_timeout,
+                socket.send(Message::Pong(bytes))).await??;
+            Ok(false)
+        }
+        Some(Some(Err(error))) => Err(error.into()),
+        Some(Some(Ok(_))) => anyhow::bail!("unexpected market stream client message"),
+    }
+}
+fn proto_market_frame(active: &Active, binding: &MarketBinding,
+    query: &MarketStreamQuery, body: proto::market_stream_frame::Body) -> proto::MarketStreamFrame {
+    proto::MarketStreamFrame {
+        identity: Some(proto_market_identity(active, binding, Some(&query.stream_epoch))),
+        body: Some(body),
+    }
+}
+async fn send_market_message(socket: &mut WebSocket, api: &Api,
+    frame: proto::MarketStreamFrame) -> Result<()> {
+    let bytes = market_proto::encode_frame(&frame, api.limits.frame_bytes)?;
+    send_market_frame(socket, api, bytes).await?;
     Ok(())
 }
 
+fn market_token_confirmation(snapshot: &MarketMemorySnapshot, token: &str) -> Option<Value> {
+    let fact = snapshot.confirmation_facts.get(token)?;
+    let book = snapshot.books.get(token)?;
+    let cursor = snapshot.market_book_cursors.get(token)?;
+    let version = snapshot.market_confirmation_versions.get(token)?;
+    if *version == 0 || *version > snapshot.confirmation_sequence { return None; }
+    // Never attach an older same-depth confirmation to a newer book cursor.
+    // In particular, last_trade can advance the canonical sequence without
+    // changing the depth checksum.
+    if fact["token_id"] != book["token_id"]
+        || fact["condition_id"] != book["condition_id"]
+        || fact["book_epoch"] != book["book_epoch"]
+        || fact["sequence"] != book["sequence"]
+        || fact["state_checksum"] != book["state_checksum"]
+        || fact["book_received_at"] != book["received_at"]
+    { return None; }
+    Some(json!({"token_id":fact["token_id"],"condition_id":fact["condition_id"],
+        "confirmation_sequence":version,
+        "market_cursor":cursor,"book_epoch":fact["book_epoch"],
+        "book_sequence":fact["sequence"],"state_checksum":fact["state_checksum"],
+        "book_received_at":fact["book_received_at"],"confirmed_at":fact["confirmed_at"],
+        "confirmation_source":fact["confirmation_source"],
+        "confirmation_evidence_sha256":fact["confirmation_evidence_sha256"]}))
+}
+
+fn market_confirmation_frame(active: &Active, binding: &MarketBinding,
+    query: &MarketStreamQuery, snapshot: &MarketMemorySnapshot,
+    sent_cursor: u64, after_confirmation: u64) -> Result<Option<proto::MarketStreamFrame>> {
+    if snapshot.watermark.stream_epoch != query.stream_epoch
+        || snapshot.confirmation_sequence <= after_confirmation { return Ok(None); }
+    let confirmations = snapshot.confirmation_facts.keys()
+        .filter(|token| snapshot.market_confirmation_versions.get(*token)
+            .is_some_and(|version| *version > after_confirmation))
+        .filter_map(|token| market_token_confirmation(snapshot, token))
+        .map(|value| proto_convert::confirmation(&value)).collect::<Result<Vec<_>>>()?;
+    if confirmations.iter().any(|fact|
+        fact.book_market_cursor > sent_cursor) {
+        return Ok(None);
+    }
+    Ok(Some(proto_market_frame(active, binding, query,
+        proto::market_stream_frame::Body::BookConfirmations(proto::BookConfirmations {
+            sent_market_cursor: Some(sent_cursor),
+            confirmation_sequence: snapshot.confirmation_sequence,
+            confirmations,
+        }))))
+}
+
+fn market_ready_frame(active: &Active, binding: &MarketBinding,
+    query: &MarketStreamQuery, snapshot: &MarketMemorySnapshot,
+    sent_cursor: u64) -> Result<proto::MarketStreamFrame> {
+    ensure!(snapshot.watermark.stream_epoch == query.stream_epoch
+        && snapshot.watermark.published_cursor == sent_cursor,
+        "market ready requires one caught-up snapshot");
+    ensure!(sent_cursor == 0 || snapshot.last_market_event_cursor > 0,
+        "market ready missing event cursor boundary");
+    let confirmations = snapshot.confirmation_facts.keys()
+        .filter_map(|token| market_token_confirmation(snapshot, token))
+        .map(|value| proto_convert::confirmation(&value)).collect::<Result<Vec<_>>>()?;
+    ensure!(confirmations.iter().all(|fact| fact.book_market_cursor <= sent_cursor),
+        "ready confirmation ahead of sent book");
+    Ok(proto_market_frame(active, binding, query,
+        proto::market_stream_frame::Body::Ready(proto::MarketReady {
+            market_cursor: Some(sent_cursor),
+            last_market_event_cursor: Some(snapshot.last_market_event_cursor),
+            confirmation_sequence: Some(snapshot.confirmation_sequence),
+            confirmations, execution_readiness: Some(false),
+        })))
+}
+
+async fn market_stream(socket: &mut WebSocket, api: &Api, active: Active,
+    mut profile_changed: watch::Receiver<u64>, binding: MarketBinding,
+    query: MarketStreamQuery) -> Result<()> {
+    let mut changed = api.reader.subscribe_market(&query.market_id, &query.stream_epoch)?;
+    let connection_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut cursor = query.after_market_cursor;
+    let mut ready_sent = false;
+    let mut last_confirmation = query.after_confirmation_sequence;
+    let mut last_confirmation_sent_at = std::time::Instant::now() - CONFIRMATION_MIN_INTERVAL;
+    let tokens = binding.outcomes.iter().map(|outcome|outcome.token_id.clone()).collect::<Vec<_>>();
+    // Freeze a causal ready prefix once. Requiring an empty live replay page
+    // would make a liquid market unable to become ready while new groups keep
+    // arriving. The initial snapshot's books/confirmations are valid exactly
+    // at this complete group boundary; later groups follow only after ready.
+    let initial_snapshot = api.reader.capture_market(&query.market_id, &tokens)?;
+    ensure!(initial_snapshot.watermark.stream_epoch == query.stream_epoch,
+        "market ready snapshot epoch changed");
+    let ready_target = initial_snapshot.watermark.published_cursor;
+    ensure!(cursor <= ready_target, "market ready snapshot precedes requested cursor");
+    let mut ready_snapshot = Some(initial_snapshot);
+    loop {
+        if poll_market_client_control(socket, api.limits.send_timeout).await? { return Ok(()); }
+        changed.borrow_and_update();
+        if *profile_changed.borrow() != active.profile.profile_revision {
+            let next = api.control.active()?;
+            send_market_message(socket, api, proto_market_frame(&active, &binding, &query,
+                proto::market_stream_frame::Body::ProfileChanged(proto::ProfileChanged {
+                    after_market_cursor: Some(cursor),
+                    next_profile_id: next.profile.profile_id.clone(),
+                    next_profile_revision: next.profile.profile_revision,
+                    next_profile_epoch: next.epoch,
+                    requires_new_market_full_sync: true,
+                }))).await?;
+            return Ok(());
+        }
+        let fence = api.reader.capture_market(&query.market_id, &tokens)?;
+        if fence.capacity_fenced {
+            send_market_message(socket, api, proto_market_frame(&active, &binding, &query,
+                proto::market_stream_frame::Body::Unavailable(proto::MarketUnavailable {
+                    after_market_cursor: Some(cursor), reason: "market_persistence_capacity".into(),
+                    requires_new_market_full_sync: true,
+                }))).await?;
+            return Ok(());
+        }
+        if !ready_sent && cursor == ready_target {
+            let snapshot = ready_snapshot.take().context("market ready snapshot missing")?;
+            if snapshot.capacity_fenced {
+                send_market_message(socket, api, proto_market_frame(&active, &binding, &query,
+                    proto::market_stream_frame::Body::Unavailable(proto::MarketUnavailable {
+                        after_market_cursor: Some(cursor), reason: "market_persistence_capacity".into(),
+                        requires_new_market_full_sync: true,
+                    }))).await?;
+                return Ok(());
+            }
+            send_market_message(socket, api,
+                market_ready_frame(&active, &binding, &query, &snapshot, cursor)?).await?;
+            ready_sent = true;
+            last_confirmation = snapshot.confirmation_sequence;
+        }
+        let maximum_groups = if ready_sent { 16 } else {
+            usize::try_from((ready_target - cursor).min(16))?
+        };
+        let page = api.reader.replay_market(&query.market_id, &query.stream_epoch,
+            cursor, maximum_groups, api.limits.replay_bytes)?;
+        for group in &page.groups {
+            if *profile_changed.borrow() != active.profile.profile_revision {
+                // Do not start another group under a superseded profile.
+                break;
+            }
+            let frames = market_group_frames(&active, &query, group.market_cursor,
+                &group.group_sha256, group.payload.validated.events(), api.limits.frame_bytes)?;
+            let mut group_sent_at = None;
+            for frame in frames {
+                if poll_market_client_control(socket, api.limits.send_timeout).await? { return Ok(()); }
+                group_sent_at = Some(send_market_frame(socket, api, frame).await?);
+            }
+            // A partial begin/chunk transmission is never an applied group.
+            // Only enqueue a commit-complete receipt, without serialization
+            // or waiting on diagnostics from this WS path.
+            if let Some(sent_at) = group_sent_at {
+                if ready_sent
+                    && let Some(timing) = group.payload.timing_snapshot()
+                    && let Some(elapsed_us) = slow_group_elapsed_us(&timing, sent_at)
+                    && let Some(event) = group.payload.validated.events().last()
+                    && let (Some(market_event_cursor), Some(event_id)) =
+                        (event["cursor"].as_u64(), event["event_id"].as_str())
+                {
+                    let slow = SlowMarketGroup {
+                        connection_id: connection_id.clone(),
+                        profile_epoch: active.epoch.clone(),
+                        market_id: query.market_id.clone(),
+                        stream_epoch: query.stream_epoch.clone(),
+                        market_cursor: group.market_cursor,
+                        market_event_cursor,
+                        event_id: event_id.to_owned(),
+                        event_count: group.payload.validated.events().len(),
+                        group_commit_sent_at: sent_at,
+                        raw_last_to_send_us: elapsed_us,
+                        timing,
+                    };
+                    if api.slow_group_tx.try_send(slow).is_err() {
+                        api.slow_group_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let _ = api.timeline_tx.try_send(MarketTimelineGroup {
+                    profile_epoch:active.epoch.clone(), market_id:query.market_id.clone(),
+                    stream_epoch:query.stream_epoch.clone(), market_cursor:group.market_cursor,
+                    group:group.payload.clone(), group_commit_sent_at:sent_at,
+                });
+            }
+            cursor = group.market_cursor;
+        }
+        if *profile_changed.borrow() == active.profile.profile_revision {
+            ensure!(cursor == page.next_cursor, "market replay page boundary differs");
+        }
+        if !ready_sent && cursor == ready_target { continue; }
+        let snapshot = api.reader.capture_market(&query.market_id, &tokens)?;
+        if snapshot.capacity_fenced { continue; }
+        let confirmation = if ready_sent {
+            market_confirmation_frame(&active, &binding, &query, &snapshot, cursor, last_confirmation)?
+        } else { None };
+        let confirmation_wait = confirmation_wait(last_confirmation_sent_at, std::time::Instant::now());
+        if let Some(frame) = confirmation.as_ref().filter(|_| confirmation_wait.is_zero()) {
+            if *profile_changed.borrow() != active.profile.profile_revision { continue; }
+            send_market_message(socket, api, frame.clone()).await?;
+            last_confirmation = snapshot.confirmation_sequence;
+            last_confirmation_sent_at = std::time::Instant::now();
+        }
+        // A liquid market may have another page ready on every iteration.
+        // Confirmation evidence remains an independent, memory-only prefix.
+        if !page.caught_up { continue; }
+        tokio::select! {
+            result=changed.changed()=>result.context("publication closed")?,
+            result=profile_changed.changed()=>result.context("BTC 5m profile control closed")?,
+            _=tokio::time::sleep(confirmation_wait), if confirmation.is_some() && !confirmation_wait.is_zero() => {},
+            message=socket.recv()=>match message {
+                None | Some(Ok(Message::Close(_))) => return Ok(()),
+                Some(Ok(Message::Ping(bytes))) => {
+                    tokio::time::timeout(api.limits.send_timeout,
+                        socket.send(Message::Pong(bytes))).await??;
+                },
+                Some(Ok(Message::Pong(_))) => {},
+                _ => anyhow::bail!("unexpected market stream client message"),
+            }
+        }
+    }
+}
 fn monotonic_us(start: std::time::Instant, end: std::time::Instant) -> u64 {
     u64::try_from(end.saturating_duration_since(start).as_micros()).unwrap_or(u64::MAX)
 }
@@ -1438,303 +1802,204 @@ fn source_timing_json(t: &SourceBatchTiming) -> Value {
     })
 }
 
-fn timeline_log_permitted(sampled: bool, anomalous: bool) -> bool {
-    static BUDGET: OnceLock<Mutex<(std::time::Instant, u32, u32, u64)>> = OnceLock::new();
-    let mut budget = BUDGET
-        .get_or_init(|| Mutex::new((std::time::Instant::now(), 0, 0, 0)))
-        .lock()
-        .expect("BTC 5m timeline budget poisoned");
-    if budget.0.elapsed() >= Duration::from_secs(60) {
-        if budget.3 > 0 {
-            eprintln!("{}", json!({"stage":"btc_5m_timeline_suppressed",
-                "count":budget.3,"period_seconds":60}));
-        }
-        *budget = (std::time::Instant::now(), 0, 0, 0);
-    }
-    if sampled && budget.1 < 32 {
-        budget.1 += 1;
-        true
-    } else if anomalous && budget.2 < 60 {
-        budget.2 += 1;
-        true
-    } else {
-        if sampled || anomalous {
-            budget.3 = budget.3.saturating_add(1);
-        }
-        false
-    }
-}
-
-async fn send_event(
-    socket: &mut WebSocket,
-    api: &Api,
-    frame: Value,
-    batch_timing: Option<&SourceBatchTiming>,
-    connection_id: &str,
-    replay_dequeued_at: DateTime<Utc>,
-    replay_dequeued_mono: std::time::Instant,
-) -> Result<()> {
-    let event_received_at = frame["payload"]["received_at"]
-        .as_str()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| t.with_timezone(&Utc));
-    let body = String::from_utf8(encode_bounded(&frame, api.limits.frame_bytes)?)?;
-    let send_started_mono = std::time::Instant::now();
-    let send_started_at = Utc::now();
-    let result = tokio::time::timeout(
-        api.limits.send_timeout,
-        socket.send(Message::Text(body.into())),
-    ).await;
-    let send_completed_mono = std::time::Instant::now();
-    let send_completed_at = Utc::now();
-    let send_outcome = match &result {
-        Ok(Ok(())) => "ok",
-        Ok(Err(_)) => "socket_error",
-        Err(_) => "timeout",
-    };
-    let sampled = frame["publisher_cursor"].as_u64()
-        .is_some_and(crate::source_publication::btc5m_trace_sample);
-    let anomalous = send_outcome != "ok"
-        || event_received_at.is_some_and(|t| (send_completed_at - t).num_milliseconds() >= 1000)
-        || monotonic_us(replay_dequeued_mono, send_completed_mono) >= 200_000;
-    let source = batch_timing.map(|t| {
-        let mut value = source_timing_json(t);
-        value["replay_visible_to_ws_dequeue_us"] = json!(t.shared_replay_visible_mono
-            .map(|visible|monotonic_us(visible,replay_dequeued_mono)));
-        value["actor_admit_to_ws_send_complete_us"] =
-            json!(monotonic_us(t.actor_admitted_mono,send_completed_mono));
-        value
-    });
-    let receipt = json!({
-            "stage":"btc_5m_event_timeline_v1",
-            "trace_reason":if anomalous {"anomaly"} else if sampled {"cursor_sample"} else {"query_retained"},
-            "connection_id":connection_id,
-            "epoch":frame["epoch"],"market_id":frame["market_id"],
-            "token_id":frame["token_id"],"publisher_cursor":frame["publisher_cursor"],
-            "event_id":frame["payload"]["event_id"],
-            "raw_payload_sha256":frame["payload"]["raw_payload_sha256"],
-            "book_epoch":frame["payload"]["book_epoch"],
-            "sequence":frame["payload"]["sequence"],
-            "event_received_at":frame["payload"]["received_at"],
-            "canonical_book_received_at":frame["payload"]["post_state"]["received_at"]
-                .as_str().or_else(||frame["payload"]["canonical_payload"]["received_at"].as_str()),
-            "source_batch_timing":source,
-            "ws_queue_semantics":"shared_memory_replay_no_per_client_enqueue",
-            "ws_replay_dequeued_at":replay_dequeued_at,
-            "ws_send_started_at":send_started_at,
-            "ws_send_completed_at":send_completed_at,
-            "ws_dequeue_to_send_start_us":monotonic_us(replay_dequeued_mono,send_started_mono),
-            "ws_send_call_us":monotonic_us(send_started_mono,send_completed_mono),
-            "send_outcome":send_outcome,
-            "source_clock_error_bound_ms":Value::Null,
-            "durability":frame["durability"],
-    });
-    if let (Some(epoch), Some(cursor), Some(event_id)) = (
-        frame["epoch"].as_str(), frame["publisher_cursor"].as_u64(),
-        frame["payload"]["event_id"].as_str(),
-    ) {
-        api.timeline.lock().expect("BTC 5m timeline archive poisoned")
-            .push(epoch, cursor, event_id, receipt.clone());
-    }
-    if timeline_log_permitted(sampled, anomalous) {
-        eprintln!("{receipt}");
-    }
-    result??;
-    Ok(())
-}
-
-/// The writer may be ahead of this client's replay. Never attest durability
-/// for a cursor this connection has not yet sent, and never repeat/regress a
-/// watermark. This frame carries no quote-freshness or new book evidence.
-fn durable_watermark_target(
-    sent_cursor: u64,
-    writer_cursor: u64,
-    last_sent_durable: u64,
-) -> Option<u64> {
-    let durable_cursor = writer_cursor.min(sent_cursor);
-    (durable_cursor > last_sent_durable).then_some(durable_cursor)
-}
-
-fn durable_watermark_frame(
-    active: &Active,
-    sent_cursor: u64,
-    durable_cursor: u64,
-    observed_at: DateTime<Utc>,
-) -> Value {
-    json!({
-        "schema_version":COMPACT_EVENT_SCHEMA,
-        "type":"durable_watermark",
-        "epoch":active.epoch,
-        "profile_id":active.profile.profile_id,
-        "profile_revision":active.profile.profile_revision,
-        "publisher_cursor":sent_cursor,
-        "durable_cursor":durable_cursor,
-        "observed_at":observed_at,
-        "causal_bound":"durable_cursor_not_after_sent_publisher_cursor",
-    })
-}
-
-fn durable_watermark_wait(
+fn confirmation_wait(
     last_sent_at: std::time::Instant,
     now: std::time::Instant,
 ) -> Duration {
-    DURABLE_WATERMARK_MIN_INTERVAL
+    CONFIRMATION_MIN_INTERVAL
         .saturating_sub(now.saturating_duration_since(last_sent_at))
-}
-
-async fn send_profile_changed(
-    socket: &mut WebSocket,
-    api: &Api,
-    active: &Active,
-    cursor: u64,
-    event_schema: &str,
-) -> Result<()> {
-    let next = api.control.active()?;
-    send(socket, api, json!({"schema_version":event_schema,"type":"profile_changed",
-        "epoch":active.epoch,"publisher_cursor":cursor,
-        "next_profile_id":next.profile.profile_id,
-        "next_profile_revision":next.profile.profile_revision,"next_epoch":next.epoch,
-        "requires_new_full_sync":true})).await
-}
-async fn stream(
-    socket: &mut WebSocket,
-    api: &Api,
-    active: Active,
-    mut profile_changed: watch::Receiver<u64>,
-    mut cursor: u64,
-    mut confirmation_cursor: u64,
-    wire_version: u8,
-    connection_id: &str,
-) -> Result<()> {
-    let event_schema = if wire_version == 2 {
-        COMPACT_EVENT_SCHEMA
-    } else {
-        EVENT_SCHEMA
-    };
-    let mut changed = api.reader.subscribe();
-    let mut ready_sent = false;
-    let mut last_sent_durable = 0;
-    let mut last_durable_sent_at = std::time::Instant::now();
-    loop {
-        changed.borrow_and_update();
-        if *profile_changed.borrow() != active.profile.profile_revision {
-            send_profile_changed(socket, api, &active, cursor, event_schema).await?;
-            return Ok(());
-        }
-        let page = api
-            .reader
-            .replay(cursor, confirmation_cursor, 64, api.limits.replay_bytes)?;
-        for batch in &page.batches {
-            if *profile_changed.borrow() != active.profile.profile_revision {
-                send_profile_changed(socket, api, &active, cursor, event_schema).await?;
-                return Ok(());
-            }
-            let batch_timing = batch.timing_snapshot();
-            for event in batch.validated.events() {
-                let at = event["cursor"].as_u64().context("event cursor")?;
-                if at <= cursor {
-                    continue;
-                }
-                let replay_dequeued_mono = std::time::Instant::now();
-                let replay_dequeued_at = Utc::now();
-                let frame = if wire_version == 2 {
-                    compact_event_frame(&active.profile, &active.epoch, event)?
-                } else {
-                    event_frame(&active.profile, &active.epoch, event)?
-                };
-                if let Some(frame) = frame {
-                    send_event(socket, api, frame, batch_timing.as_ref(),
-                        connection_id, replay_dequeued_at, replay_dequeued_mono).await?;
-                }
-                cursor = at;
-            }
-        }
-        ensure!(cursor == page.next, "BTC 5m replay boundary");
-        if page.caught_up && page.confirmation_sequence > confirmation_cursor {
-            if wire_version == 2 {
-                if let Some(frame) = confirmation_frame(
-                    &active.profile,
-                    &active.epoch,
-                    cursor,
-                    page.confirmation_sequence,
-                    &page.confirmation_books,
-                )? {
-                    send(socket, api, frame).await?;
-                }
-            }
-            confirmation_cursor = page.confirmation_sequence;
-        }
-        if page.caught_up && !ready_sent {
-            let view = api.reader.capture()?;
-            if view.cursor != cursor || view.confirmation_sequence != confirmation_cursor {
-                continue;
-            }
-            ensure!(view.persisted_cursor <= cursor,
-                "BTC 5m durable cursor exceeds ready replay boundary");
-            if *profile_changed.borrow() != active.profile.profile_revision {
-                send_profile_changed(socket, api, &active, cursor, event_schema).await?;
-                return Ok(());
-            }
-            let sync = full_sync(&view, &active.profile, &active.epoch, Utc::now())?;
-            send(
-                socket,
-                api,
-                json!({"schema_version":event_schema,"type":"ready","epoch":active.epoch,
-                "publisher_cursor":cursor,"durable_cursor":view.persisted_cursor,
-                "confirmation_sequence":confirmation_cursor,"ready":sync["ready"],
-                "barrier":"all_source_events_through_publisher_cursor_applied"}),
-            )
-            .await?;
-            ready_sent = true;
-            last_sent_durable = view.persisted_cursor;
-            last_durable_sent_at = std::time::Instant::now();
-        }
-        // The durability worker notifies the same watch as publication after
-        // fsync. A bounded timer also flushes progress withheld by the rate
-        // limit when no further book or writer notification arrives.
-        let pending_durable = if wire_version == 2 && ready_sent {
-            durable_watermark_target(cursor, api.reader.durable_cursor()?,
-                last_sent_durable)
-        } else {
-            None
-        };
-        let durable_wait = durable_watermark_wait(
-            last_durable_sent_at, std::time::Instant::now());
-        if durable_wait.is_zero() {
-            if let Some(durable_cursor) = pending_durable {
-                if *profile_changed.borrow() != active.profile.profile_revision {
-                    send_profile_changed(socket, api, &active, cursor, event_schema).await?;
-                    return Ok(());
-                }
-                send(socket, api, durable_watermark_frame(&active, cursor, durable_cursor,
-                    Utc::now())).await?;
-                last_sent_durable = durable_cursor;
-                last_durable_sent_at = std::time::Instant::now();
-                continue;
-            }
-        }
-        if !page.caught_up {
-            continue;
-        }
-        tokio::select! {r=changed.changed()=>r.context("publication closed")?,r=profile_changed.changed()=>{
-            r.context("BTC 5m profile control closed")?;
-            send_profile_changed(socket, api, &active, cursor, event_schema).await?;
-            return Ok(());
-        },_ = tokio::time::sleep(durable_wait), if pending_durable.is_some() => {
-            // Re-read the writer watermark on the next loop: a prior value
-            // may have advanced while the timer was waiting.
-        },m=socket.recv()=>match m {
-        None|Some(Ok(Message::Close(_)))=>return Ok(()),Some(Ok(Message::Ping(v)))=>socket.send(Message::Pong(v)).await?,
-        Some(Ok(Message::Pong(_)))=>{},_=>anyhow::bail!("unexpected BTC 5m client message")}}
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn twelve_stream_clients_allow_three_per_market_plus_one_spare() {
+        let limits = Limits {
+            snapshot_bytes: 65_536,
+            frame_bytes: 65_536,
+            replay_bytes: 65_536,
+            clients: 12,
+            send_timeout: Duration::from_secs(1),
+            snapshot_lease_capacity: 1,
+        };
+        assert!(limits.validate().is_ok());
+        assert_eq!(market_stream_client_limit(limits.clients), 4);
+        assert_eq!(market_stream_client_limit(4), 2);
+        assert!(Limits { clients: 13, ..limits }.validate().is_err());
+    }
+
+    #[test]
+    fn slow_group_log_only_selects_large_source_to_send_delay() {
+        let raw_at = chrono::Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap();
+        let mono = std::time::Instant::now();
+        let timing = SourceBatchTiming {
+            raw_batch_first_received_at: raw_at,
+            raw_batch_last_received_at: raw_at,
+            actor_admitted_at: raw_at,
+            actor_started_at: raw_at,
+            actor_completed_at: raw_at,
+            actor_admitted_mono: mono,
+            actor_started_mono: mono,
+            actor_completed_mono: mono,
+            publish_call_started_at: raw_at,
+            publish_call_started_mono: mono,
+            shared_replay_visible_at: Some(raw_at),
+            shared_replay_visible_mono: Some(mono),
+            durable_at: None,
+        };
+        assert_eq!(slow_group_elapsed_us(&timing,
+            raw_at + chrono::Duration::microseconds(SLOW_GROUP_THRESHOLD_US - 1)), None);
+        let sent_at = raw_at + chrono::Duration::microseconds(SLOW_GROUP_THRESHOLD_US);
+        assert_eq!(slow_group_elapsed_us(&timing, sent_at), Some(SLOW_GROUP_THRESHOLD_US));
+        let log = slow_group_json(&SlowMarketGroup {
+            connection_id:"connection".into(), profile_epoch:"profile".into(),
+            market_id:"market".into(), stream_epoch:"stream".into(), market_cursor:7,
+            market_event_cursor:9, event_id:"event".into(), event_count:2,
+            group_commit_sent_at:sent_at, raw_last_to_send_us:SLOW_GROUP_THRESHOLD_US,
+            timing,
+        });
+        assert_eq!(log["stage"], "btc_5m_slow_market_group");
+        assert_eq!(log["raw_last_to_group_commit_sent_us"], SLOW_GROUP_THRESHOLD_US);
+        assert_eq!(log["source_batch_timing"]["actor_queue_wait_us"], 0);
+        assert!(log.get("raw_payload").is_none());
+    }
+
+    #[test]
+    fn archive_read_rechecks_writer_progress_without_accepting_unknown_durability() {
+        use crate::source_publication::MarketStreamWatermark;
+        let before = MarketStreamWatermark { market_id:"1".into(), stream_epoch:"epoch-a".into(),
+            published_cursor:12, durable_cursor:10, replay_floor:0,
+        };
+        let mut after = before.clone();
+        assert!(!super::archive_checkpoint_within_publication(&before, &after, 12));
+        after.durable_cursor = 12;
+        assert!(super::archive_checkpoint_within_publication(&before, &after, 12));
+        assert!(!super::archive_checkpoint_within_publication(&before, &after, 13));
+        after.stream_epoch = "epoch-b".into();
+        assert!(!super::archive_checkpoint_within_publication(&before, &after, 12));
+        after = before.clone();
+        after.durable_cursor = 9;
+        assert!(!super::archive_checkpoint_within_publication(&before, &after, 9));
+        after.durable_cursor = 13;
+        assert!(!super::archive_checkpoint_within_publication(&before, &after, 13));
+    }
     use super::*;
+    use std::collections::BTreeMap;
     use crate::source_publication::Publication;
     use chrono::{SecondsFormat, TimeZone};
+    use marketcow_polymarket::discovery_source::{SnapshotBoundary, snapshot_event};
+    use marketcow_runtime::discovery_source::PreparedSourceWriter;
+    use rusqlite::{Connection, params};
+    use prost::Message as _;
     use tower::ServiceExt;
+    #[tokio::test]
+    async fn busy_market_replay_loop_still_replies_to_client_ping() {
+        use futures_util::{SinkExt, StreamExt};
+        async fn probe(ws: WebSocketUpgrade) -> impl IntoResponse {
+            ws.on_upgrade(|mut socket| async move {
+                // Model a replay loop that always has another page: there is
+                // no caught-up wait or blocking receive in this loop.
+                loop {
+                    match poll_market_client_control(&mut socket, Duration::from_secs(1)).await {
+                        Ok(false) => tokio::task::yield_now().await,
+                        _ => break,
+                    }
+                }
+            })
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/probe", get(probe)))
+                .await.unwrap();
+        });
+        let (mut client, _) = tokio_tungstenite::connect_async(
+            format!("ws://{address}/probe")).await.unwrap();
+        client.send(tokio_tungstenite::tungstenite::Message::Ping(vec![1, 2, 3].into()))
+            .await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await.unwrap().unwrap().unwrap();
+        assert!(matches!(response,
+            tokio_tungstenite::tungstenite::Message::Pong(bytes) if bytes.as_ref() == [1, 2, 3]));
+        client.close(None).await.unwrap();
+        server.abort();
+    }
+    #[test]
+    fn market_group_frames_split_without_splitting_an_event_or_advancing_early() {
+        let active = Active {profile:Arc::new(two_market_reducer_profile()), epoch:"profile-epoch".into()};
+        let market_id = active.profile.markets[0].market_id.clone();
+        let query = MarketStreamQuery {market_id, stream_epoch:"stream-epoch".into(),
+            profile_epoch:active.epoch.clone(), after_market_cursor:0, after_confirmation_sequence:0};
+        let source = crate::source_websocket::btc5m_reducer_fixture_sequence().unwrap()[0].clone();
+        let events = (0..10).map(|index| {
+            let mut event = source.clone();
+            event["cursor"] = json!(index + 1);
+            event.as_object_mut().unwrap().remove("event_id");
+            event["event_id"] = json!(canonical_hash(&event));
+            event
+        }).collect::<Vec<_>>();
+        let frames = market_group_frames(&active, &query, 7, &"a".repeat(64), &events, 4096).unwrap();
+        assert!(frames.len() > 3);
+        assert!(frames.iter().all(|frame| frame.len() <= 4096));
+        let parsed = frames.iter().map(|frame| proto::MarketStreamFrame::decode(frame.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(parsed.first().unwrap().body,
+            Some(proto::market_stream_frame::Body::GroupBegin(_))));
+        assert!(matches!(parsed.last().unwrap().body,
+            Some(proto::market_stream_frame::Body::GroupCommit(_))));
+        if let Some(proto::market_stream_frame::Body::GroupCommit(commit)) = &parsed.last().unwrap().body {
+            assert_eq!(commit.next_after_market_cursor, 7);
+        }
+        let mut rebuilt = Vec::new();
+        for (index, frame) in parsed[1..parsed.len()-1].iter().enumerate() {
+            let Some(proto::market_stream_frame::Body::GroupChunk(chunk)) = &frame.body else {
+                panic!("expected market group chunk")
+            };
+            assert_eq!(chunk.chunk_index, index as u32);
+            assert_eq!(chunk.chunk_count, (parsed.len()-2) as u32);
+            rebuilt.extend(chunk.events.iter().cloned());
+        }
+        assert_eq!(rebuilt, events.iter().map(proto_convert::market_event)
+            .collect::<Result<Vec<_>>>().unwrap());
+        let mut too_large = source;
+        too_large["canonical_payload"]["source_hash"] = json!("x".repeat(5000));
+        assert!(market_group_frames(&active, &query, 8, &"b".repeat(64),
+            &[too_large], 4096).is_err());
+    }
+    #[test]
+    fn native_market_group_wire_uses_local_event_cursor() {
+        let active = Active {profile:Arc::new(two_market_reducer_profile()), epoch:"profile-epoch".into()};
+        let market_id = active.profile.markets[0].market_id.clone();
+        let query = MarketStreamQuery {market_id:market_id.clone(),
+            stream_epoch:"stream-epoch".into(), profile_epoch:active.epoch.clone(),
+            after_market_cursor:0, after_confirmation_sequence:0};
+        let source = crate::source_websocket::btc5m_reducer_fixture_sequence().unwrap()[0].clone();
+        let after = source["cursor"].as_u64().unwrap() - 1;
+        let tokens = active.profile.markets.iter().flat_map(|binding|
+            binding.outcomes.iter().map(|outcome|
+                (outcome.token_id.clone(), binding.market_id.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let validated = marketcow_runtime::discovery_source::ValidatedSourceBatch::new_native(
+            vec![source], false, after, &tokens, 65536).unwrap()
+            .rebase_after(0, 65536).unwrap();
+        let events = validated.events().to_vec();
+        assert_eq!(events[0]["cursor"], 1);
+        let group_sha256 = marketcow_runtime::discovery_source::market_group_hash(
+            &market_id, &query.stream_epoch, 1, &events).unwrap();
+        let frames = market_group_frames(&active, &query, 1, &group_sha256,
+            &events, 65536).unwrap();
+        let frames = frames.iter().map(|frame| proto::MarketStreamFrame::decode(frame.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        let Some(proto::market_stream_frame::Body::GroupChunk(chunk)) = &frames[1].body else {
+            panic!("expected market group chunk")
+        };
+        assert_eq!(chunk.events[0].market_event_cursor, 1);
+        assert_eq!(chunk.events[0], proto_convert::market_event(&events[0]).unwrap());
+        let Some(proto::market_stream_frame::Body::GroupCommit(commit)) = &frames[2].body else {
+            panic!("expected market group commit")
+        };
+        assert_eq!(commit.next_after_market_cursor, 1);
+    }
     #[tokio::test]
     async fn renewal_heartbeat_preserves_fail_closed_phase_and_error() {
         let publication = Publication::start(0, None, std::collections::BTreeMap::new(),
@@ -1890,6 +2155,85 @@ mod tests {
         "exchange_at":at,"state_checksum":"b".repeat(64),"book_epoch":"e","bids":[{"price":"0.40","size":"10"}],
         "asks":[{"price":"0.60","size":"10"}],"last_trade_price":"0.50"})
     }
+    #[test]
+    fn market_snapshot_recovery_cannot_promote_an_old_book_to_replay_baseline() {
+        let token = "101".to_owned();
+        let now = Utc.with_ymd_and_hms(2026, 9, 26, 5, 30, 2).unwrap();
+        let mut snapshot = MarketMemorySnapshot {
+            watermark:crate::source_publication::MarketStreamWatermark {
+                stream_epoch:"stream".into(),market_id:"4944030".into(),
+                published_cursor:2,durable_cursor:1,replay_floor:0,
+            },
+            last_market_event_cursor:43,
+            market:None,
+            books:BTreeMap::from([(token.clone(), Arc::new(book(&token,"condition",
+                "2026-09-26T05:30:01Z")))]),
+            physical_book_cursors:BTreeMap::from([(token.clone(),43)]),
+            event_book_cursors:BTreeMap::from([(token.clone(),43)]),
+            market_book_cursors:BTreeMap::from([(token.clone(),2)]),
+            recoveries:BTreeMap::new(),unresolved_seed_gaps:BTreeSet::new(),capacity_fenced:false,
+            confirmation_sequence:0, confirmation_facts:BTreeMap::new(),
+            market_confirmation_versions:BTreeMap::new(),
+        };
+        assert!(market_replay_baseline_valid(&snapshot, &token, now));
+        snapshot.recoveries.insert(token.clone(), json!({"recovery_id":"r",
+            "snapshot_cursor":44}));
+        assert!(!market_replay_baseline_valid(&snapshot, &token, now));
+        snapshot.recoveries.get_mut(&token).unwrap()["snapshot_cursor"] = json!(43);
+        assert!(market_replay_baseline_valid(&snapshot, &token, now));
+        snapshot.physical_book_cursors.remove(&token);
+        assert!(market_replay_baseline_valid(&snapshot, &token, now),
+            "a native recovery baseline does not require an uncommitted archive position");
+        snapshot.unresolved_seed_gaps.insert(token.clone());
+        assert!(!market_replay_baseline_valid(&snapshot, &token, now));
+    }
+    #[test]
+    fn market_quote_diagnostics_keep_one_sided_stale_and_recovery_distinct() {
+        let token = "101".to_owned();
+        let now = Utc.with_ymd_and_hms(2026, 9, 26, 5, 30, 2).unwrap();
+        let mut snapshot = MarketMemorySnapshot {
+            watermark:crate::source_publication::MarketStreamWatermark {
+                stream_epoch:"stream".into(),market_id:"4944030".into(),
+                published_cursor:2,durable_cursor:1,replay_floor:0,
+            },
+            last_market_event_cursor:43, market:None,
+            books:BTreeMap::from([(token.clone(), Arc::new(book(&token,"condition",
+                "2026-09-26T05:30:01Z")))]),
+            physical_book_cursors:BTreeMap::new(),
+            event_book_cursors:BTreeMap::from([(token.clone(),43)]),
+            market_book_cursors:BTreeMap::from([(token.clone(),2)]),
+            recoveries:BTreeMap::new(),unresolved_seed_gaps:BTreeSet::new(),capacity_fenced:false,
+            confirmation_sequence:0,confirmation_facts:BTreeMap::new(),
+            market_confirmation_versions:BTreeMap::new(),
+        };
+        let (ready, detail) = market_token_quote_readiness(&snapshot, &token, &now, 5_000);
+        assert!(ready);
+        assert_eq!(detail["reasons"], json!([]));
+        assert_eq!(detail["age_ms"], 1_000);
+
+        let mut one_sided = book(&token, "condition", "2026-09-26T05:30:01Z");
+        one_sided["bids"] = json!([]);
+        snapshot.books.insert(token.clone(), Arc::new(one_sided));
+        let (ready, detail) = market_token_quote_readiness(&snapshot, &token, &now, 5_000);
+        assert!(!ready);
+        assert_eq!(detail["reasons"], json!(["incomplete_book"]));
+        assert_eq!(detail["bid_levels"], 0);
+        assert_eq!(detail["ask_levels"], 1);
+
+        let stale = book(&token, "condition", "2026-09-26T05:29:50Z");
+        snapshot.books.insert(token.clone(), Arc::new(stale));
+        let (_, detail) = market_token_quote_readiness(&snapshot, &token, &now, 5_000);
+        assert_eq!(detail["reasons"], json!(["book_stale"]));
+        snapshot.recoveries.insert(token.clone(), json!({"snapshot_cursor":44}));
+        let (_, detail) = market_token_quote_readiness(&snapshot, &token, &now, 5_000);
+        assert_eq!(detail["reasons"], json!(["recovery_in_progress","book_stale"]));
+        snapshot.recoveries.get_mut(&token).unwrap()["snapshot_cursor"] = json!(43);
+        let (_, detail) = market_token_quote_readiness(&snapshot, &token, &now, 5_000);
+        assert_eq!(detail["reasons"], json!(["recovery_in_progress","book_stale"]));
+        snapshot.unresolved_seed_gaps.insert(token.clone());
+        let (_, detail) = market_token_quote_readiness(&snapshot, &token, &now, 5_000);
+        assert_eq!(detail["reasons"], json!(["source_gap","recovery_in_progress","book_stale"]));
+    }
     fn profile() -> Profile {
         let mut p = Profile {
             schema_version: PROFILE_SCHEMA.into(),
@@ -1922,51 +2266,54 @@ mod tests {
         p.profile_id = p.expected_id();
         p
     }
+    fn two_market_reducer_profile() -> Profile {
+        let mut p = profile();
+        p.markets[0].outcomes[0].token_id = "101".into();
+        p.markets[0].outcomes[1].token_id = "102".into();
+        p.markets.push(MarketBinding {
+            role: WindowRole::Next,
+            window_id: "2026-09-26T05:35:00Z/2026-09-26T05:40:00Z".into(),
+            start_at: "2026-09-26T05:35:00Z".into(),
+            end_at: "2026-09-26T05:40:00Z".into(),
+            market_id: "4944031".into(),
+            condition_id: format!("0x{}", "2".repeat(64)),
+            outcomes: [
+                OutcomeBinding { outcome: "Up".into(), token_id: "201".into() },
+                OutcomeBinding { outcome: "Down".into(), token_id: "202".into() },
+            ],
+            rule_sha256: "d".repeat(64),
+        });
+        p.profile_id = p.expected_id();
+        p
+    }
     #[test]
-    fn durable_watermark_is_monotonic_causally_capped_and_rate_limited() {
-        let existing: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v2.json"
-        )).unwrap();
-        let active = Active { profile: Arc::new(serde_json::from_value(
-            existing["profile"].clone()).unwrap()),
-            epoch: "11111111111111111111111111111111".into() };
-        // Writer progress without another book must still be deliverable.
-        let first = durable_watermark_target(100, 80, 50).unwrap();
-        assert_eq!(first, 80);
-        let observed_at = Utc.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap();
-        let frame = durable_watermark_frame(&active, 100, first, observed_at);
-        assert_eq!(frame["schema_version"], COMPACT_EVENT_SCHEMA);
-        assert_eq!(frame["type"], "durable_watermark");
-        assert_eq!(frame["epoch"], "11111111111111111111111111111111");
-        assert_eq!(frame["profile_id"], active.profile.profile_id);
-        assert_eq!(frame["profile_revision"], 1);
-        assert_eq!(frame["publisher_cursor"], 100);
-        assert_eq!(frame["durable_cursor"], 80);
-        assert!(frame.get("book_received_at").is_none());
-        assert!(serde_json::to_vec(&frame).unwrap().len() < 1024);
-        let fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-durable-watermark-v2.json"
-        )).unwrap();
-        assert_eq!(frame, fixture);
-
-        // During segmented replay the writer can be much farther ahead;
-        // this connection attests only the part it has already emitted.
-        assert_eq!(durable_watermark_target(110, 500, 80), Some(110));
-        assert_eq!(durable_watermark_target(130, 120, 110), Some(120));
-        assert_eq!(durable_watermark_target(130, 119, 120), None);
-        assert_eq!(durable_watermark_target(130, 120, 120), None);
-        let at = std::time::Instant::now();
-        assert_eq!(durable_watermark_wait(at, at + Duration::from_millis(100)),
-            Duration::from_millis(150));
-        assert!(durable_watermark_wait(at, at + Duration::from_millis(250)).is_zero());
+    fn timeline_archive_retains_exact_recent_cursor_and_evicts_oldest() {
+        let mut archive = TimelineArchive::default();
+        for cursor in 1..=TIMELINE_RECEIPT_COUNT as u64 + 1 {
+            archive.push("epoch-a", "market-a", "stream-a", cursor, "event-a", json!({
+                "connection_id":"client-a","market_event_cursor":cursor,"send_outcome":"ok"
+            }));
+        }
+        assert!(archive.lookup("epoch-a", "market-a", "stream-a", 1, "event-a").is_empty());
+        assert_eq!(archive.lookup("epoch-a", "market-a", "stream-a", 2, "event-a").len(), 1);
+        assert!(archive.lookup("epoch-b", "market-a", "stream-a", 2, "event-a").is_empty());
+        assert!(archive.lookup("epoch-a", "market-b", "stream-a", 2, "event-a").is_empty());
+        assert!(archive.lookup("epoch-a", "market-a", "stream-b", 2, "event-a").is_empty());
+        assert!(archive.lookup("epoch-a", "market-a", "stream-a", 2, "event-b").is_empty());
+        let newest = TIMELINE_RECEIPT_COUNT as u64 + 1;
+        archive.push("epoch-a", "market-a", "stream-a", newest, "event-a",
+            json!({"connection_id":"client-b"}));
+        let receipts = archive.lookup("epoch-a", "market-a", "stream-a", newest, "event-a");
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0]["connection_id"], "client-a");
+        assert_eq!(receipts[1]["connection_id"], "client-b");
+        assert!(archive.bytes <= TIMELINE_RECEIPT_BYTES);
     }
     #[tokio::test]
-    async fn v2_stream_reports_later_fsync_without_another_book_event() {
-        use futures_util::StreamExt;
-        let fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v2.json"
-        )).unwrap();
-        let profile: Profile = serde_json::from_value(fixture["profile"].clone()).unwrap();
+    async fn native_market_replay_expiry_is_local_to_one_market() {
+        let profile = two_market_reducer_profile();
+        let first = &profile.markets[0];
+        let second = &profile.markets[1];
         let markets = profile.markets.iter().map(|binding| market(
             &binding.market_id, &binding.condition_id,
             &binding.outcomes[0].token_id, &binding.outcomes[1].token_id,
@@ -1974,405 +2321,49 @@ mod tests {
         let tokens = profile.markets.iter().flat_map(|binding| binding.outcomes.iter()
             .map(|outcome| (outcome.token_id.clone(), binding.market_id.clone())))
             .collect();
-        let (persist_entered, entered) = std::sync::mpsc::channel();
-        let (release, persist_release) = std::sync::mpsc::channel();
-        let mut publication = Publication::start(42,
+        let mut publication = Publication::start_managed_with_replay(42,
             Some(json!({"latest_cursor":42,"catalog_revision":profile.catalog_revision,
                 "live_stream_connected":true,"gaps":[],"books":[],"markets":markets})),
-            tokens, 8, 1024 * 1024, 512 * 1024,
-            move |_| {
-                persist_entered.send(()).unwrap();
-                persist_release.recv_timeout(Duration::from_secs(5))?;
-                Ok(())
-            }).unwrap();
-        let (router, control) = Api::router(publication.reader(), profile,
-            "epoch-durable".into(), Limits {
-                snapshot_bytes: 1024 * 1024, frame_bytes: 1024 * 1024,
-                replay_bytes: 512 * 1024, clients: 1,
-                send_timeout: Duration::from_secs(1), snapshot_lease_capacity: 1,
-            }).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let (mut client, _) = tokio_tungstenite::connect_async(format!(
-            "ws://{address}/v1/prediction-markets/polymarket/research/btc-5m/stream?epoch=epoch-durable&after_cursor=42&wire_version=2"
-        )).await.unwrap();
-        let next = |message: tokio_tungstenite::tungstenite::Message| -> Value {
-            serde_json::from_str(message.to_text().unwrap()).unwrap()
-        };
-        let ready = next(tokio::time::timeout(Duration::from_secs(2), client.next())
-            .await.unwrap().unwrap().unwrap());
-        assert_eq!(ready["type"], "ready");
-        assert_eq!(ready["publisher_cursor"], 42);
-        assert_eq!(ready["durable_cursor"], 42);
-
-        publication.publish(vec![fixture["source_events"][0].clone()], None).unwrap();
-        entered.recv_timeout(Duration::from_secs(2)).unwrap();
-        let book = next(tokio::time::timeout(Duration::from_secs(2), client.next())
-            .await.unwrap().unwrap().unwrap());
-        assert_eq!(book["type"], "book_snapshot");
-        assert_eq!(book["publisher_cursor"], 43);
-        assert!(tokio::time::timeout(Duration::from_millis(100), client.next()).await.is_err(),
-            "must not attest cursor 43 before fsync");
-        release.send(()).unwrap();
-        let durable = next(tokio::time::timeout(Duration::from_secs(2), client.next())
-            .await.unwrap().unwrap().unwrap());
-        assert_eq!(durable["type"], "durable_watermark");
-        assert_eq!(durable["epoch"], "epoch-durable");
-        assert_eq!(durable["publisher_cursor"], 43);
-        assert_eq!(durable["durable_cursor"], 43);
-        assert!(tokio::time::timeout(Duration::from_millis(350), client.next()).await.is_err(),
-            "unchanged watermark must not be repeated");
-        let incumbent = control.profile().unwrap();
-        let mut replacement = incumbent.clone();
-        replacement.profile_revision += 1;
-        replacement.profile_id = replacement.expected_id();
-        control.commit_profile_at(&incumbent.profile_id, incumbent.profile_revision,
-            replacement.clone(), false,
-            Utc.with_ymd_and_hms(2026, 9, 26, 5, 30, 30).unwrap()).unwrap();
-        let changed = next(tokio::time::timeout(Duration::from_secs(2), client.next())
-            .await.unwrap().unwrap().unwrap());
-        assert_eq!(changed["type"], "profile_changed");
-        assert_eq!(changed["epoch"], "epoch-durable");
-        assert_eq!(changed["next_profile_revision"], 2);
-        assert_eq!(changed["next_profile_id"], replacement.profile_id);
-        assert_eq!(changed["requires_new_full_sync"], true);
-        drop(client);
-        server.abort();
-        publication.finish().await.unwrap();
-    }
-    #[test]
-    fn timeline_archive_retains_exact_recent_cursor_and_evicts_oldest() {
-        let mut archive = TimelineArchive::default();
-        for cursor in 1..=TIMELINE_RECEIPT_COUNT as u64 + 1 {
-            archive.push("epoch-a", cursor, "event-a", json!({
-                "connection_id":"client-a","publisher_cursor":cursor,"send_outcome":"ok"
-            }));
-        }
-        assert!(archive.lookup("epoch-a", 1, "event-a").is_empty());
-        assert_eq!(archive.lookup("epoch-a", 2, "event-a").len(), 1);
-        assert!(archive.lookup("epoch-b", 2, "event-a").is_empty());
-        assert!(archive.lookup("epoch-a", 2, "event-b").is_empty());
-        let newest = TIMELINE_RECEIPT_COUNT as u64 + 1;
-        archive.push("epoch-a", newest, "event-a", json!({"connection_id":"client-b"}));
-        let receipts = archive.lookup("epoch-a", newest, "event-a");
-        assert_eq!(receipts.len(), 2);
-        assert_eq!(receipts[0]["connection_id"], "client-a");
-        assert_eq!(receipts[1]["connection_id"], "client-b");
-        assert!(archive.bytes <= TIMELINE_RECEIPT_BYTES);
-    }
-    #[test]
-    fn shared_wire_fixture_binds_profile_and_declared_budgets() {
-        let fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v1.json"
-        ))
-        .unwrap();
-        let profile: Profile = serde_json::from_value(fixture["profile"].clone()).unwrap();
-        profile.validate().unwrap();
-        assert_eq!(fixture["limits"]["snapshot_bytes"], 8 * 1024 * 1024);
-        assert_eq!(fixture["limits"]["frame_bytes"], 1024 * 1024);
-        assert_eq!(fixture["limits"]["replay_bytes"], 4 * 1024 * 1024);
-        assert_eq!(fixture["events"][0]["type"], "book_snapshot");
-        assert_eq!(fixture["events"][1]["type"], "book_snapshot");
-        assert_eq!(fixture["events"][2]["type"], "book_change");
-        assert_eq!(fixture["events"][3]["type"], "last_trade");
-        assert_eq!(fixture["events"][4]["type"], "recovery_started");
-        assert_eq!(fixture["events"][5]["type"], "book_snapshot");
-        assert_eq!(fixture["events"][6]["type"], "recovery_completed");
-        assert_eq!(fixture["events"][7]["type"], "ready");
-        assert_eq!(fixture["events"][8]["type"], "profile_changed");
-        assert_eq!(
-            fixture["status"]["profile_document_sha256"],
-            profile.document_sha256()
-        );
-        assert_eq!(fixture["status"]["profile"], fixture["profile"]);
-        assert_eq!(fixture["full_sync"]["after_cursor_semantics"], "exclusive");
-        assert_eq!(
-            fixture["full_sync"]["markets"][0]["tokens"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        let schema: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v1.schema.json"
-        ))
-        .unwrap();
-        assert_eq!(schema["$id"], "marketcow.polymarket.btc-5m-wire.v1");
-    }
-    #[tokio::test]
-    async fn shared_event_samples_are_output_of_the_actual_serializer() {
-        let fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v1.json"
-        ))
-        .unwrap();
-        let profile: Profile = serde_json::from_value(fixture["profile"].clone()).unwrap();
-        let mut source = crate::source_websocket::btc5m_reducer_fixture_sequence().unwrap();
-        for event in &mut source {
-            if event
-                .as_object_mut()
-                .unwrap()
-                .remove("_replay_complete_delta")
-                .is_some()
-            {
-                event.as_object_mut().unwrap().remove("event_id");
-                event["event_id"] = json!(canonical_hash(event));
-            }
-        }
-        let projected = source
-            .iter()
-            .map(|event| {
-                event_frame(&profile, "epoch-example", event)
-                    .unwrap()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let markets = profile
-            .markets
-            .iter()
-            .map(|binding| {
-                market(
-                    &binding.market_id,
-                    &binding.condition_id,
-                    &binding.outcomes[0].token_id,
-                    &binding.outcomes[1].token_id,
-                )
-            })
-            .collect::<Vec<_>>();
-        let tokens = profile
-            .markets
-            .iter()
-            .flat_map(|binding| {
-                binding
-                    .outcomes
-                    .iter()
-                    .map(|outcome| (outcome.token_id.clone(), binding.market_id.clone()))
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut publication = Publication::start(
-            42,
-            Some(
-                json!({"latest_cursor":42,"catalog_revision":profile.catalog_revision,
-                "live_stream_connected":true,"gaps":[],"books":[],"markets":markets}),
-            ),
-            tokens,
-            8,
-            1024 * 1024,
-            512 * 1024,
-            |_| Ok(()),
-        )
-        .unwrap();
-        for event in &source {
-            publication.publish(vec![event.clone()], None).unwrap();
-        }
-        for _ in 0..100 {
-            if publication.persisted_cursor() == 49 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(publication.persisted_cursor(), 49);
-        let now = DateTime::parse_from_rfc3339("2026-09-26T05:30:09Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let view = publication.capture_view().unwrap();
-        let generated_full_sync = full_sync(&view, &profile, "epoch-example", now).unwrap();
-        let generated_status = status(&view, &profile, "epoch-example", now).unwrap();
-        if let Ok(path) = std::env::var("MARKETCOW_BTC5M_FIXTURE_OUTPUT") {
-            std::fs::write(
-                path,
-                serde_json::to_vec_pretty(&json!({"source_events":source,"events":projected,
-                    "full_sync":generated_full_sync,"status":generated_status}))
-                .unwrap(),
-            )
-            .unwrap();
-            publication.finish().await.unwrap();
-            return;
-        }
-        assert_eq!(fixture["source_events"], Value::Array(source.clone()));
-        assert_eq!(
-            fixture["events"].as_array().unwrap()[..projected.len()],
-            projected
-        );
-        for event in &source {
-            assert_eq!(
-                event["canonical_payload_sha256"],
-                canonical_hash(&event["canonical_payload"])
-            );
-            assert_eq!(
-                event["raw_payload_sha256"],
-                canonical_hash(&event["raw_payload"])
-            );
-            let mut identity = event.clone();
-            identity.as_object_mut().unwrap().remove("event_id");
-            assert_eq!(event["event_id"], canonical_hash(&identity));
-            if event["event_type"] == "book" {
-                let book = &event["canonical_payload"];
-                assert_eq!(book["sequence_semantics"], "deterministic_normalized");
-                assert_eq!(
-                    book["state_checksum"],
-                    canonical_hash(&json!({"token_id":book["token_id"],
-                        "tick_size":book["tick_size"],"bids":book["bids"],"asks":book["asks"]}))
-                );
-            }
-        }
-        let recovery_book = &source[source.len() - 2];
-        let completion = &source[source.len() - 1];
-        assert_eq!(
-            completion["canonical_payload"]["snapshot_cursor"],
-            recovery_book["cursor"]
-        );
-        assert_eq!(
-            fixture["full_sync"]["markets"][0]["tokens"][0]["state_checksum"],
-            recovery_book["canonical_payload"]["state_checksum"]
-        );
-        assert_eq!(
-            fixture["full_sync"]["markets"][0]["tokens"][0]["tick_size"],
-            recovery_book["canonical_payload"]["tick_size"]
-        );
-        assert_eq!(fixture["full_sync"], generated_full_sync);
-        assert_eq!(fixture["status"], generated_status);
-        for market in fixture["full_sync"]["markets"].as_array().unwrap() {
-            for token in market["tokens"].as_array().unwrap() {
-                if let Some(book) = token["canonical_book"].as_object() {
-                    assert_eq!(
-                        token["canonical_book_sha256"],
-                        canonical_hash(&Value::Object(book.clone()))
-                    );
-                } else {
-                    assert!(token["canonical_book_sha256"].is_null());
+            tokens, 1, 1024 * 1024, 2, 16 * 1024 * 1024, 512 * 1024,
+            |_| Ok(())).unwrap();
+        for (cursor, event) in crate::source_websocket::btc5m_reducer_fixture_sequence()
+            .unwrap().iter().take(2).enumerate() {
+            publication.publish_native_events(vec![event.clone()], None).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let durable = publication.reader()
+                        .market_stream_watermark(&first.market_id).unwrap().unwrap().durable_cursor;
+                    if durable >= cursor as u64 + 1 { break; }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-            }
+            }).await.unwrap();
         }
+        let second_events = second.outcomes.iter().enumerate().map(|(index, outcome)|
+            snapshot_event(&json!({
+                "asset_id":outcome.token_id,"market":second.condition_id,
+                "tick_size":"0.01","timestamp":"1790399999000",
+                "hash":format!("second-market-{index}"),
+                "bids":[{"price":"0.4","size":"10"}],
+                "asks":[{"price":"0.6","size":"10"}]}),
+                SnapshotBoundary { market_id:&second.market_id,
+                    condition_id:&second.condition_id,
+                    token_id:&outcome.token_id,
+                    recovery_id:"second-market",cursor:45 + index as u64,
+                    received_at:Utc.with_ymd_and_hms(2026, 9, 26, 5, 30, 1).unwrap() })
+        ).collect::<std::result::Result<Vec<_>, _>>().unwrap();
+        publication.publish_native_events(second_events, None).unwrap();
+        let reader = publication.reader();
+        let first_watermark = reader.market_stream_watermark(&first.market_id)
+            .unwrap().unwrap();
+        let second_watermark = reader.market_stream_watermark(&second.market_id)
+            .unwrap().unwrap();
+        assert_eq!(first_watermark.replay_floor, 1);
+        assert_eq!(second_watermark.replay_floor, 0);
+        assert!(reader.replay_market(&first.market_id, &first_watermark.stream_epoch,
+            0, 2, 512 * 1024).is_err());
+        assert_eq!(reader.replay_market(&second.market_id, &second_watermark.stream_epoch,
+            0, 2, 512 * 1024).unwrap().next_cursor, 1);
         publication.finish().await.unwrap();
-    }
-
-    #[test]
-    fn compact_wire_keeps_snapshots_complete_and_commits_each_delta_post_state() {
-        let fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v1.json"
-        ))
-        .unwrap();
-        let profile: Profile = serde_json::from_value(fixture["profile"].clone()).unwrap();
-        let source = crate::source_websocket::compact_btc5m_fixture_events(
-            crate::source_websocket::btc5m_reducer_fixture_sequence().unwrap(),
-        )
-        .unwrap();
-        let mut projected = source
-            .iter()
-            .filter_map(|event| compact_event_frame(&profile, "epoch-example", event).unwrap())
-            .collect::<Vec<_>>();
-        let mut confirmed_book = source[source.len() - 2]["canonical_payload"].clone();
-        confirmed_book["confirmed_at"] = json!("2026-09-26T05:30:08.500Z");
-        confirmed_book["confirmation_source"] = json!("rest_book_confirmation");
-        confirmed_book["confirmation_evidence_sha256"] = json!("e".repeat(64));
-        confirmed_book["book_received_at"] = confirmed_book["received_at"].clone();
-        confirmed_book
-            .as_object_mut()
-            .unwrap()
-            .remove("received_at");
-        projected.push(
-            confirmation_frame(
-                &profile,
-                "epoch-example",
-                49,
-                1,
-                &[Arc::new(confirmed_book)],
-            )
-            .unwrap()
-            .unwrap(),
-        );
-        if let Ok(path) = std::env::var("MARKETCOW_BTC5M_V2_FIXTURE_OUTPUT") {
-            std::fs::write(
-                path,
-                serde_json::to_vec_pretty(&json!({
-                    "schema_version":"marketcow.polymarket.btc-5m-wire-fixture.v2",
-                    "profile":profile,
-                    "source_events":source,
-                    "events":projected,
-                    "replay_contract":{
-                        "initial_state":"full_sync.canonical_book",
-                        "after_cursor":"exclusive",
-                        "price_change":"apply ordered payload.delta.changes then verify both post_state hashes",
-                        "last_trade":"does not refresh canonical book received_at or quote freshness",
-                        "hash_mismatch":"invalidate token and obtain a new full-sync"
-                    }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-            return;
-        }
-        let compact_fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v2.json"
-        ))
-        .unwrap();
-        assert_eq!(
-            compact_fixture["profile"],
-            serde_json::to_value(&profile).unwrap()
-        );
-        assert_eq!(
-            compact_fixture["source_events"],
-            Value::Array(source.clone())
-        );
-        assert_eq!(compact_fixture["events"], Value::Array(projected));
-        let snapshot = compact_event_frame(&profile, "epoch-example", &source[0])
-            .unwrap()
-            .unwrap();
-        assert_eq!(snapshot["type"], "book_snapshot");
-        assert!(snapshot["payload"]["canonical_payload"]["bids"].is_array());
-
-        let mut tick_change_source = source[0].clone();
-        tick_change_source["raw_payload"]["event_type"] = json!("tick_size_change");
-        let tick_change = compact_event_frame(&profile, "epoch-example", &tick_change_source)
-            .unwrap()
-            .unwrap();
-        assert_eq!(tick_change["type"], "book_snapshot");
-        assert_eq!(tick_change["source_event_type"], "tick_size_change");
-        assert_eq!(tick_change["payload_semantics"], "complete_post_state");
-        assert!(tick_change["payload"]["canonical_payload"]["bids"].is_array());
-
-        let change_source = source
-            .iter()
-            .find(|event| event["raw_payload"]["event_type"] == "price_change")
-            .unwrap();
-        let compact = compact_event_frame(&profile, "epoch-example", change_source)
-            .unwrap()
-            .unwrap();
-        assert_eq!(compact["schema_version"], COMPACT_EVENT_SCHEMA);
-        assert_eq!(compact["type"], "book_change");
-        assert!(compact["payload"].get("canonical_payload").is_none());
-        assert_eq!(
-            compact["payload"]["post_state"]["canonical_book_sha256"],
-            change_source["canonical_payload"]["canonical_book_sha256"]
-        );
-        assert_eq!(
-            compact["payload"]["post_state"]["state_checksum"],
-            change_source["canonical_payload"]["state_checksum"]
-        );
-        assert!(
-            compact["payload"]["delta"]["changes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|change| change["asset_id"] == compact["token_id"])
-        );
-        assert!(compact["payload"]["post_state"].get("bids").is_none());
-        assert!(compact["payload"]["post_state"].get("asks").is_none());
-
-        let trade_source = source
-            .iter()
-            .find(|event| event["raw_payload"]["event_type"] == "last_trade_price")
-            .unwrap();
-        let trade = compact_event_frame(&profile, "epoch-example", trade_source)
-            .unwrap()
-            .unwrap();
-        assert_eq!(trade["type"], "last_trade");
-        assert_eq!(
-            trade["payload"]["trade"]["price"],
-            trade_source["canonical_payload"]["last_trade_price"]
-        );
-        assert!(trade["payload"]["post_state"]["state_checksum"].is_string());
     }
     #[tokio::test]
     async fn profile_rotation_is_cas_bound_and_requires_prepared_ordered_identity() {
@@ -2489,7 +2480,7 @@ mod tests {
                 market("4944030",&condition('1'),"10","20"),
                 market("4944031",&condition('2'),"30","40"),
                 market("4944032",&condition('3'),"50","60")]});
-        let publication = Publication::start(0,Some(seed),[
+        let mut publication = Publication::start(0,Some(seed),[
             ("10".into(),"4944030".into()),("20".into(),"4944030".into()),
             ("30".into(),"4944031".into()),("40".into(),"4944031".into()),
             ("50".into(),"4944032".into()),("60".into(),"4944032".into()),
@@ -2512,6 +2503,23 @@ mod tests {
             binding("4944031",'2',"30","40",WindowRole::Next,start),
         ];
         incumbent.profile_id=incumbent.expected_id();
+        let carried = &incumbent.markets[1];
+        let received_at = Utc.timestamp_opt(Utc::now().timestamp(), 0).single().unwrap();
+        let carried_events = carried.outcomes.iter().enumerate().map(|(index, outcome)|
+            snapshot_event(&json!({"asset_id":outcome.token_id,
+                "market":carried.condition_id,"tick_size":"0.01",
+                "timestamp":received_at.timestamp_millis().to_string(),
+                "hash":format!("carried-{index}"),
+                "bids":[{"price":"0.4","size":"10"}],
+                "asks":[{"price":"0.6","size":"10"}]}),
+                SnapshotBoundary {market_id:&carried.market_id,
+                    condition_id:&carried.condition_id,token_id:&outcome.token_id,
+                    recovery_id:"carried-market",cursor:index as u64 + 1,received_at}).unwrap())
+            .collect();
+        publication.publish(carried_events, None).unwrap();
+        let before = publication.reader().market_stream_watermark(&carried.market_id)
+            .unwrap().unwrap();
+        assert_eq!(before.published_cursor, 1);
         let (_,control)=Api::router(publication.reader(),incumbent.clone(),"old-epoch".into(),
             Limits{snapshot_bytes:65536,frame_bytes:65536,replay_bytes:65536,
                 clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1})
@@ -2544,6 +2552,13 @@ mod tests {
         assert_eq!(control.profile().unwrap().profile_id,incumbent.profile_id);
         assert!(control.publish(&incumbent.profile_id,incumbent.profile_revision,
             valid.clone()).is_ok());
+        let after = publication.reader().market_stream_watermark(&carried.market_id)
+            .unwrap().unwrap();
+        assert_eq!(after.stream_epoch, before.stream_epoch,
+            "carried next market must retain its own stream generation");
+        assert_eq!(after.published_cursor, before.published_cursor,
+            "profile CAS cannot reset the carried market cursor");
+        assert_eq!(control.profile().unwrap().market_ids_owned(), valid.market_ids_owned());
         let (_,three_window_control)=Api::router(publication.reader(),expanded.clone(),
             "three-window-epoch".into(),Limits{snapshot_bytes:65536,frame_bytes:65536,
                 replay_bytes:65536,clients:1,send_timeout:Duration::from_secs(1),
@@ -2640,11 +2655,7 @@ mod tests {
     }
     #[test]
     fn steady_state_rotation_reuses_next_and_never_invents_a_fourth_overlap() {
-        let fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v1.json"
-        ))
-        .unwrap();
-        let incumbent: Profile = serde_json::from_value(fixture["profile"].clone()).unwrap();
+        let incumbent = two_market_reducer_profile();
         let old_current = incumbent.window(WindowRole::Current).unwrap().clone();
         let old_next = incumbent.window(WindowRole::Next).unwrap().clone();
         let mut candidate = incumbent.clone();
@@ -2674,6 +2685,10 @@ mod tests {
         };
         candidate.markets = vec![current, next, retiring];
         candidate.profile_id = candidate.expected_id();
+        assert!(candidate.validate_rotation_from(&incumbent).is_err(),
+            "ordinary 2→3 cannot bypass the equal-shape rotation contract");
+        candidate.markets.pop();
+        candidate.profile_id = candidate.expected_id();
         candidate.validate_rotation_from(&incumbent).unwrap();
 
         let mut unrelated = candidate;
@@ -2683,15 +2698,7 @@ mod tests {
     }
     #[test]
     fn autonomous_two_window_rotation_drops_expired_current_before_new_next() {
-        let fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v1.json"
-        ))
-        .unwrap();
-        let mut incumbent: Profile = serde_json::from_value(fixture["profile"].clone()).unwrap();
-        incumbent
-            .markets
-            .retain(|market| market.role != WindowRole::Retiring);
-        incumbent.profile_id = incumbent.expected_id();
+        let incumbent = two_market_reducer_profile();
         incumbent.validate().unwrap();
         let old_next = incumbent.window(WindowRole::Next).unwrap().clone();
         let mut current = old_next;
@@ -2736,303 +2743,6 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn full_sync_is_two_token_non_atomic_and_retiring_terminates_without_settlement() {
-        let seed = json!({"latest_cursor":0,"catalog_revision":"a".repeat(64),
-        "gaps":[],"books":[book("10",&format!("0x{}", "1".repeat(64)),"2026-09-26T05:30:01Z"),book("20",&format!("0x{}", "1".repeat(64)),"2026-09-26T05:30:02Z")],
-        "markets":[market("4944030",&format!("0x{}", "1".repeat(64)),"10","20")]});
-        let p = Publication::start(
-            0,
-            Some(seed),
-            [
-                ("10".into(), "4944030".into()),
-                ("20".into(), "4944030".into()),
-            ]
-            .into(),
-            8,
-            131072,
-            65536,
-            |_| Ok(()),
-        )
-        .unwrap();
-        let profile = profile();
-        let value = full_sync(
-            &p.capture_view().unwrap(),
-            &profile,
-            "epoch",
-            DateTime::parse_from_rfc3339("2026-09-26T05:30:03Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        )
-        .unwrap();
-        assert_eq!(value["ready"], true);
-        assert_eq!(value["markets"][0]["cross_token_atomic"], false);
-        assert_eq!(value["markets"][0]["tokens"][1]["outcome"], "Down");
-        p.finish().await.unwrap();
-    }
-    #[tokio::test]
-    async fn gap_only_invalidates_affected_token() {
-        let mut seed = json!({"latest_cursor":0,"catalog_revision":"a".repeat(64),"gaps":[],
-        "books":[book("10",&format!("0x{}", "1".repeat(64)),"2026-09-26T05:30:01Z"),book("20",&format!("0x{}", "1".repeat(64)),"2026-09-26T05:30:02Z")],
-        "markets":[market("4944030",&format!("0x{}", "1".repeat(64)),"10","20")]});
-        seed["gaps"] = json!([{"token_id":"10","resolved":false}]);
-        let p = Publication::start(
-            0,
-            Some(seed),
-            [
-                ("10".into(), "4944030".into()),
-                ("20".into(), "4944030".into()),
-            ]
-            .into(),
-            8,
-            131072,
-            65536,
-            |_| Ok(()),
-        )
-        .unwrap();
-        let value = full_sync(
-            &p.capture_view().unwrap(),
-            &profile(),
-            "epoch",
-            DateTime::parse_from_rfc3339("2026-09-26T05:30:03Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        )
-        .unwrap();
-        assert_eq!(value["markets"][0]["tokens"][0]["available"], false);
-        assert_eq!(
-            value["markets"][0]["tokens"][0]["replay_baseline_valid"],
-            false
-        );
-        assert_eq!(
-            value["markets"][0]["tokens"][0]["unavailable_reason"],
-            "source_gap"
-        );
-        assert_eq!(value["markets"][0]["tokens"][1]["available"], true);
-        assert_eq!(
-            value["markets"][0]["tokens"][1]["replay_baseline_valid"],
-            true
-        );
-        assert_eq!(value["markets"][0]["tokens"][1]["token_id"], "20");
-        p.finish().await.unwrap();
-    }
-    #[tokio::test]
-    async fn full_sync_binds_an_in_progress_recovery_to_its_authoritative_snapshot() {
-        let fixture: Value = serde_json::from_slice(include_bytes!(
-            "../../../tests/fixtures/btc-5m-wire-v1.json"
-        ))
-        .unwrap();
-        let profile: Profile = serde_json::from_value(fixture["profile"].clone()).unwrap();
-        let source = crate::source_websocket::btc5m_reducer_fixture_sequence().unwrap();
-        let markets = profile
-            .markets
-            .iter()
-            .map(|binding| {
-                market(
-                    &binding.market_id,
-                    &binding.condition_id,
-                    &binding.outcomes[0].token_id,
-                    &binding.outcomes[1].token_id,
-                )
-            })
-            .collect::<Vec<_>>();
-        let tokens = profile
-            .markets
-            .iter()
-            .flat_map(|binding| {
-                binding
-                    .outcomes
-                    .iter()
-                    .map(|outcome| (outcome.token_id.clone(), binding.market_id.clone()))
-            })
-            .collect();
-        let mut publication = Publication::start(
-            42,
-            Some(
-                json!({"latest_cursor":42,"catalog_revision":profile.catalog_revision,
-                "live_stream_connected":true,"gaps":[],"books":[],"markets":markets}),
-            ),
-            tokens,
-            8,
-            1024 * 1024,
-            512 * 1024,
-            |_| Ok(()),
-        )
-        .unwrap();
-        for event in &source[..5] {
-            publication.publish(vec![event.clone()], None).unwrap();
-        }
-        // A new consumer may join after recovery_started but before the
-        // authoritative snapshot. The baseline must carry the identity that
-        // binds both subsequent frames, without making the old book usable.
-        let before = full_sync(
-            &publication.capture_view().unwrap(),
-            &profile,
-            "epoch-recovery",
-            DateTime::parse_from_rfc3339("2026-09-26T05:30:08.500Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        )
-        .unwrap();
-        let recovering = &before["markets"][0]["tokens"][0];
-        assert_eq!(recovering["available"], false);
-        assert_eq!(recovering["unavailable_reason"], "source_gap");
-        assert_eq!(recovering["replay_baseline_valid"], false);
-        assert!(recovering["recovery_snapshot_cursor"].is_null());
-        let recovery_id = recovering["recovery_id"].clone();
-        assert!(recovery_id.as_str().is_some());
-        publication.publish(vec![source[5].clone()], None).unwrap();
-        let value = full_sync(
-            &publication.capture_view().unwrap(),
-            &profile,
-            "epoch-recovery",
-            DateTime::parse_from_rfc3339("2026-09-26T05:30:08.500Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        )
-        .unwrap();
-        let token = &value["markets"][0]["tokens"][0];
-        assert_eq!(token["token_id"], "101");
-        assert_eq!(token["replay_baseline_valid"], true);
-        assert!(token["recovery_id"].as_str().is_some());
-        assert_eq!(token["recovery_id"], recovery_id);
-        assert_eq!(token["recovery_snapshot_cursor"], token["publisher_cursor"]);
-        let completion = event_frame(&profile, "epoch-recovery", &source[6])
-            .unwrap()
-            .unwrap();
-        assert_eq!(completion["type"], "recovery_completed");
-        assert_eq!(completion["payload"]["canonical_payload"]["recovery_id"], recovery_id);
-        assert_eq!(completion["payload"]["canonical_payload"]["snapshot_cursor"], token["recovery_snapshot_cursor"]);
-        publication.publish(vec![source[6].clone()], None).unwrap();
-        let finished = publication.capture_view().unwrap();
-        assert!(!finished.recoveries.contains_key("101"));
-        publication.finish().await.unwrap();
-    }
-    #[test]
-    fn confirmation_frame_advances_only_the_independent_freshness_watermark() {
-        let profile = profile();
-        let condition = format!("0x{}", "1".repeat(64));
-        let mut confirmed = book("10", &condition, "2026-09-26T05:30:01Z");
-        confirmed["book_epoch"] = json!("epoch-book");
-        confirmed["sequence"] = json!(7);
-        confirmed["confirmed_at"] = json!("2026-09-26T05:30:08.500Z");
-        confirmed["confirmation_source"] = json!("rest_book_confirmation");
-        confirmed["confirmation_evidence_sha256"] = json!("e".repeat(64));
-        confirmed["book_received_at"] = confirmed["received_at"].clone();
-        confirmed.as_object_mut().unwrap().remove("received_at");
-        let frame = confirmation_frame(
-            &profile,
-            "epoch-confirmation",
-            49,
-            3,
-            &[Arc::new(confirmed)],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(frame["type"], "book_confirmations");
-        assert_eq!(frame["publisher_cursor"], 49);
-        assert_eq!(frame["confirmation_sequence"], 3);
-        assert_eq!(
-            frame["confirmations"][0]["book_received_at"],
-            "2026-09-26T05:30:01Z"
-        );
-        assert_eq!(
-            frame["confirmations"][0]["confirmed_at"],
-            "2026-09-26T05:30:08.500Z"
-        );
-        assert!(frame.get("payload").is_none());
-    }
-    #[tokio::test]
-    async fn expired_current_profile_fails_closed_even_with_fresh_books() {
-        let seed = json!({"latest_cursor":0,"catalog_revision":"a".repeat(64),"gaps":[],
-        "books":[book("10",&format!("0x{}", "1".repeat(64)),"2026-09-26T05:35:00Z"),book("20",&format!("0x{}", "1".repeat(64)),"2026-09-26T05:35:00Z")],
-        "markets":[market("4944030",&format!("0x{}", "1".repeat(64)),"10","20")]});
-        let p = Publication::start(
-            0,
-            Some(seed),
-            [
-                ("10".into(), "4944030".into()),
-                ("20".into(), "4944030".into()),
-            ]
-            .into(),
-            8,
-            131072,
-            65536,
-            |_| Ok(()),
-        )
-        .unwrap();
-        let value = full_sync(
-            &p.capture_view().unwrap(),
-            &profile(),
-            "epoch",
-            DateTime::parse_from_rfc3339("2026-09-26T05:35:01Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        )
-        .unwrap();
-        assert_eq!(value["ready"], false);
-        assert_eq!(
-            value["markets"][0]["tokens"][0]["unavailable_reason"],
-            "market_window_inactive"
-        );
-        p.finish().await.unwrap();
-    }
-    #[tokio::test]
-    async fn future_or_locked_book_is_never_available() {
-        let condition = format!("0x{}", "1".repeat(64));
-        let future = book("10", &condition, "2026-09-26T05:30:04Z");
-        let mut locked = book("20", &condition, "2026-09-26T05:30:02Z");
-        locked["bids"] = json!([{"price":"0.60","size":"1"}]);
-        locked["asks"] = json!([{"price":"0.60","size":"1"}]);
-        let seed = json!({"latest_cursor":0,"catalog_revision":"a".repeat(64),"gaps":[],
-            "books":[future,locked],
-            "markets":[market("4944030",&condition,"10","20")]});
-        let publication = Publication::start(
-            0,
-            Some(seed),
-            [
-                ("10".into(), "4944030".into()),
-                ("20".into(), "4944030".into()),
-            ]
-            .into(),
-            8,
-            131072,
-            65536,
-            |_| Ok(()),
-        )
-        .unwrap();
-        let value = full_sync(
-            &publication.capture_view().unwrap(),
-            &profile(),
-            "epoch",
-            DateTime::parse_from_rfc3339("2026-09-26T05:30:03Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        )
-        .unwrap();
-        assert_eq!(value["markets"][0]["tokens"][0]["available"], false);
-        assert_eq!(
-            value["markets"][0]["tokens"][0]["replay_baseline_valid"],
-            false
-        );
-        assert_eq!(
-            value["markets"][0]["tokens"][0]["unavailable_reason"],
-            "future_received_at"
-        );
-        assert_eq!(
-            value["markets"][0]["tokens"][1]["unavailable_reason"],
-            "crossed_book"
-        );
-        assert_eq!(
-            value["markets"][0]["tokens"][1]["replay_baseline_valid"],
-            false
-        );
-        assert_eq!(
-            value["crossed_book_rule"],
-            "best_bid_greater_than_or_equal_to_best_ask_is_invalid"
-        );
-        publication.finish().await.unwrap();
-    }
-    #[tokio::test]
     async fn management_503_uses_versioned_error_fixture() {
         let response = failure(StatusCode::SERVICE_UNAVAILABLE,
             "btc_5m_management_unavailable", true);
@@ -3046,81 +2756,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_serve_bounded_same_process_status_and_full_sync() {
-        let seed = json!({"latest_cursor":0,"catalog_revision":"a".repeat(64),"gaps":[],
-        "books":[book("10",&format!("0x{}", "1".repeat(64)),"2026-09-26T05:30:01Z"),book("20",&format!("0x{}", "1".repeat(64)),"2026-09-26T05:30:02Z")],
-        "markets":[market("4944030",&format!("0x{}", "1".repeat(64)),"10","20")]});
-        let p = Publication::start(
-            0,
-            Some(seed),
-            [
-                ("10".into(), "4944030".into()),
-                ("20".into(), "4944030".into()),
-            ]
-            .into(),
-            8,
-            131072,
-            65536,
-            |_| Ok(()),
-        )
-        .unwrap();
-        let (router, _) = Api::router(
-            p.reader(),
-            profile(),
-            "epoch-http".into(),
-            Limits {
-                snapshot_bytes: 65536,
-                frame_bytes: 65536,
-                replay_bytes: 65536,
-                clients: 1,
-                send_timeout: Duration::from_secs(1),
-                snapshot_lease_capacity: 1,
-            },
-        )
-        .unwrap();
-        for path in [
-            "/v1/prediction-markets/polymarket/research/btc-5m/status",
-            "/v1/prediction-markets/polymarket/research/btc-5m/full-sync",
+    async fn market_replay_route_reads_writer_committed_market_only() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("indexes")).unwrap();
+        std::fs::File::create(root.path().join("events.jsonl")).unwrap();
+        let db = Connection::open(root.path().join("indexes/latest-state.sqlite3")).unwrap();
+        db.execute_batch("CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE gaps(resolved INTEGER NOT NULL);
+            CREATE TABLE books(token_id TEXT PRIMARY KEY,market_id TEXT,cursor INTEGER,payload_json BLOB,payload_sha256 TEXT);
+            CREATE TABLE book_confirmations(token_id TEXT PRIMARY KEY);
+            CREATE TABLE event_offsets(cursor INTEGER PRIMARY KEY,byte_offset INTEGER,byte_length INTEGER,event_id TEXT,market_id TEXT,token_id TEXT,line_sha256 TEXT);").unwrap();
+        for (key, value) in [
+            ("schema_version", "marketcow.polymarket.state-index.v1"),
+            ("latest_cursor", "0"), ("event_log_size", "0"),
+            ("unresolved_gap_count", "0"), ("catalog_revision", "catalog-test"),
+            ("active_recovery_id", "recovery-test"),
         ] {
-            let response = router
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri(path)
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), 65536)
-                .await
-                .unwrap();
-            assert!(bytes.len() < 65536);
-            let value: Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(value["epoch"], "epoch-http");
+            db.execute("INSERT INTO metadata VALUES (?,?)", [key, value]).unwrap();
         }
-        let timeline_path = format!(
-            "/v1/prediction-markets/polymarket/research/btc-5m/timeline?epoch=epoch-http&publisher_cursor=1&event_id={}",
-            "a".repeat(64)
-        );
-        let timeline = router.clone().oneshot(axum::http::Request::builder()
-            .uri(timeline_path).body(axum::body::Body::empty()).unwrap())
-            .await.unwrap();
-        assert_eq!(timeline.status(), StatusCode::GONE);
-        p.pause_source().unwrap();
-        let health = router.oneshot(axum::http::Request::builder()
-            .uri("/v1/prediction-markets/polymarket/research/btc-5m/management-health")
+        let profile = profile();
+        let binding = profile.markets[0].clone();
+        for outcome in &binding.outcomes {
+            let model = book(&outcome.token_id, &binding.condition_id, "2026-09-26T05:30:01Z");
+            db.execute("INSERT INTO books VALUES (?,?,0,?,?)",
+                params![outcome.token_id, binding.market_id,
+                    serde_json::to_vec(&model).unwrap(), canonical_hash(&model)]).unwrap();
+        }
+        drop(db);
+        let writer = PreparedSourceWriter::open(root.path(), 65536).unwrap();
+        let mut writer = writer;
+        let tokens = binding.outcomes.iter().map(|outcome|
+            (outcome.token_id.clone(), binding.market_id.clone())).collect();
+        let seed = json!({"latest_cursor":0,"books":[],"markets":[market(
+            &binding.market_id, &binding.condition_id,
+            &binding.outcomes[0].token_id, &binding.outcomes[1].token_id)],"gaps":[],
+            "schema_version":"marketcow.polymarket.live-stream.v1","type":"state"});
+        let mut publication = Publication::start(0, Some(seed), tokens, 8, 131072, 65536,
+            move |batches| writer.append_validated_group(
+                &batches.iter().map(|batch| &batch.validated).collect::<Vec<_>>()))
+            .unwrap();
+        let received_at = Utc.with_ymd_and_hms(2026, 9, 26, 5, 30, 1).unwrap();
+        let events = binding.outcomes.iter().enumerate().map(|(index, outcome)|
+            snapshot_event(&json!({"asset_id":outcome.token_id,"market":binding.condition_id,
+                "tick_size":"0.01","timestamp":"1790399999000","hash":"source",
+                "bids":[{"price":"0.4","size":"10"}],
+                "asks":[{"price":"0.6","size":"10"}]}),
+                SnapshotBoundary {market_id:&binding.market_id,
+                    condition_id:&binding.condition_id,token_id:&outcome.token_id,
+                    recovery_id:"test",cursor:index as u64 + 1,received_at}).unwrap())
+            .collect::<Vec<_>>();
+        publication.publish_native_events(events, None).unwrap();
+        let reader = publication.reader();
+        publication.finish().await.unwrap();
+        let watermark = reader.market_stream_watermark(&binding.market_id).unwrap().unwrap();
+        assert_eq!((watermark.published_cursor, watermark.durable_cursor), (1, 1));
+        let (router, _) = Api::router_with_archive(reader.clone(), profile.clone(),
+            "profile-epoch".into(), Limits {
+                snapshot_bytes:65536,frame_bytes:65536,replay_bytes:65536,
+                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
+            }, root.path().to_path_buf()).unwrap();
+        let status = router.clone().oneshot(axum::http::Request::builder()
+            .uri("/v1/prediction-markets/polymarket/research/btc-5m/status")
             .body(axum::body::Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(health.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(health.into_body(), 65536).await.unwrap();
-        let value: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["data_state"], "unavailable");
-        assert_eq!(value["entry_ready"], Value::Null);
-        assert_eq!(value["publication"]["publication_binding_tokens"], 2);
-        assert_eq!(value["publication"]["metadata_market_count"], 1);
-        assert_eq!(value["publication"]["wire_tokens"], Value::Null);
-        assert_eq!(value["resources"]["phase_counts_authoritative"], false);
-        p.finish().await.unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status: Value = serde_json::from_slice(&axum::body::to_bytes(
+            status.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(status["schema_version"], STATUS_SCHEMA);
+        assert!(status["observed_at"].as_str().is_some());
+        assert_eq!(status["windows"][0]["token_quotes"].as_array().unwrap().len(), 2);
+        assert!(status["windows"][0]["readiness_reasons"].as_array().is_some());
+        let streams = router.clone().oneshot(axum::http::Request::builder()
+            .uri("/v1/prediction-markets/polymarket/research/btc-5m/market-streams")
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(streams.status(), StatusCode::OK);
+        let streams = proto::MarketStreams::decode(axum::body::to_bytes(
+            streams.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(streams.markets[0].identity.as_ref().unwrap().stream_epoch.as_deref(),
+            Some(watermark.stream_epoch.as_str()));
+        assert_eq!(streams.watermarks[0].published_market_cursor, Some(1));
+        let snapshot_path = format!(
+            "/v1/prediction-markets/polymarket/research/btc-5m/market-full-sync?market_id={}",
+            binding.market_id);
+        let snapshot_response = router.clone().oneshot(axum::http::Request::builder()
+            .uri(snapshot_path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(snapshot_response.status(), StatusCode::OK);
+        let snapshot = proto::MarketFullSync::decode(axum::body::to_bytes(
+            snapshot_response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(snapshot.watermark.as_ref().unwrap().identity.as_ref().unwrap()
+            .stream_epoch.as_deref(), Some(watermark.stream_epoch.as_str()));
+        assert_eq!(snapshot.watermark.as_ref().unwrap().published_market_cursor, Some(1));
+        assert_eq!(snapshot.books.len(), 2);
+        assert!(snapshot.books.iter().all(|book| book.book_market_cursor == Some(1)
+            && book.canonical_book_sha256.as_ref().is_some_and(|hash| hash.len() == 32)
+            && book.canonical_book.is_some()));
+        assert!(snapshot.snapshot_is_not_execution_readiness);
+        for (query, expected) in [
+            ("market_id=absent", StatusCode::NOT_FOUND),
+            ("market_id=", StatusCode::BAD_REQUEST),
+        ] {
+            let response = router.clone().oneshot(axum::http::Request::builder()
+                .uri(format!("/v1/prediction-markets/polymarket/research/btc-5m/market-full-sync?{query}"))
+                .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let path = format!("/v1/prediction-markets/polymarket/research/btc-5m/market-replay?market_id={}&stream_epoch={}&after_market_cursor=0&maximum_groups=1",
+            binding.market_id, watermark.stream_epoch);
+        let response = router.clone().oneshot(axum::http::Request::builder().uri(path)
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let value = proto::MarketReplayPage::decode(body).unwrap();
+        assert_eq!(value.next_market_cursor, Some(1));
+        assert_eq!(value.groups[0].events.len(), 2);
+        assert_eq!(value.groups[0].group_sha256.len(), 32);
+        assert!(!value.archive_only);
+        // A cold epoch must remain selectively readable even when the hot
+        // profile has moved to another market. It does not expose readiness.
+        let mut next_profile = profile;
+        next_profile.markets[0].market_id = "other-hot-market".into();
+        next_profile.profile_id = next_profile.expected_id();
+        let (cold_router, _) = Api::router_with_archive(reader, next_profile,
+            "next-profile-epoch".into(), Limits {
+                snapshot_bytes:65536,frame_bytes:65536,replay_bytes:65536,
+                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
+            }, root.path().to_path_buf()).unwrap();
+        let cold_path = format!("/v1/prediction-markets/polymarket/research/market-archive-replay?market_id={}&stream_epoch={}&after_market_cursor=0&maximum_groups=1",
+            binding.market_id, watermark.stream_epoch);
+        let cold_response = cold_router.clone().oneshot(axum::http::Request::builder()
+            .uri(cold_path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(cold_response.status(), StatusCode::OK);
+        let cold = proto::MarketReplayPage::decode(axum::body::to_bytes(
+            cold_response.into_body(), 65536).await.unwrap()).unwrap();
+        assert!(cold.archive_only);
+        assert!(cold.active_identity.is_none());
+        assert_eq!(cold.groups, value.groups);
+        let missing = cold_router.oneshot(axum::http::Request::builder()
+            .uri("/v1/prediction-markets/polymarket/research/market-archive-replay?market_id=missing&stream_epoch=missing&after_market_cursor=0&maximum_groups=1")
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        for (bad, expected) in [
+            ("market_id=absent&stream_epoch=epoch&after_market_cursor=0&maximum_groups=1".to_owned(),
+                StatusCode::NOT_FOUND),
+            (format!("market_id={}&stream_epoch=wrong&after_market_cursor=0&maximum_groups=1", binding.market_id),
+                StatusCode::CONFLICT),
+        ] {
+            let response = router.clone().oneshot(axum::http::Request::builder()
+                .uri(format!("/v1/prediction-markets/polymarket/research/btc-5m/market-replay?{bad}"))
+                .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let db = Connection::open(root.path().join("indexes/latest-state.sqlite3")).unwrap();
+        db.execute("UPDATE market_streams SET replay_floor=1 WHERE market_id=? AND stream_epoch=?",
+            params![binding.market_id, watermark.stream_epoch]).unwrap();
+        let expired_path = format!("/v1/prediction-markets/polymarket/research/btc-5m/market-replay?market_id={}&stream_epoch={}&after_market_cursor=0&maximum_groups=1",
+            binding.market_id, watermark.stream_epoch);
+        let expired = router.oneshot(axum::http::Request::builder().uri(expired_path)
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(expired.status(), StatusCode::GONE);
     }
 }

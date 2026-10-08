@@ -313,9 +313,196 @@ pub fn validate_source_events(
 /// encoded lines are shared with the disk worker. No public mutation API.
 pub struct ValidatedSourceBatch {
     events: Vec<Value>,
+    events_retained_bytes: usize,
     lines: Vec<Vec<u8>>,
     terminal: bool,
     after: u64,
+    market_groups: Vec<MarketGroupProof>,
+    cursor_encodings: Vec<Option<CursorEncoding>>,
+}
+
+// Allocation-capacity accounting, not JSON wire length or an RSS guarantee.
+// BTreeMap node occupancy and allocation headers are conservatively charged
+// per entry. Compute on the validating entity worker, never walk a depth tree
+// again under the shared publication lock.
+pub fn json_retained_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity().saturating_add(32),
+        Value::Array(values) => values.capacity().saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(32).saturating_add(values.iter().map(json_retained_bytes).sum::<usize>()),
+        Value::Object(values) => values.iter().fold(
+            128 + 11 * std::mem::size_of::<(String, Value)>(), |total, (key, value)| {
+            total.saturating_add(2 * std::mem::size_of::<(String, Value)>() + 64)
+                .saturating_add(key.capacity()).saturating_add(json_retained_bytes(value))
+        }),
+        _ => 0,
+    }
+}
+
+/// Offsets into an already validated JSON line, not another copy of its book.
+/// Prepared by the entity worker; consumed once when binding archive cursors.
+struct CursorEncoding {
+    cursor_start: usize,
+    cursor_end: usize,
+    identity_start: usize,
+    identity_end: usize,
+    prefix: Sha256,
+}
+impl CursorEncoding {
+    fn prepare(line: &[u8], expected_identity: &str) -> Option<Self> {
+        if line.first() != Some(&b'{') || line.last() != Some(&b'\n') { return None; }
+        let mut cursor = None;
+        let mut identity = None;
+        let mut index = 1;
+        while index < line.len() && line[index] != b'}' {
+            let field_start = index;
+            if line.get(index) != Some(&b'"') { return None; }
+            index += 1;
+            let mut escaped = false;
+            while index < line.len() {
+                let byte = line[index];
+                index += 1;
+                if escaped { escaped = false; }
+                else if byte == b'\\' { escaped = true; }
+                else if byte == b'"' { break; }
+            }
+            let key: String = serde_json::from_slice(&line[field_start..index]).ok()?;
+            if line.get(index) != Some(&b':') { return None; }
+            index += 1;
+            let value_start = index;
+            let mut depth = 0usize;
+            let mut quoted = false;
+            let mut escaped = false;
+            while index < line.len() {
+                let byte = line[index];
+                if quoted {
+                    if escaped { escaped = false; }
+                    else if byte == b'\\' { escaped = true; }
+                    else if byte == b'"' { quoted = false; }
+                } else {
+                    match byte {
+                        b'"' => quoted = true,
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' if depth > 0 => depth -= 1,
+                        b',' | b'}' if depth == 0 => break,
+                        _ => {},
+                    }
+                }
+                index += 1;
+            }
+            if key == "cursor" { cursor = Some((value_start, index)); }
+            if key == "event_id" && field_start > 1 {
+                identity = Some((field_start - 1, index));
+            }
+            if line.get(index) == Some(&b',') { index += 1; }
+            else if line.get(index) != Some(&b'}') { return None; }
+        }
+        let (cursor_start, cursor_end) = cursor?;
+        let (identity_start, identity_end) = identity?;
+        if cursor_end > identity_start || identity_end >= line.len() { return None; }
+        let mut prefix = Sha256::new();
+        prefix.update(&line[..cursor_start]);
+        let encoding = Self { cursor_start, cursor_end, identity_start, identity_end, prefix };
+        // Prove that the encoded ordering agrees with canonical hashing before
+        // selecting the fast path. Unknown encodings retain the original path.
+        let identity = encoding.identity(line, &line[cursor_start..cursor_end]);
+        (identity == expected_identity).then_some(encoding)
+    }
+    fn identity(&self, line: &[u8], cursor: &[u8]) -> String {
+        let mut hash = self.prefix.clone();
+        hash.update(cursor);
+        hash.update(&line[self.cursor_end..self.identity_start]);
+        hash.update(&line[self.identity_end..line.len()-1]);
+        hex::encode(hash.finalize())
+    }
+    fn encode(&self, line: &[u8], cursor: u64) -> (String, Vec<u8>) {
+        let cursor = cursor.to_string();
+        let identity = self.identity(line, cursor.as_bytes());
+        let mut next = Vec::with_capacity(line.len()+20);
+        next.extend_from_slice(&line[..self.cursor_start]);
+        next.extend_from_slice(cursor.as_bytes());
+        next.extend_from_slice(&line[self.cursor_end..self.identity_start]);
+        next.extend_from_slice(b",\"event_id\":\"");
+        next.extend_from_slice(identity.as_bytes());
+        next.extend_from_slice(b"\"");
+        next.extend_from_slice(&line[self.identity_end..]);
+        (identity, next)
+    }
+}
+
+#[derive(Clone)]
+struct MarketGroupProof {
+    market_id: String,
+    stream_epoch: String,
+    market_cursor: u64,
+    first_global_cursor: u64,
+    last_global_cursor: u64,
+    group_sha256: String,
+    // The archive position is assigned by the writer. Native market events
+    // retain their public cursor and event_id when another market writes first.
+    first_event_cursor: u64,
+    native_cursor: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableMarketCheckpoint {
+    pub market_id: String,
+    pub stream_epoch: String,
+    pub durable_cursor: u64,
+    pub replay_floor: u64,
+}
+
+#[derive(Debug)]
+pub struct DurableMarketGroup {
+    pub market_cursor: u64,
+    pub group_sha256: String,
+    pub events: Vec<Value>,
+    /// Physical positions assigned by the async writer. Never a replay or
+    /// recovery cursor in the public market-local stream.
+    pub physical_archive_cursors: Vec<u64>,
+}
+
+#[derive(Debug)]
+pub struct DurableMarketPage {
+    pub checkpoint: DurableMarketCheckpoint,
+    pub next_cursor: u64,
+    pub caught_up: bool,
+    pub groups: Vec<DurableMarketGroup>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DurableMarketPageBoundary {
+    #[error("market stream not found")]
+    NotFound,
+    #[error("market replay expired; replay floor is {replay_floor}")]
+    Expired { replay_floor: u64 },
+    #[error("market replay cursor exceeds durable checkpoint {durable_cursor}")]
+    Future { durable_cursor: u64 },
+}
+
+/// Small commitment over already validated event identities. Full source
+/// lines retain their own SHA; rehashing full depth under the memory publisher
+/// lock would reintroduce a global hot-path barrier.
+pub fn market_group_hash(
+    market_id: &str,
+    stream_epoch: &str,
+    market_cursor: u64,
+    events: &[Value],
+) -> Result<String> {
+    ensure!(
+        !market_id.is_empty() && !stream_epoch.is_empty() && market_cursor > 0,
+        "market group identity"
+    );
+    let event_ids = events
+        .iter()
+        .map(|event| required(event, "event_id"))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!event_ids.is_empty(), "empty market group");
+    Ok(canonical_hash(&json!({
+        "schema_version":"marketcow.polymarket.market-group.v2",
+        "market_id":market_id,"stream_epoch":stream_epoch,
+        "market_cursor":market_cursor,"event_ids":event_ids,
+    })))
 }
 impl ValidatedSourceBatch {
     pub fn new(
@@ -325,19 +512,179 @@ impl ValidatedSourceBatch {
         tokens: &BTreeMap<String, String>,
         limit: usize,
     ) -> Result<Self> {
+        Self::new_inner(events, terminal, after, tokens, limit, true)
+    }
+
+    /// Validate an already market-local event sequence without preparing any
+    /// global-cursor rewrite cache. Its public event bytes are never rebased.
+    pub fn new_native(
+        events: Vec<Value>,
+        terminal: bool,
+        after: u64,
+        tokens: &BTreeMap<String, String>,
+        limit: usize,
+    ) -> Result<Self> {
+        Self::new_inner(events, terminal, after, tokens, limit, false)
+    }
+
+    fn new_inner(
+        events: Vec<Value>,
+        terminal: bool,
+        after: u64,
+        tokens: &BTreeMap<String, String>,
+        limit: usize,
+        prepare_cursor_encoding: bool,
+    ) -> Result<Self> {
         let lines = validate_source_events(&events, terminal, after, tokens, limit)?;
+        // Conservative metadata allowance, within the existing batch budget.
+        // No full-book duplication and no unbounded per-event cache.
+        let cache_budget = limit.saturating_sub(lines.iter().map(Vec::len).sum())
+            .min(64 * 1024);
+        let mut cursor_encodings = Vec::new();
+        if prepare_cursor_encoding && events.len() <= cache_budget / 256 {
+            cursor_encodings.reserve_exact(events.len());
+            for (event, line) in events.iter().zip(&lines) {
+                let encoding = if event["event_type"] == "recovery_completed" { None }
+                    else { event["event_id"].as_str()
+                        .and_then(|identity| CursorEncoding::prepare(line, identity)) };
+                cursor_encodings.push(encoding);
+            }
+        }
         Ok(Self {
+            events_retained_bytes: events.capacity().saturating_mul(std::mem::size_of::<Value>())
+                .saturating_add(events.iter().map(json_retained_bytes).sum::<usize>()),
             events,
             lines,
             terminal,
             after,
+            market_groups: Vec::new(),
+            cursor_encodings,
         })
+    }
+
+    /// Rebind an actor-validated observation to this market's event cursor.
+    /// The actor has already checked payload hashes, source identity,
+    /// market binding and recovery boundaries. Only these cursor-dependent
+    /// fields can change; the exact resulting lines are regenerated for the
+    /// existing writer without repeating full-depth payload validation.
+    pub fn rebase_after(mut self, new_after: u64, maximum_batch_bytes: usize) -> Result<Self> {
+        ensure!(self.market_groups.is_empty(), "already bound market group");
+        let old_after = self.after;
+        let mut lines = Vec::with_capacity(self.events.len());
+        let mut total = 0usize;
+        for (index, event) in self.events.iter_mut().enumerate() {
+            let old_cursor = old_after.checked_add(index as u64 + 1)
+                .context("actor cursor overflow")?;
+            ensure!(event["cursor"].as_u64() == Some(old_cursor), "actor cursor changed");
+            let cursor = new_after.checked_add(index as u64 + 1)
+                .context("publisher cursor overflow")?;
+            event["cursor"] = json!(cursor);
+            if event["event_type"] == "recovery_completed" {
+                let snapshot = event["canonical_payload"]["snapshot_cursor"].as_u64()
+                    .context("recovery snapshot cursor")?;
+                ensure!(snapshot > old_after && snapshot < old_cursor,
+                    "recovery snapshot outside observation");
+                event["canonical_payload"]["snapshot_cursor"] =
+                    json!(new_after.checked_add(snapshot - old_after)
+                        .context("publisher snapshot cursor overflow")?);
+                event["canonical_payload_sha256"] =
+                    json!(canonical_hash(&event["canonical_payload"]));
+                // This event changes a nested cursor and its payload hash as
+                // well as the envelope cursor. The fast encoder only patches
+                // the envelope; it would otherwise emit the original payload
+                // bytes while the in-memory event carries the new recovery
+                // boundary. Force exact encoding from the updated event.
+                if let Some(encoding) = self.cursor_encodings.get_mut(index) {
+                    *encoding = None;
+                }
+            }
+            let line = if let Some(encoding) = self.cursor_encodings.get_mut(index).and_then(Option::take) {
+                let (identity, line) = encoding.encode(&self.lines[index], cursor);
+                event["event_id"] = json!(identity);
+                line
+            } else {
+                event.as_object_mut().context("source event object")?.remove("event_id");
+                event["event_id"] = json!(canonical_hash(event));
+                let mut line = serde_json::to_vec(event)?;
+                line.push(b'\n');
+                line
+            };
+            total = total.checked_add(line.len()).context("batch length overflow")?;
+            ensure!(total <= maximum_batch_bytes, "batch byte budget exceeded");
+            lines.push(line);
+        }
+        self.lines = lines;
+        self.cursor_encodings = Vec::new();
+        self.after = new_after;
+        Ok(self)
+    }
+    /// Bind a complete validated observation to an independently ordered
+    /// market stream. The physical event cursors remain archival offsets, not
+    /// the public market cursor. The writer verifies this proof again in its
+    /// atomic index transaction.
+    pub fn with_market_group(mut self, stream_epoch: &str, market_cursor: u64) -> Result<Self> {
+        ensure!(
+            !stream_epoch.is_empty() && market_cursor > 0,
+            "market group identity"
+        );
+        let first = self.events.first().context("empty market group")?;
+        let market_id = required(first, "market_id")?.to_owned();
+        ensure!(
+            self.events
+                .iter()
+                .all(|event| event["market_id"] == market_id),
+            "market group crosses markets"
+        );
+        let first_global_cursor = first["cursor"]
+            .as_u64()
+            .context("market group first cursor")?;
+        let last_global_cursor = self.events.last().context("empty market group")?["cursor"]
+            .as_u64()
+            .context("market group last cursor")?;
+        let group_sha256 = market_group_hash(&market_id, stream_epoch, market_cursor, &self.events)?;
+        self.market_groups.push(MarketGroupProof {
+            market_id,
+            stream_epoch: stream_epoch.to_owned(),
+            market_cursor,
+            first_global_cursor,
+            last_global_cursor,
+            group_sha256,
+            first_event_cursor: first_global_cursor,
+            native_cursor: false,
+        });
+        Ok(self)
+    }
+    /// Declare a market-local public event cursor domain. The writer assigns
+    /// physical archive positions without rewriting these validated bytes.
+    pub fn with_native_market_group(mut self, stream_epoch: &str, market_cursor: u64) -> Result<Self> {
+        self = self.with_market_group(stream_epoch, market_cursor)?;
+        self.cursor_encodings.clear();
+        self.market_groups[0].native_cursor = true;
+        Ok(self)
     }
     pub fn events(&self) -> &[Value] {
         &self.events
     }
+    pub fn after_cursor(&self) -> u64 { self.after }
     pub fn encoded_bytes(&self) -> usize {
         self.lines.iter().map(Vec::len).sum()
+    }
+    pub fn retained_bytes(&self) -> usize {
+        self.events_retained_bytes
+            .saturating_add(std::mem::size_of::<Self>())
+            .saturating_add(self.lines.capacity() * std::mem::size_of::<Vec<u8>>())
+            .saturating_add(self.lines.iter().map(|line| line.capacity().saturating_add(32)).sum::<usize>())
+            .saturating_add(self.market_groups.capacity() * std::mem::size_of::<MarketGroupProof>())
+            .saturating_add(self.market_groups.iter().map(|group|
+                group.market_id.capacity() + group.stream_epoch.capacity() + group.group_sha256.capacity() + 96
+            ).sum::<usize>())
+            .saturating_add(self.cursor_encodings.capacity() * std::mem::size_of::<Option<CursorEncoding>>())
+    }
+    pub fn single_market_group(&self) -> Option<(&str, &str, u64)> {
+        (self.market_groups.len() == 1).then(|| {
+            let group = &self.market_groups[0];
+            (group.market_id.as_str(), group.stream_epoch.as_str(), group.market_cursor)
+        })
     }
 }
 
@@ -389,7 +736,273 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("missing string {field}"))
 }
 
+/// Short-lived, read-only selective replay. A pinned SQLite snapshot must
+/// agree with the fsynced manifest; the brief commit-before-manifest interval
+/// fails closed instead of exposing a merely indexed event as durable.
+pub fn read_durable_market_page(
+    root: &Path,
+    market_id: &str,
+    stream_epoch: &str,
+    after_cursor: u64,
+    maximum_groups: usize,
+    maximum_bytes: usize,
+) -> Result<DurableMarketPage> {
+    ensure!(
+        !market_id.is_empty()
+            && !stream_epoch.is_empty()
+            && (1..=256).contains(&maximum_groups)
+            && (1..=8 * 1024 * 1024).contains(&maximum_bytes),
+        "market replay request budget or identity"
+    );
+    let root = fs::canonicalize(root)?;
+    let manifest_path = fs::canonicalize(root.join("state-index.json"))?;
+    ensure!(
+        manifest_path.starts_with(&root),
+        "source manifest escapes generation"
+    );
+    ensure!(
+        fs::metadata(&manifest_path)?.len() <= 64 * 1024,
+        "source manifest too large"
+    );
+    let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    ensure!(
+        manifest["schema_version"] == "marketcow.polymarket.state-index.v1",
+        "source manifest schema"
+    );
+    let manifest_cursor: u64 = required(&manifest, "latest_cursor")?.parse()?;
+    let db_path = fs::canonicalize(root.join("indexes/latest-state.sqlite3"))?;
+    ensure!(
+        db_path.starts_with(&root),
+        "source index escapes generation"
+    );
+    let mut db = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let tx = db.transaction()?;
+    let indexed_cursor: u64 = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key='latest_cursor'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?
+        .parse()?;
+    ensure!(
+        indexed_cursor == manifest_cursor,
+        "source index/manifest boundary differs"
+    );
+    let bounded = tx
+        .query_row(
+            "SELECT value FROM metadata WHERE key='bounded_history_bytes'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some();
+    let (durable, floor): (i64, i64) = tx.query_row(
+        "SELECT durable_cursor,replay_floor FROM market_streams WHERE market_id=? AND stream_epoch=?",
+        params![market_id, stream_epoch],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?.ok_or(DurableMarketPageBoundary::NotFound)?;
+    let durable_cursor = u64::try_from(durable)?;
+    let replay_floor = u64::try_from(floor)?;
+    if after_cursor < replay_floor {
+        return Err(DurableMarketPageBoundary::Expired { replay_floor }.into());
+    }
+    if after_cursor > durable_cursor {
+        return Err(DurableMarketPageBoundary::Future { durable_cursor }.into());
+    }
+    let checkpoint = DurableMarketCheckpoint {
+        market_id: market_id.to_owned(),
+        stream_epoch: stream_epoch.to_owned(),
+        durable_cursor,
+        replay_floor,
+    };
+    let candidates = {
+        let mut statement = tx.prepare(
+            "SELECT g.market_cursor,g.first_global_cursor,g.last_global_cursor,g.group_sha256,\
+                    n.first_event_cursor \
+             FROM market_groups g JOIN market_native_groups n \
+             ON n.market_id=g.market_id AND n.stream_epoch=g.stream_epoch \
+             AND n.market_cursor=g.market_cursor \
+             WHERE g.market_id=? AND g.stream_epoch=? AND g.market_cursor>? \
+             ORDER BY g.market_cursor LIMIT ?",
+        )?;
+        statement
+            .query_map(
+                params![
+                    market_id,
+                    stream_epoch,
+                    i64::try_from(after_cursor)?,
+                    i64::try_from(maximum_groups)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut legacy_log = if bounded {
+        None
+    } else {
+        let path = fs::canonicalize(root.join("events.jsonl"))?;
+        ensure!(path.starts_with(&root), "source log escapes generation");
+        Some(File::open(path)?)
+    };
+    let mut groups = Vec::new();
+    let mut next_cursor = after_cursor;
+    let mut page_bytes = 0usize;
+    for (market_cursor, first_global, last_global, group_sha256, first_event) in candidates {
+        let market_cursor = u64::try_from(market_cursor)?;
+        let first_global = u64::try_from(first_global)?;
+        let last_global = u64::try_from(last_global)?;
+        ensure!(
+            market_cursor
+                == next_cursor
+                    .checked_add(1)
+                    .context("market cursor overflow")?
+                && first_global > 0
+                && last_global >= first_global
+                && last_global <= manifest_cursor,
+            "market replay index gap or unpublished group"
+        );
+        let expected = usize::try_from(last_global - first_global + 1)?;
+        ensure!(expected <= 256, "market replay group event cap");
+        let (count, declared_bytes): (i64, i64) = if bounded {
+            tx.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(length(payload)),0) FROM recent_events \
+                 WHERE cursor BETWEEN ? AND ?",
+                params![i64::try_from(first_global)?, i64::try_from(last_global)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        } else {
+            tx.query_row(
+                "SELECT COUNT(*),COALESCE(SUM(byte_length),0) FROM event_offsets \
+                 WHERE cursor BETWEEN ? AND ?",
+                params![i64::try_from(first_global)?, i64::try_from(last_global)?],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        };
+        ensure!(
+            usize::try_from(count)? == expected,
+            "market replay physical event gap"
+        );
+        let declared_bytes = usize::try_from(declared_bytes)?;
+        ensure!(
+            declared_bytes <= maximum_bytes,
+            "market replay group exceeds page budget"
+        );
+        if declared_bytes > maximum_bytes - page_bytes {
+            break;
+        }
+        let mut events = Vec::with_capacity(expected);
+        let mut physical_archive_cursors = Vec::with_capacity(expected);
+        for physical_cursor in first_global..=last_global {
+            let (line, sha) = if bounded {
+                tx.query_row(
+                    "SELECT payload,sha256 FROM recent_events WHERE cursor=?",
+                    [i64::try_from(physical_cursor)?],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+                )?
+            } else {
+                let (offset, length, sha): (i64, i64, String) = tx.query_row(
+                    "SELECT byte_offset,byte_length,line_sha256 FROM event_offsets WHERE cursor=?",
+                    [i64::try_from(physical_cursor)?],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                let mut line = vec![0; usize::try_from(length)?];
+                let log = legacy_log.as_mut().context("legacy source log missing")?;
+                log.seek(SeekFrom::Start(u64::try_from(offset)?))?;
+                log.read_exact(&mut line)?;
+                (line, sha)
+            };
+            ensure!(
+                hex::encode(Sha256::digest(&line)) == sha,
+                "market replay line hash differs"
+            );
+            let event: Value = serde_json::from_slice(&line)?;
+            let public_cursor = u64::try_from(first_event)?
+                .checked_add(physical_cursor - first_global)
+                .context("market event cursor overflow")?;
+            ensure!(
+                event["cursor"] == public_cursor && event["market_id"] == market_id,
+                "market replay event identity differs"
+            );
+            // The indexed line SHA alone is not an event validation: an index
+            // rewrite could update both payload and SHA. Recheck the original
+            // event identity at this bounded, off-hot-path replay boundary.
+            let mut identity = event.clone();
+            identity
+                .as_object_mut()
+                .context("market replay event is not an object")?
+                .remove("event_id");
+            ensure!(
+                event["event_id"] == canonical_hash(&identity),
+                "market replay event identity hash differs"
+            );
+            events.push(event);
+            physical_archive_cursors.push(physical_cursor);
+        }
+        ensure!(
+            market_group_hash(market_id, stream_epoch, market_cursor, &events)? == group_sha256,
+            "market replay group hash differs"
+        );
+        groups.push(DurableMarketGroup {
+            market_cursor,
+            group_sha256,
+            events,
+            physical_archive_cursors,
+        });
+        page_bytes += declared_bytes;
+        next_cursor = market_cursor;
+    }
+    ensure!(
+        next_cursor == durable_cursor || !groups.is_empty(),
+        "market replay prefix unavailable"
+    );
+    Ok(DurableMarketPage {
+        checkpoint,
+        next_cursor,
+        caught_up: next_cursor == durable_cursor,
+        groups,
+    })
+}
+
 impl PreparedSourceWriter {
+    /// Read only from a writer that has successfully reopened and verified its
+    /// manifest/index boundary. A missing stream is not a zero checkpoint.
+    pub fn market_checkpoint(
+        &self,
+        market_id: &str,
+        stream_epoch: &str,
+    ) -> Result<Option<DurableMarketCheckpoint>> {
+        ensure!(!self.poisoned, "market checkpoint writer is poisoned");
+        let result = self.database.query_row(
+            "SELECT durable_cursor,replay_floor FROM market_streams WHERE market_id=? AND stream_epoch=?",
+            params![market_id, stream_epoch],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        ).optional()?;
+        result
+            .map(|(durable, floor)| {
+                let durable_cursor = u64::try_from(durable)?;
+                let replay_floor = u64::try_from(floor)?;
+                ensure!(
+                    replay_floor <= durable_cursor,
+                    "market checkpoint floor exceeds durable"
+                );
+                Ok(DurableMarketCheckpoint {
+                    market_id: market_id.to_owned(),
+                    stream_epoch: stream_epoch.to_owned(),
+                    durable_cursor,
+                    replay_floor,
+                })
+            })
+            .transpose()
+    }
+
     pub fn open(root: &Path, maximum_batch_bytes: usize) -> Result<Self> {
         ensure!(maximum_batch_bytes > 0, "batch byte budget is required");
         let root = fs::canonicalize(root)?;
@@ -442,7 +1055,26 @@ impl PreparedSourceWriter {
              CREATE TABLE IF NOT EXISTS cold_market_evidence(\
                 market_id TEXT NOT NULL,retired_after INTEGER NOT NULL,\
                 payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL,\
-                PRIMARY KEY(market_id,retired_after))",
+                PRIMARY KEY(market_id,retired_after));\
+             CREATE TABLE IF NOT EXISTS market_streams(\
+                market_id TEXT NOT NULL,stream_epoch TEXT NOT NULL,\
+                durable_cursor INTEGER NOT NULL,replay_floor INTEGER NOT NULL,\
+                PRIMARY KEY(market_id,stream_epoch));\
+             CREATE TABLE IF NOT EXISTS market_groups(\
+                market_id TEXT NOT NULL,stream_epoch TEXT NOT NULL,market_cursor INTEGER NOT NULL,\
+                first_global_cursor INTEGER NOT NULL,last_global_cursor INTEGER NOT NULL,\
+                group_sha256 TEXT NOT NULL,\
+                PRIMARY KEY(market_id,stream_epoch,market_cursor));\
+             CREATE TABLE IF NOT EXISTS market_native_groups(\
+                market_id TEXT NOT NULL,stream_epoch TEXT NOT NULL,market_cursor INTEGER NOT NULL,\
+                first_event_cursor INTEGER NOT NULL,\
+                PRIMARY KEY(market_id,stream_epoch,market_cursor));\
+             CREATE TABLE IF NOT EXISTS market_native_streams(\
+                market_id TEXT NOT NULL,stream_epoch TEXT NOT NULL,\
+                last_event_cursor INTEGER NOT NULL,\
+                PRIMARY KEY(market_id,stream_epoch));\
+             CREATE INDEX IF NOT EXISTS market_groups_physical_start \
+                ON market_groups(first_global_cursor)",
         )?;
         // A lifecycle overlay is an authoritative retirement boundary. Older
         // generations could commit the terminal row separately from the
@@ -450,9 +1082,10 @@ impl PreparedSourceWriter {
         // actionable recovery behind. Reconcile that state atomically at the
         // writer boundary; the event log and lifecycle row remain untouched.
         let terminal_markets: BTreeSet<String> = {
-            let mut statement = database
-                .prepare("SELECT market_id,payload_json,payload_sha256 FROM market_lifecycle \
-                    WHERE market_id NOT IN (SELECT market_id FROM cold_market_catalog)")?;
+            let mut statement = database.prepare(
+                "SELECT market_id,payload_json,payload_sha256 FROM market_lifecycle \
+                    WHERE market_id NOT IN (SELECT market_id FROM cold_market_catalog)",
+            )?;
             let mut rows = statement.query([])?;
             let mut result = BTreeSet::new();
             while let Some(row) = rows.next()? {
@@ -691,6 +1324,13 @@ impl PreparedSourceWriter {
         };
         let tx = self.database.transaction()?;
         tx.execute_batch("CREATE TABLE recent_events(cursor INTEGER PRIMARY KEY,payload BLOB NOT NULL,sha256 TEXT NOT NULL); DELETE FROM event_offsets;")?;
+        // The bounded migration retains at most one physical tail line, not
+        // necessarily a complete multi-token observation. Preserve durable
+        // market checkpoints but expire all former replay groups atomically.
+        tx.execute_batch(
+            "UPDATE market_streams SET replay_floor=durable_cursor; \
+                          DELETE FROM market_groups; DELETE FROM market_native_groups;",
+        )?;
         let length = if let Some((line, hash, length)) = tail {
             tx.execute(
                 "INSERT INTO recent_events VALUES(?,?,?)",
@@ -783,11 +1423,15 @@ impl PreparedSourceWriter {
             !markets.is_empty() && markets.len() <= 4096,
             "retirement market budget"
         );
-        ensure!(cold_records.keys().cloned().collect::<BTreeSet<_>>() == *markets,
-            "retirement cold catalog identity set");
+        ensure!(
+            cold_records.keys().cloned().collect::<BTreeSet<_>>() == *markets,
+            "retirement cold catalog identity set"
+        );
         for (market, record) in cold_records {
-            ensure!(record["identity"]["market_id"] == *market,
-                "retirement cold catalog market identity");
+            ensure!(
+                record["identity"]["market_id"] == *market,
+                "retirement cold catalog market identity"
+            );
         }
         let tokens: BTreeSet<String> = self
             .token_markets
@@ -834,84 +1478,126 @@ impl PreparedSourceWriter {
         );
         self.poisoned = true;
         let tx = self.database.transaction()?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS cold_market_catalog(\
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cold_market_catalog(\
             market_id TEXT NOT NULL,retired_after INTEGER NOT NULL,\
             payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL,\
             PRIMARY KEY(market_id,payload_sha256));\
             CREATE TABLE IF NOT EXISTS cold_market_evidence(\
             market_id TEXT NOT NULL,retired_after INTEGER NOT NULL,\
             payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL,\
-            PRIMARY KEY(market_id,retired_after))")?;
+            PRIMARY KEY(market_id,retired_after))",
+        )?;
         for (market, record) in cold_records {
             let bytes = serde_json::to_vec(record)?;
-            ensure!(bytes.len() <= 256 * 1024,
-                "retirement cold catalog record exceeds read budget");
+            ensure!(
+                bytes.len() <= 256 * 1024,
+                "retirement cold catalog record exceeds read budget"
+            );
             let hash = hex::encode(Sha256::digest(&bytes));
-            let previous: Option<(Vec<u8>, String)> = tx.query_row(
-                "SELECT payload_json,payload_sha256 FROM cold_market_catalog \
+            let previous: Option<(Vec<u8>, String)> = tx
+                .query_row(
+                    "SELECT payload_json,payload_sha256 FROM cold_market_catalog \
                     WHERE market_id=? LIMIT 1",
-                [market], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
+                    [market],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             if let Some((body, prior_hash)) = previous {
-                ensure!(hex::encode(Sha256::digest(&body)) == prior_hash,
-                    "retirement prior cold catalog hash mismatch");
+                ensure!(
+                    hex::encode(Sha256::digest(&body)) == prior_hash,
+                    "retirement prior cold catalog hash mismatch"
+                );
                 let prior: Value = serde_json::from_slice(&body)?;
-                ensure!(prior["identity"] == record["identity"],
-                    "retirement cold catalog identity changed");
+                ensure!(
+                    prior["identity"] == record["identity"],
+                    "retirement cold catalog identity changed"
+                );
             }
-            tx.execute("INSERT OR IGNORE INTO cold_market_catalog VALUES (?,?,?,?)",
-                params![market, i64::try_from(after)?, bytes, hash])?;
-            let existing_evidence: Option<(Vec<u8>, String)> = tx.query_row(
-                "SELECT payload_json,payload_sha256 FROM cold_market_evidence \
+            tx.execute(
+                "INSERT OR IGNORE INTO cold_market_catalog VALUES (?,?,?,?)",
+                params![market, i64::try_from(after)?, bytes, hash],
+            )?;
+            let existing_evidence: Option<(Vec<u8>, String)> = tx
+                .query_row(
+                    "SELECT payload_json,payload_sha256 FROM cold_market_evidence \
                     WHERE market_id=? AND retired_after=?",
-                params![market,i64::try_from(after)?],
-                |row| Ok((row.get(0)?,row.get(1)?)),
-            ).optional()?;
+                    params![market, i64::try_from(after)?],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             if let Some((body, expected)) = existing_evidence {
-                ensure!(hex::encode(Sha256::digest(&body)) == expected,
-                    "retirement prior cold evidence hash mismatch");
+                ensure!(
+                    hex::encode(Sha256::digest(&body)) == expected,
+                    "retirement prior cold evidence hash mismatch"
+                );
                 let prior: Value = serde_json::from_slice(&body)?;
-                ensure!(prior["market_id"] == *market
-                    && prior["retired_after_cursor"] == after
-                    && prior["catalog_record_sha256"] == hash,
-                    "retirement prior cold evidence binding mismatch");
+                ensure!(
+                    prior["market_id"] == *market
+                        && prior["retired_after_cursor"] == after
+                        && prior["catalog_record_sha256"] == hash,
+                    "retirement prior cold evidence binding mismatch"
+                );
                 continue; // An idempotent crash replay must keep the first snapshot.
             }
             let mut books = BTreeMap::new();
             let mut recoveries = BTreeMap::new();
             let mut confirmations = Vec::new();
-            for token in self.token_markets.iter()
-                .filter(|(_, owner)| *owner == market).map(|(token, _)| token) {
+            for token in self
+                .token_markets
+                .iter()
+                .filter(|(_, owner)| *owner == market)
+                .map(|(token, _)| token)
+            {
                 for (table, target) in [
                     ("books", &mut books),
                     ("source_token_recoveries", &mut recoveries),
                 ] {
-                    let sql = format!("SELECT payload_json,payload_sha256 FROM {table} WHERE token_id=?");
-                    let row: Option<(Vec<u8>, String)> = tx.query_row(&sql, [token], |row|
-                        Ok((row.get(0)?, row.get(1)?))).optional()?;
+                    let sql =
+                        format!("SELECT payload_json,payload_sha256 FROM {table} WHERE token_id=?");
+                    let row: Option<(Vec<u8>, String)> = tx
+                        .query_row(&sql, [token], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .optional()?;
                     if let Some((body, expected)) = row {
-                        ensure!(hex::encode(Sha256::digest(&body)) == expected,
-                            "retirement source state hash mismatch");
-                        target.insert(token.clone(), serde_json::json!({
-                            "payload_sha256":expected,
-                            "payload":serde_json::from_slice::<Value>(&body)?,
-                        }));
+                        ensure!(
+                            hex::encode(Sha256::digest(&body)) == expected,
+                            "retirement source state hash mismatch"
+                        );
+                        target.insert(
+                            token.clone(),
+                            serde_json::json!({
+                                "payload_sha256":expected,
+                                "payload":serde_json::from_slice::<Value>(&body)?,
+                            }),
+                        );
                     }
                 }
                 let present: i64 = tx.query_row(
                     "SELECT count(*) FROM book_confirmations WHERE token_id=?",
-                    [token], |row| row.get(0))?;
-                if present > 0 { confirmations.push(token.clone()); }
+                    [token],
+                    |row| row.get(0),
+                )?;
+                if present > 0 {
+                    confirmations.push(token.clone());
+                }
             }
-            let lifecycle: Option<(Vec<u8>, String)> = tx.query_row(
-                "SELECT payload_json,payload_sha256 FROM market_lifecycle WHERE market_id=?",
-                [market], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+            let lifecycle: Option<(Vec<u8>, String)> = tx
+                .query_row(
+                    "SELECT payload_json,payload_sha256 FROM market_lifecycle WHERE market_id=?",
+                    [market],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             let lifecycle_sha256 = lifecycle.as_ref().map(|(_, expected)| expected.clone());
-            let lifecycle = lifecycle.map(|(body, expected)| -> Result<Value> {
-                ensure!(hex::encode(Sha256::digest(&body)) == expected,
-                    "retirement lifecycle hash mismatch");
-                Ok(serde_json::from_slice(&body)?)
-            }).transpose()?;
+            let lifecycle = lifecycle
+                .map(|(body, expected)| -> Result<Value> {
+                    ensure!(
+                        hex::encode(Sha256::digest(&body)) == expected,
+                        "retirement lifecycle hash mismatch"
+                    );
+                    Ok(serde_json::from_slice(&body)?)
+                })
+                .transpose()?;
             let evidence = serde_json::json!({"schema_version":"marketcow.cold-market-evidence.v1",
                 "market_id":market,"retired_after_cursor":after,
                 "catalog_record_sha256":hash,"books":books,"recoveries":recoveries,
@@ -919,8 +1605,10 @@ impl PreparedSourceWriter {
                 "lifecycle_sha256":lifecycle_sha256});
             let evidence_bytes = serde_json::to_vec(&evidence)?;
             let evidence_hash = hex::encode(Sha256::digest(&evidence_bytes));
-            tx.execute("INSERT OR IGNORE INTO cold_market_evidence VALUES (?,?,?,?)",
-                params![market, i64::try_from(after)?, evidence_bytes, evidence_hash])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO cold_market_evidence VALUES (?,?,?,?)",
+                params![market, i64::try_from(after)?, evidence_bytes, evidence_hash],
+            )?;
         }
         for token in &tokens {
             tx.execute("DELETE FROM books WHERE token_id=?", [token])?;
@@ -949,35 +1637,53 @@ impl PreparedSourceWriter {
 
     /// Read a retired market without re-admitting its token or wire demand.
     pub fn cold_market_record(&self, market_id: &str) -> Result<Option<Value>> {
-        let row: Option<(Vec<u8>, String)> = self.database.query_row(
-            "SELECT payload_json,payload_sha256 FROM cold_market_catalog \
+        let row: Option<(Vec<u8>, String)> = self
+            .database
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM cold_market_catalog \
                 WHERE market_id=? ORDER BY retired_after DESC,rowid DESC LIMIT 1",
-            [market_id], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
+                [market_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         row.map(|(bytes, expected)| {
-            ensure!(hex::encode(Sha256::digest(&bytes)) == expected,
-                "cold market catalog hash mismatch");
+            ensure!(
+                hex::encode(Sha256::digest(&bytes)) == expected,
+                "cold market catalog hash mismatch"
+            );
             let record: Value = serde_json::from_slice(&bytes)?;
-            ensure!(record["identity"]["market_id"] == market_id,
-                "cold market catalog identity mismatch");
+            ensure!(
+                record["identity"]["market_id"] == market_id,
+                "cold market catalog identity mismatch"
+            );
             Ok(record)
-        }).transpose()
+        })
+        .transpose()
     }
 
     pub fn cold_market_evidence(&self, market_id: &str) -> Result<Option<Value>> {
-        let row: Option<(Vec<u8>, String)> = self.database.query_row(
-            "SELECT payload_json,payload_sha256 FROM cold_market_evidence \
+        let row: Option<(Vec<u8>, String)> = self
+            .database
+            .query_row(
+                "SELECT payload_json,payload_sha256 FROM cold_market_evidence \
                 WHERE market_id=? ORDER BY retired_after DESC LIMIT 1",
-            [market_id], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
+                [market_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         row.map(|(bytes, expected)| {
-            ensure!(hex::encode(Sha256::digest(&bytes)) == expected,
-                "cold market evidence hash mismatch");
+            ensure!(
+                hex::encode(Sha256::digest(&bytes)) == expected,
+                "cold market evidence hash mismatch"
+            );
             let evidence: Value = serde_json::from_slice(&bytes)?;
-            ensure!(evidence["market_id"] == market_id,
-                "cold market evidence identity mismatch");
+            ensure!(
+                evidence["market_id"] == market_id,
+                "cold market evidence identity mismatch"
+            );
             Ok(evidence)
-        }).transpose()
+        })
+        .transpose()
     }
 
     /// Commit only whole binary markets. Missing token snapshots never become a
@@ -1003,7 +1709,7 @@ impl PreparedSourceWriter {
             &self.token_markets,
             self.maximum_batch_bytes,
         )?;
-        self.commit_encoded(events, &lines, terminal, cursor, &BTreeMap::new())
+        self.commit_encoded(events, &lines, terminal, cursor, &BTreeMap::new(), &[])
     }
 
     /// Coalesce already validated, contiguous batches on the disk worker only.
@@ -1024,6 +1730,12 @@ impl PreparedSourceWriter {
         &mut self,
         batches: &[(&ValidatedSourceBatch, &BTreeMap<u64, Value>)],
     ) -> Result<()> {
+        if batches.iter().any(|(batch, _)| batch.market_groups.iter().any(|group| group.native_cursor)) {
+            ensure!(batches.len() == 1 && batches[0].0.market_groups.len() == 1
+                && batches[0].0.market_groups[0].native_cursor,
+                "native market group requires one fair writer item");
+            return self.append_native_market_group_with_books(batches[0].0, batches[0].1);
+        }
         let first = batches.first().context("empty persistence group")?;
         let mut after = first.0.after;
         let mut bytes = 0usize;
@@ -1053,6 +1765,8 @@ impl PreparedSourceWriter {
             }
         }
         let merged = ValidatedSourceBatch {
+            events_retained_bytes: batches.iter().map(|(batch, _)| batch.events_retained_bytes).sum(),
+            cursor_encodings: Vec::new(),
             events: batches
                 .iter()
                 .flat_map(|(b, _)| b.events.iter().cloned())
@@ -1063,6 +1777,10 @@ impl PreparedSourceWriter {
                 .collect(),
             terminal: first.0.terminal,
             after: first.0.after,
+            market_groups: batches
+                .iter()
+                .flat_map(|(batch, _)| batch.market_groups.iter().cloned())
+                .collect(),
         };
         self.append_validated_with_books(&merged, &materialized_books)
     }
@@ -1071,15 +1789,56 @@ impl PreparedSourceWriter {
         self.append_validated_with_books(batch, &BTreeMap::new())
     }
 
+    /// Append one already validated market-local group. Its public event
+    /// cursor and event_id are immutable; only the archive index receives the
+    /// next physical positions. Fair scheduling may therefore write another
+    /// market first without rebasing either market's published facts.
+    pub fn append_native_market_group_with_books(
+        &mut self,
+        batch: &ValidatedSourceBatch,
+        materialized_books: &BTreeMap<u64, Value>,
+    ) -> Result<()> {
+        ensure!(!self.poisoned && batch.market_groups.len() == 1, "one native market group required");
+        ensure!(batch.encoded_bytes() <= self.maximum_batch_bytes, "writer byte cap");
+        let physical_after = self.cursor()?;
+        let first = physical_after.checked_add(1).context("archive cursor overflow")?;
+        let last = physical_after.checked_add(batch.events.len() as u64)
+            .context("archive cursor overflow")?;
+        let mut proof = batch.market_groups[0].clone();
+        ensure!(batch.after.checked_add(1) == Some(proof.first_global_cursor)
+            && proof.native_cursor,
+            "native group public boundary differs");
+        let previous: Option<i64> = self.database.query_row(
+            "SELECT last_event_cursor FROM market_native_streams WHERE market_id=? AND stream_epoch=?",
+            params![proof.market_id, proof.stream_epoch], |row| row.get(0),
+        ).optional()?;
+        ensure!(previous.map(u64::try_from).transpose()?.unwrap_or(0) == batch.after,
+            "native market event cursor is not contiguous");
+        proof.first_global_cursor = first;
+        proof.last_global_cursor = last;
+        proof.native_cursor = true;
+        self.append_validated_with_books_at(batch, materialized_books, physical_after, &[proof])
+    }
+
     fn append_validated_with_books(
         &mut self,
         batch: &ValidatedSourceBatch,
         materialized_books: &BTreeMap<u64, Value>,
     ) -> Result<()> {
-        ensure!(
-            !self.poisoned && self.cursor()? == batch.after,
-            "validated batch boundary differs"
-        );
+        ensure!(batch.market_groups.iter().all(|group| !group.native_cursor),
+            "native market group requires archive-binding append");
+        ensure!(self.cursor()? == batch.after, "validated batch boundary differs");
+        self.append_validated_with_books_at(batch, materialized_books, batch.after, &batch.market_groups)
+    }
+
+    fn append_validated_with_books_at(
+        &mut self,
+        batch: &ValidatedSourceBatch,
+        materialized_books: &BTreeMap<u64, Value>,
+        physical_after: u64,
+        groups: &[MarketGroupProof],
+    ) -> Result<()> {
+        ensure!(!self.poisoned, "writer poisoned");
         ensure!(
             batch.encoded_bytes() <= self.maximum_batch_bytes,
             "writer byte cap"
@@ -1113,9 +1872,76 @@ impl PreparedSourceWriter {
             &batch.events,
             &batch.lines,
             batch.terminal,
-            batch.after,
+            physical_after,
             materialized_books,
+            groups,
         )
+    }
+
+    fn validate_market_group_proofs(
+        &self,
+        events: &[Value],
+        groups: &[MarketGroupProof],
+    ) -> Result<()> {
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let mut offset = 0usize;
+        let mut next_by_stream = BTreeMap::<(String, String), u64>::new();
+        for group in groups {
+            ensure!(
+                !group.market_id.is_empty()
+                    && !group.stream_epoch.is_empty()
+                    && group.market_cursor > 0
+                    && group.first_global_cursor > 0
+                    && group.first_event_cursor > 0
+                    && group.last_global_cursor >= group.first_global_cursor,
+                "invalid market group boundary"
+            );
+            let count = usize::try_from(group.last_global_cursor - group.first_global_cursor + 1)?;
+            let end = offset
+                .checked_add(count)
+                .context("market group length overflow")?;
+            let slice = events
+                .get(offset..end)
+                .context("market group exceeds batch")?;
+            ensure!(
+                slice.iter().enumerate().all(|(position, event)| {
+                    event["market_id"] == group.market_id
+                        && event["cursor"].as_u64()
+                            == group.first_event_cursor.checked_add(position as u64)
+                }),
+                "market group does not cover exact public events"
+            );
+            ensure!(group.native_cursor || group.first_event_cursor == group.first_global_cursor,
+                "physical group cursor domain differs");
+            ensure!(
+                market_group_hash(
+                    &group.market_id, &group.stream_epoch, group.market_cursor, slice
+                )? == group.group_sha256,
+                "market group commitment differs"
+            );
+            let key = (group.market_id.clone(), group.stream_epoch.clone());
+            let previous = match next_by_stream.get(&key) {
+                Some(cursor) => *cursor,
+                None => self.database.query_row(
+                    "SELECT durable_cursor FROM market_streams WHERE market_id=? AND stream_epoch=?",
+                    params![group.market_id, group.stream_epoch],
+                    |row| row.get::<_, i64>(0),
+                ).optional()?.map(u64::try_from).transpose()?.unwrap_or(0),
+            };
+            ensure!(
+                previous.checked_add(1) == Some(group.market_cursor),
+                "market durable cursor is not contiguous"
+            );
+            next_by_stream.insert(key, group.market_cursor);
+            offset = end;
+        }
+        ensure!(
+            offset == events.len(),
+            "market groups leave uncovered events"
+        );
+        Ok(())
     }
 
     fn commit_encoded(
@@ -1125,7 +1951,20 @@ impl PreparedSourceWriter {
         terminal: bool,
         cursor: u64,
         materialized_books: &BTreeMap<u64, Value>,
+        market_groups: &[MarketGroupProof],
     ) -> Result<()> {
+        self.validate_market_group_proofs(events, market_groups)?;
+        if !market_groups.is_empty() {
+            let mut next = cursor.checked_add(1).context("archive cursor overflow")?;
+            for group in market_groups {
+                ensure!(group.first_global_cursor == next,
+                    "market group archive position differs");
+                next = group.last_global_cursor.checked_add(1)
+                    .context("archive cursor overflow")?;
+            }
+            ensure!(next == cursor.checked_add(events.len() as u64 + 1)
+                .context("archive cursor overflow")?, "market groups do not cover archive batch");
+        }
         if !terminal {
             ensure!(
                 events.iter().all(|event| event["market_id"]
@@ -1185,7 +2024,7 @@ impl PreparedSourceWriter {
         let tx = self.database.transaction()?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS market_lifecycle(market_id TEXT PRIMARY KEY, cursor INTEGER NOT NULL, payload_json BLOB NOT NULL, payload_sha256 TEXT NOT NULL)")?;
         let mut values = metadata(&tx)?;
-        for (event, line) in events.iter().zip(lines) {
+        for (position, (event, line)) in events.iter().zip(lines).enumerate() {
             if self.history_limit.is_none() {
                 self.log
                     .as_mut()
@@ -1194,9 +2033,13 @@ impl PreparedSourceWriter {
             }
             let market = required(event, "market_id")?;
             let token = event["token_id"].as_str();
-            let event_cursor = event["cursor"]
+            let public_cursor = event["cursor"]
                 .as_u64()
                 .ok_or_else(|| anyhow::anyhow!("missing cursor"))?;
+            let event_cursor = cursor.checked_add(position as u64 + 1)
+                .context("archive cursor overflow")?;
+            ensure!(market_groups.iter().any(|group| group.native_cursor)
+                || public_cursor == event_cursor, "physical event cursor differs");
             if self.history_limit.is_some() {
                 tx.execute(
                     "INSERT INTO recent_events VALUES(?,?,?)",
@@ -1240,7 +2083,7 @@ impl PreparedSourceWriter {
             }
             let token = token.context("missing book token")?;
             let state = materialized_books
-                .get(&event_cursor)
+                .get(&public_cursor)
                 .unwrap_or(&event["canonical_payload"]);
             if event["canonical_payload"]["payload_semantics"].is_string() {
                 ensure!(
@@ -1265,6 +2108,50 @@ impl PreparedSourceWriter {
                 BookHealth::from_book(required(event, "market_id")?.to_owned(), state)?,
             );
             offset += line.len() as u64;
+        }
+        for group in market_groups {
+            tx.execute(
+                "INSERT INTO market_groups VALUES (?,?,?,?,?,?)",
+                params![
+                    group.market_id,
+                    group.stream_epoch,
+                    i64::try_from(group.market_cursor)?,
+                    i64::try_from(group.first_global_cursor)?,
+                    i64::try_from(group.last_global_cursor)?,
+                    group.group_sha256,
+                ],
+            )?;
+            if group.native_cursor {
+                tx.execute(
+                    "INSERT INTO market_native_groups VALUES (?,?,?,?)",
+                    params![
+                        group.market_id,
+                        group.stream_epoch,
+                        i64::try_from(group.market_cursor)?,
+                        i64::try_from(group.first_event_cursor)?,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO market_native_streams VALUES (?,?,?) \
+                     ON CONFLICT(market_id,stream_epoch) DO UPDATE SET last_event_cursor=excluded.last_event_cursor",
+                    params![
+                        group.market_id,
+                        group.stream_epoch,
+                        i64::try_from(group.first_event_cursor.checked_add(
+                            group.last_global_cursor - group.first_global_cursor
+                        ).context("native market cursor overflow")?)?,
+                    ],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO market_streams VALUES (?,?,?,0) \
+                 ON CONFLICT(market_id,stream_epoch) DO UPDATE SET durable_cursor=excluded.durable_cursor",
+                params![
+                    group.market_id,
+                    group.stream_epoch,
+                    i64::try_from(group.market_cursor)?,
+                ],
+            )?;
         }
         if self.history_limit.is_none() {
             self.log
@@ -1307,6 +2194,7 @@ impl PreparedSourceWriter {
             bytes = bytes
                 .checked_add(lines.iter().map(Vec::len).sum())
                 .context("history size overflow")?;
+            let mut pruned_through = None;
             while bytes > limit {
                 let (at, size): (i64, i64) = tx.query_row(
                     "SELECT cursor,length(payload) FROM recent_events ORDER BY cursor LIMIT 1",
@@ -1316,6 +2204,45 @@ impl PreparedSourceWriter {
                 tx.execute("DELETE FROM recent_events WHERE cursor=?", [at])?;
                 bytes -= usize::try_from(size)?;
                 values.insert("history_floor_cursor".into(), at.to_string());
+                pruned_through = Some(at);
+            }
+            if let Some(pruned_through) = pruned_through {
+                // A partially pruned atomic group is not replayable. Advance
+                // only that market's replay floor; its durable cursor remains
+                // available for restart/checkpoint reconciliation.
+                let expired = {
+                    let mut statement = tx.prepare(
+                        "SELECT market_id,stream_epoch,market_cursor FROM market_groups \
+                         WHERE first_global_cursor<=? ORDER BY first_global_cursor",
+                    )?;
+                    statement
+                        .query_map([pruned_through], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                for (market_id, stream_epoch, market_cursor) in expired {
+                    tx.execute(
+                        "UPDATE market_streams SET replay_floor=MAX(replay_floor,?) \
+                         WHERE market_id=? AND stream_epoch=?",
+                        params![market_cursor, market_id, stream_epoch],
+                    )?;
+                }
+                tx.execute(
+                    "DELETE FROM market_groups WHERE first_global_cursor<=?",
+                    [pruned_through],
+                )?;
+                tx.execute(
+                    "DELETE FROM market_native_groups WHERE NOT EXISTS (\
+                     SELECT 1 FROM market_groups g WHERE g.market_id=market_native_groups.market_id \
+                     AND g.stream_epoch=market_native_groups.stream_epoch \
+                     AND g.market_cursor=market_native_groups.market_cursor)",
+                    [],
+                )?;
             }
             values.insert("recent_event_bytes".into(), bytes.to_string());
         } else {
@@ -1531,6 +2458,503 @@ mod tests {
     }
 
     #[test]
+    fn actor_validated_rebase_matches_full_publisher_validation() {
+        let tokens = [("11".into(), "1".into()), ("12".into(), "1".into())].into();
+        let actor = ValidatedSourceBatch::new(
+            vec![event("11", 1), event("12", 2)], false, 0, &tokens, 65536,
+        ).unwrap();
+        assert_eq!(actor.cursor_encodings.len(), 2, "exercise prepared encoding, not fallback");
+        assert!(actor.cursor_encodings.iter().all(Option::is_some));
+        let rebound = actor.rebase_after(42, 65536).unwrap();
+        let direct = ValidatedSourceBatch::new(
+            vec![event("11", 43), event("12", 44)], false, 42, &tokens, 65536,
+        ).unwrap();
+        assert_eq!(rebound.events, direct.events);
+        assert_eq!(rebound.lines, direct.lines);
+        assert_eq!(rebound.after, 42);
+        let rebound_again = rebound.rebase_after(98, 65536).unwrap();
+        let direct_again = ValidatedSourceBatch::new(
+            vec![event("11", 99), event("12", 100)], false, 98, &tokens, 65536,
+        ).unwrap();
+        assert_eq!(rebound_again.events, direct_again.events);
+        assert_eq!(rebound_again.lines, direct_again.lines);
+        assert!(ValidatedSourceBatch::new(
+            vec![event("11", 1), event("12", 2)], false, 0, &tokens, 65536,
+        ).unwrap().rebase_after(u64::MAX, 65536).is_err());
+    }
+
+    #[test]
+    fn prepared_cursor_encoding_preserves_nested_json_and_respects_byte_budget() {
+        let tokens = [("11".into(), "1".into()), ("12".into(), "1".into())].into();
+        let mut original = event("11", 1);
+        original["aaa"] = json!({"cursor":999,"event_id":"nested-not-envelope",
+            "text":"引号\"逗号,括号{}[]反斜杠\\换行\n","values":[true,null,{"x":[1,2]}]});
+        original["cursor_extra"] = json!({"data":"x".repeat(8192)});
+        original.as_object_mut().unwrap().remove("event_id");
+        original["event_id"] = json!(canonical_hash(&original));
+        let mut expected = original.clone();
+        expected["cursor"] = json!(u64::MAX-1);
+        expected.as_object_mut().unwrap().remove("event_id");
+        expected["event_id"] = json!(canonical_hash(&expected));
+        let sibling = event("12", 2);
+        let proof = ValidatedSourceBatch::new(vec![original.clone(), sibling.clone()], false, 0, &tokens, 65536).unwrap();
+        assert_eq!(proof.cursor_encodings.len(), 2);
+        assert!(proof.cursor_encodings.iter().all(Option::is_some));
+        assert!(std::mem::size_of::<Option<CursorEncoding>>() + 64 <= 256,
+            "conservative cached-state/vector allocation metadata budget");
+        let rebound = proof.rebase_after(u64::MAX-2, 65536).unwrap();
+        let expected = ValidatedSourceBatch::new(vec![expected, event("12", u64::MAX)], false, u64::MAX-2, &tokens, 65536).unwrap();
+        assert_eq!(rebound.events, expected.events);
+        assert_eq!(rebound.lines, expected.lines);
+        let exact_limit = serde_json::to_vec(&original).unwrap().len()+serde_json::to_vec(&sibling).unwrap().len()+2;
+        let tight = ValidatedSourceBatch::new(vec![original, sibling], false, 0, &tokens, exact_limit).unwrap();
+        assert!(tight.cursor_encodings.is_empty(), "no cache beyond existing batch byte allowance");
+        assert_eq!(tight.rebase_after(u64::MAX-2, 65536).unwrap().lines, expected.lines);
+    }
+
+    #[test]
+    #[ignore = "manual same-process owner-only rebase characterization, not end-to-end acceptance"]
+    fn prepared_cursor_encoding_owner_characterization() {
+        use marketcow_polymarket::discovery_source::{snapshot_event, SnapshotBoundary};
+        let tokens = [("11".into(), "1".into()), ("12".into(), "1".into())].into();
+        let events = (0..2).map(|index| {
+            let token = if index % 2 == 0 { "11" } else { "12" };
+            let raw = json!({"asset_id":token,"market":"condition","tick_size":"0.0001",
+                "timestamp":"1700000000000","hash":"source",
+                "bids":(0..1000).map(|i|json!({"price":format!("0.{:04}",1000+i),"size":"10"})).collect::<Vec<_>>(),
+                "asks":(0..1000).map(|i|json!({"price":format!("0.{:04}",7000+i),"size":"10"})).collect::<Vec<_>>()});
+            snapshot_event(&raw, SnapshotBoundary {market_id:"1",condition_id:"condition",
+                token_id:token,recovery_id:"test",cursor:index+1,
+                received_at:chrono::DateTime::from_timestamp(1700000001,0).unwrap()}).unwrap()
+        }).collect::<Vec<_>>();
+        let mut fast = std::time::Duration::ZERO;
+        let mut original = std::time::Duration::ZERO;
+        let mut prepare = std::time::Duration::ZERO;
+        for _ in 0..10 {
+            let started = std::time::Instant::now();
+            let proof = ValidatedSourceBatch::new(events.clone(), false, 0, &tokens, 16*1024*1024).unwrap();
+            prepare += started.elapsed();
+            assert_eq!(proof.cursor_encodings.len(), events.len());
+            assert!(proof.cursor_encodings.iter().all(Option::is_some));
+            let started = std::time::Instant::now();
+            let rebound = proof.rebase_after(10000, 16*1024*1024).unwrap();
+            fast += started.elapsed();
+            let mut baseline = events.clone();
+            let started = std::time::Instant::now();
+            let mut lines = Vec::new();
+            for (index, event) in baseline.iter_mut().enumerate() {
+                event["cursor"] = json!(10001+index);
+                event.as_object_mut().unwrap().remove("event_id");
+                event["event_id"] = json!(canonical_hash(event));
+                let mut line = serde_json::to_vec(event).unwrap();
+                line.push(b'\n');
+                lines.push(line);
+            }
+            original += started.elapsed();
+            assert_eq!(rebound.events, baseline);
+            assert_eq!(rebound.lines, lines);
+        }
+        eprintln!("owner-only characterization: 10 x 2 events / 1000 bid + 1000 ask levels; original_us={} prepared_rebase_us={} actor_preparation_us={} (unoptimized, not U1 or total-pipeline throughput)",
+            original.as_micros(), fast.as_micros(), prepare.as_micros());
+    }
+
+    #[test]
+    fn actor_validated_rebase_preserves_recovery_snapshot_boundary() {
+        let tokens = [("11".into(), "1".into())].into();
+        let mut started = event("11", 1);
+        started["event_type"] = json!("recovery_started");
+        started["canonical_payload"] = json!({"recovery_scope":"token","token_id":"11",
+            "recovery_id":"attempt","reason":"source_data_delayed"});
+        started["gaps"] = json!([{"token_id":"11","code":"coverage_gap","resolved":false,
+            "detected_at":"2026-01-01T00:00:00Z"}]);
+        rehash(&mut started);
+        let mut snapshot = event("11", 2);
+        snapshot["raw_payload"]["event_type"] = json!("book");
+        rehash(&mut snapshot);
+        let mut completed = event("11", 3);
+        completed["event_type"] = json!("recovery_completed");
+        completed["canonical_payload"] = json!({"recovery_scope":"token","token_id":"11",
+            "recovery_id":"attempt","snapshot_cursor":2,"resolved_gap_token_ids":["11"]});
+        rehash(&mut completed);
+        let actor = ValidatedSourceBatch::new(
+            vec![started.clone(), snapshot.clone(), completed.clone()], false, 0, &tokens, 65536,
+        ).unwrap();
+        let rebound = actor.rebase_after(40, 65536).unwrap();
+        for (index, event) in [&mut started, &mut completed].into_iter().enumerate() {
+            event["cursor"] = json!(if index == 0 { 41 } else { 43 });
+            if index == 1 { event["canonical_payload"]["snapshot_cursor"] = json!(42); }
+            rehash(event);
+        }
+        let mut snapshot = snapshot;
+        snapshot["cursor"] = json!(42);
+        rehash(&mut snapshot);
+        let direct = ValidatedSourceBatch::new(
+            vec![started, snapshot, completed], false, 40, &tokens, 65536,
+        ).unwrap();
+        assert_eq!(rebound.events, direct.events);
+        assert_eq!(rebound.lines, direct.lines);
+    }
+
+    #[test]
+    fn retained_charge_includes_parsed_tree_and_survives_cursor_rebase() {
+        let tokens = [("11".into(), "1".into()), ("12".into(), "1".into())].into();
+        let proof = ValidatedSourceBatch::new(vec![event("11", 1), event("12", 2)], false, 0, &tokens, 65536).unwrap();
+        assert!(proof.retained_bytes() > proof.encoded_bytes() * 2);
+        let tree_charge = proof.events_retained_bytes;
+        let rebound = proof.rebase_after(1000, 65536).unwrap().with_market_group("epoch", 1).unwrap();
+        assert_eq!(rebound.events_retained_bytes, tree_charge);
+        assert!(rebound.retained_bytes() > rebound.encoded_bytes() * 2);
+        let mut spare = String::with_capacity(65536);
+        spare.push('x');
+        assert!(json_retained_bytes(&Value::String(spare)) >= 65536);
+    }
+
+    #[test]
+    fn market_group_index_commits_with_physical_events_and_reopens_independently() {
+        let temp = fixture();
+        let path = temp.path().join("indexes/latest-state.sqlite3");
+        {
+            let db = Connection::open(&path).unwrap();
+            for token in ["21", "22"] {
+                let book = event_in_market(token, "2", 1)["canonical_payload"].clone();
+                let bytes = serde_json::to_vec(&book).unwrap();
+                db.execute(
+                    "INSERT INTO books VALUES (?,?,0,?,?)",
+                    params![token, "2", bytes, canonical_hash(&book)],
+                )
+                .unwrap();
+            }
+        }
+        let tokens = [
+            ("11".into(), "1".into()),
+            ("12".into(), "1".into()),
+            ("21".into(), "2".into()),
+            ("22".into(), "2".into()),
+        ]
+        .into();
+        let make = |market: &str, first: u64, market_cursor: u64| {
+            let (up, down) = if market == "1" {
+                ("11", "12")
+            } else {
+                ("21", "22")
+            };
+            ValidatedSourceBatch::new(
+                vec![
+                    event_in_market(up, market, first),
+                    event_in_market(down, market, first + 1),
+                ],
+                false,
+                first - 1,
+                &tokens,
+                65536,
+            )
+            .unwrap()
+            .with_market_group("epoch-1", market_cursor)
+            .unwrap()
+        };
+        let a1 = make("1", 1, 1);
+        let b1 = make("2", 3, 1);
+        let a2 = make("1", 5, 2);
+        let mut writer = PreparedSourceWriter::open(temp.path(), 65536).unwrap();
+        writer.append_validated_group(&[&a1, &b1, &a2]).unwrap();
+        assert_eq!(writer.cursor().unwrap(), 6);
+        let invalid = make("2", 7, 3);
+        assert!(
+            writer
+                .append_validated(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("not contiguous")
+        );
+        assert_eq!(writer.cursor().unwrap(), 6);
+        let b2 = make("2", 7, 2);
+        writer.append_validated(&b2).unwrap();
+        drop(writer);
+        let first_page =
+            read_durable_market_page(temp.path(), "1", "epoch-1", 0, 1, 65536).unwrap();
+        assert_eq!((first_page.next_cursor, first_page.caught_up), (1, false));
+        assert_eq!(first_page.groups[0].events.len(), 2);
+        let second_page =
+            read_durable_market_page(temp.path(), "1", "epoch-1", 1, 1, 65536).unwrap();
+        assert_eq!((second_page.next_cursor, second_page.caught_up), (2, true));
+        assert_eq!(second_page.groups[0].events[0]["cursor"], 5);
+        let other_market =
+            read_durable_market_page(temp.path(), "2", "epoch-1", 0, 2, 65536).unwrap();
+        assert_eq!(other_market.groups.len(), 2);
+        assert!(read_durable_market_page(temp.path(), "2", "epoch-1", 0, 2, 1).is_err());
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute(
+                "UPDATE market_groups SET group_sha256='bad' WHERE market_id='1' AND market_cursor=1",
+                [],
+            ).unwrap();
+            assert!(read_durable_market_page(temp.path(), "1", "epoch-1", 0, 1, 65536).is_err());
+            db.execute(
+                "UPDATE market_groups SET group_sha256=? WHERE market_id='1' AND market_cursor=1",
+                [a1.market_groups[0].group_sha256.as_str()],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE metadata SET value='9' WHERE key='latest_cursor'",
+                [],
+            )
+            .unwrap();
+            assert!(read_durable_market_page(temp.path(), "1", "epoch-1", 0, 1, 65536).is_err());
+            db.execute(
+                "UPDATE metadata SET value='8' WHERE key='latest_cursor'",
+                [],
+            )
+            .unwrap();
+        }
+        let mut reopened = PreparedSourceWriter::open(temp.path(), 65536).unwrap();
+        assert_eq!(reopened.cursor().unwrap(), 8);
+        assert_eq!(
+            reopened.market_checkpoint("2", "epoch-1").unwrap(),
+            Some(DurableMarketCheckpoint {
+                market_id: "2".into(),
+                stream_epoch: "epoch-1".into(),
+                durable_cursor: 2,
+                replay_floor: 0,
+            })
+        );
+        assert!(
+            reopened
+                .market_checkpoint("2", "unknown-epoch")
+                .unwrap()
+                .is_none()
+        );
+        let db = Connection::open(&path).unwrap();
+        for (market, expected) in [("1", 2), ("2", 2)] {
+            let (durable, floor): (i64, i64) = db.query_row(
+                "SELECT durable_cursor,replay_floor FROM market_streams WHERE market_id=? AND stream_epoch='epoch-1'",
+                [market], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!((durable, floor), (expected, 0));
+        }
+        let rows: i64 = db
+            .query_row("SELECT COUNT(*) FROM market_groups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 4);
+        drop(db);
+        reopened.enable_bounded_history(65536).unwrap();
+        assert_eq!(
+            reopened
+                .market_checkpoint("2", "epoch-1")
+                .unwrap()
+                .unwrap()
+                .replay_floor,
+            2
+        );
+        assert!(read_durable_market_page(temp.path(), "2", "epoch-1", 0, 2, 65536).is_err());
+        assert!(
+            read_durable_market_page(temp.path(), "2", "epoch-1", 2, 2, 65536)
+                .unwrap()
+                .caught_up
+        );
+        let db = Connection::open(path).unwrap();
+        let rows: i64 = db
+            .query_row("SELECT COUNT(*) FROM market_groups", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        for market in ["1", "2"] {
+            let (durable, floor): (i64, i64) = db.query_row(
+                "SELECT durable_cursor,replay_floor FROM market_streams WHERE market_id=? AND stream_epoch='epoch-1'",
+                [market], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!((durable, floor), (2, 2));
+        }
+    }
+
+    #[test]
+    fn native_market_groups_keep_public_ids_when_archive_order_interleaves() {
+        let temp = fixture();
+        let db = Connection::open(temp.path().join("indexes/latest-state.sqlite3")).unwrap();
+        for token in ["21", "22"] {
+            let book = event_in_market(token, "2", 1)["canonical_payload"].clone();
+            let bytes = serde_json::to_vec(&book).unwrap();
+            db.execute("INSERT INTO books VALUES (?,?,0,?,?)",
+                params![token, "2", bytes, canonical_hash(&book)]).unwrap();
+        }
+        drop(db);
+        let tokens = [
+            ("11".into(), "1".into()), ("12".into(), "1".into()),
+            ("21".into(), "2".into()), ("22".into(), "2".into()),
+        ].into();
+        let make = |market: &str, first: u64, group: u64| {
+            let (up, down) = if market == "1" { ("11", "12") } else { ("21", "22") };
+            ValidatedSourceBatch::new_native(vec![
+                event_in_market(up, market, first),
+                event_in_market(down, market, first + 1),
+            ], false, first - 1, &tokens, 65536).unwrap()
+                .with_native_market_group("epoch-native", group).unwrap()
+        };
+        let a1 = make("1", 1, 1);
+        let b1 = make("2", 1, 1);
+        let a2 = make("1", 3, 2);
+        assert!(a1.cursor_encodings.is_empty(), "native validation must not prepare global rebasing");
+        let mut writer = PreparedSourceWriter::open(temp.path(), 65536).unwrap();
+        writer.append_validated_group_with_books(&[(&b1, &BTreeMap::new())]).unwrap();
+        assert!(writer.append_validated(&a1).is_err(),
+            "native public cursors cannot enter the physical append path");
+        writer.append_native_market_group_with_books(&a1, &BTreeMap::new()).unwrap();
+        let skipped = make("1", 5, 2);
+        assert!(writer.append_native_market_group_with_books(&skipped, &BTreeMap::new())
+            .unwrap_err().to_string().contains("not contiguous"));
+        assert_eq!(writer.cursor().unwrap(), 4);
+        writer.append_native_market_group_with_books(&a2, &BTreeMap::new()).unwrap();
+        assert_eq!(writer.cursor().unwrap(), 6);
+        assert_eq!(b1.events()[0]["cursor"], 1);
+        assert_eq!(a1.events()[0]["cursor"], 1);
+        assert_eq!(a1.events()[0]["event_id"], event_in_market("11", "1", 1)["event_id"]);
+        drop(writer);
+        for (market, expected) in [("1", vec![&a1, &a2]), ("2", vec![&b1])] {
+            let page = read_durable_market_page(temp.path(), market, "epoch-native", 0, 4, 65536).unwrap();
+            assert_eq!(page.groups.len(), expected.len());
+            assert!(page.caught_up);
+            for (group, batch) in page.groups.iter().zip(expected) {
+                assert_eq!(group.events, batch.events());
+                assert_eq!(group.group_sha256, batch.market_groups[0].group_sha256);
+            }
+        }
+        let db = Connection::open(temp.path().join("indexes/latest-state.sqlite3")).unwrap();
+        db.execute("UPDATE market_native_groups SET first_event_cursor=99 \
+            WHERE market_id='1' AND market_cursor=1", []).unwrap();
+        assert!(read_durable_market_page(temp.path(), "1", "epoch-native", 0, 4, 65536).is_err());
+        db.execute("UPDATE market_native_groups SET first_event_cursor=1 \
+            WHERE market_id='1' AND market_cursor=1", []).unwrap();
+        drop(db);
+        let mut reopened = PreparedSourceWriter::open(temp.path(), 65536).unwrap();
+        assert_eq!(reopened.cursor().unwrap(), 6);
+        reopened.enable_bounded_history(65536).unwrap();
+        assert_eq!(reopened.market_checkpoint("1", "epoch-native").unwrap().unwrap().replay_floor, 2);
+        let remaining: i64 = reopened.database.query_row(
+            "SELECT COUNT(*) FROM market_native_groups", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(remaining, 0, "migration must retire native replay index with physical groups");
+        let a3 = make("1", 5, 3);
+        reopened.append_native_market_group_with_books(&a3, &BTreeMap::new()).unwrap();
+        drop(reopened);
+        let page = read_durable_market_page(temp.path(), "1", "epoch-native", 2, 4, 65536).unwrap();
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(page.groups[0].events, a3.events());
+        assert!(read_durable_market_page(temp.path(), "1", "epoch-native", 0, 4, 65536).is_err(),
+            "expired native replay must not invent a missing prefix");
+    }
+
+    #[test]
+    fn process_restart_opens_a_new_market_epoch_without_rewriting_old_archive() {
+        let temp = fixture();
+        let tokens = [("11".into(), "1".into()), ("12".into(), "1".into())].into();
+        let group = |after: u64, epoch: &str| ValidatedSourceBatch::new(
+            vec![event("11", after + 1), event("12", after + 2)],
+            false, after, &tokens, 65536,
+        ).unwrap().with_market_group(epoch, 1).unwrap();
+        {
+            let mut writer = PreparedSourceWriter::open(temp.path(), 65536).unwrap();
+            writer.append_validated(&group(0, "process-a")).unwrap();
+        }
+        {
+            let mut writer = PreparedSourceWriter::open(temp.path(), 65536).unwrap();
+            assert_eq!(writer.cursor().unwrap(), 2);
+            writer.append_validated(&group(2, "process-b")).unwrap();
+            assert_eq!(writer.market_checkpoint("1", "process-a").unwrap().unwrap().durable_cursor, 1);
+            assert_eq!(writer.market_checkpoint("1", "process-b").unwrap().unwrap().durable_cursor, 1);
+        }
+        let old = read_durable_market_page(temp.path(), "1", "process-a", 0, 1, 65536).unwrap();
+        let new = read_durable_market_page(temp.path(), "1", "process-b", 0, 1, 65536).unwrap();
+        assert_eq!(old.groups[0].events[0]["cursor"], 1);
+        assert_eq!(new.groups[0].events[0]["cursor"], 3);
+        assert_ne!(old.groups[0].group_sha256, new.groups[0].group_sha256);
+    }
+
+    #[test]
+    fn bounded_history_expires_only_pruned_market_groups() {
+        let temp = fixture();
+        let tokens = [("11".into(), "1".into()), ("12".into(), "1".into())].into();
+        let make = |market_cursor: u64| {
+            let first = market_cursor * 2 - 1;
+            ValidatedSourceBatch::new(
+                vec![event("11", first), event("12", first + 1)],
+                false,
+                first - 1,
+                &tokens,
+                16384,
+            )
+            .unwrap()
+            .with_market_group("epoch-1", market_cursor)
+            .unwrap()
+        };
+        let mut writer = PreparedSourceWriter::open(temp.path(), 16384).unwrap();
+        writer.append_validated(&make(1)).unwrap();
+        writer.enable_bounded_history(16384).unwrap();
+        for market_cursor in 2..=24 {
+            writer.append_validated(&make(market_cursor)).unwrap();
+        }
+        drop(writer);
+        let reopened = PreparedSourceWriter::open(temp.path(), 16384).unwrap();
+        assert_eq!(reopened.cursor().unwrap(), 48);
+        let db = Connection::open(temp.path().join("indexes/latest-state.sqlite3")).unwrap();
+        let (durable, floor): (i64, i64) = db.query_row(
+            "SELECT durable_cursor,replay_floor FROM market_streams WHERE market_id='1' AND stream_epoch='epoch-1'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(durable, 24);
+        assert!(floor > 1 && floor < durable);
+        let earliest: i64 = db
+            .query_row(
+                "SELECT MIN(market_cursor) FROM market_groups WHERE market_id='1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(earliest, floor + 1);
+        let history_floor: i64 = db
+            .query_row(
+                "SELECT value FROM metadata WHERE key='history_floor_cursor'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+        let dangling: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM market_groups WHERE first_global_cursor<=?",
+                [history_floor],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0);
+        let first = read_durable_market_page(
+            temp.path(),
+            "1",
+            "epoch-1",
+            u64::try_from(floor).unwrap(),
+            1,
+            16384,
+        )
+        .unwrap();
+        assert_eq!(first.next_cursor, u64::try_from(floor + 1).unwrap());
+        assert_eq!(first.groups[0].events.len(), 2);
+        assert!(read_durable_market_page(temp.path(), "1", "epoch-1", 0, 1, 16384).is_err());
+        let tampered_cursor = i64::try_from(first.groups[0].events[0]["cursor"].as_u64().unwrap()).unwrap();
+        let mut tampered = first.groups[0].events[0].clone();
+        tampered["uncommitted_extra"] = json!(true);
+        let payload = serde_json::to_vec(&tampered).unwrap();
+        let sha = hex::encode(Sha256::digest(&payload));
+        db.execute(
+            "UPDATE recent_events SET payload=?,sha256=? WHERE cursor=?",
+            params![payload, sha, tampered_cursor],
+        ).unwrap();
+        assert!(
+            read_durable_market_page(temp.path(), "1", "epoch-1", u64::try_from(floor).unwrap(), 1, 16384)
+                .unwrap_err()
+                .to_string()
+                .contains("event identity hash differs")
+        );
+    }
+
+    #[test]
     fn token_recovery_persists_reopens_and_requires_its_snapshot() {
         let temp = fixture();
         let tokens = [("11".into(), "1".into()), ("12".into(), "1".into())].into();
@@ -1666,13 +3090,13 @@ mod tests {
         event["event_id"] = json!(canonical_hash(event));
     }
 
-    fn event(token: &str, cursor: u64) -> Value {
+    fn event_in_market(token: &str, market_id: &str, cursor: u64) -> Value {
         snapshot_event(
             &json!({"asset_id":token,"market":"condition","tick_size":"0.01",
             "timestamp":"1700000000000","hash":"source-hash",
             "bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}),
             SnapshotBoundary {
-                market_id: "1",
+                market_id,
                 condition_id: "condition",
                 token_id: token,
                 recovery_id: "recovery-test",
@@ -1681,6 +3105,9 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    fn event(token: &str, cursor: u64) -> Value {
+        event_in_market(token, "1", cursor)
     }
     fn fixture() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -1887,6 +3314,7 @@ mod tests {
                 .append_market_batch(&[event("11", 3), event("12", 4)])
                 .is_err()
         );
+        assert!(writer.market_checkpoint("1", "epoch-1").is_err());
         assert_eq!(writer.cursor().unwrap(), 2);
         assert_eq!(
             writer
@@ -2143,12 +3571,20 @@ mod tests {
         let terminal = json!({"identity":{"market_id":"1"},"lifecycle_state":"resolved"});
         let terminal_bytes = serde_json::to_vec(&terminal).unwrap();
         let terminal_hash = hex::encode(Sha256::digest(&terminal_bytes));
-        writer.database.execute("INSERT INTO market_lifecycle VALUES (?,?,?,?)",
-            params!["1", 2_i64, terminal_bytes, terminal_hash.clone()]).unwrap();
+        writer
+            .database
+            .execute(
+                "INSERT INTO market_lifecycle VALUES (?,?,?,?)",
+                params!["1", 2_i64, terminal_bytes, terminal_hash.clone()],
+            )
+            .unwrap();
         let markets = BTreeSet::from(["1".into()]);
-        let cold = BTreeMap::from([("1".into(), json!({"identity":{
+        let cold = BTreeMap::from([(
+            "1".into(),
+            json!({"identity":{
             "market_id":"1","condition_id":"condition","outcomes":[
-                {"token_id":"11"},{"token_id":"12"}]}}))]);
+                {"token_id":"11"},{"token_id":"12"}]}}),
+        )]);
         assert!(writer.retire_catalog_markets(1, &markets, &cold).is_err());
         assert_eq!(
             before,
@@ -2160,14 +3596,25 @@ mod tests {
                 .unwrap()
         );
         writer.retire_catalog_markets(2, &markets, &cold).unwrap();
-        assert_eq!(writer.cold_market_record("1").unwrap(), Some(cold["1"].clone()));
+        assert_eq!(
+            writer.cold_market_record("1").unwrap(),
+            Some(cold["1"].clone())
+        );
         let archived = writer.cold_market_evidence("1").unwrap().unwrap();
-        assert_eq!(archived["retired_after_cursor"],2);
-        assert_eq!(archived["books"].as_object().unwrap().len(),2);
-        assert_eq!(archived["lifecycle"],terminal);
-        assert_eq!(writer.database.query_row(
-            "SELECT payload_sha256 FROM market_lifecycle WHERE market_id='1'", [],
-            |row| row.get::<_, String>(0)).unwrap(), terminal_hash);
+        assert_eq!(archived["retired_after_cursor"], 2);
+        assert_eq!(archived["books"].as_object().unwrap().len(), 2);
+        assert_eq!(archived["lifecycle"], terminal);
+        assert_eq!(
+            writer
+                .database
+                .query_row(
+                    "SELECT payload_sha256 FROM market_lifecycle WHERE market_id='1'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            terminal_hash
+        );
         assert_eq!(writer.cursor().unwrap(), 2);
         assert_eq!(
             writer
@@ -2189,19 +3636,41 @@ mod tests {
         drop(writer);
         let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
         assert_eq!(writer.cursor().unwrap(), 2);
-        assert_eq!(writer.cold_market_record("1").unwrap(), Some(cold["1"].clone()));
-        assert_eq!(writer.cold_market_evidence("1").unwrap().unwrap()["books"]
-            .as_object().unwrap().len(),2);
-        assert!(writer.terminal_markets.is_empty(),
-            "cold lifecycle history must not recreate hot terminal cache");
-        writer.retire_catalog_markets(2,&markets,&cold).unwrap();
-        assert_eq!(writer.cold_market_evidence("1").unwrap().unwrap()["books"]
-            .as_object().unwrap().len(),2,
-            "idempotent crash replay must preserve the original archived books");
-        writer.database.execute("UPDATE cold_market_catalog SET payload_sha256='bad' WHERE market_id='1'", [])
+        assert_eq!(
+            writer.cold_market_record("1").unwrap(),
+            Some(cold["1"].clone())
+        );
+        assert_eq!(
+            writer.cold_market_evidence("1").unwrap().unwrap()["books"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            writer.terminal_markets.is_empty(),
+            "cold lifecycle history must not recreate hot terminal cache"
+        );
+        writer.retire_catalog_markets(2, &markets, &cold).unwrap();
+        assert_eq!(
+            writer.cold_market_evidence("1").unwrap().unwrap()["books"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2,
+            "idempotent crash replay must preserve the original archived books"
+        );
+        writer
+            .database
+            .execute(
+                "UPDATE cold_market_catalog SET payload_sha256='bad' WHERE market_id='1'",
+                [],
+            )
             .unwrap();
-        assert!(writer.cold_market_record("1").is_err(),
-            "cold evidence must fail closed if its stored hash is corrupt");
+        assert!(
+            writer.cold_market_record("1").is_err(),
+            "cold evidence must fail closed if its stored hash is corrupt"
+        );
         writer
             .bind_catalog_tokens(BTreeMap::from([
                 ("11".into(), "1".into()),
@@ -2212,10 +3681,50 @@ mod tests {
             .append_market_batch(&[event("11", 3), event("12", 4)])
             .unwrap();
         assert_eq!(writer.cursor().unwrap(), 4);
-        writer.database.execute("UPDATE cold_market_evidence SET payload_sha256='bad' WHERE market_id='1'", [])
+        writer
+            .database
+            .execute(
+                "UPDATE cold_market_evidence SET payload_sha256='bad' WHERE market_id='1'",
+                [],
+            )
             .unwrap();
-        assert!(writer.cold_market_evidence("1").is_err(),
-            "archived evidence corruption must fail closed");
+        assert!(
+            writer.cold_market_evidence("1").is_err(),
+            "archived evidence corruption must fail closed"
+        );
+    }
+
+    #[test]
+    fn failed_cold_archive_rolls_back_and_replays_one_retirement_after_reopen() {
+        let root = fixture();
+        let cold = BTreeMap::from([("1".to_owned(), json!({"identity":{
+            "market_id":"1","condition_id":"condition","outcomes":[
+                {"token_id":"11"},{"token_id":"12"}]}}))]);
+        let markets = BTreeSet::from(["1".to_owned()]);
+        let mut writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        writer.database.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS cold_market_evidence(
+                market_id TEXT NOT NULL,retired_after INTEGER NOT NULL,
+                payload_json BLOB NOT NULL,payload_sha256 TEXT NOT NULL,
+                PRIMARY KEY(market_id,retired_after));
+            CREATE TRIGGER fail_cold_archive BEFORE INSERT ON cold_market_evidence
+            BEGIN SELECT RAISE(ABORT,'injected cold archive failure'); END;
+        "#).unwrap();
+        assert!(writer.retire_catalog_markets(0, &markets, &cold).is_err());
+        assert_eq!(writer.database.query_row("SELECT count(*) FROM cold_market_evidence", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(writer.database.query_row("SELECT count(*) FROM books", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 2);
+        writer.database.execute_batch("DROP TRIGGER fail_cold_archive").unwrap();
+        drop(writer);
+        let mut reopened = PreparedSourceWriter::open(root.path(), 16384).unwrap();
+        reopened.retire_catalog_markets(0, &markets, &cold).unwrap();
+        let first = reopened.cold_market_evidence("1").unwrap().unwrap();
+        assert_eq!(first["books"].as_object().unwrap().len(), 2);
+        reopened.retire_catalog_markets(0, &markets, &cold).unwrap();
+        assert_eq!(reopened.cold_market_evidence("1").unwrap().unwrap(), first);
+        assert_eq!(reopened.database.query_row("SELECT count(*) FROM cold_market_evidence", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 1);
     }
 
     #[test]
@@ -2225,31 +3734,51 @@ mod tests {
         let initial = BTreeSet::from(["1".to_owned()]);
         let initial_record = serde_json::json!({"identity":{"market_id":"1",
             "condition_id":"c1","outcomes":[{"token_id":"11"},{"token_id":"12"}]}});
-        writer.retire_catalog_markets(0, &initial,
-            &BTreeMap::from([("1".to_owned(),initial_record)])).unwrap();
+        writer
+            .retire_catalog_markets(
+                0,
+                &initial,
+                &BTreeMap::from([("1".to_owned(), initial_record)]),
+            )
+            .unwrap();
         for n in 2..=10_001 {
             let id = n.to_string();
             let up = format!("{id}-up");
             let down = format!("{id}-down");
-            writer.bind_catalog_tokens(BTreeMap::from([
-                (up.clone(),id.clone()),(down.clone(),id.clone()),
-            ])).unwrap();
-            assert_eq!(writer.token_markets.len(),2);
+            writer
+                .bind_catalog_tokens(BTreeMap::from([
+                    (up.clone(), id.clone()),
+                    (down.clone(), id.clone()),
+                ]))
+                .unwrap();
+            assert_eq!(writer.token_markets.len(), 2);
             let record = serde_json::json!({"identity":{"market_id":id,
                 "condition_id":format!("c{n}"),"outcomes":[
                     {"token_id":up},{"token_id":down}]}});
-            writer.retire_catalog_markets(0,&BTreeSet::from([id.clone()]),
-                &BTreeMap::from([(id.clone(),record)])).unwrap();
+            writer
+                .retire_catalog_markets(
+                    0,
+                    &BTreeSet::from([id.clone()]),
+                    &BTreeMap::from([(id.clone(), record)]),
+                )
+                .unwrap();
             assert!(writer.token_markets.is_empty());
             assert!(writer.health.is_empty());
             assert!(writer.recoveries.is_empty());
         }
-        assert_eq!(writer.database.query_row(
-            "SELECT count(*) FROM cold_market_evidence",[],|row| row.get::<_,i64>(0))
-            .unwrap(),10_001);
+        assert_eq!(
+            writer
+                .database
+                .query_row("SELECT count(*) FROM cold_market_evidence", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            10_001
+        );
         assert!(writer.cold_market_evidence("10001").unwrap().is_some());
         drop(writer);
-        let writer = PreparedSourceWriter::open(root.path(),16384).unwrap();
+        let writer = PreparedSourceWriter::open(root.path(), 16384).unwrap();
         assert!(writer.token_markets.is_empty());
         assert!(writer.cold_market_record("2").unwrap().is_some());
     }

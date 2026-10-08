@@ -10,7 +10,7 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header::SEC_WEBSOCKET_PROTOCOL},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -28,12 +28,15 @@ use tokio::{
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message as UpstreamMessage};
 
+use crate::{btc_chainlink, btc_trade};
+
 const REST_URL: &str = "https://data-api.binance.vision/api/v3/klines";
 const STEP_MS: i64 = 60_000;
 const BAR_COUNT: usize = 60;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REPAIR_BARS: usize = 1_000;
+const MAX_BINANCE_PRICE_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 struct FeedSpec {
@@ -71,6 +74,7 @@ pub struct Config {
     pub response_bytes: usize,
     pub clients: usize,
     pub send_timeout: Duration,
+    pub chainlink_credentials: Option<PathBuf>,
 }
 
 impl Config {
@@ -103,6 +107,9 @@ impl Config {
 pub struct Service {
     minute: Arc<Shared>,
     second: Arc<Shared>,
+    chainlink: btc_chainlink::Service,
+    trade: btc_trade::Service,
+    price_clients: Arc<Semaphore>,
 }
 
 struct Shared {
@@ -180,6 +187,10 @@ impl Runtime {
 }
 
 impl Service {
+    pub fn trade_source(&self) -> btc_trade::Service {
+        self.trade.clone()
+    }
+
     pub async fn start(config: Config) -> Result<Self> {
         config.validate()?;
         tokio::fs::create_dir_all(&config.root).await?;
@@ -187,13 +198,17 @@ impl Service {
         let epoch = uuid::Uuid::new_v4().simple().to_string();
         let minute = start_feed(config.clone(), MINUTE, epoch.clone()).await?;
         let second = start_feed(config, SECOND, epoch).await?;
-        Ok(Self { minute, second })
+        let chainlink = btc_chainlink::Service::start(
+            minute.config.root.clone(), minute.config.chainlink_credentials.clone());
+        let trade = btc_trade::Service::start(minute.config.root.clone());
+        let price_clients = Arc::new(Semaphore::new(minute.config.clients));
+        Ok(Self { minute, second, chainlink, trade, price_clients })
     }
 
     pub fn router(&self) -> Router {
         let status_routes = Router::new()
             .route("/v1/btc-research/status", get(status))
-            .with_state(Arc::new((self.minute.clone(), self.second.clone())));
+            .with_state(Arc::new((self.minute.clone(), self.second.clone(), self.trade.clone())));
         let minute_routes = Router::new()
             .route("/v1/btc-research/bootstrap", get(bootstrap))
             .route("/v1/btc-research/finalized-1m-window", get(window))
@@ -204,7 +219,15 @@ impl Service {
             .route("/v1/btc-research/finalized-1s-window", get(window))
             .route("/v1/btc-research/finalized-1s-facts", get(facts))
             .with_state(self.second.clone());
+        let price_routes = Router::new()
+            .route("/v1/btc-research/price-window", get(price_window))
+            .with_state(Arc::new(self.chainlink.clone()));
+        let price_stream_routes = Router::new()
+            .route("/v1/btc-research/price-stream", get(price_stream))
+            .with_state(Arc::new((self.second.clone(), self.chainlink.clone(),
+                self.trade.clone(), self.price_clients.clone())));
         status_routes.merge(minute_routes).merge(second_routes)
+            .merge(price_routes).merge(price_stream_routes)
     }
 }
 
@@ -301,6 +324,7 @@ async fn publish(
         state.failure = Some("persistence_capacity".into());
         state.phase = "failed";
         state.reason = "persistence_capacity".into();
+        drop(state);
         bail!("BTC persistence capacity")
     }
     Ok(sequence)
@@ -338,6 +362,7 @@ async fn writer_task(shared: Arc<Shared>, mut receiver: mpsc::Receiver<Persist>,
         state.failure = Some(format!("persistence_failed:{error:#}"));
         state.phase = "failed";
         state.reason = "persistence_failed".into();
+        drop(state);
     }
 }
 
@@ -375,14 +400,14 @@ async fn acquisition_task(shared: Arc<Shared>) {
                         state.reason = "live_reconnecting".into();
                     }
                     if state.failure.is_some() {
-                        eprintln!(
+                        marketcow_polymarket::async_eprintln!(
                             "{}",
                             json!({"stage":"btc_research_terminal_failure","interval":shared.spec.interval,"at":Utc::now(),"error":format!("{error:#}")})
                         );
                         return;
                     }
                 }
-                eprintln!(
+                marketcow_polymarket::async_eprintln!(
                     "{}",
                     json!({"stage":"btc_research_reconnect","interval":shared.spec.interval,"at":Utc::now(),"error":format!("{error:#}"),"delay_seconds":delay})
                 );
@@ -758,6 +783,10 @@ async fn observe_live_at(shared: &Arc<Shared>, raw: &[u8], received: String) -> 
         raw.len() <= shared.config.response_bytes,
         "WS message too large"
     );
+    if shared.spec.interval == "1s" {
+        ensure!(raw.len() <= MAX_BINANCE_PRICE_FRAME_BYTES,
+            "BTC price source frame too large");
+    }
     let value: Value = serde_json::from_slice(raw)?;
     if value["e"] != "kline" || value["k"]["i"] != shared.spec.interval || value["k"]["x"] != true {
         return Ok(());
@@ -851,7 +880,8 @@ async fn observe_live_at(shared: &Arc<Shared>, raw: &[u8], received: String) -> 
     let join = json!({"schema_version":"marketcow.binance-bootstrap-join.v1","event_type":format!("{}_bootstrap_live_join",shared.spec.fact_prefix),
         "source":"binance_global_spot_websocket","instrument_id":"BTCUSDT.BINANCE","relation":relation,
         "open_time_ms":bar["open_time_ms"],"bar":bar,"first_received_at":received,"available_at":received,
-        "source_raw_sha256":raw_sha,"bootstrap_raw_sha256":bootstrap_sha,"ready":true,"reason":"live_finalized_join_validated"});
+        "source_raw_sha256":raw_sha,"raw_frame_base64":base64::engine::general_purpose::STANDARD.encode(raw),
+        "bootstrap_raw_sha256":bootstrap_sha,"ready":true,"reason":"live_finalized_join_validated"});
     let sequence = publish(shared, join, Some((bars, digest))).await?;
     if first_join {
         shared.state.write().await.readiness_sequence = Some(sequence);
@@ -1028,15 +1058,19 @@ fn bootstrap_json_for_expected(state: &Runtime, spec: FeedSpec, expected: i64) -
         "failure":state.failure,"decision_boundary":"current_and_future_after_received_at_only"})
 }
 
-async fn status(State(feeds): State<Arc<(Arc<Shared>, Arc<Shared>)>>) -> Json<Value> {
+async fn status(State(feeds): State<Arc<(Arc<Shared>, Arc<Shared>, btc_trade::Service)>>) -> Json<Value> {
     let s = feeds.0.state.read().await;
     let second = feeds.1.state.read().await;
-    Json(status_json_for_expected(
+    let mut status = status_json_for_expected(
         &s,
         &second,
         expected_last_open_for(MINUTE.step_ms),
         expected_last_open_for(SECOND.step_ms),
-    ))
+    );
+    drop(second);
+    drop(s);
+    status["btc_trade"] = feeds.2.status().await;
+    Json(status)
 }
 fn status_json_for_expected(
     minute: &Runtime,
@@ -1064,6 +1098,144 @@ async fn window(State(shared): State<Arc<Shared>>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             "durable_finalized_window_unavailable_or_stale",
         ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriceWindowQuery {
+    source: String,
+}
+
+const PRICE_STREAM_SCHEMA: &str = "marketcow.btc-price-stream.v2";
+const PRICE_STREAM_PROTOCOL: &str = "marketcow.btc-price.v2";
+
+async fn price_stream(
+    State(source): State<Arc<(Arc<Shared>, btc_chainlink::Service, btc_trade::Service, Arc<Semaphore>)>>,
+    Query(query): Query<PriceWindowQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let offered = headers.get(SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !offered.split(',').map(str::trim).any(|v| v == PRICE_STREAM_PROTOCOL) {
+        return error(StatusCode::BAD_REQUEST, "btc_price_subprotocol_required");
+    }
+    if !matches!(query.source.as_str(), "chainlink_twap_60s" | "binance_spot_trade") {
+        return error(StatusCode::BAD_REQUEST, "unsupported_price_source");
+    }
+    let Ok(permit) = source.3.clone().try_acquire_owned() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "btc_price_stream_capacity");
+    };
+    ws.protocols([PRICE_STREAM_PROTOCOL]).max_message_size(4096).max_frame_size(4096)
+        .on_upgrade(move |socket| price_stream_socket(source, query.source, socket, permit))
+}
+
+async fn price_stream_socket(
+    source: Arc<(Arc<Shared>, btc_chainlink::Service, btc_trade::Service, Arc<Semaphore>)>,
+    selected: String,
+    mut socket: WebSocket,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let chainlink = selected == "chainlink_twap_60s";
+    let mut chainlink_events = source.1.subscribe();
+    let mut trade_events = source.2.subscribe();
+    let initial = if chainlink {
+        source.1.stream_snapshot().await
+    } else {
+        source.2.stream_snapshot().await
+    };
+    let mut epoch = initial["source_epoch"].as_str().unwrap_or("").to_owned();
+    let mut sequence = initial["message_sequence"].as_u64().unwrap_or(0);
+    let mut serial = initial["stream_serial"].as_u64().unwrap_or(0);
+    let mut ready = initial["type"] == "snapshot";
+    if send_price_frame(&source.0, &mut socket, &initial).await.is_err() { return; }
+    let mut ping = tokio::time::interval(Duration::from_secs(15));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let event = tokio::select! {
+            value = chainlink_events.recv(), if chainlink => value,
+            value = trade_events.recv(), if !chainlink => value,
+            input = socket.recv() => match input {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => break,
+                _ => continue,
+            },
+            _ = ping.tick() => {
+                if !matches!(tokio::time::timeout(source.0.config.send_timeout,
+                    socket.send(Message::Ping(Vec::new().into()))).await, Ok(Ok(()))) {
+                    break;
+                }
+                continue;
+            },
+        };
+        let frame = match event {
+            Ok(value) => value,
+            Err(_) => {
+                let failure = json!({"schema_version":PRICE_STREAM_SCHEMA,
+                    "type":"stream_error","source":selected,
+                    "reason":"consumer_lagged_or_source_channel_closed",
+                    "observed_at":Utc::now().to_rfc3339()});
+                let _ = send_price_frame(&source.0, &mut socket, &failure).await;
+                break;
+            }
+        };
+        let next_epoch = frame["source_epoch"].as_str().unwrap_or("");
+        let next_sequence = frame["message_sequence"].as_u64().unwrap_or(0);
+        let next_serial = frame["stream_serial"].as_u64().unwrap_or(0);
+        // A subscription is installed before the owner snapshot. Frames
+        // already represented by that snapshot can span older source epochs.
+        if next_serial <= serial { continue; }
+        let next_type = frame["type"].as_str().unwrap_or("");
+        let reset = (next_epoch != epoch && matches!(next_type,
+            "unavailable" | "snapshot"))
+            || (!ready && next_epoch == epoch && next_type == "snapshot");
+        if next_serial != serial.saturating_add(1)
+            || (!reset && (next_epoch != epoch
+                || next_sequence != sequence.saturating_add(1))) {
+            let failure = json!({"schema_version":PRICE_STREAM_SCHEMA,
+                "type":"stream_error","source":selected,
+                "reason":"price_stream_sequence_gap",
+                "observed_at":Utc::now().to_rfc3339()});
+            let _ = send_price_frame(&source.0, &mut socket, &failure).await;
+            break;
+        }
+        if send_price_frame(&source.0, &mut socket, &frame).await.is_err() { break; }
+        epoch = next_epoch.to_owned();
+        sequence = next_sequence;
+        serial = next_serial;
+        ready = next_type == "snapshot" || (ready && matches!(next_type, "point" | "trade"));
+    }
+    let _ = socket.close().await;
+}
+
+async fn send_price_frame(shared: &Shared, socket: &mut WebSocket, frame: &Value) -> Result<()> {
+    let encoded = serde_json::to_vec(frame)?;
+    ensure!(encoded.len() <= shared.config.response_bytes,
+        "BTC price frame exceeds response budget");
+    tokio::time::timeout(shared.config.send_timeout,
+        socket.send(Message::Text(String::from_utf8(encoded)?.into())))
+        .await.context("BTC price stream send timeout")??;
+    Ok(())
+}
+
+async fn price_window(
+    State(chainlink): State<Arc<btc_chainlink::Service>>,
+    Query(query): Query<PriceWindowQuery>,
+) -> Response {
+    match query.source.as_str() {
+        "chainlink_twap_60s" => match chainlink.window().await {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => {
+                let source_status = chainlink.unavailable_status().await;
+                (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"detail":{
+                    "code":"selected_chainlink_source_unavailable",
+                    "message":"selected_chainlink_source_unavailable",
+                    "retryable":true,"source_status":source_status,
+                }}))).into_response()
+            }
+        },
+        _ => error(StatusCode::BAD_REQUEST, "unsupported_price_source"),
     }
 }
 fn window_json_for_expected(s: &Runtime, spec: FeedSpec, expected: i64) -> Option<Value> {
@@ -1192,6 +1364,7 @@ mod tests {
                     response_bytes: 65536,
                     clients: 1,
                     send_timeout: Duration::from_secs(1),
+                    chainlink_credentials: None,
                 },
                 spec,
             }),
@@ -1597,6 +1770,7 @@ mod tests {
             response_bytes: 1024 * 1024,
             clients: 1,
             send_timeout: Duration::from_secs(2),
+            chainlink_credentials: None,
         })
         .await
         .unwrap();
@@ -1631,6 +1805,7 @@ mod tests {
             response_bytes: 1024 * 1024,
             clients: 1,
             send_timeout: Duration::from_secs(2),
+            chainlink_credentials: None,
         };
         let epoch = Runtime::new();
         let path = config.root.join(format!("facts-{}.jsonl", epoch.epoch));

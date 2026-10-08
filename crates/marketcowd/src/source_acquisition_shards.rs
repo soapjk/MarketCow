@@ -1,14 +1,17 @@
-//! Collector-owned, bounded upstream connections. Retained shards are not
-//! restarted when new market pairs are installed. No detached socket tasks.
+//! Collector-owned, bounded upstream connections. Each market pair has its
+//! own socket/reconnect boundary; retained pairs are not restarted when a
+//! different market is installed. No detached socket tasks.
 use anyhow::{Context, Result, ensure};
+use futures_util::FutureExt;
 use serde_json::{Value, json};
 use marketcow_polymarket::{
-    PolymarketTransportConfig, TransportError, TransportOutput,
+    PolymarketTransportConfig, RawTransportBatch, TransportBudget, TransportError,
+    TransportReadyHandle,
     subscription::{SubscriptionUpdate, subscription_commands},
     supervise_polymarket_transport_managed,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -25,15 +28,18 @@ struct Shard {
     retirement_target: Option<BTreeSet<String>>,
 }
 
+enum ShardExit {
+    Finished(Result<(), TransportError>),
+    Panicked,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::source_acquisition_lease::Leases;
     use std::time::Instant;
-    fn output() -> TransportOutput {
-        marketcow_polymarket::transport_output(1, 65_536, 65_536)
-            .unwrap()
-            .0
+    fn output() -> TransportBudget {
+        marketcow_polymarket::transport_budget(1, 65_536, 65_536).unwrap()
     }
     #[tokio::test]
     async fn additions_preserve_owned_shards_and_capacity_rejects_before_mutation() {
@@ -62,7 +68,7 @@ mod tests {
         let mut pool =
             Shards::new(PolymarketTransportConfig::production(), output, 6, 3, 128).unwrap();
         let ids = pool
-            .add_isolated_pairs(&[
+            .add_pairs(&[
                 ["current-up".into(), "current-down".into()],
                 ["next-up".into(), "next-down".into()],
             ])
@@ -78,7 +84,7 @@ mod tests {
         );
         let before = pool.tokens();
         assert!(
-            pool.add_isolated_pairs(&[
+            pool.add_pairs(&[
                 ["third-up".into(), "third-down".into()],
                 ["fourth-up".into(), "fourth-down".into(),]
             ])
@@ -305,19 +311,29 @@ mod tests {
 }
 pub struct Shards {
     config: PolymarketTransportConfig,
-    output: TransportOutput,
+    output: TransportBudget,
     maximum_tokens: usize,
     maximum_shards: usize,
     shard_tokens: usize,
     next_id: u64,
     shards: BTreeMap<u64, Shard>,
-    jobs: tokio::task::JoinSet<(u64, Result<(), TransportError>)>,
+    inputs: BTreeMap<u64, mpsc::Receiver<RawTransportBatch>>,
+    ready: BTreeMap<u64, TransportReadyHandle>,
+    ready_sender: mpsc::Sender<u64>,
+    ready_receiver: mpsc::Receiver<u64>,
+    jobs: tokio::task::JoinSet<(u64, ShardExit)>,
+    failed: VecDeque<(BTreeSet<String>, &'static str)>,
+}
+
+pub enum AcquisitionEvent {
+    Batch(RawTransportBatch),
+    ShardFailed { tokens: BTreeSet<String>, reason: &'static str },
 }
 #[cfg(test)]
 pub(crate) fn unanswered_retirement_fixture() -> (Shards, mpsc::Receiver<SubscriptionUpdate>) {
     // The real owner and receipt state machine are used; only the venue side
     // of the command channel is a fixture, so no external socket is opened.
-    let output = marketcow_polymarket::transport_output(1, 65_536, 65_536).unwrap().0;
+    let output = marketcow_polymarket::transport_budget(1, 65_536, 65_536).unwrap();
     let mut pool = Shards::new(
         PolymarketTransportConfig::production(), output, 4, 1, 4,
     ).unwrap();
@@ -332,7 +348,7 @@ pub(crate) fn unanswered_retirement_fixture() -> (Shards, mpsc::Receiver<Subscri
 impl Shards {
     pub fn new(
         config: PolymarketTransportConfig,
-        output: TransportOutput,
+        output: TransportBudget,
         maximum_tokens: usize,
         maximum_shards: usize,
         shard_tokens: usize,
@@ -344,6 +360,7 @@ impl Shards {
                 && maximum_shards <= 1024,
             "explicit acquisition shard budgets"
         );
+        let (ready_sender, ready_receiver) = mpsc::channel(maximum_shards);
         Ok(Self {
             config,
             output,
@@ -352,7 +369,12 @@ impl Shards {
             shard_tokens,
             next_id: 0,
             shards: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+            ready: BTreeMap::new(),
+            ready_sender,
+            ready_receiver,
             jobs: tokio::task::JoinSet::new(),
+            failed: VecDeque::new(),
         })
     }
     pub fn tokens(&self) -> BTreeSet<String> {
@@ -392,8 +414,8 @@ impl Shards {
         }).collect()
     }
     pub fn add_pairs(&mut self, pairs: &[[String; 2]]) -> Result<Vec<u64>> {
-        let batches = self.validate_add_pairs(pairs)?;
         self.reap()?;
+        let batches = self.validate_add_pairs(pairs)?;
         ensure!(
             self.jobs.len() + batches.len() <= self.maximum_shards,
             "acquisition socket capacity"
@@ -401,85 +423,47 @@ impl Shards {
         self.next_id
             .checked_add(batches.len() as u64)
             .context("shard identity overflow")?;
-        let mut added = vec![];
-        for tokens in batches {
-            let id = self.next_id;
-            self.next_id += 1;
-            let (stop, shutdown) = watch::channel(false);
-            let (commands, updates) = subscription_commands();
-            let config = self.config.clone();
-            let output = self.output.clone();
-            let initial = tokens.iter().cloned().collect();
-            self.jobs.spawn(async move {
-                (
-                    id,
-                    supervise_polymarket_transport_managed(
-                        config,
-                        initial,
-                        output,
-                        shutdown,
-                        updates,
-                        Duration::from_secs(1),
-                    )
-                    .await,
-                )
-            });
-            self.shards.insert(
-                id,
-                Shard {
-                    tokens,
-                    stop,
-                    commands,
-                    pending: None,
-                    stopping: false,
-                    retirement_target: None,
-                },
-            );
-            added.push(id);
-        }
-        Ok(added)
+        batches.into_iter().map(|tokens| self.spawn_owned_tokens(tokens, false)).collect()
     }
-    /// Keep each pair on its own bounded source connection. The BTC 5m
-    /// manager uses this for current+next so replacing the expired pair cannot
-    /// reset the already-subscribed next pair that becomes current. Capacity
-    /// is validated for the complete request before any shard is created.
-    pub fn add_isolated_pairs(&mut self, pairs: &[[String; 2]]) -> Result<Vec<u64>> {
-        ensure!(!pairs.is_empty(), "isolated pair request is empty");
-        let mut tokens = self.tokens();
-        for pair in pairs {
-            ensure!(
-                pair.iter()
-                    .all(|token| !token.is_empty() && token.len() <= 128)
-                    && pair[0] != pair[1],
-                "market token pair"
-            );
-            for token in pair {
-                ensure!(
-                    tokens.insert(token.clone()),
-                    "already-owned acquisition token"
-                );
-            }
-        }
-        ensure!(
-            tokens.len() <= self.maximum_tokens,
-            "acquisition token capacity"
-        );
-        ensure!(
-            self.jobs.len() + pairs.len() <= self.maximum_shards,
-            "acquisition socket capacity"
-        );
-        self.next_id
-            .checked_add(pairs.len() as u64)
-            .context("shard identity overflow")?;
-        let mut added = Vec::with_capacity(pairs.len());
-        for pair in pairs {
-            added.extend(self.add_pairs(std::slice::from_ref(pair))?);
-        }
-        Ok(added)
+
+    fn spawn_owned_tokens(&mut self, tokens: BTreeSet<String>, recovering: bool) -> Result<u64> {
+        ensure!(!tokens.is_empty() && tokens.len() <= self.shard_tokens,
+            "acquisition socket membership capacity");
+        ensure!(self.jobs.len() < self.maximum_shards, "acquisition socket capacity");
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).context("shard identity overflow")?;
+        let (stop, shutdown) = watch::channel(false);
+        let (commands, updates) = subscription_commands();
+        let config = self.config.clone();
+        // Every market has an independent FIFO and socket backpressure.
+        // The parent output supplies the shared absolute byte ceiling.
+        let (output, input, ready) = self.output.market_lane(
+            id, self.ready_sender.clone(), 2048, 32 * 1024 * 1024)?;
+        let initial = tokens.iter().cloned().collect();
+        self.jobs.spawn(async move {
+            // A failed socket gets an independent bounded cooldown. Never
+            // sleep the coordinator or retry in a tight loop when the shared
+            // transport budget is temporarily full.
+            if recovering { tokio::time::sleep(Duration::from_secs(1)).await; }
+            let result = std::panic::AssertUnwindSafe(supervise_polymarket_transport_managed(
+                config, initial, output, shutdown, updates, Duration::from_secs(1),
+            )).catch_unwind().await;
+            (id, match result {
+                Ok(result) => ShardExit::Finished(result),
+                Err(_) => ShardExit::Panicked,
+            })
+        });
+        self.shards.insert(id, Shard {
+            tokens, stop, commands, pending: None, stopping: false,
+            retirement_target: None,
+        });
+        self.inputs.insert(id, input);
+        self.ready.insert(id, ready);
+        Ok(id)
     }
     pub fn validate_add_pairs(&self, pairs: &[[String; 2]]) -> Result<Vec<BTreeSet<String>>> {
         let mut tokens = self.tokens();
-        let mut batches: Vec<BTreeSet<String>> = vec![];
+        let mut batches: Vec<BTreeSet<String>> = Vec::with_capacity(pairs.len());
         for pair in pairs {
             ensure!(
                 pair.iter().all(|t| !t.is_empty() && t.len() <= 128) && pair[0] != pair[1],
@@ -491,13 +475,9 @@ impl Shards {
                     "already-owned acquisition token"
                 );
             }
-            if batches
-                .last()
-                .is_none_or(|batch| batch.len() + 2 > self.shard_tokens)
-            {
-                batches.push(BTreeSet::new());
-            }
-            batches.last_mut().unwrap().extend(pair.iter().cloned());
+            // One market pair owns one transport connection. The retired
+            // market can reconnect or drain without resetting another pair.
+            batches.push(pair.iter().cloned().collect());
         }
         ensure!(
             tokens.len() <= self.maximum_tokens,
@@ -713,26 +693,92 @@ impl Shards {
     }
     fn reap(&mut self) -> Result<()> {
         while let Some(result) = self.jobs.try_join_next() {
-            let (id, result) = result?;
-            ensure!(
-                self.shards.get(&id).is_none_or(|s| s.stopping),
-                "active acquisition shard ended: {result:?}"
-            );
-            self.shards.remove(&id);
+            self.handle_finished(result)?;
+        }
+        self.purge_retired_notifications()?;
+        Ok(())
+    }
+    pub fn reap_finished(&mut self) -> Result<()> { self.reap() }
+
+    pub fn take_failure(&mut self) -> Option<(BTreeSet<String>, &'static str)> {
+        self.failed.pop_front()
+    }
+
+    fn handle_finished(&mut self,
+        result: Result<(u64, ShardExit), tokio::task::JoinError>,
+    ) -> Result<()> {
+        let (id, result) = result.context("acquisition socket task missing")?;
+        let shard = self.shards.remove(&id).context("finished acquisition socket absent")?;
+        // Dropping the old FIFO releases its permits. No pre-failure frame may
+        // arrive after the market's new recovery barrier.
+        self.inputs.remove(&id);
+        self.ready.remove(&id);
+        if shard.stopping { return Ok(()); }
+        let tokens = shard.tokens;
+        let reason = match result {
+            ShardExit::Finished(Ok(())) => "socket_task_ended",
+            ShardExit::Finished(Err(error)) => error.reason_code(),
+            ShardExit::Panicked => "socket_task_panicked",
+        };
+        // The failed socket no longer owns a live subscription. Recreate only
+        // its reviewed token set; another market's socket and actor stay put.
+        // A pending remove-first command had an unknown receipt. The old
+        // channel is gone, so the control owner retries its durable retirement
+        // target against this fresh socket rather than assuming completion.
+        let replacement = self.spawn_owned_tokens(tokens.clone(), true)?;
+        if let Some(target) = shard.retirement_target {
+            self.shards.get_mut(&replacement)
+                .context("replacement acquisition socket absent")?
+                .retirement_target = Some(target);
+        }
+        self.failed.push_back((tokens, reason));
+        Ok(())
+    }
+    fn purge_retired_notifications(&mut self) -> Result<()> {
+        let mut retained = Vec::new();
+        while let Ok(id) = self.ready_receiver.try_recv() {
+            if self.ready.contains_key(&id) { retained.push(id); }
+        }
+        for id in retained {
+            self.ready_sender.try_send(id)
+                .context("market-ready notification budget differs")?;
         }
         Ok(())
     }
-    pub async fn failure(&mut self) -> Result<()> {
+    fn take_ready(&mut self, id: u64) -> Result<Option<RawTransportBatch>> {
+        let Some(ready) = self.ready.get(&id) else { return Ok(None); };
+        ready.consumed();
+        let Some(input) = self.inputs.get_mut(&id) else { return Ok(None); };
+        let batch = input.try_recv().ok();
+        if !input.is_empty() { ready.signal()?; }
+        Ok(batch)
+    }
+    pub fn try_next_batch(&mut self) -> Result<Option<RawTransportBatch>> {
+        if !self.failed.is_empty() { return Ok(None); }
+        while let Ok(id) = self.ready_receiver.try_recv() {
+            if let Some(batch) = self.take_ready(id)? { return Ok(Some(batch)); }
+        }
+        Ok(None)
+    }
+    /// Consume edge-triggered market readiness in FIFO order without scanning
+    /// every socket on each batch. A failed live socket remains fail-closed.
+    pub async fn next_batch_or_failure(&mut self) -> Result<AcquisitionEvent> {
         loop {
-            let Some(result) = self.jobs.join_next().await else {
-                return std::future::pending().await;
-            };
-            let (id, result) = result?;
-            ensure!(
-                self.shards.get(&id).is_none_or(|s| s.stopping),
-                "active acquisition shard ended: {result:?}"
-            );
-            self.shards.remove(&id);
+            if let Some((tokens, reason)) = self.failed.pop_front() {
+                return Ok(AcquisitionEvent::ShardFailed { tokens, reason });
+            }
+            let has_jobs = !self.jobs.is_empty();
+            tokio::select! {
+                id = self.ready_receiver.recv() => {
+                    if let Some(id) = id
+                        && let Some(batch) = self.take_ready(id)?
+                    { return Ok(AcquisitionEvent::Batch(batch)); }
+                },
+                result = self.jobs.join_next(), if has_jobs => {
+                    self.handle_finished(result.context("acquisition socket task missing")?)?;
+                    self.purge_retired_notifications()?;
+                }
+            }
         }
     }
     pub async fn stop(&mut self) {
@@ -740,6 +786,9 @@ impl Shards {
             let _ = shard.stop.send(true);
         }
         self.shards.clear();
+        self.inputs.clear();
+        self.ready.clear();
+        self.failed.clear();
         self.jobs.abort_all();
         while self.jobs.join_next().await.is_some() {}
     }

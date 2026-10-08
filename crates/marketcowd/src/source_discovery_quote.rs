@@ -359,7 +359,7 @@ mod tests {
                 case["market"]["identity"]["market_id"]
             );
         }
-        eprintln!(
+        marketcow_polymarket::async_eprintln!(
             "exact market quote comparisons: {}",
             data["cases"].as_array().unwrap().len()
         );

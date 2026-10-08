@@ -460,7 +460,7 @@ async fn handle(
                 return;
             };
             if let Err(error) = serve(socket, bridge).await {
-                eprintln!("live bridge closed: {error:#}");
+                marketcow_polymarket::async_eprintln!("live bridge closed: {error:#}");
             }
         })
 }

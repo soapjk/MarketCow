@@ -232,7 +232,7 @@ impl Pool {
                                     terminal.insert(id, tokio::time::Instant::now());
                                 }
                                 Ok(None) => {}
-                                Err(error) => eprintln!(
+                                Err(error) => marketcow_polymarket::async_eprintln!(
                                     "{}",
                                     json!({"REST_lifecycle_error":error.to_string(),"market_id":id})
                                 ),
@@ -359,10 +359,10 @@ pub async fn run(
                                 Ok(drafts)=>{let cursor=publication.cursor()?;
                                     let events=drafts.into_iter().enumerate().map(|(i,d)|Ok(d.finalize(cursor.checked_add(i as u64+1).context("cursor overflow")?)?)).collect::<Result<Vec<_>>>()?;
                                     publication.publish(events,None)?;accepted+=1;},
-                                Err(error)=>{rejected+=1;eprintln!("{}",json!({"market_id":id,"source_error":error.to_string()}));},
+                                Err(error)=>{rejected+=1;marketcow_polymarket::async_eprintln!("{}",json!({"market_id":id,"source_error":error.to_string()}));},
                             }
                         }
-                        println!("{}",json!({"managed_rest":true,"accepted_markets":accepted,"rejected_markets":rejected,
+                        marketcow_polymarket::async_eprintln!("{}",json!({"managed_rest":true,"accepted_markets":accepted,"rejected_markets":rejected,
                             "fenced_late_markets":retired,"request_wait_and_prepare_us":elapsed_us,"cursor":publication.cursor()?,"persisted_cursor":publication.persisted_cursor()}));
                     },
                     Message::Terminal{epoch,evidence}=>{

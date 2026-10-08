@@ -91,7 +91,7 @@ async fn handle(State(state): State<Arc<Reader>>, Query(query): Query<Request>) 
         Ok(Ok(Some(value))) => Json(value).into_response(),
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({"detail":{"code":"cold_market_not_found"}}))).into_response(),
         Ok(Err(error)) => {
-            eprintln!("{}", json!({"stage":"cold_market_read_failed","detail":format!("{error:#}")}));
+            marketcow_polymarket::async_eprintln!("{}", json!({"stage":"cold_market_read_failed","detail":format!("{error:#}")}));
             (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"detail":{"code":"cold_market_unavailable"}}))).into_response()
         }
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"detail":{"code":"cold_read_worker_failed"}}))).into_response(),
@@ -115,7 +115,7 @@ async fn handle_evidence(State(state): State<Arc<Reader>>, Query(query): Query<R
         Ok(Ok(Some(value))) => Json(value).into_response(),
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({"detail":{"code":"cold_evidence_not_found"}}))).into_response(),
         Ok(Err(error)) => {
-            eprintln!("{}", json!({"stage":"cold_evidence_read_failed","detail":format!("{error:#}")}));
+            marketcow_polymarket::async_eprintln!("{}", json!({"stage":"cold_evidence_read_failed","detail":format!("{error:#}")}));
             (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"detail":{"code":"cold_evidence_unavailable"}}))).into_response()
         }
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"detail":{"code":"cold_read_worker_failed"}}))).into_response(),

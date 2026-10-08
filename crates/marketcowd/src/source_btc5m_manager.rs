@@ -738,7 +738,7 @@ async fn renewal_worker(
         if let Some(control_view) = &control_view {
             if healthy {
                 if let Err(error) = control_view.note_manager_renewal_at(Utc::now()) {
-                    eprintln!("{}", json!({"stage":"btc_5m_manager_heartbeat_failed",
+                    marketcow_polymarket::async_eprintln!("{}", json!({"stage":"btc_5m_manager_heartbeat_failed",
                         "detail":error.to_string()}));
                 }
             } else {
@@ -874,7 +874,7 @@ pub fn start(
     if active_candidates.is_none() {
         match load_persisted_candidates(&config, &control_view.profile()?) {
             Ok(candidates) => active_candidates = candidates,
-            Err(error) => eprintln!(
+            Err(error) => marketcow_polymarket::async_eprintln!(
                 "{}",
                 json!({"stage":"btc_5m_persisted_candidates_rejected","detail":error.to_string()})
             ),
@@ -1089,7 +1089,7 @@ pub fn start(
             if retirement_polled_at.elapsed() >= Duration::from_secs(10) {
                 retirement_polled_at = tokio::time::Instant::now();
                 if let Err(error) = retire_unreferenced(&config).await {
-                    eprintln!("{}", json!({"stage":"btc_5m_auto_hot_retirement_blocked",
+                    marketcow_polymarket::async_eprintln!("{}", json!({"stage":"btc_5m_auto_hot_retirement_blocked",
                         "detail":format!("{error:#}")}));
                 }
             }
@@ -1113,6 +1113,7 @@ async fn freshness_worker(config: Config, period: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1316,8 +1317,16 @@ mod tests {
     }
     #[tokio::test]
     async fn renewal_ticks_continue_while_discovery_path_is_blocked() {
-        let directory =
-            std::env::temp_dir().join(format!("mc-btc5m-renew-{}", uuid::Uuid::new_v4()));
+        let temp_root = std::env::temp_dir();
+        let temp_device = fs::metadata(&temp_root).unwrap().dev();
+        // Unix socket paths are much shorter than ordinary file paths. Keep
+        // this test on the configured temporary filesystem, but select the
+        // nearest ancestor that leaves room for the unique directory and /c.
+        let short_root = temp_root.ancestors().find(|candidate|
+            candidate.to_string_lossy().len() <= 64
+                && fs::metadata(candidate).is_ok_and(|entry| entry.dev() == temp_device)
+        ).expect("short directory on configured temporary filesystem");
+        let directory = short_root.join(format!("r-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir(&directory).unwrap();
         let socket = directory.join("c");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();

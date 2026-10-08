@@ -297,7 +297,7 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0);
-        eprintln!(
+        marketcow_polymarket::async_eprintln!(
             "captured binary/terminal contract checked {checked} markets (not complete scope audit)"
         );
     }

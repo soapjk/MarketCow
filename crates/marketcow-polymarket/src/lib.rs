@@ -2,6 +2,7 @@
 //! crate; a frame is normalized without network, storage, or async-runtime dependencies.
 
 pub mod discovery_source;
+pub mod diagnostic;
 pub mod subscription;
 
 use chrono::{DateTime, Utc};
@@ -129,12 +130,22 @@ pub struct RawTransportFrame {
 /// while retaining a hard memory ceiling for maximum-sized messages.
 pub struct RawTransportBatch {
     frames: Vec<RawTransportFrame>,
+    source_tokens: BTreeSet<String>,
     _bytes: OwnedSemaphorePermit,
+    _shared_bytes: Option<OwnedSemaphorePermit>,
+    _shared_slot: Option<OwnedSemaphorePermit>,
     declared_bytes: usize,
     metrics: Arc<TransportQueueMetrics>,
 }
 
 impl RawTransportBatch {
+    pub fn source_tokens(&self) -> &BTreeSet<String> {
+        &self.source_tokens
+    }
+    pub fn declared_bytes(&self) -> usize {
+        self.declared_bytes
+    }
+
     pub fn into_frames(mut self) -> Vec<RawTransportFrame> {
         std::mem::take(&mut self.frames)
     }
@@ -184,8 +195,75 @@ pub struct TransportQueueOccupancy {
 pub struct TransportOutput {
     sender: mpsc::Sender<RawTransportBatch>,
     bytes: Arc<Semaphore>,
+    shared_bytes: Option<Arc<Semaphore>>,
+    shared_slots: Option<Arc<Semaphore>>,
+    ready: Option<TransportReadyHandle>,
     maximum_batch_bytes: usize,
     metrics: Arc<TransportQueueMetrics>,
+}
+
+/// At most one queued notification per live market FIFO. The receiver is also
+/// explicitly bounded by the socket budget; failure is never a silent miss.
+#[derive(Clone)]
+pub struct TransportReadyHandle {
+    id: u64,
+    queued: Arc<std::sync::atomic::AtomicBool>,
+    sender: mpsc::Sender<u64>,
+}
+
+impl TransportReadyHandle {
+    pub fn signal(&self) -> Result<(), TransportError> {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            if self.sender.try_send(self.id).is_err() {
+                self.queued.store(false, Ordering::Release);
+                return Err(TransportError::Backpressure);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn consumed(&self) {
+        self.queued.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+pub struct TransportBudget {
+    bytes: Arc<Semaphore>,
+    slots: Arc<Semaphore>,
+    maximum_batch_bytes: usize,
+    metrics: Arc<TransportQueueMetrics>,
+}
+
+impl TransportBudget {
+    /// A market has its own bounded FIFO and byte ceiling. Its permits also
+    /// count against the collector-wide ceiling, so adding sockets cannot
+    /// multiply the maximum retained transport payload.
+    pub fn market_lane(
+        &self,
+        id: u64,
+        ready_sender: mpsc::Sender<u64>,
+        maximum_batches: usize,
+        maximum_bytes: usize,
+    ) -> Result<(TransportOutput, mpsc::Receiver<RawTransportBatch>, TransportReadyHandle), TransportError> {
+        let (mut lane, receiver) = transport_output(
+            maximum_batches,
+            maximum_bytes,
+            self.maximum_batch_bytes.min(maximum_bytes),
+        )?;
+        lane.shared_bytes = Some(self.bytes.clone());
+        lane.shared_slots = Some(self.slots.clone());
+        lane.metrics = self.metrics.clone();
+        let ready = TransportReadyHandle {
+            id, queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sender: ready_sender,
+        };
+        lane.ready = Some(ready.clone());
+        Ok((lane, receiver, ready))
+    }
+    pub fn take_occupancy(&self) -> TransportQueueOccupancy {
+        take_transport_occupancy(&self.metrics)
+    }
 }
 
 impl TransportOutput {
@@ -194,23 +272,35 @@ impl TransportOutput {
     }
 
     pub fn take_occupancy(&self) -> TransportQueueOccupancy {
-        let current_bytes = self.metrics.current_bytes.load(Ordering::Relaxed);
-        let current_batches = self.metrics.current_batches.load(Ordering::Relaxed);
-        let high_bytes = self
-            .metrics
-            .high_bytes
-            .swap(current_bytes, Ordering::Relaxed);
-        let high_batches = self
-            .metrics
-            .high_batches
-            .swap(current_batches, Ordering::Relaxed);
-        TransportQueueOccupancy {
-            current_bytes,
-            current_batches,
-            high_bytes: high_bytes.max(current_bytes),
-            high_batches: high_batches.max(current_batches),
-        }
+        take_transport_occupancy(&self.metrics)
     }
+}
+
+fn take_transport_occupancy(metrics: &TransportQueueMetrics) -> TransportQueueOccupancy {
+    let current_bytes = metrics.current_bytes.load(Ordering::Relaxed);
+    let current_batches = metrics.current_batches.load(Ordering::Relaxed);
+    let high_bytes = metrics.high_bytes.swap(current_bytes, Ordering::Relaxed);
+    let high_batches = metrics.high_batches.swap(current_batches, Ordering::Relaxed);
+    TransportQueueOccupancy {
+        current_bytes,
+        current_batches,
+        high_bytes: high_bytes.max(current_bytes),
+        high_batches: high_batches.max(current_batches),
+    }
+}
+
+pub fn transport_budget(
+    maximum_batches: usize,
+    maximum_bytes: usize,
+    maximum_batch_bytes: usize,
+) -> Result<TransportBudget, TransportError> {
+    validate_transport_limits(maximum_batches, maximum_bytes, maximum_batch_bytes)?;
+    Ok(TransportBudget {
+        bytes: Arc::new(Semaphore::new(maximum_bytes)),
+        slots: Arc::new(Semaphore::new(maximum_batches)),
+        maximum_batch_bytes,
+        metrics: Arc::new(TransportQueueMetrics::default()),
+    })
 }
 
 pub fn transport_output(
@@ -218,6 +308,28 @@ pub fn transport_output(
     maximum_bytes: usize,
     maximum_batch_bytes: usize,
 ) -> Result<(TransportOutput, mpsc::Receiver<RawTransportBatch>), TransportError> {
+    validate_transport_limits(maximum_batches, maximum_bytes, maximum_batch_bytes)?;
+    let (sender, receiver) = mpsc::channel(maximum_batches);
+    let metrics = Arc::new(TransportQueueMetrics::default());
+    Ok((
+        TransportOutput {
+            sender,
+            bytes: Arc::new(Semaphore::new(maximum_bytes)),
+            shared_bytes: None,
+            shared_slots: None,
+            ready: None,
+            maximum_batch_bytes,
+            metrics,
+        },
+        receiver,
+    ))
+}
+
+fn validate_transport_limits(
+    maximum_batches: usize,
+    maximum_bytes: usize,
+    maximum_batch_bytes: usize,
+) -> Result<(), TransportError> {
     if maximum_batches == 0
         || maximum_bytes == 0
         || maximum_bytes > u32::MAX as usize
@@ -226,17 +338,7 @@ pub fn transport_output(
     {
         return Err(TransportError::InvalidConfig);
     }
-    let (sender, receiver) = mpsc::channel(maximum_batches);
-    let metrics = Arc::new(TransportQueueMetrics::default());
-    Ok((
-        TransportOutput {
-            sender,
-            bytes: Arc::new(Semaphore::new(maximum_bytes)),
-            maximum_batch_bytes,
-            metrics,
-        },
-        receiver,
-    ))
+    Ok(())
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -364,7 +466,10 @@ pub async fn supervise_polymarket_transport_managed(
         if matches!(result, Err(TransportError::Backpressure)) {
             return result;
         }
-        tracing::warn!(token_count=tokens.len(),result=?result,"polymarket_shard_retry_group");
+        crate::async_eprintln!("{}", serde_json::json!({
+            "stage":"polymarket_shard_retry_group","token_count":tokens.len(),
+            "result":format!("{result:?}"),
+        }));
         tokio::select! {
             _=tokio::time::sleep(cooldown)=>{},
             _=shutdown.changed()=>return Ok(()),
@@ -402,13 +507,11 @@ async fn run_transport_attempts(
                 {
                     return Ok(());
                 }
-                tracing::warn!(
-                    attempt,
-                    close_code,
-                    close_reason,
-                    reason = "upstream_disconnected",
-                    "polymarket_transport_retry"
-                );
+                crate::async_eprintln!("{}", serde_json::json!({
+                    "stage":"polymarket_transport_retry","attempt":attempt,
+                    "close_code":close_code,"close_reason":close_reason,
+                    "reason":"upstream_disconnected",
+                }));
             }
             Err(TransportError::Backpressure) => return Err(TransportError::Backpressure),
             Err(error) if attempt == config.maximum_reconnect_attempts => {
@@ -425,11 +528,10 @@ async fn run_transport_attempts(
                 {
                     return Ok(());
                 }
-                tracing::warn!(
-                    attempt,
-                    reason = error.reason_code(),
-                    "polymarket_transport_exhausted"
-                );
+                crate::async_eprintln!("{}", serde_json::json!({
+                    "stage":"polymarket_transport_exhausted","attempt":attempt,
+                    "reason":error.reason_code(),
+                }));
                 return Err(error);
             }
             Err(error) => {
@@ -446,11 +548,10 @@ async fn run_transport_attempts(
                 {
                     return Ok(());
                 }
-                tracing::warn!(
-                    attempt,
-                    reason = error.reason_code(),
-                    "polymarket_transport_retry"
-                );
+                crate::async_eprintln!("{}", serde_json::json!({
+                    "stage":"polymarket_transport_retry","attempt":attempt,
+                    "reason":error.reason_code(),
+                }));
             }
         }
         if attempt == config.maximum_reconnect_attempts {
@@ -489,6 +590,12 @@ async fn publish_connection_gaps(
     output: &TransportOutput,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<bool, TransportError> {
+    // A remove-first replacement can fail after the old pair was removed but
+    // before the new pair was subscribed. There is no owned token to mark as
+    // gapped; the control receipt carries the failed replacement instead.
+    if tokens.is_empty() {
+        return Ok(true);
+    }
     let received_at = Utc::now();
     let timestamp = received_at.timestamp_millis().to_string();
     let frames = tokens
@@ -508,18 +615,49 @@ async fn publish_connection_gaps(
     let bytes = serde_json::to_vec(&frames)
         .map_err(|_| TransportError::InvalidFrame)?
         .len();
-    send_bounded(output, frames, bytes, shutdown).await
+    send_bounded(output, frames, bytes, tokens, shutdown).await
 }
 
 async fn send_bounded(
     output: &TransportOutput,
     frames: Vec<RawTransportFrame>,
     bytes: usize,
+    source_tokens: &BTreeSet<String>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<bool, TransportError> {
     if bytes == 0 || bytes > output.maximum_batch_bytes || bytes > u32::MAX as usize {
         return Err(TransportError::FrameTooLarge);
     }
+    let shared_slot_permit = if let Some(shared) = &output.shared_slots {
+        Some(tokio::select! {
+            permit = shared.clone().acquire_owned() =>
+                permit.map_err(|_| TransportError::Backpressure)?,
+            changed = shutdown.changed() => {
+                return if changed.is_err() || *shutdown.borrow() {
+                    Ok(false)
+                } else {
+                    Err(TransportError::Backpressure)
+                };
+            }
+        })
+    } else {
+        None
+    };
+    let shared_byte_permit = if let Some(shared) = &output.shared_bytes {
+        Some(tokio::select! {
+            permit = shared.clone().acquire_many_owned(bytes as u32) =>
+                permit.map_err(|_| TransportError::Backpressure)?,
+            changed = shutdown.changed() => {
+                return if changed.is_err() || *shutdown.borrow() {
+                    Ok(false)
+                } else {
+                    Err(TransportError::Backpressure)
+                };
+            }
+        })
+    } else {
+        None
+    };
     let byte_permit = tokio::select! {
         permit = output.bytes.clone().acquire_many_owned(bytes as u32) =>
             permit.map_err(|_| TransportError::Backpressure)?,
@@ -554,10 +692,14 @@ async fn send_bounded(
                 .fetch_max(current_batches, Ordering::Relaxed);
             permit.send(RawTransportBatch {
                 frames,
+                source_tokens: source_tokens.clone(),
                 _bytes: byte_permit,
+                _shared_bytes: shared_byte_permit,
+                _shared_slot: shared_slot_permit,
                 declared_bytes: bytes,
                 metrics: output.metrics.clone(),
             });
+            if let Some(ready) = &output.ready { ready.signal()?; }
             Ok(true)
         }
         changed = shutdown.changed() => {
@@ -675,7 +817,7 @@ async fn run_polymarket_connection(
                         raw_payload, received_at,
                     }).collect();
                     if frames.is_empty() {continue;}
-                    if !send_bounded(output, frames, wire_bytes, shutdown).await? {
+                    if !send_bounded(output, frames, wire_bytes, tokens, shutdown).await? {
                         let _ = socket.close(None).await;
                         return Ok(ConnectionEnd::Shutdown);
                     }
@@ -699,7 +841,7 @@ async fn run_polymarket_connection(
                     // Keep the public fail-closed reason stable while making
                     // the transport failure class observable.  Never include
                     // request headers, proxy URLs or credentials in this log.
-                    eprintln!(
+                    crate::async_eprintln!(
                         "{}",
                         serde_json::json!({
                             "stage":"polymarket_websocket_read_failed",
@@ -915,6 +1057,8 @@ struct FrameContext {
 
 struct AtomicPriceChanges {
     changes: Vec<SideLevels>,
+    bid_positions: BTreeMap<Price, usize>,
+    ask_positions: BTreeMap<Price, usize>,
     best_bid: Option<Price>,
     best_ask: Option<Price>,
 }
@@ -1112,16 +1256,32 @@ pub fn normalize_frame_with_book_tick(
                     .entry(token_id)
                     .or_insert_with(|| AtomicPriceChanges {
                         changes: Vec::new(),
+                        bid_positions: BTreeMap::new(),
+                        ask_positions: BTreeMap::new(),
                         best_bid: best_bid.clone(),
                         best_ask: best_ask.clone(),
                     });
                 if entry.best_bid != best_bid || entry.best_ask != best_ask {
                     return Err(NormalizeError::InvalidLevels);
                 }
-                entry.changes.push(SideLevels {
-                    side,
-                    levels: vec![level],
-                });
+                // All levels in one venue frame form one atomic observation.
+                // Each size replaces its price level, so only the final write
+                // to a token/side/price can affect the post-frame book. Keep
+                // the raw frame unchanged for audit and validate every item
+                // above before discarding an overwritten assignment.
+                let positions = match side {
+                    Side::Bid => &mut entry.bid_positions,
+                    Side::Ask => &mut entry.ask_positions,
+                };
+                if let Some(&position) = positions.get(&level.price) {
+                    entry.changes[position].levels[0] = level;
+                } else {
+                    positions.insert(level.price.clone(), entry.changes.len());
+                    entry.changes.push(SideLevels {
+                        side,
+                        levels: vec![level],
+                    });
+                }
             }
             by_token
                 .into_iter()
@@ -1491,6 +1651,43 @@ mod tests {
         let book = &outcome.projection.books["yes-1"];
         assert_eq!(book.bids.last_key_value().unwrap().0.0.to_string(), "0.43");
         assert_eq!(book.asks.first_key_value().unwrap().0.0.to_string(), "0.44");
+    }
+
+    #[test]
+    fn repeated_level_assignments_in_one_frame_keep_only_the_last_valid_value() {
+        let raw = serde_json::json!({
+            "event_type":"price_change", "timestamp":"2026-08-03T04:00:01Z",
+            "price_changes":[
+                {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"1"},
+                {"asset_id":"yes-1","side":"SELL","price":"0.44","size":"2"},
+                {"asset_id":"yes-1","side":"BID","price":"0.40","size":"0"},
+                {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"3"}
+            ]
+        });
+        let event = normalize_frame(&config(), raw.clone(), at(), 2)
+            .unwrap()
+            .remove(0);
+        assert_eq!(*event.raw_payload, raw);
+        let EventKind::AtomicDelta { changes, .. } = event.kind else {
+            panic!("expected atomic delta")
+        };
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].side, Side::Bid);
+        assert_eq!(changes[0].levels[0].quantity.to_string(), "3");
+        assert_eq!(changes[1].side, Side::Ask);
+        assert_eq!(changes[1].levels[0].quantity.to_string(), "2");
+
+        let invalid = serde_json::json!({
+            "event_type":"price_change", "timestamp":"2026-08-03T04:00:01Z",
+            "price_changes":[
+                {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"-1"},
+                {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"3"}
+            ]
+        });
+        assert_eq!(
+            normalize_frame(&config(), invalid, at(), 2),
+            Err(NormalizeError::InvalidDecimal)
+        );
     }
 
     #[test]
@@ -1973,6 +2170,7 @@ mod tests {
                     received_at: at(),
                 }],
                 32,
+                &BTreeSet::new(),
                 &mut first_shutdown,
             )
             .await,
@@ -1997,6 +2195,7 @@ mod tests {
                     received_at: at(),
                 }],
                 32,
+                &BTreeSet::new(),
                 &mut shutdown_rx,
             )
             .await
@@ -2018,6 +2217,7 @@ mod tests {
                     received_at: at(),
                 }],
                 32,
+                &BTreeSet::new(),
                 &mut blocker_shutdown,
             )
             .await,
@@ -2033,6 +2233,7 @@ mod tests {
                     received_at: at(),
                 }],
                 32,
+                &BTreeSet::new(),
                 &mut shutdown_rx2,
             )
             .await

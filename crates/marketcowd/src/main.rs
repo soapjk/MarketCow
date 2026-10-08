@@ -2350,8 +2350,10 @@ impl AuditCoordinator {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    marketcow_polymarket::diagnostic::install();
     tracing_subscriber::fmt()
         .json()
+        .with_writer(marketcow_polymarket::diagnostic::DiagnosticWriter::default)
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     match Cli::parse().command {

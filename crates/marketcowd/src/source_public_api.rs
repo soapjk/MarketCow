@@ -344,7 +344,7 @@ async fn ws_upgrade(
                 "message":"Scope retired; obtain current scope and new full-sync","retryable":true})).await;
         }
         if let Some(Err(error)) = result {
-            eprintln!("{}",json!({"stage":"public_live_stream_closed","at":Utc::now(),
+            marketcow_polymarket::async_eprintln!("{}",json!({"stage":"public_live_stream_closed","at":Utc::now(),
                 "connection":connection,"opened_at":opened,
                 "instance":api.instance,"initial_cursor":query.after_cursor,"error":format!("{error:#}")}));
             let _ = send_public(&mut socket,&api,json!({"type":"error","code":"polymarket_live_stream_disconnected",

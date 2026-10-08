@@ -19,7 +19,11 @@ mod source_acquisition_lease;
 mod source_acquisition_shards;
 #[allow(dead_code)]
 mod source_btc5m_api;
+mod source_btc5m_reference;
+mod source_btc5m_proto;
 mod source_btc5m_manager;
+mod btc_chainlink;
+mod btc_trade;
 mod source_cold_catalog;
 mod source_discovery_api;
 mod source_discovery_history;
@@ -31,6 +35,8 @@ mod source_finality_reader;
 mod source_finality_service;
 mod source_lifecycle;
 mod source_market_evidence;
+mod source_market_replay;
+mod source_market_persistence;
 mod source_price_history;
 mod source_public_api;
 mod source_public_binding;
@@ -121,6 +127,12 @@ struct Args {
     persistence_queue_batches: usize,
     #[arg(long)]
     persistence_queue_bytes: usize,
+    /// In-memory publication batches retained for bounded WS replay; separate
+    /// from the asynchronous persistence work queue.
+    #[arg(long, requires = "memory_replay_bytes")]
+    memory_replay_batches: Option<usize>,
+    #[arg(long, requires = "memory_replay_batches")]
+    memory_replay_bytes: Option<usize>,
     /// Explicit bounded durable history for prepared discovery or scoped sources.
     /// Readers must support recent_events; no JSONL append.
     #[arg(long)]
@@ -251,6 +263,10 @@ struct Args {
     btc_research_clients: Option<usize>,
     #[arg(long, requires = "btc_research_root")]
     btc_research_send_timeout_seconds: Option<u64>,
+    /// Optional private CLOB API credential file for the Chainlink TWAP
+    /// PolyBolt channel. Without it, Chainlink is explicitly unavailable.
+    #[arg(long, requires = "btc_research_root")]
+    btc_chainlink_credentials: Option<PathBuf>,
     /// Bounded BTC five-minute market projection over the same publication
     /// and listener. Acquisition membership is prepared through the existing
     /// managed control plane; this option never starts a sidecar source.
@@ -361,7 +377,7 @@ async fn fetch(
         body.extend_from_slice(&chunk);
     }
     let received = Utc::now();
-    eprintln!(
+    marketcow_polymarket::async_eprintln!(
         "{}",
         json!({"stage":"network_body","elapsed_us":network_started.elapsed().as_micros(),"response_bytes":body.len()})
     );
@@ -371,7 +387,7 @@ async fn fetch(
     let parse_started = std::time::Instant::now();
     let books: Vec<Value> =
         tokio::task::spawn_blocking(move || serde_json::from_slice(&body)).await??;
-    eprintln!(
+    marketcow_polymarket::async_eprintln!(
         "{}",
         json!({"stage":"response_decode","elapsed_us":parse_started.elapsed().as_micros()})
     );
@@ -439,7 +455,7 @@ async fn fetch_identified(
             (id, result)
         })
         .collect();
-    eprintln!("{}",json!({"stage":"fetch_and_prepare","request_and_decode_us":request_us,"normalize_us":normalize_started.elapsed().as_micros()}));
+    marketcow_polymarket::async_eprintln!("{}",json!({"stage":"fetch_and_prepare","request_and_decode_us":request_us,"normalize_us":normalize_started.elapsed().as_micros()}));
     result
     }).await.context("snapshot preparation worker panicked")
 }
@@ -611,6 +627,7 @@ fn replay_pending_retirement(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    marketcow_polymarket::diagnostic::install();
     let args = Args::parse();
     if let Some(output) = &args.offline_cold_output {
         let report = source_scope_migration::migrate(source_scope_migration::Inputs {
@@ -911,6 +928,15 @@ async fn main() -> Result<()> {
             .flat_map(|m| m.token_ids.iter().map(|t| (t.clone(), m.market_id.clone())))
             .collect(),
     )?;
+    // The market-local feed has no JSONL/coupled-replay compatibility mode.
+    // Reject an incomplete live configuration before accepting source data;
+    // non-BTC discovery still retains its independent archive policy.
+    if btc_5m_profile.is_some() {
+        ensure!(args.bounded_history_bytes.is_some(),
+            "BTC 5m market-local archive requires bounded history");
+        ensure!(args.memory_replay_batches.is_some() && args.memory_replay_bytes.is_some(),
+            "BTC 5m market-local replay requires independent bounds");
+    }
     // Do not migrate durable history until the complete source binding is valid.
     if let Some(limit) = args.bounded_history_bytes {
         writer.enable_bounded_history(limit)?;
@@ -1055,20 +1081,36 @@ async fn main() -> Result<()> {
     // This field is added only to the adapter seed and is not exposed as a
     // fabricated Live scope in the Discovery read contract.
     let ws_seed = websocket_seed(base.clone(), discovery_config.as_ref())?;
-    let mut publication = source_publication::Publication::start_managed(
+    let (replay_batches, replay_bytes, coupled_for_non_btc) = match
+        (args.memory_replay_batches, args.memory_replay_bytes)
+    {
+        (Some(batches), Some(bytes)) => (batches, bytes, false),
+        (None, None) => (args.persistence_queue_batches, args.persistence_queue_bytes, true),
+        _ => anyhow::bail!("memory replay batch and byte bounds must be configured together"),
+    };
+    marketcow_polymarket::async_eprintln!("{}", json!({"stage":"publication_limits",
+        "persistence_queue_batches":args.persistence_queue_batches,
+        "persistence_queue_bytes":args.persistence_queue_bytes,
+        "memory_replay_batches":replay_batches,
+        "memory_replay_bytes":replay_bytes,
+        "coupled_replay_limits_non_btc_only":coupled_for_non_btc}));
+    let mut publication = source_publication::Publication::start_managed_with_replay(
         cursor,
         base,
         bindings,
         args.persistence_queue_batches,
         args.persistence_queue_bytes,
+        replay_batches,
+        replay_bytes,
         args.batch_byte_limit,
         move |work| {
             let batches = match work {
                 source_publication::PersistenceWork::Events(batches) => batches,
                 source_publication::PersistenceWork::Retire(retirement) => {
                     writer.bind_catalog_tokens(retirement.catalog_bindings.clone())?;
+                    let after = writer.cursor()?;
                     return writer.retire_catalog_markets(
-                        retirement.after, &retirement.markets, &retirement.cold_records);
+                        after, &retirement.markets, &retirement.cold_records);
                 }
             };
             for batch in batches {
@@ -1143,6 +1185,7 @@ async fn main() -> Result<()> {
                     args.btc_research_send_timeout_seconds
                         .context("BTC send timeout")?,
                 ),
+                chainlink_credentials: args.btc_chainlink_credentials.clone(),
             })
             .await?,
         )
@@ -1224,7 +1267,7 @@ async fn main() -> Result<()> {
         }
         router = router.merge(source_cold_catalog::router(args.root.clone())?);
         if let Some(profile) = btc_5m_profile {
-            let (btc_router, control) = source_btc5m_api::Api::router(
+            let (btc_router, control) = source_btc5m_api::Api::router_with_archive(
                 publication.reader(),
                 profile,
                 uuid::Uuid::new_v4().simple().to_string(),
@@ -1243,7 +1286,11 @@ async fn main() -> Result<()> {
                         .btc_5m_snapshot_lease_capacity
                         .context("BTC 5m snapshot lease capacity")?,
                 },
+                args.root.clone(),
             )?;
+            router = router.merge(source_btc5m_reference::router(
+                control.clone(), btc_service.as_ref().map(|service| service.trade_source()),
+            )?);
             btc_5m_control = Some(control);
             router = router.merge(btc_router);
         }
@@ -1310,7 +1357,7 @@ async fn main() -> Result<()> {
             Some(acquisition_sender),
             btc_5m_control.clone(),
             journal,
-        )?)
+        ).await?)
     } else {
         None
     };
@@ -1440,7 +1487,7 @@ async fn main() -> Result<()> {
                                 terminal.insert(id,tokio::time::Instant::now());
                             },
                             Ok(None)=>{},
-                            Err(error)=>eprintln!("{}",json!({"lifecycle_refresh_error":format!("{error:#}"),"market_id":id})),
+                            Err(error)=>marketcow_polymarket::async_eprintln!("{}",json!({"lifecycle_refresh_error":format!("{error:#}"),"market_id":id})),
                         }
                     }
                 }
@@ -1470,10 +1517,10 @@ async fn main() -> Result<()> {
                                 }).collect::<Result<Vec<_>>>()?;
                                 publication.publish(events,None)?; accepted+=1;
                             },
-                            Err(error) => {rejected+=1; eprintln!("{}",json!({"market_id":id,"source_error":format!("{error:#}")}));}
+                            Err(error) => {rejected+=1; marketcow_polymarket::async_eprintln!("{}",json!({"market_id":id,"source_error":format!("{error:#}")}));}
                         }
                     }
-                    println!("{}",json!({"batch":batch,"batch_cycle":cycle,"request_wait_and_prepare_us":elapsed_us,
+                    marketcow_polymarket::async_eprintln!("{}",json!({"batch":batch,"batch_cycle":cycle,"request_wait_and_prepare_us":elapsed_us,
                         "ordered_publication_us":started.elapsed().as_micros(),"accepted_markets":accepted,"rejected_markets":rejected,
                         "cursor":publication.cursor()?,"persisted_cursor":publication.persisted_cursor(),
                         "configured_plan_market_count":args.expected_market_count,"collection_market_count":plan.markets.len(),"trading_enabled":false}));
@@ -1709,6 +1756,10 @@ mod scope_tests {
             "--persistence-queue-batches",
             "1",
             "--persistence-queue-bytes",
+            "1",
+            "--memory-replay-batches",
+            "1",
+            "--memory-replay-bytes",
             "1",
             "--poll-seconds",
             "1",

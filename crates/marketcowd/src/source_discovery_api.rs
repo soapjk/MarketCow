@@ -317,7 +317,7 @@ async fn full_sync(State(state): State<ScopeState>) -> Response {
             )
         }
         Ok(Err(e)) => {
-            eprintln!("discovery full-sync unavailable: {e:#}");
+            marketcow_polymarket::async_eprintln!("discovery full-sync unavailable: {e:#}");
             error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "discovery_projection_unavailable",
@@ -325,7 +325,7 @@ async fn full_sync(State(state): State<ScopeState>) -> Response {
             )
         }
         Err(e) => {
-            eprintln!("discovery snapshot worker failed: {e}");
+            marketcow_polymarket::async_eprintln!("discovery snapshot worker failed: {e}");
             error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "discovery_projection_unavailable",
@@ -383,7 +383,7 @@ async fn upgrade(
                 _=lease.expired()=>Err(anyhow::anyhow!("discovery scope retired")),
             };
             if let Err(e) = result {
-                eprintln!("discovery client requires resync: {e:#}");
+                marketcow_polymarket::async_eprintln!("discovery client requires resync: {e:#}");
                 let _ = send(&api, &mut socket, resync(&api, &query)).await;
             }
             let _ =
