@@ -119,3 +119,16 @@ MCP 不直连数据库，也不开放刷新、导入或管理写操作。需要�
 工具清单和分析时的数据契约注意事项见 [MCP Server 文档](docs/mcp-server.md)。
 可转债申购评分所需的发行条款、日历、缺失语义与市场估值契约见
 [Convertible-Bond MCP v1](docs/mcp-convertible-bonds.md)。
+
+## Python SDK
+
+第三方 Python 调用方可使用仓库内独立的 `marketcow-client` SDK。它提供同步/异步
+客户端、认证、超时与安全重试、稳定错误类型、Decimal/UTC 模型和 canonical 游标
+迭代器，不包含管理或部署接口：
+
+```bash
+pip install ./sdk/python
+```
+
+Quickstart 见 [Python SDK README](sdk/python/README.md)，首版稳定接口清单及公网限制见
+[SDK public surface v1](docs/sdk-public-surface-v1.md)。
