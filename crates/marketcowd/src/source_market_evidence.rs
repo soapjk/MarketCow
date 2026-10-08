@@ -1,15 +1,15 @@
 //! Raw rule/lifecycle facts; never certifies logical implication or redemption.
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     sync::Arc,
@@ -498,13 +498,15 @@ mod tests {
     }
     #[test]
     fn identity_fails() {
-        assert!(project(
-            "2",
-            "c",
-            &serde_json::to_vec(&raw()).unwrap(),
-            "2026-09-09T00:00:00Z"
-        )
-        .is_err());
+        assert!(
+            project(
+                "2",
+                "c",
+                &serde_json::to_vec(&raw()).unwrap(),
+                "2026-09-09T00:00:00Z"
+            )
+            .is_err()
+        );
     }
     #[test]
     fn missing_and_changed_rules() {
@@ -593,40 +595,46 @@ mod tests {
         assert!(
             project_execution("1", &condition, "20", "10", &bytes, "2026-09-13T00:00:00Z").is_err()
         );
-        assert!(project_execution(
-            "1",
-            &format!("0x{}", "c".repeat(64)),
-            "10",
-            "20",
-            &bytes,
-            "2026-09-13T00:00:00Z"
-        )
-        .is_err());
+        assert!(
+            project_execution(
+                "1",
+                &format!("0x{}", "c".repeat(64)),
+                "10",
+                "20",
+                &bytes,
+                "2026-09-13T00:00:00Z"
+            )
+            .is_err()
+        );
     }
     #[test]
     fn execution_facts_reject_missing_or_unsupported_spec() {
         let condition = format!("0x{}", "d".repeat(64));
         let mut raw = execution_raw(&condition, "10", "20");
         raw["mos"] = Value::Null;
-        assert!(project_execution(
-            "1",
-            &condition,
-            "10",
-            "20",
-            &serde_json::to_vec(&raw).unwrap(),
-            "2026-09-13T00:00:00Z"
-        )
-        .is_err());
+        assert!(
+            project_execution(
+                "1",
+                &condition,
+                "10",
+                "20",
+                &serde_json::to_vec(&raw).unwrap(),
+                "2026-09-13T00:00:00Z"
+            )
+            .is_err()
+        );
         let mut raw = execution_raw(&condition, "10", "20");
         raw["fd"]["to"] = json!(false);
-        assert!(project_execution(
-            "1",
-            &condition,
-            "10",
-            "20",
-            &serde_json::to_vec(&raw).unwrap(),
-            "2026-09-13T00:00:00Z"
-        )
-        .is_err());
+        assert!(
+            project_execution(
+                "1",
+                &condition,
+                "10",
+                "20",
+                &serde_json::to_vec(&raw).unwrap(),
+                "2026-09-13T00:00:00Z"
+            )
+            .is_err()
+        );
     }
 }

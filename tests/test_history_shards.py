@@ -58,10 +58,17 @@ class HistoryShardPlanningTest(unittest.TestCase):
         hyperliquid = plan_history_shards({
             **base, "provider": "hyperliquid", "interval": "1h",
         })
+        alpaca = plan_history_shards({
+            **base, "provider": "alpaca_sip", "interval": "1d",
+        })
 
         self.assertEqual(len(yahoo), 7)
         self.assertEqual(len(tushare), 5)
         self.assertEqual(len(hyperliquid), 3)
+        self.assertEqual(len(alpaca), 1)
+        self.assertTrue(
+            provider_history_capability("alpaca_sip", "1d").supports_pagination
+        )
         self.assertTrue(all(
             shard["expected_max_rows"] <= 3000 for shard in tushare
         ))

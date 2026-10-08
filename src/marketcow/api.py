@@ -666,6 +666,11 @@ def create_app(
         if settings.polymarket_discovery_depth_notionals else None
     )
     app.state.polymarket_discovery = polymarket_discovery
+    polymarket_runtime_configured = bool(
+        polymarket_discovery is not None
+        or settings.polymarket_live_stream_uri
+        or settings.polymarket_rust_data_plane_url
+    )
     polymarket_live_projection = PolymarketLiveProjection(
         replay_capacity=settings.polymarket_live_stream_replay_capacity
     )
@@ -710,6 +715,8 @@ def create_app(
     app.state.polymarket_event_metrics = polymarket_event_metrics
 
     async def read_polymarket_live_health():
+        if not polymarket_runtime_configured:
+            return LiveReadHealth(status="not_configured")
         if settings.polymarket_rust_data_plane_url:
             async with httpx.AsyncClient(
                 trust_env=False,
@@ -925,7 +932,7 @@ def create_app(
             app.state.polymarket_event_loop_monitor_task = (
                 polymarket_event_loop_monitor_task
             )
-        if metadata_repository is not None and hasattr(
+        if polymarket_runtime_configured and metadata_repository is not None and hasattr(
             metadata_repository, "upsert_prediction_market_live_observation"
         ):
             try:
@@ -1792,7 +1799,10 @@ def create_app(
         summary="Read background discovery materialization status",
     )
     async def polymarket_discovery_status():
-        return require_polymarket_discovery().materialization_status()
+        try:
+            return require_polymarket_discovery().materialization_status()
+        except PolymarketLiveReadError as exc:
+            _raise_polymarket_read_error(exc)
 
     @app.websocket(
         "/v1/prediction-markets/polymarket/live/discovery/stream"

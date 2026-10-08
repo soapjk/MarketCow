@@ -51,6 +51,14 @@ def _render(levels: dict[Decimal, Decimal], reverse: bool) -> list[dict]:
     return [{"price": str(price), "size": str(levels[price])} for price in sorted(levels, reverse=reverse)]
 
 
+def _crossed(book: dict) -> bool:
+    return bool(
+        book["bids"]
+        and book["asks"]
+        and Decimal(book["bids"][0]["price"]) >= Decimal(book["asks"][0]["price"])
+    )
+
+
 def project_archive(capture: Path, output: Path) -> dict:
     if not capture.is_absolute() or not output.is_absolute() or output.exists():
         raise ValueError("absolute_new_output_required")
@@ -180,12 +188,38 @@ def project_archive(capture: Path, output: Path) -> dict:
                     state = states[token]
                     market, outcome = token_map[token]
                     book = {"bids": _render(state["bids"], True), "asks": _render(state["asks"], False)}
-                    if (
-                        book["bids"]
-                        and book["asks"]
-                        and Decimal(book["bids"][0]["price"]) >= Decimal(book["asks"][0]["price"])
-                    ):
-                        raise ValueError("crossed_book")
+                    if _crossed(book):
+                        states.pop(token, None)
+                        epochs[token] = epochs.get(token, 0) + 1
+                        row = {
+                            "schema_version": "marketcow.btc-hour.research-l2.v1",
+                            "capture_config_sha256": _sha(config_raw),
+                            "capture_frames_sha256": archive_sha,
+                            "kind": "invalidation",
+                            "market_id": market["market_id"],
+                            "condition_id": market["condition_id"],
+                            "token_id": token,
+                            "outcome": outcome,
+                            "book_epoch": epochs[token],
+                            "local_sequence": 0,
+                            "available": False,
+                            "received_at": envelope["received_at"],
+                            "source_timestamp": payload.get("timestamp"),
+                            "reason": "crossed_book",
+                            "transport_reason": None,
+                            "input_ordinal": ordinal,
+                            "input_line_sha256": _sha(line.rstrip(b"\n")),
+                            "raw_wire_bytes_preserved": False,
+                            "state_checksum": None,
+                        }
+                        raw = _canonical(row) + b"\n"
+                        output_bytes += len(raw)
+                        if output_bytes > maximum_output_bytes:
+                            raise ValueError("l2_output_budget")
+                        target.write(raw)
+                        digest.update(raw)
+                        emitted += 1
+                        continue
                     row = {
                         "schema_version": "marketcow.btc-hour.research-l2.v1",
                         "capture_config_sha256": _sha(config_raw),

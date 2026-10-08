@@ -1,6 +1,6 @@
-//! Public Polymarket WS -> existing strict core -> live.v2 memory publication.
-//! The internal core reducer has no durable side effects. Only Publication owns
-//! public cursors/durable watermarks; reducer cursors never cross this boundary.
+//! Public Polymarket WS -> market-local actors -> market-local publication.
+//! Physical archive positions and each market's published/durable watermarks
+//! remain separate; actor reduction has no synchronous disk side effects.
 use super::{Args, Plan};
 use crate::source_publication::{ConfirmationOutcome, Publication};
 use anyhow::{Context, Result, ensure};
@@ -9,13 +9,51 @@ use marketcow_core::{CanonicalEvent, CoreError, DurableLog, EventKind, Price, Si
 use marketcow_polymarket::discovery_source::{SnapshotBoundary, canonical_hash, snapshot_event};
 use marketcow_polymarket::{
     NormalizerConfig, PolymarketTransportConfig, normalize_frame_with_book_tick,
-    run_polymarket_transport,
+    RawTransportBatch, RawTransportFrame, run_polymarket_transport, transport_budget,
+    transport_output,
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 #[path = "source_websocket_pipeline.rs"]
 mod pipeline;
+
+// Every market socket owns a 2048-item/32-MiB FIFO. All socket FIFOs also share
+// these hard count/byte ceilings; more markets never multiply total retention.
+const TRANSPORT_QUEUE_BATCHES: usize = 4096;
+const TRANSPORT_QUEUE_BYTES: usize = 64 * 1024 * 1024;
+const TRANSPORT_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const OWNER_COALESCE_BATCHES: usize = 64;
+const OWNER_COALESCE_BYTES: usize = 4 * 1024 * 1024;
+const OWNER_COALESCE_FRAMES: usize = 64;
+// Receipt-time window, not a timer: an idle actor never waits for another
+// venue frame. Control, top-of-book, recovery and trade boundaries flush it.
+const DEPTH_CONFLATION_WINDOW_US: i64 = 2_000;
+
+fn split_transport_control_boundaries(frames: Vec<RawTransportFrame>) -> Vec<Vec<RawTransportFrame>> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+    let mut current_is_gap = None;
+    for frame in frames {
+        let is_gap = frame.raw_payload["event_type"] == "source_gap";
+        if current.len() == OWNER_COALESCE_FRAMES
+            || current_is_gap.is_some_and(|prior| prior != is_gap)
+        {
+            segments.push(std::mem::take(&mut current));
+        }
+        current_is_gap = Some(is_gap);
+        current.push(frame);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+#[cfg(test)]
+pub(crate) fn compact_btc5m_fixture_events(events: Vec<Value>) -> Result<Vec<Value>> {
+    Ok(pipeline::compact_incremental_events(events)?.0)
+}
 
 struct MemoryReducer;
 #[derive(Debug)]
@@ -48,33 +86,106 @@ struct Adapter {
     sequences: BTreeMap<String, u64>,
     waiting: BTreeSet<String>,
     book_received: BTreeMap<String, chrono::DateTime<Utc>>,
+    book_source: BTreeMap<String, chrono::DateTime<Utc>>,
+    // The venue often repeats an already-applied price level with only a new
+    // transport timestamp. That is not a new book state or freshness evidence.
+    depth_checksums: BTreeMap<String, String>,
     // Complete Polymarket book frames carry this fact even though the generic
     // reducer represents later trade ticks as separate events.
     last_trades: BTreeMap<String, Price>,
     recoveries: BTreeMap<String, String>,
+    // A new, validated venue observation can reduce to the exact depth that
+    // is already public.  It is not a causal state mutation and therefore
+    // must not consume a public cursor or enter durability, but it is valid
+    // freshness evidence.  The market actor hands these receipts to the
+    // publication owner after all state-mutating events from the same input.
+    // Each receipt retains the exact book identity it observed; identical
+    // depth after a later trade is not permission to confirm the newer book.
+    confirmations: Vec<ReducedBookConfirmation>,
+    // A conflated frame has one public identity for several immutable venue
+    // frames. Retain their raw identities for the reducer's duplicate window;
+    // an exact venue replay must not become a new freshness confirmation.
+    conflated_raw_hashes: HashSet<String>,
+    conflated_raw_order: VecDeque<String>,
+}
+#[derive(Debug)]
+struct ReducedBookConfirmation {
+    market_id: String,
+    condition_id: String,
+    token_id: String,
+    book_epoch: String,
+    book_sequence: u64,
+    book_received_at: chrono::DateTime<Utc>,
+    state_checksum: String,
+    exchange_at: chrono::DateTime<Utc>,
+    received_at: chrono::DateTime<Utc>,
+    source_hash: String,
+}
+struct DepthConflationCandidate {
+    market_id: String,
+    condition_id: String,
+    observed_at: chrono::DateTime<Utc>,
+    tokens: BTreeMap<String, DepthTokenConflation>,
+}
+struct DepthTokenConflation {
+    best_bid: Price,
+    best_ask: Price,
+    changes: BTreeMap<(String, String), Value>,
 }
 struct ScopeAcquisition {
-    validate_only:bool,catalog_revision:String,records:Vec<Value>,evidence_sha256:String,
-    acquisition_market_ids:BTreeSet<String>,retire_market_ids:BTreeSet<String>,
+    validate_only: bool,
+    catalog_revision: String,
+    records: Vec<Value>,
+    evidence_sha256: String,
+    acquisition_market_ids: BTreeSet<String>,
+    retire_market_ids: BTreeSet<String>,
 }
 impl Adapter {
     /// The owner has already bound this exact identity to catalog metadata.
     /// New reducers start without tick/book/freshness state; snapshots must
     /// supply those facts. Retained pairs are never reset by admission.
-    fn admit_market(&mut self, market:&super::Market)->Result<bool> {
-        ensure!(!market.market_id.is_empty() && !market.condition_id.is_empty()
-            && market.token_ids[0]!=market.token_ids[1]
-            && market.token_ids.iter().all(|token|!token.is_empty()&&token.len()<=128),"market admission identity");
-        let expected=(market.market_id.clone(),market.condition_id.clone());
-        let existing=market.token_ids.iter().filter(|token|self.identities.contains_key(*token)).count();
-        if existing>0 {
-            ensure!(existing==2 && market.token_ids.iter().all(|token|self.identities.get(token)==Some(&expected)),"market admission ownership conflict");
+    fn admit_market(&mut self, market: &super::Market) -> Result<bool> {
+        ensure!(
+            !market.market_id.is_empty()
+                && !market.condition_id.is_empty()
+                && market.token_ids[0] != market.token_ids[1]
+                && market
+                    .token_ids
+                    .iter()
+                    .all(|token| !token.is_empty() && token.len() <= 128),
+            "market admission identity"
+        );
+        let expected = (market.market_id.clone(), market.condition_id.clone());
+        let existing = market
+            .token_ids
+            .iter()
+            .filter(|token| self.identities.contains_key(*token))
+            .count();
+        if existing > 0 {
+            ensure!(
+                existing == 2
+                    && market
+                        .token_ids
+                        .iter()
+                        .all(|token| self.identities.get(token) == Some(&expected)),
+                "market admission ownership conflict"
+            );
             return Ok(false);
         }
-        ensure!(!self.identities.values().any(|(id,_)|id==&market.market_id),"market admission changed token pair");
-        ensure!(self.identities.len()+2<=marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES,"market admission token capacity");
+        ensure!(
+            !self
+                .identities
+                .values()
+                .any(|(id, _)| id == &market.market_id),
+            "market admission changed token pair"
+        );
+        ensure!(
+            self.identities.len() + 2
+                <= marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES,
+            "market admission token capacity"
+        );
         for token in &market.token_ids {
-            self.identities.insert(token.clone(),expected.clone());
+            self.identities.insert(token.clone(), expected.clone());
             self.waiting.insert(token.clone());
         }
         Ok(true)
@@ -106,7 +217,12 @@ impl Adapter {
             epochs: BTreeMap::new(),
             sequences: BTreeMap::new(),
             book_received: BTreeMap::new(),
+            book_source: BTreeMap::new(),
+            depth_checksums: BTreeMap::new(),
             last_trades: BTreeMap::new(),
+            confirmations: Vec::new(),
+            conflated_raw_hashes: HashSet::new(),
+            conflated_raw_order: VecDeque::new(),
         }
     }
     fn reset_connection(&mut self) {
@@ -117,7 +233,12 @@ impl Adapter {
         self.epochs.clear();
         self.sequences.clear();
         self.book_received.clear();
+        self.book_source.clear();
+        self.depth_checksums.clear();
         self.last_trades.clear();
+        self.confirmations.clear();
+        self.conflated_raw_hashes.clear();
+        self.conflated_raw_order.clear();
     }
     fn new(plan: &Plan, seed: &Value) -> Result<Self> {
         let market_states: BTreeMap<_, _> = seed["markets"]
@@ -141,8 +262,15 @@ impl Adapter {
             .as_array()
             .context("market seed")?
             .iter()
-            .filter(|market| market["lifecycle_state"] == "closed" || market["lifecycle_state"] == "resolved")
-            .flat_map(|market| market["identity"]["outcomes"].as_array().into_iter().flatten())
+            .filter(|market| {
+                market["lifecycle_state"] == "closed" || market["lifecycle_state"] == "resolved"
+            })
+            .flat_map(|market| {
+                market["identity"]["outcomes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
             .filter_map(|outcome| outcome["token_id"].as_str())
             .collect();
         let active: BTreeSet<_> = market_states
@@ -162,7 +290,9 @@ impl Adapter {
             }
         }
         ensure!(
-            !identities.is_empty() && identities.len() <= marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES,
+            !identities.is_empty()
+                && identities.len()
+                    <= marketcow_runtime::discovery_source::MAX_SOURCE_TOKEN_IDENTITIES,
             "bounded active WS universe required"
         );
         let mut ticks = BTreeMap::new();
@@ -199,16 +329,17 @@ impl Adapter {
                 // durable history, but do not let it poison the active WS
                 // identity set or force a recovery for a retired token.
                 if !identities.contains_key(&token) {
-                    let market = recovery["market_id"]
-                        .as_str()
-                        .context("recovery market")?;
+                    let market = recovery["market_id"].as_str().context("recovery market")?;
                     ensure!(
                         market_states
                             .get(market)
                             .is_some_and(|state| state == "closed" || state == "resolved"),
                         "recovery token outside scope"
                     );
-                    ensure!(terminal_tokens.contains(token.as_str()), "recovery token outside scope");
+                    ensure!(
+                        terminal_tokens.contains(token.as_str()),
+                        "recovery token outside scope"
+                    );
                     return Ok(None);
                 }
                 Ok(Some((
@@ -233,8 +364,13 @@ impl Adapter {
             epochs: BTreeMap::new(),
             sequences: BTreeMap::new(),
             book_received: BTreeMap::new(),
+            book_source: BTreeMap::new(),
+            depth_checksums: BTreeMap::new(),
             last_trades: BTreeMap::new(),
             recoveries,
+            confirmations: Vec::new(),
+            conflated_raw_hashes: HashSet::new(),
+            conflated_raw_order: VecDeque::new(),
         })
     }
     fn invalidate(
@@ -248,8 +384,9 @@ impl Adapter {
             .identities
             .get(token)
             .context("unknown recovery token")?;
-        let attempt = uuid::Uuid::new_v4().to_string();
         let at = wire_time(received)?;
+        let attempt = canonical_hash(&json!({"token_id":token,"reason":reason,
+            "received_at":at,"publisher_cursor":cursor}));
         let payload = json!({"recovery_scope":"token","token_id":token,"recovery_id":attempt,"reason":reason});
         let gap = json!({"token_id":token,"code":"coverage_gap","resolved":false,
             "detected_at":at,"event_at":null,"expected":null,"observed":null,"resolution":null});
@@ -269,6 +406,8 @@ impl Adapter {
         self.epochs.remove(token);
         self.sequences.remove(token);
         self.book_received.remove(token);
+        self.book_source.remove(token);
+        self.depth_checksums.remove(token);
         self.last_trades.remove(token);
         Ok(event)
     }
@@ -290,6 +429,202 @@ impl Adapter {
         self.invalidate(token, reason, received, cursor).map(Some)
     }
 
+    // This check is deliberately conservative. It normalizes every supplier
+    // frame before considering a replacement and never conflates a top-level,
+    // BBO or recovery observation. All tokens in one supplier frame remain
+    // together; any uncertainty falls through
+    // to the original one-frame reducer and its fail-closed behavior.
+    fn depth_conflation_candidate(
+        &self,
+        frame: &RawTransportFrame,
+        require_live_state: bool,
+    ) -> Option<DepthConflationCandidate> {
+        let raw = &frame.raw_payload;
+        if raw["event_type"] != "price_change" || raw.get("marketcow_conflation").is_some() {
+            return None;
+        }
+        let source_changes = raw["price_changes"].as_array()?;
+        if source_changes.iter().any(|change| {
+            let price = &change["price"];
+            change["best_bid"].is_null() || change["best_ask"].is_null()
+                || price == &change["best_bid"] || price == &change["best_ask"]
+        }) {
+            return None;
+        }
+        let normalized = normalize_frame_with_book_tick(
+            &self.config, raw.clone(), frame.received_at, 1, None,
+        ).ok()?;
+        if normalized.is_empty() || normalized.iter().any(|event| event.source.delayed) {
+            return None;
+        }
+        if require_live_state && normalized.iter().any(|event|
+            self.conflated_raw_hashes.contains(&event.source.raw_sha256)) {
+            return None;
+        }
+        let mut market_id = None;
+        let mut condition_id = None;
+        let mut tokens = BTreeMap::new();
+        for event in &normalized {
+            let EventKind::AtomicDelta {
+                token_id, changes, best_bid: Some(best_bid), best_ask: Some(best_ask),
+            } = &event.kind else { return None; };
+            if require_live_state && self.waiting.contains(token_id) {
+                return None;
+            }
+            let (market, condition) = self.identities.get(token_id)?;
+            if raw["market"].as_str() != Some(condition.as_str()) || market.is_empty()
+                || market_id.as_ref().is_some_and(|id| id != market)
+                || condition_id.as_ref().is_some_and(|id| id != condition) {
+                return None;
+            }
+            market_id = Some(market.clone());
+            condition_id = Some(condition.clone());
+            if require_live_state {
+                let projection = self.engines.get(token_id)?.projection();
+                let book = projection.books.get(token_id)?;
+                if book.source_observed_at.is_some_and(|at| event.source_observed_at <= at) {
+                    return None;
+                }
+                // Deep-level replacement is safe only when the reducer has
+                // the same *previous* two-sided BBO as the supplier frame.
+                // A one-sided book (or a changed top) must retain every raw
+                // frame so downstream delta preimages remain reconstructible.
+                if book.bids.keys().next_back() != Some(best_bid)
+                    || book.asks.keys().next() != Some(best_ask) {
+                    return None;
+                }
+            }
+            let tick = self.ticks.get(token_id)?;
+            let mut final_changes = BTreeMap::new();
+            for change in changes {
+                let side = match change.side {
+                    marketcow_core::Side::Bid => "BUY",
+                    marketcow_core::Side::Ask => "SELL",
+                };
+                for level in &change.levels {
+                    let strictly_below_top = change.side == marketcow_core::Side::Bid
+                        && level.price.0 < best_bid.0;
+                    let strictly_above_top = change.side == marketcow_core::Side::Ask
+                        && level.price.0 > best_ask.0;
+                    if !(strictly_below_top || strictly_above_top)
+                        || !(level.price.0 % tick.0).is_zero() {
+                        return None;
+                    }
+                    let price = level.price.0.to_string();
+                    final_changes.insert((side.to_owned(), price.clone()), json!({
+                        "asset_id":token_id,
+                        "side":side,
+                        "price":price,
+                        "size":level.quantity.to_string(),
+                        "best_bid":best_bid.0.to_string(),
+                        "best_ask":best_ask.0.to_string(),
+                    }));
+                }
+            }
+            if final_changes.is_empty() { return None; }
+            tokens.insert(token_id.clone(), DepthTokenConflation {
+                best_bid: best_bid.clone(), best_ask: best_ask.clone(), changes: final_changes,
+            });
+        }
+        Some(DepthConflationCandidate {
+            market_id: market_id?, condition_id: condition_id?,
+            observed_at: normalized[0].source_observed_at, tokens,
+        })
+    }
+
+    fn flush_depth_conflation(
+        pending: &mut Vec<RawTransportFrame>,
+        candidate: &mut Option<DepthConflationCandidate>,
+        output: &mut Vec<RawTransportFrame>,
+    ) {
+        let Some(info) = candidate.take() else { return; };
+        if pending.len() < 2 {
+            output.append(pending);
+            return;
+        }
+        // The aggregate carries the originals as immutable evidence. Never
+        // turn an otherwise admissible input into an oversized public event.
+        if serde_json::to_vec(&*pending).map_or(true, |bytes| bytes.len() > 4 * 1024 * 1024) {
+            output.append(pending);
+            return;
+        }
+        let first_received_at = pending[0].received_at;
+        let last = pending.last().expect("nonempty conflation");
+        let last_received_at = last.received_at;
+        let timestamp = last.raw_payload.get("timestamp").cloned()
+            .unwrap_or_else(|| json!(wire_time(last_received_at).expect("valid receipt")));
+        let source_frames = std::mem::take(pending).into_iter().map(|frame| json!({
+            "received_at":wire_time(frame.received_at).expect("valid receipt"),
+            "raw_payload":frame.raw_payload,
+        })).collect::<Vec<_>>();
+        let source_frame_count = source_frames.len();
+        output.push(RawTransportFrame {
+            raw_payload: json!({
+                "event_type":"price_change",
+                "market":info.condition_id,
+                "timestamp":timestamp,
+                "price_changes":info.tokens.values().flat_map(|token|
+                    token.changes.values().cloned()).collect::<Vec<_>>(),
+                "marketcow_conflation":{
+                    "schema_version":"marketcow.polymarket.depth-conflation.v2",
+                    "market_id":info.market_id,
+                    "token_ids":info.tokens.keys().collect::<Vec<_>>(),
+                    "first_received_at":wire_time(first_received_at).expect("valid receipt"),
+                    "last_received_at":wire_time(last_received_at).expect("valid receipt"),
+                    "source_frame_count":source_frame_count,
+                    "source_frames":source_frames,
+                },
+            }),
+            received_at:last_received_at,
+        });
+    }
+
+    fn conflate_depth_frames(&self, frames: Vec<RawTransportFrame>, require_live_state: bool) -> Vec<RawTransportFrame> {
+        if frames.len() < 2 { return frames; }
+        let mut output = Vec::with_capacity(frames.len());
+        let mut pending: Vec<RawTransportFrame> = Vec::new();
+        let mut candidate: Option<DepthConflationCandidate> = None;
+        for frame in frames {
+            let next = self.depth_conflation_candidate(&frame, require_live_state);
+            let compatible = candidate.as_ref().zip(next.as_ref()).is_some_and(|(old, new)| {
+                old.market_id == new.market_id
+                    && old.condition_id == new.condition_id
+                    && old.tokens.len() == new.tokens.len()
+                    && old.tokens.iter().all(|(id, token)| new.tokens.get(id)
+                        .is_some_and(|other| token.best_bid == other.best_bid
+                            && token.best_ask == other.best_ask))
+                    && new.observed_at >= old.observed_at
+                    && frame.received_at >= pending[0].received_at
+                    && (frame.received_at - pending[0].received_at).num_microseconds()
+                        .is_some_and(|elapsed| elapsed <= DEPTH_CONFLATION_WINDOW_US)
+                    && pending.len() < OWNER_COALESCE_FRAMES
+                    && !pending.iter().any(|earlier: &RawTransportFrame|
+                        earlier.raw_payload == frame.raw_payload)
+            });
+            if !pending.is_empty() && !compatible {
+                Self::flush_depth_conflation(&mut pending, &mut candidate, &mut output);
+            }
+            if let Some(mut next) = next {
+                if let Some(old) = candidate.as_mut() {
+                    for (id, mut token) in next.tokens {
+                        old.tokens.get_mut(&id).expect("compatible token set")
+                            .changes.append(&mut token.changes);
+                    }
+                    old.observed_at = next.observed_at;
+                } else {
+                    candidate = Some(next);
+                }
+                pending.push(frame);
+            } else {
+                output.push(frame);
+            }
+        }
+        if !pending.is_empty() {
+            Self::flush_depth_conflation(&mut pending, &mut candidate, &mut output);
+        }
+        output
+    }
+
     /// Preserve an upstream multi-token frame as an atomic unit. If validation
     /// fails after partially reducing it, invalidate every token in that frame,
     /// never unrelated markets. No partially reduced output escapes.
@@ -299,6 +634,15 @@ impl Adapter {
         received: chrono::DateTime<Utc>,
         after: u64,
     ) -> Result<Vec<Value>> {
+        if raw["event_type"] == "price_change" && !self.conflated_raw_hashes.is_empty()
+            && self.conflated_raw_hashes.contains(&canonical_hash(&raw))
+        {
+            return Ok(Vec::new());
+        }
+        let conflated_source_hashes = raw["marketcow_conflation"]["source_frames"]
+            .as_array().map(|frames| frames.iter().filter_map(|frame|
+                frame.get("raw_payload").map(canonical_hash)).collect::<Vec<_>>())
+            .unwrap_or_default();
         let mut affected = BTreeSet::new();
         if let Some(token) = raw["asset_id"].as_str() {
             affected.insert(token.to_owned());
@@ -328,12 +672,14 @@ impl Adapter {
             "unsubscribed frame identity"
         );
         let source_gap = raw["event_type"] == "source_gap";
-        let source_gap_diagnostic = source_gap.then(|| json!({
-            "transport_reason":raw["transport_reason"],
-            "close_code":raw["close_code"],
-            "close_reason":raw["close_reason"],
-            "transport_attempt":raw["attempt"],
-        }));
+        let source_gap_diagnostic = source_gap.then(|| {
+            json!({
+                "transport_reason":raw["transport_reason"],
+                "close_code":raw["close_code"],
+                "close_reason":raw["close_reason"],
+                "transport_attempt":raw["attempt"],
+            })
+        });
         let full = raw["event_type"] == "book";
         // A price-change array is one atomic market observation. If any member
         // lacks continuity, do not partially advance its healthy sibling.
@@ -347,6 +693,16 @@ impl Adapter {
         };
         match result {
             Ok(mut events) => {
+                for hash in conflated_source_hashes {
+                    if self.conflated_raw_hashes.insert(hash.clone()) {
+                        self.conflated_raw_order.push_back(hash);
+                    }
+                }
+                while self.conflated_raw_order.len() > 10_000 {
+                    if let Some(oldest) = self.conflated_raw_order.pop_front() {
+                        self.conflated_raw_hashes.remove(&oldest);
+                    }
+                }
                 if full && let Some(snapshot) = events.first() {
                     let token = snapshot["token_id"]
                         .as_str()
@@ -383,13 +739,15 @@ impl Adapter {
                 } else {
                     "source_validation_failed"
                 };
-                let invalidatable = affected.iter().filter(|token| {
-                    !source_gap || !self.recoveries.contains_key(*token)
-                }).cloned().collect::<Vec<_>>();
+                let invalidatable = affected
+                    .iter()
+                    .filter(|token| !source_gap || !self.recoveries.contains_key(*token))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 if invalidatable.is_empty() {
                     return Ok(Vec::new());
                 }
-                eprintln!(
+                marketcow_polymarket::async_eprintln!(
                     "{}",
                     json!({"stage":"token_invalidation","tokens":invalidatable,"reason":reason,
                         "detail":error.to_string(),"source_gap":source_gap_diagnostic})
@@ -418,10 +776,41 @@ impl Adapter {
         received: chrono::DateTime<Utc>,
         after: u64,
     ) -> Result<Vec<Value>> {
+        if let Some(metadata) = raw.get("marketcow_conflation") {
+            ensure!(metadata["schema_version"] == "marketcow.polymarket.depth-conflation.v2",
+                "unsupported depth conflation schema");
+            let frames = metadata["source_frames"].as_array()
+                .context("conflation source frames missing")?;
+            ensure!(frames.len() >= 2 && frames.len() <= OWNER_COALESCE_FRAMES
+                && metadata["source_frame_count"].as_u64() == Some(frames.len() as u64),
+                "conflation source frame count");
+            let originals = frames.iter().map(|frame| {
+                let raw_payload = frame.get("raw_payload").context("conflation raw frame")?.clone();
+                let received_at = chrono::DateTime::parse_from_rfc3339(
+                    frame["received_at"].as_str().context("conflation receipt")?)?
+                    .with_timezone(&Utc);
+                Ok(RawTransportFrame { raw_payload, received_at })
+            }).collect::<Result<Vec<_>>>()?;
+            // The aggregate was selected before this batch was applied. Earlier
+            // frames in the same batch may already have advanced the book and
+            // dedupe cache, so verify the immutable supplier preimage without
+            // reapplying live-state eligibility against a later state.
+            let rebuilt = self.conflate_depth_frames(originals, false);
+            ensure!(rebuilt.len() == 1
+                && wire_time(rebuilt[0].received_at)? == wire_time(received)?
+                && rebuilt[0].raw_payload == raw,
+                "conflation does not match validated supplier frames");
+        }
         let kind = raw["event_type"]
             .as_str()
             .context("missing WS event_type")?
             .to_owned();
+        let source_hash = raw["marketcow_conflation"]["source_frames"]
+            .as_array()
+            .and_then(|frames| frames.last())
+            .and_then(|frame| frame.get("raw_payload"))
+            .map(canonical_hash)
+            .unwrap_or_else(|| canonical_hash(&raw));
         if kind == "source_gap" {
             let token = raw["asset_id"].as_str().context("gap token")?;
             ensure!(
@@ -500,14 +889,11 @@ impl Adapter {
                 .context("missing materialized WS book")?;
             if full {
                 self.waiting.remove(&token);
-                self.epochs.insert(token.clone(),canonical_hash(&json!({"connection_snapshot":uuid::Uuid::new_v4().to_string(),"token_id":token})));
+                self.epochs.insert(token.clone(),canonical_hash(&json!({
+                    "connection_snapshot_cursor":after.checked_add(output.len() as u64+1).context("cursor overflow")?,
+                    "received_at":wire_time(received)?,"source_hash":canonical_hash(&raw),"token_id":token})));
                 self.sequences.insert(token.clone(), 0);
             }
-            let sequence = self
-                .sequences
-                .get_mut(&token)
-                .context("delta without full-book epoch")?;
-            *sequence = sequence.checked_add(1).context("sequence overflow")?;
             let tick = book.tick_size.as_ref().context("missing tick")?;
             self.ticks.insert(token.clone(), tick.clone());
             if full {
@@ -546,29 +932,101 @@ impl Adapter {
                 .map(|(p, q)| json!({"price":p.0.to_string(),"size":q.to_string()}))
                 .collect();
             let at = wire_time(received)?;
-            let exchange = wire_time(observed)?;
-            if matches!(kind.as_str(), "book" | "price_change") {
+            let event_source = wire_time(observed)?;
+            let checksum = canonical_hash(
+                &json!({"token_id":token,"tick_size":tick.0.to_string(),"bids":bids,"asks":asks}),
+            );
+            if matches!(kind.as_str(), "price_change" | "best_bid_ask")
+                && self
+                    .depth_checksums
+                    .get(&token)
+                    .is_some_and(|previous| previous == &checksum)
+            {
+                // This is a new, non-replayed venue observation (the exact
+                // replay path returned above) whose fully reduced depth is
+                // already visible.  It confirms only this token in the hot
+                // projection; it is not a state mutation and must not advance
+                // the public sequence/cursor or durability watermark.
+                self.confirmations.push(ReducedBookConfirmation {
+                    market_id: market,
+                    condition_id: condition,
+                    book_epoch: self.epochs.get(&token)
+                        .context("confirmation book epoch missing")?.clone(),
+                    book_sequence: *self.sequences.get(&token)
+                        .context("confirmation book sequence missing")?,
+                    book_received_at: *self.book_received.get(&token)
+                        .context("confirmation book receipt missing")?,
+                    token_id: token,
+                    state_checksum: checksum,
+                    exchange_at: observed,
+                    received_at: received,
+                    source_hash: source_hash.clone(),
+                });
+                continue;
+            }
+            self.depth_checksums.insert(token.clone(), checksum.clone());
+            if matches!(kind.as_str(), "book" | "price_change" | "tick_size_change") {
+                // Local receipt is retained for diagnosis and ordering only.
                 self.book_received.insert(token.clone(), received);
             }
+            if matches!(kind.as_str(), "book" | "price_change") {
+                self.book_source.insert(token.clone(), observed);
+            }
+            let quote_source = wire_time(*self.book_source.get(&token)
+                .context("missing supplier quote time")?)?;
             let book_at = wire_time(
                 *self
                     .book_received
                     .get(&token)
                     .context("missing book observation")?,
             )?;
-            let checksum = canonical_hash(
-                &json!({"token_id":token,"tick_size":tick.0.to_string(),"bids":bids,"asks":asks}),
-            );
+            let sequence = {
+                let sequence = self
+                    .sequences
+                    .get_mut(&token)
+                    .context("delta without full-book epoch")?;
+                *sequence = sequence.checked_add(1).context("sequence overflow")?;
+                *sequence
+            };
             let model = json!({"token_id":token,"condition_id":condition,"book_epoch":self.epochs[&token],
-                "sequence":sequence,"sequence_semantics":"deterministic_normalized","exchange_at":exchange,
+                "sequence":sequence,"sequence_semantics":"deterministic_normalized","exchange_at":quote_source,
                 "received_at":book_at,"tick_version":book.tick_version,"tick_size":tick.0.to_string(),
                 "bids":bids,"asks":asks,"last_trade_price":self.last_trades.get(&token).map(|p|p.0.to_string()),
-                "state_checksum":checksum,"source_hash":canonical_hash(&raw)});
+                "state_checksum":checksum,"source_hash":source_hash});
             let mut envelope = json!({"contract_version":"marketcow.prediction_market.v1","schema_version":"marketcow.polymarket.live.v2",
                 "cursor":after.checked_add(output.len() as u64+1).context("cursor overflow")?,"event_type":"book",
                 "market_id":market,"condition_id":condition,"token_id":token,"book_epoch":self.epochs[&token],"sequence":sequence,
-                "exchange_at":exchange,"received_at":at,"canonical_payload_sha256":canonical_hash(&model),"canonical_payload":model,
+                "exchange_at":event_source,"received_at":at,"canonical_payload_sha256":canonical_hash(&model),"canonical_payload":model,
                 "raw_payload_sha256":canonical_hash(&raw),"raw_payload":raw,"applied":true,"fail_closed_reason":null,"gaps":[]});
+            if kind == "price_change" {
+                let EventKind::AtomicDelta { changes, .. } = &applied.persisted.event.kind else {
+                    anyhow::bail!("price change did not persist an atomic delta")
+                };
+                let replay_changes = changes
+                    .iter()
+                    .flat_map(|change| {
+                        let side = match change.side {
+                            marketcow_core::Side::Bid => "BUY",
+                            marketcow_core::Side::Ask => "SELL",
+                        };
+                        let token = token.clone();
+                        change.levels.iter().map(move |level| {
+                            json!({"asset_id":token,"side":side,
+                                "price":level.price.0.to_string(),
+                                "size":level.quantity.to_string()})
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                ensure!(
+                    !replay_changes.is_empty(),
+                    "mutating price change has no replay-complete delta"
+                );
+                // Private actor-to-publication handoff. compact_incremental_events
+                // consumes and removes it before event identity/validation. Unlike
+                // raw_payload.price_changes, this includes reducer-synthesized BBO
+                // removals and therefore exactly replays the committed post-state.
+                envelope["_replay_complete_delta"] = json!({"changes":replay_changes});
+            }
             envelope["event_id"] = json!(canonical_hash(&envelope));
             output.push(envelope);
         }
@@ -678,7 +1136,13 @@ fn recovery_event(
     gaps: Vec<Value>,
 ) -> Value {
     // Recovery is a producer control record, never a fabricated upstream book.
-    let raw = json!({"recovery_scope":"token","reason":payload.get("reason"),"recovery_id":payload["recovery_id"]});
+    let raw_source_event_type = if payload["reason"] == "source_connection_gap" {
+        "source_gap"
+    } else {
+        kind
+    };
+    let raw = json!({"recovery_scope":"token","source_event_type":raw_source_event_type,
+        "reason":payload.get("reason"),"recovery_id":payload["recovery_id"]});
     let mut event = json!({"contract_version":"marketcow.prediction_market.v1","schema_version":"marketcow.polymarket.live.v2",
         "cursor":cursor,"event_type":kind,"market_id":market,"condition_id":condition,"token_id":token,
         "book_epoch":null,"sequence":null,"exchange_at":at,"received_at":at,
@@ -702,8 +1166,100 @@ fn wire_time(value: chrono::DateTime<Utc>) -> Result<String> {
 }
 
 #[cfg(test)]
+pub(crate) fn btc5m_reducer_fixture_sequence() -> Result<Vec<Value>> {
+    use chrono::TimeZone;
+    let condition = format!("0x{}", "1".repeat(64));
+    let plan = Plan {
+        schema_version: "fixture".into(),
+        catalog_revision: "a".repeat(64),
+        markets: vec![super::Market {
+            market_id: "4944030".into(),
+            condition_id: condition.clone(),
+            token_ids: ["101".into(), "102".into()],
+        }],
+    };
+    let seed = json!({"scope_id":"btc5m-fixture-scope",
+        "markets":[{"identity":{"market_id":"4944030"},"lifecycle_state":"active"}],
+        "books":[{"token_id":"101","tick_size":"0.01"},{"token_id":"102","tick_size":"0.01"}]});
+    let mut adapter = Adapter::new(&plan, &seed)?;
+    let at = |millis| Utc.timestamp_millis_opt(millis).single().unwrap();
+    let mut events = Vec::new();
+    events.extend(adapter.apply_isolated(
+        json!({"event_type":"book","asset_id":"101",
+        "market":condition,"timestamp":"1790400604000","hash":"fixture-book-1","tick_size":"0.01",
+        "bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.60","size":"10"}],
+        "last_trade_price":"0.50"}),
+        at(1790400604010),
+        42,
+    )?);
+    events.extend(adapter.apply_isolated(
+        json!({"event_type":"book","asset_id":"102",
+        "market":condition,"timestamp":"1790400604020","hash":"fixture-book-down-1","tick_size":"0.01",
+        "bids":[{"price":"0.39","size":"8"}],"asks":[{"price":"0.61","size":"9"}],
+        "last_trade_price":"0.50"}),
+        at(1790400604030),
+        43,
+    )?);
+    events.extend(adapter.apply_isolated(json!({"event_type":"price_change","market":condition,
+        "timestamp":"1790400605000","price_changes":[{"asset_id":"101","side":"BUY",
+        "price":"0.40","size":"0","best_bid":"0.41","best_ask":"0.60"},
+        {"asset_id":"101","side":"BUY","price":"0.41","size":"8","best_bid":"0.41","best_ask":"0.60"}]}),
+        at(1790400605010),44)?);
+    events.extend(adapter.apply_isolated(
+        json!({"event_type":"last_trade_price","asset_id":"101",
+        "market":condition,"timestamp":"1790400606000","price":"0.52"}),
+        at(1790400606010),
+        45,
+    )?);
+    events.extend(adapter.apply_isolated(
+        json!({"event_type":"source_gap","asset_id":"101",
+        "transport_reason":"fixture_gap","close_code":null,"close_reason":null,"attempt":1}),
+        at(1790400607000),
+        46,
+    )?);
+    events.extend(adapter.apply_isolated(
+        json!({"event_type":"book","asset_id":"101",
+        "market":condition,"timestamp":"1790400608000","hash":"fixture-book-2","tick_size":"0.01",
+        "bids":[{"price":"0.42","size":"9"}],"asks":[{"price":"0.58","size":"11"}],
+        "last_trade_price":"0.52"}),
+        at(1790400608010),
+        47,
+    )?);
+    Ok(events)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_coalescing_preserves_order_and_gap_boundaries() {
+        let received_at = Utc::now();
+        let frames = ["book", "price_change", "source_gap", "source_gap", "book"]
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, event_type)| RawTransportFrame {
+                raw_payload: json!({"event_type":event_type,"sequence":sequence}),
+                received_at,
+            })
+            .collect();
+        let groups = split_transport_control_boundaries(frames);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [2, 2, 1]);
+        assert_eq!(groups.into_iter().flatten()
+            .map(|frame| frame.raw_payload["sequence"].as_u64().unwrap())
+            .collect::<Vec<_>>(), (0..5).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn owner_coalescing_caps_actor_inputs() {
+        let received_at = Utc::now();
+        let frames = (0..130).map(|sequence| RawTransportFrame {
+            raw_payload: json!({"event_type":"price_change","sequence":sequence}),
+            received_at,
+        }).collect();
+        let groups = split_transport_control_boundaries(frames);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [64, 64, 2]);
+    }
 
     #[test]
     fn targeted_confirmation_retry_stays_inside_freshness_budget() {
@@ -719,8 +1275,14 @@ mod tests {
         assert_eq!(recovery_retry_delay(2), std::time::Duration::from_secs(10));
         assert_eq!(recovery_retry_delay(9), std::time::Duration::from_secs(60));
         assert_eq!(audit_batch_offset(300, 0, 5), std::time::Duration::ZERO);
-        assert_eq!(audit_batch_offset(300, 1, 5), std::time::Duration::from_secs(60));
-        assert_eq!(audit_batch_offset(300, 4, 5), std::time::Duration::from_secs(240));
+        assert_eq!(
+            audit_batch_offset(300, 1, 5),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            audit_batch_offset(300, 4, 5),
+            std::time::Duration::from_secs(240)
+        );
     }
 
     #[tokio::test]
@@ -742,6 +1304,26 @@ mod tests {
     }
 
     #[test]
+    fn targeted_http_confirmation_is_complete_unique_and_book_typed() {
+        let received = Utc::now();
+        let expected = BTreeSet::from(["11".into(), "12".into()]);
+        let book = |token: &str| {
+            json!({"asset_id":token,"timestamp":"1","tick_size":"0.01",
+                "bids":[{"price":"0.4","size":"1"}],
+                "asks":[{"price":"0.6","size":"1"}]})
+        };
+        let frames =
+            confirmation_frames(vec![book("12"), book("11")], &expected, received).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| {
+            frame.raw_payload["event_type"] == "book" && frame.received_at == received
+        }));
+        assert!(confirmation_frames(vec![book("11")], &expected, received).is_err());
+        assert!(confirmation_frames(vec![book("11"), book("11")], &expected, received).is_err());
+        assert!(confirmation_frames(vec![book("11"), book("13")], &expected, received).is_err());
+    }
+
+    #[test]
     fn lifecycle_lookup_uses_the_exact_failed_catalog_identity() {
         let market = catalog_market(&json!({
             "identity": {
@@ -754,23 +1336,24 @@ mod tests {
         assert_eq!(market.market_id, "3418199");
         assert_eq!(market.condition_id, "0xcondition");
         assert_eq!(market.token_ids, ["yes", "no"]);
-        assert!(catalog_market(&json!({
-            "identity": {
-                "market_id": "1",
-                "condition_id": "c",
-                "outcomes": [{"token_id": "only-one"}]
-            }
-        }))
-        .is_err());
+        assert!(
+            catalog_market(&json!({
+                "identity": {
+                    "market_id": "1",
+                    "condition_id": "c",
+                    "outcomes": [{"token_id": "only-one"}]
+                }
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]
     async fn disabled_confirmation_finishes_without_network_io() {
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
         let (_stop, shutdown) = tokio::sync::watch::channel(false);
-        let (_membership_sender, membership) = tokio::sync::watch::channel(
-            BTreeSet::from(["1".to_owned()]),
-        );
+        let (_membership_sender, membership) =
+            tokio::sync::watch::channel(BTreeSet::from(["1".to_owned()]));
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(50),
             run_confirmations(
@@ -808,26 +1391,309 @@ mod tests {
     fn book(token: &str, now: chrono::DateTime<Utc>) -> Value {
         json!({"event_type":"book","asset_id":token,"market":"condition","timestamp":now.timestamp_millis().to_string(),"hash":"upstream","bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]})
     }
+    fn deep_change(size: &str, at: chrono::DateTime<Utc>) -> RawTransportFrame {
+        RawTransportFrame {
+            raw_payload: json!({"event_type":"price_change","market":"condition",
+                "timestamp":at.timestamp_millis().to_string(),"price_changes":[{
+                    "asset_id":"11","side":"BUY","price":"0.30","size":size,
+                    "best_bid":"0.4","best_ask":"0.6"}]}),
+            received_at: at,
+        }
+    }
+    fn paired_deep_change(size: &str, at: chrono::DateTime<Utc>) -> RawTransportFrame {
+        RawTransportFrame {
+            raw_payload: json!({"event_type":"price_change","market":"condition",
+                "timestamp":at.timestamp_millis().to_string(),"price_changes":[
+                    {"asset_id":"11","side":"BUY","price":"0.30","size":size,
+                        "best_bid":"0.4","best_ask":"0.6"},
+                    {"asset_id":"12","side":"SELL","price":"0.70","size":size,
+                        "best_bid":"0.4","best_ask":"0.6"}]}),
+            received_at: at,
+        }
+    }
+
+    #[test]
+    fn paired_token_microburst_commits_both_books_and_preserves_source_identity() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let first = paired_deep_change("1", now + chrono::Duration::milliseconds(1));
+        let last = paired_deep_change("2", now + chrono::Duration::milliseconds(2));
+        let mut sequential = fixture();
+        let mut conflated = fixture();
+        for adapter in [&mut sequential, &mut conflated] {
+            adapter.apply_isolated(book("11", now), now, 0).unwrap();
+            adapter.apply_isolated(book("12", now), now, 1).unwrap();
+        }
+        sequential.apply_isolated(first.raw_payload.clone(), first.received_at, 2).unwrap();
+        let expected = sequential.apply_isolated(last.raw_payload.clone(), last.received_at, 4).unwrap();
+        assert_eq!(expected.len(), 2);
+        let frames = conflated.conflate_depth_frames(vec![first.clone(), last.clone()], true);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].raw_payload["marketcow_conflation"]["token_ids"], json!(["11", "12"]));
+        assert_eq!(frames[0].raw_payload["marketcow_conflation"]["source_frame_count"], 2);
+        let actual = conflated.apply_isolated(frames[0].raw_payload.clone(), frames[0].received_at, 2).unwrap();
+        assert_eq!(actual.len(), 2);
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual["token_id"], expected["token_id"]);
+            assert_eq!(actual["canonical_payload"]["bids"], expected["canonical_payload"]["bids"]);
+            assert_eq!(actual["canonical_payload"]["asks"], expected["canonical_payload"]["asks"]);
+            assert_eq!(actual["canonical_payload"]["state_checksum"],
+                expected["canonical_payload"]["state_checksum"]);
+        }
+        let compact = compact_btc5m_fixture_events(actual).unwrap();
+        assert_eq!(compact.len(), 2);
+        for event in &compact {
+            let typed = crate::source_btc5m_proto::market_event(event).unwrap();
+            assert!(matches!(typed.payload,
+                Some(marketcow_contracts::btc5m_market_local_v3::wire::market_event::Payload::BookDelta(_))));
+        }
+        assert!(conflated.apply_isolated(last.raw_payload, last.received_at, 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn conflation_preimage_check_does_not_recheck_later_dedupe_state() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let first = paired_deep_change("1", now + chrono::Duration::milliseconds(1));
+        let last = paired_deep_change("2", now + chrono::Duration::milliseconds(2));
+        let mut adapter = fixture();
+        adapter.apply_isolated(book("11", now), now, 0).unwrap();
+        adapter.apply_isolated(book("12", now), now, 1).unwrap();
+        let frames = adapter.conflate_depth_frames(vec![first.clone(), last], true);
+        assert_eq!(frames.len(), 1);
+        // Selection is performed for the whole input batch before reduction.
+        // The live dedupe cache can advance before a selected aggregate is
+        // applied; immutable-preimage verification must not depend on it.
+        adapter.conflated_raw_hashes.insert(canonical_hash(&first.raw_payload));
+        let applied = adapter.apply_isolated(frames[0].raw_payload.clone(), frames[0].received_at, 2).unwrap();
+        assert_eq!(applied.len(), 2);
+        assert!(!adapter.waiting.contains("11"));
+        assert!(!adapter.waiting.contains("12"));
+    }
+
+    #[test]
+    fn paired_token_microburst_flushes_when_one_token_bbo_changes() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let mut adapter = fixture();
+        adapter.apply_isolated(book("11", now), now, 0).unwrap();
+        adapter.apply_isolated(book("12", now), now, 1).unwrap();
+        let first = paired_deep_change("1", now + chrono::Duration::milliseconds(1));
+        let mut changed = paired_deep_change("2", now + chrono::Duration::milliseconds(2));
+        changed.raw_payload["price_changes"][1]["best_bid"] = json!("0.5");
+        let frames = adapter.conflate_depth_frames(vec![first, changed], true);
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| frame.raw_payload.get("marketcow_conflation").is_none()));
+    }
+
+    #[test]
+    fn depth_conflation_keeps_raw_frames_without_matching_previous_two_sided_bbo() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        for previous_bids in [json!([]), json!([{"price":"0.35","size":"10"}])] {
+            let mut adapter = fixture();
+            let mut one_side_or_different_top = book("11", now);
+            one_side_or_different_top["bids"] = previous_bids;
+            adapter.apply_isolated(one_side_or_different_top, now, 0).unwrap();
+            adapter.apply_isolated(book("12", now), now, 1).unwrap();
+            let first = paired_deep_change("1", now + chrono::Duration::milliseconds(1));
+            let second = paired_deep_change("2", now + chrono::Duration::milliseconds(2));
+            let frames = adapter.conflate_depth_frames(vec![first.clone(), second.clone()], true);
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0].raw_payload, first.raw_payload);
+            assert_eq!(frames[1].raw_payload, second.raw_payload);
+        }
+    }
+
+    #[test]
+    fn paired_token_microburst_keeps_distinct_levels_on_both_sides() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let first = paired_deep_change("1", now + chrono::Duration::milliseconds(1));
+        let mut second = paired_deep_change("2", now + chrono::Duration::milliseconds(2));
+        second.raw_payload["price_changes"][0]["price"] = json!("0.20");
+        second.raw_payload["price_changes"][1]["price"] = json!("0.80");
+        let mut sequential = fixture();
+        let mut conflated = fixture();
+        for adapter in [&mut sequential, &mut conflated] {
+            adapter.apply_isolated(book("11", now), now, 0).unwrap();
+            adapter.apply_isolated(book("12", now), now, 1).unwrap();
+        }
+        sequential.apply_isolated(first.raw_payload.clone(), first.received_at, 2).unwrap();
+        let expected = sequential.apply_isolated(second.raw_payload.clone(), second.received_at, 4).unwrap();
+        let frames = conflated.conflate_depth_frames(vec![first, second], true);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].raw_payload["price_changes"].as_array().unwrap().len(), 4);
+        let actual = conflated.apply_isolated(frames[0].raw_payload.clone(), frames[0].received_at, 2).unwrap();
+        assert_eq!(actual.len(), 2);
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(actual["canonical_payload"]["state_checksum"],
+                expected["canonical_payload"]["state_checksum"]);
+        }
+    }
+
+    #[test]
+    fn deep_microburst_preserves_final_book_and_exact_source_frames() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let first = deep_change("1", now + chrono::Duration::milliseconds(1));
+        let last = deep_change("2", now + chrono::Duration::milliseconds(2));
+        let mut sequential = fixture();
+        let mut conflated = fixture();
+        for adapter in [&mut sequential, &mut conflated] {
+            adapter.apply_isolated(book("11", now), now, 0).unwrap();
+        }
+        sequential.apply_isolated(first.raw_payload.clone(), first.received_at, 1).unwrap();
+        let expected = sequential.apply_isolated(last.raw_payload.clone(), last.received_at, 2).unwrap();
+        let frames = conflated.conflate_depth_frames(vec![first.clone(), last.clone()], true);
+        assert_eq!(frames.len(), 1);
+        let originals = frames[0].raw_payload["marketcow_conflation"]["source_frames"]
+            .as_array().unwrap();
+        assert_eq!(originals.len(), 2);
+        assert_eq!(frames[0].raw_payload["marketcow_conflation"]["source_frame_count"], 2);
+        assert_eq!(originals[0]["raw_payload"], first.raw_payload);
+        assert_eq!(originals[1]["raw_payload"], last.raw_payload);
+        let actual = conflated.apply_isolated(frames[0].raw_payload.clone(), frames[0].received_at, 1).unwrap();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["canonical_payload"]["bids"], expected[0]["canonical_payload"]["bids"]);
+        assert_eq!(actual[0]["canonical_payload"]["asks"], expected[0]["canonical_payload"]["asks"]);
+        assert_eq!(actual[0]["canonical_payload"]["state_checksum"], expected[0]["canonical_payload"]["state_checksum"]);
+        let compact = compact_btc5m_fixture_events(actual.clone()).unwrap();
+        let typed = crate::source_btc5m_proto::market_event(&compact[0]).unwrap();
+        assert!(matches!(typed.payload,
+            Some(marketcow_contracts::btc5m_market_local_v3::wire::market_event::Payload::BookDelta(_))));
+        assert_eq!(typed.raw_payload_sha256,
+            hex::decode(compact[0]["raw_payload_sha256"].as_str().unwrap()).unwrap());
+        assert_eq!(typed.event_id,
+            hex::decode(compact[0]["event_id"].as_str().unwrap()).unwrap());
+        assert!(conflated.apply_isolated(last.raw_payload, last.received_at, 2).unwrap().is_empty(),
+            "exact replay of an original frame cannot refresh the conflated book");
+    }
+
+    #[test]
+    fn deep_microburst_flushes_on_bbo_control_and_receipt_window() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let mut adapter = fixture();
+        adapter.apply_isolated(book("11", now), now, 0).unwrap();
+        let first = deep_change("1", now + chrono::Duration::milliseconds(1));
+        let second = deep_change("2", now + chrono::Duration::milliseconds(2));
+        let late = deep_change("3", now + chrono::Duration::milliseconds(5));
+        assert_eq!(adapter.conflate_depth_frames(vec![first.clone(), second.clone(), late], true).len(), 2);
+        let control = RawTransportFrame {
+            raw_payload: json!({"event_type":"last_trade_price","asset_id":"11",
+                "market":"condition","timestamp":now.timestamp_millis().to_string(),"price":"0.5"}),
+            received_at: now + chrono::Duration::milliseconds(2),
+        };
+        assert_eq!(adapter.conflate_depth_frames(vec![first, control, second], true).len(), 3);
+    }
+
+    #[test]
+    fn deep_microburst_never_absorbs_top_level_or_invalid_frame() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let mut adapter = fixture();
+        adapter.apply_isolated(book("11", now), now, 0).unwrap();
+        let first = deep_change("1", now + chrono::Duration::milliseconds(1));
+        let mut top = deep_change("9", now + chrono::Duration::milliseconds(2));
+        top.raw_payload["price_changes"][0]["price"] = json!("0.4");
+        let last = deep_change("2", now + chrono::Duration::milliseconds(3));
+        let frames = adapter.conflate_depth_frames(vec![first.clone(), top, last.clone()], true);
+        assert_eq!(frames.len(), 3);
+        let mut invalid = deep_change("2", now + chrono::Duration::milliseconds(2));
+        invalid.raw_payload["price_changes"][0]["size"] = json!("not-a-decimal");
+        let frames = adapter.conflate_depth_frames(vec![first, invalid, last], true);
+        assert_eq!(frames.len(), 3);
+        assert!(frames.iter().all(|frame| frame.raw_payload.get("marketcow_conflation").is_none()));
+    }
+
+    #[test]
+    fn bounded_deep_burst_has_same_final_depth_as_sequential_reduction() {
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let mut sequential = fixture();
+        let mut conflated = fixture();
+        for adapter in [&mut sequential, &mut conflated] {
+            adapter.apply_isolated(book("11", now), now, 0).unwrap();
+        }
+        let frames = (0..64).map(|index| {
+            deep_change(&(index + 1).to_string(),
+                now + chrono::Duration::microseconds(1_000 + index * 20))
+        }).collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            expected = sequential.apply_isolated(frame.raw_payload.clone(),
+                frame.received_at, 1 + index as u64).unwrap();
+        }
+        let actual_frames = conflated.conflate_depth_frames(frames, true);
+        assert_eq!(actual_frames.len(), 1);
+        let actual = conflated.apply_isolated(actual_frames[0].raw_payload.clone(),
+            actual_frames[0].received_at, 1).unwrap();
+        assert_eq!(actual[0]["canonical_payload"]["state_checksum"],
+            expected[0]["canonical_payload"]["state_checksum"]);
+        assert_eq!(actual[0]["canonical_payload"]["bids"],
+            expected[0]["canonical_payload"]["bids"]);
+    }
+    #[test]
+    fn public_replay_delta_contains_reducer_synthesized_bbo_removals() {
+        let mut adapter = fixture();
+        let now = Utc::now().with_nanosecond(0).unwrap();
+        let mut snapshot = book("11", now);
+        snapshot["bids"] = json!([
+            {"price":"0.42","size":"3"},
+            {"price":"0.40","size":"10"}
+        ]);
+        adapter.apply_isolated(snapshot, now, 0).unwrap();
+        let raw = json!({"event_type":"price_change","market":"condition",
+        "timestamp":now.timestamp_millis().to_string(),"price_changes":[
+            {"asset_id":"11","side":"BUY","price":"0.40","size":"0",
+             "best_bid":"0.41","best_ask":"0.60"},
+            {"asset_id":"11","side":"BUY","price":"0.41","size":"8",
+             "best_bid":"0.41","best_ask":"0.60"}
+        ]});
+        let events = adapter.apply_isolated(raw, now, 1).unwrap();
+        assert_eq!(events.len(), 1);
+        let changes = events[0]["_replay_complete_delta"]["changes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            changes.iter().any(|row| {
+                row["side"] == "BUY" && row["price"] == "0.42" && row["size"] == "0"
+            })
+        );
+        assert!(
+            events[0]["canonical_payload"]["bids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["price"] != "0.42")
+        );
+    }
     #[test]
     fn missing_initial_tick_is_local_until_authoritative_snapshot() {
-        let plan = Plan { schema_version: "test".into(), catalog_revision: "catalog".into(),
-            markets: vec![super::super::Market { market_id:"1".into(), condition_id:"condition".into(),
-                token_ids:["11".into(),"12".into()] }] };
-        let mut a = Adapter::new(&plan, &json!({"scope_id":"scope",
+        let plan = Plan {
+            schema_version: "test".into(),
+            catalog_revision: "catalog".into(),
+            markets: vec![super::super::Market {
+                market_id: "1".into(),
+                condition_id: "condition".into(),
+                token_ids: ["11".into(), "12".into()],
+            }],
+        };
+        let mut a = Adapter::new(
+            &plan,
+            &json!({"scope_id":"scope",
             "markets":[{"identity":{"market_id":"1"},"lifecycle_state":"active"}],
-            "books":[{"token_id":"12","tick_size":"0.01"}]})).unwrap();
+            "books":[{"token_id":"12","tick_size":"0.01"}]}),
+        )
+        .unwrap();
         let now = Utc::now();
         let failed = a.apply_isolated(book("11", now), now, 0).unwrap();
         assert_eq!(failed[0]["event_type"], "recovery_started");
         assert!(!a.ticks.contains_key("11"));
         assert!(a.waiting.contains("11"));
-        let healthy = a.apply_isolated(book("12", now), now, failed.len() as u64).unwrap();
+        let healthy = a
+            .apply_isolated(book("12", now), now, failed.len() as u64)
+            .unwrap();
         assert_eq!(healthy[0]["event_type"], "book");
         assert!(!a.waiting.contains("12"));
         assert!(a.waiting.contains("11"));
         let mut authoritative = book("11", now);
         authoritative["tick_size"] = json!("0.01");
-        let recovered = a.apply_isolated(authoritative, now, (failed.len()+healthy.len()) as u64).unwrap();
+        let recovered = a
+            .apply_isolated(authoritative, now, (failed.len() + healthy.len()) as u64)
+            .unwrap();
         assert!(recovered.iter().any(|event| event["event_type"] == "book"));
         assert!(a.ticks.contains_key("11"));
         assert!(!a.waiting.contains("11"));
@@ -865,20 +1731,12 @@ mod tests {
         let now = Utc::now();
         adapter.apply_isolated(book("11", now), now, 0).unwrap();
         let first = adapter
-            .apply_isolated(
-                json!({"event_type":"source_gap","asset_id":"11"}),
-                now,
-                1,
-            )
+            .apply_isolated(json!({"event_type":"source_gap","asset_id":"11"}), now, 1)
             .unwrap();
         assert_eq!(first.len(), 1);
         let recovery = adapter.recoveries["11"].clone();
         let duplicate = adapter
-            .apply_isolated(
-                json!({"event_type":"source_gap","asset_id":"11"}),
-                now,
-                2,
-            )
+            .apply_isolated(json!({"event_type":"source_gap","asset_id":"11"}), now, 2)
             .unwrap();
         assert!(duplicate.is_empty());
         assert_eq!(adapter.recoveries["11"], recovery);
@@ -1005,6 +1863,99 @@ mod tests {
         let fresh = a.apply(raw, later, 1).unwrap();
         assert_eq!(fresh[0]["cursor"], 2);
         assert_ne!(a.epochs["11"], epoch);
+    }
+    #[test]
+    fn repeated_level_with_new_transport_identity_becomes_memory_confirmation() {
+        let mut a = fixture();
+        let now = Utc::now();
+        a.apply(book("11", now), now, 0).unwrap();
+        let later = now + chrono::Duration::seconds(1);
+        let unchanged = json!({"event_type":"price_change","market":"condition",
+            "timestamp":later.timestamp_millis().to_string(),
+            "price_changes":[{"asset_id":"11","side":"BUY","price":"0.4","size":"10",
+                "best_bid":"0.4","best_ask":"0.6"}]});
+        assert!(a.apply(unchanged, later, 1).unwrap().is_empty());
+        assert_eq!(a.book_received["11"], now);
+        assert_eq!(a.sequences["11"], 1);
+        assert_eq!(a.confirmations.len(), 1);
+        let confirmation = &a.confirmations[0];
+        assert_eq!(confirmation.token_id, "11");
+        assert_eq!(confirmation.received_at, later);
+        assert_eq!(confirmation.market_id, "1");
+
+        let changed = json!({"event_type":"price_change","market":"condition",
+            "timestamp":later.timestamp_millis().to_string(),
+            "price_changes":[{"asset_id":"11","side":"BUY","price":"0.4","size":"9",
+                "best_bid":"0.4","best_ask":"0.6"}]});
+        let output = a.apply(changed, later, 1).unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(a.book_received["11"], later);
+        assert_eq!(a.sequences["11"], 2);
+        assert_eq!(a.confirmations.len(), 1);
+    }
+    #[test]
+    fn matching_bbo_is_confirmation_only_and_does_not_create_a_wire_sequence_hole() {
+        let mut a = fixture();
+        let now = Utc::now();
+        a.apply(book("11", now), now, 0).unwrap();
+        let later = now + chrono::Duration::seconds(1);
+        let bbo = json!({"event_type":"best_bid_ask","asset_id":"11",
+            "market":"condition","timestamp":later.timestamp_millis().to_string(),
+            "best_bid":"0.4","best_ask":"0.6"});
+        assert!(a.apply(bbo, later, 1).unwrap().is_empty());
+        assert_eq!(a.sequences["11"], 1);
+        assert_eq!(a.book_received["11"], now);
+        assert_eq!(a.confirmations.len(), 1);
+        assert_eq!(a.confirmations[0].token_id, "11");
+
+        let changed = json!({"event_type":"price_change","market":"condition",
+            "timestamp":later.timestamp_millis().to_string(),
+            "price_changes":[{"asset_id":"11","side":"BUY","price":"0.4","size":"9",
+                "best_bid":"0.4","best_ask":"0.6"}]});
+        let output = a.apply(changed, later, 1).unwrap();
+        assert_eq!(output[0]["sequence"], 2);
+        assert_eq!(output[0]["canonical_payload"]["sequence"], 2);
+    }
+    #[test]
+    fn tick_change_does_not_refresh_supplier_quote_clock() {
+        let mut a = fixture();
+        let now = Utc::now();
+        let baseline = a.apply(book("11", now), now, 0).unwrap();
+        let quote_source = baseline[0]["canonical_payload"]["exchange_at"].clone();
+        let later = now + chrono::Duration::seconds(1);
+        let tick = json!({"event_type":"tick_size_change","asset_id":"11",
+            "market":"condition","timestamp":later.timestamp_millis().to_string(),
+            "old_tick_size":"0.01","new_tick_size":"0.01"});
+        let output = a.apply(tick, later, 1).unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["raw_payload"]["event_type"], "tick_size_change");
+        assert_eq!(output[0]["received_at"], wire_time(later).unwrap());
+        assert_eq!(
+            output[0]["canonical_payload"]["received_at"],
+            output[0]["received_at"]
+        );
+        assert_eq!(a.book_received["11"], later);
+        assert_eq!(a.sequences["11"], 2);
+        assert_eq!(output[0]["canonical_payload"]["exchange_at"], quote_source);
+    }
+
+    #[test]
+    fn trade_source_time_is_separate_from_the_unchanged_book_quote_time() {
+        let mut a = fixture();
+        let now = Utc::now();
+        let baseline = a.apply(book("11", now), now, 0).unwrap();
+        let quote_source = baseline[0]["canonical_payload"]["exchange_at"].clone();
+        let later = now + chrono::Duration::seconds(1);
+        let trade = json!({"event_type":"last_trade_price","asset_id":"11",
+            "market":"condition","timestamp":later.timestamp_millis().to_string(),
+            "price":"0.41"});
+        let output = a.apply(trade, later, 1).unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["canonical_payload"]["exchange_at"], quote_source);
+        assert_eq!(output[0]["exchange_at"],
+            wire_time(chrono::DateTime::<Utc>::from_timestamp_millis(
+                later.timestamp_millis()).unwrap()).unwrap());
+        assert_eq!(output[0]["canonical_payload"]["last_trade_price"], "0.41");
     }
     #[test]
     fn delayed_delta_is_delivered_but_disconnect_still_requires_baseline() {
@@ -1174,7 +2125,9 @@ pub async fn run(
     plan: &Plan,
     seed: Value,
     publication: &mut Publication,
-    acquisition:Option<tokio::sync::mpsc::Receiver<super::source_scope_control::AcquisitionRequest>>,
+    acquisition: Option<
+        tokio::sync::mpsc::Receiver<super::source_scope_control::AcquisitionRequest>,
+    >,
 ) -> Result<()> {
     ensure!(
         args.cycles.is_none(),
@@ -1248,7 +2201,7 @@ async fn recover_snapshots(
         expected.len() == tokens.len(),
         "duplicate target recovery token"
     );
-    let (send, mut receive) = tokio::sync::mpsc::channel(1);
+    let (send, mut receive) = transport_output(8, TRANSPORT_BATCH_BYTES, TRANSPORT_BATCH_BYTES)?;
     let (stop, shutdown) = tokio::sync::watch::channel(false);
     let mut job = tokio::spawn(run_polymarket_transport(
         PolymarketTransportConfig::production(),
@@ -1294,6 +2247,94 @@ async fn recover_snapshots(
         let _ = job.await;
     }
     result
+}
+
+/// Read one complete, bounded authoritative HTTP snapshot for an exact token
+/// pair. This is used only for manager-requested freshness observations; gap
+/// recovery continues to use the independently fenced WS recovery path.
+async fn confirm_snapshots(
+    client: reqwest::Client,
+    tokens: Vec<String>,
+    response_byte_limit: usize,
+) -> Result<Vec<marketcow_polymarket::RawTransportFrame>> {
+    ensure!(
+        !tokens.is_empty(),
+        "target confirmation token scope is empty"
+    );
+    let expected: BTreeSet<_> = tokens.iter().cloned().collect();
+    ensure!(
+        expected.len() == tokens.len(),
+        "duplicate target confirmation token"
+    );
+    let request = tokens
+        .iter()
+        .map(|token| json!({"token_id":token}))
+        .collect::<Vec<_>>();
+    let mut response = client
+        .post(marketcow_polymarket::CLOB_BOOK_SNAPSHOT_SOURCE_URL)
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?;
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|bytes| bytes <= response_byte_limit as u64),
+        "target confirmation response byte budget"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            body.len()
+                .checked_add(chunk.len())
+                .is_some_and(|bytes| bytes <= response_byte_limit),
+            "target confirmation response byte budget"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    let received_at = Utc::now();
+    let values: Vec<Value> = serde_json::from_slice(&body)?;
+    confirmation_frames(values, &expected, received_at)
+}
+
+fn confirmation_frames(
+    values: Vec<Value>,
+    expected: &BTreeSet<String>,
+    received_at: chrono::DateTime<Utc>,
+) -> Result<Vec<marketcow_polymarket::RawTransportFrame>> {
+    ensure!(
+        values.len() == expected.len(),
+        "target confirmation incomplete response"
+    );
+    let mut frames = BTreeMap::new();
+    for value in values {
+        let mut book = value
+            .as_object()
+            .cloned()
+            .context("target confirmation book object")?;
+        let token = book
+            .get("asset_id")
+            .and_then(Value::as_str)
+            .context("target confirmation token")?
+            .to_owned();
+        ensure!(
+            expected.contains(&token) && !frames.contains_key(&token),
+            "target confirmation unexpected or duplicate token"
+        );
+        book.insert("event_type".into(), Value::String("book".into()));
+        frames.insert(
+            token,
+            marketcow_polymarket::RawTransportFrame {
+                raw_payload: Value::Object(book),
+                received_at,
+            },
+        );
+    }
+    ensure!(
+        &frames.keys().cloned().collect::<BTreeSet<_>>() == expected,
+        "target confirmation token set differs"
+    );
+    Ok(frames.into_values().collect())
 }
 
 type FreshnessResult = (
@@ -1412,25 +2453,111 @@ fn connection_shards(
     Ok(shards)
 }
 
-fn eligible_markets(adapter:&Adapter, requested:&BTreeSet<String>)->BTreeSet<String> {
-    adapter.identities.values().map(|(market,_)|market.clone()).filter(|market|requested.contains(market)).collect()
+fn eligible_markets(adapter: &Adapter, requested: &BTreeSet<String>) -> BTreeSet<String> {
+    adapter
+        .identities
+        .values()
+        .map(|(market, _)| market.clone())
+        .filter(|market| requested.contains(market))
+        .collect()
 }
-fn eligible_pairs(adapter:&Adapter, markets:&BTreeSet<String>)->Result<Vec<[String;2]>> {
-    let mut pairs=BTreeMap::<String,Vec<String>>::new();
-    for (token,(market,_)) in &adapter.identities {
-        if markets.contains(market){pairs.entry(market.clone()).or_default().push(token.clone());}
+fn eligible_pairs(adapter: &Adapter, markets: &BTreeSet<String>) -> Result<Vec<[String; 2]>> {
+    let mut pairs = BTreeMap::<String, Vec<String>>::new();
+    for (token, (market, _)) in &adapter.identities {
+        if markets.contains(market) {
+            pairs.entry(market.clone()).or_default().push(token.clone());
+        }
     }
-    pairs.into_values().map(|mut pair|{pair.sort();pair.try_into().map_err(|_|anyhow::anyhow!("eligible acquisition market pair"))}).collect()
+    pairs
+        .into_values()
+        .map(|mut pair| {
+            pair.sort();
+            pair.try_into()
+                .map_err(|_| anyhow::anyhow!("eligible acquisition market pair"))
+        })
+        .collect()
 }
-fn pause_acquisition(adapter:&mut Adapter,pipeline:&pipeline::Pipeline,publication:&Publication,jobs:&mut super::source_acquisition_shards::Shards)->Result<()> {
-    publication.pause_source()?;pipeline.pause_all(adapter)?;
-    let tokens=jobs.tokens();if !tokens.is_empty(){let _=jobs.request_retire(&tokens)?;}
-    publication.set_acquisition_statistics(jobs.statistics());Ok(())
+fn pause_acquisition(
+    adapter: &mut Adapter,
+    pipeline: &pipeline::Pipeline,
+    publication: &Publication,
+    jobs: &mut super::source_acquisition_shards::Shards,
+) -> Result<()> {
+    publication.pause_source()?;
+    pipeline.pause_all(adapter)?;
+    let tokens = jobs.tokens();
+    if !tokens.is_empty() {
+        let _ = jobs.request_retire(&tokens)?;
+    }
+    update_acquisition_metrics(publication, jobs);
+    Ok(())
 }
-fn lease_status(leases:&super::source_acquisition_lease::Leases,adapter:&Adapter,publication:&Publication,
-    requested:&BTreeSet<String>,now:std::time::Instant)->Value {
-    let mut value=leases.status(&eligible_markets(adapter,requested),now);
-    value["source_ready"]=json!(publication.is_source_ready());value
+fn update_acquisition_metrics(
+    publication: &Publication,
+    jobs: &super::source_acquisition_shards::Shards,
+) {
+    publication.set_acquisition_metrics(jobs.statistics(), jobs.management_statistics(),
+        jobs.tokens(), jobs.draining_tokens());
+}
+/// A scope retirement is an owner-local fence from the first irreversible
+/// wire/actor action through both the writer receipt and wire release. Control
+/// preflight is not a lease lock: only this serial owner can decide the final
+/// lease state before beginning retirement.
+#[derive(Default)]
+struct ScopeRetirementFences(BTreeMap<String, ScopeRetirementFence>);
+struct ScopeRetirementFence {
+    tokens: BTreeSet<String>,
+    ticket: Option<u64>,
+}
+impl ScopeRetirementFences {
+    fn unqueued_markets(&self) -> BTreeSet<String> {
+        self.0.iter().filter(|(_, fence)| fence.ticket.is_none())
+            .map(|(id, _)| id.clone()).collect()
+    }
+    fn check_retire(&self, leases: &super::source_acquisition_lease::Leases,
+        markets: &BTreeSet<String>) -> Result<()> {
+        ensure!(markets.is_disjoint(&leases.market_ids()),
+            "active acquisition lease protects retirement");
+        ensure!(markets.iter().all(|market| !self.0.contains_key(market)),
+            "scope retirement already draining");
+        Ok(())
+    }
+    fn check_admission(&self, markets: &BTreeSet<String>) -> Result<()> {
+        ensure!(markets.iter().all(|market| !self.0.contains_key(market)),
+            "scope retirement draining; reacquire requires completed receipts");
+        Ok(())
+    }
+    fn begin(&mut self, markets: &BTreeSet<String>,
+        identities: &BTreeMap<String, (String, String)>) {
+        for market in markets {
+            let tokens = identities.iter().filter(|(_, (owner, _))| owner == market)
+                .map(|(token, _)| token.clone()).collect();
+            self.0.insert(market.clone(), ScopeRetirementFence { tokens, ticket: None });
+        }
+    }
+    fn cancel_unstarted(&mut self, markets: &BTreeSet<String>) {
+        for market in markets { self.0.remove(market); }
+    }
+    fn set_ticket(&mut self, markets: &BTreeSet<String>, ticket: u64) {
+        for market in markets {
+            self.0.get_mut(market).unwrap().ticket = Some(ticket);
+        }
+    }
+    fn reconcile(&mut self, persisted_ticket: u64, wire_tokens: &BTreeSet<String>) {
+        self.0.retain(|_, fence| !fence.ticket.is_some_and(|ticket|
+            persisted_ticket >= ticket && fence.tokens.is_disjoint(wire_tokens)));
+    }
+}
+fn lease_status(
+    leases: &super::source_acquisition_lease::Leases,
+    adapter: &Adapter,
+    publication: &Publication,
+    requested: &BTreeSet<String>,
+    now: std::time::Instant,
+) -> Value {
+    let mut value = leases.status(&eligible_markets(adapter, requested), now);
+    value["source_ready"] = json!(publication.is_source_ready());
+    value
 }
 
 struct ConfirmationBatch {
@@ -1457,8 +2584,8 @@ async fn run_confirmations(
     interval_seconds: u64,
     sender: tokio::sync::mpsc::Sender<ConfirmationBatch>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-    network:Arc<tokio::sync::Semaphore>,
-    membership:tokio::sync::watch::Receiver<BTreeSet<String>>,
+    network: Arc<tokio::sync::Semaphore>,
+    membership: tokio::sync::watch::Receiver<BTreeSet<String>>,
 ) -> Result<()> {
     // Healthy WebSocket operation must not imply a parallel full-book REST
     // downloader. Zero is the production default and performs no network I/O.
@@ -1468,7 +2595,7 @@ async fn run_confirmations(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(request_timeout_seconds))
         .build()?;
-    ensure!(concurrency>0,"confirmation concurrency");
+    ensure!(concurrency > 0, "confirmation concurrency");
     let mut jobs = tokio::task::JoinSet::new();
     let batch_count = markets.len().div_ceil(market_batch_size);
     for (batch_index, batch) in markets.chunks(market_batch_size).enumerate() {
@@ -1477,7 +2604,7 @@ async fn run_confirmations(
         let network = network.clone();
         let sender = sender.clone();
         let mut shutdown = shutdown.clone();
-        let mut membership=membership.clone();
+        let mut membership = membership.clone();
         jobs.spawn(async move {
             let offset = audit_batch_offset(interval_seconds, batch_index, batch_count);
             if !offset.is_zero() {
@@ -1493,8 +2620,12 @@ async fn run_confirmations(
                 if *shutdown.borrow() {
                     return Ok::<(), anyhow::Error>(());
                 }
-                let batch:Vec<_>=batch.iter().filter(|market|membership.borrow().contains(&market.market_id)).cloned().collect();
-                if batch.is_empty(){
+                let batch: Vec<_> = batch
+                    .iter()
+                    .filter(|market| membership.borrow().contains(&market.market_id))
+                    .cloned()
+                    .collect();
+                if batch.is_empty() {
                     tokio::select! {
                         value=membership.changed()=>{value?;continue;},
                         value=shutdown.changed()=>{value?;if *shutdown.borrow(){return Ok(());}},
@@ -1554,6 +2685,32 @@ fn pending_market_recoveries(adapter: &Adapter) -> BTreeMap<String, BTreeMap<Str
     pending
 }
 
+async fn handle_acquisition_socket_failure(
+    adapter: &mut Adapter,
+    publication: &Publication,
+    pipeline: &pipeline::Pipeline,
+    tokens: &BTreeSet<String>,
+    reason: &str,
+    acquisition_enabled: bool,
+) -> Result<()> {
+    let markets = tokens.iter().filter_map(|token|
+        adapter.identities.get(token).map(|(market, _)| market.clone()))
+        .collect::<BTreeSet<_>>();
+    marketcow_polymarket::async_eprintln!("{}", json!({
+        "stage":"market_acquisition_socket_restarted",
+        "market_ids":&markets,"reason":reason,
+    }));
+    if acquisition_enabled {
+        for market in markets {
+            if pipeline.has_market(&market) {
+                pipeline.invalidate_or_fence_market(adapter, publication, &market,
+                    "market_socket_task_failed").await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_connection(
     adapter: &mut Adapter,
     publication: &mut Publication,
@@ -1568,36 +2725,72 @@ async fn run_connection(
     mut confirmation_markets: Vec<super::Market>,
     lifecycle_candidates: Vec<super::Market>,
     mut lifecycle_markets: BTreeMap<String, Value>,
-    mut acquisition:Option<tokio::sync::mpsc::Receiver<super::source_scope_control::AcquisitionRequest>>,
-    acquisition_token_budget:usize,
-    acquisition_socket_budget:usize,
-    acquisition_lease_required:bool,
-    acquisition_lease_capacity:usize,
-    acquisition_lease_max_seconds:u64,
+    mut acquisition: Option<
+        tokio::sync::mpsc::Receiver<super::source_scope_control::AcquisitionRequest>,
+    >,
+    acquisition_token_budget: usize,
+    acquisition_socket_budget: usize,
+    acquisition_lease_required: bool,
+    acquisition_lease_capacity: usize,
+    acquisition_lease_max_seconds: u64,
 ) -> Result<()> {
-    let (mut pipeline, mut completed_markets) = pipeline::Pipeline::start_with_workers(adapter, market_workers)?;
-    let mut acquisition_tokens:BTreeSet<_>=adapter.identities.keys().cloned().collect();
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+    let (mut pipeline, mut completed_markets) =
+        pipeline::Pipeline::start_with_workers(adapter, publication, market_workers)?;
+    let mut acquisition_tokens: BTreeSet<_> = adapter.identities.keys().cloned().collect();
+    let transport_budget = transport_budget(
+        TRANSPORT_QUEUE_BATCHES,
+        TRANSPORT_QUEUE_BYTES,
+        TRANSPORT_BATCH_BYTES,
+    )?;
+    let transport_metrics = transport_budget.clone();
     let (stop, shutdown) = tokio::sync::watch::channel(false);
-    let mut jobs=super::source_acquisition_shards::Shards::new(PolymarketTransportConfig::production(),
-        sender.clone(),acquisition_token_budget,acquisition_socket_budget,websocket_shard_tokens)?;
-    let mut initial_pairs=BTreeMap::<String,Vec<String>>::new();
-    for (token,(market,_)) in &adapter.identities {initial_pairs.entry(market.clone()).or_default().push(token.clone());}
-    let initial_pairs:Vec<[String;2]>=initial_pairs.into_values().map(|pair|pair.try_into()
-        .map_err(|_|anyhow::anyhow!("initial acquisition market pair"))).collect::<Result<_>>()?;
-    let mut leases=super::source_acquisition_lease::Leases::new(acquisition_lease_required,
-        acquisition_lease_capacity,std::time::Duration::from_secs(acquisition_lease_max_seconds))?;
-    if leases.enabled(){jobs.add_pairs(&initial_pairs)?;}else{pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;}
-    publication.set_acquisition_statistics(jobs.statistics());
-    drop(sender);
+    let mut jobs = super::source_acquisition_shards::Shards::new(
+        PolymarketTransportConfig::production(),
+        transport_budget,
+        acquisition_token_budget,
+        acquisition_socket_budget,
+        websocket_shard_tokens,
+    )?;
+    let mut initial_pairs = BTreeMap::<String, Vec<String>>::new();
+    for (token, (market, _)) in &adapter.identities {
+        initial_pairs
+            .entry(market.clone())
+            .or_default()
+            .push(token.clone());
+    }
+    let initial_pairs: Vec<[String; 2]> = initial_pairs
+        .into_values()
+        .map(|pair| {
+            pair.try_into()
+                .map_err(|_| anyhow::anyhow!("initial acquisition market pair"))
+        })
+        .collect::<Result<_>>()?;
+    let mut leases = super::source_acquisition_lease::Leases::new(
+        acquisition_lease_required,
+        acquisition_lease_capacity,
+        std::time::Duration::from_secs(acquisition_lease_max_seconds),
+    )?;
+    let mut scope_retirements = ScopeRetirementFences::default();
+    if leases.enabled() {
+        jobs.add_pairs(&initial_pairs)?;
+    } else {
+        pause_acquisition(adapter, &pipeline, publication, &mut jobs)?;
+    }
+    update_acquisition_metrics(publication, &jobs);
     let (confirmation_sender, mut confirmation_receiver) =
         tokio::sync::mpsc::channel(network_concurrency);
     let confirmation_shutdown = shutdown.clone();
-    let confirmation_network=Arc::new(tokio::sync::Semaphore::new(network_concurrency));
-    let (confirmation_membership,confirmation_members)=tokio::sync::watch::channel(
-        if leases.enabled(){confirmation_markets.iter().map(|market|market.market_id.clone()).collect::<BTreeSet<_>>()}
-        else{BTreeSet::new()});
-    let mut added_confirmation_jobs=tokio::task::JoinSet::new();
+    let confirmation_network = Arc::new(tokio::sync::Semaphore::new(network_concurrency));
+    let (confirmation_membership, confirmation_members) =
+        tokio::sync::watch::channel(if leases.enabled() {
+            confirmation_markets
+                .iter()
+                .map(|market| market.market_id.clone())
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        });
+    let mut added_confirmation_jobs = tokio::task::JoinSet::new();
     let confirmation_job = tokio::spawn(run_confirmations(
         confirmation_markets.clone(),
         request_market_batch_size,
@@ -1635,8 +2828,10 @@ async fn run_connection(
     let mut terminal_unsubscribes = BTreeMap::<String, BTreeSet<String>>::new();
     let mut recovery_jobs = tokio::task::JoinSet::<MarketRecoveryResult>::new();
     let mut freshness_jobs = tokio::task::JoinSet::<FreshnessResult>::new();
+    let mut manager_freshness_jobs = tokio::task::JoinSet::<FreshnessResult>::new();
     let mut recovering_markets = BTreeSet::new();
     let mut freshness_pending = BTreeSet::new();
+    let mut manager_freshness_pending = BTreeSet::new();
     let mut freshness_queued = BTreeMap::<String, super::Market>::new();
     let mut freshness_retry_at = BTreeMap::<String, tokio::time::Instant>::new();
     let mut rest_submitted = BTreeMap::<String, String>::new();
@@ -1644,12 +2839,17 @@ async fn run_connection(
     let mut recovery_failures = BTreeMap::<String, u32>::new();
     let mut retry_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut transport_metrics_at = tokio::time::Instant::now();
     let shutdown_requested = super::shutdown_signal();
     tokio::pin!(shutdown_requested);
     // A copied generation can already contain lifecycle-only terminal rows
     // from an earlier run. Re-observe only those bounded plan members whose
     // payout remained unresolved; never rescan the catalog.
-    for market in if leases.enabled(){lifecycle_candidates}else{Vec::new()} {
+    for market in if leases.enabled() {
+        lifecycle_candidates
+    } else {
+        Vec::new()
+    } {
         let seed_market = lifecycle_markets
             .get(&market.market_id)
             .context("lifecycle candidate missing from seed")?;
@@ -1671,30 +2871,74 @@ async fn run_connection(
         }
     }
     publication.set_source_ready(leases.enabled());
+    let mut pending_transport: Option<RawTransportBatch> = None;
     let result:Result<()>=async {
         loop {
+            jobs.reap_finished()?;
+            if let Some((tokens, reason)) = jobs.take_failure() {
+                if pending_transport.as_ref().is_some_and(|batch|
+                    batch.source_tokens() == &tokens) {
+                    pending_transport = None;
+                }
+                handle_acquisition_socket_failure(adapter, publication, &pipeline,
+                    &tokens, reason, leases.enabled()).await?;
+                update_acquisition_metrics(publication, &jobs);
+                continue;
+            }
+            // Keep control and shutdown branches selectable even while one
+            // overflow batch is pending. Never take that batch inside the
+            // select future: cancellation would silently drop it.
             let frames=tokio::select! {
                 request=async {match acquisition.as_mut(){Some(rx)=>rx.recv().await,None=>std::future::pending().await}}=>{
                     let Some(request)=request else {acquisition=None;continue;};
                     let result=(||->Result<Value>{
                         use super::source_scope_control::AcquisitionAction;
                         let command_now=std::time::Instant::now();
-                        if leases.required()&&leases.expire(command_now)>0&&!leases.enabled(){
-                            confirmation_membership.send_replace(BTreeSet::new());
-                            pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                        scope_retirements.reconcile(publication.reader().retirement_status()?.1,&jobs.tokens());
+                        if leases.required(){
+                            let expired=leases.expire(command_now);let after=leases.market_ids();
+                            if expired>0 {
+                                confirmation_membership.send_replace(after.clone());
+                            }
+                            if after.is_empty()&&expired>0 {
+                                pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                            } else if !after.is_empty() {
+                                // Reconcile orphaned wire ownership on every
+                                // command, not only on the expiry edge. A busy
+                                // shard command queue therefore cannot turn a
+                                // failed first retirement attempt into an
+                                // unbounded subscription leak.
+                                let desired_tokens:BTreeSet<_>=eligible_pairs(adapter,&after)?.into_iter().flatten().collect();
+                                let excess:BTreeSet<_>=jobs.tokens().difference(&desired_tokens).cloned().collect();
+                                if !excess.is_empty(){let _=jobs.request_retire(&excess)?;}
+                                update_acquisition_metrics(publication, &jobs);
+                            }
                         }
                         let request=match request.action {
                             AcquisitionAction::LeaseStatus{eligible_market_ids}=>return Ok(
                                 lease_status(&leases,adapter,publication,&eligible_market_ids,command_now)),
+                            AcquisitionAction::RetirementStatus{market_ids}=>return Ok(json!({
+                                "draining_market_ids":market_ids.into_iter()
+                                    .filter(|id|scope_retirements.0.contains_key(id)).collect::<Vec<_>>()
+                            })),
                             AcquisitionAction::AcquireLease{lease_id,ttl_seconds,market_ids,eligible_market_ids}=>{
+                                scope_retirements.check_admission(&market_ids)?;
                                 let now=std::time::Instant::now();let eligible=eligible_markets(adapter,&eligible_market_ids);
                                 let was_enabled=leases.enabled();
+                                leases.validate_acquire(&lease_id,std::time::Duration::from_secs(ttl_seconds),&market_ids,&eligible,now)?;
+                                let before=leases.market_ids();
+                                let mut after=before.clone();after.extend(market_ids.iter().cloned());
+                                let added:BTreeSet<_>=after.difference(&before).cloned().collect();
+                                let pairs=eligible_pairs(adapter,&added)?;jobs.validate_add_pairs(&pairs)?;
+                                if !pairs.is_empty(){
+                                    jobs.add_pairs(&pairs)?;
+                                }
                                 leases.acquire(lease_id,std::time::Duration::from_secs(ttl_seconds),market_ids,&eligible,now)?;
-                                if !was_enabled&&jobs.tokens().is_empty() {
-                                    jobs.add_pairs(&eligible_pairs(adapter,&eligible)?)?;
-                                    confirmation_membership.send_replace(eligible.clone());
+                                publication.resume_acquisition();
+                                if after!=before {
+                                    confirmation_membership.send_replace(after.clone());
                                     acquisition_tokens=jobs.tokens();
-                                    publication.set_acquisition_statistics(jobs.statistics());
+                                    update_acquisition_metrics(publication, &jobs);
                                 }
                                 if !was_enabled {
                                     for record in lifecycle_markets.values().filter(|record|matches!(record["lifecycle_state"].as_str(),
@@ -1714,14 +2958,125 @@ async fn run_connection(
                                 let active=leases.market_ids();
                                 return Ok(lease_status(&leases,adapter,publication,&active,now));
                             },
+                            AcquisitionAction::RefreshLeaseMarkets{lease_id,market_ids}=>{
+                                let now=std::time::Instant::now();
+                                let owned=leases.lease_market_ids(&lease_id,now)?;
+                                ensure!(!market_ids.is_empty()&&market_ids.is_subset(&owned),
+                                    "freshness request must be a nonempty subset of its lease");
+                                let mut accepted=Vec::new();
+                                for market_id in &market_ids {
+                                    let record=lifecycle_markets.get(market_id)
+                                        .context("freshness market missing")?;
+                                    let market=catalog_market(record)?;
+                                    if !manager_freshness_pending.insert(market_id.clone()) { continue; }
+                                    let requested=Utc::now();
+                                    let client=lifecycle_client.clone();
+                                    manager_freshness_jobs.spawn(async move {
+                                        let result=confirm_snapshots(client,market.token_ids.to_vec(),response_byte_limit).await;
+                                        (market,requested,result)
+                                    });
+                                    accepted.push(market_id.clone());
+                                }
+                                return Ok(json!({"schema_version":"marketcow.acquisition-freshness-request.v1",
+                                    "status":if accepted.is_empty(){"coalesced"}else{"accepted"},
+                                    "lease_id":lease_id,"market_ids":market_ids,
+                                    "accepted_market_ids":accepted,
+                                    "pending_markets":manager_freshness_pending.len()}));
+                            },
+                            AcquisitionAction::ReplaceLease{lease_id,ttl_seconds,expected_market_ids,market_ids,
+                                eligible_market_ids,removed_token_ids,added_token_ids}=>{
+                                scope_retirements.check_admission(&market_ids)?;
+                                let now=std::time::Instant::now();
+                                let expected=eligible_markets(adapter,&expected_market_ids);
+                                let available=eligible_markets(adapter,&eligible_market_ids);
+                                let desired=eligible_markets(adapter,&market_ids);
+                                ensure!(expected==expected_market_ids&&desired==market_ids&&desired.is_subset(&available),
+                                    "replacement lease contains unprepared market");
+                                ensure!(expected.difference(&desired).count()==1&&desired.difference(&expected).count()==1,
+                                    "replacement lease must rotate one market");
+                                leases.validate_replace(&lease_id,std::time::Duration::from_secs(ttl_seconds),&expected,&desired,&available,now)?;
+                                let union_before=leases.market_ids();
+                                let union_after=leases.union_after_replacement(&lease_id,&desired)?;
+                                let removed_union:BTreeSet<_>=union_before.difference(&union_after).cloned().collect();
+                                let added_union:BTreeSet<_>=union_after.difference(&union_before).cloned().collect();
+                                let removed_market=expected.difference(&desired).next().unwrap();
+                                let added_market=desired.difference(&expected).next().unwrap();
+                                ensure!(removed_token_ids.iter().all(|token|adapter.identities.get(token).is_some_and(|(market,_)|market==removed_market)),
+                                    "replacement removed token binding differs");
+                                ensure!(added_token_ids.iter().all(|token|adapter.identities.get(token).is_some_and(|(market,_)|market==added_market)),
+                                    "replacement added token binding differs");
+                                let _=jobs.poll_retirements()?;
+                                if removed_union.len()==1&&added_union.len()==1 {
+                                    if !jobs.request_pair_replacement(&removed_token_ids,&added_token_ids)? {
+                                        return Ok(json!({"schema_version":"marketcow.acquisition-lease-replacement.v1",
+                                            "status":"wire_membership_pending","lease_id":lease_id,
+                                            "expected_market_ids":expected,"market_ids":desired,
+                                            "wire_token_count":jobs.tokens().len(),"maximum_token_budget_preserved":true}));
+                                    }
+                                } else if removed_union.len()==1&&added_union.is_empty() {
+                                    let tokens:BTreeSet<_>=removed_token_ids.iter().cloned().collect();
+                                    if !jobs.request_retire(&tokens)? {
+                                        return Ok(json!({"schema_version":"marketcow.acquisition-lease-replacement.v1",
+                                            "status":"wire_membership_pending","lease_id":lease_id,
+                                            "expected_market_ids":expected,"market_ids":desired,
+                                            "wire_token_count":jobs.tokens().len(),"maximum_token_budget_preserved":true}));
+                                    }
+                                } else if removed_union.is_empty()&&added_union.len()==1 {
+                                    let pairs=eligible_pairs(adapter,&added_union)?;jobs.validate_add_pairs(&pairs)?;jobs.add_pairs(&pairs)?;
+                                } else {
+                                    ensure!(removed_union.is_empty()&&added_union.is_empty(),"replacement shared union differs by more than one market");
+                                }
+                                leases.replace(&lease_id,std::time::Duration::from_secs(ttl_seconds),&expected,
+                                    desired.clone(),&available,now)?;
+                                confirmation_membership.send_replace(union_after.clone());
+                                acquisition_tokens=jobs.tokens();
+                                update_acquisition_metrics(publication, &jobs);
+                                // A retained next window becomes current at the
+                                // UTC boundary. Its last real mutation may be
+                                // older than the execution freshness budget,
+                                // while the newly added next pair also needs a
+                                // current authoritative baseline. Reuse the
+                                // existing bounded targeted-WS recovery path
+                                // once per lease replacement; never turn this
+                                // into periodic whole-scope polling.
+                                for market_id in &desired {
+                                    let record = lifecycle_markets.get(market_id)
+                                        .context("replacement freshness market missing")?;
+                                    freshness_queued.insert(
+                                        market_id.clone(),
+                                        catalog_market(record)?,
+                                    );
+                                }
+                                start_freshness_jobs(
+                                    &mut freshness_queued,
+                                    &mut freshness_pending,
+                                    &mut freshness_jobs,
+                                    websocket_recovery_concurrency,
+                                );
+                                return Ok(json!({"schema_version":"marketcow.acquisition-lease-replacement.v1",
+                                    "status":"complete","lease":lease_status(&leases,adapter,publication,&available,now),
+                                    "wire_token_count":acquisition_tokens.len(),"maximum_token_budget_preserved":true}));
+                            },
                             AcquisitionAction::ReleaseLease{lease_id}=>{
-                                let now=std::time::Instant::now();leases.release(&lease_id)?;
+                                let now=std::time::Instant::now();
+                                let before=leases.market_ids();let after=leases.union_after_release(&lease_id)?;
+                                let removed:BTreeSet<_>=before.difference(&after).cloned().collect();
+                                let removed_tokens:BTreeSet<_>=eligible_pairs(adapter,&removed)?.into_iter().flatten().collect();
+                                let _=jobs.poll_retirements()?;
+                                if !removed_tokens.is_empty()&&!jobs.request_retire(&removed_tokens)? {
+                                    return Ok(json!({"schema_version":"marketcow.acquisition-lease-release.v1",
+                                        "status":"wire_membership_pending","lease_id":lease_id,
+                                        "market_ids":after,"wire_token_count":jobs.tokens().len()}));
+                                }
+                                leases.release(&lease_id)?;
                                 if !leases.enabled(){
                                     confirmation_membership.send_replace(BTreeSet::new());
                                     pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
+                                } else {
+                                    confirmation_membership.send_replace(after.clone());
                                 }
-                                let active=leases.market_ids();
-                                return Ok(lease_status(&leases,adapter,publication,&active,now));
+                                acquisition_tokens=jobs.tokens();update_acquisition_metrics(publication, &jobs);
+                                return Ok(lease_status(&leases,adapter,publication,&after,now));
                             },
                             AcquisitionAction::Scope{validate_only,catalog_revision,records,evidence_sha256,
                                 acquisition_market_ids,retire_market_ids}=>ScopeAcquisition{validate_only,catalog_revision,
@@ -1729,10 +3084,38 @@ async fn run_connection(
                         };
                         if !request.retire_market_ids.is_empty() {
                             let removed=&request.retire_market_ids;
+                            // The control worker may have persisted its intent
+                            // before a competing lease reached this serial owner.
+                            // Return an explicit pre-effect rejection so only
+                            // this case may safely cancel that journal intent.
+                            if !removed.is_disjoint(&leases.market_ids()) {
+                                if request.validate_only {
+                                    anyhow::bail!("active acquisition lease protects retirement");
+                                }
+                                return Ok(json!({"retirement_rejected_before_apply":"active_lease"}));
+                            }
+                            scope_retirements.check_retire(&leases,removed)?;
                             publication.check_retirement(removed.clone())?;
                             if request.validate_only{return Ok(json!({"retirement_validated":true,"publication_applied":false}));}
                             let retired_tokens:BTreeSet<_>=adapter.identities.iter().filter(|(_, (market,_))|removed.contains(market)).map(|(t,_)|t.clone()).collect();
-                            if !retired_tokens.is_empty(){jobs.begin_retire(&retired_tokens)?;}
+                            scope_retirements.begin(removed,&adapter.identities);
+                            let wire_retire_tokens:BTreeSet<_>=retired_tokens.intersection(&jobs.tokens()).cloned().collect();
+                            if !wire_retire_tokens.is_empty(){
+                                if let Err(error)=jobs.begin_retire(&wire_retire_tokens){
+                                    scope_retirements.cancel_unstarted(removed);
+                                    // begin_retire reserves every affected shard command slot
+                                    // before sending or mutating any shard. A failure here is
+                                    // therefore provably pre-effect, unlike a lost receipt after
+                                    // the command was accepted. Tell the journal owner so it can
+                                    // cancel only the matching durable intent.
+                                    marketcow_polymarket::async_eprintln!("{}", json!({
+                                        "stage":"scope_retirement_rejected_before_wire_apply",
+                                        "error":error.to_string(),
+                                    }));
+                                    return Ok(json!({"retirement_rejected_before_apply":
+                                        "wire_retirement_preflight"}));
+                                }
+                            }
                             for market in removed {
                                 if pipeline.has_market(market){pipeline.remove_market(adapter,market)?;}
                                 lifecycle_markets.remove(market);lifecycle_pending.remove(market);lifecycle_terminal.remove(market);
@@ -1741,8 +3124,11 @@ async fn run_connection(
                             confirmation_markets.retain(|m|!removed.contains(&m.market_id));
                             confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
                             acquisition_tokens=if leases.required(){jobs.tokens()}else{adapter.identities.keys().cloned().collect()};
+                            let ticket = publication.reader().retirement_status()?.0
+                                .checked_add(1).context("scope retirement ticket overflow")?;
                             publication.retire_catalog_markets(removed.clone())?;
-                            publication.set_acquisition_statistics(jobs.statistics());
+                            scope_retirements.set_ticket(removed,ticket);
+                            update_acquisition_metrics(publication, &jobs);
                             return Ok(json!({"retirement_queued":true,"retired_market_ids":removed,
                                 "source_cursor":publication.cursor()?,"wire_unsubscribe_confirmed":false}));
                         }
@@ -1764,8 +3150,15 @@ async fn run_connection(
                             if market.token_ids.iter().all(|t|!subscribed.contains(t)){added.push(market);}
                             else {ensure!(!actor_absent&&market.token_ids.iter().all(|t|subscribed.contains(t)),"acquisition retirement still pending");}
                         }
-                        let pairs:Vec<_>=added.iter().map(|m|m.token_ids.clone()).collect();
-                        jobs.validate_add_pairs(&pairs)?;
+                        scope_retirements.check_admission(&ids)?;
+                        let leased_markets = leases.market_ids();
+                        let wire_added:Vec<_>=added.iter()
+                            .filter(|market|!leases.required()
+                                || leased_markets.contains(&market.market_id))
+                            .cloned().collect();
+                        let wire_pairs:Vec<_>=wire_added.iter()
+                            .map(|market|market.token_ids.clone()).collect();
+                        jobs.validate_add_pairs(&wire_pairs)?;
                         if request.validate_only {
                             publication.check_catalog_admission(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,&request.acquisition_market_ids,acquisition_token_budget)?;
                             return Ok(json!({"acquisition_validated":true,"publication_applied":false}));
@@ -1773,22 +3166,15 @@ async fn run_connection(
                         publication.admit_catalog_markets_scoped(&request.catalog_revision,request.records.clone(),&request.evidence_sha256,
                             &request.acquisition_market_ids,acquisition_token_budget)?;
                         for market in &added {pipeline.install_admitted_market(adapter,publication,market)?;}
-                        if leases.enabled(){
-                            let active=leases.market_ids();
-                            let leased_pairs:Vec<_>=added.iter().filter(|market|active.contains(&market.market_id))
-                                .map(|market|market.token_ids.clone()).collect();
-                            jobs.add_pairs(&leased_pairs)?;
-                        }
-                        publication.set_acquisition_statistics(jobs.statistics());
+                        if leases.enabled(){jobs.add_pairs(&wire_pairs)?;}
+                        update_acquisition_metrics(publication, &jobs);
                         acquisition_tokens=if leases.required(){jobs.tokens()}else{adapter.identities.keys().cloned().collect()};
                         for record in request.records {lifecycle_markets.insert(record["identity"]["market_id"].as_str().unwrap().to_owned(),record);}
                         let added_ids:Vec<_>=added.iter().map(|m|m.market_id.clone()).collect();
-                        let active=leases.market_ids();
-                        let leased_added:Vec<_>=added.iter().filter(|market|active.contains(&market.market_id)).cloned().collect();
-                        if !leased_added.is_empty()&&leases.enabled() {
-                            confirmation_markets.extend(leased_added.clone());
+                        if !wire_added.is_empty()&&leases.enabled() {
+                            confirmation_markets.extend(wire_added.clone());
                             confirmation_membership.send_replace(confirmation_markets.iter().map(|m|m.market_id.clone()).collect());
-                            added_confirmation_jobs.spawn(run_confirmations(leased_added,request_market_batch_size,network_concurrency,
+                            added_confirmation_jobs.spawn(run_confirmations(wire_added,request_market_batch_size,network_concurrency,
                                 response_byte_limit,request_timeout_seconds,websocket_confirmation_seconds,
                                 confirmation_sender.clone(),shutdown.clone(),confirmation_network.clone(),confirmation_members.clone()));
                         }
@@ -1802,8 +3188,24 @@ async fn run_connection(
                     result.context("added confirmation task missing")???;
                     continue;
                 },
-                value=receiver.recv()=>value.context("WS transport stopped")?,
-                value=jobs.failure()=>{value?;anyhow::bail!("WS transport ended");},
+                value=async {
+                    if pending_transport.is_some() {
+                        None
+                    } else {
+                        Some(jobs.next_batch_or_failure().await)
+                    }
+                }=>match value {
+                    Some(result) => match result? {
+                        super::source_acquisition_shards::AcquisitionEvent::Batch(batch) => batch,
+                        super::source_acquisition_shards::AcquisitionEvent::ShardFailed { tokens, reason } => {
+                            handle_acquisition_socket_failure(adapter, publication, &pipeline,
+                                &tokens, reason, leases.enabled()).await?;
+                            update_acquisition_metrics(publication, &jobs);
+                            continue;
+                        }
+                    },
+                    None => pending_transport.take().context("pending transport batch missing")?,
+                },
                 completed=completed_markets.recv()=>{
                     pipeline.publish(adapter, publication, completed.context("market workers stopped")?).await?;
                     continue;
@@ -1812,7 +3214,7 @@ async fn run_connection(
                     let confirmation = confirmation.context("REST confirmation stopped")?;
                     if !leases.enabled(){continue;}
                     match confirmation.result {
-                        Err(error) => eprintln!("{}", json!({"stage":"rest_confirmation_request_failed","detail":error.to_string()})),
+                        Err(error) => marketcow_polymarket::async_eprintln!("{}", json!({"stage":"rest_confirmation_request_failed","detail":error.to_string()})),
                         Ok((books, received_at)) => {
                             for market in confirmation.markets {
                                 if !confirmation_membership.borrow().contains(&market.market_id){continue;}
@@ -1827,7 +3229,7 @@ async fn run_connection(
                                 let selected:Vec<_> = books.iter().filter(|book| market.token_ids.iter()
                                     .any(|token| book["asset_id"] == *token)).cloned().collect();
                                 if selected.len() != 2 {
-                                    eprintln!("{}",json!({"stage":"rest_confirmation_incomplete",
+                                    marketcow_polymarket::async_eprintln!("{}",json!({"stage":"rest_confirmation_incomplete",
                                         "market_id":market.market_id,"returned_token_count":selected.len()}));
                                     let due = lifecycle_retry_at.get(&market.market_id)
                                         .is_none_or(|at| *at <= tokio::time::Instant::now());
@@ -1862,7 +3264,7 @@ async fn run_connection(
                                     &selected, confirmation.request_started_at, received_at) {
                                     Ok(ConfirmationOutcome::Confirmed) => {},
                                     Ok(ConfirmationOutcome::Superseded) => {
-                                        eprintln!("{}",json!({
+                                        marketcow_polymarket::async_eprintln!("{}",json!({
                                             "stage":"rest_confirmation_superseded","market_id":market.market_id
                                         }));
                                         // REST and WS are independent official read
@@ -1884,7 +3286,7 @@ async fn run_connection(
                                         }
                                     },
                                     Ok(ConfirmationOutcome::Mismatch) => {
-                                        eprintln!("{}",json!({"stage":"rest_confirmation_mismatch","market_id":market.market_id}));
+                                        marketcow_polymarket::async_eprintln!("{}",json!({"stage":"rest_confirmation_mismatch","market_id":market.market_id}));
                                         // REST and the main WS stream can expose different
                                         // current surfaces around the same update. REST is a
                                         // freshness witness, not permission to invalidate a
@@ -1904,7 +3306,7 @@ async fn run_connection(
                                             );
                                         }
                                     },
-                                    Err(error) => eprintln!("{}",json!({"stage":"rest_confirmation_invalid","market_id":market.market_id,"detail":error.to_string()})),
+                                    Err(error) => marketcow_polymarket::async_eprintln!("{}",json!({"stage":"rest_confirmation_invalid","market_id":market.market_id,"detail":error.to_string()})),
                                 }
                             }
                         }
@@ -1927,11 +3329,9 @@ async fn run_connection(
                             let event = super::source_lifecycle::terminal_event(
                                 catalog_market,
                                 &evidence,
-                                publication.cursor()?.checked_add(1).context("cursor overflow")?,
+                                publication.next_market_event_cursor(&market.market_id)?,
                             )?;
-                            publication.publish_with_capacity_and_evidence(
-                                vec![event], Some(evidence.clone()),
-                            ).await?;
+                            publication.publish_native_events(vec![event], Some(evidence.clone()))?;
                             lifecycle_terminal.insert(market.market_id.clone());
                             let retired_tokens = if pipeline.has_market(&market.market_id) {
                                 pipeline
@@ -1963,22 +3363,22 @@ async fn run_connection(
                                 // command slot is item-local and retried by the
                                 // scheduler; it must not fail the whole source.
                                 if let Err(error) = jobs.request_retire(&retired_tokens) {
-                                    eprintln!("{}", json!({
+                                    marketcow_polymarket::async_eprintln!("{}", json!({
                                         "stage":"lifecycle_wire_retirement_retry",
                                         "market_id":market.market_id,
                                         "detail":error.to_string()
                                     }));
                                 }
                             }
-                            eprintln!("{}",json!({"stage":"lifecycle_terminal_published",
+                            marketcow_polymarket::async_eprintln!("{}",json!({"stage":"lifecycle_terminal_published",
                                 "market_id":market.market_id,
                                 "evidence_sha256":evidence["raw_response_sha256"],
                                 "retired_token_count":retired_tokens.len(),
                                 "wire_unsubscribe_pending":!retired_tokens.is_empty()}));
                         }
-                        Ok(None) => eprintln!("{}",json!({"stage":"lifecycle_not_terminal",
+                        Ok(None) => marketcow_polymarket::async_eprintln!("{}",json!({"stage":"lifecycle_not_terminal",
                             "market_id":market.market_id})),
-                        Err(error) => eprintln!("{}",json!({"stage":"lifecycle_refresh_error",
+                        Err(error) => marketcow_polymarket::async_eprintln!("{}",json!({"stage":"lifecycle_refresh_error",
                             "market_id":market.market_id,"detail":format!("{error:#}")})),
                     }
                     continue;
@@ -2009,7 +3409,7 @@ async fn run_connection(
                                     Some(frame) => pipeline.submit(
                                         adapter, publication, frame, Some((token, attempt)),
                                     ).await?,
-                                    None => eprintln!("{}", json!({"stage":"market_recovery_incomplete",
+                                    None => marketcow_polymarket::async_eprintln!("{}", json!({"stage":"market_recovery_incomplete",
                                         "market_id":market_id,"token_id":token})),
                                 }
                             }
@@ -2021,7 +3421,7 @@ async fn run_connection(
                                 market_id.clone(),
                                 tokio::time::Instant::now() + recovery_retry_delay(*failures),
                             );
-                            eprintln!("{}", json!({"stage":"market_recovery_retry",
+                            marketcow_polymarket::async_eprintln!("{}", json!({"stage":"market_recovery_retry",
                                 "market_id":market_id,"token_count":attempts.len(),
                                 "consecutive_failures":*failures,"detail":error.to_string()}));
                             // A market that disappears from the official book
@@ -2060,6 +3460,48 @@ async fn run_connection(
                     }
                     continue;
                 },
+                completed=manager_freshness_jobs.join_next(), if !manager_freshness_jobs.is_empty()=>{
+                    let (market,requested,result)=completed.context("manager freshness task missing")??;
+                    manager_freshness_pending.remove(&market.market_id);
+                    if !leases.enabled()
+                        || lifecycle_terminal.contains(&market.market_id)
+                        || !confirmation_membership.borrow().contains(&market.market_id)
+                    { continue; }
+                    match result {
+                        Err(error)=>marketcow_polymarket::async_eprintln!("{}",json!({"stage":"targeted_http_confirmation_failed",
+                            "market_id":market.market_id,"detail":error.to_string()})),
+                        Ok(frames)=>{
+                            let received=frames.iter().map(|frame|frame.received_at)
+                                .max().context("targeted HTTP confirmation empty")?;
+                            let books:Vec<_>=frames.into_iter().map(|frame|frame.raw_payload).collect();
+                            if market.token_ids.iter().any(|token|adapter.recoveries.contains_key(token)) {
+                                marketcow_polymarket::async_eprintln!("{}",json!({"stage":"targeted_http_confirmation_superseded_by_recovery",
+                                    "market_id":market.market_id}));
+                                continue;
+                            }
+                            match publication.confirm_targeted_market(&market.market_id,&market.condition_id,
+                                &market.token_ids,&books,requested,received) {
+                                Ok(ConfirmationOutcome::Confirmed)=>marketcow_polymarket::async_eprintln!("{}",json!({
+                                    "stage":"targeted_http_confirmation","market_id":market.market_id})),
+                                Ok(ConfirmationOutcome::Superseded)=>marketcow_polymarket::async_eprintln!("{}",json!({
+                                    "stage":"targeted_http_confirmation_superseded","market_id":market.market_id})),
+                                Ok(ConfirmationOutcome::Mismatch)=>{
+                                    // The main WS stream remains the causal
+                                    // state owner. A racing REST snapshot is
+                                    // useful only when it exactly confirms the
+                                    // visible state; publishing it as a full
+                                    // replacement every cadence created
+                                    // artificial invalidation/recovery churn.
+                                    marketcow_polymarket::async_eprintln!("{}",json!({"stage":"targeted_http_confirmation_mismatch",
+                                        "market_id":market.market_id}));
+                                },
+                                Err(error)=>marketcow_polymarket::async_eprintln!("{}",json!({"stage":"targeted_http_confirmation_invalid",
+                                    "market_id":market.market_id,"detail":error.to_string()})),
+                            }
+                        }
+                    }
+                    continue;
+                },
                 completed=freshness_jobs.join_next(), if !freshness_jobs.is_empty()=>{
                     let (market, requested, result) = completed.context("freshness task missing")??;
                     freshness_pending.remove(&market.market_id);
@@ -2087,7 +3529,7 @@ async fn run_connection(
                         websocket_recovery_concurrency,
                     );
                     match result {
-                        Err(error) => eprintln!("{}",json!({
+                        Err(error) => marketcow_polymarket::async_eprintln!("{}",json!({
                             "stage":"targeted_ws_confirmation_failed",
                             "market_id":market.market_id,"detail":error.to_string()
                         })),
@@ -2097,7 +3539,7 @@ async fn run_connection(
                             let books:Vec<_> = frames.into_iter()
                                 .map(|frame| frame.raw_payload).collect();
                             if market.token_ids.iter().any(|token| adapter.recoveries.contains_key(token)) {
-                                eprintln!("{}",json!({"stage":"targeted_ws_confirmation_superseded_by_recovery",
+                                marketcow_polymarket::async_eprintln!("{}",json!({"stage":"targeted_ws_confirmation_superseded_by_recovery",
                                     "market_id":market.market_id}));
                                 continue;
                             }
@@ -2105,14 +3547,14 @@ async fn run_connection(
                                 &market.market_id, &market.condition_id, &market.token_ids,
                                 &books, requested, received,
                             ) {
-                                Ok(ConfirmationOutcome::Confirmed) => eprintln!("{}",json!({
+                                Ok(ConfirmationOutcome::Confirmed) => marketcow_polymarket::async_eprintln!("{}",json!({
                                     "stage":"targeted_ws_confirmation","market_id":market.market_id
                                 })),
-                                Ok(ConfirmationOutcome::Superseded) => eprintln!("{}",json!({
+                                Ok(ConfirmationOutcome::Superseded) => marketcow_polymarket::async_eprintln!("{}",json!({
                                     "stage":"targeted_ws_confirmation_superseded","market_id":market.market_id
                                 })),
                                 Ok(ConfirmationOutcome::Mismatch) => {
-                                    eprintln!("{}",json!({"stage":"targeted_ws_confirmation_replacement",
+                                    marketcow_polymarket::async_eprintln!("{}",json!({"stage":"targeted_ws_confirmation_replacement",
                                         "market_id":market.market_id}));
                                     if let Err(error) = pipeline.submit_rest_replacement(
                                         adapter, publication, books, received, &market.market_id,
@@ -2122,13 +3564,13 @@ async fn run_connection(
                                         // market is item-local. Keep other markets and
                                         // shards live; this market remains stale and is
                                         // retried after its cooldown.
-                                        eprintln!("{}",json!({
+                                        marketcow_polymarket::async_eprintln!("{}",json!({
                                             "stage":"targeted_ws_confirmation_replacement_failed",
                                             "market_id":market.market_id,"detail":error.to_string()
                                         }));
                                     }
                                 }
-                                Err(error) => eprintln!("{}",json!({
+                                Err(error) => marketcow_polymarket::async_eprintln!("{}",json!({
                                     "stage":"targeted_ws_confirmation_invalid",
                                     "market_id":market.market_id,"detail":error.to_string()
                                 })),
@@ -2138,18 +3580,71 @@ async fn run_connection(
                     continue;
                 },
                 _=retry_tick.tick()=>{
+                    pipeline.restart_closed_actors(adapter, publication).await?;
+                    let incomplete = scope_retirements.unqueued_markets();
+                    if !incomplete.is_empty() {
+                        // A prior owner command may have started wire retirement
+                        // but hit a temporarily full durability queue. Retain
+                        // the same journal intent/fence and finish that effect;
+                        // never cancel or allocate a new transaction identity.
+                        let result:Result<()> = (|| {
+                            for market in &incomplete {
+                                if pipeline.has_market(market) { pipeline.remove_market(adapter,market)?; }
+                                lifecycle_markets.remove(market);lifecycle_pending.remove(market);
+                                lifecycle_terminal.remove(market);lifecycle_retry_at.remove(market);
+                                freshness_queued.remove(market);freshness_pending.remove(market);
+                                freshness_retry_at.remove(market);
+                            }
+                            confirmation_markets.retain(|m|!incomplete.contains(&m.market_id));
+                            confirmation_membership.send_replace(confirmation_markets.iter()
+                                .map(|m|m.market_id.clone()).collect());
+                            let ticket = publication.reader().retirement_status()?.0
+                                .checked_add(1).context("scope retirement ticket overflow")?;
+                            publication.retire_catalog_markets(incomplete.clone())?;
+                            scope_retirements.set_ticket(&incomplete,ticket);
+                            acquisition_tokens = if leases.required(){jobs.tokens()}
+                                else{adapter.identities.keys().cloned().collect()};
+                            update_acquisition_metrics(publication,&jobs);
+                            Ok(())
+                        })();
+                        if let Err(error) = result {
+                            marketcow_polymarket::async_eprintln!("{}",json!({"stage":"scope_retirement_resume_blocked",
+                                "market_ids":incomplete,"detail":format!("{error:#}")}));
+                        }
+                    }
+                    if transport_metrics_at.elapsed() >= std::time::Duration::from_secs(5) {
+                        let sample_ms = transport_metrics_at.elapsed().as_millis();
+                        let occupancy = transport_metrics.take_occupancy();
+                        marketcow_polymarket::async_eprintln!("{}", json!({
+                            "stage":"transport_queue",
+                            "current_bytes":occupancy.current_bytes,
+                            "current_batches":occupancy.current_batches,
+                            "high_bytes":occupancy.high_bytes,
+                            "high_batches":occupancy.high_batches,
+                            "maximum_bytes":TRANSPORT_QUEUE_BYTES,
+                            "maximum_batches":TRANSPORT_QUEUE_BATCHES,
+                        }));
+                        marketcow_polymarket::async_eprintln!("{}", json!({
+                            "stage":"market_hot_path_timing",
+                            "sample_ms":sample_ms,
+                            "pipeline":pipeline.take_hot_path_timing(),
+                            "publication":publication.take_hot_path_timing(),
+                        }));
+                        transport_metrics_at = tokio::time::Instant::now();
+                    }
                     if leases.required()&&leases.expire(std::time::Instant::now())>0&&!leases.enabled(){
                         confirmation_membership.send_replace(BTreeSet::new());
                         pause_acquisition(adapter,&pipeline,publication,&mut jobs)?;
-                        eprintln!("{}",json!({"stage":"acquisition_lease_expired","acquisition_enabled":false}));
+                        marketcow_polymarket::async_eprintln!("{}",json!({"stage":"acquisition_lease_expired","acquisition_enabled":false}));
                     }
-                    if let Err(error)=jobs.poll_retirements(){eprintln!("{}",json!({"stage":"acquisition_retirement_error","error":error.to_string()}));}
+                    if let Err(error)=jobs.poll_retirements(){marketcow_polymarket::async_eprintln!("{}",json!({"stage":"acquisition_retirement_error","error":error.to_string()}));}
                     if leases.enabled()&&jobs.tokens().is_empty(){
                         let active=leases.market_ids();
                         jobs.add_pairs(&eligible_pairs(adapter,&active)?)?;
+                        publication.resume_acquisition();
                         confirmation_membership.send_replace(active);
                         acquisition_tokens=jobs.tokens();
-                        publication.set_acquisition_statistics(jobs.statistics());
+                        update_acquisition_metrics(publication, &jobs);
                     }
                     let pending_terminal_markets = terminal_unsubscribes
                         .keys()
@@ -2160,24 +3655,24 @@ async fn run_connection(
                         match jobs.request_retire(&tokens) {
                             Ok(true) => {
                                 terminal_unsubscribes.remove(&market_id);
-                                eprintln!("{}",json!({
+                                marketcow_polymarket::async_eprintln!("{}",json!({
                                     "stage":"lifecycle_wire_retirement_complete",
                                     "market_id":market_id,
                                     "token_count":tokens.len()
                                 }));
                             }
                             Ok(false) => {}
-                            Err(error) => eprintln!("{}",json!({
+                            Err(error) => marketcow_polymarket::async_eprintln!("{}",json!({
                                 "stage":"lifecycle_wire_retirement_retry",
                                 "market_id":market_id,
                                 "detail":error.to_string()
                             })),
                         }
                     }
-                    publication.set_acquisition_statistics(jobs.statistics());
+                    update_acquisition_metrics(publication, &jobs);
                     if leases.enabled()&&!publication.is_source_ready()&&publication.fresh_acquisition_started(&jobs.tokens()){
                         publication.set_source_ready(true);
-                        eprintln!("{}",json!({"stage":"acquisition_lease_ready","source_cursor":publication.cursor()?}));
+                        marketcow_polymarket::async_eprintln!("{}",json!({"stage":"acquisition_lease_ready","source_cursor":publication.cursor()?}));
                     }
                     if !leases.enabled(){continue;}
                     rest_submitted.retain(|token, attempt| adapter.recoveries.get(token) == Some(attempt));
@@ -2209,22 +3704,62 @@ async fn run_connection(
                 },
                 _=&mut shutdown_requested=>break,
             };
-            for frame in frames {
-                if !leases.enabled(){continue;}
-                if !marketcow_polymarket::subscription::owned_or_unclassified(&frame.raw_payload,&acquisition_tokens){continue;}
-                // Consume completed work between admissions, not only after
-                // the whole upstream batch. A bounded drain prevents either
-                // continuously ready branch from starving the other.
-                for _ in 0..market_workers * 2 {
+            if !leases.enabled(){continue;}
+            let mut batches = vec![frames];
+            let mut declared_bytes = batches[0].declared_bytes();
+            while batches.len() < OWNER_COALESCE_BATCHES {
+                let batch = match jobs.try_next_batch()? {
+                    Some(batch) => batch,
+                    None => break,
+                };
+                if declared_bytes.saturating_add(batch.declared_bytes()) > OWNER_COALESCE_BYTES {
+                    pending_transport = Some(batch);
+                    break;
+                }
+                declared_bytes += batch.declared_bytes();
+                batches.push(batch);
+            }
+            let mut routed = std::collections::VecDeque::new();
+            for batch in batches {
+                let source_tokens = batch.source_tokens();
+                if source_tokens.is_empty() { continue; }
+                if !source_tokens.is_subset(&acquisition_tokens) { continue; }
+                let markets = source_tokens.iter().filter_map(|token|
+                    adapter.identities.get(token).map(|(market, _)| market.clone()))
+                    .collect::<BTreeSet<_>>();
+                if source_tokens.len() != 2 || markets.len() != 1
+                    || source_tokens.iter().any(|token| !adapter.identities.contains_key(token))
+                {
+                    // A malformed socket-owned batch cannot make another
+                    // market's owner loop exit. Fence every reviewed market
+                    // touched by this batch and require a fresh baseline.
+                    handle_acquisition_socket_failure(adapter, publication, &pipeline,
+                        source_tokens, "market_socket_membership_mismatch", leases.enabled()).await?;
+                    continue;
+                }
+                let market = markets.into_iter().next().expect("one reviewed socket market");
+                let frames = batch.into_frames().into_iter().filter(|frame|
+                    marketcow_polymarket::subscription::owned_or_unclassified(
+                        &frame.raw_payload, &acquisition_tokens))
+                    .collect();
+                for segment in split_transport_control_boundaries(frames) {
+                    routed.push_back((market.clone(), segment));
+                }
+            }
+            while !routed.is_empty() {
+                // Keep owner-visible completions flowing between bounded actor
+                // inputs; each market actor still reduces its own FIFO serially.
+                for _ in 0..market_workers * 4 {
                     match completed_markets.try_recv() {
                         Ok(done) => pipeline.publish(adapter, publication, done).await?,
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => anyhow::bail!("market workers stopped"),
                     }
                 }
-                pipeline.submit(adapter, publication, frame, None).await?;
-                tokio::task::yield_now().await;
+                let pass = routed.drain(..routed.len().min(16)).collect();
+                pipeline.submit_routed_batches(adapter, publication, pass).await?;
             }
+            tokio::task::yield_now().await;
         }
         Ok(())
     }.await;
@@ -2236,8 +3771,11 @@ async fn run_connection(
     while lifecycle_jobs.join_next().await.is_some() {}
     freshness_jobs.abort_all();
     while freshness_jobs.join_next().await.is_some() {}
+    manager_freshness_jobs.abort_all();
+    while manager_freshness_jobs.join_next().await.is_some() {}
     jobs.stop().await;
-    added_confirmation_jobs.abort_all();while added_confirmation_jobs.join_next().await.is_some(){}
+    added_confirmation_jobs.abort_all();
+    while added_confirmation_jobs.join_next().await.is_some() {}
     // A confirmation mismatch submits its already-validated REST pair to the
     // market actor immediately. Apply those bounded in-flight recoveries before
     // closing; merely draining and dropping their results would persist a gap
@@ -2266,7 +3804,7 @@ async fn run_connection(
                             }
                         }
                     }
-                    Err(error) => eprintln!("{}", json!({
+                    Err(error) => marketcow_polymarket::async_eprintln!("{}", json!({
                         "stage":"shutdown_market_recovery_failed","market_id":market_id,
                         "token_count":attempts.len(),"detail":error.to_string()
                     })),
@@ -2285,20 +3823,30 @@ async fn run_connection(
     // stop. Every outstanding recovery must already be published; the owner
     // subsequently drains the independent durability worker before exit.
     if !adapter.recoveries.is_empty() {
-        let (cursor, facts) = publication.shutdown_recovery_facts()?;
+        let (event_cursors, facts) = publication.shutdown_recovery_facts()?;
         validate_shutdown_recovery_facts(&adapter.recoveries, &facts)?;
-        eprintln!("{}", json!({"stage":"shutdown_recoveries_preserved",
-            "token_count":adapter.recoveries.len(),"published_cursor":cursor}));
+        marketcow_polymarket::async_eprintln!(
+            "{}",
+            json!({"stage":"shutdown_recoveries_preserved",
+            "token_count":adapter.recoveries.len(),"market_event_cursors":event_cursors})
+        );
     }
     confirmation_job.abort();
     let _ = confirmation_job.await;
     result
 }
 
-fn validate_shutdown_recovery_facts(expected:&BTreeMap<String,String>,published:&BTreeMap<String,Value>)->Result<()> {
-    for (token,attempt) in expected {
-        ensure!(published.get(token).is_some_and(|fact|fact["recovery_id"]==*attempt),
-            "shutdown recovery not represented in published state");
+fn validate_shutdown_recovery_facts(
+    expected: &BTreeMap<String, String>,
+    published: &BTreeMap<String, Value>,
+) -> Result<()> {
+    for (token, attempt) in expected {
+        ensure!(
+            published
+                .get(token)
+                .is_some_and(|fact| fact["recovery_id"] == *attempt),
+            "shutdown recovery not represented in published state"
+        );
     }
     Ok(())
 }
@@ -2308,14 +3856,96 @@ mod shard_tests {
     use super::*;
 
     #[test]
+    fn ten_thousand_owner_retirement_fences_release_after_both_receipts() {
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(120);
+        let mut leases = super::super::source_acquisition_lease::Leases::new(true, 2, ttl).unwrap();
+        let mut fences = ScopeRetirementFences::default();
+        for generation in 1..=10_000_u64 {
+            let market_id = format!("market-{generation}");
+            let markets = BTreeSet::from([market_id.clone()]);
+            let up = format!("{market_id}-up");
+            let down = format!("{market_id}-down");
+            let tokens = BTreeSet::from([up.clone(), down.clone()]);
+            let identities = BTreeMap::from([
+                (up, (market_id.clone(), "condition".to_owned())),
+                (down, (market_id, "condition".to_owned())),
+            ]);
+
+            leases.acquire("shared".into(), ttl, markets.clone(), &markets, now).unwrap();
+            assert!(fences.check_retire(&leases, &markets).is_err());
+            leases.release("shared").unwrap();
+            fences.check_retire(&leases, &markets).unwrap();
+            fences.begin(&markets, &identities);
+            fences.set_ticket(&markets, generation);
+            assert_eq!(fences.0.len(), 1);
+            assert!(fences.check_admission(&markets).is_err());
+            fences.reconcile(generation, &tokens);
+            assert_eq!(fences.0.len(), 1, "wire receipt has not completed");
+            fences.reconcile(generation - 1, &BTreeSet::new());
+            assert_eq!(fences.0.len(), 1, "durability receipt has not completed");
+            fences.reconcile(generation, &BTreeSet::new());
+            assert!(fences.0.is_empty(), "retirement fences must not accumulate");
+            fences.check_admission(&markets).unwrap();
+        }
+    }
+
+    #[test]
+    fn retirement_rechecks_owner_leases_and_fences_reacquire_until_both_receipts() {
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(120);
+        let market = BTreeSet::from(["m1".to_owned()]);
+        let mut leases = super::super::source_acquisition_lease::Leases::new(true, 2, ttl).unwrap();
+        let mut fences = ScopeRetirementFences::default();
+        // A control-side status query saw no lease; another consumer acquires
+        // before the serial owner handles the actual retirement command.
+        let _stale_query = leases.market_ids();
+        leases.acquire("other".into(), ttl, market.clone(), &market, now).unwrap();
+        assert!(fences.check_retire(&leases, &market).is_err());
+        leases.release("other").unwrap();
+        // Likewise, validate_only cannot reserve a lease-free instant.
+        fences.check_retire(&leases, &market).unwrap();
+        leases.acquire("other".into(), ttl, market.clone(), &market, now).unwrap();
+        assert!(fences.check_retire(&leases, &market).is_err());
+        leases.release("other").unwrap();
+
+        let identities = BTreeMap::from([
+            ("up".into(), ("m1".into(), "condition".into())),
+            ("down".into(), ("m1".into(), "condition".into())),
+        ]);
+        fences.begin(&market, &identities);
+        assert_eq!(fences.unqueued_markets(), market,
+            "an unknown durability effect keeps the generation fenced for replay");
+        fences.set_ticket(&market, 2);
+        assert!(fences.unqueued_markets().is_empty());
+        assert!(fences.check_admission(&market).is_err());
+        let wire = BTreeSet::from(["up".into(), "down".into()]);
+        fences.reconcile(2, &wire); // writer complete, wire still draining
+        assert!(fences.check_admission(&market).is_err());
+        fences.reconcile(1, &BTreeSet::new()); // wire complete, old writer receipt
+        assert!(fences.check_admission(&market).is_err());
+        fences.reconcile(2, &BTreeSet::new());
+        fences.check_admission(&market).unwrap();
+        // A delayed receipt for the previous generation cannot release the
+        // newly fenced generation of the same market identity.
+        fences.begin(&market, &identities);
+        fences.set_ticket(&market, 3);
+        fences.reconcile(2, &BTreeSet::new());
+        assert!(fences.check_admission(&market).is_err());
+    }
+
+    #[test]
     fn shutdown_preserves_missing_book_recovery_and_rejects_unpublished_attempt() {
-        let expected=BTreeMap::from([("token".into(),"attempt".into())]);
-        let published=BTreeMap::from([("token".into(),json!({"recovery_id":"attempt","gap":{"resolved":false}}))]);
-        validate_shutdown_recovery_facts(&expected,&published).unwrap();
-        assert_eq!(published["token"]["gap"]["resolved"],false);
-        assert!(validate_shutdown_recovery_facts(&expected,&BTreeMap::new()).is_err());
-        let stale=BTreeMap::from([("token".into(),json!({"recovery_id":"old"}))]);
-        assert!(validate_shutdown_recovery_facts(&expected,&stale).is_err());
+        let expected = BTreeMap::from([("token".into(), "attempt".into())]);
+        let published = BTreeMap::from([(
+            "token".into(),
+            json!({"recovery_id":"attempt","gap":{"resolved":false}}),
+        )]);
+        validate_shutdown_recovery_facts(&expected, &published).unwrap();
+        assert_eq!(published["token"]["gap"]["resolved"], false);
+        assert!(validate_shutdown_recovery_facts(&expected, &BTreeMap::new()).is_err());
+        let stale = BTreeMap::from([("token".into(), json!({"recovery_id":"old"}))]);
+        assert!(validate_shutdown_recovery_facts(&expected, &stale).is_err());
     }
 
     #[test]

@@ -395,7 +395,11 @@ async fn run(package: &Path, output: &Path) -> Result<serde_json::Value> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     // One transport batch can wait while the application immediately publishes
     // into the separately byte-and-count bounded persistence queue below.
-    let (sender, mut receiver) = mpsc::channel(1);
+    let (sender, mut receiver) = marketcow_polymarket::transport_output(
+        config.maximum_pending_batches,
+        config.maximum_pending_bytes as usize,
+        config.maximum_batch_bytes as usize,
+    )?;
     let transport = tokio::spawn(run_polymarket_transport(
         PolymarketTransportConfig::production(),
         tokens,

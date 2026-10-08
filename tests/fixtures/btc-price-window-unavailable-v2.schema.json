@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:marketcow:btc-price-window-unavailable:v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["detail"],
+  "properties": {
+    "detail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable", "source_status"],
+      "properties": {
+        "code": {"const": "selected_chainlink_source_unavailable"},
+        "message": {"const": "selected_chainlink_source_unavailable"},
+        "retryable": {"const": true},
+        "source_status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "source", "epoch", "status", "reason",
+            "source_continuity_status", "snapshot_sequence", "last_sequence",
+            "latest_source_time_ms", "latest_received_at"],
+          "properties": {
+            "schema_version": {"const": "marketcow.btc-price-window-unavailable.v2"},
+            "source": {"const": "chainlink_twap_60s"},
+            "epoch": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+            "status": {"const": "unavailable"},
+            "reason": {"enum": ["credentials_not_configured", "credentials_invalid",
+              "connecting", "disconnected", "invalid", "latest_point_stale_or_invalid",
+              "no_price_points"]},
+            "source_continuity_status": {"enum": ["awaiting_authenticated_snapshot",
+              "contiguous_since_snapshot"]},
+            "snapshot_sequence": {"type": ["integer", "null"], "minimum": 0},
+            "last_sequence": {"type": ["integer", "null"], "minimum": 0},
+            "latest_source_time_ms": {"type": ["integer", "null"]},
+            "latest_received_at": {"type": ["string", "null"], "format": "date-time"}
+          }
+        }
+      }
+    }
+  }
+}

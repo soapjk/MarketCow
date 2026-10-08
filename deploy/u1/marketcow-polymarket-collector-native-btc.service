@@ -1,0 +1,67 @@
+[Unit]
+Description=MarketCow unified Rust collector (Polymarket + BTC)
+Requires=marketcow-polymarket-proxy.service
+After=marketcow-polymarket-proxy.service
+ConditionPathIsMountPoint=/mnt/p44pro/marketcow-shadow-v3-runtime/linux
+
+[Service]
+KillMode=mixed
+MemorySwapMax=0
+Type=simple
+UMask=0077
+ExecStart=/usr/bin/python3 /mnt/p44pro/marketcow-shadow-v3-runtime/linux/releases/main-cd7cf396624b/scripts/run_with_bounded_log.py \
+ --log /home/czx/.local/state/marketcow/logs/btc5m-manager-r13-live.log --max-bytes 8388608 -- \
+ /usr/bin/env -u ALL_PROXY -u all_proxy -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy \
+ HTTPS_PROXY=http://127.0.0.1:17890 HTTP_PROXY=http://127.0.0.1:17890 NO_PROXY=127.0.0.1,localhost,::1 \
+ /home/czx/.local/lib/marketcow/releases/btc5m-manager-r13/marketcow-discovery-collector \
+ --input-mode websocket --market-workers 6 \
+ --root /mnt/p44pro/marketcow-shadow-v3-runtime/linux/bounded-scoped-candidate-r1 \
+ --plan /mnt/p44pro/marketcow-shadow-v3-runtime/linux/bounded-scoped-candidate-r1/rust-scoped-plan-r1.json \
+ --plan-sha256 3461f8b75ad6078e5e1199c4ea1d67c62e29872b17856603bc64764d297bbdff \
+ --configured-scope /mnt/p44pro/marketcow-shadow-v3-runtime/linux/bounded-scoped-candidate-r1/configured-scope.json \
+ --configured-scope-sha256 4443ccdc6896ed451d9be94e467d8deca2594f69d3f4d6d5f19e63a437acf7df \
+ --dependency-plan /mnt/p44pro/marketcow-shadow-v3-runtime/linux/bounded-scoped-candidate-r1/live-bridge-plan-r1.json \
+ --dependency-plan-sha256 b108d8795ba17892f6f2b361db341048cae3c2687aa1277dad0be9089d9019ce \
+ --expected-market-count 250 --concurrency 16 --request-market-batch-size 20 \
+ --response-byte-limit 2097152 --batch-byte-limit 16777216 \
+ --persistence-queue-batches 256 --persistence-queue-bytes 67108864 \
+ --websocket-shard-tokens 128 --websocket-recovery-concurrency 16 \
+ --websocket-confirmation-seconds 0 --poll-seconds 1 --request-timeout-seconds 10 \
+ --lifecycle-refresh-seconds 300 --public-listen 192.168.124.3:8793 \
+ --public-full-sync-bytes 134217728 --public-snapshot-concurrency 1 \
+ --public-frame-bytes 67108864 --public-replay-bytes 8388608 \
+ --public-maximum-clients 2 --public-send-timeout-seconds 5 --bounded-history-bytes 67108864 \
+ --scope-control-socket /mnt/p44pro/marketcow-shadow-v3-runtime/linux/hot-scope-r36-v1-live-ctl/scope.sock \
+ --scope-control-bytes 16777216 --scope-control-timeout-seconds 20 \
+ --scope-state-file /mnt/p44pro/marketcow-shadow-v3-runtime/linux/hot-scope-r36-v1-live-ctl/state.json \
+ --scope-state-bytes 134217728 --scope-retire-grace-seconds 30 \
+ --acquisition-token-budget 4096 --acquisition-socket-budget 16 \
+ --acquisition-lease-required --acquisition-lease-capacity 8 --acquisition-lease-max-seconds 120 \
+ --btc-research-root /mnt/p44pro/marketcow-shadow-v3-runtime/linux/btc-research-native-r1 \
+ --btc-research-archive-bytes 536870912 --btc-research-queue-records 128 \
+ --btc-research-queue-bytes 8388608 --btc-research-response-bytes 4194304 \
+ --btc-research-clients 4 --btc-research-send-timeout-seconds 5 \
+ --btc-5m-snapshot-bytes 8388608 --btc-5m-frame-bytes 2097152 \
+ --btc-5m-replay-bytes 8388608 --btc-5m-clients 12 --btc-5m-send-timeout-seconds 5 \
+ --btc-5m-snapshot-lease-capacity 2 \
+ --btc-5m-manager-root /mnt/p44pro/marketcow-shadow-v3-runtime/linux/bounded-scoped-candidate-r1/btc-5m-manager-r1 \
+ --btc-5m-manager-lease-ttl-seconds 120 --btc-5m-manager-renew-seconds 40 \
+ --btc-5m-manager-prereview-seconds 30 --btc-5m-manager-control-timeout-seconds 10 \
+ --btc-5m-manager-response-bytes 262144 --btc-5m-manager-evidence-files 576 \
+ --finality-root /mnt/p44pro/marketcow-shadow-v3-runtime/linux/finality-quorum-r2 \
+ --finality-profile-a /home/czx/.config/marketcow/secrets/finality-provider-a-r2.json \
+ --finality-profile-b /home/czx/.config/marketcow/secrets/finality-provider-b-r2.json \
+ --finality-caller-token-file /home/czx/.config/marketcow/secrets/finality-caller-r1.token \
+ --finality-archive-bytes 67108864 --finality-queue-records 16 --finality-queue-bytes 16777216 \
+ --finality-clients 2 --finality-request-timeout-seconds 15 --finality-retry-after-seconds 30
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=80
+MemoryMax=6G
+NoNewPrivileges=true
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=marketcow-paper-data.target

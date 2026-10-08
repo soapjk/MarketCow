@@ -30,6 +30,12 @@ from .providers.tdx_financial import TdxFinancialProvider
 from .providers.yahoo_quote import YahooQuoteProvider
 from .providers.yahoo_fx import YahooFxProvider
 from .providers.hyperliquid import HyperliquidProvider
+from .providers.alpaca_sip import (
+    AlpacaBudgets,
+    AlpacaCredentials,
+    AlpacaSipError,
+    AlpacaSipProvider,
+)
 from .cross_market import (
     cross_market_snapshot, exact_relationship, load_cross_market_inputs,
 )
@@ -178,6 +184,7 @@ class FundamentalService:
         tushare_provider: Optional[TushareProvider] = None,
         longport_quote_provider: Optional[LongPortQuoteProvider] = None,
         hyperliquid_provider: Optional[HyperliquidProvider] = None,
+        alpaca_sip_provider: Optional[AlpacaSipProvider] = None,
         sec_dividend_provider: Optional[SecDividendProvider] = None,
         cn_dividend_provider: Optional[CnExchangeDividendProvider] = None,
         hkex_dividend_provider: Optional[HkexDividendProvider] = None,
@@ -245,6 +252,23 @@ class FundamentalService:
             settings.hyperliquid_base_url, settings.hyperliquid_timeout_seconds,
             settings.hyperliquid_request_budget_seconds,
         )
+        self.alpaca_sip_provider = alpaca_sip_provider
+        if self.alpaca_sip_provider is None:
+            try:
+                credentials = AlpacaCredentials.load(settings.alpaca_credentials_file)
+            except (AlpacaSipError, FileNotFoundError):
+                credentials = None
+            if credentials is not None:
+                self.alpaca_sip_provider = AlpacaSipProvider(
+                    credentials,
+                    budgets=AlpacaBudgets(
+                        maximum_requests=settings.alpaca_maximum_requests,
+                        maximum_bytes=settings.alpaca_maximum_bytes,
+                        maximum_retries=settings.alpaca_maximum_retries,
+                        timeout_seconds=settings.alpaca_timeout_seconds,
+                        total_seconds=settings.alpaca_request_budget_seconds,
+                    ),
+                )
         self.sec_dividend_provider = sec_dividend_provider or SecDividendProvider(
             settings.sec_user_agent
         )
@@ -279,6 +303,10 @@ class FundamentalService:
             "hyperliquid", self.hyperliquid_provider,
             (REALTIME_QUOTE, MARKET_BAR_HISTORY),
         )
+        if self.alpaca_sip_provider is not None:
+            self.provider_registry.bind(
+                "alpaca_sip", self.alpaca_sip_provider, (MARKET_BAR_HISTORY,)
+            )
         self.quote_persistence = AsyncQuotePersistence(
             capacity=settings.quote_persistence_queue_size
         )
@@ -1655,6 +1683,30 @@ class FundamentalService:
                         str(exc),
                     )
                     raise
+            if name == "alpaca_sip":
+                if self.alpaca_sip_provider is None:
+                    errors.append("alpaca_sip: provider is not configured")
+                    continue
+                run_id, started_at = self._start_run(
+                    "refresh_quote_history", symbol
+                )
+                try:
+                    result = self.alpaca_sip_provider.fetch_history(
+                        normalized, range_, interval, adjustment
+                    )
+                    return self._persist_history_result(
+                        result, range_, interval, adjustment,
+                        run_id, started_at, symbol,
+                    )
+                except Exception as exc:
+                    self.metadata_repository.record_provider_health(
+                        "alpaca_sip", False, utc_now(), str(exc)
+                    )
+                    self._finish_run(
+                        run_id, "refresh_quote_history", started_at, symbol, 0,
+                        str(exc),
+                    )
+                    raise
         else:
             raise ProviderUnavailable(
                 "; ".join(errors) or "no history provider available",
@@ -1714,6 +1766,16 @@ class FundamentalService:
                     )
                 if name == "hyperliquid":
                     result = self.hyperliquid_provider.fetch_history_window(
+                        normalized, start, end, interval, adjustment
+                    )
+                elif name == "alpaca_sip":
+                    if self.alpaca_sip_provider is None:
+                        raise ProviderUnavailable(
+                            "alpaca_sip provider is not configured",
+                            provider=name, capability=MARKET_BAR_HISTORY,
+                            market=market,
+                        )
+                    result = self.alpaca_sip_provider.fetch_history_window(
                         normalized, start, end, interval, adjustment
                     )
                 elif name == "yahoo":

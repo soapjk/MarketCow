@@ -32,3 +32,4 @@ AGENTS.md
 # Corptie local Agent configuration
 /.corptie
 /sdk/python/README.md
+/docs/btc-fact-log-fast-start.md

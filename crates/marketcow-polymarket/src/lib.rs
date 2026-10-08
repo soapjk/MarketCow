@@ -2,6 +2,7 @@
 //! crate; a frame is normalized without network, storage, or async-runtime dependencies.
 
 pub mod discovery_source;
+pub mod diagnostic;
 pub mod subscription;
 
 use chrono::{DateTime, Utc};
@@ -15,13 +16,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
 };
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
@@ -120,6 +124,223 @@ pub struct RawTransportFrame {
     pub received_at: DateTime<Utc>,
 }
 
+/// A socket-reader queue item holds an exact byte permit until the downstream
+/// owner removes the item from the transport queue. This prevents a burst of
+/// many small WS messages from being constrained by an arbitrary record count
+/// while retaining a hard memory ceiling for maximum-sized messages.
+pub struct RawTransportBatch {
+    frames: Vec<RawTransportFrame>,
+    source_tokens: BTreeSet<String>,
+    _bytes: OwnedSemaphorePermit,
+    _shared_bytes: Option<OwnedSemaphorePermit>,
+    _shared_slot: Option<OwnedSemaphorePermit>,
+    declared_bytes: usize,
+    metrics: Arc<TransportQueueMetrics>,
+}
+
+impl RawTransportBatch {
+    pub fn source_tokens(&self) -> &BTreeSet<String> {
+        &self.source_tokens
+    }
+    pub fn declared_bytes(&self) -> usize {
+        self.declared_bytes
+    }
+
+    pub fn into_frames(mut self) -> Vec<RawTransportFrame> {
+        std::mem::take(&mut self.frames)
+    }
+}
+
+impl Drop for RawTransportBatch {
+    fn drop(&mut self) {
+        self.metrics
+            .current_bytes
+            .fetch_sub(self.declared_bytes, Ordering::Relaxed);
+        self.metrics.current_batches.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for RawTransportBatch {
+    type Target = [RawTransportFrame];
+    fn deref(&self) -> &Self::Target {
+        &self.frames
+    }
+}
+
+impl IntoIterator for RawTransportBatch {
+    type Item = RawTransportFrame;
+    type IntoIter = std::vec::IntoIter<RawTransportFrame>;
+    fn into_iter(mut self) -> Self::IntoIter {
+        std::mem::take(&mut self.frames).into_iter()
+    }
+}
+
+#[derive(Default)]
+struct TransportQueueMetrics {
+    current_bytes: AtomicUsize,
+    current_batches: AtomicUsize,
+    high_bytes: AtomicUsize,
+    high_batches: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportQueueOccupancy {
+    pub current_bytes: usize,
+    pub current_batches: usize,
+    pub high_bytes: usize,
+    pub high_batches: usize,
+}
+
+#[derive(Clone)]
+pub struct TransportOutput {
+    sender: mpsc::Sender<RawTransportBatch>,
+    bytes: Arc<Semaphore>,
+    shared_bytes: Option<Arc<Semaphore>>,
+    shared_slots: Option<Arc<Semaphore>>,
+    ready: Option<TransportReadyHandle>,
+    maximum_batch_bytes: usize,
+    metrics: Arc<TransportQueueMetrics>,
+}
+
+/// At most one queued notification per live market FIFO. The receiver is also
+/// explicitly bounded by the socket budget; failure is never a silent miss.
+#[derive(Clone)]
+pub struct TransportReadyHandle {
+    id: u64,
+    queued: Arc<std::sync::atomic::AtomicBool>,
+    sender: mpsc::Sender<u64>,
+}
+
+impl TransportReadyHandle {
+    pub fn signal(&self) -> Result<(), TransportError> {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            if self.sender.try_send(self.id).is_err() {
+                self.queued.store(false, Ordering::Release);
+                return Err(TransportError::Backpressure);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn consumed(&self) {
+        self.queued.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Clone)]
+pub struct TransportBudget {
+    bytes: Arc<Semaphore>,
+    slots: Arc<Semaphore>,
+    maximum_batch_bytes: usize,
+    metrics: Arc<TransportQueueMetrics>,
+}
+
+impl TransportBudget {
+    /// A market has its own bounded FIFO and byte ceiling. Its permits also
+    /// count against the collector-wide ceiling, so adding sockets cannot
+    /// multiply the maximum retained transport payload.
+    pub fn market_lane(
+        &self,
+        id: u64,
+        ready_sender: mpsc::Sender<u64>,
+        maximum_batches: usize,
+        maximum_bytes: usize,
+    ) -> Result<(TransportOutput, mpsc::Receiver<RawTransportBatch>, TransportReadyHandle), TransportError> {
+        let (mut lane, receiver) = transport_output(
+            maximum_batches,
+            maximum_bytes,
+            self.maximum_batch_bytes.min(maximum_bytes),
+        )?;
+        lane.shared_bytes = Some(self.bytes.clone());
+        lane.shared_slots = Some(self.slots.clone());
+        lane.metrics = self.metrics.clone();
+        let ready = TransportReadyHandle {
+            id, queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sender: ready_sender,
+        };
+        lane.ready = Some(ready.clone());
+        Ok((lane, receiver, ready))
+    }
+    pub fn take_occupancy(&self) -> TransportQueueOccupancy {
+        take_transport_occupancy(&self.metrics)
+    }
+}
+
+impl TransportOutput {
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    pub fn take_occupancy(&self) -> TransportQueueOccupancy {
+        take_transport_occupancy(&self.metrics)
+    }
+}
+
+fn take_transport_occupancy(metrics: &TransportQueueMetrics) -> TransportQueueOccupancy {
+    let current_bytes = metrics.current_bytes.load(Ordering::Relaxed);
+    let current_batches = metrics.current_batches.load(Ordering::Relaxed);
+    let high_bytes = metrics.high_bytes.swap(current_bytes, Ordering::Relaxed);
+    let high_batches = metrics.high_batches.swap(current_batches, Ordering::Relaxed);
+    TransportQueueOccupancy {
+        current_bytes,
+        current_batches,
+        high_bytes: high_bytes.max(current_bytes),
+        high_batches: high_batches.max(current_batches),
+    }
+}
+
+pub fn transport_budget(
+    maximum_batches: usize,
+    maximum_bytes: usize,
+    maximum_batch_bytes: usize,
+) -> Result<TransportBudget, TransportError> {
+    validate_transport_limits(maximum_batches, maximum_bytes, maximum_batch_bytes)?;
+    Ok(TransportBudget {
+        bytes: Arc::new(Semaphore::new(maximum_bytes)),
+        slots: Arc::new(Semaphore::new(maximum_batches)),
+        maximum_batch_bytes,
+        metrics: Arc::new(TransportQueueMetrics::default()),
+    })
+}
+
+pub fn transport_output(
+    maximum_batches: usize,
+    maximum_bytes: usize,
+    maximum_batch_bytes: usize,
+) -> Result<(TransportOutput, mpsc::Receiver<RawTransportBatch>), TransportError> {
+    validate_transport_limits(maximum_batches, maximum_bytes, maximum_batch_bytes)?;
+    let (sender, receiver) = mpsc::channel(maximum_batches);
+    let metrics = Arc::new(TransportQueueMetrics::default());
+    Ok((
+        TransportOutput {
+            sender,
+            bytes: Arc::new(Semaphore::new(maximum_bytes)),
+            shared_bytes: None,
+            shared_slots: None,
+            ready: None,
+            maximum_batch_bytes,
+            metrics,
+        },
+        receiver,
+    ))
+}
+
+fn validate_transport_limits(
+    maximum_batches: usize,
+    maximum_bytes: usize,
+    maximum_batch_bytes: usize,
+) -> Result<(), TransportError> {
+    if maximum_batches == 0
+        || maximum_bytes == 0
+        || maximum_bytes > u32::MAX as usize
+        || maximum_batch_bytes == 0
+        || maximum_batch_bytes > maximum_bytes
+    {
+        return Err(TransportError::InvalidConfig);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransportError {
     #[error("Polymarket transport configuration is invalid")]
@@ -173,7 +394,7 @@ impl TransportError {
 pub async fn run_polymarket_transport(
     config: PolymarketTransportConfig,
     token_ids: Vec<String>,
-    output: mpsc::Sender<Vec<RawTransportFrame>>,
+    output: TransportOutput,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), TransportError> {
     run_transport(config, token_ids, output, shutdown, None).await
@@ -185,7 +406,7 @@ pub async fn run_polymarket_transport(
 pub async fn run_polymarket_transport_managed(
     config: PolymarketTransportConfig,
     token_ids: Vec<String>,
-    output: mpsc::Sender<Vec<RawTransportFrame>>,
+    output: TransportOutput,
     shutdown: watch::Receiver<bool>,
     updates: mpsc::Receiver<subscription::SubscriptionUpdate>,
 ) -> Result<(), TransportError> {
@@ -195,44 +416,60 @@ pub async fn run_polymarket_transport_managed(
 async fn run_transport(
     config: PolymarketTransportConfig,
     token_ids: Vec<String>,
-    output: mpsc::Sender<Vec<RawTransportFrame>>,
+    output: TransportOutput,
     shutdown: watch::Receiver<bool>,
     updates: Option<mpsc::Receiver<subscription::SubscriptionUpdate>>,
 ) -> Result<(), TransportError> {
-    let mut shutdown=shutdown;
-    let mut updates=updates;
+    let mut shutdown = shutdown;
+    let mut updates = updates;
     config.validate()?;
-    let count=token_ids.len();
+    let count = token_ids.len();
     let mut tokens = token_ids.into_iter().collect::<BTreeSet<_>>();
-    if tokens.len()!=count {
+    if tokens.len() != count {
         return Err(TransportError::InvalidConfig);
     }
     subscription::validate_tokens(&tokens)?;
-    run_transport_attempts(&config,&mut tokens,&output,&mut shutdown,&mut updates).await
+    run_transport_attempts(&config, &mut tokens, &output, &mut shutdown, &mut updates).await
 }
 
 /// Service-owned shard supervision. Each retry group still has the configured
 /// attempt/deadline bounds; a failed group cools down without killing other
 /// shards. Current membership and the bounded control receiver survive it.
 pub async fn supervise_polymarket_transport_managed(
-    config:PolymarketTransportConfig,token_ids:Vec<String>,
-    output:mpsc::Sender<Vec<RawTransportFrame>>,mut shutdown:watch::Receiver<bool>,
-    updates:mpsc::Receiver<subscription::SubscriptionUpdate>,cooldown:Duration,
-) -> Result<(),TransportError> {
+    config: PolymarketTransportConfig,
+    token_ids: Vec<String>,
+    output: TransportOutput,
+    mut shutdown: watch::Receiver<bool>,
+    updates: mpsc::Receiver<subscription::SubscriptionUpdate>,
+    cooldown: Duration,
+) -> Result<(), TransportError> {
     config.validate()?;
-    if cooldown.is_zero() || cooldown>Duration::from_secs(60) {return Err(TransportError::InvalidConfig);}
-    let count=token_ids.len();
-    let mut tokens:BTreeSet<_>=token_ids.into_iter().collect();
-    if tokens.len()!=count {return Err(TransportError::InvalidConfig);}
+    if cooldown.is_zero() || cooldown > Duration::from_secs(60) {
+        return Err(TransportError::InvalidConfig);
+    }
+    let count = token_ids.len();
+    let mut tokens: BTreeSet<_> = token_ids.into_iter().collect();
+    if tokens.len() != count {
+        return Err(TransportError::InvalidConfig);
+    }
     subscription::validate_tokens(&tokens)?;
-    let mut updates=Some(updates);
+    let mut updates = Some(updates);
     loop {
-        let result=run_transport_attempts(&config,&mut tokens,&output,&mut shutdown,&mut updates).await;
-        if *shutdown.borrow() || output.is_closed() {return Ok(());}
+        let result =
+            run_transport_attempts(&config, &mut tokens, &output, &mut shutdown, &mut updates)
+                .await;
+        if *shutdown.borrow() || output.is_closed() {
+            return Ok(());
+        }
         // Output capacity errors remain a real shared-consumer failure, not an
         // excuse to drop accepted input or spin a reconnect loop.
-        if matches!(result,Err(TransportError::Backpressure)) {return result;}
-        tracing::warn!(token_count=tokens.len(),result=?result,"polymarket_shard_retry_group");
+        if matches!(result, Err(TransportError::Backpressure)) {
+            return result;
+        }
+        crate::async_eprintln!("{}", serde_json::json!({
+            "stage":"polymarket_shard_retry_group","token_count":tokens.len(),
+            "result":format!("{result:?}"),
+        }));
         tokio::select! {
             _=tokio::time::sleep(cooldown)=>{},
             _=shutdown.changed()=>return Ok(()),
@@ -241,17 +478,22 @@ pub async fn supervise_polymarket_transport_managed(
 }
 
 async fn run_transport_attempts(
-    config:&PolymarketTransportConfig,tokens:&mut BTreeSet<String>,
-    output:&mpsc::Sender<Vec<RawTransportFrame>>,shutdown:&mut watch::Receiver<bool>,
-    updates:&mut Option<mpsc::Receiver<subscription::SubscriptionUpdate>>,
-) -> Result<(),TransportError> {
+    config: &PolymarketTransportConfig,
+    tokens: &mut BTreeSet<String>,
+    output: &TransportOutput,
+    shutdown: &mut watch::Receiver<bool>,
+    updates: &mut Option<mpsc::Receiver<subscription::SubscriptionUpdate>>,
+) -> Result<(), TransportError> {
     for attempt in 1..=config.maximum_reconnect_attempts {
         if *shutdown.borrow() {
             return Ok(());
         }
         match run_polymarket_connection(config, tokens, output, shutdown, updates).await {
             Ok(ConnectionEnd::Shutdown) => return Ok(()),
-            Ok(ConnectionEnd::Disconnected { close_code, close_reason }) => {
+            Ok(ConnectionEnd::Disconnected {
+                close_code,
+                close_reason,
+            }) => {
                 if !publish_connection_gaps(
                     tokens,
                     attempt,
@@ -265,13 +507,11 @@ async fn run_transport_attempts(
                 {
                     return Ok(());
                 }
-                tracing::warn!(
-                    attempt,
-                    close_code,
-                    close_reason,
-                    reason = "upstream_disconnected",
-                    "polymarket_transport_retry"
-                );
+                crate::async_eprintln!("{}", serde_json::json!({
+                    "stage":"polymarket_transport_retry","attempt":attempt,
+                    "close_code":close_code,"close_reason":close_reason,
+                    "reason":"upstream_disconnected",
+                }));
             }
             Err(TransportError::Backpressure) => return Err(TransportError::Backpressure),
             Err(error) if attempt == config.maximum_reconnect_attempts => {
@@ -288,11 +528,10 @@ async fn run_transport_attempts(
                 {
                     return Ok(());
                 }
-                tracing::warn!(
-                    attempt,
-                    reason = error.reason_code(),
-                    "polymarket_transport_exhausted"
-                );
+                crate::async_eprintln!("{}", serde_json::json!({
+                    "stage":"polymarket_transport_exhausted","attempt":attempt,
+                    "reason":error.reason_code(),
+                }));
                 return Err(error);
             }
             Err(error) => {
@@ -309,11 +548,10 @@ async fn run_transport_attempts(
                 {
                     return Ok(());
                 }
-                tracing::warn!(
-                    attempt,
-                    reason = error.reason_code(),
-                    "polymarket_transport_retry"
-                );
+                crate::async_eprintln!("{}", serde_json::json!({
+                    "stage":"polymarket_transport_retry","attempt":attempt,
+                    "reason":error.reason_code(),
+                }));
             }
         }
         if attempt == config.maximum_reconnect_attempts {
@@ -349,9 +587,15 @@ async fn publish_connection_gaps(
     transport_reason: &str,
     close_code: Option<u16>,
     close_reason: Option<&str>,
-    output: &mpsc::Sender<Vec<RawTransportFrame>>,
+    output: &TransportOutput,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<bool, TransportError> {
+    // A remove-first replacement can fail after the old pair was removed but
+    // before the new pair was subscribed. There is no owned token to mark as
+    // gapped; the control receipt carries the failed replacement instead.
+    if tokens.is_empty() {
+        return Ok(true);
+    }
     let received_at = Utc::now();
     let timestamp = received_at.timestamp_millis().to_string();
     let frames = tokens
@@ -368,17 +612,94 @@ async fn publish_connection_gaps(
             received_at,
         })
         .collect();
-    send_bounded(output, frames, shutdown).await
+    let bytes = serde_json::to_vec(&frames)
+        .map_err(|_| TransportError::InvalidFrame)?
+        .len();
+    send_bounded(output, frames, bytes, tokens, shutdown).await
 }
 
 async fn send_bounded(
-    output: &mpsc::Sender<Vec<RawTransportFrame>>,
+    output: &TransportOutput,
     frames: Vec<RawTransportFrame>,
+    bytes: usize,
+    source_tokens: &BTreeSet<String>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<bool, TransportError> {
+    if bytes == 0 || bytes > output.maximum_batch_bytes || bytes > u32::MAX as usize {
+        return Err(TransportError::FrameTooLarge);
+    }
+    let shared_slot_permit = if let Some(shared) = &output.shared_slots {
+        Some(tokio::select! {
+            permit = shared.clone().acquire_owned() =>
+                permit.map_err(|_| TransportError::Backpressure)?,
+            changed = shutdown.changed() => {
+                return if changed.is_err() || *shutdown.borrow() {
+                    Ok(false)
+                } else {
+                    Err(TransportError::Backpressure)
+                };
+            }
+        })
+    } else {
+        None
+    };
+    let shared_byte_permit = if let Some(shared) = &output.shared_bytes {
+        Some(tokio::select! {
+            permit = shared.clone().acquire_many_owned(bytes as u32) =>
+                permit.map_err(|_| TransportError::Backpressure)?,
+            changed = shutdown.changed() => {
+                return if changed.is_err() || *shutdown.borrow() {
+                    Ok(false)
+                } else {
+                    Err(TransportError::Backpressure)
+                };
+            }
+        })
+    } else {
+        None
+    };
+    let byte_permit = tokio::select! {
+        permit = output.bytes.clone().acquire_many_owned(bytes as u32) =>
+            permit.map_err(|_| TransportError::Backpressure)?,
+        changed = shutdown.changed() => {
+            return if changed.is_err() || *shutdown.borrow() {
+                Ok(false)
+            } else {
+                Err(TransportError::Backpressure)
+            };
+        }
+    };
     tokio::select! {
-        permit = output.reserve() => {
-            permit.map_err(|_| TransportError::Backpressure)?.send(frames);
+        permit = output.sender.reserve() => {
+            let permit = permit.map_err(|_| TransportError::Backpressure)?;
+            let current_bytes = output
+                .metrics
+                .current_bytes
+                .fetch_add(bytes, Ordering::Relaxed)
+                + bytes;
+            let current_batches = output
+                .metrics
+                .current_batches
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            output
+                .metrics
+                .high_bytes
+                .fetch_max(current_bytes, Ordering::Relaxed);
+            output
+                .metrics
+                .high_batches
+                .fetch_max(current_batches, Ordering::Relaxed);
+            permit.send(RawTransportBatch {
+                frames,
+                source_tokens: source_tokens.clone(),
+                _bytes: byte_permit,
+                _shared_bytes: shared_byte_permit,
+                _shared_slot: shared_slot_permit,
+                declared_bytes: bytes,
+                metrics: output.metrics.clone(),
+            });
+            if let Some(ready) = &output.ready { ready.signal()?; }
             Ok(true)
         }
         changed = shutdown.changed() => {
@@ -394,7 +715,7 @@ async fn send_bounded(
 async fn run_polymarket_connection(
     config: &PolymarketTransportConfig,
     tokens: &mut BTreeSet<String>,
-    output: &mpsc::Sender<Vec<RawTransportFrame>>,
+    output: &TransportOutput,
     shutdown: &mut watch::Receiver<bool>,
     updates: &mut Option<mpsc::Receiver<subscription::SubscriptionUpdate>>,
 ) -> Result<ConnectionEnd, TransportError> {
@@ -414,9 +735,17 @@ async fn run_polymarket_connection(
         ))
         .await
         .map_err(|_| TransportError::SendFailed)?;
+    // A busy market must not postpone application heartbeats forever.  The
+    // previous per-iteration sleep was recreated after every inbound quote,
+    // so liquid streams never emitted PING and were eventually disconnected
+    // by the upstream gateway.  Keep one independent periodic schedule whose
+    // deadline is unaffected by market traffic.
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.heartbeat_interval,
+        config.heartbeat_interval,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let heartbeat = tokio::time::sleep(config.heartbeat_interval);
-        tokio::pin!(heartbeat);
         tokio::select! {
             update = async { match updates.as_mut() {
                 Some(receiver) => receiver.recv().await,
@@ -427,7 +756,12 @@ async fn run_polymarket_connection(
                     Ok(diff)=>diff,
                     Err(error)=>{let _=update.receipt.send(Err(error));continue;}
                 };
-                for (operation,ids) in [("subscribe",&added),("unsubscribe",&removed)] {
+                let operations = if update.remove_first {
+                    [("unsubscribe", &removed), ("subscribe", &added)]
+                } else {
+                    [("subscribe", &added), ("unsubscribe", &removed)]
+                };
+                for (operation,ids) in operations {
                     if ids.is_empty() {continue;}
                     let message=Message::Text(serde_json::json!({"operation":operation,"assets_ids":ids}).to_string().into());
                     let sent=tokio::select! {
@@ -459,6 +793,7 @@ async fn run_polymarket_connection(
                         let _ = socket.close(None).await;
                         return Err(TransportError::FrameTooLarge);
                     }
+                    let wire_bytes = text.len();
                     let received_at = Utc::now();
                     let payload: Value = serde_json::from_str(&text)
                         .map_err(|_| TransportError::InvalidFrame)?;
@@ -482,7 +817,7 @@ async fn run_polymarket_connection(
                         raw_payload, received_at,
                     }).collect();
                     if frames.is_empty() {continue;}
-                    if !send_bounded(output, frames, shutdown).await? {
+                    if !send_bounded(output, frames, wire_bytes, tokens, shutdown).await? {
                         let _ = socket.close(None).await;
                         return Ok(ConnectionEnd::Shutdown);
                     }
@@ -503,13 +838,47 @@ async fn run_polymarket_connection(
                     return Err(TransportError::InvalidFrame);
                 }
                 Some(Err(error)) => {
-                    tracing::warn!(detail=%error,"polymarket_websocket_read_failed");
+                    // Keep the public fail-closed reason stable while making
+                    // the transport failure class observable.  Never include
+                    // request headers, proxy URLs or credentials in this log.
+                    crate::async_eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "stage":"polymarket_websocket_read_failed",
+                            "error_class":websocket_read_error_class(&error),
+                        })
+                    );
                     return Err(TransportError::ReadFailed);
                 },
             },
-            _ = &mut heartbeat => socket.send(Message::Text("PING".into())).await
+            _ = heartbeat.tick() => socket.send(Message::Text("PING".into())).await
                 .map_err(|_| TransportError::SendFailed)?,
         }
+    }
+}
+
+fn websocket_read_error_class(
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> String {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::ConnectionClosed => "connection_closed".into(),
+        Error::AlreadyClosed => "already_closed".into(),
+        Error::Io(error) => format!("io_{:?}", error.kind()).to_ascii_lowercase(),
+        Error::Tls(_) => "tls".into(),
+        Error::Capacity(_) => "capacity".into(),
+        // ProtocolError is an enum without request data. Its variant is safe
+        // and necessary to distinguish a peer omitting the close handshake
+        // from an actually malformed WebSocket frame.
+        Error::Protocol(error) => {
+            format!("protocol_{error:?}").to_ascii_lowercase()
+        }
+        Error::WriteBufferFull(_) => "write_buffer_full".into(),
+        Error::Utf8(_) => "utf8".into(),
+        Error::AttackAttempt => "attack_attempt".into(),
+        Error::Url(_) => "url".into(),
+        Error::Http(_) => "http".into(),
+        Error::HttpFormat(_) => "http_format".into(),
     }
 }
 
@@ -688,6 +1057,8 @@ struct FrameContext {
 
 struct AtomicPriceChanges {
     changes: Vec<SideLevels>,
+    bid_positions: BTreeMap<Price, usize>,
+    ask_positions: BTreeMap<Price, usize>,
     best_bid: Option<Price>,
     best_ask: Option<Price>,
 }
@@ -714,15 +1085,16 @@ pub fn normalize_frame_with_book_tick(
         .ok_or(NormalizeError::FrameNotObject)?;
     let event_type = string_alias(raw, &["event_type", "type"])
         .ok_or(NormalizeError::MissingField("event_type"))?;
-    let reported_at = parse_observed_at(raw.get("timestamp"), received_at)?;
-    // A `book` frame is a complete state observation delivered at subscription/recovery time.
-    // Its exchange timestamp can legitimately be old for a quiet market; freshness is therefore
-    // anchored to receipt while the source timestamp remains preserved in the immutable raw frame.
-    let observed_at = if event_type == "book" {
-        received_at
-    } else {
-        reported_at
-    };
+    // Supplier quote and trade time is never replaced by the local socket
+    // receipt, including an old full book received during recovery. A missing
+    // supplier clock is not a fresh quote. Internal lifecycle boundaries may
+    // still use their explicit local boundary clock for ordering only.
+    if matches!(event_type.as_str(),
+        "book" | "price_change" | "best_bid_ask" | "last_trade_price" | "tick_size_change")
+        && raw.get("timestamp").is_none() {
+        return Err(NormalizeError::MissingField("timestamp"));
+    }
+    let observed_at = parse_observed_at(raw.get("timestamp"), received_at)?;
     let raw_sha256 = content_sha256(&raw_payload)?;
     let context = FrameContext {
         raw_payload: Arc::new(raw_payload.clone()),
@@ -885,16 +1257,32 @@ pub fn normalize_frame_with_book_tick(
                     .entry(token_id)
                     .or_insert_with(|| AtomicPriceChanges {
                         changes: Vec::new(),
+                        bid_positions: BTreeMap::new(),
+                        ask_positions: BTreeMap::new(),
                         best_bid: best_bid.clone(),
                         best_ask: best_ask.clone(),
                     });
                 if entry.best_bid != best_bid || entry.best_ask != best_ask {
                     return Err(NormalizeError::InvalidLevels);
                 }
-                entry.changes.push(SideLevels {
-                    side,
-                    levels: vec![level],
-                });
+                // All levels in one venue frame form one atomic observation.
+                // Each size replaces its price level, so only the final write
+                // to a token/side/price can affect the post-frame book. Keep
+                // the raw frame unchanged for audit and validate every item
+                // above before discarding an overwritten assignment.
+                let positions = match side {
+                    Side::Bid => &mut entry.bid_positions,
+                    Side::Ask => &mut entry.ask_positions,
+                };
+                if let Some(&position) = positions.get(&level.price) {
+                    entry.changes[position].levels[0] = level;
+                } else {
+                    positions.insert(level.price.clone(), entry.changes.len());
+                    entry.changes.push(SideLevels {
+                        side,
+                        levels: vec![level],
+                    });
+                }
             }
             by_token
                 .into_iter()
@@ -1267,6 +1655,43 @@ mod tests {
     }
 
     #[test]
+    fn repeated_level_assignments_in_one_frame_keep_only_the_last_valid_value() {
+        let raw = serde_json::json!({
+            "event_type":"price_change", "timestamp":"2026-08-03T04:00:01Z",
+            "price_changes":[
+                {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"1"},
+                {"asset_id":"yes-1","side":"SELL","price":"0.44","size":"2"},
+                {"asset_id":"yes-1","side":"BID","price":"0.40","size":"0"},
+                {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"3"}
+            ]
+        });
+        let event = normalize_frame(&config(), raw.clone(), at(), 2)
+            .unwrap()
+            .remove(0);
+        assert_eq!(*event.raw_payload, raw);
+        let EventKind::AtomicDelta { changes, .. } = event.kind else {
+            panic!("expected atomic delta")
+        };
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].side, Side::Bid);
+        assert_eq!(changes[0].levels[0].quantity.to_string(), "3");
+        assert_eq!(changes[1].side, Side::Ask);
+        assert_eq!(changes[1].levels[0].quantity.to_string(), "2");
+
+        let invalid = serde_json::json!({
+            "event_type":"price_change", "timestamp":"2026-08-03T04:00:01Z",
+            "price_changes":[
+                {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"-1"},
+                {"asset_id":"yes-1","side":"BUY","price":"0.40","size":"3"}
+            ]
+        });
+        assert_eq!(
+            normalize_frame(&config(), invalid, at(), 2),
+            Err(NormalizeError::InvalidDecimal)
+        );
+    }
+
+    #[test]
     fn atomic_price_change_uses_venue_bbo_to_remove_stale_crossing_levels() {
         let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
         writer.apply(snapshot(1)).unwrap();
@@ -1518,10 +1943,7 @@ mod tests {
             let subscription: Value = serde_json::from_str(&subscription).unwrap();
             assert_eq!(subscription["type"], "market");
             assert_eq!(subscription["assets_ids"], serde_json::json!(["yes-1"]));
-            socket
-                .send(Message::Text("[]".into()))
-                .await
-                .unwrap();
+            socket.send(Message::Text("[]".into())).await.unwrap();
             socket
                 .send(Message::Text(
                     serde_json::json!([{
@@ -1537,7 +1959,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
         let endpoint = Url::parse(&format!("ws://{address}/ws/market")).unwrap();
-        let (sender, mut receiver) = mpsc::channel(4);
+        let (sender, mut receiver) = transport_output(4, 65_536, 65_536).unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let transport = tokio::spawn(run_polymarket_transport(
             PolymarketTransportConfig::loopback(endpoint),
@@ -1555,81 +1977,215 @@ mod tests {
 
     #[tokio::test]
     async fn managed_transport_updates_same_socket_and_reconnects_current_membership() {
-        managed_membership_roundtrip(false).await;
+        managed_membership_roundtrip(false, false).await;
     }
 
     #[tokio::test]
     async fn supervised_shard_preserves_membership_when_retry_group_exhausts() {
-        managed_membership_roundtrip(true).await;
+        managed_membership_roundtrip(true, false).await;
     }
 
-    async fn managed_membership_roundtrip(supervised:bool) {
+    #[tokio::test]
+    async fn managed_transport_can_remove_before_add_without_transient_over_subscription() {
+        managed_membership_roundtrip(false, true).await;
+    }
+
+    async fn managed_membership_roundtrip(supervised: bool, remove_first: bool) {
         tokio::time::timeout(Duration::from_secs(3), async {
-            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint=Url::parse(&format!("ws://{}/ws/market",listener.local_addr().unwrap())).unwrap();
-            let server=tokio::spawn(async move {
-                let (stream,_)=listener.accept().await.unwrap();
-                let mut socket=tokio_tungstenite::accept_async(stream).await.unwrap();
-                let first=socket.next().await.unwrap().unwrap().into_text().unwrap();
-                assert_eq!(serde_json::from_str::<Value>(&first).unwrap()["assets_ids"],serde_json::json!(["a","b"]));
-                socket.send(Message::Text(serde_json::json!({"event_type":"book","asset_id":"b"}).to_string().into())).await.unwrap();
-                for expected in [serde_json::json!({"operation":"subscribe","assets_ids":["c"]}),
-                                 serde_json::json!({"operation":"unsubscribe","assets_ids":["a"]})] {
-                    let message=socket.next().await.unwrap().unwrap().into_text().unwrap();
-                    assert_eq!(serde_json::from_str::<Value>(&message).unwrap(),expected);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = Url::parse(&format!(
+                "ws://{}/ws/market",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let first = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&first).unwrap()["assets_ids"],
+                    serde_json::json!(["a", "b"])
+                );
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"event_type":"book","asset_id":"b"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let expected = if remove_first {
+                    [
+                        serde_json::json!({"operation":"unsubscribe","assets_ids":["a"]}),
+                        serde_json::json!({"operation":"subscribe","assets_ids":["c"]}),
+                    ]
+                } else {
+                    [
+                        serde_json::json!({"operation":"subscribe","assets_ids":["c"]}),
+                        serde_json::json!({"operation":"unsubscribe","assets_ids":["a"]}),
+                    ]
+                };
+                for expected in expected {
+                    let message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                    assert_eq!(serde_json::from_str::<Value>(&message).unwrap(), expected);
                 }
                 // A frame already queued by the venue before unsubscribe is
                 // no longer owned, and must not become a global routing gap.
-                socket.send(Message::Text(serde_json::json!({"event_type":"book","asset_id":"a"}).to_string().into())).await.unwrap();
-                socket.send(Message::Text(serde_json::json!({"event_type":"book","asset_id":"c"}).to_string().into())).await.unwrap();
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"event_type":"book","asset_id":"a"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"event_type":"book","asset_id":"c"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
                 socket.close(None).await.unwrap();
-                let (stream,_)=listener.accept().await.unwrap();
-                let mut socket=tokio_tungstenite::accept_async(stream).await.unwrap();
-                let next=socket.next().await.unwrap().unwrap().into_text().unwrap();
-                assert_eq!(serde_json::from_str::<Value>(&next).unwrap()["assets_ids"],serde_json::json!(["b","c"]));
-                socket.send(Message::Text(serde_json::json!({"event_type":"book","asset_id":"b"}).to_string().into())).await.unwrap();
-                while let Some(message)=socket.next().await {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let next = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&next).unwrap()["assets_ids"],
+                    serde_json::json!(["b", "c"])
+                );
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"event_type":"book","asset_id":"b"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                while let Some(message) = socket.next().await {
                     match message.unwrap() {
-                        Message::Close(_)=>{let _=socket.flush().await;break;},
-                        Message::Text(text) if text=="PING"=>socket.send(Message::Text("PONG".into())).await.unwrap(),
-                        other=>panic!("unexpected subscription/control: {other:?}"),
+                        Message::Close(_) => {
+                            let _ = socket.flush().await;
+                            break;
+                        }
+                        Message::Text(text) if text == "PING" => {
+                            socket.send(Message::Text("PONG".into())).await.unwrap()
+                        }
+                        other => panic!("unexpected subscription/control: {other:?}"),
                     }
                 }
             });
-            let (sender,mut receiver)=mpsc::channel(4);
-            let (stop,shutdown)=watch::channel(false);
-            let (commands,updates)=subscription::subscription_commands();
-            let worker=tokio::spawn(async move {
-                let mut config=PolymarketTransportConfig::loopback(endpoint);
+            let (sender, mut receiver) = transport_output(4, 65_536, 65_536).unwrap();
+            let (stop, shutdown) = watch::channel(false);
+            let (commands, updates) = subscription::subscription_commands();
+            let worker = tokio::spawn(async move {
+                let mut config = PolymarketTransportConfig::loopback(endpoint);
                 if supervised {
-                    config.maximum_reconnect_attempts=1;
-                    supervise_polymarket_transport_managed(config,vec!["a".into(),"b".into()],sender,shutdown,updates,Duration::from_millis(5)).await
+                    config.maximum_reconnect_attempts = 1;
+                    supervise_polymarket_transport_managed(
+                        config,
+                        vec!["a".into(), "b".into()],
+                        sender,
+                        shutdown,
+                        updates,
+                        Duration::from_millis(5),
+                    )
+                    .await
                 } else {
-                    run_polymarket_transport_managed(config,vec!["a".into(),"b".into()],sender,shutdown,updates).await
+                    run_polymarket_transport_managed(
+                        config,
+                        vec!["a".into(), "b".into()],
+                        sender,
+                        shutdown,
+                        updates,
+                    )
+                    .await
                 }
             });
-            assert_eq!(receiver.recv().await.unwrap()[0].raw_payload["asset_id"],"b");
-            let (receipt,done)=tokio::sync::oneshot::channel();
-            commands.send(subscription::SubscriptionUpdate {expected_tokens:BTreeSet::from(["a".into(),"b".into()]),token_ids:BTreeSet::from(["b".into(),"c".into()]),receipt}).await.unwrap();
-            assert_eq!(done.await.unwrap(),Ok(()));
-            assert_eq!(receiver.recv().await.unwrap()[0].raw_payload["asset_id"],"c");
-            let gaps=receiver.recv().await.unwrap();
-            assert_eq!(gaps.iter().map(|f|f.raw_payload["asset_id"].as_str().unwrap()).collect::<Vec<_>>(),vec!["b","c"]);
-            assert!(gaps.iter().all(|f|f.raw_payload["event_type"]=="source_gap"));
-            assert_eq!(receiver.recv().await.unwrap()[0].raw_payload["asset_id"],"b");
-            let (receipt,done)=tokio::sync::oneshot::channel();
-            commands.send(subscription::SubscriptionUpdate {expected_tokens:BTreeSet::from(["a".into(),"b".into()]),token_ids:BTreeSet::from(["b".into(),"c".into()]),receipt}).await.unwrap();
-            assert_eq!(done.await.unwrap(),Err(TransportError::SubscriptionConflict));
+            assert_eq!(
+                receiver.recv().await.unwrap()[0].raw_payload["asset_id"],
+                "b"
+            );
+            let (receipt, done) = tokio::sync::oneshot::channel();
+            commands
+                .send(subscription::SubscriptionUpdate {
+                    expected_tokens: BTreeSet::from(["a".into(), "b".into()]),
+                    token_ids: BTreeSet::from(["b".into(), "c".into()]),
+                    remove_first,
+                    receipt,
+                })
+                .await
+                .unwrap();
+            assert_eq!(done.await.unwrap(), Ok(()));
+            assert_eq!(
+                receiver.recv().await.unwrap()[0].raw_payload["asset_id"],
+                "c"
+            );
+            let gaps = receiver.recv().await.unwrap();
+            assert_eq!(
+                gaps.iter()
+                    .map(|f| f.raw_payload["asset_id"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["b", "c"]
+            );
+            assert!(
+                gaps.iter()
+                    .all(|f| f.raw_payload["event_type"] == "source_gap")
+            );
+            assert_eq!(
+                receiver.recv().await.unwrap()[0].raw_payload["asset_id"],
+                "b"
+            );
+            let (receipt, done) = tokio::sync::oneshot::channel();
+            commands
+                .send(subscription::SubscriptionUpdate {
+                    expected_tokens: BTreeSet::from(["a".into(), "b".into()]),
+                    token_ids: BTreeSet::from(["b".into(), "c".into()]),
+                    remove_first,
+                    receipt,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                done.await.unwrap(),
+                Err(TransportError::SubscriptionConflict)
+            );
             stop.send(true).unwrap();
-            assert_eq!(worker.await.unwrap(),Ok(()));
+            assert_eq!(worker.await.unwrap(), Ok(()));
             server.await.unwrap();
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn bounded_transport_waits_for_capacity_and_shutdown_without_dropping() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        sender.send(Vec::new()).await.unwrap();
+        let (sender, mut receiver) = transport_output(1, 64, 64).unwrap();
+        let (_shutdown_tx, mut first_shutdown) = watch::channel(false);
+        assert_eq!(
+            send_bounded(
+                &sender,
+                vec![RawTransportFrame {
+                    raw_payload: serde_json::json!({"event_type":"first"}),
+                    received_at: at(),
+                }],
+                32,
+                &BTreeSet::new(),
+                &mut first_shutdown,
+            )
+            .await,
+            Ok(true)
+        );
+        assert_eq!(
+            sender.take_occupancy(),
+            TransportQueueOccupancy {
+                current_bytes: 32,
+                current_batches: 1,
+                high_bytes: 32,
+                high_batches: 1,
+            }
+        );
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let pending_sender = sender.clone();
         let pending = tokio::spawn(async move {
@@ -1639,6 +2195,8 @@ mod tests {
                     raw_payload: serde_json::json!({"event_type":"test"}),
                     received_at: at(),
                 }],
+                32,
+                &BTreeSet::new(),
                 &mut shutdown_rx,
             )
             .await
@@ -1648,16 +2206,112 @@ mod tests {
         receiver.recv().await.unwrap();
         assert_eq!(pending.await.unwrap(), Ok(true));
         assert_eq!(receiver.recv().await.unwrap().len(), 1);
+        assert_eq!(sender.take_occupancy().current_bytes, 0);
+        assert_eq!(sender.take_occupancy().current_batches, 0);
 
-        sender.send(Vec::new()).await.unwrap();
+        let (_blocker_shutdown_tx, mut blocker_shutdown) = watch::channel(false);
+        assert_eq!(
+            send_bounded(
+                &sender,
+                vec![RawTransportFrame {
+                    raw_payload: serde_json::json!({"event_type":"blocker"}),
+                    received_at: at(),
+                }],
+                32,
+                &BTreeSet::new(),
+                &mut blocker_shutdown,
+            )
+            .await,
+            Ok(true)
+        );
         let (shutdown_tx2, mut shutdown_rx2) = watch::channel(false);
         let pending_sender = sender.clone();
         let pending = tokio::spawn(async move {
-            send_bounded(&pending_sender, Vec::new(), &mut shutdown_rx2).await
+            send_bounded(
+                &pending_sender,
+                vec![RawTransportFrame {
+                    raw_payload: serde_json::json!({"event_type":"never"}),
+                    received_at: at(),
+                }],
+                32,
+                &BTreeSet::new(),
+                &mut shutdown_rx2,
+            )
+            .await
         });
         tokio::task::yield_now().await;
         shutdown_tx2.send(true).unwrap();
         assert_eq!(pending.await.unwrap(), Ok(false));
+    }
+
+    #[tokio::test]
+    async fn busy_market_frames_do_not_starve_periodic_heartbeat() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut endpoint =
+                Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+            endpoint.set_path("/ws/market");
+            let (ping_seen, mut ping_received) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let subscription = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&subscription).unwrap()["assets_ids"],
+                    serde_json::json!(["token"])
+                );
+                let mut ping_seen = Some(ping_seen);
+                for sequence in 0..80 {
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({
+                                "event_type":"book", "asset_id":"token", "sequence":sequence
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    if let Ok(Some(Ok(Message::Text(text)))) =
+                        tokio::time::timeout(Duration::from_millis(5), socket.next()).await
+                        && text == "PING"
+                    {
+                        socket.send(Message::Text("PONG".into())).await.unwrap();
+                        ping_seen.take().unwrap().send(()).unwrap();
+                        break;
+                    }
+                }
+                while let Some(message) = socket.next().await {
+                    match message.unwrap() {
+                        Message::Close(_) => break,
+                        Message::Text(text) if text == "PING" => {
+                            socket.send(Message::Text("PONG".into())).await.unwrap();
+                        }
+                        other => panic!("unexpected client frame: {other:?}"),
+                    }
+                }
+            });
+            let (sender, mut receiver) = transport_output(128, 1_048_576, 65_536).unwrap();
+            let (stop, shutdown) = watch::channel(false);
+            let mut worker = tokio::spawn(run_polymarket_transport(
+                PolymarketTransportConfig::loopback(endpoint),
+                vec!["token".into()],
+                sender,
+                shutdown,
+            ));
+            loop {
+                tokio::select! {
+                    result = &mut ping_received => { result.unwrap(); break; }
+                    batch = receiver.recv() => { drop(batch.expect("transport output stopped")); }
+                    result = &mut worker => { panic!("transport stopped before heartbeat: {:?}", result.unwrap()); }
+                }
+            }
+            stop.send(true).unwrap();
+            assert_eq!(worker.await.unwrap(), Ok(()));
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1960,6 +2614,44 @@ mod tests {
     }
 
     #[test]
+    fn bbo_not_newer_than_authoritative_book_is_an_auditable_noop() {
+        let mut writer = SingleWriter::new("scope".into(), MemoryLog(Vec::new()));
+        writer.apply(snapshot(1)).unwrap();
+        let normalized = normalize_frame(
+            &config(),
+            serde_json::json!({
+                "event_type":"best_bid_ask", "asset_id":"yes-1",
+                "timestamp":"2026-08-03T03:59:59Z", "best_bid":"0.39", "best_ask":"0.42"
+            }),
+            at(),
+            2,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(
+            normalized.source_observed_at
+                < writer.projection().books["yes-1"]
+                    .source_observed_at
+                    .unwrap()
+        );
+        let outcome = writer.apply(normalized).unwrap();
+        assert!(outcome.persisted.applied);
+        assert_eq!(outcome.persisted.fail_closed_reason, None);
+        assert_eq!(
+            outcome.projection.books["yes-1"]
+                .bids
+                .last_key_value()
+                .unwrap()
+                .0
+                .0
+                .to_string(),
+            "0.4"
+        );
+        assert!(outcome.projection.ready);
+        assert!(!outcome.projection.unresolved_gaps.contains("yes-1"));
+    }
+
+    #[test]
     fn network_delivered_atomic_delta_with_older_source_boundary_is_an_auditable_noop() {
         let mut tolerant = config();
         tolerant.maximum_source_delay_ms = 10_000;
@@ -2020,7 +2712,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_market_full_book_freshness_is_anchored_to_receipt() {
+    fn quiet_market_full_book_keeps_supplier_time_separate_from_receipt() {
         let mut strict = config();
         strict.maximum_source_delay_ms = 1_000;
         let normalized = normalize_frame(
@@ -2035,15 +2727,29 @@ mod tests {
         )
         .unwrap()
         .remove(0);
-        assert!(!normalized.source.delayed);
-        assert_eq!(normalized.source_observed_at, at());
+        assert!(normalized.source.delayed);
+        assert_eq!(normalized.source_observed_at,
+            chrono::DateTime::parse_from_rfc3339("2026-08-03T03:00:00Z")
+                .unwrap().with_timezone(&chrono::Utc));
+        assert_eq!(normalized.received_at, at());
         assert_eq!(normalized.raw_payload["timestamp"], "2026-08-03T03:00:00Z");
+    }
+
+    #[test]
+    fn supplier_quote_without_source_timestamp_cannot_inherit_receipt_time() {
+        let raw = serde_json::json!({
+            "event_type":"book", "asset_id":"yes-1", "tick_size":"0.01",
+            "bids":[{"price":"0.40","size":"10"}],
+            "asks":[{"price":"0.42","size":"11"}]
+        });
+        assert_eq!(normalize_frame(&config(), raw, at(), 1),
+            Err(NormalizeError::MissingField("timestamp")));
     }
 
     #[test]
     fn zero_tick_and_off_grid_price_are_rejected() {
         let zero_tick = serde_json::json!({
-            "event_type":"book", "asset_id":"yes-1", "tick_size":"0",
+            "event_type":"book", "asset_id":"yes-1", "timestamp":"2026-08-03T04:00:00Z", "tick_size":"0",
             "bids":[], "asks":[]
         });
         assert_eq!(
@@ -2055,7 +2761,7 @@ mod tests {
         let off_grid = normalize_frame(
             &config(),
             serde_json::json!({
-                "event_type":"book", "asset_id":"yes-1", "tick_size":"0.01",
+                "event_type":"book", "asset_id":"yes-1", "timestamp":"2026-08-03T04:00:00Z", "tick_size":"0.01",
                 "bids":[{"price":"0.405","size":"1"}],
                 "asks":[{"price":"0.60","size":"1"}]
             }),

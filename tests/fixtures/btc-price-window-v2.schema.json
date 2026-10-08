@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:marketcow:btc-price-window:v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "source", "instrument_id", "epoch",
+    "first_source_time_ms", "partial", "quote_interval_diagnostics",
+    "source_continuity", "freshness", "archive_diagnostics", "points"
+  ],
+  "properties": {
+    "schema_version": {"const": "marketcow.btc-price-window.v2"},
+    "source": {"enum": ["chainlink_twap_60s", "binance_spot_1s"]},
+    "instrument_id": {"type": "string"},
+    "epoch": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "source_channel": {"type": "string"},
+    "source_symbol": {"type": "string"},
+    "window_seconds": {"type": "integer"},
+    "first_source_time_ms": {"type": "integer"},
+    "partial": {"type": "boolean"},
+    "quote_interval_diagnostics": {"$ref": "#/$defs/intervals"},
+    "source_continuity": {"type": "object"},
+    "freshness": {"$ref": "#/$defs/freshness"},
+    "archive_diagnostics": {"type": "object"},
+    "checkpoint_sequence": {"type": "integer", "minimum": 0},
+    "durable_watermark": {"type": "integer", "minimum": 0},
+    "window_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "points": {"type": "array", "minItems": 1, "maxItems": 300}
+  },
+  "oneOf": [
+    {
+      "required": ["source_channel", "source_symbol", "window_seconds"],
+      "properties": {
+        "source": {"const": "chainlink_twap_60s"},
+        "instrument_id": {"const": "BTCUSD.CHAINLINK.TWAP60"},
+        "source_channel": {"const": "price.crypto.twap"},
+        "source_symbol": {"const": "btcusd"},
+        "window_seconds": {"const": 60},
+        "quote_interval_diagnostics": {
+          "allOf": [
+            {"$ref": "#/$defs/intervals"},
+            {"properties": {"cadence_requirement": {"const": "none"}}}
+          ]
+        },
+        "source_continuity": {"$ref": "#/$defs/chainlink_continuity"},
+        "freshness": {
+          "allOf": [
+            {"$ref": "#/$defs/freshness"},
+            {"properties": {"max_source_age_ms": {"const": 3000}}}
+          ]
+        },
+        "archive_diagnostics": {"$ref": "#/$defs/chainlink_archive"},
+        "points": {"type": "array", "minItems": 1, "maxItems": 300,
+          "items": {"$ref": "#/$defs/chainlink_point"}}
+      },
+      "not": {"anyOf": [
+        {"required": ["checkpoint_sequence"]},
+        {"required": ["durable_watermark"]},
+        {"required": ["window_sha256"]}
+      ]}
+    },
+    {
+      "required": ["checkpoint_sequence", "durable_watermark", "window_sha256"],
+      "properties": {
+        "source": {"const": "binance_spot_1s"},
+        "instrument_id": {"const": "BTCUSDT.BINANCE"},
+        "partial": {"const": false},
+        "quote_interval_diagnostics": {
+          "allOf": [
+            {"$ref": "#/$defs/intervals"},
+            {"properties": {
+              "cadence_requirement": {"const": "exact_finalized_1s"},
+              "intervals_over_1000_ms": {"const": 0},
+              "max_interval_ms": {"const": 1000},
+              "latest_interval_ms": {"const": 1000}
+            }}
+          ]
+        },
+        "source_continuity": {"$ref": "#/$defs/binance_continuity"},
+        "freshness": {
+          "allOf": [
+            {"$ref": "#/$defs/freshness"},
+            {"properties": {"max_source_age_ms": {"const": 2000}}}
+          ]
+        },
+        "archive_diagnostics": {"$ref": "#/$defs/binance_archive"},
+        "points": {"type": "array", "minItems": 300, "maxItems": 300,
+          "items": {"$ref": "#/$defs/binance_point"}}
+      },
+      "not": {"anyOf": [
+        {"required": ["source_channel"]},
+        {"required": ["source_symbol"]},
+        {"required": ["window_seconds"]}
+      ]}
+    }
+  ],
+  "$defs": {
+    "intervals": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cadence_requirement", "intervals_over_1000_ms",
+        "max_interval_ms", "latest_interval_ms"],
+      "properties": {
+        "cadence_requirement": {"enum": ["none", "exact_finalized_1s"]},
+        "intervals_over_1000_ms": {"type": "integer", "minimum": 0},
+        "max_interval_ms": {"type": ["integer", "null"], "minimum": 0},
+        "latest_interval_ms": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "freshness": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "latest_source_time_ms", "latest_received_at",
+        "source_age_ms_at_response", "response_at", "max_source_age_ms"],
+      "properties": {
+        "status": {"const": "fresh"},
+        "latest_source_time_ms": {"type": "integer"},
+        "latest_received_at": {"type": "string", "format": "date-time"},
+        "source_age_ms_at_response": {"type": "integer", "minimum": 0},
+        "response_at": {"type": "string", "format": "date-time"},
+        "max_source_age_ms": {"type": "integer", "minimum": 1}
+      }
+    },
+    "chainlink_continuity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "status", "epoch", "sequence_scope",
+        "snapshot_sequence", "last_sequence", "snapshot_received_at",
+        "last_frame_received_at", "dropped_frames",
+        "snapshot_point_sequence_semantics"],
+      "properties": {
+        "kind": {"const": "polybolt_authenticated_subscription"},
+        "status": {"const": "contiguous_since_snapshot"},
+        "epoch": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "sequence_scope": {"const": "epoch_and_channel"},
+        "snapshot_sequence": {"type": "integer", "minimum": 0},
+        "last_sequence": {"type": "integer", "minimum": 0},
+        "snapshot_received_at": {"type": "string", "format": "date-time"},
+        "last_frame_received_at": {"type": "string", "format": "date-time"},
+        "dropped_frames": {"const": 0},
+        "snapshot_point_sequence_semantics": {"const": "shared_frame_sequence"}
+      }
+    },
+    "binance_continuity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "status", "epoch", "expected_interval_ms",
+        "first_open_ms", "last_open_ms"],
+      "properties": {
+        "kind": {"const": "finalized_1s_bar_series"},
+        "status": {"const": "contiguous_finalized_window"},
+        "epoch": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "expected_interval_ms": {"const": 1000},
+        "first_open_ms": {"type": "integer"},
+        "last_open_ms": {"type": "integer"}
+      }
+    },
+    "chainlink_archive": {
+      "type": "object", "additionalProperties": false,
+      "required": ["writer_healthy", "dropped_records"],
+      "properties": {
+        "writer_healthy": {"type": "boolean"},
+        "dropped_records": {"type": "integer", "minimum": 0}
+      }
+    },
+    "binance_archive": {
+      "type": "object", "additionalProperties": false,
+      "required": ["durable_checkpoint_sequence", "durable_watermark"],
+      "properties": {
+        "durable_checkpoint_sequence": {"type": "integer", "minimum": 0},
+        "durable_watermark": {"type": "integer", "minimum": 0}
+      }
+    },
+    "chainlink_point": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_time_ms", "price", "received_at",
+        "source_sequence", "source_raw_sha256"],
+      "properties": {
+        "source_time_ms": {"type": "integer"},
+        "price": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$"},
+        "received_at": {"type": "string", "format": "date-time"},
+        "source_sequence": {"type": "integer", "minimum": 0},
+        "source_raw_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "binance_point": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_time_ms", "price", "received_at",
+        "source_raw_sha256", "final"],
+      "properties": {
+        "source_time_ms": {"type": "integer"},
+        "price": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$"},
+        "received_at": {"type": "string", "format": "date-time"},
+        "source_raw_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "final": {"const": true}
+      }
+    }
+  }
+}

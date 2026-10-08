@@ -88,4 +88,20 @@ def provider_history_capability(
             1, provider, interval, 5000, 4000, 0, 60, "exclusive",
             "documented", "provider-api-contract", None,
         )
+    if provider == "alpaca_sip":
+        if interval == "1d":
+            rows_per_day = 1
+        elif interval in {"1m", "5m", "15m", "30m", "60m", "1h"}:
+            seconds = {
+                "1m": 60, "5m": 300, "15m": 900,
+                "30m": 1800, "60m": 3600, "1h": 3600,
+            }[interval]
+            rows_per_day = (16 * 3600 + seconds - 1) // seconds
+        else:
+            raise ValueError("unsupported Alpaca SIP history interval")
+        return ProviderHistoryCapability(
+            1, provider, interval, 10000, 8000, rows_per_day, 86400,
+            "exclusive", "documented",
+            "alpaca-stock-bars-openapi-2026-05-27", "XNAS", True,
+        )
     raise ValueError("unsupported history provider")

@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "marketcow.btc-price-trade.v2",
+  "title": "MarketCow BTCUSDT raw-trade price stream v2",
+  "$defs": {
+    "epoch": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "decimal": {"type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$"},
+    "rest_trade": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trade_id", "price", "quantity", "trade_time_ms", "event_time_ms", "buyer_is_maker", "received_at", "source", "source_raw_sha256", "source_row_index"],
+      "properties": {
+        "trade_id": {"type": "integer", "minimum": 0},
+        "price": {"$ref": "#/$defs/decimal"},
+        "quantity": {"$ref": "#/$defs/decimal"},
+        "trade_time_ms": {"type": "integer", "minimum": 1},
+        "event_time_ms": {"type": "null"},
+        "buyer_is_maker": {"type": "boolean"},
+        "received_at": {"type": "string", "format": "date-time"},
+        "source": {"const": "binance_spot_rest_recent"},
+        "source_raw_sha256": {"$ref": "#/$defs/sha256"},
+        "source_row_index": {"type": "integer", "minimum": 0, "maximum": 999}
+      }
+    },
+    "ws_trade": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trade_id", "price", "quantity", "trade_time_ms", "event_time_ms", "buyer_is_maker", "received_at", "source", "source_raw_sha256", "raw_frame_base64"],
+      "properties": {
+        "trade_id": {"type": "integer", "minimum": 0},
+        "price": {"$ref": "#/$defs/decimal"},
+        "quantity": {"$ref": "#/$defs/decimal"},
+        "trade_time_ms": {"type": "integer", "minimum": 1},
+        "event_time_ms": {"type": "integer", "minimum": 1},
+        "buyer_is_maker": {"type": "boolean"},
+        "received_at": {"type": "string", "format": "date-time"},
+        "source": {"const": "binance_spot_ws_trade"},
+        "source_raw_sha256": {"$ref": "#/$defs/sha256"},
+        "raw_frame_base64": {"type": "string", "contentEncoding": "base64"}
+      }
+    },
+    "common": {
+      "type": "object",
+      "required": ["schema_version", "type", "source", "instrument_id", "source_epoch", "stream_serial", "message_sequence", "source_sequence"],
+      "properties": {
+        "schema_version": {"const": "marketcow.btc-price-stream.v2"},
+        "source": {"const": "binance_spot_trade"},
+        "instrument_id": {"const": "BTCUSDT.BINANCE"},
+        "source_epoch": {"$ref": "#/$defs/epoch"},
+        "stream_serial": {"type": "integer", "minimum": 0},
+        "message_sequence": {"type": "integer", "minimum": 0},
+        "source_sequence": {"type": ["integer", "null"], "minimum": 0}
+      }
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "type", "source", "instrument_id", "source_epoch", "stream_serial", "message_sequence", "source_sequence", "source_sequence_scope", "source_continuity", "snapshot_kind", "snapshot_raw_sha256", "snapshot_raw_base64", "trades", "first_snapshot_trade_id", "snapshot_truncated", "retained_trade_count", "retained_limit", "latest_trade_age_ms_at_emit", "last_received_at", "archive_diagnostics", "freshness_policy", "snapshot_joined_at", "response_at"],
+          "properties": {
+            "schema_version": {"const": "marketcow.btc-price-stream.v2"},
+            "type": {"const": "snapshot"},
+            "source": {"const": "binance_spot_trade"},
+            "instrument_id": {"const": "BTCUSDT.BINANCE"},
+            "source_epoch": {"$ref": "#/$defs/epoch"},
+            "stream_serial": {"type": "integer", "minimum": 1},
+            "message_sequence": {"type": "integer", "minimum": 1},
+            "source_sequence": {"type": "integer", "minimum": 0},
+            "source_sequence_scope": {"const": "BTCUSDT trade_id"},
+            "source_continuity": {"const": "contiguous_trade_id_since_rest_ws_join"},
+            "snapshot_kind": {"const": "rest_recent_trades_joined_to_ws"},
+            "snapshot_raw_sha256": {"$ref": "#/$defs/sha256"},
+            "snapshot_raw_base64": {"type": "string", "contentEncoding": "base64"},
+            "trades": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"oneOf": [{"$ref": "#/$defs/rest_trade"}, {"$ref": "#/$defs/ws_trade"}]}},
+            "first_snapshot_trade_id": {"type": "integer", "minimum": 0},
+            "snapshot_truncated": {"type": "boolean"},
+            "retained_trade_count": {"type": "integer", "minimum": 1, "maximum": 4096},
+            "retained_limit": {"const": 4096},
+            "latest_trade_age_ms_at_emit": {"type": "integer"},
+            "last_received_at": {"type": "string", "format": "date-time"},
+            "archive_diagnostics": {"type": "object", "additionalProperties": false, "required": ["writer_healthy", "dropped_records"], "properties": {"writer_healthy": {"type": "boolean"}, "dropped_records": {"type": "integer", "minimum": 0}}},
+            "freshness_policy": {"const": "consumer_explicit_max_trade_age_ms_required"},
+            "snapshot_joined_at": {"type": "string", "format": "date-time"},
+            "response_at": {"type": "string", "format": "date-time"}
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "type", "source", "instrument_id", "source_epoch", "stream_serial", "message_sequence", "source_sequence", "source_sequence_scope", "source_continuity", "trade", "received_at", "latest_trade_age_ms_at_emit", "published_at"],
+          "properties": {
+            "schema_version": {"const": "marketcow.btc-price-stream.v2"},
+            "type": {"const": "trade"},
+            "source": {"const": "binance_spot_trade"},
+            "instrument_id": {"const": "BTCUSDT.BINANCE"},
+            "source_epoch": {"$ref": "#/$defs/epoch"},
+            "stream_serial": {"type": "integer", "minimum": 1},
+            "message_sequence": {"type": "integer", "minimum": 1},
+            "source_sequence": {"type": "integer", "minimum": 0},
+            "source_sequence_scope": {"const": "BTCUSDT trade_id"},
+            "source_continuity": {"const": "contiguous_trade_id_since_rest_ws_join"},
+            "trade": {"$ref": "#/$defs/ws_trade"},
+            "received_at": {"type": "string", "format": "date-time"},
+            "latest_trade_age_ms_at_emit": {"type": "integer"},
+            "published_at": {"type": "string", "format": "date-time"}
+          }
+        }
+      ]
+    },
+    {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "type", "source", "instrument_id", "source_epoch", "stream_serial", "message_sequence", "source_sequence", "reason", "observed_at"],
+          "properties": {
+            "schema_version": {"const": "marketcow.btc-price-stream.v2"},
+            "type": {"const": "unavailable"},
+            "source": {"const": "binance_spot_trade"},
+            "instrument_id": {"const": "BTCUSDT.BINANCE"},
+            "source_epoch": {"$ref": "#/$defs/epoch"},
+            "stream_serial": {"type": "integer", "minimum": 0},
+            "message_sequence": {"const": 0},
+            "source_sequence": {"type": "null"},
+            "reason": {"enum": ["bootstrap_not_started", "source_reconnecting", "source_trade_id_gap", "source_ingress_dropped", "source_bad_frame", "source_read_failed"]},
+            "observed_at": {"type": "string", "format": "date-time"}
+          }
+        }
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "type", "source", "reason", "observed_at"],
+      "properties": {
+        "schema_version": {"const": "marketcow.btc-price-stream.v2"},
+        "type": {"const": "stream_error"},
+        "source": {"const": "binance_spot_trade"},
+        "reason": {"enum": ["consumer_lagged_or_source_channel_closed", "price_stream_sequence_gap"]},
+        "observed_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  ]
+}

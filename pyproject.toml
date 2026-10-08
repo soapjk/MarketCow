@@ -50,6 +50,7 @@ dev = [
 marketcow = "marketcow.__main__:main"
 marketcow-mcp = "marketcow.mcp_server:main"
 marketcow-mcp-project = "marketcow.mcp_project_installer:main"
+marketcow-alpaca-sip = "marketcow.alpaca_sip_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/soapjk/MarketCow"
