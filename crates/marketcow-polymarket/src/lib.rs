@@ -1085,15 +1085,16 @@ pub fn normalize_frame_with_book_tick(
         .ok_or(NormalizeError::FrameNotObject)?;
     let event_type = string_alias(raw, &["event_type", "type"])
         .ok_or(NormalizeError::MissingField("event_type"))?;
-    let reported_at = parse_observed_at(raw.get("timestamp"), received_at)?;
-    // A `book` frame is a complete state observation delivered at subscription/recovery time.
-    // Its exchange timestamp can legitimately be old for a quiet market; freshness is therefore
-    // anchored to receipt while the source timestamp remains preserved in the immutable raw frame.
-    let observed_at = if event_type == "book" {
-        received_at
-    } else {
-        reported_at
-    };
+    // Supplier quote and trade time is never replaced by the local socket
+    // receipt, including an old full book received during recovery. A missing
+    // supplier clock is not a fresh quote. Internal lifecycle boundaries may
+    // still use their explicit local boundary clock for ordering only.
+    if matches!(event_type.as_str(),
+        "book" | "price_change" | "best_bid_ask" | "last_trade_price" | "tick_size_change")
+        && raw.get("timestamp").is_none() {
+        return Err(NormalizeError::MissingField("timestamp"));
+    }
+    let observed_at = parse_observed_at(raw.get("timestamp"), received_at)?;
     let raw_sha256 = content_sha256(&raw_payload)?;
     let context = FrameContext {
         raw_payload: Arc::new(raw_payload.clone()),
@@ -2711,7 +2712,7 @@ mod tests {
     }
 
     #[test]
-    fn quiet_market_full_book_freshness_is_anchored_to_receipt() {
+    fn quiet_market_full_book_keeps_supplier_time_separate_from_receipt() {
         let mut strict = config();
         strict.maximum_source_delay_ms = 1_000;
         let normalized = normalize_frame(
@@ -2726,15 +2727,29 @@ mod tests {
         )
         .unwrap()
         .remove(0);
-        assert!(!normalized.source.delayed);
-        assert_eq!(normalized.source_observed_at, at());
+        assert!(normalized.source.delayed);
+        assert_eq!(normalized.source_observed_at,
+            chrono::DateTime::parse_from_rfc3339("2026-08-03T03:00:00Z")
+                .unwrap().with_timezone(&chrono::Utc));
+        assert_eq!(normalized.received_at, at());
         assert_eq!(normalized.raw_payload["timestamp"], "2026-08-03T03:00:00Z");
+    }
+
+    #[test]
+    fn supplier_quote_without_source_timestamp_cannot_inherit_receipt_time() {
+        let raw = serde_json::json!({
+            "event_type":"book", "asset_id":"yes-1", "tick_size":"0.01",
+            "bids":[{"price":"0.40","size":"10"}],
+            "asks":[{"price":"0.42","size":"11"}]
+        });
+        assert_eq!(normalize_frame(&config(), raw, at(), 1),
+            Err(NormalizeError::MissingField("timestamp")));
     }
 
     #[test]
     fn zero_tick_and_off_grid_price_are_rejected() {
         let zero_tick = serde_json::json!({
-            "event_type":"book", "asset_id":"yes-1", "tick_size":"0",
+            "event_type":"book", "asset_id":"yes-1", "timestamp":"2026-08-03T04:00:00Z", "tick_size":"0",
             "bids":[], "asks":[]
         });
         assert_eq!(
@@ -2746,7 +2761,7 @@ mod tests {
         let off_grid = normalize_frame(
             &config(),
             serde_json::json!({
-                "event_type":"book", "asset_id":"yes-1", "tick_size":"0.01",
+                "event_type":"book", "asset_id":"yes-1", "timestamp":"2026-08-03T04:00:00Z", "tick_size":"0.01",
                 "bids":[{"price":"0.405","size":"1"}],
                 "asks":[{"price":"0.60","size":"1"}]
             }),

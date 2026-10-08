@@ -1,8 +1,10 @@
 syntax = "proto3";
 
-package marketcow.polymarket.btc5m.v2;
+package marketcow.polymarket.btc5m.v3;
 
-// MarketCow -> Tradude BTC five-minute market-local contract, version 2.
+// MarketCow -> Tradude BTC five-minute market-local contract, version 3.
+// Quote/trade freshness is exclusively supplier-clock time. Local receive,
+// publish and apply clocks are diagnostic and never renew a quote.
 // Hot snapshots and streams do not expose persistence progress as a trading
 // gate. Only separate replay APIs report durable archive bounds.
 // This is the only high-frequency feed. A consumer MUST reject another schema
@@ -55,8 +57,8 @@ message CanonicalBook {
   string book_epoch = 3;
   uint64 sequence = 4;
   string sequence_semantics = 5;
-  optional string exchange_at = 6;    // RFC3339 UTC, source supplied.
-  string received_at = 7;              // Canonical observation clock.
+  string quote_source_at = 6;          // Required supplier book timestamp, RFC3339 UTC.
+  string received_at = 7;              // Local receipt; diagnostic only.
   bytes tick_version = 8;               // SHA-256 of the tick-size fact.
   string tick_size = 9;
   repeated PriceLevel bids = 10;       // Strict descending price; no duplicate.
@@ -79,8 +81,8 @@ message BookPostState {
   string book_epoch = 3;
   uint64 sequence = 4;
   string sequence_semantics = 5;
-  optional string exchange_at = 6;
-  string received_at = 7;
+  string quote_source_at = 6;          // Supplier book timestamp; not trade time.
+  string received_at = 7;              // Local receipt; diagnostic only.
   bytes tick_version = 8;
   string tick_size = 9;
   optional string last_trade_price = 10;
@@ -97,8 +99,8 @@ message BookDelta {
 
 message LastTrade {
   string price = 1;
-  BookPostState post_state = 2;         // Depth unchanged; book clock advances.
-  optional string trade_exchange_at = 3;
+  BookPostState post_state = 2;         // Depth unchanged; quote clock does not advance.
+  string trade_source_at = 3;          // Required supplier trade timestamp.
   string trade_received_at = 4;
 }
 
@@ -156,8 +158,8 @@ message MarketEvent {
   optional string token_id = 7;
   optional string book_epoch = 8;
   optional uint64 book_sequence = 9;
-  optional string exchange_at = 10;
-  string received_at = 11;
+  optional string source_at = 10;     // Supplier event time on book events; absent for internal boundaries.
+  string received_at = 11;             // Local receipt; diagnostic only.
   optional bool applied = 12;
   optional string fail_closed_reason = 13;
   optional uint64 physical_archive_cursor = 14; // Absent on live WS; present only in durable replay.
@@ -188,10 +190,11 @@ message BookConfirmation {
   string book_epoch = 5;
   uint64 book_sequence = 6;
   bytes state_checksum = 7;
-  string book_received_at = 8;
-  string confirmed_at = 9;
+  string book_quote_source_at = 8;     // Supplier time of the bound canonical book.
+  string confirmation_source_at = 9;   // Supplier time of this exact observation.
   string confirmation_source = 10;
   bytes confirmation_evidence_sha256 = 11;
+  string confirmation_received_at = 12; // Local receipt; diagnostic only.
 }
 
 message BookBaseline {
@@ -228,7 +231,7 @@ message MarketStreamRequest {
   // same fields as explicit URL query parameters. The cursor parameter is
   // exactly after_market_cursor; after_cursor is not an accepted alias.
   // Stream response is Binary MarketStreamFrame under subprotocol
-  // marketcow.btc5m.market-local.v2.
+  // marketcow.btc5m.market-local.v3.
   MarketIdentity identity = 1;
   optional uint64 after_market_cursor = 2; // Explicit zero is valid.
   optional uint64 after_confirmation_sequence = 3; // Independent prefix.

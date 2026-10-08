@@ -3,7 +3,7 @@
 //! hash preimage or a second live state machine.
 
 use anyhow::{Context, Result, bail, ensure};
-use marketcow_contracts::btc5m_market_local_v2::{encode_frame, wire};
+use marketcow_contracts::btc5m_market_local_v3::{encode_frame, wire};
 use serde::{Serialize, Serializer, ser::{SerializeMap, SerializeSeq}};
 use serde_json::Value;
 use marketcow_runtime::discovery_source::DurableMarketGroup;
@@ -99,7 +99,7 @@ pub(crate) fn canonical_book(value: &Value) -> Result<wire::CanonicalBook> {
         book_epoch: required_string(value, "book_epoch")?.into(),
         sequence: required_u64(value, "sequence")?,
         sequence_semantics: required_string(value, "sequence_semantics")?.into(),
-        exchange_at: optional_string(value, "exchange_at")?,
+        quote_source_at: required_string(value, "exchange_at")?.into(),
         received_at: required_string(value, "received_at")?.into(),
         tick_version: hash32(required_string(value, "tick_version")?)?,
         tick_size: required_string(value, "tick_size")?.into(),
@@ -118,7 +118,7 @@ fn post_state(value: &Value) -> Result<wire::BookPostState> {
         book_epoch: required_string(value, "book_epoch")?.into(),
         sequence: required_u64(value, "sequence")?,
         sequence_semantics: required_string(value, "sequence_semantics")?.into(),
-        exchange_at: optional_string(value, "exchange_at")?,
+        quote_source_at: required_string(value, "exchange_at")?.into(),
         received_at: required_string(value, "received_at")?.into(),
         tick_version: hash32(required_string(value, "tick_version")?)?,
         tick_size: required_string(value, "tick_size")?.into(),
@@ -136,7 +136,8 @@ pub(crate) fn market_event(value: &Value) -> Result<wire::MarketEvent> {
     let preimage = serde_json::to_vec(&SourceEventPreimage(value))?;
     ensure!(hex::encode(Sha256::digest(&preimage)) == required_string(value, "event_id")?,
         "source event preimage differs from event identity");
-    let body = match required_string(value, "event_type")? {
+    let event_type = required_string(value, "event_type")?;
+    let body = match event_type {
         "book" => match payload.get("payload_semantics").and_then(Value::as_str) {
             None => Payload::BookSnapshot(canonical_book(payload)?),
             Some("ordered_depth_delta_with_complete_post_state_commitment") => {
@@ -155,7 +156,7 @@ pub(crate) fn market_event(value: &Value) -> Result<wire::MarketEvent> {
                 Payload::LastTrade(wire::LastTrade {
                     price: required_string(&payload["trade"], "price")?.into(),
                     post_state: Some(post_state(payload)?),
-                    trade_exchange_at: optional_string(&payload["trade"], "exchange_at")?,
+                    trade_source_at: required_string(&payload["trade"], "exchange_at")?.into(),
                     trade_received_at: required_string(&payload["trade"], "received_at")?.into(),
                 })
             }
@@ -205,7 +206,11 @@ pub(crate) fn market_event(value: &Value) -> Result<wire::MarketEvent> {
         token_id: optional_string(value, "token_id")?,
         book_epoch: optional_string(value, "book_epoch")?,
         book_sequence: optional_u64(value, "sequence")?,
-        exchange_at: optional_string(value, "exchange_at")?,
+        source_at: if event_type == "book" {
+            Some(required_string(value, "exchange_at")?.into())
+        } else {
+            None
+        },
         received_at: required_string(value, "received_at")?.into(),
         applied: Some(value["applied"].as_bool().context("missing applied")?),
         fail_closed_reason: optional_string(value, "fail_closed_reason")?,
@@ -224,10 +229,11 @@ pub(crate) fn confirmation(value: &Value) -> Result<wire::BookConfirmation> {
         book_epoch: required_string(value, "book_epoch")?.into(),
         book_sequence: required_u64(value, "book_sequence")?,
         state_checksum: hash32(required_string(value, "state_checksum")?)?,
-        book_received_at: required_string(value, "book_received_at")?.into(),
-        confirmed_at: required_string(value, "confirmed_at")?.into(),
+        book_quote_source_at: required_string(value, "book_quote_source_at")?.into(),
+        confirmation_source_at: required_string(value, "confirmation_source_at")?.into(),
         confirmation_source: required_string(value, "confirmation_source")?.into(),
         confirmation_evidence_sha256: hash32(required_string(value, "confirmation_evidence_sha256")?)?,
+        confirmation_received_at: required_string(value, "confirmation_received_at")?.into(),
     })
 }
 

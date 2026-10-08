@@ -86,6 +86,7 @@ struct Adapter {
     sequences: BTreeMap<String, u64>,
     waiting: BTreeSet<String>,
     book_received: BTreeMap<String, chrono::DateTime<Utc>>,
+    book_source: BTreeMap<String, chrono::DateTime<Utc>>,
     // The venue often repeats an already-applied price level with only a new
     // transport timestamp. That is not a new book state or freshness evidence.
     depth_checksums: BTreeMap<String, String>,
@@ -216,6 +217,7 @@ impl Adapter {
             epochs: BTreeMap::new(),
             sequences: BTreeMap::new(),
             book_received: BTreeMap::new(),
+            book_source: BTreeMap::new(),
             depth_checksums: BTreeMap::new(),
             last_trades: BTreeMap::new(),
             confirmations: Vec::new(),
@@ -231,6 +233,7 @@ impl Adapter {
         self.epochs.clear();
         self.sequences.clear();
         self.book_received.clear();
+        self.book_source.clear();
         self.depth_checksums.clear();
         self.last_trades.clear();
         self.confirmations.clear();
@@ -361,6 +364,7 @@ impl Adapter {
             epochs: BTreeMap::new(),
             sequences: BTreeMap::new(),
             book_received: BTreeMap::new(),
+            book_source: BTreeMap::new(),
             depth_checksums: BTreeMap::new(),
             last_trades: BTreeMap::new(),
             recoveries,
@@ -402,6 +406,7 @@ impl Adapter {
         self.epochs.remove(token);
         self.sequences.remove(token);
         self.book_received.remove(token);
+        self.book_source.remove(token);
         self.depth_checksums.remove(token);
         self.last_trades.remove(token);
         Ok(event)
@@ -927,7 +932,7 @@ impl Adapter {
                 .map(|(p, q)| json!({"price":p.0.to_string(),"size":q.to_string()}))
                 .collect();
             let at = wire_time(received)?;
-            let exchange = wire_time(observed)?;
+            let event_source = wire_time(observed)?;
             let checksum = canonical_hash(
                 &json!({"token_id":token,"tick_size":tick.0.to_string(),"bids":bids,"asks":asks}),
             );
@@ -961,12 +966,14 @@ impl Adapter {
             }
             self.depth_checksums.insert(token.clone(), checksum.clone());
             if matches!(kind.as_str(), "book" | "price_change" | "tick_size_change") {
-                // A tick change commits a new authoritative representation of
-                // the complete book.  Its canonical state and outer source
-                // event therefore share the same receipt clock.  Trades and
-                // matching BBO confirmations remain non-book-freshness facts.
+                // Local receipt is retained for diagnosis and ordering only.
                 self.book_received.insert(token.clone(), received);
             }
+            if matches!(kind.as_str(), "book" | "price_change") {
+                self.book_source.insert(token.clone(), observed);
+            }
+            let quote_source = wire_time(*self.book_source.get(&token)
+                .context("missing supplier quote time")?)?;
             let book_at = wire_time(
                 *self
                     .book_received
@@ -982,14 +989,14 @@ impl Adapter {
                 *sequence
             };
             let model = json!({"token_id":token,"condition_id":condition,"book_epoch":self.epochs[&token],
-                "sequence":sequence,"sequence_semantics":"deterministic_normalized","exchange_at":exchange,
+                "sequence":sequence,"sequence_semantics":"deterministic_normalized","exchange_at":quote_source,
                 "received_at":book_at,"tick_version":book.tick_version,"tick_size":tick.0.to_string(),
                 "bids":bids,"asks":asks,"last_trade_price":self.last_trades.get(&token).map(|p|p.0.to_string()),
                 "state_checksum":checksum,"source_hash":source_hash});
             let mut envelope = json!({"contract_version":"marketcow.prediction_market.v1","schema_version":"marketcow.polymarket.live.v2",
                 "cursor":after.checked_add(output.len() as u64+1).context("cursor overflow")?,"event_type":"book",
                 "market_id":market,"condition_id":condition,"token_id":token,"book_epoch":self.epochs[&token],"sequence":sequence,
-                "exchange_at":exchange,"received_at":at,"canonical_payload_sha256":canonical_hash(&model),"canonical_payload":model,
+                "exchange_at":event_source,"received_at":at,"canonical_payload_sha256":canonical_hash(&model),"canonical_payload":model,
                 "raw_payload_sha256":canonical_hash(&raw),"raw_payload":raw,"applied":true,"fail_closed_reason":null,"gaps":[]});
             if kind == "price_change" {
                 let EventKind::AtomicDelta { changes, .. } = &applied.persisted.event.kind else {
@@ -1437,7 +1444,7 @@ mod tests {
         for event in &compact {
             let typed = crate::source_btc5m_proto::market_event(event).unwrap();
             assert!(matches!(typed.payload,
-                Some(marketcow_contracts::btc5m_market_local_v2::wire::market_event::Payload::BookDelta(_))));
+                Some(marketcow_contracts::btc5m_market_local_v3::wire::market_event::Payload::BookDelta(_))));
         }
         assert!(conflated.apply_isolated(last.raw_payload, last.received_at, 4).unwrap().is_empty());
     }
@@ -1548,7 +1555,7 @@ mod tests {
         let compact = compact_btc5m_fixture_events(actual.clone()).unwrap();
         let typed = crate::source_btc5m_proto::market_event(&compact[0]).unwrap();
         assert!(matches!(typed.payload,
-            Some(marketcow_contracts::btc5m_market_local_v2::wire::market_event::Payload::BookDelta(_))));
+            Some(marketcow_contracts::btc5m_market_local_v3::wire::market_event::Payload::BookDelta(_))));
         assert_eq!(typed.raw_payload_sha256,
             hex::decode(compact[0]["raw_payload_sha256"].as_str().unwrap()).unwrap());
         assert_eq!(typed.event_id,
@@ -1910,10 +1917,11 @@ mod tests {
         assert_eq!(output[0]["canonical_payload"]["sequence"], 2);
     }
     #[test]
-    fn tick_change_commits_a_fresh_complete_book_clock() {
+    fn tick_change_does_not_refresh_supplier_quote_clock() {
         let mut a = fixture();
         let now = Utc::now();
-        a.apply(book("11", now), now, 0).unwrap();
+        let baseline = a.apply(book("11", now), now, 0).unwrap();
+        let quote_source = baseline[0]["canonical_payload"]["exchange_at"].clone();
         let later = now + chrono::Duration::seconds(1);
         let tick = json!({"event_type":"tick_size_change","asset_id":"11",
             "market":"condition","timestamp":later.timestamp_millis().to_string(),
@@ -1928,6 +1936,26 @@ mod tests {
         );
         assert_eq!(a.book_received["11"], later);
         assert_eq!(a.sequences["11"], 2);
+        assert_eq!(output[0]["canonical_payload"]["exchange_at"], quote_source);
+    }
+
+    #[test]
+    fn trade_source_time_is_separate_from_the_unchanged_book_quote_time() {
+        let mut a = fixture();
+        let now = Utc::now();
+        let baseline = a.apply(book("11", now), now, 0).unwrap();
+        let quote_source = baseline[0]["canonical_payload"]["exchange_at"].clone();
+        let later = now + chrono::Duration::seconds(1);
+        let trade = json!({"event_type":"last_trade_price","asset_id":"11",
+            "market":"condition","timestamp":later.timestamp_millis().to_string(),
+            "price":"0.41"});
+        let output = a.apply(trade, later, 1).unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["canonical_payload"]["exchange_at"], quote_source);
+        assert_eq!(output[0]["exchange_at"],
+            wire_time(chrono::DateTime::<Utc>::from_timestamp_millis(
+                later.timestamp_millis()).unwrap()).unwrap());
+        assert_eq!(output[0]["canonical_payload"]["last_trade_price"], "0.41");
     }
     #[test]
     fn delayed_delta_is_delivered_but_disconnect_still_requires_baseline() {

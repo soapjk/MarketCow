@@ -3,11 +3,11 @@
 
 use prost::Message;
 
-pub const SCHEMA_VERSION: &str = "marketcow.polymarket.btc5m.market-local.v2";
+pub const SCHEMA_VERSION: &str = "marketcow.polymarket.btc5m.market-local.v3";
 pub const CONTENT_TYPE: &str = "application/x-protobuf";
 
 pub mod wire {
-    include!(concat!(env!("OUT_DIR"), "/marketcow.polymarket.btc5m.v2.rs"));
+    include!(concat!(env!("OUT_DIR"), "/marketcow.polymarket.btc5m.v3.rs"));
 }
 
 /// Encode exactly one frame. Message encoding is transport only, never the

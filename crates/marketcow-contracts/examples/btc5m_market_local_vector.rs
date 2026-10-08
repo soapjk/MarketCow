@@ -1,5 +1,5 @@
 //! Deterministic serializer vector generator; not a live feed or test runner.
-use marketcow_contracts::btc5m_market_local_v2::{encode_frame, wire};
+use marketcow_contracts::btc5m_market_local_v3::{encode_frame, wire};
 use serde::{Serialize, Serializer, ser::{SerializeMap, SerializeSeq}};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -62,12 +62,15 @@ fn depth_conflation_vector(identity: &wire::MarketIdentity) {
                 "size":"1","best_bid":"0.40","best_ask":"0.60"}
         ]
     });
+    // Supplier frames retain their lexical decimals. The producer normalizes
+    // parsed Price/Level values before writing the conflated raw frame, compact
+    // delta, and canonical post-state (for example 0.30 -> 0.3).
     // BTreeMap's (side, price) order is the producer's deterministic order.
     let final_changes = json!([
-        {"asset_id":"10001","side":"BUY","price":"0.20",
-            "size":"1","best_bid":"0.40","best_ask":"0.60"},
-        {"asset_id":"10001","side":"BUY","price":"0.30",
-            "size":"6","best_bid":"0.40","best_ask":"0.60"}
+        {"asset_id":"10001","side":"BUY","price":"0.2",
+            "size":"1","best_bid":"0.4","best_ask":"0.6"},
+        {"asset_id":"10001","side":"BUY","price":"0.3",
+            "size":"6","best_bid":"0.4","best_ask":"0.6"}
     ]);
     let raw_payload = json!({
         "event_type":"price_change","market":condition_id,"timestamp":last_at,
@@ -88,9 +91,9 @@ fn depth_conflation_vector(identity: &wire::MarketIdentity) {
     let tick_version = hex(&tick_version_bytes);
     let checksum_bytes = sha256(&canonical_json(&json!({
         "token_id":"10001","tick_size":"0.01",
-        "bids":[{"price":"0.40","size":"8"},
-            {"price":"0.30","size":"6"},{"price":"0.20","size":"1"}],
-        "asks":[{"price":"0.60","size":"7"}]
+        "bids":[{"price":"0.4","size":"8"},
+            {"price":"0.3","size":"6"},{"price":"0.2","size":"1"}],
+        "asks":[{"price":"0.6","size":"7"}]
     })));
     let checksum = hex(&checksum_bytes);
     let book = json!({
@@ -98,9 +101,9 @@ fn depth_conflation_vector(identity: &wire::MarketIdentity) {
         "sequence":43,"sequence_semantics":"deterministic_normalized",
         "exchange_at":last_at,"received_at":last_at,
         "tick_version":tick_version,"tick_size":"0.01",
-        "bids":[{"price":"0.40","size":"8"},
-            {"price":"0.30","size":"6"},{"price":"0.20","size":"1"}],
-        "asks":[{"price":"0.60","size":"7"}],
+        "bids":[{"price":"0.4","size":"8"},
+            {"price":"0.3","size":"6"},{"price":"0.2","size":"1"}],
+        "asks":[{"price":"0.6","size":"7"}],
         "last_trade_price":null,"state_checksum":checksum,"source_hash":source_hash
     });
     let book_bytes = canonical_json(&book);
@@ -115,8 +118,8 @@ fn depth_conflation_vector(identity: &wire::MarketIdentity) {
         "last_trade_price":null,"state_checksum":checksum,"source_hash":source_hash,
         "canonical_book_sha256":book_hash,"materialized_book_bytes":book_bytes.len(),
         "delta":{"changes":[
-            {"asset_id":"10001","side":"BUY","price":"0.20","size":"1"},
-            {"asset_id":"10001","side":"BUY","price":"0.30","size":"6"}
+            {"asset_id":"10001","side":"BUY","price":"0.2","size":"1"},
+            {"asset_id":"10001","side":"BUY","price":"0.3","size":"6"}
         ]}
     });
     let raw_hash = sha256(&canonical_json(&raw_payload));
@@ -147,21 +150,21 @@ fn depth_conflation_vector(identity: &wire::MarketIdentity) {
         canonical_payload_sha256: compact_hash.clone(),
         market_id: identity.market_id.clone(), condition_id: identity.condition_id.clone(),
         token_id: Some("10001".into()), book_epoch: Some("e".repeat(64)),
-        book_sequence: Some(43), exchange_at: Some(last_at.into()), received_at: last_at.into(),
+        book_sequence: Some(43), source_at: Some(last_at.into()), received_at: last_at.into(),
         applied: Some(true), fail_closed_reason: None, physical_archive_cursor: None,
         source_event_preimage_json: source_event_preimage_json.clone(),
         payload: Some(wire::market_event::Payload::BookDelta(wire::BookDelta {
             changes: vec![
                 wire::DepthChange { token_id:"10001".into(), side:"BUY".into(),
-                    price:"0.20".into(), size:"1".into() },
+                    price:"0.2".into(), size:"1".into() },
                 wire::DepthChange { token_id:"10001".into(), side:"BUY".into(),
-                    price:"0.30".into(), size:"6".into() },
+                    price:"0.3".into(), size:"6".into() },
             ],
             post_state: Some(wire::BookPostState {
                 token_id:"10001".into(), condition_id:identity.condition_id.clone(),
                 book_epoch:"e".repeat(64), sequence:43,
                 sequence_semantics:"deterministic_normalized".into(),
-                exchange_at:Some(last_at.into()), received_at:last_at.into(),
+                quote_source_at:last_at.into(), received_at:last_at.into(),
                 tick_version:tick_version_bytes,
                 tick_size:"0.01".into(), last_trade_price:None,
                 state_checksum:checksum_bytes.clone(),
@@ -214,19 +217,19 @@ fn main() {
         stream_epoch: Some("d".repeat(32)),
     };
     let tick_size = "0.01";
-    let bids = vec![wire::PriceLevel { price: "0.40".into(), size: "8".into() }];
-    let asks = vec![wire::PriceLevel { price: "0.60".into(), size: "7".into() }];
+    let bids = vec![wire::PriceLevel { price: "0.4".into(), size: "8".into() }];
+    let asks = vec![wire::PriceLevel { price: "0.6".into(), size: "7".into() }];
     let checksum = sha256(&canonical_json(&json!({
         "token_id":"10001","tick_size":tick_size,
-        "bids":[{"price":"0.40","size":"8"}],
-        "asks":[{"price":"0.60","size":"7"}]
+        "bids":[{"price":"0.4","size":"8"}],
+        "asks":[{"price":"0.6","size":"7"}]
     })));
     let tick_version = sha256(&canonical_json(&json!({"tick_size":tick_size})));
     let book = wire::CanonicalBook {
         token_id: "10001".into(), condition_id: identity.condition_id.clone(),
         book_epoch: "e".repeat(64), sequence: 42,
         sequence_semantics: "deterministic_normalized".into(),
-        exchange_at: Some("2026-10-04T00:00:00.000000Z".into()),
+        quote_source_at: "2026-10-04T00:00:00.000000Z".into(),
         received_at: "2026-10-04T00:00:00.000000Z".into(),
         tick_version, tick_size: tick_size.into(), bids, asks,
         last_trade_price: None, state_checksum: checksum.clone(),
@@ -239,8 +242,8 @@ fn main() {
         "exchange_at":"2026-10-04T00:00:00.000000Z",
         "received_at":"2026-10-04T00:00:00.000000Z",
         "tick_version":hex(&book.tick_version),"tick_size":"0.01",
-        "bids":[{"price":"0.40","size":"8"}],
-        "asks":[{"price":"0.60","size":"7"}],
+        "bids":[{"price":"0.4","size":"8"}],
+        "asks":[{"price":"0.6","size":"7"}],
         "last_trade_price":null,"state_checksum":hex(&checksum),
         "source_hash":"f".repeat(40),
     });
@@ -285,7 +288,7 @@ fn main() {
         token_id: Some("10001".into()),
         book_epoch: Some("e".repeat(64)),
         book_sequence: Some(42),
-        exchange_at: Some("2026-10-04T00:00:00.000000Z".into()),
+        source_at: Some("2026-10-04T00:00:00.000000Z".into()),
         received_at: "2026-10-04T00:00:00.000000Z".into(),
         applied: Some(true),
         fail_closed_reason: None,
@@ -325,10 +328,11 @@ fn main() {
                     confirmation_sequence: 2, book_market_cursor: 1,
                     book_epoch: "e".repeat(64), book_sequence: 42,
                     state_checksum: checksum.clone(),
-                    book_received_at: "2026-10-04T00:00:00.000000Z".into(),
-                    confirmed_at: "2026-10-04T00:00:00.100000Z".into(),
+                    book_quote_source_at: "2026-10-04T00:00:00.000000Z".into(),
+                    confirmation_source_at: "2026-10-04T00:00:00.100000Z".into(),
                     confirmation_source: "polymarket_websocket".into(),
                     confirmation_evidence_sha256: sha256(b"synthetic-confirmation-v1"),
+                    confirmation_received_at: "2026-10-04T00:00:00.150000Z".into(),
                 }],
                 execution_readiness: Some(false),
             })),
@@ -342,10 +346,11 @@ fn main() {
                     confirmation_sequence: 3, book_market_cursor: 1,
                     book_epoch: "e".repeat(64), book_sequence: 42,
                     state_checksum: checksum,
-                    book_received_at: "2026-10-04T00:00:00.000000Z".into(),
-                    confirmed_at: "2026-10-04T00:00:00.200000Z".into(),
+                    book_quote_source_at: "2026-10-04T00:00:00.000000Z".into(),
+                    confirmation_source_at: "2026-10-04T00:00:00.200000Z".into(),
                     confirmation_source: "polymarket_websocket".into(),
                     confirmation_evidence_sha256: sha256(b"synthetic-confirmation-v2"),
+                    confirmation_received_at: "2026-10-04T00:00:00.250000Z".into(),
                 }],
             })),
         },

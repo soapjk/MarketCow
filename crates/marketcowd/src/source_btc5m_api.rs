@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use marketcow_polymarket::discovery_source::canonical_hash;
 use marketcow_runtime::discovery_source::{DurableMarketPageBoundary, read_durable_market_page};
-use marketcow_contracts::btc5m_market_local_v2::{self as market_proto, wire as proto};
+use marketcow_contracts::btc5m_market_local_v3::{self as market_proto, wire as proto};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -31,9 +31,9 @@ use crate::source_btc5m_proto as proto_convert;
 use crate::source_publication::{Batch, MarketMemorySnapshot, MemoryReader, SourceBatchTiming};
 
 const PROFILE_SCHEMA: &str = "marketcow.polymarket.btc-5m-profile.v1";
-const STATUS_SCHEMA: &str = "marketcow.polymarket.btc-5m-status.v4";
+const STATUS_SCHEMA: &str = "marketcow.polymarket.btc-5m-status.v5";
 const ERROR_SCHEMA: &str = "marketcow.polymarket.btc-5m-error.v1";
-const MARKET_PROTO_SUBPROTOCOL: &str = "marketcow.btc5m.market-local.v2";
+const MARKET_PROTO_SUBPROTOCOL: &str = "marketcow.btc5m.market-local.v3";
 // Fixed v1 management-contract TTL, not an implicit runtime fallback.
 const MANAGER_STALE_AFTER_SECONDS: i64 = 60;
 const MAX_MARKETS: usize = 3;
@@ -821,6 +821,7 @@ fn market_replay_baseline_valid(snapshot: &MarketMemorySnapshot, token: &str,
     if snapshot.unresolved_seed_gaps.contains(token) { return false; }
     if snapshot.capacity_fenced { return false; }
     let Some(book) = snapshot.books.get(token) else { return false; };
+    if !instant(book, "exchange_at").is_ok_and(|source| source <= now) { return false; }
     if !instant(book, "received_at").is_ok_and(|received| received <= now) { return false; }
     if snapshot.recoveries.get(token).is_some_and(|recovery|
         recovery["snapshot_cursor"].as_u64() != snapshot.event_book_cursors.get(token).copied()) {
@@ -851,13 +852,17 @@ fn market_token_quote_readiness(snapshot: &MarketMemorySnapshot, token: &str,
     // A replayable canonical baseline inside an active recovery is not an
     // execution-ready quote. Completion must clear the recovery barrier.
     if snapshot.recoveries.contains_key(token) { reasons.push("recovery_in_progress"); }
+    let quote_source = book.and_then(|book| instant(book, "exchange_at").ok());
     let received = book.and_then(|book| instant(book, "received_at").ok());
-    if book.is_some() && received.is_none() { reasons.push("book_clock_invalid"); }
-    let confirmed = market_token_confirmation(snapshot, token)
-        .and_then(|fact| instant(&fact, "confirmed_at").ok());
-    let freshness = match (received, confirmed.clone()) {
-        (Some(received), Some(confirmed)) => Some(received.max(confirmed)),
-        (Some(received), None) => Some(received),
+    if book.is_some() && (quote_source.is_none() || received.is_none()) {
+        reasons.push("book_clock_invalid");
+    }
+    let confirmation = market_token_confirmation(snapshot, token);
+    let confirmation_source = confirmation.as_ref()
+        .and_then(|fact| instant(fact, "confirmation_source_at").ok());
+    let freshness = match (quote_source, confirmation_source) {
+        (Some(source), Some(confirmed)) => Some(source.max(confirmed)),
+        (Some(source), None) => Some(source),
         (None, _) => None,
     };
     let age_ms = freshness.as_ref().map(|at|
@@ -888,9 +893,13 @@ fn market_token_quote_readiness(snapshot: &MarketMemorySnapshot, token: &str,
         "reasons":reasons,
         "book_market_cursor":snapshot.market_book_cursors.get(token),
         "book_market_event_cursor":snapshot.event_book_cursors.get(token),
+        "quote_source_at":book.and_then(|book| book["exchange_at"].as_str()),
         "book_received_at":book.and_then(|book| book["received_at"].as_str()),
-        "confirmed_at":confirmed.map(|at| at.to_rfc3339()),
-        "effective_freshness_at":freshness.map(|at| at.to_rfc3339()),
+        "confirmation_source_at":confirmation.as_ref()
+            .and_then(|fact| fact["confirmation_source_at"].as_str()),
+        "confirmation_received_at":confirmation.as_ref()
+            .and_then(|fact| fact["confirmation_received_at"].as_str()),
+        "effective_quote_source_at":freshness.map(|at| at.to_rfc3339()),
         "age_ms":age_ms,
         "bid_levels":bid_levels,
         "ask_levels":ask_levels,
@@ -1578,13 +1587,19 @@ fn market_token_confirmation(snapshot: &MarketMemorySnapshot, token: &str) -> Op
         || fact["book_epoch"] != book["book_epoch"]
         || fact["sequence"] != book["sequence"]
         || fact["state_checksum"] != book["state_checksum"]
-        || fact["book_received_at"] != book["received_at"]
+        || fact["book_quote_source_at"] != book["exchange_at"]
     { return None; }
+    let quote_at = instant(book, "exchange_at").ok()?;
+    let confirmation_at = instant(fact, "confirmation_source_at").ok()?;
+    let receipt_at = instant(fact, "confirmation_received_at").ok()?;
+    if confirmation_at <= quote_at || confirmation_at > receipt_at { return None; }
     Some(json!({"token_id":fact["token_id"],"condition_id":fact["condition_id"],
         "confirmation_sequence":version,
         "market_cursor":cursor,"book_epoch":fact["book_epoch"],
         "book_sequence":fact["sequence"],"state_checksum":fact["state_checksum"],
-        "book_received_at":fact["book_received_at"],"confirmed_at":fact["confirmed_at"],
+        "book_quote_source_at":fact["book_quote_source_at"],
+        "confirmation_source_at":fact["confirmation_source_at"],
+        "confirmation_received_at":fact["confirmation_received_at"],
         "confirmation_source":fact["confirmation_source"],
         "confirmation_evidence_sha256":fact["confirmation_evidence_sha256"]}))
 }
@@ -2233,6 +2248,41 @@ mod tests {
         snapshot.unresolved_seed_gaps.insert(token.clone());
         let (_, detail) = market_token_quote_readiness(&snapshot, &token, &now, 5_000);
         assert_eq!(detail["reasons"], json!(["source_gap","recovery_in_progress","book_stale"]));
+    }
+    #[test]
+    fn local_receipt_and_confirmation_receipt_never_refresh_supplier_quote_age() {
+        let token = "101".to_owned();
+        let now = Utc.with_ymd_and_hms(2026, 9, 26, 5, 30, 2).unwrap();
+        let mut stale = book(&token, "condition", "2026-09-26T05:29:50Z");
+        stale["received_at"] = json!("2026-09-26T05:30:01Z");
+        stale["sequence"] = json!(1);
+        let snapshot = MarketMemorySnapshot {
+            watermark:crate::source_publication::MarketStreamWatermark {
+                stream_epoch:"stream".into(),market_id:"4944030".into(),
+                published_cursor:2,durable_cursor:1,replay_floor:0,
+            },
+            last_market_event_cursor:43, market:None,
+            books:BTreeMap::from([(token.clone(), Arc::new(stale))]),
+            physical_book_cursors:BTreeMap::new(),
+            event_book_cursors:BTreeMap::from([(token.clone(),43)]),
+            market_book_cursors:BTreeMap::from([(token.clone(),2)]),
+            recoveries:BTreeMap::new(),unresolved_seed_gaps:BTreeSet::new(),capacity_fenced:false,
+            confirmation_sequence:1,
+            confirmation_facts:BTreeMap::from([(token.clone(),Arc::new(json!({
+                "token_id":token.clone(),"condition_id":"condition","book_epoch":"e",
+                "sequence":1,"state_checksum":"b".repeat(64),
+                "book_quote_source_at":"2026-09-26T05:29:50Z",
+                "confirmation_source_at":"2026-09-26T05:29:51Z",
+                "confirmation_received_at":"2026-09-26T05:30:02Z",
+                "confirmation_source":"polymarket_websocket",
+                "confirmation_evidence_sha256":"c".repeat(64),
+            })))]),
+            market_confirmation_versions:BTreeMap::from([(token.clone(),1)]),
+        };
+        let (ready, detail) = market_token_quote_readiness(&snapshot, &token, &now, 5_000);
+        assert!(!ready);
+        assert_eq!(detail["age_ms"], 11_000);
+        assert_eq!(detail["reasons"], json!(["book_stale"]));
     }
     fn profile() -> Profile {
         let mut p = Profile {

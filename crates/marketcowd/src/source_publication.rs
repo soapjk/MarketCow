@@ -659,7 +659,8 @@ impl MarketReadState {
             if !state.recoveries.contains_key(token) && !state.unresolved_seed_gaps.contains(token) {
                 if let Some(fact) = memory.confirmation_facts.get(token) {
                     if fact["book_epoch"] == book["book_epoch"] && fact["sequence"] == book["sequence"]
-                        && fact["state_checksum"] == book["state_checksum"] {
+                        && fact["state_checksum"] == book["state_checksum"]
+                        && fact["book_quote_source_at"] == book["exchange_at"] {
                         state.confirmation_facts.insert(token.clone(), fact.clone());
                         if let Some(version) = memory.market_confirmation_versions.get(token) {
                             state.market_confirmation_versions.insert(token.clone(), *version);
@@ -2196,8 +2197,9 @@ impl MarketPublisher {
     ) -> Result<bool> {
         let received_at = chrono::DateTime::from_timestamp_micros(received_at.timestamp_micros())
             .context("reduced confirmation receipt timestamp")?;
-        let _exchange_at = chrono::DateTime::from_timestamp_micros(exchange_at.timestamp_micros())
+        let exchange_at = chrono::DateTime::from_timestamp_micros(exchange_at.timestamp_micros())
             .context("reduced confirmation exchange timestamp")?;
+        ensure!(exchange_at <= received_at, "reduced confirmation supplier clock is in future");
         ensure!(
             market == self.market_id
                 && self.catalog_bindings.get(token).is_some_and(|owner| owner == market),
@@ -2215,15 +2217,15 @@ impl MarketPublisher {
                 "reduced confirmation book identity differs");
             ensure!(current["state_checksum"] == state_checksum,
                 "reduced confirmation state differs");
-            let mut freshness_fence = chrono::DateTime::parse_from_rfc3339(
-                current["received_at"].as_str().context("reduced confirmation book time")?)?
+            let mut source_fence = chrono::DateTime::parse_from_rfc3339(
+                current["exchange_at"].as_str().context("reduced confirmation book source time")?)?
                 .with_timezone(&Utc);
             if let Some(fact) = current_state.confirmation_facts.get(token) {
-                freshness_fence = freshness_fence.max(DateTime::parse_from_rfc3339(
-                    fact["confirmed_at"].as_str().context("previous confirmation time")?)?
+                source_fence = source_fence.max(DateTime::parse_from_rfc3339(
+                    fact["confirmation_source_at"].as_str().context("previous confirmation source time")?)?
                     .with_timezone(&Utc));
             }
-            if received_at - freshness_fence < chrono::TimeDelta::milliseconds(
+            if exchange_at - source_fence < chrono::TimeDelta::milliseconds(
                 WS_STATE_CONFIRMATION_MIN_INTERVAL_MS) {
                 return Ok((None, false));
             }
@@ -2231,8 +2233,9 @@ impl MarketPublisher {
                 "token_id":current["token_id"],"condition_id":current["condition_id"],
                 "book_epoch":current["book_epoch"],"sequence":current["sequence"],
                 "state_checksum":current["state_checksum"],
-                "book_received_at":current["received_at"],
-                "confirmed_at":received_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+                "book_quote_source_at":current["exchange_at"],
+                "confirmation_source_at":exchange_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+                "confirmation_received_at":received_at.to_rfc3339_opts(SecondsFormat::Micros, true),
                 "confirmation_source":"polymarket_websocket_state_confirmation",
                 "confirmation_evidence_sha256":source_hash,
             }));
@@ -2274,10 +2277,10 @@ impl Publication {
     }
 
     /// Confirm a complete pair obtained from a fresh, bounded official WS
-    /// subscription. Unlike REST, the first full WS book is an authoritative
-    /// current baseline even when its venue timestamp predates the main
-    /// stream's latest mutation. The local receipt fence still prevents a
-    /// snapshot from replacing a concurrent main-stream update.
+    /// subscription. Unlike REST, it can establish an authoritative recovery
+    /// baseline. Its supplier timestamp must still advance the current quote
+    /// clock before it can confirm freshness; local receipt only fences a
+    /// concurrent main-stream update.
     pub fn confirm_targeted_market(
         &self,
         market: &str,
@@ -2368,22 +2371,6 @@ impl Publication {
                     .context("book received_at")?,
             )?
             .with_timezone(&chrono::Utc);
-            // An identical REST/targeted-WS response may finish decoding after
-            // a newer WS book or confirmation was already installed. Matching
-            // price/size alone does not make its older receipt a fresh proof.
-            // Never move either the original-book or confirmation time back.
-            let mut freshness_fence = current_received;
-            if let Some(fact) = incumbent.confirmation_facts.get(token) {
-                if let Some(value) = fact["confirmed_at"].as_str() {
-                    freshness_fence = freshness_fence.max(
-                        chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc),
-                    );
-                }
-            }
-            if received_at <= freshness_fence {
-                superseded += 1;
-                continue;
-            }
             let candidate = &candidates[token];
             let current_book_exchange = incumbent
                 .book_exchanges
@@ -2395,6 +2382,22 @@ impl Publication {
                     .context("confirmation exchange_at")?,
             )?
             .with_timezone(&chrono::Utc);
+            ensure!(candidate_exchange <= received_at,
+                "confirmation supplier clock is in future");
+            // Local receipt only fences an in-flight race; it never becomes
+            // the supplier quote clock. A repeated old source timestamp must
+            // not make an old book appear new merely because REST was polled.
+            let mut source_fence = *current_book_exchange;
+            if let Some(fact) = incumbent.confirmation_facts.get(token) {
+                source_fence = source_fence.max(chrono::DateTime::parse_from_rfc3339(
+                    fact["confirmation_source_at"].as_str()
+                        .context("previous confirmation source time")?)?
+                    .with_timezone(&chrono::Utc));
+            }
+            if candidate_exchange <= source_fence {
+                superseded += 1;
+                continue;
+            }
             // REST book confirmation proves the freshness of the price/size
             // book.  last_trade_price is a separate WS event stream and the
             // venue's REST snapshot can legitimately lag it while carrying an
@@ -2405,7 +2408,7 @@ impl Publication {
                 || current["tick_size"] != candidate["tick_size"];
             if book_differs {
                 if (require_monotonic_exchange && current_book_exchange > &candidate_exchange)
-                    || freshness_fence > request_started_at
+                    || current_received > request_started_at
                 {
                     // This token advanced while the pair request was in flight.
                     // Preserve its newer WS state, but continue: a quiet sibling
@@ -2419,22 +2422,22 @@ impl Publication {
                 // earlier in this loop.
                 return Ok((None, ConfirmationOutcome::Mismatch));
             }
-            let mut next = current.as_ref().clone();
-            if next["book_received_at"].is_null() {
-                next["book_received_at"] = current["received_at"].clone();
-            }
-            next["confirmed_at"] = candidate["received_at"].clone();
-            next["confirmation_source"] = json!(if require_monotonic_exchange {
-                "polymarket_rest"
-            } else {
-                "polymarket_websocket"
-            });
-            next["confirmation_evidence_sha256"] = json!(evidence_hashes[token]);
-            if current["last_trade_price"] == candidate["last_trade_price"] {
-                next["exchange_at"] = candidate["exchange_at"].clone();
-                next["source_hash"] = candidate["source_hash"].clone();
-            }
-            confirmed.push((token.clone(), next));
+            // The book is immutable here. Confirmation is a separate source
+            // observation bound to this exact canonical identity and raw hash.
+            confirmed.push((token.clone(), json!({
+                "token_id":current["token_id"],
+                "condition_id":current["condition_id"],
+                "book_epoch":current["book_epoch"],
+                "sequence":current["sequence"],
+                "state_checksum":current["state_checksum"],
+                "book_quote_source_at":current["exchange_at"],
+                "confirmation_source_at":candidate["exchange_at"],
+                "confirmation_received_at":received_at.to_rfc3339_opts(SecondsFormat::Micros, true),
+                "confirmation_source":if require_monotonic_exchange {
+                    "polymarket_rest"
+                } else { "polymarket_websocket" },
+                "confirmation_evidence_sha256":evidence_hashes[token],
+            })));
         }
         if confirmed.is_empty() {
             ensure!(
@@ -2444,18 +2447,7 @@ impl Publication {
             return Ok((None, ConfirmationOutcome::Superseded));
         }
         let mut next_state = incumbent.clone();
-        for (token, book) in confirmed {
-            let fact = json!({
-                "token_id":book["token_id"],
-                "condition_id":book["condition_id"],
-                "book_epoch":book["book_epoch"],
-                "sequence":book["sequence"],
-                "state_checksum":book["state_checksum"],
-                "book_received_at":book["received_at"],
-                "confirmed_at":book["confirmed_at"],
-                "confirmation_source":book["confirmation_source"],
-                "confirmation_evidence_sha256":book["confirmation_evidence_sha256"]
-            });
+        for (token, fact) in confirmed {
             let market_sequence = next_state.confirmation_sequence.checked_add(1)
                 .context("market confirmation sequence overflow")?;
             next_state.confirmation_sequence = market_sequence;
@@ -4633,7 +4625,7 @@ mod tests {
         let ids = vec!["11".to_owned(), "12".to_owned()];
         let before = p.reader().capture_market("1", &ids).unwrap();
         let raw = ids.iter().map(|token| json!({"asset_id":token,"market":"condition",
-            "tick_size":"0.01","timestamp":"1700000000000","hash":"confirm",
+            "tick_size":"0.01","timestamp":"1700000002000","hash":"confirm",
             "bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]})).collect::<Vec<_>>();
         let requested = chrono::DateTime::from_timestamp(1_700_000_002, 0).unwrap();
         let received = chrono::DateTime::from_timestamp(1_700_000_003, 0).unwrap();
@@ -4650,19 +4642,40 @@ mod tests {
         p.finish().await.unwrap();
     }
     #[tokio::test]
+    async fn old_supplier_rest_book_with_fresh_local_receipt_does_not_confirm() {
+        let p = test_start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
+        p.publish_native_events(events(0), None).unwrap();
+        let ids = vec!["11".to_owned(), "12".to_owned()];
+        let before = p.reader().capture_market("1", &ids).unwrap();
+        let raw = ids.iter().map(|token| json!({"asset_id":token,"market":"condition",
+            "tick_size":"0.01","timestamp":"1700000000000","hash":"old-confirm",
+            "bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]}))
+            .collect::<Vec<_>>();
+        let requested = chrono::DateTime::from_timestamp(1_700_000_020, 0).unwrap();
+        let received = chrono::DateTime::from_timestamp(1_700_000_021, 0).unwrap();
+        assert_eq!(p.confirm_market("1", "condition", &[ids[0].clone(), ids[1].clone()],
+            &raw, requested, received).unwrap(), ConfirmationOutcome::Superseded);
+        let after = p.reader().capture_market("1", &ids).unwrap();
+        assert_eq!(after.confirmation_sequence, before.confirmation_sequence);
+        assert_eq!(after.books, before.books);
+        p.finish().await.unwrap();
+    }
+    #[tokio::test]
     async fn websocket_precision_is_canonicalized_for_confirmation_boundary() {
         let p = test_start(0, Some(seed()), tokens(), 8, 131072, 65536, |_| Ok(())).unwrap();
         p.publish_native_events(events(0), None).unwrap();
         let ids = vec!["11".to_owned(), "12".to_owned()];
         let raw = ids.iter().map(|token| json!({"asset_id":token,"market":"condition",
-            "tick_size":"0.01","timestamp":"1700000000000","hash":"confirm",
+            "tick_size":"0.01","timestamp":"1700000002000","hash":"confirm",
             "bids":[{"price":"0.4","size":"10"}],"asks":[{"price":"0.6","size":"10"}]})).collect::<Vec<_>>();
         let requested = chrono::DateTime::from_timestamp(1_700_000_002, 123_456_789).unwrap();
         let received = chrono::DateTime::from_timestamp(1_700_000_003, 987_654_321).unwrap();
         assert_eq!(p.confirm_market("1", "condition", &[ids[0].clone(), ids[1].clone()],
             &raw, requested, received).unwrap(), ConfirmationOutcome::Confirmed);
         let after = p.reader().capture_market("1", &ids).unwrap();
-        assert_eq!(after.confirmation_facts["11"]["confirmed_at"],
+        assert_eq!(after.confirmation_facts["11"]["confirmation_source_at"],
+            "2023-11-14T22:13:22Z");
+        assert_eq!(after.confirmation_facts["11"]["confirmation_received_at"],
             "2023-11-14T22:13:23.987654Z");
         p.finish().await.unwrap();
     }
@@ -4681,7 +4694,7 @@ mod tests {
         assert_eq!(after.watermark.published_cursor, before.watermark.published_cursor);
         assert_eq!(after.books, before.books);
         assert_eq!(after.confirmation_sequence, before.confirmation_sequence + 1);
-        assert_eq!(after.confirmation_facts["11"]["confirmed_at"],
+        assert_eq!(after.confirmation_facts["11"]["confirmation_source_at"],
             "2023-11-14T22:13:30.123456Z");
         assert_eq!(after.confirmation_facts["11"]["confirmation_source"],
             "polymarket_websocket_state_confirmation");

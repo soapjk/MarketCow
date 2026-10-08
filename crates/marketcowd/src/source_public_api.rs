@@ -744,7 +744,7 @@ pub fn full_sync(
     let mut oldest = now;
     for book in books.values() {
         oldest = oldest.min(
-            DateTime::parse_from_rfc3339(book["received_at"].as_str().context("book received")?)?
+            DateTime::parse_from_rfc3339(book["exchange_at"].as_str().context("book source time")?)?
                 .with_timezone(&Utc),
         );
     }
@@ -827,14 +827,14 @@ pub fn full_sync(
             "persistence_lag_events":view.cursor-view.persisted_cursor,"persistence_queue_depth":view.queued,
             "derived_index_error":null,"live_stream_connected":true,"live_stream_disconnect_count":0,
             "event_loop_stall_max_ms":0,"events_read_source":"memory_projection","realtime_sqlite_query_ms":0,
-            "reason_codes":reasons,"oldest_book_received_at":oldest.to_rfc3339(),"maximum_book_age_ms":age,"source_policy":"official_free_only"
+            "reason_codes":reasons,"oldest_quote_source_at":oldest.to_rfc3339(),"maximum_book_age_ms":age,"source_policy":"official_free_only"
         }),
     );
     let mut response = common;
     extend_object(
         &mut response,
         json!({"schema_version":"marketcow.polymarket.live-full-sync.v1",
-        "cursor":view.cursor,"oldest_book_received_at":oldest.to_rfc3339(),"maximum_book_age_ms":age,
+        "cursor":view.cursor,"oldest_quote_source_at":oldest.to_rfc3339(),"maximum_book_age_ms":age,
         "consumer_maximum_book_age_ms":null,"minimum_delivery_headroom_ms":null,"freshness_budget_remaining_ms":null,
         "freshness_policy":"consumer_decides","stream_instance_id":instance,"confirmation_sequence":view.confirmation_sequence,
         "health":health,"bootstrap":bootstrap,"snapshot":snapshot}),

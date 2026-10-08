@@ -2008,7 +2008,8 @@ impl<L: DurableLog> SingleWriter<L> {
                         } else {
                             book.tick_size = Some(new_tick_size.clone());
                             book.tick_version = tick_version.clone();
-                            book.source_observed_at = Some(event.source_observed_at);
+                            // A supplier tick-size rule update is not a new
+                            // observation of the quoted depth.
                         }
                     }
                 }
