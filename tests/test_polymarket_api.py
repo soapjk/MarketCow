@@ -69,6 +69,19 @@ class PolymarketApiTest(unittest.TestCase):
         )
         self.assertIn("projection_id", websocket["query_parameters"])
 
+    def test_unconfigured_local_polymarket_does_not_read_legacy_state(self):
+        health = self.client.get("/v1/prediction-markets/polymarket/live/health")
+        discovery = self.client.get(
+            "/v1/prediction-markets/polymarket/live/discovery/status"
+        )
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["status"], "not_configured")
+        self.assertEqual(discovery.status_code, 503)
+        self.assertEqual(
+            discovery.json()["detail"]["code"],
+            "polymarket_discovery_configuration_missing",
+        )
+
     def test_explicit_empty_shadow_incumbent_is_content_addressed(self):
         catalog_revision = "7" * 64
         scope_id = content_sha256({

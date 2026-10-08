@@ -238,14 +238,13 @@ def build_services(
             f"http://127.0.0.1:{rust_port}" if "polymarket-rust-data-plane" in selected else ""
         ),
         "MARKETCOW_POLYMARKET_LIVE_STREAM_URI": "",
+        "MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS": (
+            environment.get("MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS", "")
+            if "polymarket-discovery-collector" in selected else ""
+        ),
     })
-    # The unified-api gateway is the *reader* of the durable discovery
-    # projection. Discovery read endpoints (/live/discovery/*) serve from the
-    # on-disk materialized snapshot and must remain available even when the
-    # discovery-collector *writer* process is not selected for this launch.
-    # Clearing MARKETCOW_POLYMARKET_DISCOVERY_DEPTH_NOTIONALS here would disable
-    # the read store (polymarket_discovery becomes None) and break Tradude's
-    # delivery chain with 503/500. Keep the depth config intact.
+    # A unified-api-only launch must not start the legacy local discovery
+    # materializer just because a shared environment file still has its config.
     unified_api = Service(
         "unified-api",
         (

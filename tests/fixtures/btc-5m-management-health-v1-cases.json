@@ -1,0 +1,15 @@
+{
+  "schema_version": "marketcow.btc-5m-management-health-cases.v1",
+  "base_fixture": "btc-5m-management-health-v1.json",
+  "cases": [
+    {"name": "running_without_capture", "blocked_reasons": [], "data_state": "capture_required", "current_readiness_reason": "capture_required"},
+    {"name": "source_paused", "blocked_reasons": ["source_not_ready"], "data_state": "unavailable", "current_readiness_reason": "source_not_ready"},
+    {"name": "manager_exited_and_timeout_elapsed", "blocked_reasons": ["manager_stale"], "data_state": "unavailable", "current_readiness_reason": "manager_stale"},
+    {"name": "manager_reconciling", "blocked_reasons": ["manager_recovering"], "data_state": "unavailable", "current_readiness_reason": "manager_recovering"},
+    {"name": "capacity_error", "blocked_reasons": ["capacity_exhausted", "manager_failed"], "data_state": "unavailable", "current_readiness_reason": "capacity_exhausted"},
+    {"name": "lease_invalid", "blocked_reasons": ["lease_invalid", "manager_failed"], "data_state": "unavailable", "current_readiness_reason": "lease_invalid"},
+    {"name": "persistence_failed", "blocked_reasons": ["persistence_failed"], "data_state": "unavailable", "current_readiness_reason": "persistence_failed"},
+    {"name": "current_window_expired", "blocked_reasons": ["current_window_expired"], "data_state": "unavailable", "current_readiness_reason": "window_expired"},
+    {"name": "manager_missing", "blocked_reasons": ["manager_missing"], "data_state": "unavailable", "current_readiness_reason": "manager_missing"}
+  ]
+}

@@ -109,6 +109,12 @@ def shard_span(request: Dict[str, Any]) -> timedelta:
         return timedelta(days=366)
     if provider == "hyperliquid":
         return timedelta(seconds=INTERVAL_SECONDS[interval] * 4000)
+    if provider == "alpaca_sip":
+        if interval == "1d":
+            return timedelta(days=366)
+        if interval in INTRADAY_INTERVALS:
+            return timedelta(days=7)
+        raise ValueError("unsupported Alpaca SIP interval")
     raise ValueError("unsupported history provider")
 
 
@@ -125,7 +131,7 @@ def _budgeted_span(
             seconds / max(1, INTERVAL_SECONDS[str(request["interval"])])
         )
         return shard_end, expected
-    if capability.provider == "yahoo":
+    if capability.provider in {"yahoo", "alpaca_sip"}:
         shard_end = min(end, cursor + shard_span(request))
         days = max(1, int((shard_end - cursor).total_seconds() / 86400) + 1)
         return shard_end, days * capability.rows_per_trading_day

@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use rust_decimal::Decimal;
+use serde::{Serialize, Serializer, ser::SerializeMap, ser::SerializeSeq};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, str::FromStr};
@@ -22,21 +23,33 @@ pub struct SnapshotBoundary<'a> {
 }
 
 pub fn canonical_hash(value: &Value) -> String {
-    // This crate does not enable serde_json/preserve_order. Build every object
-    // from sorted keys explicitly so callers cannot change the hash ordering.
-    fn sorted(value: &Value) -> Value {
-        match value {
-            Value::Object(values) => {
-                let ordered: BTreeMap<_, _> =
-                    values.iter().map(|(k, v)| (k.clone(), sorted(v))).collect();
-                serde_json::to_value(ordered).expect("JSON object serialization")
+    // Serialize sorted keys directly, avoiding a clone of the entire book.
+    struct Sorted<'a>(&'a Value);
+    impl Serialize for Sorted<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            match self.0 {
+                Value::Object(values) => {
+                    let mut keys = values.keys().collect::<Vec<_>>();
+                    keys.sort_unstable();
+                    let mut map = serializer.serialize_map(Some(keys.len()))?;
+                    for key in keys {
+                        map.serialize_entry(key, &Sorted(&values[key]))?;
+                    }
+                    map.end()
+                }
+                Value::Array(values) => {
+                    let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                    for value in values {
+                        seq.serialize_element(&Sorted(value))?;
+                    }
+                    seq.end()
+                }
+                value => value.serialize(serializer),
             }
-            Value::Array(values) => Value::Array(values.iter().map(sorted).collect()),
-            _ => value.clone(),
         }
     }
     hex::encode(Sha256::digest(
-        serde_json::to_vec(&sorted(value)).expect("JSON serialization"),
+        serde_json::to_vec(&Sorted(value)).expect("JSON serialization"),
     ))
 }
 
@@ -191,6 +204,28 @@ pub fn prepare_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_sorted_serialization_matches_clone_based_canonical_hash() {
+        fn sorted(value: &Value) -> Value {
+            match value {
+                Value::Object(values) => {
+                    let ordered: BTreeMap<_, _> = values.iter()
+                        .map(|(key, value)| (key.clone(), sorted(value))).collect();
+                    serde_json::to_value(ordered).unwrap()
+                }
+                Value::Array(values) => Value::Array(values.iter().map(sorted).collect()),
+                _ => value.clone(),
+            }
+        }
+        for value in [
+            json!({"z":1,"a":{"y":[{"b":"雪","a":0.01},null,true],"x":-4},"m":[]}),
+            json!([1,2.5,"\n\\\"",{"β":0,"a":-0.0}]),
+            json!({"book":{"asks":[["0.51","10"]],"bids":[["0.49","5"]]}}),
+        ] {
+            let expected = hex::encode(Sha256::digest(serde_json::to_vec(&sorted(&value)).unwrap()));
+            assert_eq!(canonical_hash(&value), expected);
+        }
+    }
     fn raw() -> Value {
         json!({"asset_id":"123","market":"condition","tick_size":"0.01",
         "timestamp":"1700000000123","hash":"source-hash","bids":[{"price":"0.40","size":"10.0"}],

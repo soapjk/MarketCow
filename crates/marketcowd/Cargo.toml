@@ -28,8 +28,10 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 http.workspace = true
 hex.workspace = true
+prost.workspace = true
 libc.workspace = true
 marketcow-core = { path = "../marketcow-core" }
 marketcow-jobs = { path = "../marketcow-jobs" }
@@ -40,11 +42,12 @@ marketcow-runtime = { path = "../marketcow-runtime" }
 marketcow-realtime = { path = "../marketcow-realtime" }
 marketcow-storage = { path = "../marketcow-storage" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 rust_decimal.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

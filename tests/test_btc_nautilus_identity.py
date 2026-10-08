@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from marketcow.btc_hourly_identity import local_hour_to_utc, plan_hours
-from marketcow.btc_nautilus_worker import decode_raw
+from marketcow.btc_nautilus_worker import decode_raw, subscription_streams
 
 
 def test_dst():
@@ -54,3 +54,12 @@ def test_wrong_instrument_and_duplicate_keys():
     for raw in [b'{"data":{"s":"ETHUSDT"}}', b'{"data":{},"data":{}}']:
         with pytest.raises(ValueError):
             decode_raw(raw, processed_at="2026-09-10T00:00:00Z", monotonic_ns=1, maximum_bytes=1024)
+
+
+def test_low_traffic_profile_excludes_trades():
+    assert subscription_streams("finalized-klines") == ("1m_kline", "1h_kline")
+    assert subscription_streams("trades-and-klines") == (
+        "trades", "1m_kline", "1h_kline",
+    )
+    with pytest.raises(ValueError, match="unsupported_stream_profile"):
+        subscription_streams("unknown")

@@ -58,7 +58,7 @@ class CanonicalInstrument:
         elif self.market == "US":
             if normalized in {"provider:longport", "broker:longport"}:
                 return f"{self.symbol.replace('-', '.')}.US"
-            if normalized in {"provider:yahoo", "provider:sec"}:
+            if normalized in {"provider:yahoo", "provider:sec", "provider:alpaca_sip"}:
                 return self.symbol
         elif self.mic == "HYPL" and normalized == "provider:hyperliquid":
             return self.symbol.removesuffix("-PERP")
@@ -129,7 +129,9 @@ def external_instrument(
         if mic is None:
             raise ValueError("US external symbols require an explicit MIC mapping")
         return canonical_instrument(f"{us.group(1)}.{mic.upper()}")
-    if normalized_namespace in {"provider:yahoo", "provider:sec"}:
+    if normalized_namespace in {
+        "provider:yahoo", "provider:sec", "provider:alpaca_sip",
+    }:
         if mic is None:
             raise ValueError("US external symbols require an explicit MIC mapping")
         return canonical_instrument(f"{symbol}.{mic.upper()}")

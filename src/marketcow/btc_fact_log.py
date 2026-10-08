@@ -79,39 +79,67 @@ class FactLog:
         self.stopped = False
         self.stop = threading.Event()
         self.recovered_continuity = None
+        self.startup_validation = None
         db = None
         try:
             db = sqlite3.connect(root / "index.sqlite")
             db.execute("CREATE TABLE IF NOT EXISTS facts(seq INTEGER PRIMARY KEY, offset INTEGER, length INTEGER, sha TEXT)")
-            last = db.execute("SELECT seq,offset,length FROM facts ORDER BY seq DESC LIMIT 1").fetchone()
+            db.execute("""CREATE TABLE IF NOT EXISTS log_state(
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                schema_version INTEGER NOT NULL,
+                durable_seq INTEGER NOT NULL,
+                durable_end INTEGER NOT NULL,
+                durable_sha TEXT,
+                continuity_json BLOB,
+                continuity_seq INTEGER,
+                validation_mode TEXT NOT NULL)""")
+            last = db.execute("SELECT seq,offset,length,sha FROM facts ORDER BY seq DESC LIMIT 1").fetchone()
             self.durable = self.published = last[0] if last else 0
             self.disk_bytes = last[1] + last[2] if last else 0
             path = root / "facts.jsonl"
             actual = path.stat().st_size if path.exists() else 0
             if actual != self.disk_bytes:
                 raise ValueError("unindexed_or_missing_tail_requires_recovery")
-            # Validate committed bytes on startup, bounded per row (no full-log load).
-            if actual:
+            state = db.execute("SELECT schema_version,durable_seq,durable_end,durable_sha,continuity_json,continuity_seq,validation_mode "
+                               "FROM log_state WHERE singleton=1").fetchone()
+            # Startup is deliberately O(1): validate the transactionally committed
+            # tail only. Full historical validation belongs to audit_committed().
+            checkpoint_raw = None
+            if last:
+                seq, offset, length, sha = last
+                if offset < 0 or not isinstance(length, int) or length <= 0 or length > maximum_pending_bytes:
+                    raise ValueError("corrupt_index_tail")
                 with path.open("rb") as stream:
-                    expected_seq, expected_offset = 1, 0
-                    for seq, offset, length, sha in db.execute("SELECT * FROM facts ORDER BY seq"):
-                        if seq != expected_seq or offset != expected_offset or not isinstance(length, int) or length <= 0:
-                            raise ValueError("corrupt_index_continuity")
-                        if length > maximum_pending_bytes:
-                            raise ValueError("record_exceeds_budget")
-                        stream.seek(offset)
-                        raw = stream.read(length)
-                        if hashlib.sha256(raw).hexdigest() != sha or json.loads(raw)["sequence"] != seq:
-                            raise ValueError("corrupt_committed_fact")
-                        fact = json.loads(raw)["fact"]
-                        checkpoint = fact.get("continuity_checkpoint")
-                        if checkpoint is not None:
-                            from .btc_continuity import Continuity
-                            validated = Continuity()
-                            validated.restore(checkpoint)
-                            self.recovered_continuity = validated.checkpoint()
-                        expected_seq += 1
-                        expected_offset += length
+                    stream.seek(offset)
+                    raw = stream.read(length)
+                try:
+                    value = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("corrupt_committed_tail") from exc
+                if len(raw) != length or hashlib.sha256(raw).hexdigest() != sha or value.get("sequence") != seq:
+                    raise ValueError("corrupt_committed_tail")
+                checkpoint = value.get("fact", {}).get("continuity_checkpoint")
+                checkpoint_raw = canonical(checkpoint) if checkpoint is not None else None
+            if state is None:
+                mode = "legacy_tail_bootstrap" if last else "empty"
+                db.execute("INSERT INTO log_state VALUES(1,1,?,?,?,?,?,?)",
+                           (self.durable, self.disk_bytes, last[3] if last else None,
+                            checkpoint_raw, self.durable if checkpoint_raw is not None else None, mode))
+                self.startup_validation = {"mode": mode, "records_checked": 1 if last else 0}
+            else:
+                version, durable_seq, durable_end, durable_sha, checkpoint_raw, checkpoint_seq, mode = state
+                if version != 1 or durable_seq != self.durable or durable_end != self.disk_bytes \
+                        or durable_sha != (last[3] if last else None):
+                    raise ValueError("log_state_tail_mismatch")
+                if (checkpoint_raw is None) != (checkpoint_seq is None) \
+                        or checkpoint_seq is not None and not 1 <= checkpoint_seq <= durable_seq:
+                    raise ValueError("log_state_checkpoint_mismatch")
+                self.startup_validation = {"mode": mode, "records_checked": 1 if last else 0}
+            if checkpoint_raw is not None:
+                from .btc_continuity import Continuity
+                validated = Continuity()
+                validated.restore(json.loads(checkpoint_raw))
+                self.recovered_continuity = validated.checkpoint()
             db.commit()
         except BaseException:
             self.owner.close()
@@ -147,7 +175,9 @@ class FactLog:
             self.published = seq
             for subscriber in self.subscribers:
                 subscriber.offer(data)
-            self.pending.put_nowait((seq, data))
+            checkpoint = fact.get("continuity_checkpoint")
+            checkpoint_raw = canonical(checkpoint) if checkpoint is not None else None
+            self.pending.put_nowait((seq, data, checkpoint_raw))
             return seq
 
     def unsubscribe(self, subscriber: Subscriber) -> None:
@@ -167,7 +197,7 @@ class FactLog:
             with (self.root / "facts.jsonl").open("ab") as stream:
                 while not self.stop.is_set() or not self.pending.empty():
                     try:
-                        seq, data = self.pending.get(timeout=0.05)
+                        seq, data, checkpoint_raw = self.pending.get(timeout=0.05)
                     except queue.Empty:
                         continue
                     if self.before_write:
@@ -176,7 +206,19 @@ class FactLog:
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
-                    db.execute("INSERT INTO facts VALUES(?,?,?,?)", (seq, offset, len(data), hashlib.sha256(data).hexdigest()))
+                    digest = hashlib.sha256(data).hexdigest()
+                    db.execute("INSERT INTO facts VALUES(?,?,?,?)", (seq, offset, len(data), digest))
+                    db.execute("""INSERT INTO log_state VALUES(1,1,?,?,?,?,?,?)
+                        ON CONFLICT(singleton) DO UPDATE SET
+                        schema_version=excluded.schema_version,
+                        durable_seq=excluded.durable_seq,
+                        durable_end=excluded.durable_end,
+                        durable_sha=excluded.durable_sha,
+                        continuity_json=coalesce(excluded.continuity_json,log_state.continuity_json),
+                        continuity_seq=coalesce(excluded.continuity_seq,log_state.continuity_seq),
+                        validation_mode=excluded.validation_mode""",
+                        (seq, offset + len(data), digest, checkpoint_raw,
+                         seq if checkpoint_raw is not None else None, "transactional_tail"))
                     db.commit()
                     with self.lock:
                         self.durable = seq
@@ -197,7 +239,8 @@ class FactLog:
         with self.lock:
             return {"epoch": self.epoch, "published": self.published, "durable": self.durable,
                     "pending_count": self.pending_count, "pending_bytes": self.pending_bytes,
-                    "error": self.error, "stopped": self.stopped}
+                    "error": self.error, "stopped": self.stopped,
+                    "startup_validation": self.startup_validation}
 
     def close(self, timeout: float) -> None:
         with self.lock:
@@ -292,3 +335,55 @@ def recover_tail(root: Path, *, maximum_tail_bytes: int) -> dict:
                 os.close(descriptor)
             return {"recovered_bytes": len(raw), "preserved_file": preserved.name,
                     "sha256": digest, "requires_source_resync": True}
+
+
+def audit_committed(root: Path, *, maximum_record_bytes: int) -> dict:
+    """Explicit O(N) audit; never called by service startup.
+
+    The audit reads a stable SQLite snapshot up to its durable tail. A concurrently
+    appended raw tail is intentionally outside this receipt.
+    """
+    if maximum_record_bytes <= 0:
+        raise ValueError("invalid_budget")
+    db = sqlite3.connect(f"{(root / 'index.sqlite').resolve().as_uri()}?mode=ro", uri=True)
+    checked = total_bytes = 0
+    final_sha = None
+    try:
+        db.execute("BEGIN")
+        state = db.execute("SELECT durable_seq,durable_end,durable_sha FROM log_state WHERE singleton=1").fetchone()
+        if state is None:
+            last = db.execute("SELECT seq,offset+length,sha FROM facts ORDER BY seq DESC LIMIT 1").fetchone()
+            state = last or (0, 0, None)
+        durable_seq, durable_end, durable_sha = state
+        with (root / "facts.jsonl").open("rb") as source:
+            expected_seq = 1
+            expected_offset = 0
+            for seq, offset, length, sha in db.execute("SELECT seq,offset,length,sha FROM facts ORDER BY seq"):
+                if seq > durable_seq:
+                    raise ValueError("index_beyond_durable_state")
+                if seq != expected_seq or offset != expected_offset or length <= 0:
+                    raise ValueError("corrupt_index_continuity")
+                if length > maximum_record_bytes:
+                    raise ValueError("record_exceeds_budget")
+                raw = source.read(length)
+                if len(raw) != length or hashlib.sha256(raw).hexdigest() != sha:
+                    raise ValueError("corrupt_committed_fact")
+                try:
+                    value = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("corrupt_committed_fact") from exc
+                if value.get("sequence") != seq:
+                    raise ValueError("corrupt_committed_fact")
+                checked += 1
+                total_bytes += length
+                final_sha = sha
+                expected_seq += 1
+                expected_offset += length
+            if checked != durable_seq or expected_offset != durable_end or final_sha != durable_sha:
+                raise ValueError("durable_state_mismatch")
+        return {"schema_version": "marketcow.btc-fact-audit.v1", "complete": True,
+                "records_checked": checked, "bytes_checked": total_bytes,
+                "durable_seq": durable_seq, "durable_end": durable_end,
+                "durable_sha": durable_sha}
+    finally:
+        db.close()

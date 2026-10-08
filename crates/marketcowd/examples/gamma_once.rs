@@ -1,11 +1,18 @@
 //! One read-only Gamma request; no service state or account access.
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, time::{Duration, Instant}};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let output = PathBuf::from(std::env::args().nth(1).expect("new output directory required"));
+    let output = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .expect("new output directory required"),
+    );
     std::fs::create_dir(&output)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -25,14 +32,18 @@ async fn main() -> Result<()> {
     let result: Result<()> = async {
         let mut response = client.get(url).send().await?;
         report["status"] = response.status().as_u16().into();
-        ensure!(response.content_length().is_none_or(|n|n<=262144), "response cap");
+        ensure!(
+            response.content_length().is_none_or(|n| n <= 262144),
+            "response cap"
+        );
         while let Some(chunk) = response.chunk().await? {
-            ensure!(body.len()+chunk.len()<=262144, "response cap");
+            ensure!(body.len() + chunk.len() <= 262144, "response cap");
             body.extend_from_slice(&chunk);
         }
         report["raw_complete"] = true.into();
         Ok(())
-    }.await;
+    }
+    .await;
     if result.is_err() {
         // Do not expose transport errors containing proxy configuration.
         report["error"] = "request_or_response_failed".into();
@@ -51,6 +62,6 @@ async fn main() -> Result<()> {
     let serialized = serde_json::to_vec_pretty(&report)?;
     std::fs::write(output.join("report.json"), &serialized)?;
     println!("{}", String::from_utf8(serialized.clone())?);
-    println!("report_sha256={}",hex::encode(Sha256::digest(serialized)));
+    println!("report_sha256={}", hex::encode(Sha256::digest(serialized)));
     Ok(())
 }

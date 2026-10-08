@@ -16,6 +16,7 @@ from pathlib import Path
 from .btc_fact_log import FactLog
 from .btc_continuity import Continuity
 from .btc_backfill import KlineBackfill
+from .btc_minute_bootstrap import BootstrapBudget, BootstrapError, BtcMinuteBootstrap
 
 
 def decode_raw(raw: bytes, *, processed_at: str, monotonic_ns: int, maximum_bytes: int) -> dict | None:
@@ -65,6 +66,14 @@ def decode_raw(raw: bytes, *, processed_at: str, monotonic_ns: int, maximum_byte
     }
 
 
+def subscription_streams(profile: str) -> tuple[str, ...]:
+    if profile == "finalized-klines":
+        return ("1m_kline", "1h_kline")
+    if profile == "trades-and-klines":
+        return ("trades", "1m_kline", "1h_kline")
+    raise ValueError("unsupported_stream_profile")
+
+
 def run(args) -> None:
     import nautilus_trader
     if nautilus_trader.__version__ != "1.231.0":
@@ -83,23 +92,32 @@ def run(args) -> None:
         trader_id=TraderId("MC-DATA-001"), logging=LoggingConfig(log_level="ERROR"),
         data_clients={"BINANCE": BinanceDataClientConfig(
             api_key=None, api_secret=None, account_type=BinanceAccountType.SPOT,
-            environment=BinanceEnvironment.LIVE, us=False, proxy_url=args.proxy_url,
+            environment=BinanceEnvironment.LIVE, us=False,
+            base_url_http="https://data-api.binance.vision",
+            base_url_ws="wss://data-stream.binance.vision",
+            proxy_url=args.proxy_url,
             instrument_provider=InstrumentProviderConfig(load_ids=frozenset([instrument])),
         )}, exec_clients={}, timeout_connection=20.0, timeout_disconnection=10.0,
     )
     if args.check_only:
         print(json.dumps({"version": nautilus_trader.__version__, "module": nautilus_trader.__file__,
                           "execution_clients": len(config.exec_clients), "product": "SPOT",
-                          "instrument": str(instrument), "network_started": False}))
+                          "instrument": str(instrument), "network_started": False,
+                          "streams": subscription_streams(args.stream_profile)}))
         return
     continuous = getattr(args, "continuous", False)
     if not continuous and (args.seconds is None or args.seconds <= 0 or args.seconds > 1800):
         raise ValueError("seconds_must_be_1_to_1800")
     if getattr(args, "read_port", None) is not None and not 1 <= args.read_port <= 65535:
         raise ValueError("invalid_read_port")
+    bootstrap = BtcMinuteBootstrap(budget=BootstrapBudget(
+        bars=args.bootstrap_bars,
+        maximum_bytes=args.bootstrap_maximum_bytes,
+        timeout_seconds=args.bootstrap_timeout_seconds,
+    ))
     log = FactLog(args.output, maximum_pending=10000, maximum_pending_bytes=64 * 1024 * 1024,
                   maximum_disk_bytes=args.maximum_disk_bytes, maximum_subscribers=4)
-    node = TradingNode(config=config)
+    node = None
     failure = []
     original = BinanceCommonDataClient._handle_ws_message
     server = None
@@ -116,7 +134,6 @@ def run(args) -> None:
         return repaired
 
     repairs = KlineBackfill(log.publish, completed=repair_completed)
-
     def capture(client, raw):
         try:
             fact = decode_raw(raw, processed_at=datetime.now(timezone.utc).isoformat(),
@@ -130,6 +147,23 @@ def run(args) -> None:
                                               "error_type": type(exc).__name__}
                 fact["continuity_checkpoint"] = continuity.checkpoint()
                 log.publish(fact)
+                try:
+                    join = bootstrap.observe_live_finalized(
+                        json.loads(raw)["data"],
+                        first_received_at=fact["first_received_at"],
+                        source_raw_sha256=fact["raw_sha256"],
+                    )
+                    if join is not None:
+                        join_sequence = log.publish(join)
+                        bootstrap.acknowledge_join(join_sequence)
+                except BootstrapError as exc:
+                    log.publish({
+                        "schema_version": "marketcow.binance-bootstrap-failure.v1",
+                        "event_type": "btc_1m_bootstrap_failed",
+                        "reason": str(exc),
+                        "status": bootstrap.status(log.status()["durable"]),
+                    })
+                    raise
                 if not fact["stream_quality"]["apply_to_live"]:
                     return
                 quality = fact["stream_quality"]
@@ -151,7 +185,9 @@ def run(args) -> None:
 
     class Collector(Actor):
         def on_start(self):
-            self.subscribe_trade_ticks(instrument)
+            streams = subscription_streams(args.stream_profile)
+            if "trades" in streams:
+                self.subscribe_trade_ticks(instrument)
             for interval in ("1-MINUTE", "1-HOUR"):
                 self.subscribe_bars(BarType.from_str(f"{instrument}-{interval}-LAST-EXTERNAL"))
 
@@ -161,14 +197,17 @@ def run(args) -> None:
         def on_trade_tick(self, tick):
             pass
 
-    BinanceCommonDataClient._handle_ws_message = capture
     try:
+        bootstrap.capture(log, proxy_url=args.proxy_url)
+        node = TradingNode(config=config)
+        BinanceCommonDataClient._handle_ws_message = capture
         if getattr(args, "read_port", None) is not None:
             import uvicorn
             from .btc_research_read import create_read_app
             app = create_read_app(args.output, maximum_records=1000,
-                                  maximum_bytes=8 * 1024 * 1024, live_log=log)
-            server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1",
+                                  maximum_bytes=8 * 1024 * 1024, live_log=log,
+                                  bootstrap=bootstrap)
+            server = uvicorn.Server(uvicorn.Config(app, host=args.read_host,
                                                    port=args.read_port, log_level="warning"))
             server_thread = threading.Thread(target=server.run, name="btc-read-api", daemon=True)
             server_thread.start()
@@ -201,7 +240,8 @@ def run(args) -> None:
         repairs.pending.clear()
         for task in list(repairs.tasks.values()):
             task.cancel()
-        node.dispose()
+        if node is not None:
+            node.dispose()
         if server is not None:
             server.should_exit = True
             server_thread.join(10)
@@ -221,8 +261,16 @@ def main() -> None:
     duration.add_argument("--continuous", action="store_true", help="Run until stopped or a bounded resource fails")
     parser.add_argument("--maximum-disk-bytes", type=int, required=True)
     parser.add_argument("--proxy-url")
+    parser.add_argument("--bootstrap-bars", type=int, default=60)
+    parser.add_argument("--bootstrap-maximum-bytes", type=int, default=1048576)
+    parser.add_argument("--bootstrap-timeout-seconds", type=float, default=10)
+    parser.add_argument(
+        "--stream-profile", choices=("finalized-klines", "trades-and-klines"),
+        default="finalized-klines",
+    )
     parser.add_argument("--check-only", action="store_true")
-    parser.add_argument("--read-port", type=int, help="Optional loopback HTTP/WS read listener")
+    parser.add_argument("--read-port", type=int, help="Optional bounded HTTP/WS read listener")
+    parser.add_argument("--read-host", choices=("127.0.0.1", "192.168.124.3"), default="127.0.0.1")
     run(parser.parse_args())
 
 

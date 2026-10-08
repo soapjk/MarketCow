@@ -1,3 +1,5 @@
+import hashlib
+import json
 import threading
 import time
 import sqlite3
@@ -6,7 +8,7 @@ import sys
 
 import pytest
 
-from marketcow.btc_fact_log import FactLog, read_page, recover_tail
+from marketcow.btc_fact_log import FactLog, audit_committed, read_page, recover_tail
 
 
 def make(root, **kwargs):
@@ -130,18 +132,89 @@ def test_single_writer_and_torn_tail(tmp_path):
 
 
 @pytest.mark.parametrize("mutation", ["DELETE FROM facts WHERE seq=1", "UPDATE facts SET length=-1 WHERE seq=1"])
-def test_corrupt_index_rejected_and_lock_released(tmp_path, mutation):
+def test_middle_corruption_is_offline_audit_responsibility(tmp_path, mutation):
     log = make(tmp_path)
     log.publish({"x": 1})
     log.publish({"x": 2})
     log.close(2)
     with sqlite3.connect(tmp_path / "index.sqlite") as db:
         db.execute(mutation)
-    for _ in range(2):
-        with pytest.raises(ValueError, match="continuity"):
-            make(tmp_path)
+    # Normal startup checks only the transactionally bound tail and remains O(1).
+    log = make(tmp_path)
+    assert log.status()["startup_validation"]["records_checked"] == 1
+    log.close(2)
+    # Explicit audit remains strict over the complete history.
     with pytest.raises(ValueError, match="continuity"):
-        read_page(tmp_path, after=0, through=2, limit=3, maximum_bytes=4096)
+        audit_committed(tmp_path, maximum_record_bytes=4096)
+
+
+def test_tail_state_mismatch_rejected_and_lock_released(tmp_path):
+    log = make(tmp_path)
+    log.publish({"x": 1})
+    log.close(2)
+    with sqlite3.connect(tmp_path / "index.sqlite") as db:
+        db.execute("UPDATE log_state SET durable_end=durable_end+1")
+    for _ in range(2):
+        with pytest.raises(ValueError, match="tail_mismatch"):
+            make(tmp_path)
+
+
+def test_startup_checks_one_record_and_full_audit_is_explicit(tmp_path):
+    log = FactLog(tmp_path, maximum_pending=6000, maximum_pending_bytes=8 * 1024 * 1024,
+                  maximum_disk_bytes=32 * 1024 * 1024, maximum_subscribers=1)
+    for value in range(5000):
+        log.publish({"value": value})
+    log.close(10)
+
+    log = FactLog(tmp_path, maximum_pending=3, maximum_pending_bytes=8 * 1024 * 1024,
+                  maximum_disk_bytes=32 * 1024 * 1024, maximum_subscribers=1)
+    try:
+        assert log.status()["durable"] == 5000
+        assert log.status()["startup_validation"] == {
+            "mode": "transactional_tail", "records_checked": 1}
+    finally:
+        log.close(2)
+    receipt = audit_committed(tmp_path, maximum_record_bytes=4096)
+    assert receipt["complete"] and receipt["records_checked"] == 5000
+
+
+def test_checkpoint_survives_later_fact_without_checkpoint(tmp_path):
+    from marketcow.btc_continuity import Continuity
+    state = Continuity()
+    state.states["1m"] = dict(version=(120000, 121000), position=120000,
+                              final=False, missing=True,
+                              gap={"start": 0, "end_exclusive": 120000})
+    log = make(tmp_path)
+    log.publish({"continuity_checkpoint": state.checkpoint()})
+    log.publish({"unrelated": True})
+    log.close(2)
+    log = make(tmp_path)
+    try:
+        assert log.recovered_continuity["states"]["1m"]["missing"]
+    finally:
+        log.close(2)
+
+
+def test_legacy_archive_bootstraps_from_tail_without_history_scan(tmp_path):
+    rows = []
+    offset = 0
+    with (tmp_path / "facts.jsonl").open("wb") as output:
+        for seq in range(1, 101):
+            raw = (json.dumps({"epoch": "legacy", "sequence": seq, "fact": {"x": seq}},
+                              sort_keys=True, separators=(",", ":")) + "\n").encode()
+            output.write(raw)
+            rows.append((seq, offset, len(raw), hashlib.sha256(raw).hexdigest()))
+            offset += len(raw)
+    with sqlite3.connect(tmp_path / "index.sqlite") as db:
+        db.execute("CREATE TABLE facts(seq INTEGER PRIMARY KEY, offset INTEGER, length INTEGER, sha TEXT)")
+        db.executemany("INSERT INTO facts VALUES(?,?,?,?)", rows)
+    log = FactLog(tmp_path, maximum_pending=3, maximum_pending_bytes=4096,
+                  maximum_disk_bytes=16384, maximum_subscribers=1)
+    try:
+        assert log.status()["startup_validation"] == {
+            "mode": "legacy_tail_bootstrap", "records_checked": 1}
+    finally:
+        log.close(2)
 
 
 def test_close_timeout_retains_owner(tmp_path):

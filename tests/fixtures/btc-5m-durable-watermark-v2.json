@@ -1,0 +1,11 @@
+{
+  "schema_version": "marketcow.polymarket.btc-5m-event.v2",
+  "type": "durable_watermark",
+  "epoch": "11111111111111111111111111111111",
+  "profile_id": "a1670fbda37ff59ecf3aa9049c02f965a5eda1a271c22bec42039ec6c337fa17",
+  "profile_revision": 1,
+  "publisher_cursor": 100,
+  "durable_cursor": 80,
+  "observed_at": "2026-10-03T00:00:00Z",
+  "causal_bound": "durable_cursor_not_after_sent_publisher_cursor"
+}

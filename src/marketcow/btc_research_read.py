@@ -11,7 +11,8 @@ from .btc_hourly_dataset import canonical, timestamp
 
 def create_read_app(root: Path, *, maximum_records: int, maximum_bytes: int,
                     live_log: FactLog | None = None, subscriber_count: int = 256,
-                    subscriber_bytes: int = 1048576, send_timeout: float = 5.0) -> FastAPI:
+                    subscriber_bytes: int = 1048576, send_timeout: float = 5.0,
+                    bootstrap: object | None = None) -> FastAPI:
     if maximum_records <= 0 or maximum_bytes <= 0:
         raise ValueError("invalid_read_budget")
     app = FastAPI(title="MarketCow BTC research read-only")
@@ -22,7 +23,28 @@ def create_read_app(root: Path, *, maximum_records: int, maximum_bytes: int,
     def status():
         if live_log is None:
             raise HTTPException(503, "live_capture_not_attached")
-        return live_log.status()
+        result = live_log.status()
+        if bootstrap is not None:
+            result["btc_1m_bootstrap"] = bootstrap.status(result["durable"])
+        return result
+
+    @app.get("/v1/btc-research/bootstrap")
+    def bootstrap_status():
+        if live_log is None or bootstrap is None:
+            raise HTTPException(503, "btc_1m_bootstrap_not_attached")
+        return bootstrap.status(live_log.status()["durable"])
+
+    @app.get("/v1/btc-research/finalized-1m-window")
+    def finalized_minute_window():
+        if live_log is None or bootstrap is None:
+            raise HTTPException(503, "btc_1m_bootstrap_not_attached")
+        try:
+            log_status = live_log.status()
+            result = bootstrap.checkpoint(log_status["durable"])
+            result["epoch"] = log_status["epoch"]
+            return result
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
 
     @app.websocket("/v1/btc-research/stream")
     async def stream(socket: WebSocket):
@@ -35,10 +57,15 @@ def create_read_app(root: Path, *, maximum_records: int, maximum_bytes: int,
             subscriber = live_log.subscribe(count=subscriber_count, size=subscriber_bytes)
             await socket.accept()
             # This is a future-only raw feed, never a book-ready or replay baseline.
+            durable = live_log.status()["durable"]
+            bootstrap_status_value = (
+                bootstrap.status(durable) if bootstrap is not None else None
+            )
             await asyncio.wait_for(socket.send_json({
                 "schema_version": "marketcow.btc-research.stream-start.v1",
                 "epoch": live_log.epoch, "replay": False,
                 "continuity": "unverified", "durability": "asynchronous",
+                "btc_1m_bootstrap": bootstrap_status_value,
             }), send_timeout)
             receive = asyncio.create_task(socket.receive())
             while True:
