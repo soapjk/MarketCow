@@ -4,6 +4,7 @@
 pub mod discovery_source;
 pub mod diagnostic;
 pub mod subscription;
+mod transport_diagnostic;
 
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -131,6 +132,7 @@ pub struct RawTransportFrame {
 pub struct RawTransportBatch {
     frames: Vec<RawTransportFrame>,
     source_tokens: BTreeSet<String>,
+    queued_at: std::time::Instant,
     _bytes: OwnedSemaphorePermit,
     _shared_bytes: Option<OwnedSemaphorePermit>,
     _shared_slot: Option<OwnedSemaphorePermit>,
@@ -144,6 +146,12 @@ impl RawTransportBatch {
     }
     pub fn declared_bytes(&self) -> usize {
         self.declared_bytes
+    }
+
+    /// Time in this market's transport FIFO, excluding upstream socket read
+    /// and actor admission. Read before moving the batch into its frames.
+    pub fn queued_for(&self) -> Duration {
+        self.queued_at.elapsed()
     }
 
     pub fn into_frames(mut self) -> Vec<RawTransportFrame> {
@@ -615,7 +623,7 @@ async fn publish_connection_gaps(
     let bytes = serde_json::to_vec(&frames)
         .map_err(|_| TransportError::InvalidFrame)?
         .len();
-    send_bounded(output, frames, bytes, tokens, shutdown).await
+    send_bounded(output, frames, bytes, tokens, shutdown, None).await
 }
 
 async fn send_bounded(
@@ -624,10 +632,12 @@ async fn send_bounded(
     bytes: usize,
     source_tokens: &BTreeSet<String>,
     shutdown: &mut watch::Receiver<bool>,
+    mut timing: Option<&mut transport_diagnostic::SendTiming>,
 ) -> Result<bool, TransportError> {
     if bytes == 0 || bytes > output.maximum_batch_bytes || bytes > u32::MAX as usize {
         return Err(TransportError::FrameTooLarge);
     }
+    let wait_started = std::time::Instant::now();
     let shared_slot_permit = if let Some(shared) = &output.shared_slots {
         Some(tokio::select! {
             permit = shared.clone().acquire_owned() =>
@@ -643,6 +653,10 @@ async fn send_bounded(
     } else {
         None
     };
+    if let Some(timing) = timing.as_deref_mut() {
+        timing.shared_slot_wait = wait_started.elapsed();
+    }
+    let wait_started = std::time::Instant::now();
     let shared_byte_permit = if let Some(shared) = &output.shared_bytes {
         Some(tokio::select! {
             permit = shared.clone().acquire_many_owned(bytes as u32) =>
@@ -658,6 +672,10 @@ async fn send_bounded(
     } else {
         None
     };
+    if let Some(timing) = timing.as_deref_mut() {
+        timing.shared_byte_wait = wait_started.elapsed();
+    }
+    let wait_started = std::time::Instant::now();
     let byte_permit = tokio::select! {
         permit = output.bytes.clone().acquire_many_owned(bytes as u32) =>
             permit.map_err(|_| TransportError::Backpressure)?,
@@ -669,9 +687,16 @@ async fn send_bounded(
             };
         }
     };
+    if let Some(timing) = timing.as_deref_mut() {
+        timing.lane_byte_wait = wait_started.elapsed();
+    }
+    let wait_started = std::time::Instant::now();
     tokio::select! {
         permit = output.sender.reserve() => {
             let permit = permit.map_err(|_| TransportError::Backpressure)?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.queue_slot_wait = wait_started.elapsed();
+            }
             let current_bytes = output
                 .metrics
                 .current_bytes
@@ -693,6 +718,7 @@ async fn send_bounded(
             permit.send(RawTransportBatch {
                 frames,
                 source_tokens: source_tokens.clone(),
+                queued_at: std::time::Instant::now(),
                 _bytes: byte_permit,
                 _shared_bytes: shared_byte_permit,
                 _shared_slot: shared_slot_permit,
@@ -745,7 +771,9 @@ async fn run_polymarket_connection(
         config.heartbeat_interval,
     );
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut transport_diagnostic = transport_diagnostic::TransportDiagnostic::new(tokens);
     loop {
+        let socket_poll_started = std::time::Instant::now();
         tokio::select! {
             update = async { match updates.as_mut() {
                 Some(receiver) => receiver.recv().await,
@@ -778,6 +806,7 @@ async fn run_polymarket_connection(
                     if operation=="subscribe" {tokens.extend(ids.iter().cloned());}
                     else {for id in ids {tokens.remove(id);}}
                 }
+                transport_diagnostic.set_tokens(tokens);
                 let _=update.receipt.send(Ok(()));
             }
             changed = shutdown.changed() => {
@@ -795,6 +824,8 @@ async fn run_polymarket_connection(
                     }
                     let wire_bytes = text.len();
                     let received_at = Utc::now();
+                    let socket_next_poll = socket_poll_started.elapsed();
+                    let decode_started = std::time::Instant::now();
                     let payload: Value = serde_json::from_str(&text)
                         .map_err(|_| TransportError::InvalidFrame)?;
                     let values = match payload {
@@ -817,10 +848,16 @@ async fn run_polymarket_connection(
                         raw_payload, received_at,
                     }).collect();
                     if frames.is_empty() {continue;}
-                    if !send_bounded(output, frames, wire_bytes, tokens, shutdown).await? {
+                    transport_diagnostic.record_batch(&frames, wire_bytes,
+                        socket_next_poll, decode_started.elapsed());
+                    let mut send_timing = transport_diagnostic::SendTiming::default();
+                    if !send_bounded(output, frames, wire_bytes, tokens, shutdown,
+                        Some(&mut send_timing)).await? {
                         let _ = socket.close(None).await;
                         return Ok(ConnectionEnd::Shutdown);
                     }
+                    transport_diagnostic.record_send(&send_timing);
+                    transport_diagnostic.flush_if_due();
                 }
                 Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await
                     .map_err(|_| TransportError::SendFailed)?,
@@ -851,8 +888,11 @@ async fn run_polymarket_connection(
                     return Err(TransportError::ReadFailed);
                 },
             },
-            _ = heartbeat.tick() => socket.send(Message::Text("PING".into())).await
-                .map_err(|_| TransportError::SendFailed)?,
+            _ = heartbeat.tick() => {
+                transport_diagnostic.flush_if_due();
+                socket.send(Message::Text("PING".into())).await
+                    .map_err(|_| TransportError::SendFailed)?;
+            },
         }
     }
 }
@@ -2173,6 +2213,7 @@ mod tests {
                 32,
                 &BTreeSet::new(),
                 &mut first_shutdown,
+                None,
             )
             .await,
             Ok(true)
@@ -2198,6 +2239,7 @@ mod tests {
                 32,
                 &BTreeSet::new(),
                 &mut shutdown_rx,
+                None,
             )
             .await
         });
@@ -2220,6 +2262,7 @@ mod tests {
                 32,
                 &BTreeSet::new(),
                 &mut blocker_shutdown,
+                None,
             )
             .await,
             Ok(true)
@@ -2236,6 +2279,7 @@ mod tests {
                 32,
                 &BTreeSet::new(),
                 &mut shutdown_rx2,
+                None,
             )
             .await
         });
