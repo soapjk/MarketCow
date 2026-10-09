@@ -723,11 +723,19 @@ impl Pipeline {
                         let sampled = event["cursor"].as_u64()
                             .is_some_and(crate::source_publication::btc5m_trace_sample)
                             && state.trace_budget.2 < 32;
-                        let slow = !sampled && slow_batch && state.trace_budget.1 < 60;
+                        let source_lag = event["exchange_at"].as_str()
+                            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                            .zip(event["received_at"].as_str()
+                                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok()))
+                            .is_some_and(|(source_at, received_at)|
+                                received_at.signed_duration_since(source_at)
+                                    .num_milliseconds() > 5_000);
+                        let slow = !sampled && (slow_batch || source_lag)
+                            && state.trace_budget.1 < 60;
                         if sampled || slow {
                             if sampled { state.trace_budget.2 += 1; }
                             else { state.trace_budget.1 += 1; }
-                            trace_events.push((sampled, json!({
+                            trace_events.push((sampled, source_lag, json!({
                                 "market_id":market_id,
                                 "market_event_cursor":event["cursor"],
                                 "market_cursor":market_cursor,
@@ -739,15 +747,16 @@ impl Pipeline {
                                 "sequence":event["sequence"],
                                 "canonical_book_received_at":event["canonical_payload"]["received_at"],
                                 "event_received_at":event["received_at"],
+                                "event_source_at":event["exchange_at"],
                             })));
                         }
                     }
                     if trace_events.len() >= 96 { break; }
                 }
-                for (sampled, event) in trace_events {
+                for (sampled, source_lag, event) in trace_events {
                     marketcow_polymarket::async_eprintln!("{}", json!({
                         "stage":"market_event_timeline",
-                        "trace_reason":if sampled {"cursor_sample"} else {"slow_batch"},
+                        "trace_reason":if sampled {"cursor_sample"} else if source_lag {"source_lag"} else {"slow_batch"},
                         "market_id":event["market_id"],
                         "event":event,
                         "raw_batch_first_received_at":trace.raw_batch_first_received_at,

@@ -2872,6 +2872,8 @@ async fn run_connection(
     }
     publication.set_source_ready(leases.enabled());
     let mut pending_transport: Option<RawTransportBatch> = None;
+    let mut transport_dwell_started = std::time::Instant::now();
+    let mut transport_dwell = BTreeMap::<String, (u64, u128, u64, u64)>::new();
     let result:Result<()>=async {
         loop {
             jobs.reap_finished()?;
@@ -3738,6 +3740,12 @@ async fn run_connection(
                     continue;
                 }
                 let market = markets.into_iter().next().expect("one reviewed socket market");
+                let dwell_us = u64::try_from(batch.queued_for().as_micros()).unwrap_or(u64::MAX);
+                let dwell = transport_dwell.entry(market.clone()).or_default();
+                dwell.0 += 1;
+                dwell.1 = dwell.1.saturating_add(u128::from(dwell_us));
+                dwell.2 = dwell.2.max(dwell_us);
+                dwell.3 += u64::from(dwell_us >= 100_000);
                 let frames = batch.into_frames().into_iter().filter(|frame|
                     marketcow_polymarket::subscription::owned_or_unclassified(
                         &frame.raw_payload, &acquisition_tokens))
@@ -3758,6 +3766,21 @@ async fn run_connection(
                 }
                 let pass = routed.drain(..routed.len().min(16)).collect();
                 pipeline.submit_routed_batches(adapter, publication, pass).await?;
+            }
+            if transport_dwell_started.elapsed() >= std::time::Duration::from_secs(5) {
+                for (market_id, (count, total_us, max_us, over_100ms)) in
+                    std::mem::take(&mut transport_dwell) {
+                    marketcow_polymarket::async_eprintln!("{}", json!({
+                        "stage":"market_transport_queue_dwell_window",
+                        "market_id":market_id,
+                        "count":count,
+                        "mean_us":if count == 0 { 0 } else { (total_us / u128::from(count)) as u64 },
+                        "max_us":max_us,
+                        "over_100ms":over_100ms,
+                        "window_elapsed_ms":transport_dwell_started.elapsed().as_millis(),
+                    }));
+                }
+                transport_dwell_started = std::time::Instant::now();
             }
             tokio::task::yield_now().await;
         }
