@@ -178,6 +178,8 @@ impl Lane {
                     chrono::DateTime::parse_from_rfc3339(&confirmation.bound_quote_source_at)?;
                 let at = chrono::DateTime::parse_from_rfc3339(&confirmation.source_at)?;
                 ensure!(quote <= at, "confirmation before quote");
+                let received = chrono::DateTime::parse_from_rfc3339(&confirmation.received_at)?;
+                ensure!(at <= received, "confirmation after receipt");
             }
             ensure!(
                 !meta.data_valid || meta.quote_source_at.is_some(),
@@ -527,6 +529,17 @@ mod native_tests {
             evidence_id: None,
         });
         assert!(lane.capture(invalid, "private-a".into()).is_err());
+        assert_eq!(lane.sequence, first.sequence);
+        let mut future = (*first.snapshot).clone();
+        future.books[0].metadata.as_mut().unwrap().confirmation = Some(wire::Confirmation {
+            source_at: "2026-10-15T00:00:03Z".into(),
+            received_at: "2026-10-15T00:00:02Z".into(),
+            source: "supplier".into(),
+            bound_quote_source_at: "2026-10-15T00:00:01Z".into(),
+            bound_book_revision: 0,
+            evidence_id: None,
+        });
+        assert!(lane.capture(future, "private-a".into()).is_err());
         assert_eq!(lane.sequence, first.sequence);
         let mut next = (*first.snapshot).clone();
         next.books[0].bids.clear();

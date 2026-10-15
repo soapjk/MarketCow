@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::PathBuf, time::Duration};
 use tokio::task::JoinSet;
 mod btc_research;
+mod source_snapshot;
 #[allow(dead_code)]
 #[path = "live_source_bridge.rs"]
 mod durable_bootstrap;
