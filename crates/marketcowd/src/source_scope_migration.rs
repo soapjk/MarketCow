@@ -197,6 +197,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let source = workspace.path().join("source");
         fs::create_dir(&source).unwrap();
+        let source = source.canonicalize().unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(source.join("indexes")).unwrap();
         fs::write(source.join("events.jsonl"), b"").unwrap();
@@ -245,7 +246,7 @@ mod tests {
         let state_hash = sha256(&state_path).unwrap();
         let index_hash = sha256(&source.join("indexes/latest-state.sqlite3")).unwrap();
         let events_hash = sha256(&source.join("events.jsonl")).unwrap();
-        let output = workspace.path().join("output");
+        let output = workspace.path().canonicalize().unwrap().join("output");
         let receipt = migrate(Inputs {source_root:&source,state_path:&state_path,
             output_root:&output,state_max_bytes:2 * 1024 * 1024,batch_bytes:16384,
             expected_state_sha256:&state_hash,expected_index_sha256:&index_hash,
@@ -317,7 +318,7 @@ mod tests {
         assert_eq!(busy,0);
         drop(db);
         let bounded_index_hash = sha256(&source.join("indexes/latest-state.sqlite3")).unwrap();
-        let bounded_output = workspace.path().join("bounded-output");
+        let bounded_output = workspace.path().canonicalize().unwrap().join("bounded-output");
         let bounded_receipt = migrate(Inputs {source_root:&source,state_path:&state_path,
             output_root:&bounded_output,state_max_bytes:2 * 1024 * 1024,batch_bytes:16384,
             expected_state_sha256:&state_hash,expected_index_sha256:&bounded_index_hash,

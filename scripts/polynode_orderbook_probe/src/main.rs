@@ -34,7 +34,7 @@ fn now_ns() -> Result<u128, Box<dyn std::error::Error>> {
 }
 
 fn usage() -> &'static str {
-    "usage: polynode-orderbook-probe --output PATH [--market SLUG_OR_CONDITION_OR_TOKEN ...] [--duration-seconds 1..600] [--api-key-file PATH] [--proxy-host HOST --proxy-port PORT]\nIf --market is omitted, subscribes to the current and next btc-updown-5m slugs."
+    "usage: polynode-orderbook-probe --output PATH [--market SLUG_OR_CONDITION_OR_TOKEN ...] [--duration-seconds 1..600] [--stop-after-first-data] [--api-key-file PATH] [--proxy-host HOST --proxy-port PORT]\nIf --market is omitted, subscribes to the current and next btc-updown-5m slugs."
 }
 
 fn key_from_file(path: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output: Option<PathBuf> = None;
     let mut markets = Vec::<String>::new();
     let mut duration = 300_u64;
+    let mut stop_after_first_data = false;
     let mut proxy_host: Option<String> = None;
     let mut proxy_port: Option<u16> = None;
     let mut args = env::args().skip(1);
@@ -92,6 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if arg == "--help" {
             println!("{}", usage());
             return Ok(());
+        }
+        if arg == "--stop-after-first-data" {
+            stop_after_first_data = true;
+            continue;
         }
         let value = args.next().ok_or("missing argument value")?;
         match arg.as_str() {
@@ -127,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut capture_bytes = 0_usize;
     let mut controls = 0_u64;
     let mut error: Option<&'static str> = None;
+    let mut connect_http_status: Option<u16> = None;
 
     // Never format a WebSocket error: it may contain the authenticated request URL.
     let connection = if let (Some(host), Some(port)) = (proxy_host, proxy_port) {
@@ -137,14 +143,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 client_async_tls_with_config(url, stream, None, None),
             )
             .await
-            .map(|result| result.map(|(ws, _)| ws).map_err(|_| ()))
+            .map(|result| result.map(|(ws, _)| ws).map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response) =>
+                    Some(response.status().as_u16()),
+                _ => None,
+            }))
             .map_err(|_| ()),
             _ => Err(()),
         }
     } else {
         tokio::time::timeout(Duration::from_secs(10), connect_async(url))
             .await
-            .map(|result| result.map(|(ws, _)| ws).map_err(|_| ()))
+            .map(|result| result.map(|(ws, _)| ws).map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response) =>
+                    Some(response.status().as_u16()),
+                _ => None,
+            }))
             .map_err(|_| ())
     };
 
@@ -162,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let received_at_ns = now_ns()?;
                                 let kind = serde_json::from_str::<serde_json::Value>(&raw)
                                     .ok().and_then(|value| value.get("type").and_then(|v| v.as_str()).map(str::to_owned));
-                                if matches!(kind.as_deref(), Some("batch" | "snapshot_batch" | "book_snapshot")) {
+                                if matches!(kind.as_deref(), Some("batch" | "snapshot_batch" | "book_snapshot" | "book_update")) {
                                     if raw.contains(&key) {
                                         error = Some("secret_echo_in_data_frame");
                                         break;
@@ -173,6 +187,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         break;
                                     }
                                     captured.push(ReceivedMessage { received_at_ns, raw_data: raw.to_string() });
+                                    if stop_after_first_data {
+                                        break;
+                                    }
                                 } else {
                                     controls += 1;
                                 }
@@ -189,7 +206,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let _ = tokio::time::timeout(Duration::from_secs(1), ws.close(None)).await;
         }
-        _ => error = Some("connect_failed"),
+        Ok(Err(status)) => {
+            connect_http_status = status;
+            error = Some("connect_http_rejected");
+        }
+        Err(()) => error = Some("connect_failed"),
     }
     let end_ns = now_ns()?;
     let mut writer = BufWriter::new(File::options().write(true).create_new(true).open(&output)?);
@@ -209,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "control_frames": controls,
         "output": output,
         "error": error,
+        "connect_http_status": connect_http_status,
     }));
     Ok(())
 }

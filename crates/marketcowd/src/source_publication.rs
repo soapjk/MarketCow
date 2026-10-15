@@ -498,6 +498,7 @@ pub struct MarketStreamWatermark {
 /// One selected market's books and replay boundary captured while holding only
 /// its market lane. It does not clone unrelated markets' depth or claim that
 /// the latest published books are already durable.
+#[derive(Clone)]
 pub struct MarketMemorySnapshot {
     pub watermark: MarketStreamWatermark,
     /// Last event in the selected market's published stream, including
@@ -2690,8 +2691,10 @@ impl MarketPublisher {
             // No writer owns this group's post-state. The live projection has
             // already installed its Arc; retaining a second writer-only copy
             // would unnecessarily consume the bounded replay allowance.
+            // Publication has already committed. Cleanup cannot turn a
+            // successful handoff into an ambiguous/rejected transaction.
             batch.materialized_books.lock()
-                .map_err(|_| anyhow::anyhow!("materialized books poisoned"))?.take();
+                .unwrap_or_else(|poisoned| poisoned.into_inner()).take();
             let count = self.volatile_groups.fetch_add(1, Ordering::AcqRel) + 1;
             if !was_volatile || count % 256 == 0 {
                 marketcow_polymarket::async_eprintln!("{}", json!({

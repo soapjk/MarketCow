@@ -124,6 +124,7 @@ struct State {
     trace_budget: (std::time::Instant, u32, u32),
 }
 struct Input {
+    handoff_receipt: Option<tokio::sync::oneshot::Sender<bool>>,
     generation: u64,
     frames: Vec<RawTransportFrame>,
     admitted_at: chrono::DateTime<Utc>,
@@ -554,8 +555,31 @@ impl Pipeline {
                         recovery_transitions: vec![],
                     });
                 }
-                let atomic_recovery = input.rest_recovery.is_some();
-                let events = if let Some(raw_books) = input.rest_recovery {
+                let mut handoff_receipt = input.handoff_receipt;
+                let handoff = handoff_receipt.is_some();
+                let mut staged_adapter = None;
+                let atomic_recovery = input.rest_recovery.is_some() || handoff;
+                let events = if handoff {
+                    let staged = input.frames.first().context("checkpoint input")
+                        .and_then(|frame| state.adapter.stage_connection_checkpoint(frame,Utc::now()));
+                    match staged {
+                        Ok((adapter, events)) if input.frames.len() == 1 => {
+                            staged_adapter = Some(adapter);
+                            events
+                        }
+                        other => {
+                            marketcow_polymarket::async_eprintln!("{}",json!({
+                                "stage":"market_hot_checkpoint_rejected",
+                                "observed_at":Utc::now(),
+                                "detail":other.err().map(|error|error.to_string())
+                                    .unwrap_or_else(||"checkpoint must be isolated".into()),
+                            }));
+                            if let Some(receipt) = handoff_receipt.take() { let _ = receipt.send(false); }
+                            return Ok(Output { generation:input.generation,published_groups:0,
+                                #[cfg(test)] published_event_types:vec![],recovery_transitions:vec![] });
+                        }
+                    }
+                } else if let Some(raw_books) = input.rest_recovery {
                     let received_at = input
                         .frames
                         .first()
@@ -604,24 +628,26 @@ impl Pipeline {
                 // mutations. A later mutation/gap can supersede an earlier
                 // identical-depth observation in the same coalesced input.
                 // It must not confirm the new state (or abort the owner).
-                let confirmations: Vec<ReducedBookConfirmation> = std::mem::take(&mut state.adapter.confirmations)
+                let confirmation_adapter = staged_adapter.as_mut().unwrap_or(&mut state.adapter);
+                let confirmations: Vec<ReducedBookConfirmation> = std::mem::take(&mut confirmation_adapter.confirmations)
                     .into_iter().filter(|fact| {
-                        !state.adapter.recoveries.contains_key(&fact.token_id)
-                            && state.adapter.depth_checksums.get(&fact.token_id)
+                        !confirmation_adapter.recoveries.contains_key(&fact.token_id)
+                            && confirmation_adapter.depth_checksums.get(&fact.token_id)
                                 == Some(&fact.state_checksum)
-                            && state.adapter.epochs.get(&fact.token_id)
+                            && confirmation_adapter.epochs.get(&fact.token_id)
                                 == Some(&fact.book_epoch)
-                            && state.adapter.sequences.get(&fact.token_id)
+                            && confirmation_adapter.sequences.get(&fact.token_id)
                                 == Some(&fact.book_sequence)
-                            && state.adapter.book_received.get(&fact.token_id)
+                            && confirmation_adapter.book_received.get(&fact.token_id)
                                 == Some(&fact.book_received_at)
                     }).collect();
-                let (events, materialized_books) = compact_incremental_events(events)?;
-                bounded_size(&events, OUTPUT_BYTES)?;
-                let token_markets = state.adapter.identities.iter()
+                let observations = (|| -> Result<Vec<ActorObservation>> {
+                  let (events, materialized_books) = compact_incremental_events(events)?;
+                  bounded_size(&events, OUTPUT_BYTES)?;
+                  let token_markets = state.adapter.identities.iter()
                     .map(|(token, (market, _))| (token.clone(), market.clone()))
                     .collect::<BTreeMap<_, _>>();
-                let observations = partition_observation_batches(
+                  partition_observation_batches(
                     events, materialized_books, atomic_recovery,
                 )?.into_iter().map(|(events, materialized_books)| {
                     let prepared = prepare_market_projection(&events, &materialized_books)?;
@@ -633,7 +659,21 @@ impl Pipeline {
                         events, terminal, after, &token_markets, OUTPUT_BYTES,
                     )?;
                     Ok(ActorObservation { validated, materialized_books, prepared })
-                }).collect::<Result<Vec<_>>>()?;
+                  }).collect::<Result<Vec<_>>>()
+                })();
+                let observations = match observations {
+                    Ok(observations) => observations,
+                    Err(error) if handoff => {
+                        marketcow_polymarket::async_eprintln!("{}",json!({
+                            "stage":"market_hot_checkpoint_rejected",
+                            "observed_at":Utc::now(),"detail":error.to_string(),
+                        }));
+                        if let Some(receipt) = handoff_receipt.take() { let _ = receipt.send(false); }
+                        return Ok(Output {generation:input.generation,published_groups:0,
+                            #[cfg(test)] published_event_types:vec![],recovery_transitions:vec![]});
+                    }
+                    Err(error) => return Err(error),
+                };
                 trace.actor_completed_at = Utc::now();
                 trace.actor_completed_mono = std::time::Instant::now();
                 // The control fence is held across this market's publication.
@@ -652,7 +692,7 @@ impl Pipeline {
                 for observation in observations {
                     let publish_call_started_mono = std::time::Instant::now();
                     let publish_call_started_at = Utc::now();
-                    let batch = state.publisher.publish(
+                    let result = state.publisher.publish(
                         observation.validated, observation.materialized_books,
                         observation.prepared, None, Some(SourceBatchTiming {
                             raw_batch_first_received_at: trace.raw_batch_first_received_at,
@@ -666,7 +706,20 @@ impl Pipeline {
                             publish_call_started_at, publish_call_started_mono,
                             shared_replay_visible_at: None, shared_replay_visible_mono: None,
                             durable_at: None,
-                        }))?;
+                        }));
+                    let batch = match result {
+                        Ok(batch) => batch,
+                        Err(error) if handoff => {
+                            marketcow_polymarket::async_eprintln!("{}",json!({
+                                "stage":"market_hot_checkpoint_not_committed",
+                                "observed_at":Utc::now(),"detail":error.to_string(),
+                            }));
+                            if let Some(receipt) = handoff_receipt.take() { let _ = receipt.send(false); }
+                            return Ok(Output {generation:input.generation,published_groups:0,
+                                #[cfg(test)] published_event_types:vec![],recovery_transitions:vec![]});
+                        }
+                        Err(error) => return Err(error),
+                    };
                     for event in batch.validated.events() {
                         if marketcow_runtime::discovery_source::is_token_recovery(event) {
                             let token = event["token_id"].as_str()
@@ -685,6 +738,10 @@ impl Pipeline {
                         }
                     }
                     published.push(batch);
+                }
+                if let Some(adapter) = staged_adapter {
+                    state.adapter = adapter;
+                    if let Some(receipt) = handoff_receipt.take() { let _ = receipt.send(true); }
                 }
                 for confirmation in confirmations {
                     if let Err(error) = state.publisher.confirm_reduced_token(
@@ -865,6 +922,37 @@ impl Pipeline {
             self.market_conditions.get(expected).is_some_and(|known| known.as_str() == condition))
     }
 
+    /// Candidate admission is optional work: failure rejects the candidate,
+    /// never installs a recovery barrier on the still-live active connection.
+    pub(super) fn submit_connection_checkpoint(&self, router: &Adapter,
+        market: String, frames: Vec<RawTransportFrame>,
+        receipt: tokio::sync::oneshot::Sender<bool>) -> Result<()> {
+        ensure!(frames.len() == 1
+            && frames[0].raw_payload["event_type"] == "marketcow_connection_checkpoint"
+            && self.belongs_to_market(router, &market, &frames[0]), "checkpoint route");
+        let generation = {
+            let control = self.controls.get(&market).context("checkpoint market owner")?
+                .lock().map_err(|_|anyhow::anyhow!("checkpoint control poisoned"))?;
+            if !control.attempts.is_empty() || !control.pending_barrier.is_empty() {
+                let _ = receipt.send(false);
+                return Ok(());
+            }
+            control.generation
+        };
+        let bytes = bounded_size(&frames, FRAME_BYTES)?;
+        let (shared, local) = match self.try_reserve_input_bytes(&market, bytes) {
+            Ok(permits) => permits,
+            Err(_) => { let _ = receipt.send(false); return Ok(()); }
+        };
+        let input = Input { handoff_receipt:Some(receipt), generation, frames,
+            admitted_at:Utc::now(),admitted_mono:std::time::Instant::now(),
+            recovery:vec![],rest_recovery:None,replacement_reason:None,
+            _bytes:shared,_market_bytes:local };
+        // A returned input drops its receipt: the old socket remains active.
+        let _ = self.dispatch.try_submit(&market, input);
+        Ok(())
+    }
+
     pub(super) async fn submit(
         &self,
         router: &mut Adapter,
@@ -1023,6 +1111,7 @@ impl Pipeline {
             match self.try_reserve_input_bytes(&market, bytes) {
                 Ok((permit, market_permit)) => {
                 let input = Input {
+                    handoff_receipt: None,
                     generation,
                     frames: std::mem::take(&mut frames),
                     admitted_at: Utc::now(),
@@ -1117,6 +1206,7 @@ impl Pipeline {
             }
         };
         let input = Input {
+            handoff_receipt: None,
             generation,
             frames: vec![frame],
             admitted_at: Utc::now(),
@@ -1188,6 +1278,7 @@ impl Pipeline {
             }
         };
         let input = Input {
+            handoff_receipt: None,
             generation,
             frames: vec![frame],
             admitted_at: Utc::now(),
@@ -1956,6 +2047,53 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn connection_checkpoint_receipt_requires_atomic_publication_and_preserves_other_market() {
+        let mut router = fixture();
+        let publication = fixture_publication(&router);
+        let (mut pipeline, mut output) = Pipeline::start_with_workers(&router,&publication,2).unwrap();
+        let up = book("11");
+        let down = book("12");
+        pipeline.submit_routed_batches(&mut router,&publication,
+            vec![("1".into(),vec![up.clone(),down.clone()])]).await.unwrap();
+        next(&mut output).await.result.unwrap();
+        let before = publication.reader().capture_market("1",&["11".into(),"12".into()]).unwrap();
+        let other = publication.reader().market_stream_watermark("2").unwrap();
+        let frame = RawTransportFrame {received_at:down.received_at,raw_payload:json!({
+            "event_type":"marketcow_connection_checkpoint",
+            "schema_version":"marketcow.polymarket.connection-checkpoint.v1",
+            "market":"c1","token_ids":["11","12"],
+            "rotation_id":1,"attempt":1,"connection_id":"test-standby",
+            "source_frames":[
+                {"raw_payload":up.raw_payload,"received_at":up.received_at},
+                {"raw_payload":down.raw_payload,"received_at":down.received_at},
+            ]})};
+        let (tx,rx) = tokio::sync::oneshot::channel();
+        pipeline.submit_connection_checkpoint(&router,"1".into(),vec![frame.clone()],tx).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2),rx).await.unwrap().unwrap());
+        let done = next(&mut output).await.result.unwrap();
+        assert_eq!(done.published_groups,1);
+        assert_eq!(done.published_event_types,vec!["book","book"]);
+        let after = publication.reader().capture_market("1",&["11".into(),"12".into()]).unwrap();
+        assert_eq!(after.watermark.published_cursor,before.watermark.published_cursor+1);
+        assert!(after.recoveries.is_empty());
+        assert_eq!(after.market_book_cursors["11"],after.market_book_cursors["12"]);
+        assert_eq!(publication.reader().market_stream_watermark("2").unwrap(),other);
+        let mut broken = frame;
+        broken.raw_payload["source_frames"][1]["raw_payload"]["market"] = json!("wrong");
+        let (tx,rx) = tokio::sync::oneshot::channel();
+        pipeline.submit_connection_checkpoint(&router,"1".into(),vec![broken],tx).unwrap();
+        assert!(!tokio::time::timeout(std::time::Duration::from_secs(2),rx).await.unwrap().unwrap());
+        assert_eq!(next(&mut output).await.result.unwrap().published_groups,0);
+        let rejected = publication.reader().capture_market("1",&["11".into(),"12".into()]).unwrap();
+        assert_eq!(rejected.watermark.published_cursor,after.watermark.published_cursor);
+        assert!(rejected.recoveries.is_empty());
+        pipeline.dispatch.close();
+        while output.recv().await.is_some() {}
+        pipeline.dispatch.join().await;
+        publication.finish().await.unwrap();
+    }
+
     #[test]
     fn incremental_history_is_compact_but_keeps_exact_materialized_post_state() {
         let original = super::super::btc5m_reducer_fixture_sequence().unwrap();
@@ -2155,14 +2293,17 @@ mod tests {
                 .unwrap();
         }
         let cursor = market_event_cursor(&publication, "1");
-        for _ in 0..100 {
-            if market_durable_cursor(&publication, "1") ==
-                publication.reader().market_stream_watermark("1").unwrap().unwrap().published_cursor {
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let watermark = publication.reader().market_stream_watermark("1")
+                    .unwrap().unwrap();
+                if watermark.durable_cursor > 0
+                    && watermark.durable_cursor == watermark.published_cursor {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
-        assert!(market_durable_cursor(&publication, "1") > 0);
+        }).await.expect("initial book writes become durable");
         let now = Utc::now().with_nanosecond(0).unwrap() + chrono::Duration::seconds(2);
         let delta = RawTransportFrame {
             received_at: now,

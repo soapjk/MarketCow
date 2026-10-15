@@ -38,6 +38,10 @@ mod source_market_evidence;
 mod source_market_replay;
 mod source_market_persistence;
 mod source_price_history;
+#[allow(dead_code)]
+mod source_polynode_pn1;
+mod source_polynode_service;
+mod source_official_ws_relay;
 mod source_public_api;
 mod source_public_binding;
 mod source_public_frame;
@@ -274,12 +278,21 @@ struct Args {
     btc_5m_profile: Option<PathBuf>,
     #[arg(long, requires = "btc_5m_profile")]
     btc_5m_profile_sha256: Option<String>,
+    /// Private PolyNode orderbook key. Enables the PN1 market-local v4 hot
+    /// feed; never included in logs, profiles, snapshots or deployment receipts.
+    #[arg(long, requires = "public_listen")]
+    btc_polynode_key_file: Option<PathBuf>,
     #[arg(long)]
     btc_5m_snapshot_bytes: Option<usize>,
     #[arg(long)]
     btc_5m_frame_bytes: Option<usize>,
     #[arg(long)]
     btc_5m_replay_bytes: Option<usize>,
+    /// Live consumers replace stale prefixes with an atomic current-state checkpoint.
+    #[arg(long, default_value_t = 64)]
+    btc_5m_live_backlog_groups: usize,
+    #[arg(long, default_value_t = 500)]
+    btc_5m_live_backlog_age_ms: u64,
     #[arg(long)]
     btc_5m_clients: Option<usize>,
     #[arg(long)]
@@ -929,8 +942,9 @@ async fn main() -> Result<()> {
             .collect(),
     )?;
     // The market-local feed has no JSONL/coupled-replay compatibility mode.
-    // Reject an incomplete live configuration before accepting source data;
-    // non-BTC discovery still retains its independent archive policy.
+    // PN1 is an optional source: the official-WS market-local read surface
+    // remains available when the private PN1 subscription is disabled.
+    // Non-BTC discovery retains its independent archive policy.
     if btc_5m_profile.is_some() {
         ensure!(args.bounded_history_bytes.is_some(),
             "BTC 5m market-local archive requires bounded history");
@@ -1232,6 +1246,7 @@ async fn main() -> Result<()> {
     };
     let mut control_backend = None;
     let mut btc_5m_control = None;
+    let mut polynode_task = None;
     let public_task = if let Some(listen) = args.public_listen {
         ensure!(
             listen.ip().is_loopback()
@@ -1272,6 +1287,8 @@ async fn main() -> Result<()> {
                 profile,
                 uuid::Uuid::new_v4().simple().to_string(),
                 source_btc5m_api::Limits {
+                    live_backlog_groups: args.btc_5m_live_backlog_groups,
+                    live_backlog_age: std::time::Duration::from_millis(args.btc_5m_live_backlog_age_ms),
                     snapshot_bytes: args
                         .btc_5m_snapshot_bytes
                         .context("BTC 5m snapshot bytes")?,
@@ -1291,6 +1308,15 @@ async fn main() -> Result<()> {
             router = router.merge(source_btc5m_reference::router(
                 control.clone(), btc_service.as_ref().map(|service| service.trade_source()),
             )?);
+            router = router.merge(source_official_ws_relay::router(
+                control.clone(), publication.reader(),
+            )?);
+            if let Some(key_path) = args.btc_polynode_key_file.clone() {
+                let (pn1, archive_rx) = source_polynode_service::Service::new(control.clone())?;
+                polynode_task = Some(pn1.start(key_path,
+                    args.root.join("polynode-pn1"), archive_rx)?);
+                router = router.merge(pn1.router());
+            }
             btc_5m_control = Some(control);
             router = router.merge(btc_router);
         }
@@ -1404,6 +1430,10 @@ async fn main() -> Result<()> {
             task.abort();
             let _ = task.await;
         }
+        if let Some(task) = polynode_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         let drain = publication.finish().await;
         result?;
         drain?;
@@ -1425,6 +1455,10 @@ async fn main() -> Result<()> {
             task.abort();
         }
         if let Some(task) = control_task {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = polynode_task.take() {
             task.abort();
             let _ = task.await;
         }
@@ -1550,6 +1584,10 @@ async fn main() -> Result<()> {
     if let Some(task) = stream_task {
         task.abort();
     }
+    if let Some(task) = polynode_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     // Even a rejected batch must drain previously accepted data before normal exit.
     // The stream closes first, so downstream never mistakes a stopped source for healthy.
     let drain_result = publication.finish().await;
@@ -1619,7 +1657,7 @@ mod scope_tests {
             loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
         }
         for stage in ["intent_committed","wire_result_unknown","writer_committed"] {
-            let root = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+            let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
             std::fs::create_dir(root.path().join("private")).unwrap();
             std::fs::set_permissions(root.path().join("private"),
                 std::fs::Permissions::from_mode(0o700)).unwrap();

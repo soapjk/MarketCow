@@ -141,6 +141,105 @@ struct ScopeAcquisition {
     retire_market_ids: BTreeSet<String>,
 }
 impl Adapter {
+    /// Reduce a standby prefix in a separate owner. The caller commits the
+    /// returned pair as ONE publication group before replacing this adapter.
+    /// Raw evidence remains explicitly derived; it is not a venue snapshot.
+    fn stage_connection_checkpoint(&self, frame: &RawTransportFrame, now: chrono::DateTime<Utc>)
+        -> Result<(Self, Vec<Value>)> {
+        let raw = &frame.raw_payload;
+        ensure!(raw["schema_version"] == "marketcow.polymarket.connection-checkpoint.v1",
+            "checkpoint schema");
+        ensure!(self.identities.len() == 2 && self.waiting.is_empty()
+            && self.recoveries.is_empty(), "checkpoint requires active complete market");
+        let tokens: BTreeSet<String> = serde_json::from_value(raw["token_ids"].clone())?;
+        ensure!(tokens == self.identities.keys().cloned().collect(), "checkpoint token binding");
+        let market = self.identities.values().next().context("checkpoint market")?.0.clone();
+        ensure!(self.identities.values().all(|(id, condition)|
+            id == &market && raw["market"].as_str() == Some(condition.as_str())),
+            "checkpoint condition binding");
+        let frames = raw["source_frames"].as_array().context("checkpoint source prefix")?;
+        ensure!(!frames.is_empty() && frames.len() <= marketcow_polymarket::MAX_CONNECTION_CHECKPOINT_FRAMES,
+            "checkpoint frame count");
+        ensure!(serde_json::to_vec(frame)?.len() <= marketcow_polymarket::MAX_CONNECTION_CHECKPOINT_BYTES,
+            "checkpoint byte budget");
+        // Venue book messages do not always carry tick metadata. Commit the
+        // actual reducer seed to the derived evidence, rather than asking an
+        // independent consumer to guess it from the final book or old socket.
+        let initial_ticks = tokens.iter().map(|token| Ok((token.clone(),
+            self.ticks.get(token).context("checkpoint initial tick missing")?.0.to_string())))
+            .collect::<Result<BTreeMap<_,_>>>()?;
+        let mut checkpoint_evidence = raw.clone();
+        checkpoint_evidence["initial_tick_sizes"] = json!(initial_ticks);
+        ensure!(serde_json::to_vec(&checkpoint_evidence)?.len()
+            <= marketcow_polymarket::MAX_CONNECTION_CHECKPOINT_EVIDENCE_BYTES,
+            "checkpoint evidence byte budget");
+        let mut staged = self.market_actor(&market);
+        staged.recoveries.clear();
+        let mut final_events = BTreeMap::new();
+        let mut previous_received = None;
+        for source in frames {
+            let received = chrono::DateTime::parse_from_rfc3339(
+                source["received_at"].as_str().context("checkpoint source receipt")?)?
+                .with_timezone(&Utc);
+            ensure!(previous_received.is_none_or(|previous| received >= previous)
+                && received <= frame.received_at, "checkpoint receipt order");
+            previous_received = Some(received);
+            let source_raw = source["raw_payload"].clone();
+            ensure!(source_raw.get("marketcow_conflation").is_none()
+                && matches!(source_raw["event_type"].as_str(),
+                    Some("book" | "price_change" | "last_trade_price" | "tick_size_change"
+                        | "best_bid_ask")), "checkpoint unsupported source boundary");
+            let affected = source_raw["asset_id"].as_str().map(str::to_owned)
+                .into_iter().chain(source_raw["price_changes"].as_array().into_iter()
+                    .flatten().filter_map(|change|change["asset_id"].as_str().map(str::to_owned)))
+                .collect::<BTreeSet<_>>();
+            ensure!(!affected.is_empty() && affected.is_subset(&tokens),
+                "checkpoint source token binding");
+            ensure!(source_raw["event_type"] == "book"
+                || affected.iter().all(|token| !staged.waiting.contains(token)),
+                "checkpoint delta before baseline");
+            // Direct apply propagates validation failures. apply_isolated's
+            // recovery fallback must not turn a bad candidate into a commit.
+            for event in staged.apply(source_raw, received, 0)? {
+                ensure!(event["event_type"] == "book", "checkpoint non-book reduction");
+                final_events.insert(event["token_id"].as_str()
+                    .context("checkpoint event token")?.to_owned(), event);
+            }
+        }
+        ensure!(staged.waiting.is_empty() && final_events.len() == 2,
+            "checkpoint incomplete pair");
+        ensure!(previous_received == Some(frame.received_at), "checkpoint last receipt binding");
+        for token in &tokens {
+            let quote_at = *staged.book_source.get(token).context("checkpoint quote clock")?;
+            ensure!(self.book_source.get(token).is_none_or(|old|quote_at >= *old),
+                "checkpoint quote clock regression");
+            let verified_at = staged.confirmations.iter()
+                .filter(|fact| &fact.token_id == token
+                    && staged.depth_checksums.get(token) == Some(&fact.state_checksum)
+                    && staged.sequences.get(token) == Some(&fact.book_sequence))
+                .map(|fact|fact.exchange_at).max().unwrap_or(quote_at);
+            let age = now.signed_duration_since(verified_at).num_milliseconds();
+            ensure!((0..1500).contains(&age), "checkpoint candidate aged before commit");
+        }
+        let mut events = Vec::with_capacity(2);
+        for token in tokens {
+            let mut event = final_events.remove(&token).context("checkpoint final book")?;
+            event.as_object_mut().context("checkpoint event")?.remove("_replay_complete_delta");
+            event.as_object_mut().context("checkpoint event")?.remove("event_id");
+            event["cursor"] = json!(events.len() as u64 + 1);
+            // One owner observation installs the pair atomically; each
+            // canonical book retains its own original receipt/source clocks.
+            event["received_at"] = json!(wire_time(frame.received_at)?);
+            event["exchange_at"] = event["canonical_payload"]["exchange_at"].clone();
+            event["raw_payload"] = checkpoint_evidence.clone();
+            event["raw_payload_sha256"] = json!(canonical_hash(&checkpoint_evidence));
+            event["event_id"] = json!(canonical_hash(&event));
+            events.push(event);
+        }
+        // Only facts still bound to this final pair may be published after
+        // commit; the actor rechecks epoch/sequence/checksum independently.
+        Ok((staged, events))
+    }
     /// The owner has already bound this exact identity to catalog metadata.
     /// New reducers start without tick/book/freshness state; snapshots must
     /// supply those facts. Retained pairs are never reset by admission.
@@ -1400,6 +1499,207 @@ mod tests {
             received_at: at,
         }
     }
+
+    fn checkpoint_fixture(now: chrono::DateTime<Utc>) -> (Adapter, RawTransportFrame) {
+        let mut active = fixture();
+        let baseline_at = now - chrono::Duration::milliseconds(200);
+        for token in ["11","12"] {
+            active.apply_isolated(book(token,baseline_at),baseline_at,0).unwrap();
+        }
+        let standby_at = now - chrono::Duration::milliseconds(100);
+        let change = deep_change("7",now);
+        let frame = RawTransportFrame { received_at:now,raw_payload:json!({
+            "event_type":"marketcow_connection_checkpoint",
+            "schema_version":"marketcow.polymarket.connection-checkpoint.v1",
+            "market":"condition","token_ids":["11","12"],
+            "rotation_id":1,"attempt":1,"connection_id":"fixture-standby",
+            "source_frames":[
+                {"raw_payload":book("11",standby_at),"received_at":standby_at},
+                {"raw_payload":book("12",standby_at),"received_at":standby_at},
+                {"raw_payload":change.raw_payload,"received_at":change.received_at},
+            ]}) };
+        (active,frame)
+    }
+
+    #[test]
+    fn connection_checkpoint_commits_complete_pair_without_gap_or_clock_fabrication() {
+        let now = Utc::now();
+        let (active,frame) = checkpoint_fixture(now);
+        let original = active.depth_checksums.clone();
+        let (staged,events) = active.stage_connection_checkpoint(&frame,now).unwrap();
+        assert_eq!(active.depth_checksums,original);
+        assert_eq!(events.len(),2);
+        assert!(events.iter().all(|event|event["event_type"] == "book"
+            && event["gaps"] == json!([])
+            && event["raw_payload"]["event_type"] == "marketcow_connection_checkpoint"));
+        assert!(staged.waiting.is_empty());
+        assert_ne!(staged.depth_checksums["11"],active.depth_checksums["11"]);
+        assert_eq!(staged.depth_checksums["12"],active.depth_checksums["12"]);
+        let bindings = [("11".into(),"1".into()),("12".into(),"1".into())].into();
+        marketcow_runtime::discovery_source::ValidatedSourceBatch::new(
+            events,false,0,&bindings,16*1024*1024).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_aged_checkpoint_does_not_mutate_active_owner() {
+        let now = Utc::now();
+        let (active,mut frame) = checkpoint_fixture(now);
+        let original = active.depth_checksums.clone();
+        frame.raw_payload["source_frames"][2]["raw_payload"]["market"] = json!("wrong");
+        assert!(active.stage_connection_checkpoint(&frame,now).is_err());
+        assert_eq!(active.depth_checksums,original);
+        let (_,frame) = checkpoint_fixture(now);
+        assert!(active.stage_connection_checkpoint(&frame,now+chrono::Duration::seconds(2)).is_err());
+        assert_eq!(active.depth_checksums,original);
+    }
+
+    #[test]
+    fn incomplete_or_out_of_order_checkpoint_is_rejected() {
+        let now = Utc::now();
+        let (active,mut frame) = checkpoint_fixture(now);
+        frame.raw_payload["source_frames"].as_array_mut().unwrap().remove(1);
+        assert!(active.stage_connection_checkpoint(&frame,now).is_err());
+        let (_,mut frame) = checkpoint_fixture(now);
+        frame.raw_payload["source_frames"].as_array_mut().unwrap().swap(0,2);
+        assert!(active.stage_connection_checkpoint(&frame,now).is_err());
+    }
+
+    #[test]
+    fn connection_checkpoint_official_serializer_fixed_vector() {
+        use chrono::TimeZone;
+        use marketcow_contracts::btc5m_market_local_v5::wire;
+        let now = Utc.timestamp_millis_opt(1_791_550_800_500).single().unwrap();
+        let (mut active,mut frame) = checkpoint_fixture(now);
+        let condition = format!("0x{}","1".repeat(64));
+        for (_,bound) in active.identities.values_mut() { *bound = condition.clone(); }
+        frame.raw_payload["market"] = json!(condition);
+        for source in frame.raw_payload["source_frames"].as_array_mut().unwrap() {
+            source["raw_payload"]["market"] = json!(condition);
+        }
+        let (_,events) = active.stage_connection_checkpoint(&frame,now).unwrap();
+        let identity = wire::MarketIdentity {market_id:"1".into(),condition_id:condition,
+            profile_id:"2".repeat(64),profile_revision:1,profile_epoch:"3".repeat(32),
+            stream_epoch:Some("4".repeat(32))};
+        let group_hash = marketcow_runtime::discovery_source::market_group_hash(
+            "1","44444444444444444444444444444444",1,&events).unwrap();
+        let frames = crate::source_btc5m_proto::encode_market_group(
+            &identity,1,&group_hash,&events,65536).unwrap();
+        for event in &events {
+            assert!(matches!(crate::source_btc5m_proto::market_event(event).unwrap().payload,
+                Some(wire::market_event::Payload::ConnectionCheckpointBook(_))));
+        }
+        let vector = json!({
+            "schema_version":"marketcow.polymarket.connection-checkpoint-vector.v1",
+            "source_events":events,"group_sha256":group_hash,
+            "frames_hex":frames.iter().map(hex::encode).collect::<Vec<_>>()
+        });
+        let fixed: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/btc-5m-connection-checkpoint-v5.json")).unwrap();
+        assert_eq!(vector,fixed);
+        println!("MARKETCOW_CONNECTION_CHECKPOINT_VECTOR={vector}");
+    }
+    #[test]
+    fn connection_checkpoint_single_sided_trade_serializer_vector() {
+        use chrono::TimeZone;
+        use marketcow_contracts::btc5m_market_local_v5::wire;
+        let now = Utc.timestamp_millis_opt(1_791_550_800_500).single().unwrap();
+        let (mut active,mut frame) = checkpoint_fixture(now);
+        let condition = format!("0x{}","1".repeat(64));
+        for (_,bound) in active.identities.values_mut() { *bound = condition.clone(); }
+        frame.raw_payload["market"] = json!(condition);
+        let source = frame.raw_payload["source_frames"].as_array_mut().unwrap();
+        source.truncate(2);
+        for source in source.iter_mut() { source["raw_payload"]["market"] = json!(condition); }
+        source[0]["raw_payload"]["asks"] = json!([]);
+        source[0]["raw_payload"]["last_trade_price"] = json!("0.50");
+        source[1]["raw_payload"]["bids"] = json!([]);
+        source.push(json!({"raw_payload":{"event_type":"last_trade_price","market":condition,
+            "asset_id":"11","price":"0.52","timestamp":now.timestamp_millis().to_string()},
+            "received_at":now}));
+        let (_,events) = active.stage_connection_checkpoint(&frame,now).unwrap();
+        assert_eq!(events[0]["sequence"],2);
+        assert_eq!(events[1]["sequence"],1);
+        assert_eq!(events[0]["canonical_payload"]["asks"],json!([]));
+        assert_eq!(events[1]["canonical_payload"]["bids"],json!([]));
+        assert_eq!(events[0]["canonical_payload"]["last_trade_price"],"0.52");
+        assert_eq!(events[0]["canonical_payload"]["exchange_at"],wire_time(now-chrono::Duration::milliseconds(100)).unwrap());
+        assert_eq!(events[0]["canonical_payload"]["source_hash"],
+            canonical_hash(&frame.raw_payload["source_frames"][2]["raw_payload"]));
+        let identity = wire::MarketIdentity {market_id:"1".into(),condition_id:condition,
+            profile_id:"2".repeat(64),profile_revision:1,profile_epoch:"3".repeat(32),
+            stream_epoch:Some("4".repeat(32))};
+        let group_hash = marketcow_runtime::discovery_source::market_group_hash(
+            "1","44444444444444444444444444444444",1,&events).unwrap();
+        let frames = crate::source_btc5m_proto::encode_market_group(
+            &identity,1,&group_hash,&events,4096).unwrap();
+        let vector = json!({"schema_version":"marketcow.polymarket.connection-checkpoint-single-sided-vector.v1",
+            "source_events":events,"group_sha256":group_hash,
+            "frames_hex":frames.iter().map(hex::encode).collect::<Vec<_>>()});
+        let fixed:Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/btc-5m-connection-checkpoint-single-sided-v5.json")).unwrap();
+        assert_eq!(vector,fixed);
+        println!("MARKETCOW_CONNECTION_CHECKPOINT_SINGLE_SIDED_VECTOR={vector}");
+    }
+    #[test]
+    fn connection_checkpoint_extended_serializer_vector() {
+        use chrono::TimeZone;
+        use marketcow_contracts::btc5m_market_local_v5::wire;
+        let now = Utc.timestamp_millis_opt(1_791_550_800_500).single().unwrap();
+        let (mut active,mut frame) = checkpoint_fixture(now);
+        let condition = format!("0x{}","1".repeat(64));
+        for (_,bound) in active.identities.values_mut() { *bound = condition.clone(); }
+        frame.raw_payload["market"] = json!(condition);
+        let source = frame.raw_payload["source_frames"].as_array_mut().unwrap();
+        for source in source.iter_mut() { source["raw_payload"]["market"] = json!(condition); }
+        source[2]["raw_payload"]["timestamp"] = json!((now.timestamp_millis()-50).to_string());
+        source[2]["received_at"] = json!(now-chrono::Duration::milliseconds(50));
+        for (offset,raw) in [
+            (40,json!({"event_type":"tick_size_change","asset_id":"11","market":condition,
+                "old_tick_size":"0.01","new_tick_size":"0.02"})),
+            (30,json!({"event_type":"last_trade_price","asset_id":"11","market":condition,"price":"0.52"})),
+            (20,json!({"event_type":"price_change","market":condition,"price_changes":[
+                {"asset_id":"11","side":"BUY","price":"0.40","size":"8","best_bid":"0.4","best_ask":"0.6"},
+                {"asset_id":"12","side":"SELL","price":"0.60","size":"9","best_bid":"0.4","best_ask":"0.6"}]})),
+        ] {
+            let at = now-chrono::Duration::milliseconds(offset);
+            let mut raw = raw;
+            raw["timestamp"] = json!(at.timestamp_millis().to_string());
+            source.push(json!({"raw_payload":raw,"received_at":at}));
+        }
+        frame.received_at = now-chrono::Duration::milliseconds(20);
+        let (_,events) = active.stage_connection_checkpoint(&frame,now).unwrap();
+        assert_eq!(events[0]["canonical_payload"]["tick_size"],"0.02");
+        assert_eq!(events[0]["canonical_payload"]["last_trade_price"],"0.52");
+        assert_eq!(events[0]["sequence"],5);
+        assert_eq!(events[1]["sequence"],2);
+        let identity = wire::MarketIdentity {market_id:"1".into(),condition_id:condition,
+            profile_id:"2".repeat(64),profile_revision:1,profile_epoch:"3".repeat(32),
+            stream_epoch:Some("4".repeat(32))};
+        let group_hash = marketcow_runtime::discovery_source::market_group_hash(
+            "1","44444444444444444444444444444444",1,&events).unwrap();
+        let frames = crate::source_btc5m_proto::encode_market_group(
+            &identity,1,&group_hash,&events,4096).unwrap();
+        let mut negative = Vec::new();
+        for code in ["missing_down_baseline","wrong_condition","source_clock_regression","off_tick_trade","last_receipt_mismatch"] {
+            let mut bad = frame.clone();
+            match code {
+                "missing_down_baseline" => {bad.raw_payload["source_frames"].as_array_mut().unwrap().remove(1);},
+                "wrong_condition" => bad.raw_payload["source_frames"][5]["raw_payload"]["market"] = json!("wrong"),
+                "source_clock_regression" => bad.raw_payload["source_frames"][5]["raw_payload"]["timestamp"] = json!((now.timestamp_millis()-1000).to_string()),
+                "off_tick_trade" => bad.raw_payload["source_frames"][4]["raw_payload"]["price"] = json!("0.51"),
+                _ => bad.received_at = now,
+            }
+            assert!(active.stage_connection_checkpoint(&bad,now).is_err(),"{code}");
+            negative.push(json!({"case":code,"raw_transport_frame":bad,"expected":"reject_entire_candidate"}));
+        }
+        let vector = json!({"schema_version":"marketcow.polymarket.connection-checkpoint-extended-vector.v1",
+            "source_events":events,"group_sha256":group_hash,
+            "frames_hex":frames.iter().map(hex::encode).collect::<Vec<_>>(),"negative_cases":negative});
+        let fixed: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/btc-5m-connection-checkpoint-extended-v5.json")).unwrap();
+        assert_eq!(vector,fixed);
+        println!("MARKETCOW_CONNECTION_CHECKPOINT_EXTENDED_VECTOR={vector}");
+    }
     fn paired_deep_change(size: &str, at: chrono::DateTime<Utc>) -> RawTransportFrame {
         RawTransportFrame {
             raw_payload: json!({"event_type":"price_change","market":"condition",
@@ -1444,7 +1744,7 @@ mod tests {
         for event in &compact {
             let typed = crate::source_btc5m_proto::market_event(event).unwrap();
             assert!(matches!(typed.payload,
-                Some(marketcow_contracts::btc5m_market_local_v3::wire::market_event::Payload::BookDelta(_))));
+                Some(marketcow_contracts::btc5m_market_local_v5::wire::market_event::Payload::BookDelta(_))));
         }
         assert!(conflated.apply_isolated(last.raw_payload, last.received_at, 4).unwrap().is_empty());
     }
@@ -1555,7 +1855,7 @@ mod tests {
         let compact = compact_btc5m_fixture_events(actual.clone()).unwrap();
         let typed = crate::source_btc5m_proto::market_event(&compact[0]).unwrap();
         assert!(matches!(typed.payload,
-            Some(marketcow_contracts::btc5m_market_local_v3::wire::market_event::Payload::BookDelta(_))));
+            Some(marketcow_contracts::btc5m_market_local_v5::wire::market_event::Payload::BookDelta(_))));
         assert_eq!(typed.raw_payload_sha256,
             hex::decode(compact[0]["raw_payload_sha256"].as_str().unwrap()).unwrap());
         assert_eq!(typed.event_id,
@@ -3722,7 +4022,7 @@ async fn run_connection(
                 batches.push(batch);
             }
             let mut routed = std::collections::VecDeque::new();
-            for batch in batches {
+            for mut batch in batches {
                 let source_tokens = batch.source_tokens();
                 if source_tokens.is_empty() { continue; }
                 if !source_tokens.is_subset(&acquisition_tokens) { continue; }
@@ -3746,10 +4046,19 @@ async fn run_connection(
                 dwell.1 = dwell.1.saturating_add(u128::from(dwell_us));
                 dwell.2 = dwell.2.max(dwell_us);
                 dwell.3 += u64::from(dwell_us >= 100_000);
+                let handoff_receipt = batch.take_handoff_receipt();
                 let frames = batch.into_frames().into_iter().filter(|frame|
                     marketcow_polymarket::subscription::owned_or_unclassified(
                         &frame.raw_payload, &acquisition_tokens))
-                    .collect();
+                    .collect::<Vec<_>>();
+                if let Some(receipt) = handoff_receipt {
+                    // Earlier A inputs must enter this market's FIFO before
+                    // its checkpoint. New B inputs cannot enter until commit.
+                    pipeline.submit_routed_batches(adapter, publication,
+                        routed.drain(..).collect()).await?;
+                    pipeline.submit_connection_checkpoint(adapter, market, frames, receipt)?;
+                    continue;
+                }
                 for segment in split_transport_control_boundaries(frames) {
                     routed.push_back((market.clone(), segment));
                 }

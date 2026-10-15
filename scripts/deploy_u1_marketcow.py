@@ -93,10 +93,15 @@ def local(args):
                             f'{shlex.quote(args.btc_chainlink_credentials)}'
                             if args.btc_chainlink_credentials is not None else '')
         btc_5m_option = f' --btc-5m-clients {args.btc_5m_clients}'
+        polynode_option = (' --disable-btc-polynode' if args.disable_btc_polynode else
+                           f' --btc-polynode-key-file {shlex.quote(args.btc_polynode_key_file)}')
+        uk_ws_option = ' --uk-polymarket-ws-route' if args.uk_polymarket_ws_route else ''
         quick_option = ' --quick' if args.quick else ''
         run([*ssh, f'python3 {DEPLOY}/incoming/deploy_u1_marketcow.py '
              f'--remote --archive-sha256 {sha(archive)} --jobs {args.jobs}'
              f'{replay_option}{persistence_option}{chainlink_option}{btc_5m_option}'
+             f'{polynode_option}'
+             f'{uk_ws_option}'
              f'{quick_option}'])
 
 
@@ -177,7 +182,8 @@ def cleanup_previous_versions():
 
 def rewrite_unit(unit, current, memory_replay_bytes=None,
                  persistence_queue_batches=None, persistence_queue_bytes=None,
-                 btc_chainlink_credentials=None, btc_5m_clients=None):
+                 btc_chainlink_credentials=None, btc_5m_clients=None,
+                 btc_polynode_key_file=None, disable_polynode=False):
     matches = re.findall(r'/[^\s\\]+/marketcow-discovery-collector', unit)
     if len(matches) != 1:
         raise RuntimeError('expected exactly one collector executable in formal unit')
@@ -215,6 +221,24 @@ def rewrite_unit(unit, current, memory_replay_bytes=None,
             if updated.count(marker) != 1:
                 raise RuntimeError('expected one BTC research component in formal unit')
             updated = updated.replace(marker, option + ' ' + marker)
+    if disable_polynode:
+        existing = re.findall(r'--btc-polynode-key-file\s+[^\s\\]+', updated)
+        if len(existing) > 1:
+            raise RuntimeError('multiple PN1 key options in formal unit')
+        if existing:
+            updated = updated.replace(existing[0], '', 1)
+    elif btc_polynode_key_file is not None:
+        option = f'--btc-polynode-key-file {btc_polynode_key_file}'
+        existing = re.findall(r'--btc-polynode-key-file\s+[^\s\\]+', updated)
+        if len(existing) > 1:
+            raise RuntimeError('multiple PN1 key options in formal unit')
+        if existing:
+            updated = updated.replace(existing[0], option)
+        else:
+            marker = '--btc-5m-manager-root '
+            if updated.count(marker) != 1:
+                raise RuntimeError('expected one BTC 5m manager in formal unit')
+            updated = updated.replace(marker, option + ' ' + marker)
     return updated
 
 
@@ -226,6 +250,62 @@ def validate_chainlink_credentials_path(value):
     if (path.parent != allowed or not re.fullmatch(r'[A-Za-z0-9_.-]+\.json', path.name)):
         raise RuntimeError('Chainlink credentials must be a private MarketCow secrets JSON path')
     return path
+
+
+def validate_polynode_key_path(value):
+    path = Path(value)
+    allowed = {
+        Path('/mnt/p44pro/marketcow-shadow-v3-runtime/linux/diagnostics/polynode-probe/api-key'),
+        Path('/home/czx/.config/marketcow/secrets/polynode-pn1.key'),
+    }
+    if path not in allowed:
+        raise RuntimeError('PN1 key must use an approved private U1 path')
+    return path
+
+
+def pin_uk_polymarket_ws_route():
+    """Route only the public CLOB market WS through the fixed UK Pro node."""
+    import yaml
+    config_path = ROOT / 'polymarket-proxy/config.yaml'
+    if config_path.is_symlink() or not config_path.is_file():
+        raise RuntimeError('formal proxy config is absent or linked')
+    original = config_path.read_bytes()
+    config = yaml.safe_load(original)
+    node = '🇬🇧 英国-Pro-01|v202605'
+    if node not in {item['name'] for item in config['proxies']}:
+        raise RuntimeError('fixed UK Pro node is absent')
+    if not any(group.get('name') == 'POLYMARKET' for group in config['proxy-groups']):
+        raise RuntimeError('formal Polymarket proxy group is absent')
+    config['proxy-groups'] = [group for group in config['proxy-groups']
+                              if group.get('name') != 'POLYMARKET_WS']
+    config['proxy-groups'].insert(0, {
+        'name': 'POLYMARKET_WS', 'type': 'select', 'proxies': [node]})
+    rule = 'DOMAIN,ws-subscriptions-clob.polymarket.com,POLYMARKET_WS'
+    config['rules'] = [rule] + [item for item in config['rules'] if item != rule]
+    replacement = yaml.safe_dump(config, allow_unicode=True).encode()
+
+    def atomic_write(payload):
+        with tempfile.NamedTemporaryFile(dir=config_path.parent, delete=False) as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(payload)
+            name = stream.name
+        Path(name).replace(config_path)
+
+    atomic_write(replacement)
+    try:
+        run(['systemctl', '--user', 'restart', 'marketcow-polymarket-proxy.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        result = subprocess.run(['systemctl', '--user', 'is-active',
+                                 'marketcow-polymarket-proxy.service'],
+                                capture_output=True, text=True)
+        if result.stdout.strip() != 'active':
+            raise RuntimeError('UK WS proxy did not start')
+    except Exception:
+        atomic_write(original)
+        run(['systemctl', '--user', 'restart', 'marketcow-polymarket-proxy.service'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        raise
+    return node
 
 
 def remote(args):
@@ -297,11 +377,22 @@ def remote(args):
                     or metadata.st_uid != os.geteuid()
                     or metadata.st_mode & 0o077 or metadata.st_size > 4096):
                 raise RuntimeError('Chainlink credentials are absent or not a private regular file')
+        polynode_key = None
+        if not args.disable_btc_polynode:
+            polynode_key = validate_polynode_key_path(args.btc_polynode_key_file)
+            key_metadata = polynode_key.lstat()
+            if (not polynode_key.is_file() or polynode_key.is_symlink()
+                    or key_metadata.st_uid != os.geteuid()
+                    or key_metadata.st_mode & 0o077 or not 1 <= key_metadata.st_size <= 512):
+                raise RuntimeError('PN1 key is absent or not a private regular file')
         updated = rewrite_unit(unit, current, args.memory_replay_bytes,
                                args.persistence_queue_batches, args.persistence_queue_bytes,
                                str(credentials) if credentials is not None else None,
-                               args.btc_5m_clients)
+                               args.btc_5m_clients, str(polynode_key) if polynode_key else None,
+                               disable_polynode=args.disable_btc_polynode)
         run(['systemctl', '--user', 'stop', UNIT])
+        if args.uk_polymarket_ws_route:
+            receipt['polymarket_ws_route'] = pin_uk_polymarket_ws_route()
         candidate.replace(current / 'marketcow-discovery-collector')
         shutil.copyfile(source / 'scripts/run_with_bounded_log.py', current / 'run_with_bounded_log.py')
         unit_path.write_text(updated)
@@ -364,10 +455,19 @@ if __name__ == '__main__':
                         help='existing private CLOB L2 credentials file on U1; never uploaded')
     parser.add_argument('--btc-5m-clients', type=int, choices=range(1, 13), default=12,
                         help='bounded global BTC 5m WS budget; 12 gives four slots per market')
+    parser.add_argument('--btc-polynode-key-file', default=str(
+        ROOT / 'diagnostics/polynode-probe/api-key'),
+        help='existing private PN1 key file on U1; key contents are never uploaded')
+    parser.add_argument('--disable-btc-polynode', action='store_true',
+                        help='omit PN1 subscription without deleting the private key file')
+    parser.add_argument('--uk-polymarket-ws-route', action='store_true',
+                        help='pin only the public market WebSocket to the UK Pro proxy node')
     parser.add_argument('--remote', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--archive-sha256', help=argparse.SUPPRESS)
     args = parser.parse_args()
     if (args.persistence_queue_batches is None) != (args.persistence_queue_bytes is None):
         parser.error('persistence queue batches and bytes must be supplied together')
     validate_chainlink_credentials_path(args.btc_chainlink_credentials)
+    if not args.disable_btc_polynode:
+        validate_polynode_key_path(args.btc_polynode_key_file)
     remote(args) if args.remote else local(args)

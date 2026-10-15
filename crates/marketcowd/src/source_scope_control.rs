@@ -1065,6 +1065,7 @@ mod tests {
             MarketBinding {role:WindowRole::Current,..bindings[1].clone()},bindings[2].clone()]);
         let (_,btc) = crate::source_btc5m_api::Api::router(publication.reader(),incumbent.clone(),
             "epoch-test".into(),Btc5mLimits {snapshot_bytes:65536,frame_bytes:65536,
+                live_backlog_groups:64,live_backlog_age:std::time::Duration::from_millis(500),
                 replay_bytes:65536,clients:1,send_timeout:Duration::from_secs(1),
                 snapshot_lease_capacity:1}).unwrap();
         let directory = std::env::temp_dir().canonicalize().unwrap()
@@ -1621,6 +1622,7 @@ mod tests {
             initial.clone(),
             "epoch-test".into(),
             Btc5mLimits {
+                live_backlog_groups:64,live_backlog_age:std::time::Duration::from_millis(500),
                 snapshot_bytes: 65_536,
                 frame_bytes: 65_536,
                 replay_bytes: 65_536,

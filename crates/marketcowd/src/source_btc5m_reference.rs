@@ -145,7 +145,7 @@ async fn http_binance_comparison(
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                json!({"schema_version":"marketcow.btc5m.binance-reference-window.v1",
+                json!({"schema_version":"marketcow.btc5m.binance-reference-window.v2",
                 "available":false,"market_id":query.market_id,
                 "reason":format!("{error:#}")}),
             ),
@@ -162,7 +162,7 @@ async fn http_comparison(
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                json!({"schema_version":"marketcow.btc5m.reference-comparison.v2",
+                json!({"schema_version":"marketcow.btc5m.reference-comparison.v3",
                 "available":false,"market_id":query.market_id,
                 "reason":format!("{error:#}")}),
             ),
@@ -200,15 +200,25 @@ impl Service {
             .context("market is not in current BTC five-minute profile")?;
         let start_ms = DateTime::parse_from_rfc3339(&binding.start_at)?.timestamp_millis();
         let end_ms = DateTime::parse_from_rfc3339(&binding.end_at)?.timestamp_millis();
+        let window_identity = btc_trade::WindowIdentity {
+            market_id: binding.market_id.clone(),
+            condition_id: binding.condition_id.clone(),
+            window_id: binding.window_id.clone(),
+            rule_sha256: binding.rule_sha256.clone(),
+            start_ms,
+            end_ms,
+        };
         let binance = match &self.trade {
-            Some(trade) => trade.window_comparison(start_ms, end_ms, None).await,
-            None => json!({"schema_version":"marketcow.btc5m.binance-comparison.v1",
+            Some(trade) => trade.window_comparison(&window_identity, None).await,
+            None => json!({"schema_version":"marketcow.btc5m.binance-comparison.v2",
                 "source":"binance_spot_trade","available":false,
+                "opening_available":false,"opening_reason":"trade_source_not_configured",
+                "current_available":false,"current_reason":"trade_source_not_configured",
                 "reason":"trade_source_not_configured"}),
         };
         self.require_same_profile(&before)?;
         Ok(
-            json!({"schema_version":"marketcow.btc5m.binance-reference-window.v1",
+            json!({"schema_version":"marketcow.btc5m.binance-reference-window.v2",
             "market_id":market_id,"condition_id":binding.condition_id,
             "window_id":binding.window_id,"start_at":binding.start_at,
             "end_at":binding.end_at,"profile_epoch":before["epoch"],
@@ -233,12 +243,22 @@ impl Service {
             .context("market is not in current BTC five-minute profile")?;
         let start_ms = DateTime::parse_from_rfc3339(&binding.start_at)?.timestamp_millis();
         let end_ms = DateTime::parse_from_rfc3339(&binding.end_at)?.timestamp_millis();
+        let window_identity = btc_trade::WindowIdentity {
+            market_id: binding.market_id.clone(),
+            condition_id: binding.condition_id.clone(),
+            window_id: binding.window_id.clone(),
+            rule_sha256: binding.rule_sha256.clone(),
+            start_ms,
+            end_ms,
+        };
         let official_future = self.reference(market_id);
         let binance_future = async {
             match &self.trade {
-                Some(trade) => trade.window_comparison(start_ms, end_ms, None).await,
-                None => json!({"schema_version":"marketcow.btc5m.binance-comparison.v1",
+                Some(trade) => trade.window_comparison(&window_identity, None).await,
+                None => json!({"schema_version":"marketcow.btc5m.binance-comparison.v2",
                     "source":"binance_spot_trade","available":false,
+                    "opening_available":false,"opening_reason":"trade_source_not_configured",
+                    "current_available":false,"current_reason":"trade_source_not_configured",
                     "reason":"trade_source_not_configured"}),
             }
         };
@@ -259,7 +279,7 @@ impl Service {
             Err(error) => error.body(),
         };
         Ok(
-            json!({"schema_version":"marketcow.btc5m.reference-comparison.v2",
+            json!({"schema_version":"marketcow.btc5m.reference-comparison.v3",
             "market_id":market_id,"condition_id":binding.condition_id,
             "window_id":binding.window_id,"start_at":binding.start_at,
             "end_at":binding.end_at,"profile_epoch":before["epoch"],

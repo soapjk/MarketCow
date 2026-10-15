@@ -1,0 +1,170 @@
+syntax = "proto3";
+
+package marketcow.polymarket.btc5m.v4;
+
+// Sole hot Polymarket depth feed. This is PolyNode PN1 observation, not an
+// official CLOB book or an executable quote. Official /book is fetched only
+// by a downstream caller through MarketCow's bounded relay.
+//
+// All integer serials are scoped by the named epoch. Presence is explicit:
+// an absent supplier time is not zero and must not be filled from receipt.
+message MarketIdentity {
+  string market_id = 1;
+  string condition_id = 2;
+  string window_id = 3;
+  string profile_id = 4;
+  uint64 profile_revision = 5;
+  string profile_epoch = 6;
+  string stream_epoch = 7;
+  string role = 8;                 // current or next; never retired.
+  string start_at = 9;
+  string end_at = 10;
+  string rule_sha256 = 11;         // Exact market rule identity, lowercase hex.
+}
+
+message OutcomeBinding {
+  string outcome = 1;              // Up or Down.
+  string token_id = 2;
+}
+
+message DepthLevel {
+  string price = 1;                // Canonical PN1 decimal text.
+  string size = 2;                 // Absolute size; zero deletes on update.
+}
+
+message DepthChange {
+  string side = 1;                 // B or A.
+  string price = 2;
+  string size = 3;
+}
+
+message TokenBookState {
+  string token_id = 1;
+  uint64 provider_seq = 2;        // Per-token PN1 sequence, not venue seq.
+  bytes pn1_checksum = 3;         // Exactly 32 bytes, verified locally.
+  repeated DepthLevel bids = 4;   // Descending canonical price.
+  repeated DepthLevel asks = 5;   // Ascending canonical price.
+  bytes raw_frame_sha256 = 6;     // SHA256(latest exact UTF-8 WS frame bytes).
+  bytes raw_frame = 7;            // Snapshot: latest frame. In a stream batch,
+                                  // empty because parent carries exact frame.
+  optional uint64 provider_batch_ts_ms = 8; // Provider batch clock only.
+  uint64 socket_received_at_unix_ns = 9;    // MarketCow clock, diagnostic.
+  optional uint64 quote_source_at_ms = 10;   // Always absent for PN1 depth.
+}
+
+message MarketSnapshot {
+  MarketIdentity identity = 1;
+  repeated OutcomeBinding outcomes = 2; // Exactly Up then Down.
+  string source_epoch = 3;        // New on every PN socket/re-subscription.
+  uint64 market_serial = 4;       // Market-local prefix scoped by stream_epoch
+                                  // AND source_epoch; resets on source reconnect.
+  optional uint64 replay_floor_serial = 5; // Oldest resumable prefix.
+  repeated TokenBookState books = 6;      // Exactly the two outcomes if ready.
+  bool ready = 7;                 // True only when both PN1 anchors verified.
+  string unavailable_reason = 8;  // Nonempty iff ready=false.
+  uint64 snapshot_at_unix_ns = 9; // Diagnostic; not quote source time.
+  bool execution_readiness = 10; // Always false: official REST proof is separate.
+}
+
+message MarketAvailability {
+  MarketIdentity identity = 1;
+  string source_epoch = 2;
+  uint64 market_serial = 3;
+  uint64 replay_floor_serial = 4;
+  bool ready = 5;
+  string unavailable_reason = 6;
+  bool execution_readiness = 7; // Always false: this is an observation source.
+}
+
+message MarketStreams {
+  string profile_id = 1;
+  uint64 profile_revision = 2;
+  string profile_epoch = 3;
+  repeated MarketAvailability markets = 4; // current and next, no retiring.
+  uint64 response_at_unix_ns = 5;           // Diagnostic clock only.
+  uint64 raw_archive_gap_count = 6;         // Never a hot-readiness gate.
+  bool raw_archive_available = 7;           // Never a hot-readiness gate.
+}
+
+message MarketDepthDelta {
+  string token_id = 1;
+  uint64 prev_provider_seq = 2;
+  uint64 provider_seq = 3;
+  bytes pn1_checksum = 4;
+  repeated DepthChange changes = 5; // Apply in encoded order, atomically.
+  // No per-event supplier quote timestamp exists in PN1. A consumer must
+  // not treat the parent batch clock or local receipt as one.
+}
+
+message MarketDepthItem {
+  oneof body {
+    TokenBookState token_anchor = 1;
+    MarketDepthDelta delta = 2;
+  }
+}
+
+message MarketDepthBatch {
+  repeated MarketDepthItem updates = 1; // Source order, one market only.
+  bytes raw_frame_sha256 = 2;           // SHA256(exact vendor WS frame).
+  bytes raw_frame = 3;                  // Exact frame; may contain other markets.
+  optional uint64 provider_batch_ts_ms = 4;
+  uint64 socket_received_at_unix_ns = 5;
+  uint64 published_at_unix_ns = 6;
+  optional uint64 quote_source_at_ms = 7; // Always absent for PN1 depth.
+}
+
+message MarketInvalidated {
+  repeated string token_ids = 1;
+  string reason = 2;              // integrity_failed, profile_changed,
+                                  // replay_expired, source_disconnected.
+  bool requires_new_snapshot = 3; // Always true.
+}
+
+message MarketReady {
+  uint64 market_serial = 1;       // Complete delivered prefix.
+  repeated string verified_token_ids = 2;
+  bool execution_readiness = 3;  // Always false: REST proof is separate.
+}
+
+message MarketStreamFrame {
+  MarketIdentity identity = 1;
+  string source_epoch = 2;
+  uint64 market_serial = 3;       // Strictly increases within both epochs.
+  oneof body {
+    MarketDepthBatch depth_batch = 10;
+    MarketInvalidated unavailable = 12;
+    MarketReady ready = 13;
+  }
+}
+
+// The HTTP full-sync returns MarketSnapshot. A WS client supplies exact
+// identity, source_epoch and after_market_serial from that snapshot. The
+// market-local replay is retained while the snapshot and WS request race;
+// if the supplied serial is below its floor, return HTTP 410 replay_expired.
+// A midstream eviction closes WS with 1012/replay_expired. The consumer must
+// discard its partial state and fetch a new full-sync; no serial is skipped.
+message MarketStreamRequest {
+  MarketIdentity identity = 1;
+  string source_epoch = 2;
+  uint64 after_market_serial = 3;
+}
+
+// PN1 checksum is the vendor-defined SHA256("pn1:book\\0" || bid_count ||
+// "\\0" || ask_count || "\\0" || XOR(level_hashes)); each level hash is
+// SHA256("pn1:level\\0" || side || "\\0" || canonical_price || "\\0" ||
+// canonical_size). The checksum does not prove an official CLOB state.
+// raw_frame_sha256 is over exact received frame bytes, not protobuf encoding.
+// There is no v3 publisher cursor, durable watermark, book confirmation,
+// source quote time fallback, or implicit transition between source epochs.
+//
+// The separate GET /official-book relay takes market_id, condition_id,
+// token_id, rule_sha256, profile_epoch, profile_revision, stream_epoch, and
+// source_epoch from this exact identity. It does not fetch automatically or
+// decide whether an order may be sent. On an upstream response it returns the
+// unmodified /book body/status with x-marketcow-relay-schema =
+// marketcow.polymarket.official-book-relay.v2 and identity/timing/SHA headers.
+// Relay-generated errors use official-book-relay-error.v2. The official JSON
+// timestamp observed in live /book responses is a decimal-string epoch-ms;
+// its presence/validity must be checked by the downstream decision owner.
+// MarketCow receipt/relay times and the upstream body hash are not supplier
+// quote clocks or a proof that the official book is executable.

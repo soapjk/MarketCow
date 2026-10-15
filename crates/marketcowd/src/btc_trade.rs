@@ -46,6 +46,33 @@ const ARCHIVE_DISK_BYTES: usize = 512 * 1024 * 1024;
 const SOURCE_IDLE: Duration = Duration::from_secs(30);
 const TWAP_SECONDS: i64 = 60;
 const TWAP_HISTORY_SECONDS: usize = 720;
+const MAX_OPENING_WINDOWS: usize = 12;
+const MARKET_WINDOW_MS: i64 = 300_000;
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WindowIdentity {
+    pub market_id: String,
+    pub condition_id: String,
+    pub window_id: String,
+    pub rule_sha256: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+#[derive(Clone)]
+struct OpeningCandidate {
+    start_ms: i64,
+    price: Decimal,
+    source_epoch: String,
+    seconds_sha256: String,
+}
+
+#[derive(Clone)]
+struct BoundOpening {
+    identity: WindowIdentity,
+    candidate: OpeningCandidate,
+    evidence_sha256: String,
+}
 
 #[derive(Clone)]
 struct PriceSecond {
@@ -131,6 +158,29 @@ impl TradeTwap {
     fn latest_completed_end_ms(&self) -> Option<i64> {
         Some(self.last_time_ms?.div_euclid(1000) * 1000)
     }
+
+    fn seconds_sha256_at(&self, end_ms: i64) -> Option<String> {
+        self.completed_at(end_ms)?;
+        let start_ms = end_ms.checked_sub(TWAP_SECONDS * 1000)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"marketcow.binance-opening-seconds.v1\n");
+        for second in self
+            .seconds
+            .iter()
+            .filter(|entry| entry.start_ms >= start_ms && entry.start_ms < end_ms)
+        {
+            hasher.update(
+                format!(
+                    "{}|{}|{}\n",
+                    second.start_ms,
+                    second.price_milliseconds.normalize(),
+                    second.covered_ms
+                )
+                .as_bytes(),
+            );
+        }
+        Some(hex::encode(hasher.finalize()))
+    }
 }
 
 enum Ingress {
@@ -157,6 +207,9 @@ struct State {
     last_id: Option<u64>,
     trades: VecDeque<Value>,
     twap: TradeTwap,
+    opening_candidates: VecDeque<OpeningCandidate>,
+    bound_openings: VecDeque<BoundOpening>,
+    checked_opening_boundary_ms: Option<i64>,
     snapshot_raw_sha256: Option<String>,
     snapshot_raw_base64: Option<String>,
     snapshot_published_at: Option<String>,
@@ -258,24 +311,76 @@ impl Service {
     /// This is a comparison signal, never a substitute for the venue reference.
     pub async fn window_comparison(
         &self,
-        start_ms: i64,
-        end_ms: i64,
+        identity: &WindowIdentity,
         official_price: Option<Decimal>,
     ) -> Value {
-        let state = self.state.read().await;
-        let opening = state.twap.completed_at(start_ms);
+        let mut state = self.state.write().await;
+        let start_ms = identity.start_ms;
+        let end_ms = identity.end_ms;
+        let valid_window = end_ms > start_ms && start_ms.rem_euclid(MARKET_WINDOW_MS) == 0;
+        // Bind an already verified opening to the exact market/rule. Neither
+        // a later source epoch nor a current-price outage can rewrite it.
+        if valid_window
+            && !state
+                .bound_openings
+                .iter()
+                .any(|entry| entry.identity == *identity)
+            && !state
+                .bound_openings
+                .iter()
+                .any(|entry| entry.identity.start_ms == start_ms)
+        {
+            if let Some(candidate) = state
+                .opening_candidates
+                .iter()
+                .find(|entry| entry.start_ms == start_ms)
+                .cloned()
+            {
+                let mut hasher = Sha256::new();
+                hasher.update(b"marketcow.binance-opening-binding.v1\n");
+                for part in [
+                    &identity.market_id,
+                    &identity.condition_id,
+                    &identity.window_id,
+                    &identity.rule_sha256,
+                    &candidate.source_epoch,
+                    &candidate.seconds_sha256,
+                ] {
+                    hasher.update(part.as_bytes());
+                    hasher.update(b"\n");
+                }
+                hasher.update(
+                    format!("{}|{}|{}", start_ms, end_ms, candidate.price.normalize()).as_bytes(),
+                );
+                state.bound_openings.push_back(BoundOpening {
+                    identity: identity.clone(),
+                    candidate,
+                    evidence_sha256: hex::encode(hasher.finalize()),
+                });
+                while state.bound_openings.len() > MAX_OPENING_WINDOWS {
+                    state.bound_openings.pop_front();
+                }
+            }
+        }
+        let bound = state
+            .bound_openings
+            .iter()
+            .find(|entry| entry.identity == *identity);
+        let opening = bound.map(|entry| entry.candidate.price);
         let latest_end_ms = state
             .twap
             .latest_completed_end_ms()
             .map(|latest| latest.min(end_ms));
-        let current = latest_end_ms.and_then(|end| state.twap.completed_at(end));
-        let available = state.phase == "live"
-            && end_ms > start_ms
-            && opening.is_some()
-            && current.is_some()
-            && latest_end_ms.is_some_and(|end| end >= start_ms);
-        let opening = opening.filter(|_| available);
-        let current = current.filter(|_| available);
+        let opening_available = valid_window && opening.is_some();
+        let current = if valid_window && state.phase == "live" {
+            latest_end_ms
+                .filter(|end| *end >= start_ms)
+                .and_then(|end| state.twap.completed_at(end))
+        } else {
+            None
+        };
+        let current_available = current.is_some();
+        let available = opening_available && current_available;
         let mapped = opening.zip(current).zip(official_price).and_then(
             |((opening, current), official_price)| {
                 (opening > Decimal::ZERO)
@@ -284,12 +389,22 @@ impl Service {
                     .and_then(|scaled| scaled.checked_div(opening))
             },
         );
-        json!({"schema_version":"marketcow.btc5m.binance-comparison.v1",
+        json!({"schema_version":"marketcow.btc5m.binance-comparison.v2",
             "source":"binance_spot_trade","instrument_id":INSTRUMENT,
             "source_epoch":state.epoch,"available":available,
-            "reason":if available {"ready"} else if state.phase != "live" {
-                "trade_source_unavailable"
+            "reason":if available {"ready"} else if !opening_available {
+                "complete_60s_coverage_unavailable"
+            } else if state.phase != "live" {"trade_source_unavailable"}
+                else {"current_60s_coverage_unavailable"},
+            "opening_available":opening_available,
+            "opening_reason":if opening_available {"ready"} else if !valid_window {
+                "invalid_market_window"
             } else {"complete_60s_coverage_unavailable"},
+            "current_available":current_available,
+            "current_reason":if current_available {"ready"} else if !valid_window {
+                "invalid_market_window"
+            } else if state.phase != "live" {"trade_source_unavailable"}
+                else {"current_60s_coverage_unavailable"},
             "method":"last_trade_price_time_weighted_over_preceding_60000ms",
             "quote_asset":"USDT","official_method_exactly_reproduced":false,
             "carry_between_trades":true,"window_start_ms":start_ms,
@@ -297,7 +412,12 @@ impl Service {
             "opening_interval_start_ms":start_ms.saturating_sub(60_000),
             "opening_interval_end_ms":start_ms,
             "opening_price_usdt":opening.map(|value| value.normalize().to_string()),
-            "current_interval_end_ms":latest_end_ms.filter(|_| available),
+            "opening_source_epoch":bound.map(|entry| entry.candidate.source_epoch.clone()),
+            "opening_seconds_sha256":bound.map(|entry| entry.candidate.seconds_sha256.clone()),
+            "opening_evidence_sha256":bound.map(|entry| entry.evidence_sha256.clone()),
+            "opening_covered_ms":bound.map(|_| TWAP_SECONDS * 1000),
+            "opening_evidence_kind":"complete_trade_price_seconds_bound_to_market_identity",
+            "current_interval_end_ms":latest_end_ms.filter(|_| current_available),
             "current_price_usdt":current.map(|value| value.normalize().to_string()),
             "mapped_official_scale_price":mapped.map(|value| value.normalize().to_string()),
             "mapping_status":if official_price.is_some() {"official_reference_available"}
@@ -641,6 +761,7 @@ impl Service {
             state.snapshot_published_at = Some(Utc::now().to_rfc3339());
             state.trades = trades;
             state.twap = twap;
+            state.capture_opening_boundary();
             state.serial += 1;
             state.sequence += 1;
             self.snapshot_frame(&state)
@@ -660,6 +781,7 @@ impl Service {
                     .context("trade time missing")?,
                 Decimal::from_str(point["price"].as_str().context("trade price missing")?)?,
             )?;
+            state.capture_opening_boundary();
             state.serial = state
                 .serial
                 .checked_add(1)
@@ -711,6 +833,7 @@ impl Service {
             state.last_id = None;
             state.trades.clear();
             state.twap = TradeTwap::default();
+            state.checked_opening_boundary_ms = None;
             state.snapshot_raw_sha256 = None;
             state.snapshot_raw_base64 = None;
             state.snapshot_published_at = None;
@@ -745,6 +868,39 @@ impl Service {
 }
 
 impl State {
+    fn capture_opening_boundary(&mut self) {
+        let Some(last_time_ms) = self.twap.last_time_ms else {
+            return;
+        };
+        let boundary_ms = last_time_ms.div_euclid(MARKET_WINDOW_MS) * MARKET_WINDOW_MS;
+        if self.checked_opening_boundary_ms == Some(boundary_ms) {
+            return;
+        }
+        self.checked_opening_boundary_ms = Some(boundary_ms);
+        let (Some(price), Some(seconds_sha256)) = (
+            self.twap.completed_at(boundary_ms),
+            self.twap.seconds_sha256_at(boundary_ms),
+        ) else {
+            return;
+        };
+        if self
+            .opening_candidates
+            .iter()
+            .any(|entry| entry.start_ms == boundary_ms)
+        {
+            return;
+        }
+        self.opening_candidates.push_back(OpeningCandidate {
+            start_ms: boundary_ms,
+            price,
+            source_epoch: self.epoch.clone(),
+            seconds_sha256,
+        });
+        while self.opening_candidates.len() > MAX_OPENING_WINDOWS {
+            self.opening_candidates.pop_front();
+        }
+    }
+
     fn new() -> Self {
         Self {
             epoch: uuid::Uuid::new_v4().simple().to_string(),
@@ -755,6 +911,9 @@ impl State {
             last_id: None,
             trades: VecDeque::new(),
             twap: TradeTwap::default(),
+            opening_candidates: VecDeque::new(),
+            bound_openings: VecDeque::new(),
+            checked_opening_boundary_ms: None,
             snapshot_raw_sha256: None,
             snapshot_raw_base64: None,
             snapshot_published_at: None,
@@ -874,10 +1033,19 @@ mod tests {
     async fn binance_window_remains_available_without_official_reference() {
         let mut state = State::new();
         state.phase = "live";
-        state.twap.observe(1_000, Decimal::from(100)).unwrap();
-        state.twap.observe(31_000, Decimal::from(200)).unwrap();
-        state.twap.observe(61_000, Decimal::from(300)).unwrap();
-        state.twap.observe(121_000, Decimal::from(400)).unwrap();
+        state.twap.observe(240_000, Decimal::from(100)).unwrap();
+        state.twap.observe(270_000, Decimal::from(200)).unwrap();
+        state.twap.observe(300_000, Decimal::from(300)).unwrap();
+        state.twap.observe(360_000, Decimal::from(400)).unwrap();
+        state.capture_opening_boundary();
+        let identity = WindowIdentity {
+            market_id: "market-a".into(),
+            condition_id: "condition-a".into(),
+            window_id: "window-a".into(),
+            rule_sha256: "rule-a".into(),
+            start_ms: 300_000,
+            end_ms: 600_000,
+        };
         let (live, _) = broadcast::channel(1);
         let (archive, _) = mpsc::channel(1);
         let service = Service {
@@ -888,7 +1056,7 @@ mod tests {
             archive_healthy: Arc::new(AtomicBool::new(true)),
             archive_dropped: Arc::new(AtomicU64::new(0)),
         };
-        let without = service.window_comparison(61_000, 121_000, None).await;
+        let without = service.window_comparison(&identity, None).await;
         assert_eq!(without["available"], true);
         assert_eq!(without["opening_price_usdt"], "150");
         assert_eq!(without["current_price_usdt"], "300");
@@ -896,9 +1064,66 @@ mod tests {
         assert!(without["mapped_official_scale_price"].is_null());
         assert_eq!(without["mapping_status"], "official_reference_unavailable");
         let with = service
-            .window_comparison(61_000, 121_000, Some(Decimal::from(1000)))
+            .window_comparison(&identity, Some(Decimal::from(1000)))
             .await;
         assert_eq!(with["mapped_official_scale_price"], "2000");
+
+        service.invalidate("source_reconnecting").await;
+        let reconnecting = service.window_comparison(&identity, None).await;
+        assert_eq!(reconnecting["opening_available"], true);
+        assert_eq!(reconnecting["opening_price_usdt"], "150");
+        assert_eq!(reconnecting["current_available"], false);
+        assert_eq!(reconnecting["current_reason"], "trade_source_unavailable");
+        assert_eq!(
+            reconnecting["opening_source_epoch"],
+            without["opening_source_epoch"]
+        );
+        assert_eq!(
+            reconnecting["opening_evidence_sha256"],
+            without["opening_evidence_sha256"]
+        );
+
+        let different_rule = WindowIdentity {
+            rule_sha256: "rule-b".into(),
+            ..identity
+        };
+        let rebound = service.window_comparison(&different_rule, None).await;
+        assert_eq!(rebound["opening_available"], false);
+        assert!(rebound["opening_evidence_sha256"].is_null());
+    }
+
+    #[tokio::test]
+    async fn incomplete_opening_coverage_is_not_fabricated() {
+        let mut state = State::new();
+        state.phase = "live";
+        state.twap.observe(250_001, Decimal::from(100)).unwrap();
+        state.twap.observe(300_000, Decimal::from(110)).unwrap();
+        state.capture_opening_boundary();
+        let identity = WindowIdentity {
+            market_id: "market-a".into(),
+            condition_id: "condition-a".into(),
+            window_id: "window-a".into(),
+            rule_sha256: "rule-a".into(),
+            start_ms: 300_000,
+            end_ms: 600_000,
+        };
+        let (live, _) = broadcast::channel(1);
+        let (archive, _) = mpsc::channel(1);
+        let service = Service {
+            state: Arc::new(RwLock::new(state)),
+            live,
+            archive,
+            archive_bytes: Arc::new(AtomicUsize::new(0)),
+            archive_healthy: Arc::new(AtomicBool::new(true)),
+            archive_dropped: Arc::new(AtomicU64::new(0)),
+        };
+        let result = service.window_comparison(&identity, None).await;
+        assert_eq!(result["opening_available"], false);
+        assert!(result["opening_price_usdt"].is_null());
+        assert_eq!(
+            result["opening_reason"],
+            "complete_60s_coverage_unavailable"
+        );
     }
 
     #[test]

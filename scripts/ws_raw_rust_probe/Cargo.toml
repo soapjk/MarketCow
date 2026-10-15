@@ -3,6 +3,8 @@ name = "ws-raw-rust-probe"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+
 [dependencies]
 futures-util = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

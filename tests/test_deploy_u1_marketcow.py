@@ -67,6 +67,18 @@ class DeploymentTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 deploy.validate_chainlink_credentials_path(invalid)
 
+    def test_disable_polynode_removes_only_subscription_argument(self):
+        unit = ('ExecStart=/old/run_with_bounded_log.py -- '
+                '/old/marketcow-discovery-collector --root /data/live '
+                '--btc-polynode-key-file /data/private/api-key '
+                '--btc-5m-manager-root /data/manager\n')
+        current = Path('/data/deployment/current')
+        updated = deploy.rewrite_unit(unit, current, disable_polynode=True)
+        self.assertNotIn('--btc-polynode-key-file', updated)
+        self.assertIn('--root /data/live', updated)
+        self.assertIn('--btc-5m-manager-root /data/manager', updated)
+        self.assertEqual(updated, deploy.rewrite_unit(updated, current, disable_polynode=True))
+
     def test_cleanup_rejects_outside_target_and_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

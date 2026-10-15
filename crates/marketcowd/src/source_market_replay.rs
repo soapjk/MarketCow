@@ -43,6 +43,18 @@ pub struct MarketPage<T> {
     pub caught_up: bool,
 }
 
+#[derive(Debug)]
+pub struct MarketReplayGroupBudget {
+    pub bytes: usize,
+    pub limit: usize,
+}
+impl std::fmt::Display for MarketReplayGroupBudget {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,"single market group exceeds page budget: {} > {}",self.bytes,self.limit)
+    }
+}
+impl std::error::Error for MarketReplayGroupBudget {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarketWatermark {
     pub market_id: String,
@@ -674,10 +686,9 @@ impl<T, S: Default> MarketReplay<T, S> {
             .filter(|group| group.market_cursor > after)
         {
             if groups.len() == maximum_groups || group.bytes > maximum_bytes - bytes {
-                ensure!(
-                    !groups.is_empty(),
-                    "single market group exceeds page budget"
-                );
+                if groups.is_empty() {
+                    return Err(MarketReplayGroupBudget {bytes:group.bytes,limit:maximum_bytes}.into());
+                }
                 break;
             }
             ensure!(group.market_cursor == next + 1, "market replay gap");
