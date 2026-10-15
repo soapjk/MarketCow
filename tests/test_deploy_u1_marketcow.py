@@ -14,6 +14,31 @@ spec.loader.exec_module(deploy)
 
 
 class DeploymentTests(unittest.TestCase):
+    def test_external_build_keeps_separate_space_guards(self):
+        gib = 1024**3
+        deploy.check_build_space(2 * gib, 6 * gib, True)
+        with self.assertRaisesRegex(RuntimeError, 'runtime volume'):
+            deploy.check_build_space(2 * gib - 1, 100 * gib, True)
+        with self.assertRaisesRegex(RuntimeError, 'isolated build volume'):
+            deploy.check_build_space(3 * gib, 6 * gib - 1, True)
+        with self.assertRaisesRegex(RuntimeError, 'isolated compilation'):
+            deploy.check_build_space(3 * gib, 100 * gib, False)
+
+    def test_btc_research_config_changes_only_client_budget(self):
+        unit = ('ExecStart=/formal/collector --btc-research-clients 4 '
+                '--btc-5m-clients 12 --root /data/live\nMemoryMax=17179869184\n')
+        updated = deploy.rewrite_btc_research_clients(unit, 8)
+        self.assertEqual(updated, unit.replace('--btc-research-clients 4',
+                                               '--btc-research-clients 8'))
+        self.assertEqual(updated, deploy.rewrite_btc_research_clients(updated, 8))
+        for invalid in (unit.replace('--btc-research-clients 4 ', ''),
+                        unit + '--btc-research-clients 4'):
+            with self.assertRaises(RuntimeError):
+                deploy.rewrite_btc_research_clients(invalid, 8)
+        for invalid in (0, 65):
+            with self.assertRaises(ValueError):
+                deploy.rewrite_btc_research_clients(unit, invalid)
+
     def test_unit_rewrite_is_repeatable_and_preserves_data_arguments(self):
         unit = ('ExecStart=/usr/bin/python3 /old/scripts/run_with_bounded_log.py '
                 '--log /data/current.log -- /old/release/marketcow-discovery-collector '
@@ -66,6 +91,18 @@ class DeploymentTests(unittest.TestCase):
                         '/home/czx/.config/marketcow/secrets/has space.json'):
             with self.assertRaises(RuntimeError):
                 deploy.validate_chainlink_credentials_path(invalid)
+
+    def test_disable_polynode_removes_only_subscription_argument(self):
+        unit = ('ExecStart=/old/run_with_bounded_log.py -- '
+                '/old/marketcow-discovery-collector --root /data/live '
+                '--btc-polynode-key-file /data/private/api-key '
+                '--btc-5m-manager-root /data/manager\n')
+        current = Path('/data/deployment/current')
+        updated = deploy.rewrite_unit(unit, current, disable_polynode=True)
+        self.assertNotIn('--btc-polynode-key-file', updated)
+        self.assertIn('--root /data/live', updated)
+        self.assertIn('--btc-5m-manager-root /data/manager', updated)
+        self.assertEqual(updated, deploy.rewrite_unit(updated, current, disable_polynode=True))
 
     def test_cleanup_rejects_outside_target_and_symlink(self):
         with tempfile.TemporaryDirectory() as directory:

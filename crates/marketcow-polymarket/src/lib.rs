@@ -5,6 +5,7 @@ pub mod discovery_source;
 pub mod diagnostic;
 pub mod subscription;
 mod transport_diagnostic;
+mod transport_rotation;
 
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -32,6 +33,9 @@ use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 pub const NORMALIZER_VERSION: &str = "marketcow.polymarket.normalizer.v2";
+pub const MAX_CONNECTION_CHECKPOINT_FRAMES: usize = 8192;
+pub const MAX_CONNECTION_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CONNECTION_CHECKPOINT_EVIDENCE_BYTES: usize = MAX_CONNECTION_CHECKPOINT_BYTES + 1024;
 pub const CLOB_MARKET_STREAM_SOURCE_URL: &str =
     "https://ws-subscriptions-clob.polymarket.com/ws/market";
 pub const CLOB_BOOK_SNAPSHOT_SOURCE_URL: &str = "https://clob.polymarket.com/books";
@@ -45,6 +49,7 @@ pub struct PolymarketTransportConfig {
     maximum_reconnect_attempts: u32,
     maximum_frame_bytes: usize,
     https_proxy: Option<Url>,
+    hot_rotation: bool,
 }
 
 impl PolymarketTransportConfig {
@@ -61,6 +66,7 @@ impl PolymarketTransportConfig {
                 .or_else(|_| std::env::var("https_proxy"))
                 .ok()
                 .and_then(|value| Url::parse(&value).ok()),
+            hot_rotation: true,
         }
     }
 
@@ -115,6 +121,7 @@ impl PolymarketTransportConfig {
             maximum_reconnect_attempts: 2,
             maximum_frame_bytes: 64 * 1024,
             https_proxy: None,
+            hot_rotation: false,
         }
     }
 }
@@ -130,6 +137,7 @@ pub struct RawTransportFrame {
 /// many small WS messages from being constrained by an arbitrary record count
 /// while retaining a hard memory ceiling for maximum-sized messages.
 pub struct RawTransportBatch {
+    handoff_receipt: Option<tokio::sync::oneshot::Sender<bool>>,
     frames: Vec<RawTransportFrame>,
     source_tokens: BTreeSet<String>,
     queued_at: std::time::Instant,
@@ -141,6 +149,11 @@ pub struct RawTransportBatch {
 }
 
 impl RawTransportBatch {
+    /// True is sent only after the market owner has committed both books.
+    /// Dropping/rejecting the batch leaves the active connection authoritative.
+    pub fn take_handoff_receipt(&mut self) -> Option<tokio::sync::oneshot::Sender<bool>> {
+        self.handoff_receipt.take()
+    }
     pub fn source_tokens(&self) -> &BTreeSet<String> {
         &self.source_tokens
     }
@@ -496,7 +509,12 @@ async fn run_transport_attempts(
         if *shutdown.borrow() {
             return Ok(());
         }
-        match run_polymarket_connection(config, tokens, output, shutdown, updates).await {
+        let connection = if config.hot_rotation {
+            transport_rotation::run_rotating_connection(config, tokens, output, shutdown, updates).await
+        } else {
+            run_polymarket_connection(config, tokens, output, shutdown, updates).await
+        };
+        match connection {
             Ok(ConnectionEnd::Shutdown) => return Ok(()),
             Ok(ConnectionEnd::Disconnected {
                 close_code,
@@ -632,7 +650,19 @@ async fn send_bounded(
     bytes: usize,
     source_tokens: &BTreeSet<String>,
     shutdown: &mut watch::Receiver<bool>,
+    timing: Option<&mut transport_diagnostic::SendTiming>,
+) -> Result<bool, TransportError> {
+    send_bounded_with_receipt(output, frames, bytes, source_tokens, shutdown, timing, None).await
+}
+
+async fn send_bounded_with_receipt(
+    output: &TransportOutput,
+    frames: Vec<RawTransportFrame>,
+    bytes: usize,
+    source_tokens: &BTreeSet<String>,
+    shutdown: &mut watch::Receiver<bool>,
     mut timing: Option<&mut transport_diagnostic::SendTiming>,
+    handoff_receipt: Option<tokio::sync::oneshot::Sender<bool>>,
 ) -> Result<bool, TransportError> {
     if bytes == 0 || bytes > output.maximum_batch_bytes || bytes > u32::MAX as usize {
         return Err(TransportError::FrameTooLarge);
@@ -716,6 +746,7 @@ async fn send_bounded(
                 .high_batches
                 .fetch_max(current_batches, Ordering::Relaxed);
             permit.send(RawTransportBatch {
+                handoff_receipt,
                 frames,
                 source_tokens: source_tokens.clone(),
                 queued_at: std::time::Instant::now(),
@@ -1902,7 +1933,8 @@ mod tests {
         assert_eq!(
             normalize_frame(
                 &config(),
-                serde_json::json!({"event_type":"price_change","price_changes":[]}),
+                serde_json::json!({"event_type":"price_change",
+                    "timestamp":"2026-08-03T04:00:03Z","price_changes":[]}),
                 at(),
                 1,
             ),
@@ -2489,6 +2521,7 @@ mod tests {
             &config(),
             serde_json::json!({
                 "event_type":"best_bid_ask", "asset_id":"yes-1",
+                "timestamp":"2026-08-03T04:00:03Z",
                 "best_bid":"0.39", "best_ask":"0.42"
             }),
             at(),
@@ -2510,6 +2543,7 @@ mod tests {
             &config(),
             serde_json::json!({
                 "event_type":"tick_size_change", "asset_id":"yes-1",
+                "timestamp":"2026-08-03T04:00:03Z",
                 "old_tick_size":"0.001", "new_tick_size":"0.01"
             }),
             at(),
@@ -2621,7 +2655,7 @@ mod tests {
         let normalized = normalize_frame(
             &tolerant,
             serde_json::json!({
-                "event_type":"price_change", "timestamp":"2026-08-03T04:00:02Z",
+                "event_type":"price_change", "timestamp":"2026-08-03T03:59:59Z",
                 "price_changes":[
                     {"asset_id":"yes-1","side":"BUY","price":"0.39","size":"10",
                      "best_bid":"0.39","best_ask":"0.42"}

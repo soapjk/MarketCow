@@ -1,0 +1,113 @@
+{
+  "schema_version": "marketcow.binance-trade-history-contract.v1",
+  "response_schema": "marketcow.binance-trade-history.v1",
+  "route": "/v1/btc-research/price-history",
+  "contract_route": "/v1/btc-research/price-history-contract",
+  "release_route": "/v1/btc-research/price-history/session",
+  "release_method": "DELETE",
+  "release_query": {
+    "source": "required literal binance_spot_trade",
+    "session_id": "exact opaque 32-character hex session_id from first page",
+    "start_time_ms": "exact immutable session start_time_ms",
+    "through_trade_id": "exact immutable session through_trade_id",
+    "limit": "exact immutable session limit"
+  },
+  "release_response": {
+    "schema_version": "marketcow.binance-trade-history-release.v1",
+    "released": "true if this call removed the matching session; false if already released, expired or unknown; HTTP 200 is idempotent",
+    "identity": "source, session_id, start_time_ms, through_trade_id and limit echo the validated request; an existing session with mismatched range returns HTTP 409 and remains untouched"
+  },
+  "method": "GET",
+  "query": {
+    "source": "required literal binance_spot_trade",
+    "start_time_ms": "required positive signed integer Unix milliseconds, inclusive",
+    "through_trade_id": "required positive unsigned integer; fixed live snapshot final trade ID",
+    "limit": "integer 1..1000, default 1000, identical on all session pages",
+    "page_token": "absent on first request; exact next_page_token on subsequent requests"
+  },
+  "response_fields": {
+    "session_id": "opaque process-local indexed database view identity; metadata and page fingerprints freeze at first request across live and completed historical SQLite shards",
+    "start_time_ms": "signed integer, exact request range start",
+    "through_trade_id": "unsigned integer, exact immutable request final ID",
+    "limit": "integer, immutable requested page limit",
+    "page_index": "zero-based integer",
+    "page_count": "integer 1..1024",
+    "session_ttl_seconds": "integer 600 from completed indexed metadata freeze; later pages are bounded database index reads verified against frozen page fingerprints, not temporary full-range files",
+    "predecessor": "trade row or null; only first page; last genuine trade before start, excluded from trades",
+    "trades": "array sorted by original trade_id, inclusive start_time_ms and through_trade_id",
+    "evidence": "per-page complete evidence objects for all referenced rows, including predecessor",
+    "next_page_token": "opaque string or null only on final page",
+    "complete": "true only on final page of entirely verified frozen range including predecessor, consecutive original IDs and exact through ID; partial pages false",
+    "coverage_verified": "whole frozen range is verified; never authorizes partial page installation",
+    "code": "null on valid range; explicit reason on incomplete range/resource failure",
+    "missing_ranges": "array of inclusive original trade ID intervals {from_trade_id,through_trade_id}",
+    "coverage_first_T": "first in-range supplier trade_time_ms integer or null",
+    "coverage_last_T": "last in-range supplier trade_time_ms integer or null",
+    "total_trade_count": "in-range count, excluding predecessor",
+    "time_unit": "integer_unix_milliseconds",
+    "fallback_used": "always false",
+    "execution_readiness": "always false",
+    "failure": "on a 503 build failure, failure.reason equals code; bounded capacity/deadline/validation failures retain their exact code, while actual OS I/O failures use disk_full, permission_denied, history_io_timeout, or history_io_or_index_failed with os_error when available and detail",
+    "archive_health_at_freeze": "independent JSONL writer health; never used as a query fallback",
+    "database_health_at_freeze": "live indexed database ingestion progress/failure at freeze plus maximum trade ID across all activated SQLite shards; through_trade_id beyond last indexed ID yields explicit database_write_lag, never an owner-memory or JSONL fallback"
+  },
+  "trade_fields": {
+    "trade_id": "original Binance BTCUSDT integer ID, not aggregate ID",
+    "trade_time_ms": "integer supplier T (WS) or time (REST), never receipt",
+    "event_time_ms": "integer supplier E for WS; null for REST",
+    "price": "exact supplier decimal string from the SHA-verified original row; SQLite may index a normalized numeric-equivalent value",
+    "quantity": "exact supplier decimal string from the SHA-verified original row, never split aggregate quantity; SQLite may index a normalized numeric-equivalent value",
+    "buyer_is_maker": "boolean supplier m or isBuyerMaker",
+    "evidence_ref": "SHA256 hex string identifying an evidence entry in the same page",
+    "source_row_index": "zero-based original JSON array index; zero for singleton WS object"
+  },
+  "evidence_fields": {
+    "evidence_ref": "equals raw_sha256",
+    "raw_sha256": "SHA256 exact decoded raw_base64 bytes, not rewritten JSON",
+    "raw_base64": "standard padded Base64 of complete supplier raw body/frame",
+    "raw_bytes": "decoded byte count",
+    "source_epoch": "original capture epoch string or null, provenance only; not continuity gate",
+    "received_at": "original local reception RFC3339 string or null when not retained; diagnostic only",
+    "acquisition": "ws_archive or official_recent_trades; no fabricated backfill",
+    "upstream_url": "exact maintained WS URL or recent-trades bootstrap URL"
+  },
+  "budgets": {
+    "maximum_span_ms": 960000,
+    "page_rows": 1000,
+    "page_bytes_including_evidence": 4194304,
+    "session_bytes_all_serialized_pages_including_repeated_evidence": 1073741824,
+    "session_trades_excluding_one_predecessor": 1024000,
+    "pages": 1024,
+    "sessions": 4,
+    "session_ttl_seconds": 600,
+    "parallel_background_builds": 1,
+    "parallel_frozen_page_reads": 4,
+    "build_deadline_seconds": 120,
+    "database_read_only_pages": true,
+    "historical_shard_activation": "only after explicit import_complete=1 and overlapping trade identities match live database",
+    "temporary_full_range_copy": false,
+    "jsonl_files_scanned_per_business_request": 0
+  },
+  "http": {
+    "200": "frozen page, possibly complete=false with explicit coverage failure",
+    "400": "invalid_request / invalid_range_or_source / invalid_page_token / page_out_of_range",
+    "409": "session_range_mismatch",
+    "410": "session_expired_or_unknown; includes service restart",
+    "503": "history_capacity / session_capacity / history_database_unavailable / history_historical_database_invalid / historical_live_trade_identity_conflict / history_database_query_failed / history_database_changed_during_session / history_deadline / database evidence, conflict or budget error; complete=false, no partial success claim",
+    "cache_control": "no-store",
+    "release": "DELETE release_route returns 200 released true/false, 400 invalid identity, or 409 matching session_id with mismatched range"
+  },
+  "lifecycle": [
+    "Open live WS first, freeze final snapshot trade_id, buffer live independently, then request historical pages.",
+    "Never block live reception on database or JSONL IO; no new external feed or official history backfill in this implementation.",
+    "Collect all pages with identical session/range, verify every raw association and final complete, then match actual live overlap by trade_id/T/price/quantity/maker.",
+    "A repeated first-page GET for a still-valid complete frozen range reuses the same session_id and page zero; it does not consume another session slot. This is a retry convenience, not a substitute for verifying all pages and the live overlap.",
+    "After successful validation and installation, or after an explicit decision to abandon the range, DELETE the matching frozen session. Do not release while any required page read/retry is still in flight. If the consumer fails transiently and intends to retry, retain the session_id and page_token until its bounded retry/recovery decision. Release is idempotent and does not delete database rows or permanent JSONL originals.",
+    "WS and REST raw hashes need not match for identical trades; original evidence remains distinct.",
+    "No requirement for matching old/new live source_epoch. Time ordering and original trade ID continuity are independently checked.",
+    "Preserve completed historical window facts across reconnect. Current connection recovery and live freshness remain independent.",
+    "Budget, evidence, gap or tail failure never becomes strategy-complete coverage. No aggTrades/Kline fallback or interpolation.",
+    "A first request validates indexed rows in live SQLite and any completed historical SQLite shard, deduplicated by original trade ID, and stores only bounded page fingerprints/coverage metadata. Each page is independently read from SQLite and rechecked; a changed row fails closed instead of silently changing a frozen session. No entire-range temporary page copy is created.",
+    "Raw JSONL segments remain permanent forensic originals and are never queried by normal business requests. Explicit marketcow-btc-db-migrate import may read them after SHA/identity validation; import success does not certify gap-free historical coverage."
+  ]
+}

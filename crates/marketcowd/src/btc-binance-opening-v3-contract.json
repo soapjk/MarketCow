@@ -1,0 +1,82 @@
+{
+  "schema_version": "marketcow.binance-opening-contract.v3",
+  "read_faces": {
+    "binance": {
+      "route": "/v1/prediction-markets/polymarket/research/btc-5m/binance-comparison?market_id={market_id}",
+      "outer_schema": "marketcow.btc5m.binance-reference-window.v3",
+      "nested_field": "binance_comparison",
+      "nested_schema": "marketcow.btc5m.binance-comparison.v3"
+    },
+    "with_official": {
+      "route": "/v1/prediction-markets/polymarket/research/btc-5m/reference-comparison?market_id={market_id}",
+      "outer_schema": "marketcow.btc5m.reference-comparison.v3",
+      "nested_field": "binance_comparison",
+      "nested_schema": "marketcow.btc5m.binance-comparison.v3"
+    }
+  },
+  "identity": {
+    "outer_required": ["market_id", "condition_id", "window_id", "start_at", "end_at", "profile_epoch", "profile_revision", "rule_sha256"],
+    "opening_binds": ["market_id", "condition_id", "window_id", "rule_sha256", "window_start_ms", "window_end_ms"],
+    "opening_binding_lifetime": "An already bound opening cannot be rebound to a different immutable identity at the same start; current trade outages cannot erase it."
+  },
+  "units": {
+    "all_integer_times": "Unix milliseconds unless field ends in _at and contains an RFC3339 string",
+    "price": "exact base-10 USDT string, rust_decimal 1.42.1 Decimal::normalize() after checked_div by 60000",
+    "quote_asset": "USDT",
+    "official_reference": "independent USD market reference, never replaced by Binance opening estimate",
+    "current_source_epoch": "The live stream's present epoch; never used as an alias for historical opening provenance."
+  },
+  "opening_method": {
+    "name": "last_trade_price_time_weighted_over_preceding_60000ms",
+    "interval": "[window_start_ms-60000, window_start_ms)",
+    "carry": "Last real trade price is carried between supplier trade times, including the one real predecessor strictly before the interval.",
+    "seconds_sha256": "SHA256 of UTF-8 ASCII prefix marketcow.binance-opening-seconds.v1 followed by LF, then 60 lines in ascending second order: second_start_ms|Decimal::normalize(price_milliseconds)|1000 followed by LF. Each second area is checked exact Decimal sum of trade_price*covered_integer_ms.",
+    "coverage": "All 60 source-time seconds must have exactly 1000ms of real predecessor/real trade price coverage. Receipt, first in-window tick, kline or interpolation cannot fill missing evidence."
+  },
+  "historical_recovery": {
+    "source": "Existing immutable Binance original-trade archive plus bounded current-owner raw evidence; no new feed and no aggTrades fallback.",
+    "freeze": "start_time_ms=window_start_ms-60000; through_trade_id=first retained actual trade with supplier T>=window_start_ms; require final history.v1 page complete=true and coverage_verified=true, no missing_ranges, one real predecessor and all raw SHA/row bindings valid.",
+    "history_preimage_encoding": "UTF-8, no BOM; literal marketcow.binance-opening-history.v1 then LF; decimal integer start_ms|boundary_ms then LF; then rows in ascending trade_id: predecessor, every in-interval trade, first successor at/after boundary inclusive. Each row is trade_id|supplier_T_ms|normalized_decimal_price|normalized_decimal_quantity|lowercase_true_or_false_maker|lowercase_raw_frame_sha256_hex|source_epoch then LF. No whitespace or final extra bytes.",
+    "history_sha256": "Lowercase hex SHA256(history_preimage_encoding). Each row is re-derived from raw_base64 after SHA256(raw bytes)==raw_sha256==evidence_ref; no receipt-derived time.",
+    "source_epochs": "Distinct source_epoch strings in first-appearance order from the predecessor and trades with T<boundary; successor's epoch is excluded unless it also contributed before boundary. Count 1..64; >64 fails closed with history_opening_epoch_capacity.",
+    "first_successor": "Included in history hash to prove the window's upper bound, but its price and epoch never contribute to the opening TWAP or opening_source_epochs.",
+    "resource_bounds": "Original history.v1 freeze: 30s build, 64MiB session, 64 pages, 64000 trades plus one predecessor; failure remains unavailable with exact reason and no partial opening."
+  },
+  "binding_sha256": {
+    "domain": "marketcow.binance-opening-binding.v2",
+    "encoding": "UTF-8, no BOM. Literal domain followed by LF. Then six values each followed by LF in this exact order: market_id, condition_id, window_id, rule_sha256, opening_seconds_sha256, opening_evidence_kind. Then for every opening_source_epochs element in encounter order: literal epoch: plus epoch plus LF. If and only if history kind: literal history: plus opening_history_evidence_sha256 plus LF. Finally window_start_ms|window_end_ms|Decimal::normalize(opening_price_usdt), no final LF. No length prefixes; values are the validated market identity/hex epoch/hex SHA and decimal atoms and must not contain LF or pipe.",
+    "output": "opening_evidence_sha256 is lowercase hex SHA256 of these exact bytes. The fixed vector includes base64 of these bytes and expected hash."
+  },
+  "branches": {
+    "live_single_epoch": {
+      "opening_available": true,
+      "opening_evidence_kind": "complete_trade_price_seconds_bound_to_market_identity",
+      "opening_source_epoch": "same nonempty string as the sole opening_source_epochs element",
+      "opening_source_epochs": "one element",
+      "opening_history_evidence_sha256": null
+    },
+    "verified_history": {
+      "opening_available": true,
+      "opening_evidence_kind": "verified_original_trade_history_price_seconds",
+      "opening_source_epoch": "sole opening_source_epochs element when count=1; JSON null when count>1",
+      "opening_source_epochs": "one to 64 ordered distinct elements",
+      "opening_history_evidence_sha256": "non-null lowercase 64-character SHA256 hex"
+    },
+    "unavailable": {
+      "opening_available": false,
+      "opening_price_usdt": null,
+      "opening_source_epoch": null,
+      "opening_source_epochs": null,
+      "opening_seconds_sha256": null,
+      "opening_history_evidence_sha256": null,
+      "opening_evidence_sha256": null,
+      "opening_covered_ms": null,
+      "opening_evidence_kind": null,
+      "opening_reason": "required nonempty machine string; history_recovery_pending or exact historical failure when applicable"
+    }
+  },
+  "all_branch_fields": "opening_available/opening_reason/opening_price_usdt/opening_source_epoch/opening_source_epochs/opening_seconds_sha256/opening_history_evidence_sha256/opening_evidence_sha256/opening_covered_ms/opening_evidence_kind/current_available/current_reason/current_price_usdt/current_interval_end_ms are present even when null.",
+  "current_independence": "Current availability and live source epoch are independent of immutable opening availability; source outage cannot erase a previously bound opening. available=true only when both opening_available and current_available.",
+  "vector_path": "btc-binance-opening-v3-vector.json",
+  "vector_generation": "The fixed vector is generated by the production history reduction, production opening_binding_preimage, production window_comparison_at, and serde_json::to_vec serializers in the opening_v3_serializer_vector test. It includes three original synthetic supplier trade frames, the exact history and binding preimages, and exact nested comparison JSON bytes; observed_at uses a fixed injected UTC clock. The SHA of serialized nested JSON is a vector integrity check, not an additional runtime signature or trading gate."
+}

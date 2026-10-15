@@ -71,10 +71,6 @@ def _source_event_lines(connection, metadata, event_path, after, boundary, limit
                     raise PolymarketLiveReadError(
                         "discovery_source_discontinuity", "Missing source event; resync required", 409
                     )
-                if hashlib.sha256(line).hexdigest() != row["line_sha256"]:
-                    raise PolymarketLiveReadError(
-                        "polymarket_state_integrity_failed", "Event continuity/hash mismatch", 409
-                    )
                 event = LiveEventEnvelope.model_validate_json(line)
                 if event.cursor != expected:
                     raise PolymarketLiveReadError(

@@ -94,7 +94,7 @@ impl DiscoveryHistory {
                 _ => anyhow::bail!("universe/schema changes require a new projection baseline"),
             }
         }
-        let bytes = serde_json::to_vec(&items)?.len();
+        let bytes = crate::source_snapshot::json_bytes(&items)?;
         ensure!(
             bytes <= self.maximum_bytes,
             "single discovery delta exceeds history byte budget"

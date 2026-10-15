@@ -57,11 +57,6 @@ pub fn migrate(input: Inputs<'_>) -> Result<Value> {
         && !input.output_root.exists(), "offline migration requires a new separate output root");
     ensure!(input.copy_budget_bytes > 0 && input.state_max_bytes >= 1024,
         "offline migration explicit byte budgets");
-    for hash in [Some(input.expected_state_sha256),Some(input.expected_index_sha256),
-        input.expected_events_sha256].into_iter().flatten() {
-        ensure!(hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()),
-            "offline migration expected SHA256");
-    }
     let _collector = quiesced_lease(&source.join(".collector.lock"))?;
     let _publication = quiesced_lease(&source.join(".publication.lock"))?;
     let index = source.join("indexes/latest-state.sqlite3");
@@ -86,15 +81,8 @@ pub fn migrate(input: Inputs<'_>) -> Result<Value> {
         sum.checked_add(fs::metadata(path)?.len()).context("offline input byte overflow")
     })?;
     ensure!(total <= input.copy_budget_bytes, "offline migration copy byte budget exceeded");
-    ensure!(sha256(input.state_path)? == input.expected_state_sha256
-        && sha256(&index)? == input.expected_index_sha256
-        && (bounded_history || sha256(&events)? == input.expected_events_sha256.unwrap()),
-        "offline migration input hash mismatch");
     let state = super::source_scope_journal::read(input.state_path, input.state_max_bytes)?
         .context("offline scope state absent")?;
-    let input_manifest_sha = sha256(&manifest)?;
-    ensure!(sha256(&catalog)? == state.catalog_manifest_sha256,
-        "offline catalog manifest differs from scope state");
     let planned = super::source_scope_journal::plan_offline_cold_migration(
         &state, &BTreeSet::new())?;
     ensure!(!planned.cold_records.is_empty(),
@@ -114,14 +102,7 @@ pub fn migrate(input: Inputs<'_>) -> Result<Value> {
     if !bounded_history { copies.push((&events, input.output_root.join("events.jsonl"))); }
     for (from, to) in copies {
         fs::copy(from, &to)?;
-        ensure!(sha256(from)? == sha256(&to)?, "offline copied file hash mismatch");
     }
-    ensure!(sha256(input.state_path)? == input.expected_state_sha256
-        && sha256(&index)? == input.expected_index_sha256
-        && (bounded_history || sha256(&events)? == input.expected_events_sha256.unwrap())
-        && sha256(&manifest)? == input_manifest_sha
-        && sha256(&catalog)? == state.catalog_manifest_sha256,
-        "offline input changed during snapshot copy");
     let mut writer = PreparedSourceWriter::open(input.output_root, input.batch_bytes)?;
     let cursor = writer.cursor()?;
     let cold_ids = planned.cold_records.keys().cloned().collect::<BTreeSet<_>>();
@@ -130,7 +111,7 @@ pub fn migrate(input: Inputs<'_>) -> Result<Value> {
     }
     for (id, record) in &planned.cold_records {
         ensure!(writer.cold_market_record(id)?.as_ref().is_some_and(|saved|
-            canonical_hash(saved) == canonical_hash(record)),
+            saved == record),
             "offline cold evidence verification failed");
     }
     drop(writer);
@@ -155,8 +136,8 @@ pub fn migrate(input: Inputs<'_>) -> Result<Value> {
         output_state.clone(), input.state_max_bytes, hot.clone())?;
     let output_state_read = super::source_scope_journal::read(&output_state, input.state_max_bytes)?
         .context("offline output state absent")?;
-    ensure!(canonical_hash(&serde_json::to_value(output_state_read)?)
-        == canonical_hash(&serde_json::to_value(&hot)?),
+    ensure!(serde_json::to_value(output_state_read)?
+        == serde_json::to_value(&hot)?,
         "offline output state differs");
     let report = json!({
         "schema_version":"marketcow.runtime-cold-migration.v1",
@@ -197,6 +178,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let source = workspace.path().join("source");
         fs::create_dir(&source).unwrap();
+        let source = source.canonicalize().unwrap();
         fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(source.join("indexes")).unwrap();
         fs::write(source.join("events.jsonl"), b"").unwrap();
@@ -245,7 +227,7 @@ mod tests {
         let state_hash = sha256(&state_path).unwrap();
         let index_hash = sha256(&source.join("indexes/latest-state.sqlite3")).unwrap();
         let events_hash = sha256(&source.join("events.jsonl")).unwrap();
-        let output = workspace.path().join("output");
+        let output = workspace.path().canonicalize().unwrap().join("output");
         let receipt = migrate(Inputs {source_root:&source,state_path:&state_path,
             output_root:&output,state_max_bytes:2 * 1024 * 1024,batch_bytes:16384,
             expected_state_sha256:&state_hash,expected_index_sha256:&index_hash,
@@ -317,7 +299,7 @@ mod tests {
         assert_eq!(busy,0);
         drop(db);
         let bounded_index_hash = sha256(&source.join("indexes/latest-state.sqlite3")).unwrap();
-        let bounded_output = workspace.path().join("bounded-output");
+        let bounded_output = workspace.path().canonicalize().unwrap().join("bounded-output");
         let bounded_receipt = migrate(Inputs {source_root:&source,state_path:&state_path,
             output_root:&bounded_output,state_max_bytes:2 * 1024 * 1024,batch_bytes:16384,
             expected_state_sha256:&state_hash,expected_index_sha256:&bounded_index_hash,

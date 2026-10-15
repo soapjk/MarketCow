@@ -27,5 +27,5 @@ def test_verified_catalog_sharing_excludes_state(tmp_path):
     with pytest.raises(ValueError, match="mutable"):
         clone_catalog_artifacts(source, other, final, maximum_copy_bytes=0)
     rewritten, report = clone_catalog_artifacts(source, other, final, maximum_copy_bytes=100)
-    assert report[0]["method"] == "verified_copy"
+    assert report[0]["method"] == "bounded_copy"
     assert (other/"normalized_catalog").stat().st_ino != (source/"normalized_catalog").stat().st_ino

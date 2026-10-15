@@ -32,6 +32,14 @@ impl Queue {
 }
 
 static QUEUE: OnceLock<Queue> = OnceLock::new();
+type Observer = Box<dyn Fn(&str) + Send + Sync>;
+static OBSERVER: OnceLock<Observer> = OnceLock::new();
+
+/// Called only by the existing diagnostic thread, never by a market actor.
+/// The observer must remain bounded and nonblocking.
+pub fn install_observer(observer: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = OBSERVER.set(Box::new(observer));
+}
 
 fn queue() -> &'static Queue {
     QUEUE.get_or_init(|| {
@@ -42,6 +50,10 @@ fn queue() -> &'static Queue {
                 let stderr = std::io::stderr();
                 while let Ok(line) = receiver.recv() {
                     let dropped = QUEUE.get().map_or(0, |queue| queue.dropped.swap(0, Ordering::Relaxed));
+                    if let Some(observer) = OBSERVER.get() {
+                        observer(&line);
+                        if dropped > 0 { observer(&format!("{{\"stage\":\"diagnostic_log_dropped\",\"count\":{dropped}}}")); }
+                    }
                     // Never retain the process-wide stderr lock while waiting
                     // for another diagnostic; panic hooks and unrelated code
                     // must remain able to report independently.

@@ -13,10 +13,10 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Utc};
-use futures_util::FutureExt;
+use futures_util::StreamExt;
 use marketcow_polymarket::discovery_source::canonical_hash;
 use marketcow_runtime::discovery_source::{DurableMarketPageBoundary, read_durable_market_page};
-use marketcow_contracts::btc5m_market_local_v3::{self as market_proto, wire as proto};
+use marketcow_contracts::btc5m_market_local_v5::{self as market_proto, wire as proto};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -33,7 +33,7 @@ use crate::source_publication::{Batch, MarketMemorySnapshot, MemoryReader, Sourc
 const PROFILE_SCHEMA: &str = "marketcow.polymarket.btc-5m-profile.v1";
 const STATUS_SCHEMA: &str = "marketcow.polymarket.btc-5m-status.v5";
 const ERROR_SCHEMA: &str = "marketcow.polymarket.btc-5m-error.v1";
-const MARKET_PROTO_SUBPROTOCOL: &str = "marketcow.btc5m.market-local.v3";
+const MARKET_PROTO_SUBPROTOCOL: &str = "marketcow.btc5m.market-local.v5";
 // Fixed v1 management-contract TTL, not an implicit runtime fallback.
 const MANAGER_STALE_AFTER_SECONDS: i64 = 60;
 const MAX_MARKETS: usize = 3;
@@ -372,6 +372,8 @@ impl Profile {
 
 #[derive(Clone)]
 pub struct Limits {
+    pub live_backlog_groups: usize,
+    pub live_backlog_age: Duration,
     pub snapshot_bytes: usize,
     pub frame_bytes: usize,
     pub replay_bytes: usize,
@@ -381,6 +383,9 @@ pub struct Limits {
 }
 impl Limits {
     fn validate(&self) -> Result<()> {
+        ensure!((1..=4096).contains(&self.live_backlog_groups)
+            && (10..=10_000).contains(&self.live_backlog_age.as_millis()),
+            "BTC 5m live delivery budget");
         ensure!(
             (64 * 1024..=16 * 1024 * 1024).contains(&self.snapshot_bytes),
             "BTC 5m snapshot bytes"
@@ -444,6 +449,7 @@ pub struct Api {
     timeline_tx: std::sync::mpsc::SyncSender<MarketTimelineGroup>,
     slow_group_tx: std::sync::mpsc::SyncSender<SlowMarketGroup>,
     slow_group_dropped: Arc<AtomicU64>,
+    send_diagnostics: crate::source_market_send_diagnostic::Diagnostics,
 }
 #[derive(Clone)]
 struct Active {
@@ -453,12 +459,27 @@ struct Active {
 #[derive(Clone)]
 pub struct Control {
     reader: MemoryReader,
+    live: crate::source_market_live::Registry,
     process_instance_id: String,
     active: Arc<RwLock<Active>>,
     changed: watch::Sender<u64>,
     manager: Arc<RwLock<Option<Value>>>,
 }
 impl Control {
+    pub fn live_identity(&self, binding: &MarketBinding) -> Result<(marketcow_contracts::btc5m_market_local_v6::wire::MarketKey,String)> {
+        self.live.identity(binding)
+    }
+    pub fn profile_for_market_source(&self) -> Result<(Arc<Profile>, String)> {
+        let active = self.active()?;
+        Ok((active.profile, active.epoch))
+    }
+
+    pub fn profile_with_watch_for_market_source(&self)
+        -> Result<(Arc<Profile>, String, watch::Receiver<u64>)> {
+        let (active, changed) = self.active_with_watch()?;
+        Ok((active.profile, active.epoch, changed))
+    }
+
     fn active(&self) -> Result<Active> {
         Ok(self
             .active
@@ -658,10 +679,12 @@ impl Api {
     ) -> Result<(Router, Control)> {
         profile.validate()?;
         limits.validate()?;
+        reader.configure_ordinary_handoff_frame_bytes(limits.frame_bytes)?;
         ensure!(!epoch.is_empty(), "BTC 5m epoch");
         let (changed, _) = watch::channel(profile.profile_revision);
         let control = Control {
             reader: reader.clone(),
+            live: crate::source_market_live::Registry::default(),
             process_instance_id: uuid::Uuid::new_v4().simple().to_string(),
             active: Arc::new(RwLock::new(Active {
                 profile: Arc::new(profile),
@@ -720,6 +743,7 @@ impl Api {
                 }
             }
         })?;
+        let send_diagnostics=crate::source_market_send_diagnostic::Diagnostics::start(archive_root.clone());
         let state = Self {
             reader,
             control: control.clone(),
@@ -731,8 +755,10 @@ impl Api {
             timeline_tx,
             slow_group_tx,
             slow_group_dropped,
+            send_diagnostics,
             limits,
         };
+        start_live_publication(state.clone());
         Ok((
             Router::new()
                 .route(
@@ -742,6 +768,21 @@ impl Api {
                 .route(
                     "/v1/prediction-markets/polymarket/research/btc-5m/management-health",
                     get(http_management_health),
+                )
+                // The official CLOB WebSocket remains an explicit observation
+                // source. Its market-local v3 cursor and confirmation domain
+                // must never be confused with the PN1 v4 market serial.
+                .route(
+                    "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-streams",
+                    get(http_live_market_streams),
+                )
+                .route(
+                    "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-full-sync",
+                    get(http_live_market_full_sync),
+                )
+                .route(
+                    "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-stream",
+                    get(http_live_market_stream),
                 )
                 .route(
                     "/v1/prediction-markets/polymarket/research/btc-5m/market-timeline",
@@ -755,27 +796,187 @@ impl Api {
                     "/v1/prediction-markets/polymarket/research/market-archive-replay",
                     get(http_market_archive_replay),
                 )
-                .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/market-streams",
-                    get(http_market_streams),
-                )
-                .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/market-full-sync",
-                    get(http_market_full_sync),
-                )
-                .route(
-                    "/v1/prediction-markets/polymarket/research/btc-5m/market-stream",
-                    get(http_market_stream),
-                )
                 .with_state(state),
             control,
         ))
     }
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MarketFullSyncQuery {
     market_id: String,
+}
+
+fn live_response<T: prost::Message>(document: &T) -> Response {
+    use marketcow_contracts::btc5m_market_local_v6 as live;
+    match live::encode(document,crate::source_market_live::MAX_FRAME_BYTES) {
+        Ok(bytes) => ([("content-type",live::CONTENT_TYPE),("cache-control","no-store")],bytes).into_response(),
+        Err(_) => failure(StatusCode::PAYLOAD_TOO_LARGE,"btc_5m_live_frame_budget",false),
+    }
+}
+async fn http_live_market_streams(State(api):State<Api>) -> Response {
+    use marketcow_contracts::btc5m_market_local_v6::{self as live,wire};
+    let document=(|| -> Result<wire::MarketStreams> {
+        let active=api.control.active()?;
+        api.control.live.retain(&active.profile.markets)?;
+        let markets=active.profile.markets.iter().map(|binding| {
+            let (key,stream_id)=api.control.live_identity(binding)?;
+            Ok(wire::MarketBinding{key:Some(key),stream_id,role:match binding.role {
+                WindowRole::Current=>"current",WindowRole::Next=>"next",WindowRole::Retiring=>"retiring",
+            }.into()})
+        }).collect::<Result<Vec<_>>>()?;
+        ensure!(api.control.active()?.profile.document_sha256()==active.profile.document_sha256(),"discovery changed");
+        Ok(wire::MarketStreams{schema_version:live::SCHEMA_VERSION.into(),markets,
+            delivery_budget:Some(wire::DeliveryBudget {
+                maximum_frame_bytes:crate::source_market_live::MAX_FRAME_BYTES as u64,
+                maximum_state_bytes:crate::source_market_live::MAX_STATE_BYTES as u64,
+                maximum_levels_per_side:crate::source_market_live::MAX_LEVELS as u64,
+                maximum_changes:crate::source_market_live::MAX_CHANGES as u64,
+            })})
+    })();
+    match document {Ok(value)=>live_response(&value),Err(_)=>failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_live_discovery_unavailable",true)}
+}
+
+fn start_live_publication(api: Api) {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_millis(10));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            let Ok(active) = api.control.active() else {
+                api.control.live.invalidate_all("profile_unavailable");
+                continue;
+            };
+            if api.control.live.retain(&active.profile.markets).is_err() { continue }
+            let mut jobs = tokio::task::JoinSet::new();
+            for binding in active.profile.markets.iter().cloned() {
+                let api = api.clone();
+                jobs.spawn(async move {
+                    match build_live_state(&api,binding.clone()).await {
+                        Ok(state) => { let _ = api.control.live.publish(&binding,state); }
+                        Err(error) => {
+                            let _=api.control.live.invalidate_market(&binding,"publisher_failed");
+                            marketcow_polymarket::async_eprintln!("{}",json!({
+                                "stage":"market_live_publication_failed","market_id":binding.market_id,
+                                "error":format!("{error:#}")}));
+                        },
+                    }
+                });
+            }
+            // At most the three managed markets are in flight. Slow consumers
+            // never create more builders or retain a backlog of snapshots.
+            while jobs.join_next().await.is_some() {}
+        }
+    });
+}
+
+async fn capture_live_state(api:&Api,binding:MarketBinding) -> Result<Arc<crate::source_market_live::LiveState>> {
+    api.control.live.load(&binding)
+}
+
+async fn build_live_state(api:&Api,binding:MarketBinding) -> Result<Arc<crate::source_market_live::LiveState>> {
+    let api=api.clone();
+    tokio::task::spawn_blocking(move || {
+        let active=api.control.active()?;
+        api.control.live.retain(&active.profile.markets)?;
+        let lane=api.control.live.lane(&binding)?;
+        let still_bound=active.profile.markets.iter().any(|b|
+            crate::source_market_live::key(b).ok()==crate::source_market_live::key(&binding).ok());
+        ensure!(still_bound,"immutable market key no longer active");
+        let tokens=binding.outcomes.iter().map(|o|o.token_id.clone()).collect::<Vec<_>>();
+        let ended=Utc::now()>=DateTime::parse_from_rfc3339(&binding.end_at)?.with_timezone(&Utc);
+        let snapshot=api.reader.capture_market(&binding.market_id,&tokens).ok();
+        let mut lane=lane.lock().map_err(|_|anyhow::anyhow!("live lane poisoned"))?;
+        match lane.capture(snapshot.as_ref(),ended) {
+            Ok(state)=>Ok(state),
+            Err(error)=>{
+                marketcow_polymarket::async_eprintln!("{}",json!({"stage":"market_live_state_rejected",
+                    "market_id":binding.market_id,"error":format!("{error:#}")}));
+                lane.reject(snapshot.as_ref(),ended,"state_budget_or_invalid")
+            }
+        }
+    }).await?
+}
+async fn http_live_market_full_sync(State(api):State<Api>,Query(query):Query<MarketFullSyncQuery>) -> Response {
+    let Ok(_permit)=api.snapshots.clone().try_acquire_owned() else {
+        return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_snapshot_capacity",true);
+    };
+    let binding=api.control.active().ok().and_then(|a|a.profile.markets.iter()
+        .find(|b|b.market_id==query.market_id).cloned());
+    let Some(binding)=binding else {return failure(StatusCode::NOT_FOUND,"btc_5m_market_not_in_profile",false);};
+    match capture_live_state(&api,binding).await.and_then(|state|crate::source_market_live::frame(&state,None)) {
+        Ok(document)=>live_response(&document),
+        Err(_)=>failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_live_snapshot_unavailable",true),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveStreamQuery {market_id:String,stream_id:String}
+async fn http_live_market_stream(State(api):State<Api>,Query(query):Query<LiveStreamQuery>,
+    peer:Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers:HeaderMap,ws:WebSocketUpgrade) -> Response {
+    use marketcow_contracts::btc5m_market_local_v6 as live;
+    if !headers.get(axum::http::header::SEC_WEBSOCKET_PROTOCOL).and_then(|h|h.to_str().ok())
+        .is_some_and(|h|h.split(',').any(|s|s.trim()==live::SUBPROTOCOL)) {
+        return failure(StatusCode::UPGRADE_REQUIRED,"btc_5m_proto_subprotocol_required",false);
+    }
+    let Ok(active)=api.control.active() else {return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_unavailable",true);};
+    let Some(binding)=active.profile.markets.iter().find(|b|b.market_id==query.market_id).cloned() else {
+        return failure(StatusCode::NOT_FOUND,"btc_5m_market_not_in_profile",false);
+    };
+    if api.control.live.retain(&active.profile.markets).is_err()
+        || !api.control.live_identity(&binding).is_ok_and(|(_,id)|id==query.stream_id) {
+        return failure(StatusCode::CONFLICT,"btc_5m_live_stream_changed",false);
+    }
+    let slots={
+        let Ok(mut slots)=api.market_stream_slots.lock() else {return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_stream_capacity",true);};
+        slots.retain(|id,_|active.profile.markets.iter().any(|b|&b.market_id==id));
+        slots.entry(query.market_id.clone()).or_insert_with(||Arc::new(Semaphore::new(market_stream_client_limit(api.limits.clients)))).clone()
+    };
+    let Ok(market_permit)=slots.try_acquire_owned() else {return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_market_stream_capacity",true);};
+    let Ok(permit)=api.streams.clone().try_acquire_owned() else {return failure(StatusCode::SERVICE_UNAVAILABLE,"btc_5m_stream_capacity",true);};
+    ws.protocols([live::SUBPROTOCOL]).max_message_size(4096).max_frame_size(4096).on_upgrade(move |socket|async move {
+        let (_permit,_market_permit)=(permit,market_permit);
+        let mut socket=MarketClientIo::new(socket);
+        socket.peer=peer.map(|axum::Extension(axum::extract::ConnectInfo(addr))|addr);
+        socket.diagnostics=Some(api.send_diagnostics.clone());
+        api.send_diagnostics.record(json!({"stage":"market_send_connection","observed_at":Utc::now(),
+            "connection_id":socket.connection_id,"peer":socket.peer,"market_id":query.market_id,
+            "stream_id":query.stream_id,"schema_version":live::SCHEMA_VERSION}));
+        let result=async {
+            let mut previous:Option<Arc<crate::source_market_live::LiveState>>=None;
+            let mut changed=api.control.live.subscribe(&binding)?;
+            changed.mark_changed();
+            loop {
+                tokio::select! {
+                    message=socket.controls.recv()=> {if socket.handle_control(message,api.limits.send_timeout).await? {break;}}
+                    notification=changed.changed()=>{
+                        notification.context("public market retired")?;
+                        let state=capture_live_state(&api,binding.clone()).await?;
+                        ensure!(state.stream_id==query.stream_id,"public stream recreated");
+                        if previous.as_ref().is_some_and(|old|old.sequence==state.sequence) {continue;}
+                        // Net differences are always based on the last fully flushed state.
+                        // Private source replacement chooses an ordinary snapshot, not a control protocol.
+                        let frame=crate::source_market_live::frame(&state,previous.as_deref())?;
+                        let bytes=live::encode(&frame,crate::source_market_live::MAX_FRAME_BYTES)?;
+                        socket.in_flight_cursor=Some(state.sequence);
+                        send_market_frame(&mut socket,&api,bytes).await?;
+                        socket.last_complete_cursor=state.sequence;socket.in_flight_cursor=None;
+                        let ended=state.snapshot.source_status=="ended";
+                        previous=Some(state);
+                        if ended {break;}
+                    }
+                }
+            }
+            Ok::<_,anyhow::Error>(())
+        }.await;
+        if let Err(error)=result {marketcow_polymarket::async_eprintln!("{}",json!({
+            "stage":"btc_5m_live_stream_closed","observed_at":Utc::now(),"market_id":query.market_id,
+            "stream_id":query.stream_id,"connection_id":socket.connection_id,"last_state_sequence":socket.last_complete_cursor,
+            "error":format!("{error:#}")}));}
+        let _=tokio::time::timeout(api.limits.send_timeout,socket.send(Message::Close(None))).await;
+    })
 }
 fn proto_market_identity(active: &Active, binding: &MarketBinding,
     stream_epoch: Option<&str>) -> proto::MarketIdentity {
@@ -937,6 +1138,16 @@ async fn http_market_full_sync(State(api): State<Api>, Query(query): Query<Marke
         || active.profile.profile_revision != still_active.profile.profile_revision {
         return failure(StatusCode::CONFLICT, "btc_5m_profile_changed", true);
     }
+    let document = market_full_sync_document(&active, binding, &snapshot);
+    drop(permit);
+    match document {
+        Ok(document) => proto_document_response(&document, api.limits.snapshot_bytes),
+        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_snapshot_invalid", true),
+    }
+}
+
+fn market_full_sync_document(active: &Active, binding: &MarketBinding,
+    snapshot: &MarketMemorySnapshot) -> Result<proto::MarketFullSync> {
     let books = binding.outcomes.iter().map(|outcome| -> Result<proto::BookBaseline> {
         let token = &outcome.token_id;
         let book = snapshot.books.get(token);
@@ -961,18 +1172,13 @@ async fn http_market_full_sync(State(api): State<Api>, Query(query): Query<Marke
                 .map(|value| proto_convert::confirmation(&value)).transpose()?,
         })
     }).collect::<Result<Vec<_>>>();
-    let document = books.and_then(|books| Ok(proto::MarketFullSync {
+    books.and_then(|books| Ok(proto::MarketFullSync {
         binding: Some(proto_market_binding(&active, binding, Some(&snapshot.watermark.stream_epoch))?),
         watermark: Some(proto_market_watermark(&active, binding, &snapshot)),
         books,
         market_unavailable_reason: snapshot.capacity_fenced.then(|| "market_persistence_capacity".into()),
         snapshot_is_not_execution_readiness: true,
-    }));
-    drop(permit);
-    match document {
-        Ok(document) => proto_document_response(&document, api.limits.snapshot_bytes),
-        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_snapshot_invalid", true),
-    }
+    }))
 }
 fn required_recovery_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key].as_str().with_context(|| format!("missing recovery {key}"))
@@ -1016,6 +1222,18 @@ async fn http_market_streams(State(api): State<Api>) -> Response {
         profile_revision: active.profile.profile_revision,
         profile_epoch: active.epoch,
         markets, watermarks,
+        live_delivery_budget:Some(proto::LiveDeliveryBudget {
+            maximum_frame_bytes:api.limits.frame_bytes as u64,
+            maximum_group_encoded_bytes:32*1024*1024,
+            maximum_checkpoint_encoded_bytes:api.limits.snapshot_bytes as u64*3,
+            backlog_groups:api.limits.live_backlog_groups as u64,
+            backlog_age_ms:api.limits.live_backlog_age.as_millis() as u64,
+            minimum_checkpoint_interval_ms:250,
+            maximum_connection_checkpoint_frames:marketcow_polymarket::MAX_CONNECTION_CHECKPOINT_FRAMES as u64,
+            maximum_connection_checkpoint_bytes:marketcow_polymarket::MAX_CONNECTION_CHECKPOINT_EVIDENCE_BYTES as u64,
+            maximum_checkpoint_chunk_count:(api.limits.snapshot_bytes*3)
+                .div_ceil(api.limits.frame_bytes-512) as u64,
+        }),
     }, api.limits.snapshot_bytes)
 }
 #[derive(Clone, Deserialize)]
@@ -1442,6 +1660,7 @@ struct MarketStreamQuery {
 
 async fn http_market_stream(
     State(api): State<Api>, Query(query): Query<MarketStreamQuery>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap, ws: WebSocketUpgrade,
 ) -> Response {
     if !headers.get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
@@ -1473,18 +1692,26 @@ async fn http_market_stream(
     if query.after_market_cursor > watermark.published_cursor {
         return failure(StatusCode::CONFLICT, "btc_5m_market_future_cursor", false);
     }
-    if query.after_market_cursor < watermark.replay_floor {
-        return failure(StatusCode::GONE, "btc_5m_market_replay_expired", false);
-    }
     let tokens = binding.outcomes.iter().map(|outcome| outcome.token_id.clone()).collect::<Vec<_>>();
     match api.reader.capture_market(&query.market_id, &tokens) {
         Ok(snapshot) if query.after_confirmation_sequence <= snapshot.confirmation_sequence => {},
         Ok(_) => return failure(StatusCode::BAD_REQUEST, "btc_5m_market_future_confirmation", false),
         Err(_) => return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_unavailable", true),
     }
-    if api.reader.replay_market(&query.market_id, &query.stream_epoch,
-        query.after_market_cursor, 1, api.limits.replay_bytes).is_err() {
-        return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_stream_unavailable", true);
+    if query.after_market_cursor >= watermark.replay_floor {
+        if let Err(error) = api.reader.replay_market(&query.market_id, &query.stream_epoch,
+            query.after_market_cursor, 1, api.limits.replay_bytes) {
+            // A bounded latest-state replacement is a v5 protocol operation,
+            // including reconnects from an evicted applied prefix. Do not
+            // reject that operation before the WS writer can send it.
+            let expired = api.reader.market_stream_watermark(&query.market_id)
+                .ok().flatten().is_some_and(|latest|
+                    latest.stream_epoch == query.stream_epoch
+                    && query.after_market_cursor < latest.replay_floor);
+            if !expired && error.downcast_ref::<crate::source_market_replay::MarketReplayGroupBudget>().is_none() {
+                return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_market_stream_unavailable", true);
+            }
+        }
     }
     // One market's slow or excessive consumers cannot occupy every WS slot
     // needed by current/next. The shared cap remains an absolute bound; each
@@ -1506,14 +1733,24 @@ async fn http_market_stream(
         return failure(StatusCode::SERVICE_UNAVAILABLE, "btc_5m_stream_capacity", true);
     };
     ws.protocols([MARKET_PROTO_SUBPROTOCOL]).max_message_size(4096).max_frame_size(4096)
-        .on_upgrade(move |mut socket| async move {
+        .on_upgrade(move |socket| async move {
             let _permit = permit;
             let _market_permit = market_permit;
+            let mut socket = MarketClientIo::new(socket);
+            socket.diagnostics=Some(api.send_diagnostics.clone());
+            socket.peer=peer.map(|axum::Extension(axum::extract::ConnectInfo(addr))|addr);
+            api.send_diagnostics.record(json!({"stage":"market_send_connection",
+                "observed_at":Utc::now(),"connection_id":socket.connection_id,
+                "peer":socket.peer,"market_id":query.market_id,
+                "stream_epoch":query.stream_epoch,"profile_epoch":query.profile_epoch}));
             if let Err(error) = market_stream(&mut socket, &api, active,
                 profile_changed, binding, query.clone()).await {
                 marketcow_polymarket::async_eprintln!("{}", json!({"stage":"btc_5m_market_stream_closed",
                     "at":Utc::now(),"market_id":query.market_id,
                     "stream_epoch":query.stream_epoch,"initial_after_market_cursor":query.after_market_cursor,
+                    "connection_id":socket.connection_id,
+                    "last_complete_market_cursor":socket.last_complete_cursor,
+                    "in_flight_market_cursor":socket.in_flight_cursor,
                     "error":format!("{error:#}")}));
             }
             // Release this selected market's and the shared WS permits even
@@ -1523,10 +1760,9 @@ async fn http_market_stream(
         })
 }
 
-/// Split only on event boundaries. A consumer must stage all chunks and
-/// validate the group hash before applying a single book update or advancing
-/// its exclusive market cursor. Disconnect in a partial group resumes from
-/// the preceding complete group.
+/// Split an encoded event bundle under the frame budget. A consumer stages
+/// all parts before decoding events and validating the semantic group hash;
+/// only the complete commit can advance its exclusive market cursor.
 fn market_group_frames(active: &Active, query: &MarketStreamQuery,
     market_cursor: u64, group_sha256: &str, events: &[Value],
     frame_bytes: usize) -> Result<Vec<Vec<u8>>> {
@@ -1536,29 +1772,195 @@ fn market_group_frames(active: &Active, query: &MarketStreamQuery,
     proto_convert::encode_market_group(&identity, market_cursor, group_sha256, events, frame_bytes)
 }
 
-async fn send_market_frame(socket: &mut WebSocket, api: &Api, bytes: Vec<u8>) -> Result<DateTime<Utc>> {
-    tokio::time::timeout(api.limits.send_timeout,
-        socket.send(Message::Binary(bytes.into()))).await??;
+/// A bounded control reader runs even while the single data writer awaits
+/// socket capacity. It never queues/forwards live market data or owns state.
+struct MarketClientIo {
+    connection_id: String,
+    last_complete_cursor: u64,
+    in_flight_cursor: Option<u64>,
+    send_trace_budget: (std::time::Instant,u32),
+    writer: futures_util::stream::SplitSink<WebSocket, Message>,
+    controls: tokio::sync::mpsc::Receiver<std::result::Result<Message,String>>,
+    reader: tokio::task::JoinHandle<()>,
+    peer:Option<std::net::SocketAddr>,
+    diagnostics:Option<crate::source_market_send_diagnostic::Diagnostics>,
+    send_trace:SendTrace,
+    send_window_started:std::time::Instant,
+    send_histogram:[u64;8],
+    send_count:u64,
+    send_max_us:u64,
+}
+#[derive(Default,Serialize)]
+struct SendTrace {
+    phase:&'static str,
+    ready_us:u64,
+    start_send_us:u64,
+    flush_us:u64,
+    ready_pending:u64,
+    flush_pending:u64,
+    first_poll_delay_us:u64,
+    // Includes legitimate IO wait; never label this scheduling latency.
+    max_poll_interval_us:u64,
+}
+impl MarketClientIo {
+    fn new(socket: WebSocket) -> Self {
+        let (writer, mut reader) = socket.split();
+        let (tx, controls) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            while let Some(message) = reader.next().await {
+                let message = message.map_err(|error|error.to_string());
+                if matches!(message, Ok(Message::Pong(_))) { continue; }
+                let stop = matches!(message, Ok(Message::Close(_)) | Err(_));
+                if tx.try_send(message).is_err() || stop { break; }
+            }
+        });
+        Self {writer,controls,reader:task,
+            connection_id:uuid::Uuid::new_v4().simple().to_string(),
+            last_complete_cursor:0,in_flight_cursor:None,
+            peer:None,diagnostics:None,send_trace:SendTrace::default(),
+            send_window_started:std::time::Instant::now(),send_histogram:[0;8],
+            send_count:0,send_max_us:0,
+            send_trace_budget:(std::time::Instant::now(),0)}
+    }
+    async fn send(&mut self, message: Message) -> Result<()> {
+        use futures_util::Sink;
+        use std::{pin::Pin,task::Poll};
+        let started=std::time::Instant::now();
+        self.send_trace=SendTrace{phase:"poll_ready",..SendTrace::default()};
+        let mut previous=None;
+        futures_util::future::poll_fn(|cx| {
+            let now=std::time::Instant::now();
+            if let Some(old)=previous {
+                self.send_trace.max_poll_interval_us=self.send_trace.max_poll_interval_us
+                    .max(micros(now.duration_since(old)));
+            } else {self.send_trace.first_poll_delay_us=micros(now.duration_since(started));}
+            previous=Some(now);
+            self.send_trace.ready_us=micros(now.duration_since(started));
+            let result=Pin::new(&mut self.writer).poll_ready(cx);
+            if matches!(result,Poll::Pending){self.send_trace.ready_pending+=1;}
+            result
+        }).await?;
+        self.send_trace.phase="start_send";
+        let writing=std::time::Instant::now();
+        Pin::new(&mut self.writer).start_send(message)?;
+        self.send_trace.start_send_us=micros(writing.elapsed());
+        self.send_trace.phase="poll_flush";
+        let flushing=std::time::Instant::now();
+        previous=None;
+        futures_util::future::poll_fn(|cx| {
+            let now=std::time::Instant::now();
+            if let Some(old)=previous {
+                self.send_trace.max_poll_interval_us=self.send_trace.max_poll_interval_us
+                    .max(micros(now.duration_since(old)));
+            }
+            previous=Some(now);
+            self.send_trace.flush_us=micros(now.duration_since(flushing));
+            let result=Pin::new(&mut self.writer).poll_flush(cx);
+            if matches!(result,Poll::Pending){self.send_trace.flush_pending+=1;}
+            result
+        }).await?;
+        self.send_trace.phase="completed";
+        Ok(())
+    }
+    fn record_data_send(&mut self,bytes:usize,elapsed:Duration,result:&str) {
+        let us=micros(elapsed);
+        // Cancellation may occur between polls. Include the final pending
+        // interval instead of reporting only time up to the last poll.
+        if self.send_trace.phase=="poll_ready" {self.send_trace.ready_us=us;}
+        if self.send_trace.phase=="poll_flush" {
+            self.send_trace.flush_us=us.saturating_sub(self.send_trace.ready_us)
+                .saturating_sub(self.send_trace.start_send_us);
+        }
+        let upper=[1_000,5_000,10_000,50_000,100_000,500_000,1_000_000];
+        let bucket=upper.iter().position(|limit|us<=*limit).unwrap_or(7);
+        self.send_histogram[bucket]+=1;self.send_count+=1;self.send_max_us=self.send_max_us.max(us);
+        let Some(diagnostics)=&self.diagnostics else{return;};
+        if us>=50_000 || result!="ok" {
+            diagnostics.record(json!({"stage":"market_send_detail","observed_at":Utc::now(),
+                "connection_id":self.connection_id,"peer":self.peer,
+                "in_flight_market_cursor":self.in_flight_cursor,
+                "last_complete_market_cursor":self.last_complete_cursor,
+                "frame_bytes":bytes,"result":result,"elapsed_us":us,"trace":self.send_trace}));
+        }
+        if self.send_window_started.elapsed()>=Duration::from_secs(5) {
+            diagnostics.record(json!({"stage":"market_send_window","observed_at":Utc::now(),
+                "connection_id":self.connection_id,"peer":self.peer,
+                "elapsed_us":micros(self.send_window_started.elapsed()),"count":self.send_count,
+                "max_us":self.send_max_us,"bucket_counts":self.send_histogram,
+                "bucket_upper_us":upper,"overflow_bucket":7}));
+            self.send_window_started=std::time::Instant::now();self.send_histogram=[0;8];
+            self.send_count=0;self.send_max_us=0;
+        }
+    }
+    async fn handle_control(&mut self,
+        message: Option<std::result::Result<Message,String>>, timeout: Duration) -> Result<bool> {
+        match message {
+            None | Some(Ok(Message::Close(_))) => Ok(true),
+            Some(Ok(Message::Ping(bytes))) => {
+                tokio::time::timeout(timeout,self.send(Message::Pong(bytes))).await??;
+                Ok(false)
+            }
+            Some(Ok(Message::Pong(_))) => Ok(false),
+            Some(Err(error)) => anyhow::bail!("market client receive: {error}"),
+            _ => anyhow::bail!("unexpected market stream client message"),
+        }
+    }
+}
+impl Drop for MarketClientIo {
+    fn drop(&mut self) {
+        if let Some(diagnostics)=&self.diagnostics {
+            diagnostics.record(json!({"stage":"market_send_connection_finished",
+                "observed_at":Utc::now(),"connection_id":self.connection_id,"peer":self.peer,
+                "last_complete_market_cursor":self.last_complete_cursor,
+                "in_flight_market_cursor":self.in_flight_cursor,
+                "tail_window_elapsed_us":micros(self.send_window_started.elapsed()),
+                "tail_count":self.send_count,"tail_max_us":self.send_max_us,
+                "tail_bucket_counts":self.send_histogram,
+                "bucket_upper_us":[1000,5000,10000,50000,100000,500000,1000000],
+                "overflow_bucket":7}));
+        }
+        self.reader.abort();
+    }
+}
+async fn poll_live_client_control(socket: &mut MarketClientIo, timeout: Duration) -> Result<bool> {
+    loop {
+        match socket.controls.try_recv() {
+            Ok(message) => if socket.handle_control(Some(message),timeout).await? { return Ok(true); },
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(false),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(true),
+        }
+    }
+}
+
+async fn send_market_frame(socket: &mut MarketClientIo, api: &Api, bytes: Vec<u8>) -> Result<DateTime<Utc>> {
+    let count = bytes.len();
+    let started = std::time::Instant::now();
+    let result=tokio::time::timeout(api.limits.send_timeout,
+        socket.send(Message::Binary(bytes.into()))).await;
+    socket.record_data_send(count,started.elapsed(),match &result {
+        Ok(Ok(()))=>"ok",Ok(Err(_))=>"write_error",Err(_)=>"deadline",
+    });
+    result.context("market stream send deadline")??;
+    if socket.send_trace_budget.0.elapsed() >= Duration::from_secs(60) {
+        socket.send_trace_budget = (std::time::Instant::now(),0);
+    }
+    if started.elapsed() >= Duration::from_millis(50) && socket.send_trace_budget.1 < 60 {
+        socket.send_trace_budget.1 += 1;
+        marketcow_polymarket::async_eprintln!("{}",json!({
+            "stage":"market_stream_slow_send","observed_at":Utc::now(),
+            "connection_id":socket.connection_id,"last_complete_market_cursor":socket.last_complete_cursor,
+            "in_flight_market_cursor":socket.in_flight_cursor,"frame_bytes":count,
+            "send_await_us":started.elapsed().as_micros(),
+            "send_trace":socket.send_trace,
+        }));
+    }
     Ok(Utc::now())
 }
 
-// A busy market can have a replay page ready on every iteration. Poll the
-// control side between data frames so that client Ping/Close is not gated on
-// replay catching up. This does not advance a group cursor: a disconnect in
-// the middle of begin/chunk/commit still replays the whole group.
-async fn poll_market_client_control(socket: &mut WebSocket, send_timeout: Duration) -> Result<bool> {
-    match socket.recv().now_or_never() {
-        None | Some(Some(Ok(Message::Pong(_)))) => Ok(false),
-        Some(None | Some(Ok(Message::Close(_)))) => Ok(true),
-        Some(Some(Ok(Message::Ping(bytes)))) => {
-            tokio::time::timeout(send_timeout,
-                socket.send(Message::Pong(bytes))).await??;
-            Ok(false)
-        }
-        Some(Some(Err(error))) => Err(error.into()),
-        Some(Some(Ok(_))) => anyhow::bail!("unexpected market stream client message"),
-    }
+fn micros(duration:Duration)->u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
+
 fn proto_market_frame(active: &Active, binding: &MarketBinding,
     query: &MarketStreamQuery, body: proto::market_stream_frame::Body) -> proto::MarketStreamFrame {
     proto::MarketStreamFrame {
@@ -1566,7 +1968,7 @@ fn proto_market_frame(active: &Active, binding: &MarketBinding,
         body: Some(body),
     }
 }
-async fn send_market_message(socket: &mut WebSocket, api: &Api,
+async fn send_market_message(socket: &mut MarketClientIo, api: &Api,
     frame: proto::MarketStreamFrame) -> Result<()> {
     let bytes = market_proto::encode_frame(&frame, api.limits.frame_bytes)?;
     send_market_frame(socket, api, bytes).await?;
@@ -1648,15 +2050,85 @@ fn market_ready_frame(active: &Active, binding: &MarketBinding,
         })))
 }
 
-async fn market_stream(socket: &mut WebSocket, api: &Api, active: Active,
+fn live_checkpoint_frames(active: &Active, binding: &MarketBinding,
+    query: &MarketStreamQuery, snapshot: &MarketMemorySnapshot,
+    replaces_after: u64, reason: &str, limits: &Limits) -> Result<Vec<Vec<u8>>> {
+    use prost::Message as _;
+    ensure!(snapshot.watermark.stream_epoch == query.stream_epoch
+        && snapshot.watermark.published_cursor > replaces_after,
+        "live checkpoint epoch/prefix");
+    ensure!(matches!(reason, "live_backlog" | "replay_expired"), "checkpoint reason");
+    let document = market_full_sync_document(active, binding, snapshot)?;
+    let books = binding.outcomes.iter().zip(document.books.iter()).map(|(outcome, baseline)| {
+        let token = &outcome.token_id;
+        let book = snapshot.books.get(token);
+        json!({"token_id":token,"canonical_book":book.map(|book|book.as_ref()),
+            "canonical_book_sha256":book.map(|book|canonical_hash(book.as_ref())),
+            "book_market_cursor":snapshot.market_book_cursors.get(token),
+            "book_market_event_cursor":snapshot.event_book_cursors.get(token),
+            "replay_baseline_valid":baseline.replay_baseline_valid,
+            "active_recovery":baseline.active_recovery.as_ref().map(|recovery|json!({
+                "token_id":recovery.token_id,"recovery_id":recovery.recovery_id,
+                "gap_code":recovery.gap_code,"gap_detected_at":recovery.gap_detected_at,
+                "snapshot_cursor":recovery.snapshot_cursor})),
+            "confirmation":market_token_confirmation(snapshot,token)})
+    }).collect::<Vec<_>>();
+    let preimage = json!({
+        "schema_version":"marketcow.polymarket.live-checkpoint.v1",
+        "market_id":query.market_id,"stream_epoch":query.stream_epoch,
+        "profile_epoch":active.epoch,"profile_id":active.profile.profile_id,
+        "profile_revision":active.profile.profile_revision,"binding":binding,
+        "replaces_after_market_cursor":replaces_after,
+        "market_cursor":snapshot.watermark.published_cursor,
+        "last_market_event_cursor":snapshot.last_market_event_cursor,
+        "confirmation_sequence":snapshot.confirmation_sequence,"reason":reason,"books":books,
+    });
+    let digest = proto_convert::hash32(&canonical_hash(&preimage))?;
+    let checkpoint = proto::LiveCheckpoint { snapshot:Some(document),
+        replaces_after_market_cursor:replaces_after,
+        last_market_event_cursor:snapshot.last_market_event_cursor,
+        reason:reason.into(),semantic_preimage_json:proto_convert::canonical_json_bytes(&preimage)?,
+        semantic_sha256:digest.clone() };
+    // Material and transport have explicit separate budgets. The preimage is
+    // audit evidence embedded in this sole feed, not another live JSON feed.
+    let encoded = checkpoint.encode_to_vec();
+    ensure!(encoded.len() <= limits.snapshot_bytes.checked_mul(3)
+        .context("checkpoint byte budget overflow")?, "checkpoint byte budget");
+    let chunk_bytes = limits.frame_bytes.checked_sub(512).context("checkpoint frame budget")?;
+    let checkpoint_id = hex::encode(&digest);
+    let count = u32::try_from(encoded.len().div_ceil(chunk_bytes))?;
+    let mut frames = Vec::with_capacity(count as usize + 2);
+    frames.push(market_proto::encode_frame(&proto_market_frame(active,binding,query,
+        proto::market_stream_frame::Body::CheckpointBegin(proto::CheckpointBegin {
+            checkpoint_id:checkpoint_id.clone(),replaces_after_market_cursor:replaces_after,
+            market_cursor:snapshot.watermark.published_cursor,chunk_count:count,
+            encoded_bytes:encoded.len() as u64,semantic_sha256:digest.clone(),
+        })), limits.frame_bytes)?);
+    for (index, part) in encoded.chunks(chunk_bytes).enumerate() {
+        frames.push(market_proto::encode_frame(&proto_market_frame(active,binding,query,
+            proto::market_stream_frame::Body::CheckpointChunk(proto::CheckpointChunk {
+                checkpoint_id:checkpoint_id.clone(),chunk_index:index as u32,
+                encoded_checkpoint_part:part.to_vec(),
+            })),limits.frame_bytes)?);
+    }
+    frames.push(market_proto::encode_frame(&proto_market_frame(active,binding,query,
+        proto::market_stream_frame::Body::CheckpointCommit(proto::CheckpointCommit {
+            checkpoint_id,market_cursor:snapshot.watermark.published_cursor,semantic_sha256:digest,
+        })),limits.frame_bytes)?);
+    Ok(frames)
+}
+
+async fn market_stream(socket: &mut MarketClientIo, api: &Api, active: Active,
     mut profile_changed: watch::Receiver<u64>, binding: MarketBinding,
     query: MarketStreamQuery) -> Result<()> {
     let mut changed = api.reader.subscribe_market(&query.market_id, &query.stream_epoch)?;
-    let connection_id = uuid::Uuid::new_v4().simple().to_string();
+    let connection_id = socket.connection_id.clone();
     let mut cursor = query.after_market_cursor;
+    socket.last_complete_cursor = cursor;
     let mut ready_sent = false;
     let mut last_confirmation = query.after_confirmation_sequence;
     let mut last_confirmation_sent_at = std::time::Instant::now() - CONFIRMATION_MIN_INTERVAL;
+    let mut last_checkpoint_at = std::time::Instant::now() - Duration::from_secs(1);
     let tokens = binding.outcomes.iter().map(|outcome|outcome.token_id.clone()).collect::<Vec<_>>();
     // Freeze a causal ready prefix once. Requiring an empty live replay page
     // would make a liquid market unable to become ready while new groups keep
@@ -1669,7 +2141,7 @@ async fn market_stream(socket: &mut WebSocket, api: &Api, active: Active,
     ensure!(cursor <= ready_target, "market ready snapshot precedes requested cursor");
     let mut ready_snapshot = Some(initial_snapshot);
     loop {
-        if poll_market_client_control(socket, api.limits.send_timeout).await? { return Ok(()); }
+        if poll_live_client_control(socket, api.limits.send_timeout).await? { return Ok(()); }
         changed.borrow_and_update();
         if *profile_changed.borrow() != active.profile.profile_revision {
             let next = api.control.active()?;
@@ -1683,7 +2155,7 @@ async fn market_stream(socket: &mut WebSocket, api: &Api, active: Active,
                 }))).await?;
             return Ok(());
         }
-        let fence = api.reader.capture_market(&query.market_id, &tokens)?;
+        let mut fence = api.reader.capture_market(&query.market_id, &tokens)?;
         if fence.capacity_fenced {
             send_market_message(socket, api, proto_market_frame(&active, &binding, &query,
                 proto::market_stream_frame::Body::Unavailable(proto::MarketUnavailable {
@@ -1710,18 +2182,106 @@ async fn market_stream(socket: &mut WebSocket, api: &Api, active: Active,
         let maximum_groups = if ready_sent { 16 } else {
             usize::try_from((ready_target - cursor).min(16))?
         };
-        let page = api.reader.replay_market(&query.market_id, &query.stream_epoch,
-            cursor, maximum_groups, api.limits.replay_bytes)?;
+        let mut expired = cursor < fence.watermark.replay_floor;
+        let mut oversized_group = false;
+        let group_backlog = fence.watermark.published_cursor.saturating_sub(cursor)
+            > api.limits.live_backlog_groups as u64;
+        let page = if expired { None } else {
+            match api.reader.replay_market(&query.market_id, &query.stream_epoch,
+                cursor, maximum_groups, api.limits.replay_bytes) {
+                Ok(page) => Some(page),
+                Err(error) => {
+                    // Eviction can race the preceding capture. Recheck the
+                    // actual floor, never classify every read error as expiry.
+                    fence = api.reader.capture_market(&query.market_id,&tokens)?;
+                    if cursor < fence.watermark.replay_floor {
+                        expired = true;
+                        None
+                    } else if error.downcast_ref::<crate::source_market_replay::MarketReplayGroupBudget>().is_some() {
+                        oversized_group = true;
+                        None
+                    } else { return Err(error); }
+                }
+            }
+        };
+        let aged_prefix = page.as_ref().and_then(|page|page.groups.first())
+            .and_then(|group|group.payload.timing_snapshot())
+            .and_then(|timing|timing.shared_replay_visible_mono)
+            .is_some_and(|at|at.elapsed() >= api.limits.live_backlog_age);
+        if (expired || oversized_group) && last_checkpoint_at.elapsed() < Duration::from_millis(250) {
+            let wait = Duration::from_millis(250).saturating_sub(last_checkpoint_at.elapsed());
+            tokio::select! {
+                _=tokio::time::sleep(wait)=>{},
+                result=profile_changed.changed()=>result.context("profile control closed during checkpoint pacing")?,
+                message=socket.controls.recv()=> {
+                    if socket.handle_control(message,api.limits.send_timeout).await? { return Ok(()); }
+                }
+            }
+            continue;
+        }
+        if expired || oversized_group || ((group_backlog || aged_prefix)
+            && last_checkpoint_at.elapsed() >= Duration::from_millis(250)) {
+            let reason = if expired { "replay_expired" } else { "live_backlog" };
+            let checkpoint_cursor = fence.watermark.published_cursor;
+            let encoder_active = active.clone();
+            let encoder_binding = binding.clone();
+            let encoder_query = query.clone();
+            let encoder_snapshot = fence.clone();
+            let encoder_limits = api.limits.clone();
+            // One bounded encoder job per admitted connection. Serialization
+            // never executes on a socket-reader task or holds a replay lane.
+            let frames = tokio::task::spawn_blocking(move || live_checkpoint_frames(
+                &encoder_active,&encoder_binding,&encoder_query,&encoder_snapshot,
+                cursor,reason,&encoder_limits)).await.context("checkpoint encoder stopped")??;
+            if *profile_changed.borrow() != active.profile.profile_revision { continue; }
+            socket.in_flight_cursor = Some(checkpoint_cursor);
+            let sent_start = std::time::Instant::now();
+            for frame in frames {
+                if poll_live_client_control(socket,api.limits.send_timeout).await? { return Ok(()); }
+                send_market_frame(socket,api,frame).await?;
+            }
+            // No intervening mutation/confirmation escapes this writer. Only
+            // commit completes replacement; on partial send the consumer
+            // discards it and reconnects from its last applied prefix.
+            marketcow_polymarket::async_eprintln!("{}",json!({
+                "stage":"market_live_checkpoint_sent","observed_at":Utc::now(),
+                "connection_id":connection_id,"profile_epoch":active.epoch,
+                "market_id":query.market_id,"stream_epoch":query.stream_epoch,
+                "reason":reason,"replaces_after_market_cursor":cursor,
+                "market_cursor":checkpoint_cursor,"send_elapsed_us":sent_start.elapsed().as_micros(),
+            }));
+            cursor = checkpoint_cursor;
+            socket.last_complete_cursor = cursor;
+            socket.in_flight_cursor = None;
+            last_confirmation = fence.confirmation_sequence;
+            last_checkpoint_at = std::time::Instant::now();
+            if !ready_sent {
+                send_market_message(socket,api,
+                    market_ready_frame(&active,&binding,&query,&fence,cursor)?).await?;
+                ready_sent = true;
+                ready_snapshot = None;
+            }
+            continue;
+        }
+        let page = page.context("market replay page unavailable without checkpoint")?;
         for group in &page.groups {
             if *profile_changed.borrow() != active.profile.profile_revision {
                 // Do not start another group under a superseded profile.
                 break;
             }
-            let frames = market_group_frames(&active, &query, group.market_cursor,
-                &group.group_sha256, group.payload.validated.events(), api.limits.frame_bytes)?;
+            let encoder_active = active.clone();
+            let encoder_query = query.clone();
+            let encoder_group = group.clone();
+            let frame_bytes = api.limits.frame_bytes;
+            let frames = tokio::task::spawn_blocking(move || market_group_frames(
+                &encoder_active,&encoder_query,encoder_group.market_cursor,
+                &encoder_group.group_sha256,encoder_group.payload.validated.events(),frame_bytes))
+                .await.context("market group encoder stopped")??;
+            if *profile_changed.borrow() != active.profile.profile_revision { break; }
+            socket.in_flight_cursor = Some(group.market_cursor);
             let mut group_sent_at = None;
             for frame in frames {
-                if poll_market_client_control(socket, api.limits.send_timeout).await? { return Ok(()); }
+                if poll_live_client_control(socket, api.limits.send_timeout).await? { return Ok(()); }
                 group_sent_at = Some(send_market_frame(socket, api, frame).await?);
             }
             // A partial begin/chunk transmission is never an applied group.
@@ -1759,6 +2319,8 @@ async fn market_stream(socket: &mut WebSocket, api: &Api, active: Active,
                 });
             }
             cursor = group.market_cursor;
+            socket.last_complete_cursor = cursor;
+            socket.in_flight_cursor = None;
         }
         if *profile_changed.borrow() == active.profile.profile_revision {
             ensure!(cursor == page.next_cursor, "market replay page boundary differs");
@@ -1783,14 +2345,8 @@ async fn market_stream(socket: &mut WebSocket, api: &Api, active: Active,
             result=changed.changed()=>result.context("publication closed")?,
             result=profile_changed.changed()=>result.context("BTC 5m profile control closed")?,
             _=tokio::time::sleep(confirmation_wait), if confirmation.is_some() && !confirmation_wait.is_zero() => {},
-            message=socket.recv()=>match message {
-                None | Some(Ok(Message::Close(_))) => return Ok(()),
-                Some(Ok(Message::Ping(bytes))) => {
-                    tokio::time::timeout(api.limits.send_timeout,
-                        socket.send(Message::Pong(bytes))).await??;
-                },
-                Some(Ok(Message::Pong(_))) => {},
-                _ => anyhow::bail!("unexpected market stream client message"),
+            message=socket.controls.recv()=> {
+                if socket.handle_control(message,api.limits.send_timeout).await? { return Ok(()); }
             }
         }
     }
@@ -1827,6 +2383,161 @@ fn confirmation_wait(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn v6_formal_routes_emit_ordinary_snapshot_and_preserve_role_identity() {
+        use prost::Message as _;
+        use futures_util::{SinkExt,StreamExt};
+        use marketcow_contracts::btc5m_market_local_v6::{self as live,wire};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest,Message as ClientMessage};
+        let publication=crate::source_publication::Publication::start(0,None,BTreeMap::new(),
+            8,131072,65536,|_|Ok(())).unwrap();
+        let (router,control)=Api::router(publication.reader(),profile(),"epoch".into(),Limits {
+            live_backlog_groups:8,live_backlog_age:Duration::from_millis(100),snapshot_bytes:65536,
+            frame_bytes:4096,replay_bytes:65536,clients:3,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
+        }).unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {axum::serve(listener,router).await.unwrap();});
+        let root=format!("http://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws");
+        let http=reqwest::Client::new();
+        let response=tokio::time::timeout(Duration::from_secs(2),async {
+            loop {
+                let response=http.get(format!("{root}/market-streams")).send().await.unwrap();
+                if response.status()==StatusCode::OK {break response}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(response.status(),StatusCode::OK);
+        let discovery=wire::MarketStreams::decode(response.bytes().await.unwrap()).unwrap();
+        assert_eq!(discovery.schema_version,live::SCHEMA_VERSION);
+        assert_eq!(discovery.delivery_budget.unwrap().maximum_frame_bytes,8388608);
+        let binding=&discovery.markets[0];let key=binding.key.as_ref().unwrap();
+        let response=http.get(format!("{root}/market-full-sync?market_id={}",key.market_id)).send().await.unwrap();
+        assert_eq!(response.headers()["cache-control"],"no-store");
+        let snapshot=wire::MarketFrame::decode(response.bytes().await.unwrap()).unwrap();
+        assert_eq!(snapshot.stream_id,binding.stream_id);
+        assert!(matches!(snapshot.body,Some(wire::market_frame::Body::Snapshot(_))));
+        let mut request=format!("ws://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-stream?market_id={}&stream_id={}",key.market_id,binding.stream_id).into_client_request().unwrap();
+        request.headers_mut().insert("sec-websocket-protocol",live::SUBPROTOCOL.parse().unwrap());
+        let (mut ws,response)=tokio_tungstenite::connect_async(request).await.unwrap();
+        assert_eq!(response.headers()["sec-websocket-protocol"],live::SUBPROTOCOL);
+        let message=tokio::time::timeout(Duration::from_secs(2),ws.next()).await.unwrap().unwrap().unwrap();
+        let ClientMessage::Binary(bytes)=message else {panic!("first ordinary snapshot");};
+        let first=wire::MarketFrame::decode(bytes).unwrap();
+        assert_eq!(first.stream_id,binding.stream_id);
+        assert!(matches!(first.body,Some(wire::market_frame::Body::Snapshot(_))));
+        assert_eq!(control.live_identity(&control.profile().unwrap().markets[0]).unwrap().1,binding.stream_id);
+        let _=ws.close(None).await;server.abort();publication.finish().await.unwrap();
+    }
+    #[test]
+    fn live_checkpoint_serializer_has_atomic_segments_and_semantic_hash() {
+        use prost::Message as _;
+        use sha2::{Digest,Sha256};
+        let active = Active {profile:Arc::new(profile()),epoch:"1".repeat(32)};
+        let binding = &active.profile.markets[0];
+        let query = MarketStreamQuery {market_id:binding.market_id.clone(),
+            stream_epoch:"2".repeat(32),profile_epoch:active.epoch.clone(),
+            after_market_cursor:4,after_confirmation_sequence:0};
+        let mut books = BTreeMap::new();
+        for outcome in &binding.outcomes {
+            let bids = json!([{"price":"0.4","size":"10"}]);
+            let asks = json!([{"price":"0.6","size":"10"}]);
+            let checksum = canonical_hash(&json!({"token_id":outcome.token_id,
+                "tick_size":"0.01","bids":bids,"asks":asks}));
+            books.insert(outcome.token_id.clone(),Arc::new(json!({
+                "token_id":outcome.token_id,"condition_id":binding.condition_id,
+                "book_epoch":"3".repeat(64),"sequence":1,
+                "sequence_semantics":"deterministic_normalized",
+                "exchange_at":"2026-10-09T00:00:00Z","received_at":"2026-10-09T00:00:00.100000Z",
+                "tick_version":canonical_hash(&json!({"tick_size":"0.01"})),
+                "tick_size":"0.01","bids":bids,"asks":asks,"last_trade_price":null,
+                "state_checksum":checksum,"source_hash":"venue-fixture"})));
+        }
+        let snapshot = MarketMemorySnapshot {
+            watermark:crate::source_publication::MarketStreamWatermark {
+                stream_epoch:query.stream_epoch.clone(),market_id:query.market_id.clone(),
+                published_cursor:64,durable_cursor:0,replay_floor:32},
+            last_market_event_cursor:129,market:None,books,
+            physical_book_cursors:BTreeMap::new(),
+            trade_source_times:BTreeMap::new(),
+            event_book_cursors:[("10".into(),128),("20".into(),129)].into(),
+            market_book_cursors:[("10".into(),64),("20".into(),64)].into(),
+            recoveries:BTreeMap::new(),unresolved_seed_gaps:BTreeSet::new(),capacity_fenced:false,
+            confirmation_sequence:0,confirmation_facts:BTreeMap::new(),
+            market_confirmation_versions:BTreeMap::new(),
+        };
+        let limits = Limits {snapshot_bytes:65536,frame_bytes:4096,replay_bytes:65536,
+            clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
+            live_backlog_groups:64,live_backlog_age:Duration::from_millis(500)};
+        let frames = live_checkpoint_frames(&active,binding,&query,&snapshot,4,"replay_expired",&limits).unwrap();
+        let decoded = frames.iter().map(|bytes|proto::MarketStreamFrame::decode(bytes.as_slice()).unwrap())
+            .collect::<Vec<_>>();
+        let proto::market_stream_frame::Body::CheckpointBegin(begin) = decoded[0].body.as_ref().unwrap() else {panic!("begin")};
+        let proto::market_stream_frame::Body::CheckpointCommit(commit) = decoded.last().unwrap().body.as_ref().unwrap() else {panic!("commit")};
+        assert_eq!(begin.checkpoint_id,commit.checkpoint_id);
+        assert_eq!(begin.semantic_sha256,commit.semantic_sha256);
+        let mut encoded = Vec::new();
+        for (index,frame) in decoded[1..decoded.len()-1].iter().enumerate() {
+            let proto::market_stream_frame::Body::CheckpointChunk(chunk) = frame.body.as_ref().unwrap() else {panic!("chunk")};
+            assert_eq!(chunk.checkpoint_id,begin.checkpoint_id);
+            assert_eq!(chunk.chunk_index,index as u32);
+            encoded.extend_from_slice(&chunk.encoded_checkpoint_part);
+        }
+        assert_eq!(encoded.len() as u64,begin.encoded_bytes);
+        assert_eq!(decoded.len() as u32-2,begin.chunk_count);
+        let checkpoint = proto::LiveCheckpoint::decode(encoded.as_slice()).unwrap();
+        assert_eq!(Sha256::digest(&checkpoint.semantic_preimage_json).as_slice(),begin.semantic_sha256);
+        assert_eq!(checkpoint.last_market_event_cursor,129);
+        let restored = checkpoint.snapshot.unwrap();
+        assert_eq!(restored.books.len(),2);
+        assert_eq!(restored.watermark.unwrap().published_market_cursor,Some(64));
+        assert!(restored.books.iter().all(|book|book.confirmation.is_none()));
+        let vector = json!({
+            "schema_version":"marketcow.polymarket.live-checkpoint-vector.v1",
+            "frames_hex":frames.iter().map(hex::encode).collect::<Vec<_>>()
+        });
+        let fixed:Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/btc-5m-live-checkpoint-v5.json")).unwrap();
+        assert_eq!(vector,fixed);
+        println!("MARKETCOW_LIVE_CHECKPOINT_VECTOR={vector}");
+        assert!(live_checkpoint_frames(&active,binding,&query,&snapshot,64,"live_backlog",&limits).is_err());
+        let mut recovering = snapshot.clone();
+        for (index,outcome) in binding.outcomes.iter().enumerate() {
+            recovering.recoveries.insert(outcome.token_id.clone(),json!({
+                "recovery_id":format!("recovery-{index}"),
+                "snapshot_cursor":if index == 0 {Some(128_u64)} else {None},
+                "gap":{"code":"coverage_gap","detected_at":"2026-10-09T00:00:01Z",
+                    "diagnostic_only":"not carried by RecoveryState"},
+                "extra_native_detail":"not a typed recovery commitment"}));
+        }
+        let frames = live_checkpoint_frames(&active,binding,&query,&recovering,4,"replay_expired",&limits).unwrap();
+        let mut encoded = Vec::new();
+        for bytes in &frames {
+            let frame = proto::MarketStreamFrame::decode(bytes.as_slice()).unwrap();
+            if let Some(proto::market_stream_frame::Body::CheckpointChunk(chunk)) = frame.body {
+                encoded.extend_from_slice(&chunk.encoded_checkpoint_part);
+            }
+        }
+        let checkpoint = proto::LiveCheckpoint::decode(encoded.as_slice()).unwrap();
+        let semantic:Value = serde_json::from_slice(&checkpoint.semantic_preimage_json).unwrap();
+        assert_eq!(Sha256::digest(&checkpoint.semantic_preimage_json).as_slice(),checkpoint.semantic_sha256);
+        for (row,baseline) in semantic["books"].as_array().unwrap().iter()
+            .zip(checkpoint.snapshot.as_ref().unwrap().books.iter()) {
+            let recovery = baseline.active_recovery.as_ref().unwrap();
+            assert_eq!(row["active_recovery"],json!({"token_id":recovery.token_id,
+                "recovery_id":recovery.recovery_id,"gap_code":recovery.gap_code,
+                "gap_detected_at":recovery.gap_detected_at,"snapshot_cursor":recovery.snapshot_cursor}));
+            assert_eq!(row["replay_baseline_valid"],json!(baseline.replay_baseline_valid));
+            assert_eq!(row["active_recovery"].as_object().unwrap().len(),5);
+        }
+        let vector = json!({"schema_version":"marketcow.polymarket.live-checkpoint-recovery-vector.v1",
+            "semantic_preimage":semantic,"frames_hex":frames.iter().map(hex::encode).collect::<Vec<_>>()});
+        let fixed:Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/btc-5m-live-checkpoint-recovery-v5.json")).unwrap();
+        assert_eq!(vector,fixed);
+        println!("MARKETCOW_LIVE_CHECKPOINT_RECOVERY_VECTOR={vector}");
+    }
+
     #[test]
     fn twelve_stream_clients_allow_three_per_market_plus_one_spare() {
         let limits = Limits {
@@ -1835,7 +2546,7 @@ mod tests {
             replay_bytes: 65_536,
             clients: 12,
             send_timeout: Duration::from_secs(1),
-            snapshot_lease_capacity: 1,
+            snapshot_lease_capacity: 1, live_backlog_groups:64, live_backlog_age:Duration::from_millis(500),
         };
         assert!(limits.validate().is_ok());
         assert_eq!(market_stream_client_limit(limits.clients), 4);
@@ -1908,14 +2619,111 @@ mod tests {
     use prost::Message as _;
     use tower::ServiceExt;
     #[tokio::test]
+    async fn ordinary_latest_snapshot_keeps_same_socket_then_delivers_next_state() {
+        use futures_util::{SinkExt,StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest,Message as ClientMessage};
+        use marketcow_contracts::btc5m_market_local_v6::{self as live,wire};
+        let mut p = profile();
+        let start=Utc::now().timestamp().div_euclid(300)*300;
+        for b in &mut p.markets {
+            let offset=match b.role {WindowRole::Current=>0,WindowRole::Next=>300,WindowRole::Retiring=>-300};
+            let at=start+offset;
+            b.start_at=chrono::DateTime::from_timestamp(at,0).unwrap().to_rfc3339();
+            b.end_at=chrono::DateTime::from_timestamp(at+300,0).unwrap().to_rfc3339();
+            b.window_id=format!("btc-updown-5m-{at}");
+        }
+        p.profile_id=p.expected_id();
+        let binding = p.markets[0].clone();
+        let seed = json!({"latest_cursor":0,"catalog_revision":"a".repeat(64),
+            "gaps":[],"books":[],"markets":[market(&binding.market_id,
+                &binding.condition_id,&binding.outcomes[0].token_id,&binding.outcomes[1].token_id)]});
+        let tokens = binding.outcomes.iter().map(|outcome|
+            (outcome.token_id.clone(),binding.market_id.clone())).collect();
+        let mut publication = Publication::start(0,Some(seed),tokens,64,
+            8*1024*1024,1024*1024,|_|Ok(())).unwrap();
+        let publish_pair = |publication:&Publication, group:u64| {
+            let received_at = Utc::now();
+            let events = binding.outcomes.iter().enumerate().map(|(index,outcome)|
+                snapshot_event(&json!({"asset_id":outcome.token_id,"market":binding.condition_id,
+                    "tick_size":"0.01","timestamp":received_at.timestamp_millis().to_string(),
+                    "hash":format!("source-{group}-{index}"),
+                    "bids":[{"price":"0.4","size":group.to_string()}],
+                    "asks":[{"price":"0.6","size":"10"}]}),SnapshotBoundary {
+                        market_id:&binding.market_id,condition_id:&binding.condition_id,
+                        token_id:&outcome.token_id,recovery_id:"loopback",cursor:group*2-1+index as u64,
+                        received_at}).unwrap()).collect();
+            publication.publish_native_events(events,None).unwrap();
+        };
+        for group in 1..=7 { publish_pair(&publication,group); }
+        let (router,_) = Api::router(publication.reader(),p,"loopback-profile".into(),Limits {
+            snapshot_bytes:65536,frame_bytes:4096,replay_bytes:65536,clients:2,
+            send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
+            live_backlog_groups:2,live_backlog_age:Duration::from_secs(10)}).unwrap();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {axum::serve(listener,router).await.unwrap()});
+        let http=reqwest::Client::new();
+        let discovery=tokio::time::timeout(Duration::from_secs(3),async {
+            loop {
+                let response=http.get(format!("http://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-streams")).send().await.unwrap();
+                if response.status()==StatusCode::OK {
+                    break wire::MarketStreams::decode(response.bytes().await.unwrap()).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        let discovered=discovery.markets.iter().find(|m|m.key.as_ref().unwrap().market_id==binding.market_id).unwrap();
+        let mut request=format!("ws://{address}/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-stream?market_id={}&stream_id={}",
+            binding.market_id,discovered.stream_id).into_client_request().unwrap();
+        request.headers_mut().insert("sec-websocket-protocol",live::SUBPROTOCOL.parse().unwrap());
+        let (mut client,_)=tokio_tungstenite::connect_async(request).await.unwrap();
+        let initial=tokio::time::timeout(Duration::from_secs(3),async {
+            loop {
+                if let ClientMessage::Binary(bytes)=client.next().await.unwrap().unwrap() {
+                    break wire::MarketFrame::decode(bytes).unwrap();
+                }
+            }
+        }).await.unwrap();
+        let Some(wire::market_frame::Body::Snapshot(snapshot))=initial.body else {panic!("ordinary initial snapshot");};
+        assert_eq!(snapshot.source_status,"available");
+        assert!(snapshot.books.iter().all(|book|book.bids[0].size=="7"));
+        publish_pair(&publication,8);
+        client.send(ClientMessage::Ping(vec![7,8].into())).await.unwrap();
+        let mut pong=false;
+        let mut updated=false;
+        tokio::time::timeout(Duration::from_secs(3),async {
+            while !pong || !updated {
+                match client.next().await.unwrap().unwrap() {
+                    ClientMessage::Pong(bytes)=>{assert_eq!(bytes.as_ref(),[7,8]);pong=true;}
+                    ClientMessage::Binary(bytes)=>{
+                        let frame=wire::MarketFrame::decode(bytes).unwrap();
+                        assert_eq!(frame.stream_id,discovered.stream_id);
+                        if frame.state_sequence<=initial.state_sequence {continue}
+                        updated=match frame.body.unwrap() {
+                            wire::market_frame::Body::Snapshot(snapshot)=>
+                                snapshot.books.iter().all(|book|book.bids.first().is_some_and(|b|b.size=="8")),
+                            wire::market_frame::Body::PriceChange(delta)=>
+                                delta.changes.iter().any(|change|change.side=="BUY" && change.size=="8"),
+                        };
+                    }
+                    other=>panic!("unexpected ordinary socket frame {other:?}"),
+                }
+            }
+        }).await.unwrap();
+        client.close(None).await.unwrap();
+        server.abort();
+        publication.finish().await.unwrap();
+    }
+    #[tokio::test]
     async fn busy_market_replay_loop_still_replies_to_client_ping() {
         use futures_util::{SinkExt, StreamExt};
         async fn probe(ws: WebSocketUpgrade) -> impl IntoResponse {
-            ws.on_upgrade(|mut socket| async move {
+            ws.on_upgrade(|socket| async move {
+                let mut socket = MarketClientIo::new(socket);
                 // Model a replay loop that always has another page: there is
                 // no caught-up wait or blocking receive in this loop.
                 loop {
-                    match poll_market_client_control(&mut socket, Duration::from_secs(1)).await {
+                    match poll_live_client_control(&mut socket, Duration::from_secs(1)).await {
                         Ok(false) => tokio::task::yield_now().await,
                         _ => break,
                     }
@@ -1972,14 +2780,15 @@ mod tests {
             };
             assert_eq!(chunk.chunk_index, index as u32);
             assert_eq!(chunk.chunk_count, (parsed.len()-2) as u32);
-            rebuilt.extend(chunk.events.iter().cloned());
+            rebuilt.extend_from_slice(&chunk.encoded_events_part);
         }
-        assert_eq!(rebuilt, events.iter().map(proto_convert::market_event)
+        let rebuilt = proto::MarketEventBundle::decode(rebuilt.as_slice()).unwrap();
+        assert_eq!(rebuilt.events, events.iter().map(proto_convert::market_event)
             .collect::<Result<Vec<_>>>().unwrap());
         let mut too_large = source;
         too_large["canonical_payload"]["source_hash"] = json!("x".repeat(5000));
         assert!(market_group_frames(&active, &query, 8, &"b".repeat(64),
-            &[too_large], 4096).is_err());
+            &[too_large], 4096).is_ok());
     }
     #[test]
     fn native_market_group_wire_uses_local_event_cursor() {
@@ -2008,8 +2817,9 @@ mod tests {
         let Some(proto::market_stream_frame::Body::GroupChunk(chunk)) = &frames[1].body else {
             panic!("expected market group chunk")
         };
-        assert_eq!(chunk.events[0].market_event_cursor, 1);
-        assert_eq!(chunk.events[0], proto_convert::market_event(&events[0]).unwrap());
+        let bundle = proto::MarketEventBundle::decode(chunk.encoded_events_part.as_slice()).unwrap();
+        assert_eq!(bundle.events[0].market_event_cursor, 1);
+        assert_eq!(bundle.events[0], proto_convert::market_event(&events[0]).unwrap());
         let Some(proto::market_stream_frame::Body::GroupCommit(commit)) = &frames[2].body else {
             panic!("expected market group commit")
         };
@@ -2021,7 +2831,7 @@ mod tests {
             8, 131072, 65536, |_| Ok(())).unwrap();
         let (_, control) = Api::router(publication.reader(), profile(), "epoch".into(), Limits {
             snapshot_bytes: 65536, frame_bytes: 65536, replay_bytes: 65536,
-            clients: 1, send_timeout: Duration::from_secs(1), snapshot_lease_capacity: 1,
+            clients: 1, send_timeout: Duration::from_secs(1), snapshot_lease_capacity: 1, live_backlog_groups:64, live_backlog_age:Duration::from_millis(500),
         }).unwrap();
         let first = Utc.with_ymd_and_hms(2026, 10, 1, 22, 40, 0).unwrap();
         let renewed = first + chrono::Duration::seconds(40);
@@ -2184,6 +2994,7 @@ mod tests {
             books:BTreeMap::from([(token.clone(), Arc::new(book(&token,"condition",
                 "2026-09-26T05:30:01Z")))]),
             physical_book_cursors:BTreeMap::from([(token.clone(),43)]),
+            trade_source_times:BTreeMap::new(),
             event_book_cursors:BTreeMap::from([(token.clone(),43)]),
             market_book_cursors:BTreeMap::from([(token.clone(),2)]),
             recoveries:BTreeMap::new(),unresolved_seed_gaps:BTreeSet::new(),capacity_fenced:false,
@@ -2215,6 +3026,7 @@ mod tests {
             books:BTreeMap::from([(token.clone(), Arc::new(book(&token,"condition",
                 "2026-09-26T05:30:01Z")))]),
             physical_book_cursors:BTreeMap::new(),
+            trade_source_times:BTreeMap::new(),
             event_book_cursors:BTreeMap::from([(token.clone(),43)]),
             market_book_cursors:BTreeMap::from([(token.clone(),2)]),
             recoveries:BTreeMap::new(),unresolved_seed_gaps:BTreeSet::new(),capacity_fenced:false,
@@ -2264,6 +3076,7 @@ mod tests {
             last_market_event_cursor:43, market:None,
             books:BTreeMap::from([(token.clone(), Arc::new(stale))]),
             physical_book_cursors:BTreeMap::new(),
+            trade_source_times:BTreeMap::new(),
             event_book_cursors:BTreeMap::from([(token.clone(),43)]),
             market_book_cursors:BTreeMap::from([(token.clone(),2)]),
             recoveries:BTreeMap::new(),unresolved_seed_gaps:BTreeSet::new(),capacity_fenced:false,
@@ -2460,7 +3273,7 @@ mod tests {
                 replay_bytes: 65536,
                 clients: 1,
                 send_timeout: Duration::from_secs(1),
-                snapshot_lease_capacity: 1,
+                snapshot_lease_capacity: 1, live_backlog_groups:64, live_backlog_age:Duration::from_millis(500),
             },
         )
         .unwrap();
@@ -2572,7 +3385,7 @@ mod tests {
         assert_eq!(before.published_cursor, 1);
         let (_,control)=Api::router(publication.reader(),incumbent.clone(),"old-epoch".into(),
             Limits{snapshot_bytes:65536,frame_bytes:65536,replay_bytes:65536,
-                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1})
+                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,live_backlog_groups:64,live_backlog_age:Duration::from_millis(500)})
             .unwrap();
         let mut unrelated=incumbent.clone();
         unrelated.profile_revision+=1;
@@ -2612,7 +3425,7 @@ mod tests {
         let (_,three_window_control)=Api::router(publication.reader(),expanded.clone(),
             "three-window-epoch".into(),Limits{snapshot_bytes:65536,frame_bytes:65536,
                 replay_bytes:65536,clients:1,send_timeout:Duration::from_secs(1),
-                snapshot_lease_capacity:1}).unwrap();
+                snapshot_lease_capacity:1,live_backlog_groups:64,live_backlog_age:Duration::from_millis(500)}).unwrap();
         let mut contracted=valid;
         contracted.profile_revision=expanded.profile_revision+1;
         contracted.profile_id=contracted.expected_id();
@@ -2649,7 +3462,7 @@ mod tests {
         incumbent.profile_id=incumbent.expected_id();
         let (_,control)=Api::router(publication.reader(),incumbent.clone(),"initial".into(),
             Limits{snapshot_bytes:65536,frame_bytes:65536,replay_bytes:65536,
-                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1})
+                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,live_backlog_groups:64,live_backlog_age:Duration::from_millis(500)})
             .unwrap();
         for index in 0..10_000_usize {
             let now=Utc.timestamp_opt(base+index as i64*300+1,0).single().unwrap();
@@ -2860,10 +3673,10 @@ mod tests {
         publication.finish().await.unwrap();
         let watermark = reader.market_stream_watermark(&binding.market_id).unwrap().unwrap();
         assert_eq!((watermark.published_cursor, watermark.durable_cursor), (1, 1));
-        let (router, _) = Api::router_with_archive(reader.clone(), profile.clone(),
+        let (router, control) = Api::router_with_archive(reader.clone(), profile.clone(),
             "profile-epoch".into(), Limits {
                 snapshot_bytes:65536,frame_bytes:65536,replay_bytes:65536,
-                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
+                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1, live_backlog_groups:64, live_backlog_age:Duration::from_millis(500),
             }, root.path().to_path_buf()).unwrap();
         let status = router.clone().oneshot(axum::http::Request::builder()
             .uri("/v1/prediction-markets/polymarket/research/btc-5m/status")
@@ -2878,37 +3691,48 @@ mod tests {
         let streams = router.clone().oneshot(axum::http::Request::builder()
             .uri("/v1/prediction-markets/polymarket/research/btc-5m/market-streams")
             .body(axum::body::Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(streams.status(), StatusCode::OK);
-        let streams = proto::MarketStreams::decode(axum::body::to_bytes(
-            streams.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(streams.markets[0].identity.as_ref().unwrap().stream_epoch.as_deref(),
-            Some(watermark.stream_epoch.as_str()));
-        assert_eq!(streams.watermarks[0].published_market_cursor, Some(1));
+        assert_eq!(streams.status(), StatusCode::NOT_FOUND);
         let snapshot_path = format!(
             "/v1/prediction-markets/polymarket/research/btc-5m/market-full-sync?market_id={}",
             binding.market_id);
         let snapshot_response = router.clone().oneshot(axum::http::Request::builder()
             .uri(snapshot_path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(snapshot_response.status(), StatusCode::OK);
-        let snapshot = proto::MarketFullSync::decode(axum::body::to_bytes(
-            snapshot_response.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(snapshot.watermark.as_ref().unwrap().identity.as_ref().unwrap()
-            .stream_epoch.as_deref(), Some(watermark.stream_epoch.as_str()));
-        assert_eq!(snapshot.watermark.as_ref().unwrap().published_market_cursor, Some(1));
-        assert_eq!(snapshot.books.len(), 2);
-        assert!(snapshot.books.iter().all(|book| book.book_market_cursor == Some(1)
-            && book.canonical_book_sha256.as_ref().is_some_and(|hash| hash.len() == 32)
-            && book.canonical_book.is_some()));
-        assert!(snapshot.snapshot_is_not_execution_readiness);
-        for (query, expected) in [
-            ("market_id=absent", StatusCode::NOT_FOUND),
-            ("market_id=", StatusCode::BAD_REQUEST),
-        ] {
-            let response = router.clone().oneshot(axum::http::Request::builder()
-                .uri(format!("/v1/prediction-markets/polymarket/research/btc-5m/market-full-sync?{query}"))
-                .body(axum::body::Body::empty()).unwrap()).await.unwrap();
-            assert_eq!(response.status(), expected);
-        }
+        assert_eq!(snapshot_response.status(), StatusCode::NOT_FOUND);
+        use marketcow_contracts::btc5m_market_local_v6::{self as live,wire};
+        let official_streams=tokio::time::timeout(Duration::from_secs(2),async {
+            loop {
+                let response=router.clone().oneshot(axum::http::Request::builder()
+                    .uri("/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-streams")
+                    .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+                if response.status()==StatusCode::OK {
+                    break wire::MarketStreams::decode(axum::body::to_bytes(
+                        response.into_body(),65536).await.unwrap()).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(official_streams.schema_version,live::SCHEMA_VERSION);
+        let ordinary_binding=official_streams.markets.iter()
+            .find(|m|m.key.as_ref().unwrap().market_id==binding.market_id).unwrap();
+        let official_snapshot_path=format!(
+            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/market-full-sync?market_id={}",
+            binding.market_id);
+        let official_snapshot=router.clone().oneshot(axum::http::Request::builder()
+            .uri(official_snapshot_path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(official_snapshot.status(),StatusCode::OK);
+        let official_snapshot=wire::MarketFrame::decode(axum::body::to_bytes(
+            official_snapshot.into_body(),65536).await.unwrap()).unwrap();
+        let Some(wire::market_frame::Body::Snapshot(books))=official_snapshot.body else {panic!("ordinary snapshot");};
+        assert_eq!(books.books.len(),2);
+        let relay=crate::source_official_ws_relay::router(control,reader.clone()).unwrap();
+        let wrong_rule=format!(
+            "/v1/prediction-markets/polymarket/research/btc-5m/official-ws/official-book?market_id={}&condition_id={}&token_id={}&rule_sha256={}&window_id={}&start_at={}&end_at={}&up_token_id={}&down_token_id={}&stream_id={}",
+            binding.market_id,binding.condition_id,binding.outcomes[0].token_id,"f".repeat(64),
+            binding.window_id,binding.start_at,binding.end_at,binding.outcomes[0].token_id,
+            binding.outcomes[1].token_id,ordinary_binding.stream_id);
+        let rejected=relay.oneshot(axum::http::Request::builder().uri(wrong_rule)
+            .body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(rejected.status(),StatusCode::CONFLICT);
         let path = format!("/v1/prediction-markets/polymarket/research/btc-5m/market-replay?market_id={}&stream_epoch={}&after_market_cursor=0&maximum_groups=1",
             binding.market_id, watermark.stream_epoch);
         let response = router.clone().oneshot(axum::http::Request::builder().uri(path)
@@ -2928,7 +3752,7 @@ mod tests {
         let (cold_router, _) = Api::router_with_archive(reader, next_profile,
             "next-profile-epoch".into(), Limits {
                 snapshot_bytes:65536,frame_bytes:65536,replay_bytes:65536,
-                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1,
+                clients:1,send_timeout:Duration::from_secs(1),snapshot_lease_capacity:1, live_backlog_groups:64, live_backlog_age:Duration::from_millis(500),
             }, root.path().to_path_buf()).unwrap();
         let cold_path = format!("/v1/prediction-markets/polymarket/research/market-archive-replay?market_id={}&stream_epoch={}&after_market_cursor=0&maximum_groups=1",
             binding.market_id, watermark.stream_epoch);

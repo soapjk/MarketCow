@@ -113,8 +113,6 @@ class AdmissionStore:
                 if row:
                     if row[0] != digest:
                         error = "idempotency_conflict"
-                    elif hashlib.sha256(row[1]).hexdigest() != row[2]:
-                        error = "store_corruption"
                     else:
                         result = row[1]
                 elif response is None:

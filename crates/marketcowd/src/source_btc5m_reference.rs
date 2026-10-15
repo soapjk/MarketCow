@@ -45,6 +45,7 @@ struct Service {
     // independent lock over the bounded HTTP reads coalesces duplicate reads;
     // it never participates in market publication or WebSocket processing.
     cache: Arc<Mutex<BTreeMap<(String, String), Cached>>>,
+    requests: Arc<Mutex<BTreeMap<(String, String), Arc<Mutex<()>>>>>,
 }
 
 struct Cached {
@@ -119,6 +120,7 @@ pub fn router(control: Control, trade: Option<btc_trade::Service>) -> Result<Rou
         trade,
         client,
         cache: Arc::new(Mutex::new(BTreeMap::new())),
+        requests: Arc::new(Mutex::new(BTreeMap::new())),
     };
     Ok(Router::new()
         .route(
@@ -145,7 +147,7 @@ async fn http_binance_comparison(
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                json!({"schema_version":"marketcow.btc5m.binance-reference-window.v1",
+                json!({"schema_version":"marketcow.btc5m.binance-reference-window.v3",
                 "available":false,"market_id":query.market_id,
                 "reason":format!("{error:#}")}),
             ),
@@ -162,7 +164,7 @@ async fn http_comparison(
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
-                json!({"schema_version":"marketcow.btc5m.reference-comparison.v2",
+                json!({"schema_version":"marketcow.btc5m.reference-comparison.v3",
                 "available":false,"market_id":query.market_id,
                 "reason":format!("{error:#}")}),
             ),
@@ -200,15 +202,21 @@ impl Service {
             .context("market is not in current BTC five-minute profile")?;
         let start_ms = DateTime::parse_from_rfc3339(&binding.start_at)?.timestamp_millis();
         let end_ms = DateTime::parse_from_rfc3339(&binding.end_at)?.timestamp_millis();
+        let window_identity = btc_trade::WindowIdentity {
+            market_id: binding.market_id.clone(),
+            condition_id: binding.condition_id.clone(),
+            window_id: binding.window_id.clone(),
+            rule_sha256: binding.rule_sha256.clone(),
+            start_ms,
+            end_ms,
+        };
         let binance = match &self.trade {
-            Some(trade) => trade.window_comparison(start_ms, end_ms, None).await,
-            None => json!({"schema_version":"marketcow.btc5m.binance-comparison.v1",
-                "source":"binance_spot_trade","available":false,
-                "reason":"trade_source_not_configured"}),
+            Some(trade) => trade.window_comparison(&window_identity, None).await,
+            None => unconfigured_binance_comparison(&window_identity),
         };
         self.require_same_profile(&before)?;
         Ok(
-            json!({"schema_version":"marketcow.btc5m.binance-reference-window.v1",
+            json!({"schema_version":"marketcow.btc5m.binance-reference-window.v3",
             "market_id":market_id,"condition_id":binding.condition_id,
             "window_id":binding.window_id,"start_at":binding.start_at,
             "end_at":binding.end_at,"profile_epoch":before["epoch"],
@@ -233,13 +241,19 @@ impl Service {
             .context("market is not in current BTC five-minute profile")?;
         let start_ms = DateTime::parse_from_rfc3339(&binding.start_at)?.timestamp_millis();
         let end_ms = DateTime::parse_from_rfc3339(&binding.end_at)?.timestamp_millis();
+        let window_identity = btc_trade::WindowIdentity {
+            market_id: binding.market_id.clone(),
+            condition_id: binding.condition_id.clone(),
+            window_id: binding.window_id.clone(),
+            rule_sha256: binding.rule_sha256.clone(),
+            start_ms,
+            end_ms,
+        };
         let official_future = self.reference(market_id);
         let binance_future = async {
             match &self.trade {
-                Some(trade) => trade.window_comparison(start_ms, end_ms, None).await,
-                None => json!({"schema_version":"marketcow.btc5m.binance-comparison.v1",
-                    "source":"binance_spot_trade","available":false,
-                    "reason":"trade_source_not_configured"}),
+                Some(trade) => trade.window_comparison(&window_identity, None).await,
+                None => unconfigured_binance_comparison(&window_identity),
             }
         };
         let (official, mut binance) = tokio::join!(official_future, binance_future);
@@ -259,7 +273,7 @@ impl Service {
             Err(error) => error.body(),
         };
         Ok(
-            json!({"schema_version":"marketcow.btc5m.reference-comparison.v2",
+            json!({"schema_version":"marketcow.btc5m.reference-comparison.v3",
             "market_id":market_id,"condition_id":binding.condition_id,
             "window_id":binding.window_id,"start_at":binding.start_at,
             "end_at":binding.end_at,"profile_epoch":before["epoch"],
@@ -320,6 +334,15 @@ impl Service {
             ));
         }
         let key = (epoch.to_owned(), market_id.to_owned());
+        let request = {
+            let mut requests = self.requests.lock().await;
+            requests.retain(|existing, value|
+                existing == &key || Arc::strong_count(value) > 1);
+            requests.entry(key.clone()).or_insert_with(||Arc::new(Mutex::new(()))).clone()
+        };
+        // Only identical requests wait together. Never hold the cache directory
+        // across upstream I/O or make another market wait for this fetch.
+        let _request = request.lock().await;
         let mut cache = self.cache.lock().await;
         cache.retain(|(cached_epoch, _), _| cached_epoch == epoch);
         if let Some(cached) = cache.get(&key) {
@@ -330,6 +353,7 @@ impl Service {
                 return cached.result.clone();
             }
         }
+        drop(cache);
         let result = self
             .fetch_window(
                 binding,
@@ -346,7 +370,7 @@ impl Service {
             Ok(_) => 60,
             Err(_) => 0,
         };
-        cache.insert(
+        self.cache.lock().await.insert(
             key,
             Cached {
                 valid_until: Instant::now()
@@ -517,6 +541,32 @@ impl Service {
     }
 }
 
+fn unconfigured_binance_comparison(identity: &btc_trade::WindowIdentity) -> Value {
+    json!({"schema_version":"marketcow.btc5m.binance-comparison.v3",
+        "source":"binance_spot_trade","instrument_id":"BTCUSDT.BINANCE",
+        "source_epoch":null,"available":false,"reason":"trade_source_not_configured",
+        "opening_available":false,"opening_reason":"trade_source_not_configured",
+        "current_available":false,"current_reason":"trade_source_not_configured",
+        "method":"last_trade_price_time_weighted_over_preceding_60000ms",
+        "quote_asset":"USDT","official_method_exactly_reproduced":false,
+        "carry_between_trades":true,"window_start_ms":identity.start_ms,
+        "window_end_ms":identity.end_ms,
+        "opening_interval_start_ms":identity.start_ms.saturating_sub(60_000),
+        "opening_interval_end_ms":identity.start_ms,
+        "opening_price_usdt":null,"opening_source_epoch":null,
+        "opening_source_epochs":null,"opening_seconds_sha256":null,
+        "opening_history_evidence_sha256":null,"opening_evidence_sha256":null,
+        "opening_covered_ms":null,"opening_evidence_kind":null,
+        "current_interval_end_ms":null,"current_price_usdt":null,
+        "mapped_official_scale_price":null,
+        "mapping_status":"official_reference_unavailable","direction":null,
+        "latest_trade_time_ms":null,"latest_trade_age_ms_at_emit":null,
+        "latest_trade_id":null,
+        "freshness_policy":"consumer_explicit_max_trade_age_ms_required",
+        "snapshot_is_not_execution_readiness":true,
+        "observed_at":Utc::now().to_rfc3339()})
+}
+
 fn add_official_mapping(binance: &mut Value, official_price: Option<rust_decimal::Decimal>) {
     let Some(price) = official_price else { return };
     let parsed = binance["opening_price_usdt"]
@@ -648,6 +698,25 @@ async fn read_bounded(mut response: reqwest::Response, limit: usize) -> Referenc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unconfigured_v3_branch_has_explicit_null_opening_fields() {
+        let identity = btc_trade::WindowIdentity {
+            market_id: "600001".into(), condition_id: "0xaaaaaaaa".into(),
+            window_id: "btc-updown-5m-300".into(), rule_sha256: "bbbb".into(),
+            start_ms: 300_000, end_ms: 600_000,
+        };
+        let value = unconfigured_binance_comparison(&identity);
+        assert_eq!(value["schema_version"], "marketcow.btc5m.binance-comparison.v3");
+        assert_eq!(value["opening_available"], false);
+        assert_eq!(value["opening_reason"], "trade_source_not_configured");
+        for field in ["opening_price_usdt", "opening_source_epoch", "opening_source_epochs",
+            "opening_history_evidence_sha256", "opening_evidence_sha256",
+            "opening_covered_ms", "current_price_usdt"] {
+            assert!(value.get(field).is_some(), "missing {field}");
+            assert!(value[field].is_null(), "{field} must be null");
+        }
+    }
 
     #[test]
     fn mapping_status_distinguishes_missing_binance_from_missing_official() {

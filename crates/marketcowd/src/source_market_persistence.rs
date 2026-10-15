@@ -280,7 +280,7 @@ impl<T> MarketPersistence<T> {
         commit: C,
     ) -> Result<Arc<MarketGroup<T>>>
     where
-        S: Default,
+        S: Default + Clone,
         C: FnOnce(&mut S),
     {
         self.publish_with_replay_prepared(replay, market, epoch, expected_cursor,
@@ -301,7 +301,7 @@ impl<T> MarketPersistence<T> {
         wire_bytes: usize, retained_bytes: usize, prepare: P, commit: C,
     ) -> Result<Arc<MarketGroup<T>>>
     where
-        S: Default,
+        S: Default + Clone,
         P: FnOnce(&S) -> Result<U>,
         C: FnOnce(&mut S, U),
     {
@@ -318,7 +318,7 @@ impl<T> MarketPersistence<T> {
         prepare: P, commit: C,
     ) -> Result<Arc<MarketGroup<T>>>
     where
-        S: Default,
+        S: Default + Clone,
         P: FnOnce(&S) -> Result<U>,
         C: FnOnce(&mut S, U),
     {
@@ -430,7 +430,7 @@ impl<T> MarketPersistence<T> {
     /// memory replay cursor on enqueue, dequeue, or an unknown write outcome.
     pub fn run_writer<S, F>(&self, replay: &MarketReplay<T, S>, mut persist: F) -> Result<()>
     where
-        S: Default,
+        S: Default + Clone,
         F: FnMut(&Work<T>) -> Result<()>,
     {
         while let Some(work) = self.wait_pop()? {

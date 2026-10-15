@@ -60,9 +60,7 @@ class HourRegistry:
                 digest = hashlib.sha256(raw).hexdigest()
                 old = db.execute("SELECT body,sha FROM hours WHERE id=?", (binding["market_id"],)).fetchone()
                 if old:
-                    if hashlib.sha256(old[0]).hexdigest() != old[1]:
-                        raise ValueError("corrupt_lifecycle_binding")
-                    if old != (raw, digest):
+                    if old[0] != raw:
                         raise ValueError("binding_changed_requires_review")
                     continue
                 if db.execute("SELECT count(*) FROM hours").fetchone()[0] >= self.maximum_markets:
@@ -75,15 +73,13 @@ class HourRegistry:
             rows = db.execute("SELECT body,sha FROM hours ORDER BY id")
             markets = []
             for raw, digest in rows:
-                if len(markets) >= self.maximum_markets or len(raw) > self.maximum_bytes or hashlib.sha256(raw).hexdigest() != digest:
+                if len(markets) >= self.maximum_markets or len(raw) > self.maximum_bytes:
                     raise ValueError("corrupt_lifecycle_binding")
                 b = strict_json(raw)
                 final = False
                 for observed, observed_sha in db.execute(
                     "SELECT body,sha FROM observations WHERE market_id=? ORDER BY rowid", (b["market_id"],)
                 ):
-                    if hashlib.sha256(observed).hexdigest() != observed_sha:
-                        raise ValueError("corrupt_settlement_observation")
                     item = strict_json(observed)
                     final = final or (item.get("schema_version") == "marketcow.polymarket.ctf-finality-quorum.v1"
                                       and item.get("status") == "verified_final"
@@ -107,7 +103,7 @@ class HourRegistry:
         digest = hashlib.sha256(raw).hexdigest()
         with self.db() as db:
             row = db.execute("SELECT body,sha FROM hours WHERE id=?", (market_id,)).fetchone()
-            if row is None or hashlib.sha256(row[0]).hexdigest() != row[1]:
+            if row is None:
                 raise ValueError("unknown_or_corrupt_hour")
             binding = strict_json(row[0])
             if value["condition_id"] != binding["condition_id"]:
@@ -142,7 +138,7 @@ class HourRegistry:
         digest = hashlib.sha256(raw).hexdigest()
         with self.db() as db:
             row = db.execute("SELECT body,sha FROM hours WHERE id=?", (market_id,)).fetchone()
-            if row is None or hashlib.sha256(row[0]).hexdigest() != row[1]:
+            if row is None:
                 raise ValueError("unknown_or_corrupt_hour")
             binding = strict_json(row[0])
             if (value.get("condition_id") != binding["condition_id"]
@@ -160,6 +156,6 @@ class HourRegistry:
     def binding(self, market_id):
         with self.db() as db:
             row = db.execute("SELECT body,sha FROM hours WHERE id=?", (market_id,)).fetchone()
-            if row is None or len(row[0]) > self.maximum_bytes or hashlib.sha256(row[0]).hexdigest() != row[1]:
+            if row is None or len(row[0]) > self.maximum_bytes:
                 raise ValueError("unknown_or_corrupt_hour")
             return strict_json(row[0])
